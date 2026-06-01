@@ -1,0 +1,18 @@
+[package]
+name = "havn-core"
+description = "Shared types for havn — IDs, messages, policy, errors. No I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[lints]
+workspace = true

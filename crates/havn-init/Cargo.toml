@@ -1,0 +1,21 @@
+[package]
+name = "havn-init"
+description = "Tiny PID-1 shim for the havn agent runtime — forks into the spawner-prepared PID namespace, mounts /proc, and exec's the runtime."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "havn-init"
+path = "src/main.rs"
+
+[dependencies]
+havn-spawner.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[lints]
+workspace = true

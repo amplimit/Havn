@@ -1,0 +1,184 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/havn-core",
+    "crates/havn-proto",
+    "crates/havn-spawner",
+    "crates/havn-db",
+    "crates/havn-gateway",
+    "crates/havn-runtime",
+    "crates/havn-cli",
+    "crates/havn-init",
+]
+
+[workspace.package]
+version = "0.1.0-dev"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/amplimit/havn"
+homepage = "https://github.com/amplimit/havn"
+authors = ["Amplimit <oss@amplimit.com>"]
+
+[workspace.dependencies]
+# Internal crates — path locally, version when published.
+havn-core = { path = "crates/havn-core", version = "0.1.0-dev" }
+havn-proto = { path = "crates/havn-proto", version = "0.1.0-dev" }
+havn-spawner = { path = "crates/havn-spawner", version = "0.1.0-dev" }
+havn-db = { path = "crates/havn-db", version = "0.1.0-dev" }
+havn-init = { path = "crates/havn-init", version = "0.1.0-dev" }
+
+# Async runtime
+tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "sync", "time", "fs", "process"] }
+async-trait = "0.1"
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+
+# HTTP / WebSocket
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+
+# Errors / logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# IDs / time
+uuid = { version = "1.23", features = ["v5", "v7", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Database (SQLite only — see project_havn_scope memory).
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "chrono", "uuid", "json"] }
+
+# HTTP client (rustls — no OpenSSL dep).
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json", "stream", "http2"] }
+
+# Filesystem watch + atomic Arc swap for hot config reload (spec §8.4).
+notify = "8"
+arc-swap = "1"
+
+# Skill format parsing (YAML frontmatter). serde_norway is the maintained fork
+# of serde_yaml (serde_yml was archived as unsound — RUSTSEC-2025-0068).
+serde_norway = "0.9"
+
+# PreToolUse hook patterns — operator declares regex denies in
+# workspace/.havn/hooks.yaml; runtime checks before tool dispatch.
+regex = "1"
+
+# Pure-byte view over `&[f32]` ↔ `&[u8]` for storing embedding vectors
+# as SQLite BLOBs without any per-element allocation. Used by the
+# embedding hybrid-search path (§9.4 v0.7).
+bytemuck = { version = "1.21", features = ["derive"] }
+
+# Credential encryption-at-rest (spec §13 Phase 3). Symmetric passphrase
+# mode (scrypt-based); operator owns the lifecycle of HAVN_AGE_KEY env.
+# rust-age library, NOT the rage CLI.
+age = "0.11"
+secrecy = "0.10"
+
+# Model Context Protocol client (spec §13 Phase 3). stdio-only:
+# the agent runtime spawns operator-installed MCP server binaries as
+# child processes. We deliberately leave server, SSE, HTTP, OAuth
+# variants OFF — havn agents only consume MCP, never expose; and the
+# stdio transport keeps `default no network` invariant intact.
+rmcp = { version = "1.6", default-features = false, features = ["client", "transport-child-process", "macros"] }
+
+# Linux LSM bindings used by the agent runtime to restrict filesystem access
+# at the kernel level (spec §4.1).
+landlock = "0.4"
+
+# seccomp-bpf compiler — Firecracker's library; restricts the agent's syscall
+# surface as a defence-in-depth on top of namespaces + Landlock (spec §4.1).
+seccompiler = "0.5"
+
+# Testing
+tokio-test = "0.4"
+
+# Unix syscalls (signal delivery for graceful agent stop).
+libc = "0.2"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_debug_implementations = "warn"
+unused_must_use = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Pedantic lints are advisory — useful during development but not hard
+# errors in CI (where -D warnings promotes everything).
+pedantic = { level = "allow", priority = -1 }
+# Pragmatic carve-outs — pedantic lints that fight idiomatic Rust or
+# produce noise in a codebase of this shape.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+too_many_lines = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
+single_match_else = "allow"
+match_wildcard_for_single_variants = "allow"
+manual_let_else = "allow"
+collapsible_if = "allow"
+items_after_statements = "allow"
+format_push_string = "allow"
+similar_names = "allow"
+unnested_or_patterns = "allow"
+redundant_guards = "allow"
+match_same_arms = "allow"
+trivially_copy_pass_by_ref = "allow"
+option_if_let_else = "allow"
+manual_string_new = "allow"
+return_self_not_must_use = "allow"
+struct_field_names = "allow"
+unused_self = "allow"
+needless_pass_by_value = "allow"
+implicit_hasher = "allow"
+default_trait_access = "allow"
+wildcard_imports = "allow"
+too_many_arguments = "allow"
+# Remaining clippy::all lints that fire on existing code — each is a
+# low-value nit that would require a large mechanical diff with no
+# functional change. Suppress and fix incrementally.
+derivable_impls = "allow"
+doc_lazy_continuation = "allow"
+field_reassign_with_default = "allow"
+items_after_test_module = "allow"
+iter_cloned_collect = "allow"
+ptr_arg = "allow"
+type_complexity = "allow"
+unusual_byte_groupings = "allow"
+# Extra hygiene.
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+# unwrap/expect are warn-level advisories; -D warnings in CI would make
+# them fatal even in test code, so keep them allow for now. The strict
+# lints (dbg_macro, todo, print_*) catch the things that actually matter.
+unwrap_used = "allow"
+expect_used = "allow"
+print_stdout = "warn"
+# CLI and init shim legitimately use eprintln for diagnostics.
+print_stderr = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+debug = "limited"

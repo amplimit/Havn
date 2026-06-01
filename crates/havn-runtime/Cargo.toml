@@ -1,0 +1,55 @@
+[package]
+name = "havn-runtime"
+description = "havn agent runtime — LLM loop, tools, three-tier memory, heartbeat, curator."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "havn-runtime"
+path = "src/main.rs"
+
+[features]
+# Compile in the local fastembed-rs embedder (spec §9.4 v0.7).
+# Off by default because `fastembed` pulls `ort` (~80 MB ONNX
+# native libs) at build time. Operators who want a fully-local
+# embedder enable this and accept the build-time download.
+default = []
+local-embed = ["dep:fastembed"]
+
+[dependencies]
+havn-core.workspace = true
+havn-proto.workspace = true
+havn-db.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+serde_norway.workspace = true
+regex.workspace = true
+chrono.workspace = true
+arc-swap.workspace = true
+bytemuck.workspace = true
+rmcp.workspace = true
+
+# Optional: local fastembed-rs provider for hybrid retrieval. See
+# `features.local-embed` above + `embedding/local.rs`.
+fastembed = { version = "5", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = { workspace = true }
+seccompiler = { workspace = true }
+libc = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,68 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor backups
+*.swp
+*.swo
+*~
+
+# Environment / secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Local data
+/var/
+/data/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Node (dashboard, future)
+node_modules/
+.next/
+dist/
+build/
+
+# Logs
+*.log
+/logs/
+
+# Coverage
+/coverage/
+*.profraw
+
+# Internal design documents (not part of the open-source distribution).
+platform-spec.md
+DESIGN.md
+
+# AI assistant config.
+.claude/
+
+# Vendored reference implementations.
+/resources/
+
+# fastembed-rs lazy model cache. Created on first embed call when the
+# operator opts into `provider = "local"` and runs from the repo root.
+# Models are ~30-200 MB ONNX files — never want these in git.
+/.fastembed_cache/
+**/.fastembed_cache/
+
+# playwright-cli artefacts. The CLI drops snapshot YAMLs in its CWD by
+# default; if a developer invokes it from the repo root during testing
+# those land here. Agent workspaces are gitignored via `/var/`.
+/.playwright-cli/
+**/.playwright-cli/

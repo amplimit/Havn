@@ -1,0 +1,29 @@
+[package]
+name = "havn-cli"
+description = "havn command-line interface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "havn"
+path = "src/main.rs"
+
+[dependencies]
+havn-core.workspace = true
+havn-db.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+toml.workspace = true
+sqlx.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true
