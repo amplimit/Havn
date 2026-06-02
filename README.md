@@ -41,7 +41,11 @@ havn is a self-hosted server that runs a gateway and per-user agents. Identity, 
 
 ## Quick Start
 
-**Requirements:** Linux (Ubuntu 24.04 LTS recommended), Rust 1.94+, Node.js 22+ (for dashboard).
+**Requirements:**
+
+- **OS** — Linux only. Ubuntu 24.04 LTS recommended. Agent isolation relies on kernel features (user namespaces, Landlock ≥ 5.13, seccomp, cgroup v2) without macOS/Windows equivalents.
+- **Rust** — 1.94+ (pinned via `rust-toolchain.toml`)
+- **Node.js** — 22+ (for dashboard only)
 
 ```bash
 # Build
@@ -50,13 +54,13 @@ cargo build --release
 # Initial setup — creates config + data directories
 ./target/release/havn setup
 
-# Add your LLM credential
+# Set the encryption key for credentials (any passphrase you choose)
+export HAVN_AGE_KEY="your-secret-passphrase"
+
+# Add your LLM credential (encrypted at rest)
 ./target/release/havn credential add anthropic sk-ant-...
 
-# Provision a user (single-user mode)
-./target/release/havn user add operator --display-name "Operator"
-
-# Start the gateway
+# Start the gateway (same HAVN_AGE_KEY must be set)
 ./target/release/havn start
 ```
 
