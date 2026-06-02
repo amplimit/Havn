@@ -95,9 +95,8 @@ pub async fn get(
     user: AuthedUser,
     Path(id): Path<String>,
 ) -> Result<Json<AgentView>, ApiError> {
-    let id = parse_id(&id)?;
-    let agent = ensure_owner(&state, &user, id).await?;
-    let connected = state.registry.is_connected(id).await;
+    let agent = resolve_agent(&id, &user, &state).await?;
+    let connected = state.registry.is_connected(agent.id).await;
     Ok(Json(AgentView::from_agent(agent, connected)))
 }
 
@@ -171,8 +170,8 @@ pub async fn patch(
     Path(id): Path<String>,
     Json(req): Json<PatchAgentRequest>,
 ) -> Result<Json<AgentView>, ApiError> {
-    let id = parse_id(&id)?;
-    let agent = ensure_owner(&state, &user, id).await?;
+    let agent = resolve_agent(&id, &user, &state).await?;
+    let id = agent.id;
 
     if let Some(n) = &req.name {
         if n.trim().is_empty() {
@@ -222,8 +221,8 @@ pub async fn start(
     user: AuthedUser,
     Path(id): Path<String>,
 ) -> Result<Json<AgentView>, ApiError> {
-    let id = parse_id(&id)?;
-    let _ = ensure_owner(&state, &user, id).await?;
+    let agent = resolve_agent(&id, &user, &state).await?;
+    let id = agent.id;
 
     // Idempotent — explicit POST /start is now mostly redundant since
     // the WS handler auto-starts on chat connect (spec §4.3 lifecycle
@@ -353,8 +352,8 @@ pub async fn stop(
     user: AuthedUser,
     Path(id): Path<String>,
 ) -> Result<Json<AgentView>, ApiError> {
-    let id = parse_id(&id)?;
-    let _ = ensure_owner(&state, &user, id).await?;
+    let agent = resolve_agent(&id, &user, &state).await?;
+    let id = agent.id;
 
     // Best-effort graceful shutdown via socket; ignore if not connected.
     if state.registry.is_connected(id).await
@@ -392,8 +391,8 @@ pub async fn delete(
     user: AuthedUser,
     Path(id): Path<String>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    let id = parse_id(&id)?;
-    let _ = ensure_owner(&state, &user, id).await?;
+    let agent = resolve_agent(&id, &user, &state).await?;
+    let id = agent.id;
 
     // Stop first if running.
     if let Some(handle) = state.registry.remove(id).await {
@@ -430,23 +429,31 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn parse_id(s: &str) -> Result<AgentId, ApiError> {
-    AgentId::from_str(s).map_err(|_| ApiError::BadRequest("invalid agent id".into()))
-}
-
-pub(crate) async fn ensure_owner(
-    state: &AppState,
+/// Resolve a path parameter (UUID or agent name) and verify ownership
+/// in a single step. Name lookup is owner-scoped so it doubles as the
+/// ownership check; UUID lookup needs an explicit owner_id comparison.
+/// Returns 404 for non-existent agents AND for agents owned by someone
+/// else — don't leak existence to non-owners.
+pub(crate) async fn resolve_agent(
+    s: &str,
     user: &AuthedUser,
-    id: AgentId,
+    state: &AppState,
 ) -> Result<Agent, ApiError> {
-    let agent = repo::find_by_id(&state.db, id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    if agent.owner_id != user.id {
-        // Don't leak existence to non-owners.
-        return Err(ApiError::NotFound);
+    let s = s.trim();
+    if let Ok(id) = AgentId::from_str(s) {
+        let agent = repo::find_by_id(&state.db, id)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        if agent.owner_id != user.id {
+            // Don't leak existence to non-owners.
+            return Err(ApiError::NotFound);
+        }
+        return Ok(agent);
     }
-    Ok(agent)
+    // Name path: find_by_owner_and_name is already owner-scoped.
+    repo::find_by_owner_and_name(&state.db, user.id, s)
+        .await?
+        .ok_or(ApiError::NotFound)
 }
 
 pub(crate) fn workspace_for(state: &AppState, id: AgentId) -> std::path::PathBuf {

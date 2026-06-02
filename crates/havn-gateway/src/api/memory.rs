@@ -15,11 +15,9 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
-use havn_core::AgentId;
 use havn_db::agent::memory::{self, Kind};
 use havn_proto::{AdminOutcome, GatewayToAgent, MemoryForgetRequest};
 use serde::{Deserialize, Serialize};
-use std::str::FromStr as _;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -91,17 +89,8 @@ pub async fn list(
     Path(id): Path<String>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<ListResponse>, ApiError> {
-    let agent_id =
-        AgentId::from_str(&id).map_err(|_| ApiError::BadRequest("invalid agent id".into()))?;
-
-    // Same ownership check the other endpoints use — don't leak
-    // existence of agents the caller doesn't own.
-    let agent = havn_db::repo::agents::find_by_id(&state.db, agent_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    if agent.owner_id != user.id {
-        return Err(ApiError::NotFound);
-    }
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let agent_id = agent.id;
 
     let agent_db_path = state
         .workspace_root
@@ -110,7 +99,7 @@ pub async fn list(
         .join("agent.db");
     if !tokio::fs::try_exists(&agent_db_path).await.unwrap_or(false) {
         return Ok(Json(ListResponse {
-            agent_id: id,
+            agent_id: agent_id.to_string(),
             entries: Vec::new(),
             uninitialised: true,
         }));
@@ -149,7 +138,7 @@ pub async fn list(
 
     let views = entries.into_iter().map(MemoryEntryView::from).collect();
     Ok(Json(ListResponse {
-        agent_id: id,
+        agent_id: agent_id.to_string(),
         entries: views,
         uninitialised: false,
     }))
@@ -172,14 +161,8 @@ pub async fn forget(
     user: AuthedUser,
     Path((id, key)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    let agent_id =
-        AgentId::from_str(&id).map_err(|_| ApiError::BadRequest("invalid agent id".into()))?;
-    let agent = havn_db::repo::agents::find_by_id(&state.db, agent_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    if agent.owner_id != user.id {
-        return Err(ApiError::NotFound);
-    }
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let agent_id = agent.id;
     if !state.registry.is_connected(agent_id).await {
         return Err(ApiError::Conflict(
             "agent is not running — start it to apply memory edits (spec §5.2 single-writer)"

@@ -66,3 +66,4 @@ DESIGN.md
 # those land here. Agent workspaces are gitignored via `/var/`.
 /.playwright-cli/
 **/.playwright-cli/
+test-deploy/

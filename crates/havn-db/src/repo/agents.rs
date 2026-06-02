@@ -99,6 +99,23 @@ pub async fn find_by_id(pool: &SqlitePool, id: AgentId) -> Result<Option<Agent>>
     row.map(Agent::try_from).transpose()
 }
 
+pub async fn find_by_owner_and_name(
+    pool: &SqlitePool,
+    owner_id: UserId,
+    name: &str,
+) -> Result<Option<Agent>> {
+    let row: Option<AgentRow> = sqlx::query_as::<_, AgentRow>(
+        "SELECT id, owner_id, team_id, name, status, host, pid, config, created_at, updated_at \
+         FROM agents WHERE owner_id = ?1 AND name = ?2",
+    )
+    .bind(owner_id.to_string())
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(Agent::try_from).transpose()
+}
+
 /// Number of agents owned by `owner_id`. Used by the policy gate that
 /// enforces `Policy::max_agents` (spec §6.3) without paying the cost of
 /// loading every row.
@@ -340,6 +357,69 @@ mod tests {
             .expect("find")
             .expect("some");
         assert_eq!(after.status, AgentStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn find_by_owner_and_name_round_trip() {
+        let pool = connect_in_memory().await.expect("connect");
+        let owner = make_user(&pool, "u@e").await;
+        let agent = create(
+            &pool,
+            NewAgent {
+                owner_id: owner,
+                team_id: None,
+                name: "my-agent",
+                config: serde_json::json!({"model": "claude-sonnet-4-6"}),
+            },
+        )
+        .await
+        .expect("create agent");
+
+        let found = find_by_owner_and_name(&pool, owner, "my-agent")
+            .await
+            .expect("find")
+            .expect("should be Some");
+        assert_eq!(found.id, agent.id);
+        assert_eq!(found.name, "my-agent");
+        assert_eq!(found.owner_id, owner);
+        assert_eq!(found.config["model"], "claude-sonnet-4-6");
+    }
+
+    #[tokio::test]
+    async fn find_by_owner_and_name_wrong_owner() {
+        let pool = connect_in_memory().await.expect("connect");
+        let alice = make_user(&pool, "alice@e").await;
+        let bob = make_user(&pool, "bob@e").await;
+        create(
+            &pool,
+            NewAgent {
+                owner_id: alice,
+                team_id: None,
+                name: "secret-agent",
+                config: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("create agent");
+
+        let found = find_by_owner_and_name(&pool, bob, "secret-agent")
+            .await
+            .expect("query should succeed");
+        assert!(
+            found.is_none(),
+            "should not find agent owned by another user"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_by_owner_and_name_not_found() {
+        let pool = connect_in_memory().await.expect("connect");
+        let owner = make_user(&pool, "u@e").await;
+
+        let found = find_by_owner_and_name(&pool, owner, "does-not-exist")
+            .await
+            .expect("query should succeed");
+        assert!(found.is_none(), "should return None for non-existent name");
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use havn_core::{AgentId, CronJobId};
+use havn_core::CronJobId;
 use havn_db::repo::cron::{self, CronJob, CronRun, NewCronJob, Schedule};
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -134,8 +134,8 @@ pub async fn list(
     user: AuthedUser,
     Path(agent_id): Path<String>,
 ) -> Result<Json<Vec<CronJobView>>, ApiError> {
-    let agent_id = parse_agent(&agent_id)?;
-    ensure_agent_owner(&state, &user, agent_id).await?;
+    let agent = crate::api::agents::resolve_agent(&agent_id, &user, &state).await?;
+    let agent_id = agent.id;
     let jobs = cron::list_for_agent(&state.db, agent_id).await?;
     Ok(Json(jobs.into_iter().map(CronJobView::from).collect()))
 }
@@ -146,8 +146,8 @@ pub async fn create(
     Path(agent_id): Path<String>,
     Json(req): Json<CreateCronRequest>,
 ) -> Result<(StatusCode, Json<CronJobView>), ApiError> {
-    let agent_id = parse_agent(&agent_id)?;
-    ensure_agent_owner(&state, &user, agent_id).await?;
+    let agent = crate::api::agents::resolve_agent(&agent_id, &user, &state).await?;
+    let agent_id = agent.id;
 
     // Spec §6.3 enforcement: `can_schedule_cron` is a per-user
     // capability; refuse here before INSERT so a denied user can never
@@ -217,9 +217,9 @@ pub async fn update(
     Path((agent_id, job_id)): Path<(String, String)>,
     Json(req): Json<UpdateCronRequest>,
 ) -> Result<Json<CronJobView>, ApiError> {
-    let agent_id = parse_agent(&agent_id)?;
+    let agent = crate::api::agents::resolve_agent(&agent_id, &user, &state).await?;
+    let agent_id = agent.id;
     let job_id = parse_job(&job_id)?;
-    ensure_agent_owner(&state, &user, agent_id).await?;
     let job = cron::find_by_id(&state.db, job_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -240,9 +240,9 @@ pub async fn delete(
     user: AuthedUser,
     Path((agent_id, job_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    let agent_id = parse_agent(&agent_id)?;
+    let agent = crate::api::agents::resolve_agent(&agent_id, &user, &state).await?;
+    let agent_id = agent.id;
     let job_id = parse_job(&job_id)?;
-    ensure_agent_owner(&state, &user, agent_id).await?;
     let job = cron::find_by_id(&state.db, job_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -258,9 +258,9 @@ pub async fn list_runs(
     user: AuthedUser,
     Path((agent_id, job_id)): Path<(String, String)>,
 ) -> Result<Json<Vec<CronRunView>>, ApiError> {
-    let agent_id = parse_agent(&agent_id)?;
+    let agent = crate::api::agents::resolve_agent(&agent_id, &user, &state).await?;
+    let agent_id = agent.id;
     let job_id = parse_job(&job_id)?;
-    ensure_agent_owner(&state, &user, agent_id).await?;
     let job = cron::find_by_id(&state.db, job_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -271,23 +271,6 @@ pub async fn list_runs(
     Ok(Json(runs.into_iter().map(CronRunView::from).collect()))
 }
 
-fn parse_agent(s: &str) -> Result<AgentId, ApiError> {
-    AgentId::from_str(s).map_err(|_| ApiError::BadRequest("invalid agent id".into()))
-}
 fn parse_job(s: &str) -> Result<CronJobId, ApiError> {
     CronJobId::from_str(s).map_err(|_| ApiError::BadRequest("invalid cron job id".into()))
-}
-
-async fn ensure_agent_owner(
-    state: &AppState,
-    user: &AuthedUser,
-    agent_id: AgentId,
-) -> Result<(), ApiError> {
-    let agent = havn_db::repo::agents::find_by_id(&state.db, agent_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    if agent.owner_id != user.id {
-        return Err(ApiError::NotFound);
-    }
-    Ok(())
 }

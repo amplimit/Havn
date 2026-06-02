@@ -11,11 +11,9 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
-use havn_core::AgentId;
 use havn_db::agent::skills_index::{self, CuratableSkill, Source};
 use havn_proto::{AdminOutcome, GatewayToAgent, SkillPinRequest};
 use serde::Serialize;
-use std::str::FromStr as _;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -67,14 +65,8 @@ pub async fn list(
     user: AuthedUser,
     Path(id): Path<String>,
 ) -> Result<Json<ListResponse>, ApiError> {
-    let agent_id =
-        AgentId::from_str(&id).map_err(|_| ApiError::BadRequest("invalid agent id".into()))?;
-    let agent = havn_db::repo::agents::find_by_id(&state.db, agent_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    if agent.owner_id != user.id {
-        return Err(ApiError::NotFound);
-    }
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let agent_id = agent.id;
     let agent_db_path = state
         .workspace_root
         .join(agent_id.to_string())
@@ -82,7 +74,7 @@ pub async fn list(
         .join("agent.db");
     if !tokio::fs::try_exists(&agent_db_path).await.unwrap_or(false) {
         return Ok(Json(ListResponse {
-            agent_id: id,
+            agent_id: agent_id.to_string(),
             active: Vec::new(),
             archived: Vec::new(),
             uninitialised: true,
@@ -98,7 +90,7 @@ pub async fn list(
     let active = skills_index::list_all_active(&pool, DEFAULT_LIMIT).await?;
     let archived = skills_index::list_archived(&pool, DEFAULT_LIMIT).await?;
     Ok(Json(ListResponse {
-        agent_id: id,
+        agent_id: agent_id.to_string(),
         active: active.into_iter().map(SkillView::from).collect(),
         archived: archived.into_iter().map(SkillView::from).collect(),
         uninitialised: false,
@@ -127,14 +119,8 @@ pub async fn curator_reports(
     user: AuthedUser,
     Path(id): Path<String>,
 ) -> Result<Json<CuratorReportsResponse>, ApiError> {
-    let agent_id =
-        AgentId::from_str(&id).map_err(|_| ApiError::BadRequest("invalid agent id".into()))?;
-    let agent = havn_db::repo::agents::find_by_id(&state.db, agent_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    if agent.owner_id != user.id {
-        return Err(ApiError::NotFound);
-    }
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let agent_id = agent.id;
     let dir = state
         .workspace_root
         .join(agent_id.to_string())
@@ -142,7 +128,7 @@ pub async fn curator_reports(
         .join(".curator");
     if !tokio::fs::try_exists(&dir).await.unwrap_or(false) {
         return Ok(Json(CuratorReportsResponse {
-            agent_id: id,
+            agent_id: agent_id.to_string(),
             reports: Vec::new(),
             uninitialised: true,
         }));
@@ -152,7 +138,7 @@ pub async fn curator_reports(
         Ok(e) => e,
         Err(_) => {
             return Ok(Json(CuratorReportsResponse {
-                agent_id: id,
+                agent_id: agent_id.to_string(),
                 reports,
                 uninitialised: false,
             }));
@@ -186,7 +172,7 @@ pub async fn curator_reports(
     // Newest first.
     reports.sort_by(|a, b| b.name.cmp(&a.name));
     Ok(Json(CuratorReportsResponse {
-        agent_id: id,
+        agent_id: agent_id.to_string(),
         reports,
         uninitialised: false,
     }))
@@ -219,14 +205,8 @@ async fn set_pinned(
     name: &str,
     pinned: bool,
 ) -> Result<StatusCode, ApiError> {
-    let agent_id =
-        AgentId::from_str(id).map_err(|_| ApiError::BadRequest("invalid agent id".into()))?;
-    let agent = havn_db::repo::agents::find_by_id(&state.db, agent_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    if agent.owner_id != user.id {
-        return Err(ApiError::NotFound);
-    }
+    let agent = crate::api::agents::resolve_agent(id, &user, &state).await?;
+    let agent_id = agent.id;
     if !state.registry.is_connected(agent_id).await {
         return Err(ApiError::Conflict(
             "agent is not running — start it to apply skill edits (spec §5.2 single-writer)".into(),
