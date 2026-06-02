@@ -78,6 +78,13 @@ pub enum GatewayToAgent {
         session_token: String,
         #[serde(default)]
         policy: Policy,
+        /// Human-readable agent name (e.g. "dev assistant"). Shipped
+        /// so the runtime can inject it into the platform-context
+        /// preamble without a DB round-trip. Defaulted on deserialize
+        /// so an older gateway that doesn't yet send it still parses
+        /// (the runtime falls back to the agent_id string).
+        #[serde(default)]
+        agent_name: Option<String>,
         /// Model the runtime should use for this session's LLM calls.
         /// Resolved gateway-side from `agent.config.model`; `None`
         /// when the agent's config doesn't pin one (runtime falls back
@@ -456,6 +463,7 @@ mod tests {
         let frame = GatewayToAgent::Welcome {
             session_token: "tok".into(),
             policy: havn_core::Policy::default(),
+            agent_name: None,
             model: None,
             embedding: serde_json::Value::Null,
             extra_mounts: Vec::new(),
@@ -484,6 +492,7 @@ mod tests {
         let frame = GatewayToAgent::Welcome {
             session_token: "tok".into(),
             policy: policy.clone(),
+            agent_name: Some("test agent".into()),
             model: Some("claude-sonnet-4-6".into()),
             embedding: serde_json::Value::Null,
             extra_mounts: Vec::new(),

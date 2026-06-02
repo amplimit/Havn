@@ -274,7 +274,7 @@ mod tests {
             embedder: None,
         };
         Bridge {
-            parent_system_prompt: Arc::new(BootstrapFiles::default().system_prompt()),
+            parent_system_prompt: Arc::new(BootstrapFiles::default().system_prompt(None)),
             child_handle: LoopHandle {
                 writer_tx: tx,
                 pending: Arc::new(Mutex::new(HashMap::new())),

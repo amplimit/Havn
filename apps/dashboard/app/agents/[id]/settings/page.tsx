@@ -326,14 +326,14 @@ export default function SettingsPage({
 }
 
 /**
- * Bootstrap-file editor: SYSTEM.md / USER.md / HEARTBEAT.md (spec
+ * Bootstrap-file editor: SOUL.md / USER.md / HEARTBEAT.md (spec
  * §5.3, §9.4 layer 2). Each file gets its own textarea + save button
  * because (a) the three have different effect timing and the user
  * benefits from a clear "saved!" beat per file, (b) one big form
- * makes a typo in HEARTBEAT.md block a SYSTEM.md save the user really
+ * makes a typo in HEARTBEAT.md block a SOUL.md save the user really
  * wanted to land. Independent saves keep it simple.
  *
- * Effect timing on the hint lines mirrors spec §9.4: SYSTEM/USER are
+ * Effect timing on the hint lines mirrors spec §9.4: SOUL/USER are
  * frozen into the system prompt at session start, so edits land on
  * the agent's next start. HEARTBEAT.md is the deliberate exception —
  * it's re-read on every tick (§9.6), so edits land on the next tick
@@ -405,7 +405,7 @@ function BootstrapEditor({ agentId }: { agentId: string }) {
         </div>
       )}
       <BootstrapFileEditor
-        title="SYSTEM.md — persona + identity"
+        title="SOUL.md — persona + identity"
         hint="Tone, values, name, purpose. Frozen into the system prompt at session start; edits take effect on the agent's next start."
         value={system}
         onChange={setSystem}

@@ -13,7 +13,7 @@ const README: &str = "# This agent's workspace
 
 This directory contains files the agent reads at every session start:
 
-- `SYSTEM.md` — Persona + identity (tone, values, communication style, name, purpose).
+- `SOUL.md` — Persona + identity (tone, values, communication style, name, purpose).
 - `USER.md` — What the agent should always know about you.
 - `HEARTBEAT.md` — Periodic self-tick instructions (spec §9.6).
 
@@ -28,12 +28,11 @@ skill index). The dashboard's /memory and /skills pages read this file
 directly via a read-only handle.
 
 Earlier drafts of havn shipped four bootstrap files (SOUL, IDENTITY, USER,
-MEMORY, HEARTBEAT). v0.6 collapsed SOUL+IDENTITY → SYSTEM.md and removed
-MEMORY.md (its job is now done by the typed memory table — see spec §9.4).
-The runtime still tolerates the old filenames for existing workspaces.
+MEMORY, HEARTBEAT). v0.6 collapsed them into SYSTEM.md; v0.7 renamed it to
+SOUL.md. The runtime still tolerates the old filenames for existing workspaces.
 ";
 
-const BOOTSTRAP_FILES: &[&str] = &["SYSTEM.md", "USER.md", "HEARTBEAT.md"];
+const BOOTSTRAP_FILES: &[&str] = &["SOUL.md", "USER.md", "HEARTBEAT.md"];
 
 /// Create the workspace directory and all bootstrap files if they don't already exist.
 /// Idempotent — safe to call on an existing workspace.
@@ -80,29 +79,28 @@ mod tests {
         let workspace = dir.join("workspace");
         ensure(&workspace).await.expect("first");
 
-        let system = workspace.join("SYSTEM.md");
-        tokio::fs::write(&system, "user content")
+        let soul = workspace.join("SOUL.md");
+        tokio::fs::write(&soul, "user content")
             .await
             .expect("write");
 
         ensure(&workspace).await.expect("second");
-        let after = tokio::fs::read_to_string(&system).await.expect("read");
+        let after = tokio::fs::read_to_string(&soul).await.expect("read");
         assert_eq!(after, "user content");
     }
 
     #[tokio::test]
     async fn does_not_create_legacy_bootstrap_files() {
-        // Earlier drafts created SOUL.md / IDENTITY.md / MEMORY.md. v0.6
-        // does not — the legacy fallback in the runtime's BootstrapFiles
-        // loader still reads them when present, but `ensure` does not
-        // produce them.
+        // v0.7 creates SOUL.md (not SYSTEM.md). Legacy filenames like
+        // IDENTITY.md / MEMORY.md / SYSTEM.md are not created — the
+        // runtime's BootstrapFiles loader still reads them when present.
         let dir = tempdir();
         let workspace = dir.join("workspace");
         ensure(&workspace).await.expect("create");
-        for legacy in ["SOUL.md", "IDENTITY.md", "MEMORY.md"] {
+        for legacy in ["SYSTEM.md", "IDENTITY.md", "MEMORY.md"] {
             assert!(
                 !workspace.join(legacy).exists(),
-                "{legacy} should not be created in v0.6"
+                "{legacy} should not be created in v0.7"
             );
         }
     }
