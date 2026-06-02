@@ -22,10 +22,9 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
-use havn_core::{AgentId, McpServerConfig};
+use havn_core::McpServerConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::str::FromStr as _;
 use tokio::fs;
 use tracing::{info, warn};
 
@@ -71,8 +70,7 @@ pub async fn get(
     user: AuthedUser,
     Path(id): Path<String>,
 ) -> Result<Json<McpView>, ApiError> {
-    let id = AgentId::from_str(&id).map_err(|_| ApiError::BadRequest("invalid agent id".into()))?;
-    let agent = crate::api::agents::ensure_owner(&state, &user, id).await?;
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
     let (can_use_mcp, servers) = read_mcp_from_config(&agent.config);
     let available_binaries = list_installed_binaries().await;
     Ok(Json(McpView {
@@ -88,8 +86,8 @@ pub async fn patch(
     Path(id): Path<String>,
     Json(req): Json<McpPatch>,
 ) -> Result<Json<McpView>, ApiError> {
-    let id = AgentId::from_str(&id).map_err(|_| ApiError::BadRequest("invalid agent id".into()))?;
-    let agent = crate::api::agents::ensure_owner(&state, &user, id).await?;
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let id = agent.id;
 
     // Validate every server config the operator is about to commit.
     // The runtime would also reject these at boot, but failing here

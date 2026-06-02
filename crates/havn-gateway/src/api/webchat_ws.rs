@@ -25,7 +25,6 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use havn_core::{AgentId, InboundMessage, MessageContent};
 use havn_proto::GatewayToAgent;
 use serde::Deserialize;
-use std::str::FromStr as _;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -76,16 +75,8 @@ pub async fn handler(
         return Err(ApiError::BadRequest("invalid token".into()));
     }
 
-    let agent_id = AgentId::from_str(&agent_id)
-        .map_err(|_| ApiError::BadRequest("invalid agent id".into()))?;
-
-    let agent = havn_db::repo::agents::find_by_id(&state.db, agent_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    if agent.owner_id != user.id {
-        // Don't leak existence to non-owners.
-        return Err(ApiError::NotFound);
-    }
+    let agent = crate::api::agents::resolve_agent(&agent_id, &user, &state).await?;
+    let agent_id = agent.id;
 
     // Lazy-spawn: starting an agent is a runtime detail, not a UX
     // step the user should have to think about. Idempotent + race-

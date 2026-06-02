@@ -439,6 +439,7 @@ pub(crate) async fn resolve_agent(
     user: &AuthedUser,
     state: &AppState,
 ) -> Result<Agent, ApiError> {
+    let s = s.trim();
     if let Ok(id) = AgentId::from_str(s) {
         let agent = repo::find_by_id(&state.db, id)
             .await?
@@ -453,23 +454,6 @@ pub(crate) async fn resolve_agent(
     repo::find_by_owner_and_name(&state.db, user.id, s)
         .await?
         .ok_or(ApiError::NotFound)
-}
-
-/// Verify that `id` belongs to `user`. Used by sibling API modules
-/// (bootstrap, mcp) that already have a parsed `AgentId`.
-pub(crate) async fn ensure_owner(
-    state: &AppState,
-    user: &AuthedUser,
-    id: AgentId,
-) -> Result<Agent, ApiError> {
-    let agent = repo::find_by_id(&state.db, id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    if agent.owner_id != user.id {
-        // Don't leak existence to non-owners.
-        return Err(ApiError::NotFound);
-    }
-    Ok(agent)
 }
 
 pub(crate) fn workspace_for(state: &AppState, id: AgentId) -> std::path::PathBuf {

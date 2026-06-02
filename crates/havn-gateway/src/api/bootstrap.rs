@@ -21,10 +21,8 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
-use havn_core::AgentId;
 use serde::{Deserialize, Serialize};
 use std::path::Path as StdPath;
-use std::str::FromStr as _;
 use tokio::fs;
 use tracing::info;
 
@@ -69,8 +67,8 @@ pub async fn get(
     user: AuthedUser,
     Path(id): Path<String>,
 ) -> Result<Json<BootstrapView>, ApiError> {
-    let id = AgentId::from_str(&id).map_err(|_| ApiError::BadRequest("invalid agent id".into()))?;
-    let _ = crate::api::agents::ensure_owner(&state, &user, id).await?;
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let id = agent.id;
     let workspace = crate::api::agents::workspace_for(&state, id);
     Ok(Json(BootstrapView {
         system: read_optional(&workspace, SYSTEM_MD).await?,
@@ -85,8 +83,8 @@ pub async fn put(
     Path(id): Path<String>,
     Json(req): Json<BootstrapPatch>,
 ) -> Result<Json<BootstrapView>, ApiError> {
-    let id = AgentId::from_str(&id).map_err(|_| ApiError::BadRequest("invalid agent id".into()))?;
-    let _ = crate::api::agents::ensure_owner(&state, &user, id).await?;
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let id = agent.id;
     let workspace = crate::api::agents::workspace_for(&state, id);
     if !workspace.exists() {
         // The spawner creates the workspace at agent CREATE time,

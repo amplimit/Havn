@@ -15,10 +15,8 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use chrono::{DateTime, Utc};
-use havn_core::AgentId;
 use havn_db::agent::conversations::{self, Role};
 use serde::{Deserialize, Serialize};
-use std::str::FromStr as _;
 use uuid::Uuid;
 
 use crate::AppState;
@@ -60,15 +58,8 @@ pub async fn list(
     Path(id): Path<String>,
     Query(q): Query<ConversationQuery>,
 ) -> Result<Json<ConversationResponse>, ApiError> {
-    let agent_id =
-        AgentId::from_str(&id).map_err(|_| ApiError::BadRequest("invalid agent id".into()))?;
-
-    let agent = havn_db::repo::agents::find_by_id(&state.db, agent_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    if agent.owner_id != user.id {
-        return Err(ApiError::NotFound);
-    }
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let agent_id = agent.id;
 
     // Same derivation webchat_ws::handle_session uses — UUIDv5 over
     // (sender_id, agent_id). If these two ever drift the dashboard
