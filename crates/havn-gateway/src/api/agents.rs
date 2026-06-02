@@ -95,7 +95,7 @@ pub async fn get(
     user: AuthedUser,
     Path(id): Path<String>,
 ) -> Result<Json<AgentView>, ApiError> {
-    let id = parse_id(&id)?;
+    let id = resolve_id(&id, &user, &state).await?;
     let agent = ensure_owner(&state, &user, id).await?;
     let connected = state.registry.is_connected(id).await;
     Ok(Json(AgentView::from_agent(agent, connected)))
@@ -171,7 +171,7 @@ pub async fn patch(
     Path(id): Path<String>,
     Json(req): Json<PatchAgentRequest>,
 ) -> Result<Json<AgentView>, ApiError> {
-    let id = parse_id(&id)?;
+    let id = resolve_id(&id, &user, &state).await?;
     let agent = ensure_owner(&state, &user, id).await?;
 
     if let Some(n) = &req.name {
@@ -222,7 +222,7 @@ pub async fn start(
     user: AuthedUser,
     Path(id): Path<String>,
 ) -> Result<Json<AgentView>, ApiError> {
-    let id = parse_id(&id)?;
+    let id = resolve_id(&id, &user, &state).await?;
     let _ = ensure_owner(&state, &user, id).await?;
 
     // Idempotent — explicit POST /start is now mostly redundant since
@@ -353,7 +353,7 @@ pub async fn stop(
     user: AuthedUser,
     Path(id): Path<String>,
 ) -> Result<Json<AgentView>, ApiError> {
-    let id = parse_id(&id)?;
+    let id = resolve_id(&id, &user, &state).await?;
     let _ = ensure_owner(&state, &user, id).await?;
 
     // Best-effort graceful shutdown via socket; ignore if not connected.
@@ -392,7 +392,7 @@ pub async fn delete(
     user: AuthedUser,
     Path(id): Path<String>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    let id = parse_id(&id)?;
+    let id = resolve_id(&id, &user, &state).await?;
     let _ = ensure_owner(&state, &user, id).await?;
 
     // Stop first if running.
@@ -430,8 +430,17 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn parse_id(s: &str) -> Result<AgentId, ApiError> {
-    AgentId::from_str(s).map_err(|_| ApiError::BadRequest("invalid agent id".into()))
+/// Resolve a path parameter that is either a UUID or an agent name.
+/// UUID is tried first; on parse failure, falls back to a name lookup
+/// scoped to the authenticated user (agent names are UNIQUE per owner).
+async fn resolve_id(s: &str, user: &AuthedUser, state: &AppState) -> Result<AgentId, ApiError> {
+    if let Ok(id) = AgentId::from_str(s) {
+        return Ok(id);
+    }
+    let agent = repo::find_by_owner_and_name(&state.db, user.id, s)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok(agent.id)
 }
 
 pub(crate) async fn ensure_owner(
@@ -443,7 +452,6 @@ pub(crate) async fn ensure_owner(
         .await?
         .ok_or(ApiError::NotFound)?;
     if agent.owner_id != user.id {
-        // Don't leak existence to non-owners.
         return Err(ApiError::NotFound);
     }
     Ok(agent)

@@ -99,6 +99,23 @@ pub async fn find_by_id(pool: &SqlitePool, id: AgentId) -> Result<Option<Agent>>
     row.map(Agent::try_from).transpose()
 }
 
+pub async fn find_by_owner_and_name(
+    pool: &SqlitePool,
+    owner_id: UserId,
+    name: &str,
+) -> Result<Option<Agent>> {
+    let row: Option<AgentRow> = sqlx::query_as::<_, AgentRow>(
+        "SELECT id, owner_id, team_id, name, status, host, pid, config, created_at, updated_at \
+         FROM agents WHERE owner_id = ?1 AND name = ?2",
+    )
+    .bind(owner_id.to_string())
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(Agent::try_from).transpose()
+}
+
 /// Number of agents owned by `owner_id`. Used by the policy gate that
 /// enforces `Policy::max_agents` (spec §6.3) without paying the cost of
 /// loading every row.
