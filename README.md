@@ -143,11 +143,21 @@ allowed_proxies = ["127.0.0.1/32"]
 
 ## Channel Adapters
 
-havn ships a stable HTTP + WebSocket protocol at `/api/v1/channel` for external adapter daemons. Adapters run outside havn's trust zone and translate between chat platforms and havn's wire format.
+Havn ships a stable HTTP + WebSocket protocol at `/api/v1/channel` for external adapter daemons. Adapters run outside havn's trust zone and translate between chat platforms and havn's wire format.
+
+| Adapter | Repository | Status |
+|---------|-----------|--------|
+| Telegram | [havn-channel-telegram](https://github.com/amplimit/havn-channel-telegram) | Available |
+| Slack | — | Planned |
+| Discord | — | Planned |
 
 ## Capability Packs
 
-Some agent workloads need capabilities havn doesn't build into core (browser, code interpreter, vendor CLI). havn provides generic primitives — bind mounts, tmpfs mounts, seccomp allowances — and external capability packs wire them together. Packs live in separate repositories and install under `/opt/havn/<pack>/`.
+Some agent workloads need capabilities havn doesn't build into core (browser, code interpreter, vendor CLI). Havn provides generic primitives — bind mounts, tmpfs mounts, seccomp allowances — and external capability packs wire them together. Packs live in separate repositories and install under `/opt/havn/<pack>/`.
+
+| Pack | Repository | Description |
+|------|-----------|-------------|
+| Browser | [havn-pack-browser](https://github.com/amplimit/havn-pack-browser) | Playwright CLI + Chromium for web browsing |
 
 ## License
 
