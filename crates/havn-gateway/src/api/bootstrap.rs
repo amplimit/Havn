@@ -6,7 +6,7 @@
 //!
 //! | File          | What it holds                                    | When edits take effect             |
 //! | ------------- | ------------------------------------------------ | ---------------------------------- |
-//! | `SYSTEM.md`   | Persona + identity (tone, values, name, purpose) | Next agent restart (frozen prompt) |
+//! | `SOUL.md`     | Persona + identity (tone, values, name, purpose) | Next agent restart (frozen prompt) |
 //! | `USER.md`     | Durable facts about the user the agent should always have in scope | Next agent restart (frozen prompt) |
 //! | `HEARTBEAT.md`| Plain-language instructions for the periodic self-tick (§9.6) | Next heartbeat tick (re-read fresh — the deliberate exception to the frozen-prompt invariant) |
 //!
@@ -31,9 +31,11 @@ use crate::api::ApiError;
 use crate::audit;
 use crate::auth::AuthedUser;
 
-const SYSTEM_MD: &str = "SYSTEM.md";
+const SOUL_MD: &str = "SOUL.md";
 const USER_MD: &str = "USER.md";
 const HEARTBEAT_MD: &str = "HEARTBEAT.md";
+/// v0.6 filename — read as fallback when SOUL.md is absent.
+const LEGACY_SYSTEM_MD: &str = "SYSTEM.md";
 
 /// Hard cap matching the runtime side's per-skill body cap (§9.3) —
 /// bootstrap files don't need to be bigger; system prompts that
@@ -47,6 +49,9 @@ pub struct BootstrapView {
     /// trim — the runtime treats both the same (skips the section in
     /// the assembled prompt). The dashboard renders an empty
     /// textarea for both cases.
+    ///
+    /// Backed by `SOUL.md` on disk (v0.7); API field stays `system`
+    /// for backward compat with existing dashboard code.
     pub system: Option<String>,
     pub user: Option<String>,
     pub heartbeat: Option<String>,
@@ -71,7 +76,7 @@ pub async fn get(
     let id = agent.id;
     let workspace = crate::api::agents::workspace_for(&state, id);
     Ok(Json(BootstrapView {
-        system: read_optional(&workspace, SYSTEM_MD).await?,
+        system: read_soul_with_fallback(&workspace).await?,
         user: read_optional(&workspace, USER_MD).await?,
         heartbeat: read_optional(&workspace, HEARTBEAT_MD).await?,
     }))
@@ -97,8 +102,8 @@ pub async fn put(
     }
     let mut touched: Vec<&'static str> = Vec::new();
     if let Some(s) = &req.system {
-        write_or_clear(&workspace, SYSTEM_MD, s).await?;
-        touched.push(SYSTEM_MD);
+        write_or_clear(&workspace, SOUL_MD, s).await?;
+        touched.push(SOUL_MD);
     }
     if let Some(s) = &req.user {
         write_or_clear(&workspace, USER_MD, s).await?;
@@ -122,10 +127,20 @@ pub async fn put(
     // `Some("")` PATCHes round-trip to `None` (file removed), which
     // matches the runtime's "empty = no section" semantics.
     Ok(Json(BootstrapView {
-        system: read_optional(&workspace, SYSTEM_MD).await?,
+        system: read_soul_with_fallback(&workspace).await?,
         user: read_optional(&workspace, USER_MD).await?,
         heartbeat: read_optional(&workspace, HEARTBEAT_MD).await?,
     }))
+}
+
+/// Read the persona file: try SOUL.md first, fall back to SYSTEM.md for
+/// v0.6 backward compat.
+async fn read_soul_with_fallback(workspace: &StdPath) -> Result<Option<String>, ApiError> {
+    let soul = read_optional(workspace, SOUL_MD).await?;
+    if soul.is_some() {
+        return Ok(soul);
+    }
+    read_optional(workspace, LEGACY_SYSTEM_MD).await
 }
 
 async fn read_optional(workspace: &StdPath, name: &str) -> Result<Option<String>, ApiError> {

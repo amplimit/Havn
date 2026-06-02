@@ -206,20 +206,14 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("opening agent.db at {}", agent_db_path.display()))?;
     info!(db = %agent_db_path.display(), "agent db ready");
 
-    // 2. Load bootstrap files into the frozen system prompt for this session.
+    // 2. Load bootstrap files — system prompt assembly is deferred to
+    //    step 4c (after the tool registry is built) so the platform-
+    //    context preamble can list the actual tool names.
     let bootstrap = BootstrapFiles::load(&args.workspace)
         .await
         .context("loading bootstrap files")?;
-    let system_prompt = Arc::new(bootstrap.system_prompt());
-    let cron_prompt = Arc::new(bootstrap.cron_system_prompt());
     let heartbeat_fallback = Arc::new(bootstrap.heartbeat.clone());
     let workspace_dir = Arc::new(args.workspace.clone());
-    let prompt_size = system_prompt.as_text().map_or(0, str::len);
-    info!(
-        prompt_chars = prompt_size,
-        has_heartbeat = heartbeat_fallback.is_some(),
-        "system prompt frozen"
-    );
 
     // 2b. Index workspace skills (spec §9.3). v0.6 ships zero bundled
     //     skills — earlier drafts had a compiled-in `include_dir!` set
@@ -266,8 +260,17 @@ async fn main() -> anyhow::Result<()> {
     .context("sending Hello")?;
 
     #[allow(clippy::type_complexity)]
-    let (policy, model, embedder, extra_mounts, tmpfs_mounts, seccomp_allow_extra): (
+    let (
+        policy,
+        agent_name,
+        model,
+        embedder,
+        extra_mounts,
+        tmpfs_mounts,
+        seccomp_allow_extra,
+    ): (
         Arc<Policy>,
+        Option<String>,
         Option<String>,
         embedding::EmbedderHandle,
         Vec<(std::path::PathBuf, bool)>,
@@ -280,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
         Some(GatewayToAgent::Welcome {
             session_token,
             policy,
+            agent_name: welcome_agent_name,
             model,
             embedding: emb_value,
             extra_mounts: extra_mounts_wire,
@@ -342,6 +346,7 @@ async fn main() -> anyhow::Result<()> {
                 .collect();
             info!(
                 token = %session_token,
+                agent_name = ?welcome_agent_name,
                 can_use_shell = policy.permissions.can_use_shell,
                 can_access_network = policy.permissions.can_access_network,
                 model = ?model,
@@ -353,6 +358,7 @@ async fn main() -> anyhow::Result<()> {
             );
             (
                 Arc::new(policy),
+                welcome_agent_name,
                 model,
                 embedder,
                 extra_mount_pairs,
@@ -463,6 +469,33 @@ async fn main() -> anyhow::Result<()> {
         policy: Arc::clone(&policy),
         embedder: embedder.clone(),
     };
+
+    // 4c. Now that the base registry is built, assemble the frozen system
+    //     prompt with the platform-context preamble listing the actual
+    //     tool names the LLM will see. Tool names come from the base
+    //     registry (subagent_spawn / agent_query are added later but are
+    //     policy-gated — their addition doesn't change the visible set
+    //     enough to justify a deferred second pass).
+    let tool_names: Vec<String> = base_registry
+        .schemas()
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.get("name")?.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let display_name = agent_name.as_deref().unwrap_or(&args.agent_id);
+    let plat_ctx = system_prompt::platform_context(display_name, &args.agent_id, &tool_names);
+    let system_prompt = Arc::new(bootstrap.system_prompt(Some(&plat_ctx)));
+    let cron_prompt = Arc::new(bootstrap.cron_system_prompt(Some(&plat_ctx)));
+    let prompt_size = system_prompt.as_text().map_or(0, str::len);
+    info!(
+        prompt_chars = prompt_size,
+        has_heartbeat = heartbeat_fallback.is_some(),
+        tool_count = tool_names.len(),
+        "system prompt frozen with platform context"
+    );
 
     // 5. Writer task + shared LLM-response routing map.
     let (writer_tx, mut writer_rx) = mpsc::channel::<AgentToGateway>(OUTBOUND_QUEUE_CAPACITY);

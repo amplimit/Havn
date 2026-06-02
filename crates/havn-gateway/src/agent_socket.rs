@@ -144,7 +144,7 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
     //    unavailable, ship `Policy::default()` rather than refuse the
     //    connection. Refusing here would just orphan the runtime; the
     //    spawner would retry into the same dead end.
-    let (policy, model): (Policy, Option<String>) =
+    let (policy, model, agent_name): (Policy, Option<String>, Option<String>) =
         match agents_repo::find_by_id(&ctx.db, agent_id).await {
             Ok(Some(agent)) => {
                 let model = agent
@@ -152,19 +152,24 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
                     .get("model")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string);
+                let name = Some(agent.name.clone());
                 // for_session walks per-agent override → user/team
                 // merged → default. Same chain used at spawn time so
                 // cgroup limits and tool registry stay consistent
                 // (spec §6.3).
-                (policy_resolver::for_session(&ctx.db, &agent).await, model)
+                (
+                    policy_resolver::for_session(&ctx.db, &agent).await,
+                    model,
+                    name,
+                )
             }
             Ok(None) => {
                 warn!(%agent_id, "agent not found at handshake; sending default policy");
-                (Policy::default(), None)
+                (Policy::default(), None, None)
             }
             Err(e) => {
                 warn!(%agent_id, error = %e, "policy lookup failed; sending default policy");
-                (Policy::default(), None)
+                (Policy::default(), None, None)
             }
         };
 
@@ -174,6 +179,7 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
         &GatewayToAgent::Welcome {
             session_token: session_token.clone(),
             policy,
+            agent_name,
             model,
             embedding: ctx.embedding_config.load().as_ref().clone(),
             // Wire form is `{path: String, mode: "ro"|"rw"}`; we
