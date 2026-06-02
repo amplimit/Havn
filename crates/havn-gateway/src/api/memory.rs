@@ -99,7 +99,7 @@ pub async fn list(
         .join("agent.db");
     if !tokio::fs::try_exists(&agent_db_path).await.unwrap_or(false) {
         return Ok(Json(ListResponse {
-            agent_id: id,
+            agent_id: agent_id.to_string(),
             entries: Vec::new(),
             uninitialised: true,
         }));
@@ -138,7 +138,7 @@ pub async fn list(
 
     let views = entries.into_iter().map(MemoryEntryView::from).collect();
     Ok(Json(ListResponse {
-        agent_id: id,
+        agent_id: agent_id.to_string(),
         entries: views,
         uninitialised: false,
     }))

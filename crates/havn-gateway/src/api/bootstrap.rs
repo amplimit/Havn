@@ -14,7 +14,7 @@
 //! way to edit them was ssh + vim; this module exposes a small
 //! HTTP surface so the dashboard can offer a textarea per file.
 //!
-//! Auth is owner-only via `agents::ensure_owner` (same as the
+//! Auth is owner-only via `agents::resolve_agent` (same as the
 //! settings PATCH path). Writes log an audit entry. Empty / missing
 //! files return `null` so the dashboard can render a placeholder
 //! rather than a misleading empty-string.

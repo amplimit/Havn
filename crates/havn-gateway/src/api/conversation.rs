@@ -78,7 +78,7 @@ pub async fn list(
         .join("agent.db");
     if !tokio::fs::try_exists(&agent_db_path).await.unwrap_or(false) {
         return Ok(Json(ConversationResponse {
-            agent_id: id,
+            agent_id: agent_id.to_string(),
             channel_id,
             turns: Vec::new(),
             uninitialised: true,
@@ -108,7 +108,7 @@ pub async fn list(
         })
         .collect();
     Ok(Json(ConversationResponse {
-        agent_id: id,
+        agent_id: agent_id.to_string(),
         channel_id,
         turns: views,
         uninitialised: false,

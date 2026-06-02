@@ -74,7 +74,7 @@ pub async fn list(
         .join("agent.db");
     if !tokio::fs::try_exists(&agent_db_path).await.unwrap_or(false) {
         return Ok(Json(ListResponse {
-            agent_id: id,
+            agent_id: agent_id.to_string(),
             active: Vec::new(),
             archived: Vec::new(),
             uninitialised: true,
@@ -90,7 +90,7 @@ pub async fn list(
     let active = skills_index::list_all_active(&pool, DEFAULT_LIMIT).await?;
     let archived = skills_index::list_archived(&pool, DEFAULT_LIMIT).await?;
     Ok(Json(ListResponse {
-        agent_id: id,
+        agent_id: agent_id.to_string(),
         active: active.into_iter().map(SkillView::from).collect(),
         archived: archived.into_iter().map(SkillView::from).collect(),
         uninitialised: false,
@@ -128,7 +128,7 @@ pub async fn curator_reports(
         .join(".curator");
     if !tokio::fs::try_exists(&dir).await.unwrap_or(false) {
         return Ok(Json(CuratorReportsResponse {
-            agent_id: id,
+            agent_id: agent_id.to_string(),
             reports: Vec::new(),
             uninitialised: true,
         }));
@@ -138,7 +138,7 @@ pub async fn curator_reports(
         Ok(e) => e,
         Err(_) => {
             return Ok(Json(CuratorReportsResponse {
-                agent_id: id,
+                agent_id: agent_id.to_string(),
                 reports,
                 uninitialised: false,
             }));
@@ -172,7 +172,7 @@ pub async fn curator_reports(
     // Newest first.
     reports.sort_by(|a, b| b.name.cmp(&a.name));
     Ok(Json(CuratorReportsResponse {
-        agent_id: id,
+        agent_id: agent_id.to_string(),
         reports,
         uninitialised: false,
     }))

@@ -12,7 +12,7 @@
 //! Writes never touch unrelated policy keys (allowed_models,
 //! resource_limits, …) — we read agent.config, splice in only the
 //! `policy.permissions.can_use_mcp` and `policy.mcp_servers` fields,
-//! and write back. Owner-only auth via `agents::ensure_owner`.
+//! and write back. Owner-only auth via `agents::resolve_agent`.
 //!
 //! `available_binaries` lists names under `/usr/share/havn/mcp-servers/`
 //! at GET time so the dashboard can present a dropdown of binaries
