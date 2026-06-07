@@ -50,7 +50,7 @@ havn is a self-hosted server that runs a gateway and per-user agents. Identity, 
 ### Install (prebuilt — no toolchain, no compile)
 
 ```bash
-curl -fsSL https://havn.dev/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/amplimit/havn/main/install.sh | bash
 ```
 
 This fetches a statically-linked `havn` binary from [Releases](https://github.com/amplimit/havn/releases) (verified by SHA-256), creates the `havn-wakecheck` sandbox user, and runs `havn setup`. Pin a version with `HAVN_VERSION=v0.1.0`, or force a source build with `HAVN_FROM_SOURCE=1`.

@@ -12,7 +12,7 @@
 #                 test), or when prebuilt is unavailable for the platform.
 #
 # Usage:
-#   curl -fsSL https://havn.dev/install.sh | bash      # prebuilt fast path
+#   curl -fsSL https://raw.githubusercontent.com/amplimit/havn/main/install.sh | bash   # prebuilt fast path
 #   ./install.sh                                        # in a clone → builds source
 #   HAVN_VERSION=v0.1.0 ./install.sh                    # pin a specific release
 #   HAVN_FROM_SOURCE=1  ./install.sh                    # force a source build
