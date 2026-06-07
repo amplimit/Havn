@@ -44,24 +44,36 @@ havn is a self-hosted server that runs a gateway and per-user agents. Identity, 
 **Requirements:**
 
 - **OS** — Linux only. Ubuntu 24.04 LTS recommended. Agent isolation relies on kernel features (user namespaces, Landlock ≥ 5.13, seccomp, cgroup v2) without macOS/Windows equivalents.
-- **Rust** — 1.94+ (pinned via `rust-toolchain.toml`)
-- **Node.js** — 22+ (for dashboard only)
+- **Rust** — 1.94+ — only for building from source. The installer downloads a prebuilt static binary by default, so no toolchain is needed.
+- **Node.js** — 22+ (for the dashboard only)
+
+### Install (prebuilt — no toolchain, no compile)
 
 ```bash
-# Build
-cargo build --release
+curl -fsSL https://havn.dev/install.sh | bash
+```
 
-# Initial setup — creates config + data directories
-./target/release/havn setup
+This fetches a statically-linked `havn` binary from [Releases](https://github.com/amplimit/havn/releases) (verified by SHA-256), creates the `havn-wakecheck` sandbox user, and runs `havn setup`. Pin a version with `HAVN_VERSION=v0.1.0`, or force a source build with `HAVN_FROM_SOURCE=1`.
 
+Then configure and start:
+
+```bash
 # Set the encryption key for credentials (any passphrase you choose)
 export HAVN_AGE_KEY="your-secret-passphrase"
 
 # Add your LLM credential (encrypted at rest)
-./target/release/havn credential add anthropic sk-ant-...
+havn credential add anthropic sk-ant-...
 
 # Start the gateway (same HAVN_AGE_KEY must be set)
-./target/release/havn start
+havn start
+```
+
+### Build from source
+
+```bash
+cargo build --release
+./target/release/havn setup
+# …then the same credential / start steps as above.
 ```
 
 Then open the dashboard at `http://localhost:3000`, create an agent, and start chatting.
