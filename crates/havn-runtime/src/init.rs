@@ -52,9 +52,11 @@ use tokio::signal::unix::SignalKind;
 use tracing::{debug, warn};
 
 /// Set by the `SIGTERM` handler so the main loop can observe a shutdown
-/// request and exit cleanly. `pub(crate)` so the LLM loop can poll it
-/// (Phase 2 work — for now the cgroup.kill backstop catches anyone who
-/// ignores it).
+/// request and exit cleanly. `run_reader_loop` (main.rs) polls it via a
+/// pinned interval future and breaks out of the frame loop when it flips,
+/// letting the runtime exit before the spawner's `cgroup.kill` deadline.
+/// The `cgroup.kill` backstop still catches anything stuck mid-flight past
+/// the grace window (e.g. a long in-progress LLM call).
 pub(crate) static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// True iff this process is PID 1 in its (possibly host) PID namespace.
