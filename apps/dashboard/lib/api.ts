@@ -312,14 +312,15 @@ export const api = {
   },
 
   bootstrap: {
-    /** Read SYSTEM.md / USER.md / HEARTBEAT.md from the agent's
+    /** Read SOUL.md / USER.md / HEARTBEAT.md from the agent's
      * workspace (spec §5.3, §9.4 layer 2). Each field is `null` when
-     * the file doesn't exist or is empty. */
+     * the file doesn't exist or is empty. (The `system` field name is
+     * kept for backward compat; it maps to SOUL.md on disk.) */
     get: (agentId: string) =>
       request<BootstrapView>(`/agents/${agentId}/bootstrap`),
     /** Write any non-null field. Empty string is treated as "delete
      * the file" — same semantics as the runtime ("absent or empty =
-     * skip this section"). SYSTEM.md and USER.md changes take effect
+     * skip this section"). SOUL.md and USER.md changes take effect
      * on the agent's next start (frozen-prompt invariant);
      * HEARTBEAT.md is re-read on every tick. */
     put: (agentId: string, patch: Partial<BootstrapView>) =>

@@ -28,8 +28,8 @@ export default function NewAgentPage() {
     <div className="mx-auto max-w-xl px-8 py-12">
       <h1 className="display-h2 mb-2">new agent</h1>
       <p style={{ color: "var(--color-body)" }} className="mb-8">
-        Pick a name and model. The agent gets its own workspace, four bootstrap
-        files (SOUL / USER / HEARTBEAT / IDENTITY), and a WebChat channel
+        Pick a name and model. The agent gets its own workspace, three bootstrap
+        files (SOUL / USER / HEARTBEAT), and a WebChat channel
         binding automatically.
       </p>
 
