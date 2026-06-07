@@ -32,9 +32,7 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            cc: musl-gcc
-          # aarch64-unknown-linux-musl needs a cross C toolchain for the
-          # bundled sqlite / ring builds — add once cross-compilation is wired.
+          - target: aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
 
@@ -52,25 +50,28 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      - name: install musl toolchain
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends musl-tools
+      - name: install zig + cargo-zigbuild
+        # zig provides the cross C compiler/linker for the bundled C deps
+        # (sqlite, aws-lc) across both musl targets — one mechanism, no
+        # per-arch system toolchain, and it cross-compiles aarch64 from the
+        # x86_64 runner.
+        run: |
+          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
+            | sudo tar -xJ -C /opt
+          echo "/opt/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+          cargo install --locked cargo-zigbuild
 
       - name: build static binaries
-        env:
-          CC_x86_64_unknown_linux_musl: ${{ matrix.cc }}
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.cc }}
-        run: cargo build --release --target ${{ matrix.target }} --bins
+        run: cargo zigbuild --release --target ${{ matrix.target }} --bins
 
       - name: verify the binary is fully static
         run: |
           bin="target/${{ matrix.target }}/release/havn-gateway"
           file "$bin"
-          # ldd prints "statically linked" (or errors "not a dynamic
-          # executable") for a static binary; a dynamic one lists .so deps.
-          if ldd "$bin" 2>&1 | grep -qE '=>|\.so'; then
-            echo "::error::$bin is dynamically linked — expected a static musl build"
-            ldd "$bin"; exit 1
-          fi
+          # `file` reads the ELF header, so it works for a cross-arch binary
+          # where `ldd` can't run. A static build reports "statically linked".
+          file "$bin" | grep -q "statically linked" \
+            || { echo "::error::$bin is not statically linked"; exit 1; }
           echo "ok: static"
 
       - name: package

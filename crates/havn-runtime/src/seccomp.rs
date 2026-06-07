@@ -170,6 +170,17 @@ fn match_any_rule() -> Result<SeccompRule, SeccompError> {
     SeccompRule::new(vec![cond]).map_err(|e| SeccompError::Build(format!("rule: {e:?}")))
 }
 
+/// `libc` exposes `SYS_kexec_file_load` for x86_64 but omits it for the
+/// aarch64 *musl* target — a gap in the crate's musl syscall tables, even
+/// though the kernel implements the call (generic uapi `__NR_kexec_file_load`
+/// = 294). Supply the number directly on aarch64 so the block still applies;
+/// dropping it would silently weaken the boundary on exactly the arch we
+/// build statically for.
+#[cfg(target_arch = "aarch64")]
+const SYS_KEXEC_FILE_LOAD: i64 = 294;
+#[cfg(not(target_arch = "aarch64"))]
+const SYS_KEXEC_FILE_LOAD: i64 = libc::SYS_kexec_file_load;
+
 /// Syscalls that hard-kill the agent process if invoked. Listed by
 /// architecture-portable `libc::SYS_*` constants where the kernel name
 /// matches across `x86_64` + `aarch64`. Any syscall not in this list runs
@@ -187,7 +198,7 @@ const DANGEROUS_SYSCALLS: &[i64] = &[
     // ── kernel reboot / replacement ─────────────────────────────────
     libc::SYS_reboot,
     libc::SYS_kexec_load,
-    libc::SYS_kexec_file_load,
+    SYS_KEXEC_FILE_LOAD,
     // ── process inspection / injection ──────────────────────────────
     libc::SYS_ptrace,
     libc::SYS_process_vm_readv,
