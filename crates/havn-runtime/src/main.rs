@@ -79,6 +79,13 @@ struct Args {
 }
 
 const OUTBOUND_QUEUE_CAPACITY: usize = 64;
+/// Best-effort window to flush already-queued outbound frames during
+/// shutdown before the runtime returns. Long-lived senders (the curator
+/// scheduler, the subagent bridge, agent_query) keep the writer channel
+/// open for the whole process, so the writer task never closes on its own —
+/// this is a bounded flush, kept well under the spawner's 5s SIGTERM→SIGKILL
+/// grace (`STOP_GRACE`).
+const SHUTDOWN_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Number of recent turns retrieved per channel for context build.
 const HISTORY_WINDOW: u32 = 40;
 /// Hard cap on the number of LLM ↔ tool round trips per inbound message.
@@ -632,7 +639,20 @@ async fn main() -> anyhow::Result<()> {
     let dispatch = run_reader_loop(&mut reader, ctx).await;
 
     drop(writer_tx);
-    let _ = writer_task.await;
+    // The writer task drains until every `writer_tx` clone drops — but
+    // long-lived tasks (curator scheduler, subagent bridge, agent_query)
+    // hold clones for the whole process lifetime, so it never closes on its
+    // own. Treat this purely as a best-effort flush window for already-queued
+    // outbound frames, then return regardless: on SIGTERM the runtime must
+    // exit well within the spawner's grace period rather than block here.
+    // Returning drops the tokio runtime, which aborts the still-running
+    // writer and background tasks.
+    if tokio::time::timeout(SHUTDOWN_DRAIN_GRACE, writer_task)
+        .await
+        .is_err()
+    {
+        warn!("outbound drain window elapsed on shutdown; exiting");
+    }
     info!("agent runtime exiting");
     dispatch
 }
