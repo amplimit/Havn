@@ -641,10 +641,36 @@ async fn run_reader_loop<R>(reader: &mut R, ctx: Ctx) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    while let Some(frame) = read_frame::<_, GatewayToAgent>(reader)
-        .await
-        .context("read frame")?
-    {
+    // A future that resolves only once a termination signal has set
+    // `init::SHUTDOWN_REQUESTED` (the PID-1 handler stores it on
+    // SIGTERM/SIGINT/SIGHUP). Pinned outside the loop so its interval state
+    // persists across iterations — in steady state it stays pending and
+    // `read_frame` is never cancelled, so the frame read stays cancel-safe.
+    // It is only cancelled when shutdown fires, where we break and exit, so
+    // a half-read frame doesn't matter.
+    let shutdown = async {
+        let mut poll = tokio::time::interval(std::time::Duration::from_millis(250));
+        poll.tick().await; // first tick is immediate — skip it
+        loop {
+            poll.tick().await;
+            if init::SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+        }
+    };
+    tokio::pin!(shutdown);
+
+    loop {
+        let frame = tokio::select! {
+            res = read_frame::<_, GatewayToAgent>(reader) => match res.context("read frame")? {
+                Some(f) => f,
+                None => break,
+            },
+            () = &mut shutdown => {
+                info!("termination signal received — exiting agent runtime cleanly");
+                break;
+            }
+        };
         match frame {
             GatewayToAgent::Welcome { .. } => {
                 warn!("unexpected duplicate Welcome");
