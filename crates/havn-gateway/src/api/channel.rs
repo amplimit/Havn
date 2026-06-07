@@ -508,11 +508,14 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
     // This `ensure_running` is awaited inline in the per-account WS read loop,
     // so a cold spawn blocks this one connection (including its ping/pong) for
     // up to ensure_running's handshake timeout. That head-of-line blocking is
-    // intentional: it bounds the stall to a single (channel, account) — never
-    // other accounts — and the inline await is what preserves inbound ordering
-    // across a cold-start burst (message N+1 isn't read until N is forwarded).
-    // Do NOT move this to a detached task without restoring an ordering
-    // guarantee. The hot path (already connected) skips it via is_connected.
+    // intentional: the stall is bounded to that timeout and confined to
+    // accounts bound to this same agent (a concurrent inbound for the same
+    // agent waits on ensure_running's per-agent start lock) — unrelated agents
+    // and their accounts are unaffected. The inline await also preserves
+    // inbound ordering across a cold-start burst (message N+1 isn't read until
+    // N is forwarded). Do NOT move this to a detached task without restoring an
+    // ordering guarantee. The hot path (already connected) skips it via
+    // is_connected.
     if !state.registry.is_connected(agent_id).await {
         match agent_repo::find_by_id(&state.db, agent_id).await {
             Ok(Some(agent_row)) => {
