@@ -23,6 +23,7 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use futures_util::{SinkExt as _, StreamExt as _};
 use havn_core::{InboundMessage, MessageContent};
+use havn_db::repo::agents as agent_repo;
 use havn_db::repo::credentials::{self as creds, CredentialScope};
 use havn_proto::GatewayToAgent;
 use havn_proto::channel::{ChannelFrame, ChannelInbound, ChannelMessageContent};
@@ -497,6 +498,61 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
         timestamp: inb.timestamp,
         raw: inb.raw.unwrap_or(serde_json::Value::Null),
     };
+
+    // Parity with WebChat: a message to a stopped agent should wake it, not
+    // vanish. WebChat lazy-spawns on its WS upgrade (api::webchat_ws); channel
+    // inbound had no equivalent, so a message to an offline bound agent used to
+    // be dropped with only a warn. The binding is the authorization here;
+    // attribute the lazy start to the agent's owner for the audit log.
+    //
+    // This `ensure_running` is awaited inline in the per-account WS read loop,
+    // so a cold spawn blocks this one connection (including its ping/pong) for
+    // up to ensure_running's handshake timeout. That head-of-line blocking is
+    // intentional: the stall is bounded to that timeout and confined to
+    // accounts bound to this same agent (a concurrent inbound for the same
+    // agent waits on ensure_running's per-agent start lock) — unrelated agents
+    // and their accounts are unaffected. The inline await also preserves
+    // inbound ordering across a cold-start burst (message N+1 isn't read until
+    // N is forwarded). Do NOT move this to a detached task without restoring an
+    // ordering guarantee. The hot path (already connected) skips it via
+    // is_connected.
+    if !state.registry.is_connected(agent_id).await {
+        match agent_repo::find_by_id(&state.db, agent_id).await {
+            Ok(Some(agent_row)) => {
+                if let Err(e) =
+                    crate::api::agents::ensure_running(state, agent_row.owner_id, agent_id).await
+                {
+                    warn!(
+                        channel,
+                        account = %inb.account_id,
+                        %agent_id,
+                        error = ?e,
+                        "channel inbound: failed to lazy-spawn bound agent; dropping"
+                    );
+                    return;
+                }
+            }
+            Ok(None) => {
+                warn!(
+                    channel,
+                    account = %inb.account_id,
+                    %agent_id,
+                    "channel inbound: binding points to a non-existent agent; dropping"
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    channel,
+                    account = %inb.account_id,
+                    %agent_id,
+                    error = %e,
+                    "channel inbound: db error resolving bound agent; dropping"
+                );
+                return;
+            }
+        }
+    }
 
     if let Err(e) = state
         .registry
