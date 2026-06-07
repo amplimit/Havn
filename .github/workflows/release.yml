@@ -38,9 +38,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: install pinned toolchain + musl target
+        # rust-toolchain.toml pins the channel (1.94.0). `rustup target add`
+        # runs against that pinned toolchain — not `stable` — so the musl std
+        # lands where the build actually uses it. (Adding the target to
+        # `stable` instead is why an earlier run failed with E0463 "can't find
+        # crate for core".)
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
