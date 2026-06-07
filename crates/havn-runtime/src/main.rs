@@ -49,7 +49,7 @@ use havn_proto::{
 use sqlx::SqlitePool;
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
-use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore, mpsc};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -79,12 +79,11 @@ struct Args {
 }
 
 const OUTBOUND_QUEUE_CAPACITY: usize = 64;
-/// Best-effort window to flush already-queued outbound frames during
-/// shutdown before the runtime returns. Long-lived senders (the curator
-/// scheduler, the subagent bridge, agent_query) keep the writer channel
-/// open for the whole process, so the writer task never closes on its own —
-/// this is a bounded flush, kept well under the spawner's 5s SIGTERM→SIGKILL
-/// grace (`STOP_GRACE`).
+/// Backstop bound on the shutdown writer flush. When the reader loop ends the
+/// writer is signalled to drain its queue and exit, so it normally finishes in
+/// well under this; the timeout only fires if a socket write is genuinely
+/// wedged. Kept comfortably under the spawner's 5s SIGTERM→SIGKILL grace
+/// (`STOP_GRACE`).
 const SHUTDOWN_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Number of recent turns retrieved per channel for context build.
 const HISTORY_WINDOW: u32 = 40;
@@ -506,14 +505,41 @@ async fn main() -> anyhow::Result<()> {
 
     // 5. Writer task + shared LLM-response routing map.
     let (writer_tx, mut writer_rx) = mpsc::channel::<AgentToGateway>(OUTBOUND_QUEUE_CAPACITY);
-    let writer_task = tokio::spawn(async move {
-        while let Some(frame) = writer_rx.recv().await {
-            if let Err(e) = write_frame(&mut write, &frame).await {
-                error!(error = %e, "agent writer failed");
-                break;
+    // Signalled once the reader loop ends (for ANY reason: SIGTERM, gateway
+    // Shutdown frame, or EOF) so the writer flushes its queue and stops. The
+    // channel never closes on its own — long-lived tasks (curator, subagent
+    // bridge, agent_query) hold senders for the whole process — so without
+    // this the writer would block on recv through shutdown until the backstop
+    // timeout. `recv()` is cancellation-safe, so selecting it against the
+    // notify never drops a frame.
+    let writer_shutdown = Arc::new(Notify::new());
+    let writer_task = {
+        let writer_shutdown = Arc::clone(&writer_shutdown);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    maybe = writer_rx.recv() => match maybe {
+                        Some(frame) => {
+                            if let Err(e) = write_frame(&mut write, &frame).await {
+                                error!(error = %e, "agent writer failed");
+                                break;
+                            }
+                        }
+                        None => break,
+                    },
+                    () = writer_shutdown.notified() => {
+                        // Flush whatever is already queued, best-effort, then stop.
+                        while let Ok(frame) = writer_rx.try_recv() {
+                            if write_frame(&mut write, &frame).await.is_err() {
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
             }
-        }
-    });
+        })
+    };
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
     let parent_messages = Arc::new(RwLock::new(Vec::<serde_json::Value>::new()));
 
@@ -638,46 +664,57 @@ async fn main() -> anyhow::Result<()> {
     };
     let dispatch = run_reader_loop(&mut reader, ctx).await;
 
+    // Reader loop has ended (SIGTERM, gateway Shutdown frame, or EOF). Tell the
+    // writer to flush any queued frames and stop — the channel never closes on
+    // its own (long-lived tasks hold senders), so this is what lets the writer
+    // task finish promptly instead of parking until the backstop timeout below.
+    // `notify_one` stores a permit if the writer is mid-write, so there's no
+    // lost-wakeup race. Returning then drops the tokio runtime, aborting the
+    // still-running background tasks.
+    writer_shutdown.notify_one();
     drop(writer_tx);
-    // The writer task drains until every `writer_tx` clone drops — but
-    // long-lived tasks (curator scheduler, subagent bridge, agent_query)
-    // hold clones for the whole process lifetime, so it never closes on its
-    // own. Treat this purely as a best-effort flush window for already-queued
-    // outbound frames, then return regardless: on SIGTERM the runtime must
-    // exit well within the spawner's grace period rather than block here.
-    // Returning drops the tokio runtime, which aborts the still-running
-    // writer and background tasks.
     if tokio::time::timeout(SHUTDOWN_DRAIN_GRACE, writer_task)
         .await
         .is_err()
     {
-        warn!("outbound drain window elapsed on shutdown; exiting");
+        warn!("writer did not finish flushing within the shutdown grace; exiting");
     }
     info!("agent runtime exiting");
     dispatch
+}
+
+/// Resolves once a termination signal has flipped `init::SHUTDOWN_REQUESTED`
+/// (the PID-1 handler sets it on SIGTERM/SIGINT/SIGHUP), polled on a 250ms
+/// interval. Off Linux there is no PID-1 handler — `SubprocessSpawner` relies
+/// on the default SIGTERM disposition — and nothing sets the flag, so this
+/// never resolves; loops then exit only on the gateway `Shutdown` frame or EOF.
+#[cfg(target_os = "linux")]
+async fn wait_for_shutdown() {
+    let mut poll = tokio::time::interval(std::time::Duration::from_millis(250));
+    poll.tick().await; // first tick is immediate — skip it
+    loop {
+        poll.tick().await;
+        if init::SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn wait_for_shutdown() {
+    std::future::pending::<()>().await;
 }
 
 async fn run_reader_loop<R>(reader: &mut R, ctx: Ctx) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    // A future that resolves only once a termination signal has set
-    // `init::SHUTDOWN_REQUESTED` (the PID-1 handler stores it on
-    // SIGTERM/SIGINT/SIGHUP). Pinned outside the loop so its interval state
-    // persists across iterations — in steady state it stays pending and
-    // `read_frame` is never cancelled, so the frame read stays cancel-safe.
-    // It is only cancelled when shutdown fires, where we break and exit, so
-    // a half-read frame doesn't matter.
-    let shutdown = async {
-        let mut poll = tokio::time::interval(std::time::Duration::from_millis(250));
-        poll.tick().await; // first tick is immediate — skip it
-        loop {
-            poll.tick().await;
-            if init::SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-        }
-    };
+    // Resolves only once a termination signal has set the shutdown flag.
+    // Pinned outside the loop so its interval state persists across iterations
+    // — in steady state it stays pending and `read_frame` is never cancelled,
+    // keeping the frame read cancel-safe; it's only cancelled when shutdown
+    // fires, where we break and exit so a half-read frame is moot.
+    let shutdown = wait_for_shutdown();
     tokio::pin!(shutdown);
 
     loop {
