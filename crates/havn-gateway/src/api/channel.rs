@@ -411,26 +411,22 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
     // the resolved id immediately — don't hold the ArcSwap guard across the
     // awaits below (ensure_running/send); see the arc_swap-guard discipline in
     // webchat_ws.rs.
-    let agent_id_owned = channel_router::agent_for_account(
-        &state.bindings.load(),
-        channel,
-        &inb.account_id,
-    )
-    .map(str::to_owned);
-    let agent_id_str =
-        match agent_id_owned {
-            Some(s) => s,
-            None => {
-                warn!(
-                    channel,
-                    account = %inb.account_id,
-                    seq = inb.seq,
-                    sender = %inb.sender_id,
-                    "dropping inbound: no [[bindings]] entry for this (channel, account)"
-                );
-                return;
-            }
-        };
+    let agent_id_owned =
+        channel_router::agent_for_account(&state.bindings.load(), channel, &inb.account_id)
+            .map(str::to_owned);
+    let agent_id_str = match agent_id_owned {
+        Some(s) => s,
+        None => {
+            warn!(
+                channel,
+                account = %inb.account_id,
+                seq = inb.seq,
+                sender = %inb.sender_id,
+                "dropping inbound: no [[bindings]] entry for this (channel, account)"
+            );
+            return;
+        }
+    };
     let agent_id = match havn_core::AgentId::from_str(&agent_id_str) {
         Ok(a) => a,
         Err(_) => {

@@ -210,7 +210,10 @@ impl ReloadHandles {
             if path.starts_with("allowed_origins") {
                 self.allowed_origins
                     .store(Arc::new(new.allowed_origins.clone()));
-                info!(new_count = new.allowed_origins.len(), "hot-reloaded allowed_origins");
+                info!(
+                    new_count = new.allowed_origins.len(),
+                    "hot-reloaded allowed_origins"
+                );
             } else if path.starts_with("bindings") {
                 self.bindings.store(Arc::new(new.bindings.clone()));
                 info!(count = new.bindings.len(), "hot-reloaded channel bindings");
@@ -218,10 +221,7 @@ impl ReloadHandles {
                 self.channels.store(Arc::new(new.channels.clone()));
                 info!(count = new.channels.len(), "hot-reloaded channel accounts");
             } else {
-                warn!(
-                    path,
-                    "hot path has no live applier — silently ignored"
-                );
+                warn!(path, "hot path has no live applier — silently ignored");
             }
         }
     }
