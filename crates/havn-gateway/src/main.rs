@@ -109,10 +109,14 @@ struct AppState {
     /// of truth for "which (channel, account) pairs are allowed to open
     /// a `/api/v1/channel` WS"; the WS handler rejects connections for
     /// pairs not declared here.
-    pub channels: Arc<std::collections::BTreeMap<String, config::ChannelEntry>>,
+    /// Held behind `ArcSwap` so the config watcher can hot-reload channel
+    /// accounts without a restart (issue #16) — the WS upgrade handler
+    /// `.load()`s the current value per connect.
+    pub channels: Arc<ArcSwap<std::collections::BTreeMap<String, config::ChannelEntry>>>,
     /// Cross-channel agent bindings (spec §3.5). The router consults
-    /// this to translate inbound `(channel, account)` → `agent_id`.
-    pub bindings: Arc<Vec<config::ChannelBindingConfig>>,
+    /// this to translate inbound `(channel, account)` → `agent_id`. Behind
+    /// `ArcSwap` for hot-reload (issue #16); read per inbound message.
+    pub bindings: Arc<ArcSwap<Vec<config::ChannelBindingConfig>>>,
     /// Per-(channel, account) outbound mpsc map for connected channel
     /// adapter daemons. Populated when a `/api/v1/channel` WS opens;
     /// drained when an agent replies — see [`crate::channel_router`].
@@ -316,8 +320,8 @@ async fn main() -> anyhow::Result<()> {
         tmpfs_mounts: cfg.tmpfs_mounts.clone(),
         seccomp_allow_extra: cfg.seccomp.allow_extra.clone(),
         agent_dns: cfg.network.agent_dns.clone(),
-        channels: Arc::new(cfg.channels.clone()),
-        bindings: Arc::new(cfg.bindings.clone()),
+        channels: reload_handles.channels.clone(),
+        bindings: reload_handles.bindings.clone(),
         channel_router: channel_router_state.clone(),
         webchat_router: webchat_router.clone(),
         allowed_origins,

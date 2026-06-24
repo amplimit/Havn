@@ -21,7 +21,7 @@
 //! services treat the restart-only subset of their config: surface it, let the
 //! operator (or their supervisor) restart.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +31,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::config::GatewayConfig;
+use crate::config::{ChannelBindingConfig, ChannelEntry, GatewayConfig};
 
 /// One row in the static rule table. Order doesn't matter — match is by
 /// longest-matching prefix.
@@ -70,6 +70,16 @@ pub const RULES: &[ReloadRule] = &[
     },
     ReloadRule {
         prefix: "defaults",
+        kind: ReloadKind::Hot,
+    },
+    // Channel routing is pure gateway-side state read at dispatch/connect time
+    // (issue #16): swapping it doesn't touch any agent. Hot-reloadable.
+    ReloadRule {
+        prefix: "bindings",
+        kind: ReloadKind::Hot,
+    },
+    ReloadRule {
+        prefix: "channels",
         kind: ReloadKind::Hot,
     },
     ReloadRule {
@@ -176,12 +186,20 @@ fn walk(old: &Value, new: &Value, prefix: &str, out: &mut Vec<String>) {
 #[derive(Clone)]
 pub struct ReloadHandles {
     pub allowed_origins: Arc<ArcSwap<Vec<String>>>,
+    /// Cross-channel routing table (spec §3.5). `AppState` reads this per
+    /// inbound; swapping it reroutes without touching any agent (issue #16).
+    pub bindings: Arc<ArcSwap<Vec<ChannelBindingConfig>>>,
+    /// Declared channel accounts (spec §3.4). `AppState` reads this on each
+    /// adapter WS upgrade to authorize the (channel, account) pair.
+    pub channels: Arc<ArcSwap<BTreeMap<String, ChannelEntry>>>,
 }
 
 impl ReloadHandles {
     pub fn from_config(cfg: &GatewayConfig) -> Self {
         Self {
             allowed_origins: Arc::new(ArcSwap::from_pointee(cfg.allowed_origins.clone())),
+            bindings: Arc::new(ArcSwap::from_pointee(cfg.bindings.clone())),
+            channels: Arc::new(ArcSwap::from_pointee(cfg.channels.clone())),
         }
     }
 
@@ -193,15 +211,17 @@ impl ReloadHandles {
                 self.allowed_origins
                     .store(Arc::new(new.allowed_origins.clone()));
                 info!(
-                    paths = ?paths,
                     new_count = new.allowed_origins.len(),
                     "hot-reloaded allowed_origins"
                 );
+            } else if path.starts_with("bindings") {
+                self.bindings.store(Arc::new(new.bindings.clone()));
+                info!(count = new.bindings.len(), "hot-reloaded channel bindings");
+            } else if path.starts_with("channels") {
+                self.channels.store(Arc::new(new.channels.clone()));
+                info!(count = new.channels.len(), "hot-reloaded channel accounts");
             } else {
-                warn!(
-                    path,
-                    "hot path has no live applier — Phase 1 silently ignores"
-                );
+                warn!(path, "hot path has no live applier — silently ignored");
             }
         }
     }
@@ -401,5 +421,30 @@ mod tests {
 
         let live = handles.allowed_origins.load();
         assert_eq!(&**live, &vec!["https://example.com".to_string()]);
+    }
+
+    #[test]
+    fn handles_apply_hot_swaps_bindings_and_channels() {
+        let cfg = GatewayConfig::default();
+        let handles = ReloadHandles::from_config(&cfg);
+        assert!(handles.bindings.load().is_empty());
+        assert!(handles.channels.load().is_empty());
+
+        let mut new_cfg = cfg.clone();
+        new_cfg.bindings.push(ChannelBindingConfig {
+            agent_id: "agent-1".into(),
+            channel: "telegram".into(),
+            account_id: "alice-tg-bot".into(),
+        });
+        new_cfg
+            .channels
+            .insert("telegram".into(), ChannelEntry::default());
+
+        handles.apply_hot(&new_cfg, &["bindings".to_string(), "channels".to_string()]);
+
+        let live_bindings = handles.bindings.load();
+        assert_eq!(live_bindings.len(), 1);
+        assert_eq!(live_bindings[0].agent_id, "agent-1");
+        assert!(handles.channels.load().contains_key("telegram"));
     }
 }

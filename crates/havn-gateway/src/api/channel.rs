@@ -85,10 +85,16 @@ pub async fn handler(
     // credential row (defence against an operator who manually
     // inserted a `channel:*` row without binding it to a config-
     // declared account).
-    let account = state
+    // `.load()` the current channel table (hot-reloadable, issue #16) and own
+    // the one field we need — don't hold the ArcSwap guard across the
+    // credential-lookup await below (arc_swap-guard discipline, see
+    // webchat_ws.rs). The guard drops at the end of this block.
+    let adapter_token_ref = state
         .channels
+        .load()
         .get(&q.channel)
         .and_then(|entry| entry.accounts.iter().find(|a| a.id == q.account))
+        .map(|a| a.adapter_token_ref.clone())
         .ok_or_else(|| {
             warn!(
                 channel = %q.channel,
@@ -105,7 +111,7 @@ pub async fn handler(
     // name="alice-tg-bot"). The reference parser is strict; malformed
     // refs at upgrade time are 401 (not 500) — operator config error
     // shouldn't expose internals, just refuse the connection.
-    let parsed_ref = secret_ref::parse(&account.adapter_token_ref).map_err(|e| {
+    let parsed_ref = secret_ref::parse(&adapter_token_ref).map_err(|e| {
         warn!(
             channel = %q.channel,
             account = %q.account,
@@ -401,21 +407,27 @@ async fn handle_session(
 /// the operator-visible signal that they need to add a binding (the
 /// startup `dangling_bindings` warning catches the inverse case).
 async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
-    let agent_id_str =
-        match channel_router::agent_for_account(&state.bindings, channel, &inb.account_id) {
-            Some(s) => s,
-            None => {
-                warn!(
-                    channel,
-                    account = %inb.account_id,
-                    seq = inb.seq,
-                    sender = %inb.sender_id,
-                    "dropping inbound: no [[bindings]] entry for this (channel, account)"
-                );
-                return;
-            }
-        };
-    let agent_id = match havn_core::AgentId::from_str(agent_id_str) {
+    // `.load()` the current routing table (hot-reloadable, issue #16) and own
+    // the resolved id immediately — don't hold the ArcSwap guard across the
+    // awaits below (ensure_running/send); see the arc_swap-guard discipline in
+    // webchat_ws.rs.
+    let agent_id_owned =
+        channel_router::agent_for_account(&state.bindings.load(), channel, &inb.account_id)
+            .map(str::to_owned);
+    let agent_id_str = match agent_id_owned {
+        Some(s) => s,
+        None => {
+            warn!(
+                channel,
+                account = %inb.account_id,
+                seq = inb.seq,
+                sender = %inb.sender_id,
+                "dropping inbound: no [[bindings]] entry for this (channel, account)"
+            );
+            return;
+        }
+    };
+    let agent_id = match havn_core::AgentId::from_str(&agent_id_str) {
         Ok(a) => a,
         Err(_) => {
             warn!(
