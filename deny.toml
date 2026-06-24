@@ -5,8 +5,13 @@ all-features = true
 
 [advisories]
 yanked = "warn"
-# paste is unmaintained but has no replacement; transitive dep via rmcp.
-ignore = ["RUSTSEC-2024-0436"]
+ignore = [
+    # paste is unmaintained but has no replacement; transitive dep via rmcp.
+    "RUSTSEC-2024-0436",
+    # proc-macro-error2 is unmaintained with no safe upgrade (RUSTSEC-2026-0173);
+    # pulled in transitively via age -> i18n-embed-fl. Re-evaluate when age drops it.
+    "RUSTSEC-2026-0173",
+]
 
 [licenses]
 allow = [
