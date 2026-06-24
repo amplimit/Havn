@@ -60,7 +60,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use crate::agent_registry::AgentRegistry;
 use crate::agent_socket::AgentSocketCtx;
 use crate::config::GatewayConfig;
-use crate::reload::{ReloadHandles, RestartTrigger};
+use crate::reload::ReloadHandles;
 use crate::webchat::WebChatRouter;
 
 #[derive(Clone)]
@@ -374,7 +374,6 @@ async fn main() -> anyhow::Result<()> {
         config::GatewayConfig::resolved_path(),
         cfg.clone(),
         reload_handles,
-        RestartTrigger,
     );
 
     let app = Router::new()
