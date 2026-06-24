@@ -122,10 +122,6 @@ impl ReloadPlan {
         }
         plan
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.hot_paths.is_empty() && self.restart_paths.is_empty()
-    }
 }
 
 fn longest_match(path: &str, rules: &[ReloadRule]) -> ReloadRule {

@@ -143,7 +143,7 @@ cpu_cores = 1.0
 heartbeat_minutes = 30
 ```
 
-Config edits are picked up live: runtime-tunable fields (`allowed_origins`, `defaults`) hot-reload in place, while deploy-time fields (`listen`, `db_path`, paths) are logged as needing a `havn gateway restart` to apply — the gateway never restarts itself.
+Config edits are picked up live: runtime-tunable fields (e.g. `allowed_origins`) hot-reload in place, while deploy-time fields (`listen`, `db_path`, paths) are logged as needing a `havn gateway restart` to apply — the gateway never restarts itself.
 
 For non-loopback exposure, configure a reverse proxy and enable trust-header mode:
 
