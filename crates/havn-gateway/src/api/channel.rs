@@ -85,8 +85,11 @@ pub async fn handler(
     // credential row (defence against an operator who manually
     // inserted a `channel:*` row without binding it to a config-
     // declared account).
-    let account = state
-        .channels
+    // `.load()` the current channel table (hot-reloadable, issue #16). The
+    // guard is bound to a local so `account` can borrow it through the rest
+    // of the handler.
+    let channels = state.channels.load();
+    let account = channels
         .get(&q.channel)
         .and_then(|entry| entry.accounts.iter().find(|a| a.id == q.account))
         .ok_or_else(|| {
@@ -401,8 +404,11 @@ async fn handle_session(
 /// the operator-visible signal that they need to add a binding (the
 /// startup `dangling_bindings` warning catches the inverse case).
 async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
+    // `.load()` the current routing table (hot-reloadable, issue #16); the
+    // guard is bound to a local so `agent_id_str` can borrow it.
+    let bindings = state.bindings.load();
     let agent_id_str =
-        match channel_router::agent_for_account(&state.bindings, channel, &inb.account_id) {
+        match channel_router::agent_for_account(&bindings, channel, &inb.account_id) {
             Some(s) => s,
             None => {
                 warn!(
