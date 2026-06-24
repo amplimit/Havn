@@ -435,20 +435,16 @@ fn default_config_path() -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReloadConfig {
-    pub mode: ReloadMode,
     pub debounce_ms: u32,
 }
 
 impl Default for ReloadConfig {
     fn default() -> Self {
-        // v0.6 default flipped from Hybrid → Restart per spec §8.4.
-        // Restart is easier to reason about and the right shape for
-        // production. Hybrid stays available as an opt-in for dev
-        // quality, but it isn't the recommended baseline.
-        Self {
-            mode: ReloadMode::Restart,
-            debounce_ms: 300,
-        }
+        // No `mode`: hot paths apply in place, deploy-time paths are reported
+        // for the operator to apply via `havn gateway restart` (spec §8.4,
+        // issue #10). A legacy `[reload] mode = ...` in an existing config is
+        // ignored rather than rejected.
+        Self { debounce_ms: 300 }
     }
 }
 
@@ -467,16 +463,6 @@ pub struct TrustHeaderConfig {
     /// reverse proxy + listen-address discipline. Reserved.
     #[allow(dead_code, reason = "reserved for source-IP enforcement")]
     pub allowed_proxies: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReloadMode {
-    Off,
-    #[default]
-    Restart,
-    Hot,
-    Hybrid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -517,11 +503,20 @@ mod tests {
     #[test]
     fn empty_toml_round_trips_to_defaults() {
         let parsed: GatewayConfig = toml::from_str("").expect("parse empty");
-        // Spec §8.4 v0.6: restart is the recommended production default.
-        assert_eq!(parsed.reload.mode, ReloadMode::Restart);
+        assert_eq!(parsed.reload.debounce_ms, 300);
         assert_eq!(parsed.defaults.heartbeat_minutes, 30);
         assert!(parsed.channels.is_empty());
         assert!(parsed.bindings.is_empty());
+    }
+
+    #[test]
+    fn legacy_reload_mode_field_is_ignored_not_rejected() {
+        // The `mode` enum was removed (issue #10); an existing config that
+        // still sets it must keep parsing rather than fail to load.
+        let parsed: GatewayConfig =
+            toml::from_str("[reload]\nmode = \"hybrid\"\ndebounce_ms = 500")
+                .expect("legacy mode field should be ignored");
+        assert_eq!(parsed.reload.debounce_ms, 500);
     }
 
     #[test]

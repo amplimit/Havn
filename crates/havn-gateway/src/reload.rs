@@ -1,4 +1,4 @@
-//! Config hot reload — gateway side of spec §8.4.
+//! Config reload — gateway side of spec §8.4.
 //!
 //! At a high level:
 //!
@@ -9,17 +9,17 @@
 //! 3. Old vs new is JSON-diffed into a flat list of changed dot-paths.
 //! 4. Each path is matched against the static [`RULES`] table (longest
 //!    prefix wins; unmatched paths default to `Restart`).
-//! 5. The selected [`ReloadMode`] decides what actually happens:
-//!     - `Off`  → nothing.
-//!     - `Restart` → if anything changed at all, schedule a restart.
-//!     - `Hot` → if any path requires restart, log a warning and skip;
-//!       otherwise run the hot actions.
-//!     - `Hybrid` (default) → run hot actions for hot paths AND schedule
-//!       restart if any path is restart-only.
+//! 5. Hot paths are applied in place via [`ReloadHandles::apply_hot`]. Restart
+//!    paths are *reported*, not acted on: havn does not restart itself.
 //!
-//! "Schedule restart" in Phase 1 = log clearly and ask the operator to
-//! restart. Production deployments can replace [`RestartTrigger`] with a
-//! sentinel-file + SIGUSR1 implementation per spec §8.4.
+//! Every `Restart` path is a deploy-time constant — `listen`, `db_path`, the
+//! socket/workspace paths, the runtime binary — that an operator only changes
+//! during a deliberate redeploy. A gateway that self-execs to apply them would
+//! orphan every running agent, so instead the watcher logs exactly which
+//! deploy-time fields changed and that they take effect on the next
+//! `havn gateway restart`. This mirrors how nginx / PostgreSQL / systemd-managed
+//! services treat the restart-only subset of their config: surface it, let the
+//! operator (or their supervisor) restart.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -31,7 +31,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{GatewayConfig, ReloadMode};
+use crate::config::GatewayConfig;
 
 /// One row in the static rule table. Order doesn't matter — match is by
 /// longest-matching prefix.
@@ -122,64 +122,6 @@ impl ReloadPlan {
         }
         plan
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.hot_paths.is_empty() && self.restart_paths.is_empty()
-    }
-}
-
-/// Decision for a given mode + plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReloadDecision {
-    /// Nothing to do (mode `Off`, or all changes ignored).
-    NoOp,
-    /// Restart the gateway. Phase 1 surfaces this to the operator via logs.
-    Restart { reason: Vec<String> },
-    /// Run hot actions only.
-    HotOnly { paths: Vec<String> },
-    /// Mode `Hot` and a restart path was touched: skip everything for safety.
-    /// Spec §8.4: "if `mode = hot` and a restart path appears: log warning,
-    /// do nothing for that path."
-    SkippedDueToRestartInHotMode { paths: Vec<String> },
-}
-
-pub fn decide(plan: &ReloadPlan, mode: ReloadMode) -> ReloadDecision {
-    if plan.is_empty() {
-        return ReloadDecision::NoOp;
-    }
-    match mode {
-        ReloadMode::Off => ReloadDecision::NoOp,
-        ReloadMode::Restart => ReloadDecision::Restart {
-            reason: plan
-                .hot_paths
-                .iter()
-                .chain(plan.restart_paths.iter())
-                .cloned()
-                .collect(),
-        },
-        ReloadMode::Hot => {
-            if plan.restart_paths.is_empty() {
-                ReloadDecision::HotOnly {
-                    paths: plan.hot_paths.clone(),
-                }
-            } else {
-                ReloadDecision::SkippedDueToRestartInHotMode {
-                    paths: plan.restart_paths.clone(),
-                }
-            }
-        }
-        ReloadMode::Hybrid => {
-            if plan.restart_paths.is_empty() {
-                ReloadDecision::HotOnly {
-                    paths: plan.hot_paths.clone(),
-                }
-            } else {
-                ReloadDecision::Restart {
-                    reason: plan.restart_paths.clone(),
-                }
-            }
-        }
-    }
 }
 
 fn longest_match(path: &str, rules: &[ReloadRule]) -> ReloadRule {
@@ -265,34 +207,15 @@ impl ReloadHandles {
     }
 }
 
-/// Restart trigger surface. Phase 1 just logs; production deployments swap
-/// in a sentinel-file + SIGUSR1 implementation per spec §8.4.
-#[derive(Debug, Clone, Default)]
-pub struct RestartTrigger;
-
-impl RestartTrigger {
-    #[allow(
-        clippy::unused_self,
-        reason = "Phase 2 wires sentinel + SIGUSR1 — keeps call-site stable"
-    )]
-    pub fn request(&self, reason: &[String]) {
-        warn!(
-            paths = ?reason,
-            "configuration change requires restart — schedule one to apply"
-        );
-    }
-}
-
 /// Spawn the watcher task. Returns immediately; the task runs forever or
 /// until the channel from the underlying notify watcher closes.
 pub fn spawn_watcher(
     config_path: PathBuf,
     initial: GatewayConfig,
     handles: ReloadHandles,
-    restart: RestartTrigger,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run_watcher(config_path, initial, handles, restart).await {
+        if let Err(e) = run_watcher(config_path, initial, handles).await {
             error!(error = ?e, "config watcher terminated with error");
         }
     })
@@ -302,7 +225,6 @@ async fn run_watcher(
     config_path: PathBuf,
     initial: GatewayConfig,
     handles: ReloadHandles,
-    restart: RestartTrigger,
 ) -> anyhow::Result<()> {
     use notify::{EventKind, RecursiveMode, Watcher};
 
@@ -322,7 +244,6 @@ async fn run_watcher(
     let mut last_known_good = current.clone();
 
     let debounce = Duration::from_millis(u64::from(current.reload.debounce_ms.max(1)));
-    let mode = current.reload.mode;
 
     loop {
         // Wait for any event referencing our config path.
@@ -362,24 +283,21 @@ async fn run_watcher(
                     continue;
                 }
                 let plan = ReloadPlan::build(&changed);
-                let decision = decide(&plan, mode);
-                debug!(?changed, ?decision, "config change");
+                debug!(?changed, hot = ?plan.hot_paths, restart = ?plan.restart_paths, "config change");
 
-                match decision {
-                    ReloadDecision::NoOp => {}
-                    ReloadDecision::HotOnly { paths } => {
-                        handles.apply_hot(&new_cfg, &paths);
-                    }
-                    ReloadDecision::Restart { reason } => {
-                        handles.apply_hot(&new_cfg, &plan.hot_paths);
-                        restart.request(&reason);
-                    }
-                    ReloadDecision::SkippedDueToRestartInHotMode { paths } => {
-                        warn!(
-                            paths = ?paths,
-                            "hot mode rejected change because a restart-only path was modified"
-                        );
-                    }
+                // Apply hot paths in place.
+                if !plan.hot_paths.is_empty() {
+                    handles.apply_hot(&new_cfg, &plan.hot_paths);
+                }
+
+                // Report restart-only (deploy-time) paths to the operator. We
+                // do not restart the gateway ourselves — these take effect on
+                // the next `havn gateway restart`.
+                if !plan.restart_paths.is_empty() {
+                    warn!(
+                        paths = ?plan.restart_paths,
+                        "config changed deploy-time settings; run `havn gateway restart` to apply them"
+                    );
                 }
 
                 current = new_cfg.clone();
@@ -459,50 +377,17 @@ mod tests {
     }
 
     #[test]
-    fn decide_off_means_noop() {
-        let plan = ReloadPlan::build(&["allowed_origins".into()]);
-        assert!(matches!(
-            decide(&plan, ReloadMode::Off),
-            ReloadDecision::NoOp
-        ));
-    }
-
-    #[test]
-    fn decide_hot_only_when_no_restart_paths() {
-        let plan = ReloadPlan::build(&["allowed_origins".into()]);
-        match decide(&plan, ReloadMode::Hot) {
-            ReloadDecision::HotOnly { paths } => assert_eq!(paths, vec!["allowed_origins"]),
-            other => panic!("got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn decide_hot_skips_when_restart_path_changed() {
-        let plan = ReloadPlan::build(&["allowed_origins".into(), "listen".into()]);
-        match decide(&plan, ReloadMode::Hot) {
-            ReloadDecision::SkippedDueToRestartInHotMode { paths } => {
-                assert_eq!(paths, vec!["listen"]);
-            }
-            other => panic!("got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn decide_hybrid_runs_hot_then_requests_restart() {
-        let plan = ReloadPlan::build(&["allowed_origins".into(), "listen".into()]);
-        match decide(&plan, ReloadMode::Hybrid) {
-            ReloadDecision::Restart { reason } => assert_eq!(reason, vec!["listen"]),
-            other => panic!("got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn decide_restart_mode_always_restarts_on_change() {
-        let plan = ReloadPlan::build(&["allowed_origins".into()]);
-        assert!(matches!(
-            decide(&plan, ReloadMode::Restart),
-            ReloadDecision::Restart { .. }
-        ));
+    fn plan_separates_hot_from_deploy_time_paths() {
+        // The watcher applies hot_paths in place and only reports
+        // restart_paths to the operator — no self-restart.
+        let plan = ReloadPlan::build(&[
+            "allowed_origins".into(),
+            "defaults".into(),
+            "listen".into(),
+            "db_path".into(),
+        ]);
+        assert_eq!(plan.hot_paths, vec!["allowed_origins", "defaults"]);
+        assert_eq!(plan.restart_paths, vec!["listen", "db_path"]);
     }
 
     #[test]
