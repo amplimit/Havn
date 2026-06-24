@@ -10,14 +10,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, anyhow};
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
-const DEFAULT_HEARTBEAT_MIN: u32 = 30;
 
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub config_path: PathBuf,
     pub data_dir: PathBuf,
     pub listen: String,
-    pub heartbeat_minutes: u32,
 }
 
 impl Plan {
@@ -27,7 +25,6 @@ impl Plan {
             config_path: home.join(".config/havn/config.toml"),
             data_dir: home.join(".local/share/havn"),
             listen: DEFAULT_LISTEN.into(),
-            heartbeat_minutes: DEFAULT_HEARTBEAT_MIN,
         })
     }
 
@@ -48,10 +45,9 @@ workspace_root = {agents_root:?}
 allowed_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
 
 [reload]
-# v0.6 default: restart on config change. Easy to reason about, no
-# surprise live-mutation bugs. Switch to "hybrid" if you want in-process
-# hot reload for dev iteration; see spec §8.4.
-mode = "restart"
+# Config edits are picked up live: hot-reloadable fields (allowed_origins,
+# bindings, channels) apply in place; deploy-time fields (listen, db_path,
+# paths) are logged as needing a `havn gateway restart`. See spec §8.4.
 debounce_ms = 300
 
 [trust_header]
@@ -65,18 +61,11 @@ debounce_ms = 300
 # The gateway refuses to start with a non-loopback listen address
 # unless this flag is true (or `HAVN_TRUST_HEADER=1` is set).
 enabled = false
-
-[defaults]
-model = "claude-opus-4-6"
-memory_mb = 512
-cpu_cores = 1.0
-heartbeat_minutes = {hb}
 "#,
             listen = self.listen,
             db = db.display().to_string(),
             socket = socket.display().to_string(),
             agents_root = agents_root.display().to_string(),
-            hb = self.heartbeat_minutes,
         )
     }
 }
@@ -219,7 +208,6 @@ mod tests {
             config_path: PathBuf::from("/tmp/havn/config.toml"),
             data_dir: PathBuf::from("/tmp/havn"),
             listen: "127.0.0.1:8080".into(),
-            heartbeat_minutes: 30,
         };
         let rendered = plan.render_config();
         for key in &[
@@ -229,8 +217,6 @@ mod tests {
             "workspace_root",
             "allowed_origins",
             "[reload]",
-            "[defaults]",
-            "heartbeat_minutes",
         ] {
             assert!(rendered.contains(key), "config missing {key}");
         }
@@ -245,7 +231,6 @@ mod tests {
             config_path: dir.join("config.toml"),
             data_dir: dir.join("data"),
             listen: "127.0.0.1:8080".into(),
-            heartbeat_minutes: 30,
         };
         apply(&plan).expect("apply");
         assert!(plan.config_path.exists());
@@ -260,7 +245,6 @@ mod tests {
             config_path: dir.join("config.toml"),
             data_dir: dir.join("data"),
             listen: "127.0.0.1:8080".into(),
-            heartbeat_minutes: 30,
         };
         apply(&plan).unwrap();
         // Mutate the config — second apply should not overwrite.
