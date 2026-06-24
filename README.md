@@ -135,15 +135,9 @@ Gateway config lives at `~/.config/havn/config.toml`:
 [gateway]
 listen = "127.0.0.1:8080"
 db_path = "~/.local/share/havn/havn.db"
-
-[defaults]
-model = "claude-sonnet-4-6"
-memory_mb = 512
-cpu_cores = 1.0
-heartbeat_minutes = 30
 ```
 
-Config edits are picked up live: runtime-tunable fields (e.g. `allowed_origins`) hot-reload in place, while deploy-time fields (`listen`, `db_path`, paths) are logged as needing a `havn gateway restart` to apply — the gateway never restarts itself.
+Config edits are picked up live: hot-reloadable fields (`allowed_origins`, `[[bindings]]`, `[[channels]]`) apply in place, while deploy-time fields (`listen`, `db_path`, paths) are logged as needing a `havn gateway restart` to apply — the gateway never restarts itself. Per-agent resource limits come from the agent's role policy, not a global config block.
 
 For non-loopback exposure, configure a reverse proxy and enable trust-header mode:
 

@@ -68,10 +68,6 @@ pub const RULES: &[ReloadRule] = &[
         prefix: "allowed_origins",
         kind: ReloadKind::Hot,
     },
-    ReloadRule {
-        prefix: "defaults",
-        kind: ReloadKind::Hot,
-    },
     // Channel routing is pure gateway-side state read at dispatch/connect time
     // (issue #16): swapping it doesn't touch any agent. Hot-reloadable.
     ReloadRule {
@@ -342,16 +338,16 @@ mod tests {
 
     #[test]
     fn diff_paths_finds_top_level_change() {
-        let a = json!({ "listen": "127.0.0.1:8080", "defaults": { "model": "x" } });
-        let b = json!({ "listen": "0.0.0.0:8080", "defaults": { "model": "x" } });
+        let a = json!({ "listen": "127.0.0.1:8080", "trust_header": { "enabled": false } });
+        let b = json!({ "listen": "0.0.0.0:8080", "trust_header": { "enabled": false } });
         assert_eq!(diff_paths(&a, &b), vec!["listen".to_string()]);
     }
 
     #[test]
     fn diff_paths_finds_nested_change() {
-        let a = json!({ "defaults": { "model": "x", "memory_mb": 512 } });
-        let b = json!({ "defaults": { "model": "y", "memory_mb": 512 } });
-        assert_eq!(diff_paths(&a, &b), vec!["defaults.model".to_string()]);
+        let a = json!({ "trust_header": { "enabled": false, "allowed_proxies": [] } });
+        let b = json!({ "trust_header": { "enabled": true, "allowed_proxies": [] } });
+        assert_eq!(diff_paths(&a, &b), vec!["trust_header.enabled".to_string()]);
     }
 
     #[test]
@@ -389,10 +385,13 @@ mod tests {
         let plan = ReloadPlan::build(&[
             "allowed_origins".to_string(),
             "listen".to_string(),
-            "defaults.model".to_string(),
+            "channels.telegram.accounts".to_string(),
             "totally_unknown".to_string(),
         ]);
-        assert_eq!(plan.hot_paths, vec!["allowed_origins", "defaults.model"]);
+        assert_eq!(
+            plan.hot_paths,
+            vec!["allowed_origins", "channels.telegram.accounts"]
+        );
         assert_eq!(plan.restart_paths, vec!["listen", "totally_unknown"]);
     }
 
@@ -402,11 +401,11 @@ mod tests {
         // restart_paths to the operator — no self-restart.
         let plan = ReloadPlan::build(&[
             "allowed_origins".into(),
-            "defaults".into(),
+            "bindings".into(),
             "listen".into(),
             "db_path".into(),
         ]);
-        assert_eq!(plan.hot_paths, vec!["allowed_origins", "defaults"]);
+        assert_eq!(plan.hot_paths, vec!["allowed_origins", "bindings"]);
         assert_eq!(plan.restart_paths, vec!["listen", "db_path"]);
     }
 

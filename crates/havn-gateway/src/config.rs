@@ -32,7 +32,6 @@ pub struct GatewayConfig {
     /// dashboard's dev server. Production deployments add their domain.
     pub allowed_origins: Vec<String>,
     pub reload: ReloadConfig,
-    pub defaults: AgentDefaults,
     /// Trust-header configuration (spec §1.7). When enabled, the
     /// gateway resolves the calling user from the `X-User-ID` header
     /// set by an upstream reverse proxy. Required for any non-loopback
@@ -275,7 +274,6 @@ impl Default for GatewayConfig {
             allowed_origins: default_allowed_origins(),
             reload: ReloadConfig::default(),
             trust_header: TrustHeaderConfig::default(),
-            defaults: AgentDefaults::default(),
             embedding: default_embedding_config(),
             extra_mounts: Vec::new(),
             tmpfs_mounts: Vec::new(),
@@ -465,26 +463,6 @@ pub struct TrustHeaderConfig {
     pub allowed_proxies: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AgentDefaults {
-    pub model: String,
-    pub memory_mb: u64,
-    pub cpu_cores: f64,
-    pub heartbeat_minutes: u32,
-}
-
-impl Default for AgentDefaults {
-    fn default() -> Self {
-        Self {
-            model: "claude-opus-4-6".into(),
-            memory_mb: 512,
-            cpu_cores: 1.0,
-            heartbeat_minutes: 30,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -504,18 +482,19 @@ mod tests {
     fn empty_toml_round_trips_to_defaults() {
         let parsed: GatewayConfig = toml::from_str("").expect("parse empty");
         assert_eq!(parsed.reload.debounce_ms, 300);
-        assert_eq!(parsed.defaults.heartbeat_minutes, 30);
         assert!(parsed.channels.is_empty());
         assert!(parsed.bindings.is_empty());
     }
 
     #[test]
-    fn legacy_reload_mode_field_is_ignored_not_rejected() {
-        // The `mode` enum was removed (issue #10); an existing config that
-        // still sets it must keep parsing rather than fail to load.
-        let parsed: GatewayConfig =
-            toml::from_str("[reload]\nmode = \"hybrid\"\ndebounce_ms = 500")
-                .expect("legacy mode field should be ignored");
+    fn legacy_dead_config_blocks_are_ignored_not_rejected() {
+        // `[reload] mode` (removed in #10) and the whole `[defaults]` block
+        // (removed in #18 — it was never consumed) must keep parsing in an
+        // existing config rather than fail to load.
+        let parsed: GatewayConfig = toml::from_str(
+            "[reload]\nmode = \"hybrid\"\ndebounce_ms = 500\n\n[defaults]\nmodel = \"x\"\nmemory_mb = 999",
+        )
+        .expect("legacy dead config blocks should be ignored");
         assert_eq!(parsed.reload.debounce_ms, 500);
     }
 
