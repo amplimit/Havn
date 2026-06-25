@@ -108,15 +108,14 @@ struct AppState {
     /// Channel-adapter accounts keyed by channel id (spec §3.4). Source
     /// of truth for "which (channel, account) pairs are allowed to open
     /// a `/api/v1/channel` WS"; the WS handler rejects connections for
-    /// pairs not declared here.
-    /// Held behind `ArcSwap` so the config watcher can hot-reload channel
-    /// accounts without a restart (issue #16) — the WS upgrade handler
-    /// `.load()`s the current value per connect.
-    pub channels: Arc<ArcSwap<std::collections::BTreeMap<String, config::ChannelEntry>>>,
+    /// pairs not declared here. A snapshot taken at startup — edits are
+    /// restart-class (spec §8.4 / §3.5): the config watcher logs that a
+    /// `[[channels]]` change needs `havn gateway restart`.
+    pub channels: Arc<std::collections::BTreeMap<String, config::ChannelEntry>>,
     /// Cross-channel agent bindings (spec §3.5). The router consults
-    /// this to translate inbound `(channel, account)` → `agent_id`. Behind
-    /// `ArcSwap` for hot-reload (issue #16); read per inbound message.
-    pub bindings: Arc<ArcSwap<Vec<config::ChannelBindingConfig>>>,
+    /// this to translate inbound `(channel, account)` → `agent_id`. Startup
+    /// snapshot; `[[bindings]]` edits are restart-class (spec §8.4 / §3.5).
+    pub bindings: Arc<Vec<config::ChannelBindingConfig>>,
     /// Per-(channel, account) outbound mpsc map for connected channel
     /// adapter daemons. Populated when a `/api/v1/channel` WS opens;
     /// drained when an agent replies — see [`crate::channel_router`].
@@ -320,8 +319,8 @@ async fn main() -> anyhow::Result<()> {
         tmpfs_mounts: cfg.tmpfs_mounts.clone(),
         seccomp_allow_extra: cfg.seccomp.allow_extra.clone(),
         agent_dns: cfg.network.agent_dns.clone(),
-        channels: reload_handles.channels.clone(),
-        bindings: reload_handles.bindings.clone(),
+        channels: Arc::new(cfg.channels.clone()),
+        bindings: Arc::new(cfg.bindings.clone()),
         channel_router: channel_router_state.clone(),
         webchat_router: webchat_router.clone(),
         allowed_origins,
