@@ -136,9 +136,9 @@ pub struct ChannelAccount {
     /// match `id` above by convention but the gateway only enforces
     /// resolvability, not naming convention.
     pub adapter_token_ref: String,
-    /// DM access policy. Default `owner_only` — only the bound agent's
-    /// owner may DM. Operators with public bots set `open`; allowlist
-    /// for explicit user-id lists.
+    /// DM access policy. Default `allowlist` — only senders listed in
+    /// `allow_from` may DM; empty list = deny all (safe default).
+    /// Operators with public bots set `open`.
     #[serde(default)]
     pub dm_policy: DmPolicy,
     /// Platform-prefixed sender IDs allowed when `dm_policy = "allowlist"`.
@@ -150,16 +150,15 @@ pub struct ChannelAccount {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DmPolicy {
-    /// Only senders listed in `allow_from` may DM. Default for explicit
-    /// access control.
-    Allowlist,
-    /// Any sender on the platform may DM. Use for public help bots.
-    Open,
-    /// Only the bound agent's owner may DM. Default for `webchat:*`
-    /// loopback accounts (when the channel grows that surface) and a
-    /// safe default for other channels too.
+    /// Only senders listed in `allow_from` may DM. Empty list = deny
+    /// all. Safe failure direction: "nobody can use it" rather than
+    /// "everyone can use it".
     #[default]
-    OwnerOnly,
+    Allowlist,
+    /// Any sender on the platform may DM. Use for public help bots or
+    /// personal bots where the operator controls visibility at the
+    /// platform level (e.g. Telegram bot handle is private).
+    Open,
 }
 
 /// One cross-channel binding (spec §3.5). The same agent can have
@@ -525,9 +524,9 @@ mod tests {
         assert_eq!(tg.accounts[0].dm_policy, DmPolicy::Allowlist);
         assert_eq!(tg.accounts[0].allow_from, vec!["tg:123456789"]);
         assert_eq!(tg.accounts[1].dm_policy, DmPolicy::Open);
-        // Default dm_policy is owner_only when omitted.
+        // Default dm_policy is allowlist when omitted (deny-all safe default).
         let slack = cfg.channels.get("slack").expect("slack entry");
-        assert_eq!(slack.accounts[0].dm_policy, DmPolicy::OwnerOnly);
+        assert_eq!(slack.accounts[0].dm_policy, DmPolicy::Allowlist);
     }
 
     #[test]
@@ -598,7 +597,7 @@ mod tests {
                 accounts: vec![ChannelAccount {
                     id: "alice-tg-bot".into(),
                     adapter_token_ref: "secret:channel:telegram:alice-tg-bot".into(),
-                    dm_policy: DmPolicy::OwnerOnly,
+                    dm_policy: DmPolicy::Allowlist,
                     allow_from: Vec::new(),
                 }],
             },
@@ -614,7 +613,7 @@ mod tests {
     #[test]
     fn unknown_dm_policy_value_rejected() {
         // Typo guard — operator pasting `dm_policy = "alowlist"` should
-        // fail config parse, not silently default to owner_only.
+        // fail config parse, not silently default to allowlist.
         let s = r#"
             [[channels.telegram.accounts]]
             id = "x"
@@ -623,6 +622,21 @@ mod tests {
         "#;
         let r: Result<GatewayConfig, _> = toml::from_str(s);
         assert!(r.is_err(), "typo should not silently parse");
+    }
+
+    #[test]
+    fn owner_only_dm_policy_no_longer_parses() {
+        // OwnerOnly removed — it required a sender→User identity map
+        // that doesn't exist. Keeping an unimplementable variant in
+        // config is a lie; operator must switch to allowlist or open.
+        let s = r#"
+            [[channels.telegram.accounts]]
+            id = "x"
+            adapter_token_ref = "secret:channel:telegram:x"
+            dm_policy = "owner_only"
+        "#;
+        let r: Result<GatewayConfig, _> = toml::from_str(s);
+        assert!(r.is_err(), "owner_only should not parse (removed)");
     }
 
     fn write_tmp_config(body: &str) -> std::path::PathBuf {
