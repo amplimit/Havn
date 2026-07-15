@@ -28,7 +28,10 @@ use havn_db::repo::credentials::{self as creds, CredentialScope};
 use havn_proto::GatewayToAgent;
 use havn_proto::channel::{ChannelFrame, ChannelInbound, ChannelMessageContent};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::str::FromStr as _;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -36,6 +39,7 @@ use crate::AppState;
 use crate::api::ApiError;
 use crate::channel_id_codec;
 use crate::channel_router::{self, AccountKey};
+use crate::config::DmPolicy;
 use crate::secret_ref;
 
 /// Header carrying the operator-generated adapter authentication
@@ -44,6 +48,50 @@ use crate::secret_ref;
 /// finds it by handle and constant-time-compares the decrypted bytes
 /// against this header.
 const ADAPTER_TOKEN_HEADER: &str = "x-adapter-token";
+
+/// Cooldown between rejection messages to the same sender on the same
+/// account. Prevents the bot from becoming a traffic reflector if an
+/// unauthorized sender spams it. 5 minutes matches the replay-buffer
+/// window.
+const DM_REJECT_COOLDOWN: Duration = Duration::from_secs(300);
+
+const DM_REJECT_MESSAGE: &str =
+    "This bot is not available to you. Please contact the system administrator.";
+
+/// Rate-limits rejection messages to unauthorized senders. Without
+/// this an attacker who floods a bot endpoint would trigger equally
+/// many outbound "access denied" replies (reflector amplification).
+///
+/// Key: `"{channel}|{account_id}|{sender_id}"`.
+#[derive(Debug, Clone, Default)]
+pub struct DmRejectLimiter {
+    last_reject: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+}
+
+impl DmRejectLimiter {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns `true` if a rejection should be sent (cooldown expired
+    /// or first rejection for this sender). Lazily prunes stale entries
+    /// when the map exceeds 1 000 keys.
+    pub fn should_send(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let mut map = self.last_reject.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() > 1000 {
+            map.retain(|_, v| now.duration_since(*v) < DM_REJECT_COOLDOWN * 2);
+        }
+        match map.get(key) {
+            Some(last) if now.duration_since(*last) < DM_REJECT_COOLDOWN => false,
+            _ => {
+                map.insert(key.to_string(), now);
+                true
+            }
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ChannelQuery {
@@ -441,6 +489,51 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
         return;
     }
 
+    // --- dm_policy enforcement (spec §3.4, issue #23) ---
+    //
+    // The adapter-daemon WS connection is already authenticated (token
+    // match above), but the *individual sender* must also be authorized
+    // by the account's dm_policy + allow_from. This is the gate the
+    // audit found missing: without it, any platform user who can reach
+    // the bot gets the full agent toolset.
+    let dm_allowed = state
+        .channels
+        .get(channel)
+        .and_then(|entry| entry.accounts.iter().find(|a| a.id == inb.account_id))
+        .is_some_and(|acct| match acct.dm_policy {
+            DmPolicy::Open => true,
+            DmPolicy::Allowlist => acct.allow_from.iter().any(|id| id == &inb.sender_id),
+        });
+
+    if !dm_allowed {
+        warn!(
+            channel,
+            account = %inb.account_id,
+            sender = %inb.sender_id,
+            "dm_policy: rejecting inbound from unauthorized sender"
+        );
+        let limiter_key = format!("{channel}|{}|{}", inb.account_id, inb.sender_id);
+        if state.dm_reject_limiter.should_send(&limiter_key) {
+            let rejection = ChannelMessageContent::Text {
+                text: DM_REJECT_MESSAGE.into(),
+            };
+            if let Err(e) = state
+                .channel_router
+                .deliver(
+                    channel,
+                    &inb.account_id,
+                    &inb.sender_id,
+                    Some(inb.channel_message_id.clone()),
+                    rejection,
+                )
+                .await
+            {
+                warn!(error = %e, "dm_policy: failed to deliver rejection notice");
+            }
+        }
+        return;
+    }
+
     let encoded_channel_id = channel_id_codec::encode(channel, &inb.account_id, &inb.sender_id);
     let content = match inb.content {
         ChannelMessageContent::Text { text } => MessageContent::Text { text },
@@ -502,8 +595,9 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
     // Parity with WebChat: a message to a stopped agent should wake it, not
     // vanish. WebChat lazy-spawns on its WS upgrade (api::webchat_ws); channel
     // inbound had no equivalent, so a message to an offline bound agent used to
-    // be dropped with only a warn. The binding is the authorization here;
-    // attribute the lazy start to the agent's owner for the audit log.
+    // be dropped with only a warn. The binding is the routing decision; per-sender
+    // authorization is handled by dm_policy above. Attribute the lazy start to
+    // the agent's owner for the audit log.
     //
     // This `ensure_running` is awaited inline in the per-account WS read loop,
     // so a cold spawn blocks this one connection (including its ping/pong) for
@@ -587,5 +681,20 @@ mod tests {
         // intent is "no early per-byte exit on equal-length inputs",
         // which the all-equal-length tests above pin.
         assert!(!tokens_match(b"x", b"xxxx"));
+    }
+
+    #[test]
+    fn dm_reject_limiter_allows_first_then_blocks() {
+        let limiter = DmRejectLimiter::new();
+        assert!(limiter.should_send("telegram|bot|tg:1"));
+        assert!(!limiter.should_send("telegram|bot|tg:1"));
+    }
+
+    #[test]
+    fn dm_reject_limiter_independent_keys() {
+        let limiter = DmRejectLimiter::new();
+        assert!(limiter.should_send("telegram|bot|tg:1"));
+        assert!(limiter.should_send("telegram|bot|tg:2"));
+        assert!(!limiter.should_send("telegram|bot|tg:1"));
     }
 }

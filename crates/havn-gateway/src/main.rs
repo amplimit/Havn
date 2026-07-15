@@ -120,6 +120,10 @@ struct AppState {
     /// adapter daemons. Populated when a `/api/v1/channel` WS opens;
     /// drained when an agent replies — see [`crate::channel_router`].
     pub channel_router: channel_router::ChannelRouter,
+    /// Per-sender cooldown for dm_policy rejection messages (spec §3.4,
+    /// issue #23). Prevents the bot from becoming a traffic reflector
+    /// when unauthorized senders spam it.
+    pub dm_reject_limiter: crate::api::channel::DmRejectLimiter,
     pub webchat_router: WebChatRouter,
     /// Origins accepted on the `WebChat` WS endpoint (spec §11). Hot-reloaded
     /// via the config watcher (spec §8.4) — readers swap-load atomically.
@@ -189,6 +193,23 @@ async fn main() -> anyhow::Result<()> {
             reason = ?d.reason,
             "dangling binding — config references unknown channel/account"
         );
+    }
+
+    // Warn on accounts whose dm_policy will reject everyone (allowlist
+    // with no entries). The operator likely forgot to add allow_from or
+    // meant to set dm_policy = "open". Better a startup warning than a
+    // silent "bot doesn't reply" mystery.
+    for (channel_name, entry) in &cfg.channels {
+        for acct in &entry.accounts {
+            if acct.dm_policy == config::DmPolicy::Allowlist && acct.allow_from.is_empty() {
+                warn!(
+                    channel = %channel_name,
+                    account = %acct.id,
+                    "dm_policy is 'allowlist' with empty allow_from — all inbound messages \
+                     will be rejected; set dm_policy = 'open' or add entries to allow_from"
+                );
+            }
+        }
     }
 
     if let Some(parent) = cfg.db_path.parent()
@@ -322,6 +343,7 @@ async fn main() -> anyhow::Result<()> {
         channels: Arc::new(cfg.channels.clone()),
         bindings: Arc::new(cfg.bindings.clone()),
         channel_router: channel_router_state.clone(),
+        dm_reject_limiter: crate::api::channel::DmRejectLimiter::new(),
         webchat_router: webchat_router.clone(),
         allowed_origins,
         admin_rpc: admin_rpc.clone(),
