@@ -137,8 +137,9 @@ impl ToolRegistry {
     /// Build the standard tool set with two-layer policy enforcement (spec §6):
     ///
     /// 1. **Capability layer (here, build time)** — drop tools whose
-    ///    underlying capability is forbidden outright (`can_use_shell`,
-    ///    `can_access_network`). The LLM never sees these even with no
+    ///    underlying capability is forbidden outright (`can_use_shell`;
+    ///    `can_access_network` plus `network_policy.egress_allowed` for
+    ///    `web_fetch`). The LLM never sees these even with no
     ///    context filter.
     /// 2. **Context layer (per call, see [`Self::schemas_for`] /
     ///    [`Self::execute_for`])** — within an allowed capability set,
@@ -158,7 +159,7 @@ impl ToolRegistry {
             Arc::new(files::FileReadTool),
             Arc::new(files::FileWriteTool),
         ];
-        if policy.permissions.can_access_network {
+        if policy.permissions.can_access_network && policy.network_policy.egress_allowed {
             tools.push(Arc::new(network::WebFetchTool));
         }
         if policy.permissions.can_use_shell {
@@ -428,7 +429,8 @@ mod tests {
 
     #[test]
     fn standard_includes_network_and_shell_when_allowed() {
-        let policy = Policy::default();
+        let mut policy = Policy::default();
+        policy.network_policy.egress_allowed = true;
         assert!(policy.permissions.can_access_network);
         assert!(policy.permissions.can_use_shell);
 
@@ -463,10 +465,19 @@ mod tests {
         assert!(names.contains(&"file_read".into()));
     }
 
+    #[test]
+    fn web_fetch_requires_network_egress() {
+        let policy = Policy::default();
+        assert!(policy.permissions.can_access_network);
+        assert!(!policy.network_policy.egress_allowed);
+        assert!(!names_in(&registry(policy).schemas()).contains(&"web_fetch".into()));
+    }
+
     // ---- context layer (per call) -----------------------------------------
 
     fn policy_with_cron_disabled(disabled: &[&str]) -> Policy {
         let mut policy = Policy::default();
+        policy.network_policy.egress_allowed = true;
         policy.context_toolsets.0.insert(
             context::CRON.into(),
             ContextToolsetEntry {
