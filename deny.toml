@@ -6,11 +6,29 @@ all-features = true
 [advisories]
 yanked = "warn"
 ignore = [
-    # paste is unmaintained but has no replacement; transitive dep via rmcp.
+    # paste is unmaintained but has no replacement; proc-macro dep via
+    # fastembed -> tokenizers and fastembed -> image -> ravif -> rav1e (local-embed).
     "RUSTSEC-2024-0436",
     # proc-macro-error2 is unmaintained with no safe upgrade (RUSTSEC-2026-0173);
     # pulled in transitively via age -> i18n-embed-fl. Re-evaluate when age drops it.
     "RUSTSEC-2026-0173",
+    # basic-toml is unmaintained with no safe upgrade (RUSTSEC-2026-0374); its only
+    # dependent is i18n-config, reached from age through the i18n-embed-fl and
+    # i18n-embed-impl proc-macros, so it runs at compile time only.
+    # Re-evaluate when age drops i18n-embed / i18n-config.
+    "RUSTSEC-2026-0374",
+    # rmcp < 3.9 buffers Streamable HTTP response bodies without a bound
+    # (RUSTSEC-2026-0462). havn builds rmcp with default-features = false and only
+    # client + transport-child-process + macros, so that transport is not compiled.
+    # Remove when rmcp is upgraded to >= 3.9.
+    "RUSTSEC-2026-0462",
+    # Bundled SQLite in libsqlite3-sys < 0.39 (RUSTSEC-2026-0459, CVE-2026-119375).
+    # Both sqlx 0.8 and 0.9 cap libsqlite3-sys below 0.39, so the bundled copy cannot
+    # be upgraded yet. sqlx's sqlite-unbundled feature would link a system SQLite
+    # instead, but release binaries are static musl builds that must bundle it.
+    # Tracked in a repository security advisory; remove once sqlx allows
+    # libsqlite3-sys >= 0.39.
+    "RUSTSEC-2026-0459",
 ]
 
 [licenses]
