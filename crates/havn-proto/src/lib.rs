@@ -92,6 +92,8 @@ pub enum GatewayToAgent {
         /// older gateway can interop.
         #[serde(default)]
         model: Option<String>,
+        #[serde(default)]
+        max_tokens: Option<u32>,
         /// Embedding-provider configuration shipped from the gateway
         /// (spec §9.4 v0.7 hybrid retrieval). The runtime instantiates
         /// the right `EmbeddingProvider` impl from this and uses it
@@ -465,6 +467,7 @@ mod tests {
             policy: havn_core::Policy::default(),
             agent_name: None,
             model: None,
+            max_tokens: None,
             embedding: serde_json::Value::Null,
             extra_mounts: Vec::new(),
             tmpfs_mounts: Vec::new(),
@@ -494,6 +497,7 @@ mod tests {
             policy: policy.clone(),
             agent_name: Some("test agent".into()),
             model: Some("claude-sonnet-4-6".into()),
+            max_tokens: Some(8192),
             embedding: serde_json::Value::Null,
             extra_mounts: Vec::new(),
             tmpfs_mounts: Vec::new(),
@@ -503,11 +507,13 @@ mod tests {
         let parsed: GatewayToAgent = serde_json::from_str(&line).expect("parse");
         let GatewayToAgent::Welcome {
             policy: parsed_policy,
+            max_tokens: parsed_max_tokens,
             ..
         } = parsed
         else {
             panic!("wrong variant");
         };
+        assert_eq!(parsed_max_tokens, Some(8192));
         assert!(!parsed_policy.permissions.can_use_shell);
         assert!(!parsed_policy.permissions.can_access_network);
         assert_eq!(
@@ -527,10 +533,14 @@ mod tests {
         // Policy::default() with a warn log.
         let line = r#"{"type":"welcome","session_token":"tok"}"#;
         let parsed: GatewayToAgent = serde_json::from_str(line).expect("parse");
-        let GatewayToAgent::Welcome { policy, .. } = parsed else {
+        let GatewayToAgent::Welcome {
+            policy, max_tokens, ..
+        } = parsed
+        else {
             panic!("wrong variant");
         };
         // Default policy mirrors havn-core's defaults.
         assert!(policy.permissions.can_use_shell);
+        assert_eq!(max_tokens, None);
     }
 }

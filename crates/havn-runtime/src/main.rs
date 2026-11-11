@@ -131,6 +131,7 @@ struct Ctx {
     /// Model resolved at handshake from the agent's `config.model`.
     /// `Arc<String>` so cloning into per-loop `LoopHandle`s is cheap.
     model: Arc<String>,
+    max_tokens: u32,
     /// Pending oneshots for outbound `agent_query` calls (spec §4.4
     /// v0.7). The `agent_query` tool inserts an entry per call; the
     /// reader loop pops on `AgentQueryResult` and resolves the future.
@@ -158,6 +159,7 @@ impl Ctx {
             max_iterations: MAX_TOOL_ITERATIONS,
             messages_mirror: Some(Arc::clone(&self.parent_messages)),
             model: Arc::clone(&self.model),
+            max_tokens: self.max_tokens,
             billing_user_id: None,
         }
     }
@@ -270,6 +272,7 @@ async fn main() -> anyhow::Result<()> {
         policy,
         agent_name,
         model,
+        max_tokens,
         embedder,
         extra_mounts,
         tmpfs_mounts,
@@ -278,6 +281,7 @@ async fn main() -> anyhow::Result<()> {
         Arc<Policy>,
         Option<String>,
         Option<String>,
+        Option<u32>,
         embedding::EmbedderHandle,
         Vec<(std::path::PathBuf, bool)>,
         Vec<std::path::PathBuf>,
@@ -291,6 +295,7 @@ async fn main() -> anyhow::Result<()> {
             policy,
             agent_name: welcome_agent_name,
             model,
+            max_tokens,
             embedding: emb_value,
             extra_mounts: extra_mounts_wire,
             tmpfs_mounts: tmpfs_mounts_wire,
@@ -355,6 +360,7 @@ async fn main() -> anyhow::Result<()> {
                 can_use_shell = policy.permissions.can_use_shell,
                 can_access_network = policy.permissions.can_access_network,
                 model = ?model,
+                max_tokens = ?max_tokens,
                 embedding = provider_label,
                 extra_mounts = extra_mount_pairs.len(),
                 tmpfs_mounts = tmpfs_paths.len(),
@@ -365,6 +371,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(policy),
                 welcome_agent_name,
                 model,
+                max_tokens,
                 embedder,
                 extra_mount_pairs,
                 tmpfs_paths,
@@ -598,6 +605,7 @@ async fn main() -> anyhow::Result<()> {
     // Resolve the runtime's per-session model: gateway-supplied via Welcome,
     // fall back to the compiled-in default. `Arc<String>` so every cloned
     // LoopHandle (parent + each subagent task) shares one allocation.
+    let session_max_tokens: u32 = max_tokens.unwrap_or(crate::tool_loop::DEFAULT_MAX_TOKENS);
     let session_model: Arc<String> = Arc::new(
         model
             .clone()
@@ -616,6 +624,7 @@ async fn main() -> anyhow::Result<()> {
             // base_registry).
             messages_mirror: None,
             model: Arc::clone(&session_model),
+            max_tokens: session_max_tokens,
             // Subagents inherit the billing context per call (set when
             // the parent's loop is itself running an IncomingQuery).
             billing_user_id: None,
@@ -658,6 +667,7 @@ async fn main() -> anyhow::Result<()> {
         parent_messages,
         last_inbound,
         model: session_model,
+        max_tokens: session_max_tokens,
         agent_query_pending,
         incoming_query_registry,
     };
@@ -1409,6 +1419,7 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
         // The temp loop is a closed system — no parent_messages to mirror.
         messages_mirror: None,
         model: Arc::clone(&ctx.model),
+        max_tokens: ctx.max_tokens,
         // Caller pays. Every LlmRequest the loop emits carries this
         // override; the gateway resolves credentials and bills usage
         // against `billing_user_id` instead of this agent's owner.

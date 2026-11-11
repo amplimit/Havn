@@ -145,34 +145,45 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
     //    unavailable, ship `Policy::default()` rather than refuse the
     //    connection. Refusing here would just orphan the runtime; the
     //    spawner would retry into the same dead end.
-    let (policy, model, agent_name): (Policy, Option<String>, Option<String>) =
-        match agents_repo::find_by_id(&ctx.db, agent_id).await {
-            Ok(Some(agent)) => {
-                let model = agent
-                    .config
-                    .get("model")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string);
-                let name = Some(agent.name.clone());
-                // for_session walks per-agent override → user/team
-                // merged → default. Same chain used at spawn time so
-                // cgroup limits and tool registry stay consistent
-                // (spec §6.3).
-                (
-                    policy_resolver::for_session(&ctx.db, &agent, ctx.multi_user).await,
-                    model,
-                    name,
-                )
-            }
-            Ok(None) => {
-                warn!(%agent_id, "agent not found at handshake; sending default policy");
-                (Policy::default(), None, None)
-            }
-            Err(e) => {
-                warn!(%agent_id, error = %e, "policy lookup failed; sending default policy");
-                (Policy::default(), None, None)
-            }
-        };
+    let (policy, model, max_tokens, agent_name): (
+        Policy,
+        Option<String>,
+        Option<u32>,
+        Option<String>,
+    ) = match agents_repo::find_by_id(&ctx.db, agent_id).await {
+        Ok(Some(agent)) => {
+            let model = agent
+                .config
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let max_tokens = agent
+                .config
+                .get("max_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0);
+            let name = Some(agent.name.clone());
+            // for_session walks per-agent override → user/team
+            // merged → default. Same chain used at spawn time so
+            // cgroup limits and tool registry stay consistent
+            // (spec §6.3).
+            (
+                policy_resolver::for_session(&ctx.db, &agent, ctx.multi_user).await,
+                model,
+                max_tokens,
+                name,
+            )
+        }
+        Ok(None) => {
+            warn!(%agent_id, "agent not found at handshake; sending default policy");
+            (Policy::default(), None, None, None)
+        }
+        Err(e) => {
+            warn!(%agent_id, error = %e, "policy lookup failed; sending default policy");
+            (Policy::default(), None, None, None)
+        }
+    };
 
     let session_token = Uuid::now_v7().to_string();
     write_frame(
@@ -182,6 +193,7 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
             policy,
             agent_name,
             model,
+            max_tokens,
             embedding: ctx.embedding_config.load().as_ref().clone(),
             // Wire form is `{path: String, mode: "ro"|"rw"}`; we
             // translate from the spawner type once at handshake. Empty
@@ -586,7 +598,7 @@ fn build_anthropic_request(req: &LlmRequest) -> anyhow::Result<AnthropicRequest>
         .get("max_tokens")
         .and_then(serde_json::Value::as_u64)
         .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(1024);
+        .unwrap_or(8192);
     let system = req
         .options
         .get("system")
