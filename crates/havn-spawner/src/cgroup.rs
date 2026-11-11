@@ -31,6 +31,8 @@ use tracing::{debug, warn};
 /// missing and writable.
 const SLICE: &str = "havn.slice";
 
+const REQUIRED_CONTROLLERS: &[&str] = &["cpu", "memory", "pids"];
+
 /// cgroup v2 cpu.max period — the standard 100 ms scheduler window. Quota is
 /// derived per-agent from `cpu_cores * PERIOD_US`.
 const PERIOD_US: u64 = 100_000;
@@ -58,6 +60,17 @@ pub enum CgroupError {
     },
     #[error("cannot remove cgroup {0}")]
     Cleanup(PathBuf),
+    #[error(
+        "cannot enable cgroup controllers `{controllers}` in {file}: {source} \
+         (run the gateway as root on a systemd host, or delegate these controllers \
+         to havn.slice)"
+    )]
+    ControllerDelegation {
+        file: PathBuf,
+        controllers: String,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// Stats snapshot for a single agent cgroup.
@@ -106,6 +119,7 @@ impl CgroupController {
             );
             return Err(CgroupError::SliceCreate(slice));
         }
+        delegate_controllers(&root, &slice)?;
         Ok(Self { root, slice })
     }
 
@@ -234,6 +248,36 @@ fn format_pids_max(pids_max: u32) -> String {
     }
 }
 
+fn delegate_controllers(root: &Path, slice: &Path) -> Result<(), CgroupError> {
+    let root_control = root.join("cgroup.subtree_control");
+    let enabled = fs::read_to_string(&root_control).map_err(|e| CgroupError::ReadFailed {
+        file: root_control.clone(),
+        source: e,
+    })?;
+    let missing: Vec<&str> = REQUIRED_CONTROLLERS
+        .iter()
+        .copied()
+        .filter(|c| !enabled.split_whitespace().any(|e| e == *c))
+        .collect();
+    if !missing.is_empty() {
+        enable_controllers(&root_control, &missing)?;
+    }
+    enable_controllers(&slice.join("cgroup.subtree_control"), REQUIRED_CONTROLLERS)
+}
+
+fn enable_controllers(control: &Path, controllers: &[&str]) -> Result<(), CgroupError> {
+    let request = controllers
+        .iter()
+        .map(|c| format!("+{c}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    fs::write(control, &request).map_err(|e| CgroupError::ControllerDelegation {
+        file: control.to_path_buf(),
+        controllers: request,
+        source: e,
+    })
+}
+
 fn write_file(path: &Path, contents: &str) -> Result<(), CgroupError> {
     fs::write(path, contents).map_err(|e| CgroupError::WriteFailed {
         file: path.to_path_buf(),
@@ -274,11 +318,60 @@ mod tests {
     /// Build a minimal "cgroup v2 root" in a tempdir: contains
     /// `cgroup.controllers` so [`CgroupController::with_root`] is happy.
     fn fake_v2_root() -> PathBuf {
+        fake_v2_root_with_enabled("cpu io memory pids")
+    }
+
+    fn fake_v2_root_with_enabled(root_subtree_control: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!("havn-cg-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&p).expect("mkdir");
         File::create(p.join("cgroup.controllers")).expect("touch cgroup.controllers");
+        std::fs::write(p.join("cgroup.subtree_control"), root_subtree_control)
+            .expect("write cgroup.subtree_control");
         p
+    }
+
+    #[test]
+    fn with_root_enables_required_controllers_on_slice() {
+        let root = fake_v2_root();
+        let ctl = CgroupController::with_root(root.clone()).expect("ctl");
+        let slice_control =
+            std::fs::read_to_string(ctl.slice().join("cgroup.subtree_control")).expect("read");
+        assert_eq!(slice_control, "+cpu +memory +pids");
+        let root_control =
+            std::fs::read_to_string(root.join("cgroup.subtree_control")).expect("read");
+        assert_eq!(root_control, "cpu io memory pids");
+    }
+
+    #[test]
+    fn with_root_enables_missing_controllers_on_root_first() {
+        let root = fake_v2_root_with_enabled("cpu io");
+        CgroupController::with_root(root.clone()).expect("ctl");
+        let root_control =
+            std::fs::read_to_string(root.join("cgroup.subtree_control")).expect("read");
+        assert_eq!(root_control, "+memory +pids");
+    }
+
+    #[test]
+    fn with_root_rejects_slice_without_writable_subtree_control() {
+        let root = fake_v2_root();
+        let control = root.join(SLICE).join("cgroup.subtree_control");
+        std::fs::create_dir_all(&control).expect("mkdir");
+        let err = CgroupController::with_root(root).expect_err("must fail");
+        assert!(
+            matches!(err, CgroupError::ControllerDelegation { ref file, .. } if *file == control),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn with_root_rejects_root_without_subtree_control() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("havn-cg-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&p).expect("mkdir");
+        File::create(p.join("cgroup.controllers")).expect("touch cgroup.controllers");
+        let err = CgroupController::with_root(p).expect_err("must fail");
+        assert!(matches!(err, CgroupError::ReadFailed { .. }), "{err:?}");
     }
 
     #[test]

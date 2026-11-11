@@ -466,6 +466,8 @@ mod tests {
         p.push(format!("havn-ns-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&p).expect("mkdir");
         File::create(p.join("cgroup.controllers")).expect("touch cgroup.controllers");
+        std::fs::write(p.join("cgroup.subtree_control"), "cpu io memory pids")
+            .expect("write cgroup.subtree_control");
         p
     }
 
