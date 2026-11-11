@@ -408,6 +408,7 @@ async fn main() -> anyhow::Result<()> {
         admin_rpc,
         query_broker,
         embedding_config: embedding_config.clone(),
+        multi_user: cfg.trust_header.enabled,
         extra_mounts: cfg.extra_mounts.clone(),
         tmpfs_mounts: cfg.tmpfs_mounts.clone(),
         seccomp_allow_extra: cfg.seccomp.allow_extra.clone(),

@@ -66,6 +66,7 @@ pub struct AgentSocketCtx {
     /// `PATCH /embedding` atomically affects every subsequent Welcome
     /// without a side-channel.
     pub embedding_config: Arc<arc_swap::ArcSwap<serde_json::Value>>,
+    pub multi_user: bool,
     /// Operator-declared extra bind-mounts shipped to each runtime in
     /// Welcome so it can add Landlock entries (spec §4.1 v0.7). Cloned
     /// from `GatewayConfig::extra_mounts` at startup; same list the
@@ -158,7 +159,7 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
                 // cgroup limits and tool registry stay consistent
                 // (spec §6.3).
                 (
-                    policy_resolver::for_session(&ctx.db, &agent).await,
+                    policy_resolver::for_session(&ctx.db, &agent, ctx.multi_user).await,
                     model,
                     name,
                 )

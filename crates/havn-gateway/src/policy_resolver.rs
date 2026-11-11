@@ -1,18 +1,9 @@
 //! Per-agent policy resolution (spec §6).
 //!
-//! Per-agent override chain:
-//!
-//! ```text
-//! 1. Agent.config["policy"]   ← per-agent override stored as JSON
-//! 2. Policy::default()        ← system default (havn-core)
-//! ```
-//!
-//! `for_user` (below) walks team memberships → roles to derive the
-//! user-level policy used for `max_agents`, `can_schedule_cron`, etc.
-//! Future: merge the agent override with the resolved team-role policy
-//! per spec §6.3 (per-agent override → team role → system default).
-//! Today the agent-side chain stops at the override; team policy
-//! affects the *user* surface only.
+//! `for_user` derives a user's policy from their team roles (or the
+//! single-user default when they belong to no team). `for_session` adds
+//! the per-agent override (`Agent.config["policy"]`): applied as written
+//! in single-user mode, clamped to the owner's policy in multi-user mode.
 //!
 //! Resolution runs once per agent connection — during the gateway-side
 //! `Welcome` handshake — and the resulting snapshot is shipped to the
@@ -25,13 +16,6 @@ use havn_db::repo::agents::Agent;
 use sqlx::SqlitePool;
 use tracing::warn;
 
-/// Resolve the effective policy for `agent`.
-///
-/// Never fails: a malformed `config.policy` value falls back to
-/// `Policy::default()` with a warn log so misconfiguration tightens
-/// privileges rather than expanding them. (Returning an error here would
-/// either reject the agent connection — bad for ux — or force every
-/// caller to re-implement the same fallback.)
 /// Resolve the effective policy for a user (independent of any one
 /// agent — used to enforce `max_agents`, `can_bind_channels`,
 /// `can_schedule_cron`, etc. *before* an agent is created or a
@@ -45,10 +29,11 @@ use tracing::warn;
 /// agent.
 ///
 /// Walks `team_memberships → roles → policy` for `user_id`. When the
-/// user belongs to one or more teams, returns the most-permissive of
-/// their team-role policies (max of `max_agents`, OR of capability
-/// flags). When the user belongs to no team, returns the single-user
-/// default — `Policy::default()` widened with `HAVN_MAX_AGENTS_PER_USER`.
+/// user belongs to one or more teams, returns the most-permissive
+/// combination of their role policies themselves ([`Policy::widen_with`]),
+/// so a role's restrictions hold; `HAVN_MAX_AGENTS_PER_USER` caps
+/// `max_agents`. When the user belongs to no team, returns the single-user
+/// default. Lookup failures fall back to a restrictive policy.
 ///
 /// The "max wins" merge is deliberate: a user who is admin of team A
 /// and a viewer of team B should get the union of capabilities,
@@ -63,30 +48,49 @@ pub async fn for_user(db: &SqlitePool, user_id: UserId) -> Policy {
         .filter(|&n| n > 0);
     base.max_agents = env_cap.unwrap_or(50);
 
-    // Walk teams + roles. Skip silently on DB errors — the safe fall-back
-    // is the conservative single-user default rather than blocking the
-    // user from creating an agent because of a transient lookup failure.
     let memberships = match havn_db::repo::team_memberships::list_for_user(db, user_id).await {
         Ok(m) => m,
         Err(e) => {
-            warn!(%user_id, error = %e, "team membership lookup failed; using single-user default");
-            return base;
+            warn!(%user_id, error = %e, "team membership lookup failed; using the most restrictive policy");
+            return restrictive_fallback();
         }
     };
     if memberships.is_empty() {
         return base;
     }
+    let mut merged: Option<Policy> = None;
     for m in memberships {
-        if let Ok(Some(role)) = havn_db::repo::roles::find_by_id(db, m.role_id).await {
-            base.max_agents = base.max_agents.max(role.policy.max_agents);
-            base.permissions.can_install_skills |= role.policy.permissions.can_install_skills;
-            base.permissions.can_access_network |= role.policy.permissions.can_access_network;
-            base.permissions.can_use_shell |= role.policy.permissions.can_use_shell;
-            base.permissions.can_spawn_subagents |= role.policy.permissions.can_spawn_subagents;
-            base.permissions.can_schedule_cron |= role.policy.permissions.can_schedule_cron;
+        match havn_db::repo::roles::find_by_id(db, m.role_id).await {
+            Ok(Some(role)) => {
+                merged = Some(match merged {
+                    Some(acc) => acc.widen_with(&role.policy),
+                    None => role.policy,
+                });
+            }
+            Ok(None) => {
+                warn!(%user_id, role_id = %m.role_id, "membership references a missing role")
+            }
+            Err(e) => warn!(%user_id, role_id = %m.role_id, error = %e, "role lookup failed"),
         }
     }
-    base
+    let Some(mut policy) = merged else {
+        warn!(%user_id, "no role policy could be loaded; using the most restrictive policy");
+        return restrictive_fallback();
+    };
+    if let Some(cap) = env_cap {
+        policy.max_agents = policy.max_agents.min(cap);
+    }
+    policy
+}
+
+fn restrictive_fallback() -> Policy {
+    let mut p = Policy::default();
+    p.max_agents = 0;
+    p.permissions.can_install_skills = false;
+    p.permissions.can_access_network = false;
+    p.permissions.can_use_shell = false;
+    p.permissions.can_schedule_cron = false;
+    p
 }
 
 /// Per-agent override only — pure / sync. Returns `None` when the
@@ -109,9 +113,9 @@ pub fn override_for(agent: &Agent) -> Option<Policy> {
     }
 }
 
-/// Full per-session resolution chain (spec §6.3): per-agent override
-/// wins, falling through to the owner's user/team-merged policy, then
-/// the system default.
+/// Full per-session resolution chain (spec §6.3): the owner's policy,
+/// with the per-agent override applied on top (clamped to the owner's
+/// policy when `multi_user`).
 ///
 /// This is what *both* the spawn-time path (cgroup limits) and the
 /// Welcome handshake (runtime tool registry) consult, so the agent
@@ -121,11 +125,13 @@ pub fn override_for(agent: &Agent) -> Option<Policy> {
 /// granting `memory_mb: 1024` saw the override in their tool
 /// registry but their cgroup was still capped at the system default
 /// 512 MiB. Drift fix.
-pub async fn for_session(db: &SqlitePool, agent: &Agent) -> Policy {
-    if let Some(p) = override_for(agent) {
-        return p;
+pub async fn for_session(db: &SqlitePool, agent: &Agent, multi_user: bool) -> Policy {
+    let owner = for_user(db, agent.owner_id).await;
+    match override_for(agent) {
+        Some(p) if multi_user => p.clamp_to(&owner),
+        Some(p) => p,
+        None => owner,
     }
-    for_user(db, agent.owner_id).await
 }
 
 #[cfg(test)]
@@ -207,5 +213,121 @@ mod tests {
             cron.disabled,
             vec!["shell".to_string(), "web_fetch".to_string()]
         );
+    }
+
+    fn widening_override() -> Agent {
+        agent_with(json!({
+            "policy": {
+                "permissions": { "can_spawn_subagents": true, "can_use_mcp": true },
+                "resource_limits": { "memory_mb": 4096, "pids_max": 4096 }
+            }
+        }))
+    }
+
+    #[tokio::test]
+    async fn multi_user_override_cannot_exceed_owner_policy() {
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let p = for_session(&db, &widening_override(), true).await;
+        assert!(!p.permissions.can_spawn_subagents);
+        assert!(!p.permissions.can_use_mcp);
+        assert_eq!(p.resource_limits.memory_mb, 512);
+        assert_eq!(p.resource_limits.pids_max, 64);
+    }
+
+    async fn user_in_roles(db: &SqlitePool, roles: &[&str]) -> havn_core::UserId {
+        use havn_db::repo::{roles as role_repo, team_memberships, teams, users};
+        let user = users::create(db, users::NewUser { display_name: "m" })
+            .await
+            .expect("user");
+        for (i, name) in roles.iter().enumerate() {
+            let team = teams::create(
+                db,
+                teams::NewTeam {
+                    name: &format!("team-{i}"),
+                },
+            )
+            .await
+            .expect("team");
+            let role = role_repo::find_by_team_and_name(db, None, name)
+                .await
+                .expect("lookup")
+                .expect("seeded role");
+            team_memberships::add(db, user.id, team.id, role.id)
+                .await
+                .expect("membership");
+        }
+        user.id
+    }
+
+    #[tokio::test]
+    async fn member_role_restrictions_apply() {
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let uid = user_in_roles(&db, &["member"]).await;
+        let p = for_user(&db, uid).await;
+        assert!(!p.permissions.can_use_shell);
+        assert!(!p.permissions.can_spawn_subagents);
+        assert_eq!(p.max_agents, 5);
+        assert_eq!(p.budget.max_tokens_per_day, 1_000_000);
+        assert_eq!(
+            p.context_toolsets.0["cron"].disabled,
+            vec!["shell".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn member_override_cannot_enable_shell_or_raise_limits() {
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let mut agent = agent_with(json!({
+            "policy": {
+                "permissions": { "can_use_shell": true },
+                "resource_limits": { "memory_mb": 4096 },
+                "budget": { "max_tokens_per_day": 0 }
+            }
+        }));
+        agent.owner_id = user_in_roles(&db, &["member"]).await;
+        let p = for_session(&db, &agent, true).await;
+        assert!(!p.permissions.can_use_shell);
+        assert_eq!(p.resource_limits.memory_mb, 512);
+        assert_eq!(p.budget.max_tokens_per_day, 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn multiple_roles_combine_to_the_most_permissive() {
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let uid = user_in_roles(&db, &["member", "admin"]).await;
+        let p = for_user(&db, uid).await;
+        assert!(p.permissions.can_use_shell);
+        assert_eq!(p.resource_limits.memory_mb, 1024);
+        assert_eq!(p.budget.max_tokens_per_day, 0);
+        assert!(
+            p.context_toolsets
+                .0
+                .get("cron")
+                .is_none_or(|c| c.disabled.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn override_mcp_servers_need_a_role_grant() {
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let mut agent = agent_with(json!({
+            "policy": {
+                "permissions": { "can_use_mcp": true },
+                "mcp_servers": { "fs": { "binary": "fs", "extra_paths_rw": ["/"] } }
+            }
+        }));
+        agent.owner_id = user_in_roles(&db, &["admin"]).await;
+        let p = for_session(&db, &agent, true).await;
+        assert!(!p.permissions.can_use_mcp);
+        assert!(p.mcp_servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn single_user_override_applies_as_written() {
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let p = for_session(&db, &widening_override(), false).await;
+        assert!(p.permissions.can_spawn_subagents);
+        assert!(p.permissions.can_use_mcp);
+        assert_eq!(p.resource_limits.memory_mb, 4096);
     }
 }

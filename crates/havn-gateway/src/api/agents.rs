@@ -117,7 +117,7 @@ pub async fn create(
     let current_count = repo::count_for_owner(&state.db, user.id).await?;
     if current_count >= user_policy.max_agents {
         return Err(ApiError::Forbidden(format!(
-            "agent quota exhausted: {current_count}/{} agents already created. Adjust HAVN_MAX_AGENTS_PER_USER or remove an existing agent.",
+            "agent quota exhausted: {current_count}/{} agents already created. Raise max_agents in your team role (or HAVN_MAX_AGENTS_PER_USER without teams) or remove an existing agent.",
             user_policy.max_agents
         )));
     }
@@ -310,7 +310,9 @@ pub async fn ensure_running(
         let agent_row = repo::find_by_id(&state.db, id)
             .await?
             .ok_or(ApiError::NotFound)?;
-        let policy = policy_resolver::for_session(&state.db, &agent_row).await;
+        let policy =
+            policy_resolver::for_session(&state.db, &agent_row, state.trusted_proxies.is_some())
+                .await;
 
         let handle = state.spawner.spawn(&cfg, &policy).await.map_err(|e| {
             tracing::error!(agent_id = %id, error = %e, "spawner.spawn failed");
