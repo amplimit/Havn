@@ -287,7 +287,7 @@ async fn main() -> anyhow::Result<()> {
         .context("reading Welcome")?
     {
         Some(GatewayToAgent::Welcome {
-            session_token,
+            session_token: _,
             policy,
             agent_name: welcome_agent_name,
             model,
@@ -351,7 +351,6 @@ async fn main() -> anyhow::Result<()> {
                 .map(|m| std::path::PathBuf::from(m.path))
                 .collect();
             info!(
-                token = %session_token,
                 agent_name = ?welcome_agent_name,
                 can_use_shell = policy.permissions.can_use_shell,
                 can_access_network = policy.permissions.can_access_network,
