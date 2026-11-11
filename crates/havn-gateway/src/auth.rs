@@ -254,7 +254,7 @@ pub async fn resolve(parts: &Parts, app: &AppState) -> Result<AuthedUser, ApiErr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(
         clippy::expect_used,
         clippy::unwrap_used,
@@ -269,7 +269,7 @@ mod tests {
 
     /// Build an AppState with a real in-memory DB + a bootstrap user.
     /// Returns the state and the bootstrap user's ID.
-    async fn state_with(trust: bool) -> (AppState, UserId) {
+    pub(crate) async fn state_with(trust: bool) -> (AppState, UserId) {
         use crate::agent_registry::AgentRegistry;
         use crate::webchat::WebChatRouter;
         use arc_swap::ArcSwap;
