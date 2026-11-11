@@ -158,7 +158,7 @@ impl ToolRegistry {
             Arc::new(files::FileReadTool),
             Arc::new(files::FileWriteTool),
         ];
-        if policy.permissions.can_access_network {
+        if policy.permissions.can_access_network && policy.network_policy.egress_allowed {
             tools.push(Arc::new(network::WebFetchTool));
         }
         if policy.permissions.can_use_shell {
@@ -428,7 +428,8 @@ mod tests {
 
     #[test]
     fn standard_includes_network_and_shell_when_allowed() {
-        let policy = Policy::default();
+        let mut policy = Policy::default();
+        policy.network_policy.egress_allowed = true;
         assert!(policy.permissions.can_access_network);
         assert!(policy.permissions.can_use_shell);
 
@@ -463,10 +464,19 @@ mod tests {
         assert!(names.contains(&"file_read".into()));
     }
 
+    #[test]
+    fn web_fetch_requires_network_egress() {
+        let policy = Policy::default();
+        assert!(policy.permissions.can_access_network);
+        assert!(!policy.network_policy.egress_allowed);
+        assert!(!names_in(&registry(policy).schemas()).contains(&"web_fetch".into()));
+    }
+
     // ---- context layer (per call) -----------------------------------------
 
     fn policy_with_cron_disabled(disabled: &[&str]) -> Policy {
         let mut policy = Policy::default();
+        policy.network_policy.egress_allowed = true;
         policy.context_toolsets.0.insert(
             context::CRON.into(),
             ContextToolsetEntry {
