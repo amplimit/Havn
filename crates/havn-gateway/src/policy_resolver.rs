@@ -21,12 +21,10 @@ use tracing::warn;
 /// `can_schedule_cron`, etc. *before* an agent is created or a
 /// channel/cron is added).
 ///
-/// Phase 2 (now): returns `Policy::default()` with `max_agents` lifted
-/// to a sane single-user cap (50). The Policy struct's own default of 1
-/// is the conservative spec default for an *unauthorized* user; in
-/// single-user mode the gateway's bootstrap user gets a more permissive
-/// baseline so the install→first-chat SLO doesn't trip on the second
-/// agent.
+/// Without team memberships this is `Policy::default()` with `max_agents`
+/// lifted to a single-user cap (50, or `HAVN_MAX_AGENTS_PER_USER`). The
+/// Policy struct's own default of 1 is the conservative spec default for an
+/// *unauthorized* user.
 ///
 /// Walks `team_memberships → roles → policy` for `user_id`. When the
 /// user belongs to one or more teams, returns the most-permissive

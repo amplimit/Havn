@@ -10,8 +10,7 @@
 //! max_requests_per_minute}`. The credential resolver consults these
 //! at LLM-proxy time (see `crate::credential_resolver::per_user_ceilings_remaining`).
 //!
-//! Spec §1.5 (`Phase 2 still to land`): "team-level credentials with
-//! per-user token / RPM caps (the schema supports it; consume + UI)".
+//! Spec §1.5: "team-level credentials with per-user token / RPM caps".
 //! This module is the consume-side; the dashboard is the UI.
 
 use axum::Json;
