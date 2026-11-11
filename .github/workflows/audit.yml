@@ -1,0 +1,47 @@
+name: audit
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  push:
+    branches: [main]
+    paths: ['Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'deny.toml', '.github/workflows/audit.yml']
+  pull_request:
+    branches: [main]
+    paths: ['Cargo.toml', 'Cargo.lock', '**/Cargo.toml', 'deny.toml', '.github/workflows/audit.yml']
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: cargo-deny advisories
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+
+  report:
+    name: report scheduled failure
+    needs: advisories
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: 'audit: scheduled cargo-deny advisories check failed'
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          existing=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "Still failing: $RUN_URL"
+          else
+            gh issue create --title "$TITLE" --body "The daily RustSec advisories check failed on \`main\`: $RUN_URL"
+          fi

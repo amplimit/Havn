@@ -23,9 +23,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The runner already has a stable Rust toolchain via dtolnay/rust-toolchain;
-      # install.sh skips its own rustup step when HAVN_SKIP_RUSTUP=1.
-      - uses: dtolnay/rust-toolchain@stable
+      # rust-toolchain.toml is the single toolchain source; install.sh skips its
+      # own rustup step when HAVN_SKIP_RUSTUP=1.
+      - run: rustup show
 
       # Cache the cargo registry + git index + target/ so re-runs measure the
       # incremental build path (which is what the production SLO targets:
@@ -52,11 +52,37 @@ jobs:
           # rather than the kernel-isolation primitives (those are covered
           # by spawner unit tests and a separate `cargo test` job).
           HAVN_SPAWNER: subprocess
+          HAVN_SMOKE_EXPECT_SPAWNER: subprocess
 
       - name: upload gateway log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: gateway-log
+          path: ${{ runner.temp }}/havn-gateway.log
+          if-no-files-found: ignore
+
+  namespace-isolation:
+    name: NamespaceSpawner isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: install jq
+        run: sudo apt-get update -qq && sudo apt-get install -y jq
+      - name: build
+        run: cargo build --bins
+      # The real NamespaceSpawner needs cgroup v2 write access, which on a
+      # systemd host means running the gateway as root.
+      - name: run smoke test as root with NamespaceSpawner
+        run: |
+          sudo env "PATH=$PWD/target/debug:$PATH"             RUNNER_TEMP="$RUNNER_TEMP"             HAVN_SKIP_INSTALL=1             HAVN_SMOKE_EXPECT_SPAWNER=namespace             ./scripts/smoke.sh
+      - name: upload gateway log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-log-namespace
           path: ${{ runner.temp }}/havn-gateway.log
           if-no-files-found: ignore

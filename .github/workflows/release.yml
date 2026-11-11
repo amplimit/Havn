@@ -24,8 +24,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  audit:
+    uses: ./.github/workflows/audit.yml
+    permissions:
+      contents: read
+      issues: write
+
   build:
     name: build ${{ matrix.target }}
+    needs: [ci, audit]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false

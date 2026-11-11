@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,9 +18,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      # rust-toolchain.toml is the single toolchain source (channel + components);
+      # `rustup show` installs exactly that.
+      - run: rustup show
       - run: cargo fmt --all --check
 
   clippy:
@@ -27,9 +28,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -38,7 +37,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features
 
@@ -47,6 +46,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # Advisories live in audit.yml: the RustSec database changes daily, so a
+      # time-varying check does not belong in the gate for unrelated PRs.
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check advisories bans licenses sources
+          command: check bans licenses sources

@@ -35,6 +35,8 @@ if [ "${HAVN_SKIP_INSTALL:-0}" != "1" ]; then
     HAVN_PROFILE="${HAVN_PROFILE:-debug}" \
     HAVN_SKIP_RUSTUP="${HAVN_SKIP_RUSTUP:-1}" \
         bash ./install.sh
+else
+    havn setup --non-interactive >/dev/null
 fi
 
 # 2. background-start the gateway.
@@ -87,6 +89,22 @@ done
 [ "$CONNECTED" = "true" ] \
     || { tail -100 "$GATEWAY_LOG" >&2; die "agent never connected to socket"; }
 ok "agent connected (WebChat endpoint will now accept WS upgrades)"
+
+case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
+    namespace)
+        grep -q "agent spawner: NamespaceSpawner" "$GATEWAY_LOG" \
+            || { tail -50 "$GATEWAY_LOG" >&2; die "gateway did not select NamespaceSpawner"; }
+        CGROUP="/sys/fs/cgroup/havn.slice/agent-$AGENT_ID"
+        for limit in memory.max cpu.max pids.max; do
+            [ -f "$CGROUP/$limit" ] || die "agent cgroup is missing $limit ($CGROUP)"
+        done
+        ok "NamespaceSpawner isolation: memory.max=$(cat "$CGROUP/memory.max") pids.max=$(cat "$CGROUP/pids.max")"
+        ;;
+    subprocess)
+        grep -q "agent spawner: SubprocessSpawner" "$GATEWAY_LOG" \
+            || die "gateway did not select SubprocessSpawner"
+        ;;
+esac
 
 # 7. verify the WebSocket upgrade is accepted. Curl will return non-zero on
 #    a non-101 response; we use --max-time to bail out of the long-poll.
