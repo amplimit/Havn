@@ -155,6 +155,7 @@ struct AppState {
     /// via `config.toml` (the file is the canonical operator-facing
     /// source of truth — see spec §1.6 "infrastructure not SaaS").
     pub embedding_config: Arc<ArcSwap<serde_json::Value>>,
+    pub agent_env_passthrough: Arc<Vec<String>>,
     /// Credential encryption-at-rest handle (spec §13 Phase 3).
     /// `None` means the operator hasn't set `HAVN_AGE_KEY` AND the
     /// credentials table is empty — in that mode the gateway runs
@@ -349,6 +350,7 @@ async fn main() -> anyhow::Result<()> {
         admin_rpc: admin_rpc.clone(),
         start_locks,
         embedding_config: embedding_config.clone(),
+        agent_env_passthrough: Arc::new(api::agents::embedding_env_passthrough(&cfg.embedding)),
         keyring: keyring.clone(),
     };
 

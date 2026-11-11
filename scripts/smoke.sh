@@ -43,7 +43,7 @@ fi
 log "starting gateway"
 LOG_DIR="${RUNNER_TEMP:-/tmp}"
 GATEWAY_LOG="$LOG_DIR/havn-gateway.log"
-nohup havn start >"$GATEWAY_LOG" 2>&1 &
+HAVN_AGE_KEY="${HAVN_AGE_KEY:-havn-smoke-canary}" nohup havn start >"$GATEWAY_LOG" 2>&1 &
 GW_PID=$!
 cleanup() {
     if [ -n "${AGENT_ID:-}" ]; then
@@ -127,6 +127,19 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
             || die "gateway did not select SubprocessSpawner"
         ;;
 esac
+
+AGENT_PIDS=$(for pid in $(pgrep -x havn-runtime) $(pgrep -x havn-init); do
+    if tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q -- "--agent-id $AGENT_ID "; then echo "$pid"; fi
+done)
+[ -n "$AGENT_PIDS" ] || die "no havn-runtime process for agent $AGENT_ID"
+for pid in $AGENT_PIDS; do
+    ENVIRON=$(tr '\0' '\n' < "/proc/$pid/environ") || die "cannot read /proc/$pid/environ"
+    printf '%s\n' "$ENVIRON" | grep -q '^PATH=' || die "unexpected environment for pid $pid"
+    if printf '%s\n' "$ENVIRON" | grep -q '^HAVN_AGE_KEY='; then
+        die "agent process $pid ($(cat "/proc/$pid/comm")) inherited HAVN_AGE_KEY from the gateway"
+    fi
+done
+ok "agent environment: $(printf '%s\n' "$ENVIRON" | cut -d= -f1 | paste -sd' ')"
 
 # 7. verify the WebSocket upgrade is accepted. Curl will return non-zero on
 #    a non-101 response; we use --max-time to bail out of the long-poll.

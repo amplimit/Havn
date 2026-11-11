@@ -305,6 +305,7 @@ pub async fn ensure_running(
             tmpfs_mounts: state.tmpfs_mounts.clone(),
             seccomp_allow_extra: state.seccomp_allow_extra.clone(),
             agent_dns: state.agent_dns.clone(),
+            env_passthrough: state.agent_env_passthrough.as_ref().clone(),
         };
         let agent_row = repo::find_by_id(&state.db, id)
             .await?
@@ -458,4 +459,44 @@ pub(crate) async fn resolve_agent(
 
 pub(crate) fn workspace_for(state: &AppState, id: AgentId) -> std::path::PathBuf {
     state.workspace_root.join(id.to_string()).join("workspace")
+}
+
+pub(crate) fn embedding_env_passthrough(embedding: &serde_json::Value) -> Vec<String> {
+    if embedding
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        != Some("openai")
+    {
+        return Vec::new();
+    }
+    let name = embedding
+        .get("api_key_env")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("OPENAI_API_KEY");
+    vec![name.to_string()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::embedding_env_passthrough;
+    use serde_json::json;
+
+    #[test]
+    fn passthrough_is_empty_unless_openai_embeddings() {
+        assert!(embedding_env_passthrough(&json!({ "provider": "disabled" })).is_empty());
+        assert!(embedding_env_passthrough(&json!({ "provider": "hrr" })).is_empty());
+        assert!(embedding_env_passthrough(&serde_json::Value::Null).is_empty());
+    }
+
+    #[test]
+    fn passthrough_names_the_configured_openai_key_variable() {
+        assert_eq!(
+            embedding_env_passthrough(&json!({ "provider": "openai" })),
+            ["OPENAI_API_KEY"]
+        );
+        assert_eq!(
+            embedding_env_passthrough(&json!({ "provider": "openai", "api_key_env": "EMBED_KEY" })),
+            ["EMBED_KEY"]
+        );
+    }
 }

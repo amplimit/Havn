@@ -13,6 +13,7 @@
 //! The trait surface is preserved so future backends (gVisor,
 //! Firecracker) can be added without touching the gateway.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -91,6 +92,46 @@ pub struct AgentSpawnConfig {
     /// empty in production.
     #[serde(default)]
     pub agent_dns: Vec<String>,
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+}
+
+const AGENT_BASE_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "RUST_LOG",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "XDG_CACHE_HOME",
+    "HAVN_RECENT_EVENTS_DAYS",
+    "HAVN_RECENT_EVENTS_LIMIT",
+    "HAVN_AUTO_COMMIT",
+];
+
+pub fn agent_environment<F>(passthrough: &[String], source: F) -> Vec<(String, OsString)>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    let mut names: Vec<&str> = AGENT_BASE_ENV.to_vec();
+    for name in passthrough {
+        if !name.starts_with("HAVN_") && !names.contains(&name.as_str()) {
+            names.push(name);
+        }
+    }
+    names
+        .into_iter()
+        .filter_map(|name| source(name).map(|value| (name.to_string(), value)))
+        .collect()
 }
 
 /// One operator-declared tmpfs mount carried into the agent namespace
@@ -315,6 +356,44 @@ pub enum SpawnerError {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn gateway_env(name: &str) -> Option<OsString> {
+        match name {
+            "PATH" => Some("/usr/bin".into()),
+            "RUST_LOG" => Some("info".into()),
+            "HAVN_AGE_KEY" => Some("master-passphrase".into()),
+            "OPENROUTER_API_KEY" => Some("sk-or-secret".into()),
+            "OPENAI_API_KEY" => Some("sk-embedding".into()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn agent_environment_keeps_only_allowlisted_variables() {
+        let env = agent_environment(&[], gateway_env);
+        let names: Vec<&str> = env.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["PATH", "RUST_LOG"]);
+    }
+
+    #[test]
+    fn agent_environment_adds_explicit_passthrough() {
+        let env = agent_environment(&["OPENAI_API_KEY".to_string()], gateway_env);
+        assert!(env.contains(&("OPENAI_API_KEY".to_string(), "sk-embedding".into())));
+        assert!(!env.iter().any(|(name, _)| name == "OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn agent_environment_never_passes_age_key() {
+        let env = agent_environment(&["HAVN_AGE_KEY".to_string()], gateway_env);
+        assert!(!env.iter().any(|(name, _)| name == "HAVN_AGE_KEY"));
+    }
+
+    #[test]
+    fn agent_environment_rejects_any_havn_passthrough() {
+        let source = |name: &str| (name == "HAVN_TRUST_HEADER").then(|| "1".into());
+        let env = agent_environment(&["HAVN_TRUST_HEADER".to_string()], source);
+        assert!(env.is_empty());
+    }
 
     #[test]
     fn extra_mounts_codec_round_trip() {

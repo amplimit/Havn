@@ -191,6 +191,7 @@ mod tests {
             embedding_config: Arc::new(ArcSwap::from_pointee(
                 serde_json::json!({"provider": "disabled"}),
             )),
+            agent_env_passthrough: Arc::new(Vec::new()),
             keyring: None,
         };
         (app, bootstrap)

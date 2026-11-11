@@ -47,6 +47,10 @@ impl AgentSpawner for SubprocessSpawner {
         tokio::fs::create_dir_all(&config.workspace_dir).await?;
 
         let mut cmd = Command::new(&config.runtime_binary);
+        cmd.env_clear()
+            .envs(crate::agent_environment(&config.env_passthrough, |name| {
+                std::env::var_os(name)
+            }));
         cmd.arg("--agent-id")
             .arg(config.agent_id.to_string())
             .arg("--gateway-socket")
@@ -151,6 +155,7 @@ mod tests {
             tmpfs_mounts: Vec::new(),
             seccomp_allow_extra: Vec::new(),
             agent_dns: Vec::new(),
+            env_passthrough: Vec::new(),
         }
     }
 

@@ -144,6 +144,10 @@ impl AgentSpawner for NamespaceSpawner {
             )
         })?;
         let mut cmd = Command::new(init_binary);
+        cmd.env_clear()
+            .envs(crate::agent_environment(&config.env_passthrough, |name| {
+                std::env::var_os(name)
+            }));
         cmd.arg(&config.runtime_binary)
             .arg("--agent-id")
             .arg(config.agent_id.to_string())
@@ -494,6 +498,7 @@ mod tests {
             tmpfs_mounts: Vec::new(),
             seccomp_allow_extra: Vec::new(),
             agent_dns: Vec::new(),
+            env_passthrough: Vec::new(),
         };
         let policy = Policy::default();
 
