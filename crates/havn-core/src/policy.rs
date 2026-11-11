@@ -241,11 +241,398 @@ impl Default for AdminVisibility {
     }
 }
 
+impl Policy {
+    #[must_use]
+    pub fn clamp_to(&self, ceiling: &Policy) -> Policy {
+        let own = &self.permissions;
+        let cap = &ceiling.permissions;
+        Policy {
+            max_agents: self.max_agents.min(ceiling.max_agents),
+            allowed_models: narrow_wildcard_list(&self.allowed_models, &ceiling.allowed_models),
+            resource_limits: ResourceLimits {
+                memory_mb: min_limit(
+                    self.resource_limits.memory_mb,
+                    ceiling.resource_limits.memory_mb,
+                ),
+                cpu_cores: min_cpu(
+                    self.resource_limits.cpu_cores,
+                    ceiling.resource_limits.cpu_cores,
+                ),
+                pids_max: min_limit(
+                    self.resource_limits.pids_max,
+                    ceiling.resource_limits.pids_max,
+                ),
+            },
+            budget: BudgetPolicy {
+                max_tokens_per_day: min_limit(
+                    self.budget.max_tokens_per_day,
+                    ceiling.budget.max_tokens_per_day,
+                ),
+                on_exhaust: stricter_exhaust(self.budget.on_exhaust, ceiling.budget.on_exhaust),
+            },
+            permissions: Permissions {
+                can_install_skills: own.can_install_skills && cap.can_install_skills,
+                can_access_network: own.can_access_network && cap.can_access_network,
+                can_use_shell: own.can_use_shell && cap.can_use_shell,
+                can_view_own_logs: own.can_view_own_logs && cap.can_view_own_logs,
+                can_export_memory: own.can_export_memory && cap.can_export_memory,
+                can_bind_channels: narrow_channels(&own.can_bind_channels, &cap.can_bind_channels),
+                can_spawn_subagents: own.can_spawn_subagents && cap.can_spawn_subagents,
+                can_schedule_cron: own.can_schedule_cron && cap.can_schedule_cron,
+                can_use_mcp: own.can_use_mcp && cap.can_use_mcp,
+                can_query_other_agents: own.can_query_other_agents && cap.can_query_other_agents,
+            },
+            network_policy: NetworkPolicy {
+                egress_allowed: self.network_policy.egress_allowed
+                    && ceiling.network_policy.egress_allowed,
+                allowed_domains: narrow_allowlist(
+                    &self.network_policy.allowed_domains,
+                    &ceiling.network_policy.allowed_domains,
+                ),
+                blocked_domains: union(
+                    &self.network_policy.blocked_domains,
+                    &ceiling.network_policy.blocked_domains,
+                ),
+            },
+            context_toolsets: union_disabled(&self.context_toolsets, &ceiling.context_toolsets),
+            admin_visibility: ceiling.admin_visibility.clone(),
+            mcp_servers: ceiling
+                .mcp_servers
+                .iter()
+                .filter_map(|(name, granted)| {
+                    let requested = self.mcp_servers.get(name)?;
+                    let mut server = granted.clone();
+                    server.enabled = granted.enabled && requested.enabled;
+                    Some((name.clone(), server))
+                })
+                .collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn widen_with(&self, other: &Policy) -> Policy {
+        let a = &self.permissions;
+        let b = &other.permissions;
+        Policy {
+            max_agents: self.max_agents.max(other.max_agents),
+            allowed_models: widen_wildcard_list(&self.allowed_models, &other.allowed_models),
+            resource_limits: ResourceLimits {
+                memory_mb: max_limit(
+                    self.resource_limits.memory_mb,
+                    other.resource_limits.memory_mb,
+                ),
+                cpu_cores: max_cpu(
+                    self.resource_limits.cpu_cores,
+                    other.resource_limits.cpu_cores,
+                ),
+                pids_max: max_limit(
+                    self.resource_limits.pids_max,
+                    other.resource_limits.pids_max,
+                ),
+            },
+            budget: BudgetPolicy {
+                max_tokens_per_day: max_limit(
+                    self.budget.max_tokens_per_day,
+                    other.budget.max_tokens_per_day,
+                ),
+                on_exhaust: if stricter_exhaust(self.budget.on_exhaust, other.budget.on_exhaust)
+                    == self.budget.on_exhaust
+                {
+                    other.budget.on_exhaust
+                } else {
+                    self.budget.on_exhaust
+                },
+            },
+            permissions: Permissions {
+                can_install_skills: a.can_install_skills || b.can_install_skills,
+                can_access_network: a.can_access_network || b.can_access_network,
+                can_use_shell: a.can_use_shell || b.can_use_shell,
+                can_view_own_logs: a.can_view_own_logs || b.can_view_own_logs,
+                can_export_memory: a.can_export_memory || b.can_export_memory,
+                can_bind_channels: widen_channels(&a.can_bind_channels, &b.can_bind_channels),
+                can_spawn_subagents: a.can_spawn_subagents || b.can_spawn_subagents,
+                can_schedule_cron: a.can_schedule_cron || b.can_schedule_cron,
+                can_use_mcp: a.can_use_mcp || b.can_use_mcp,
+                can_query_other_agents: a.can_query_other_agents || b.can_query_other_agents,
+            },
+            network_policy: NetworkPolicy {
+                egress_allowed: self.network_policy.egress_allowed
+                    || other.network_policy.egress_allowed,
+                allowed_domains: widen_allowlist(
+                    &self.network_policy.allowed_domains,
+                    &other.network_policy.allowed_domains,
+                ),
+                blocked_domains: intersect(
+                    &self.network_policy.blocked_domains,
+                    &other.network_policy.blocked_domains,
+                ),
+            },
+            context_toolsets: intersect_disabled(&self.context_toolsets, &other.context_toolsets),
+            admin_visibility: AdminVisibility {
+                can_view_agent_status: self.admin_visibility.can_view_agent_status
+                    || other.admin_visibility.can_view_agent_status,
+                can_view_agent_config: self.admin_visibility.can_view_agent_config
+                    || other.admin_visibility.can_view_agent_config,
+                can_view_conversations: self.admin_visibility.can_view_conversations
+                    || other.admin_visibility.can_view_conversations,
+                can_view_audit_log: self.admin_visibility.can_view_audit_log
+                    || other.admin_visibility.can_view_audit_log,
+            },
+            mcp_servers: {
+                let mut merged = self.mcp_servers.clone();
+                for (name, server) in &other.mcp_servers {
+                    merged.entry(name.clone()).or_insert_with(|| server.clone());
+                }
+                merged
+            },
+        }
+    }
+}
+
+fn max_limit<T: Copy + Ord + Default>(a: T, b: T) -> T {
+    let unlimited = T::default();
+    if a == unlimited || b == unlimited {
+        unlimited
+    } else {
+        a.max(b)
+    }
+}
+
+fn max_cpu(a: f64, b: f64) -> f64 {
+    if a <= 0.0 || b <= 0.0 { 0.0 } else { a.max(b) }
+}
+
+fn widen_wildcard_list(a: &[String], b: &[String]) -> Vec<String> {
+    if a.iter().chain(b).any(|m| m == "*") {
+        vec!["*".to_string()]
+    } else {
+        union(a, b)
+    }
+}
+
+fn widen_allowlist(a: &[String], b: &[String]) -> Vec<String> {
+    if a.is_empty() || b.is_empty() {
+        Vec::new()
+    } else {
+        widen_wildcard_list(a, b)
+    }
+}
+
+fn widen_channels(a: &ChannelAllowance, b: &ChannelAllowance) -> ChannelAllowance {
+    match (a, b) {
+        (ChannelAllowance::Allowed(x), ChannelAllowance::Allowed(y)) => {
+            ChannelAllowance::Allowed(union(x, y))
+        }
+        _ => ChannelAllowance::All,
+    }
+}
+
+fn intersect(a: &[String], b: &[String]) -> Vec<String> {
+    a.iter().filter(|x| b.contains(x)).cloned().collect()
+}
+
+fn intersect_disabled(a: &ContextToolsets, b: &ContextToolsets) -> ContextToolsets {
+    ContextToolsets(
+        a.0.iter()
+            .filter_map(|(context, entry)| {
+                let other = b.0.get(context)?;
+                Some((
+                    context.clone(),
+                    ContextToolsetEntry {
+                        disabled: intersect(&entry.disabled, &other.disabled),
+                    },
+                ))
+            })
+            .collect(),
+    )
+}
+
+fn min_limit<T: Copy + Ord + Default>(a: T, b: T) -> T {
+    let unlimited = T::default();
+    if a == unlimited {
+        b
+    } else if b == unlimited {
+        a
+    } else {
+        a.min(b)
+    }
+}
+
+fn min_cpu(a: f64, b: f64) -> f64 {
+    if a <= 0.0 {
+        b
+    } else if b <= 0.0 {
+        a
+    } else {
+        a.min(b)
+    }
+}
+
+fn stricter_exhaust(a: BudgetExhaustAction, b: BudgetExhaustAction) -> BudgetExhaustAction {
+    let rank = |x: BudgetExhaustAction| match x {
+        BudgetExhaustAction::WarnOnly => 0,
+        BudgetExhaustAction::WarnAndPause => 1,
+        BudgetExhaustAction::Fail => 2,
+    };
+    if rank(a) >= rank(b) { a } else { b }
+}
+
+fn narrow_wildcard_list(own: &[String], cap: &[String]) -> Vec<String> {
+    if cap.iter().any(|m| m == "*") {
+        own.to_vec()
+    } else if own.iter().any(|m| m == "*") {
+        cap.to_vec()
+    } else {
+        own.iter().filter(|m| cap.contains(m)).cloned().collect()
+    }
+}
+
+fn narrow_allowlist(own: &[String], cap: &[String]) -> Vec<String> {
+    match (own.is_empty(), cap.is_empty()) {
+        (true, _) => cap.to_vec(),
+        (false, true) => own.to_vec(),
+        (false, false) => narrow_wildcard_list(own, cap),
+    }
+}
+
+fn narrow_channels(own: &ChannelAllowance, cap: &ChannelAllowance) -> ChannelAllowance {
+    match (own, cap) {
+        (ChannelAllowance::All, other) | (other, ChannelAllowance::All) => other.clone(),
+        (ChannelAllowance::Allowed(a), ChannelAllowance::Allowed(b)) => {
+            ChannelAllowance::Allowed(a.iter().filter(|c| b.contains(c)).cloned().collect())
+        }
+    }
+}
+
+fn union(a: &[String], b: &[String]) -> Vec<String> {
+    let mut out = a.to_vec();
+    out.extend(b.iter().filter(|x| !a.contains(x)).cloned());
+    out
+}
+
+fn union_disabled(own: &ContextToolsets, cap: &ContextToolsets) -> ContextToolsets {
+    let mut merged = own.0.clone();
+    for (context, entry) in &cap.0 {
+        let slot = merged.entry(context.clone()).or_default();
+        slot.disabled = union(&slot.disabled, &entry.disabled);
+    }
+    ContextToolsets(merged)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn clamp_never_widens_permissions_or_limits() {
+        let mut cap = Policy::default();
+        cap.permissions.can_use_shell = false;
+        cap.permissions.can_use_mcp = false;
+        cap.resource_limits.memory_mb = 256;
+        cap.resource_limits.pids_max = 32;
+        cap.budget.max_tokens_per_day = 10_000;
+        let mut own = Policy::default();
+        own.permissions.can_use_shell = true;
+        own.permissions.can_use_mcp = true;
+        own.permissions.can_spawn_subagents = true;
+        own.resource_limits.memory_mb = 0;
+        own.resource_limits.pids_max = 4096;
+        own.budget.max_tokens_per_day = 0;
+        own.network_policy.egress_allowed = true;
+
+        let p = own.clamp_to(&cap);
+        assert!(!p.permissions.can_use_shell);
+        assert!(!p.permissions.can_use_mcp);
+        assert!(!p.permissions.can_spawn_subagents);
+        assert!(!p.network_policy.egress_allowed);
+        assert_eq!(p.resource_limits.memory_mb, 256);
+        assert_eq!(p.resource_limits.pids_max, 32);
+        assert_eq!(p.budget.max_tokens_per_day, 10_000);
+    }
+
+    #[test]
+    fn widen_takes_the_most_permissive_of_two_roles() {
+        let mut a = Policy::default();
+        a.permissions.can_use_shell = false;
+        a.resource_limits.memory_mb = 512;
+        a.budget.max_tokens_per_day = 1_000;
+        a.allowed_models = vec!["m1".into()];
+        a.context_toolsets.0.insert(
+            "cron".into(),
+            ContextToolsetEntry {
+                disabled: vec!["shell".into(), "web_fetch".into()],
+            },
+        );
+        let mut b = Policy::default();
+        b.permissions.can_use_shell = true;
+        b.resource_limits.memory_mb = 1024;
+        b.budget.max_tokens_per_day = 0;
+        b.allowed_models = vec!["m2".into()];
+        b.context_toolsets.0.insert(
+            "cron".into(),
+            ContextToolsetEntry {
+                disabled: vec!["shell".into()],
+            },
+        );
+        let p = a.widen_with(&b);
+        assert!(p.permissions.can_use_shell);
+        assert_eq!(p.resource_limits.memory_mb, 1024);
+        assert_eq!(p.budget.max_tokens_per_day, 0);
+        assert_eq!(p.allowed_models, vec!["m1".to_string(), "m2".to_string()]);
+        assert_eq!(
+            p.context_toolsets.0["cron"].disabled,
+            vec!["shell".to_string()]
+        );
+    }
+
+    #[test]
+    fn clamp_keeps_narrower_override_values() {
+        let cap = Policy::default();
+        let mut own = Policy::default();
+        own.permissions.can_use_shell = false;
+        own.resource_limits.memory_mb = 128;
+        own.resource_limits.cpu_cores = 0.5;
+        own.allowed_models = vec!["claude-opus-5-5".into()];
+        own.budget.on_exhaust = BudgetExhaustAction::Fail;
+        let p = own.clamp_to(&cap);
+        assert!(!p.permissions.can_use_shell);
+        assert_eq!(p.resource_limits.memory_mb, 128);
+        assert!((p.resource_limits.cpu_cores - 0.5).abs() < f64::EPSILON);
+        assert_eq!(p.allowed_models, vec!["claude-opus-5-5".to_string()]);
+        assert_eq!(p.budget.on_exhaust, BudgetExhaustAction::Fail);
+    }
+
+    #[test]
+    fn clamp_intersects_lists_and_unions_disabled_tools() {
+        let mut cap = Policy::default();
+        cap.allowed_models = vec!["a".into(), "b".into()];
+        cap.permissions.can_bind_channels = ChannelAllowance::Allowed(vec!["webchat".into()]);
+        cap.context_toolsets.0.insert(
+            "cron".into(),
+            ContextToolsetEntry {
+                disabled: vec!["shell".into()],
+            },
+        );
+        let mut own = Policy::default();
+        own.allowed_models = vec!["*".into()];
+        own.context_toolsets.0.insert(
+            "cron".into(),
+            ContextToolsetEntry {
+                disabled: vec!["web_fetch".into()],
+            },
+        );
+        let p = own.clamp_to(&cap);
+        assert_eq!(p.allowed_models, vec!["a".to_string(), "b".to_string()]);
+        assert!(matches!(
+            p.permissions.can_bind_channels,
+            ChannelAllowance::Allowed(ref c) if c == &vec!["webchat".to_string()]
+        ));
+        let disabled = &p.context_toolsets.0["cron"].disabled;
+        assert!(disabled.contains(&"shell".to_string()));
+        assert!(disabled.contains(&"web_fetch".to_string()));
+    }
 
     #[test]
     fn default_policy_round_trips_through_json() {

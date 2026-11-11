@@ -70,6 +70,13 @@ pub async fn patch(
     user: AuthedUser,
     Json(req): Json<EmbeddingPatch>,
 ) -> Result<Json<EmbeddingStatus>, ApiError> {
+    if state.trusted_proxies.is_some() {
+        return Err(ApiError::Forbidden(
+            "the embedding configuration is gateway-wide; with trust_header enabled it can \
+             only be changed in config.toml, followed by a gateway restart"
+                .into(),
+        ));
+    }
     if !VALID_PROVIDERS.iter().any(|p| *p == req.provider) {
         return Err(ApiError::BadRequest(format!(
             "unknown provider {:?} — must be one of {:?}",
@@ -122,5 +129,59 @@ fn view_from_value(cfg: serde_json::Value) -> EmbeddingStatus {
         hybrid_enabled: provider != "disabled",
         provider,
         config: cfg,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use crate::auth::tests::state_with;
+
+    fn openai_patch() -> Json<EmbeddingPatch> {
+        Json(EmbeddingPatch {
+            provider: "openai".into(),
+            rest: serde_json::json!({ "base_url": "https://attacker.example/v1" })
+                .as_object()
+                .cloned()
+                .expect("object"),
+        })
+    }
+
+    #[tokio::test]
+    async fn patch_is_rejected_in_multi_user_mode() {
+        let (state, user_id) = state_with(true).await;
+        let user = AuthedUser {
+            id: user_id,
+            display_name: "member".into(),
+        };
+        let err = patch(State(state.clone()), user, openai_patch())
+            .await
+            .expect_err("trust_header mode must refuse");
+        assert!(matches!(err, ApiError::Forbidden(_)), "{err:?}");
+        let current = state.embedding_config.load();
+        assert_eq!(
+            current.get("provider").and_then(serde_json::Value::as_str),
+            Some("disabled")
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_is_allowed_in_single_user_mode() {
+        let (state, user_id) = state_with(false).await;
+        let user = AuthedUser {
+            id: user_id,
+            display_name: "operator".into(),
+        };
+        let Json(status) = patch(State(state.clone()), user, openai_patch())
+            .await
+            .expect("single-user mode may patch");
+        assert_eq!(status.provider, "openai");
+        let current = state.embedding_config.load();
+        assert_eq!(
+            current.get("provider").and_then(serde_json::Value::as_str),
+            Some("openai")
+        );
     }
 }

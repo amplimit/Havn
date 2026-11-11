@@ -9,7 +9,7 @@
 //!       memory.max
 //!       cpu.max
 //!       pids.max
-//!       cgroup.procs   ← agent PID is written here after spawn
+//!       cgroup.procs   ← the agent joins by writing 0 here before exec
 //!       cgroup.kill    ← writing "1" SIGKILLs every PID in this cgroup
 //! ```
 //!
@@ -136,8 +136,7 @@ impl CgroupController {
     }
 
     /// Create the per-agent cgroup directory and write its resource limits.
-    /// Returns the cgroup path, ready for [`Self::add_pid`] after the agent
-    /// process has been spawned.
+    /// Returns the cgroup path; the spawned child joins it itself before exec.
     pub fn create_agent(
         &self,
         agent_id: &str,
@@ -158,14 +157,6 @@ impl CgroupController {
         write_file(&path.join("pids.max"), &format_pids_max(limits.pids_max))?;
         debug!(agent_id, path = %path.display(), "agent cgroup created");
         Ok(path)
-    }
-
-    /// Move a PID into the agent's cgroup. Per cgroup v2 single-writer rules,
-    /// the PID may only belong to one cgroup at a time — moving from the slice
-    /// or root cgroup into the agent's leaf is the standard pattern.
-    pub fn add_pid(&self, cgroup: &Path, pid: u32) -> Result<(), CgroupError> {
-        let path = cgroup.join("cgroup.procs");
-        write_file(&path, &pid.to_string())
     }
 
     /// Read current resource usage. Missing files yield zeroes — this happens
@@ -209,7 +200,7 @@ impl CgroupController {
     }
 }
 
-/// Files we touch in [`CgroupController::create_agent`] / [`CgroupController::add_pid`] /
+/// Files we touch in [`CgroupController::create_agent`] / the spawner's pre-exec join /
 /// [`CgroupController::kill_all`]. Listed here so [`CgroupController::cleanup`] can
 /// pre-unlink them in test environments where they're real on-disk files.
 const CONTROL_FILES: &[&str] = &[
@@ -544,16 +535,6 @@ mod tests {
         let p1 = ctl.create_agent("idem", &limits).expect("first");
         let p2 = ctl.create_agent("idem", &limits).expect("second");
         assert_eq!(p1, p2);
-    }
-
-    #[test]
-    fn add_pid_writes_to_cgroup_procs() {
-        let root = fake_v2_root();
-        let ctl = CgroupController::with_root(root).expect("ctl");
-        let path = ctl.create_agent("pid", &ResourceLimits::default()).unwrap();
-        ctl.add_pid(&path, 12345).expect("add");
-        let procs = std::fs::read_to_string(path.join("cgroup.procs")).expect("cgroup.procs");
-        assert_eq!(procs, "12345");
     }
 
     #[test]

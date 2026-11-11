@@ -454,11 +454,10 @@ pub struct TrustHeaderConfig {
     /// otherwise. Default `false` so a fresh single-user install on
     /// loopback works out of the box.
     pub enabled: bool,
-    /// Optional CIDR allowlist of source IPs we trust to set the
-    /// header. v0.6 ships the field for future enforcement but does
-    /// not yet check connection-source IP — operators rely on the
-    /// reverse proxy + listen-address discipline. Reserved.
-    #[allow(dead_code, reason = "reserved for source-IP enforcement")]
+    /// CIDR allowlist (or bare IPs) of connection peers allowed to set the
+    /// header. Requests from any other peer get 403. Empty means loopback
+    /// only (`127.0.0.0/8`, `::1`), which fits a reverse proxy on the same
+    /// host. An invalid entry stops the gateway at startup.
     pub allowed_proxies: Vec<String>,
 }
 

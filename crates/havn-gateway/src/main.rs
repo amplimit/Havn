@@ -70,12 +70,13 @@ struct AppState {
     /// `auth::AuthedUser` extractor returns this when `trust_header`
     /// is off (single-user loopback mode, spec §1.7).
     pub bootstrap_user_id: UserId,
-    /// When true, the `auth::AuthedUser` extractor reads `X-User-ID`
-    /// from the request and looks it up in the `users` table; missing
-    /// or unknown header → 403. Required (gateway refuses to start)
-    /// for any non-loopback listen address — see startup guard in
-    /// [`enforce_listen_safety`].
-    pub trust_header_enabled: bool,
+    /// `Some` when `trust_header` is enabled: the `auth::AuthedUser`
+    /// extractor reads `X-User-ID` only from connections whose peer address
+    /// is in this list (`allowed_proxies`, loopback when empty), then looks
+    /// it up in the `users` table; anything else → 403. Required (gateway
+    /// refuses to start) for any non-loopback listen address — see startup
+    /// guard in [`enforce_listen_safety`].
+    pub trusted_proxies: Option<Arc<Vec<auth::IpCidr>>>,
     pub http: reqwest::Client,
     pub registry: AgentRegistry,
     pub spawner: Arc<dyn AgentSpawner>,
@@ -155,6 +156,7 @@ struct AppState {
     /// via `config.toml` (the file is the canonical operator-facing
     /// source of truth — see spec §1.6 "infrastructure not SaaS").
     pub embedding_config: Arc<ArcSwap<serde_json::Value>>,
+    pub agent_env_passthrough: Arc<Vec<String>>,
     /// Credential encryption-at-rest handle (spec §13 Phase 3).
     /// `None` means the operator hasn't set `HAVN_AGE_KEY` AND the
     /// credentials table is empty — in that mode the gateway runs
@@ -178,6 +180,25 @@ async fn main() -> anyhow::Result<()> {
 
     enforce_listen_safety(&cfg.listen, cfg.trust_header.enabled)
         .context("listen-address safety check (spec §1.7)")?;
+    let trusted_proxies = if cfg.trust_header.enabled {
+        let proxies = auth::trusted_proxies(&cfg.trust_header.allowed_proxies)
+            .map_err(anyhow::Error::msg)
+            .context("parsing gateway.trust_header.allowed_proxies")?;
+        if cfg.trust_header.allowed_proxies.is_empty() && !is_loopback(&cfg.listen) {
+            warn!(
+                listen = %cfg.listen,
+                "trust_header.allowed_proxies is empty, so only loopback peers may set \
+                 X-User-ID; a reverse proxy on another host will get 403"
+            );
+        }
+        info!(
+            ?proxies,
+            "trust_header enabled; X-User-ID accepted only from these peers"
+        );
+        Some(Arc::new(proxies))
+    } else {
+        None
+    };
 
     // Spec §3.5 — surface bindings that reference nonexistent channels
     // or accounts. Warn-not-fail because operators commenting out an
@@ -288,7 +309,23 @@ async fn main() -> anyhow::Result<()> {
         webchat_router.clone(),
         cfg.workspace_root.clone(),
     );
-    let spawner: Arc<dyn AgentSpawner> = select_spawner(&cfg.network);
+    let (spawner, isolated_agent_pool): (Arc<dyn AgentSpawner>, Option<String>) =
+        select_spawner(&cfg.network);
+    if let Some(proxies) = trusted_proxies.as_deref() {
+        match &isolated_agent_pool {
+            Some(pool) => {
+                auth::reject_agent_pool_overlap(proxies, pool).map_err(anyhow::Error::msg)?;
+            }
+            None => {
+                warn!(
+                    loopback_trusted = proxies.iter().any(|p| p.covers_loopback()),
+                    "agents run without network isolation and share the host network: any \
+                     trusted proxy range that contains a host address (loopback included) \
+                     lets them send X-User-ID as any user"
+                );
+            }
+        }
+    }
     let runtime_binary = cfg
         .resolved_runtime_binary()
         .context("resolving runtime binary path")?;
@@ -328,7 +365,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         db: db.clone(),
         bootstrap_user_id: user.id,
-        trust_header_enabled: cfg.trust_header.enabled,
+        trusted_proxies,
         http: http.clone(),
         registry: registry.clone(),
         spawner,
@@ -349,6 +386,7 @@ async fn main() -> anyhow::Result<()> {
         admin_rpc: admin_rpc.clone(),
         start_locks,
         embedding_config: embedding_config.clone(),
+        agent_env_passthrough: Arc::new(api::agents::embedding_env_passthrough(&cfg.embedding)),
         keyring: keyring.clone(),
     };
 
@@ -370,6 +408,7 @@ async fn main() -> anyhow::Result<()> {
         admin_rpc,
         query_broker,
         embedding_config: embedding_config.clone(),
+        multi_user: cfg.trust_header.enabled,
         extra_mounts: cfg.extra_mounts.clone(),
         tmpfs_mounts: cfg.tmpfs_mounts.clone(),
         seccomp_allow_extra: cfg.seccomp.allow_extra.clone(),
@@ -499,10 +538,13 @@ async fn main() -> anyhow::Result<()> {
 
     let addr: SocketAddr = cfg.listen.parse().context("parsing listen address")?;
     let listener = TcpListener::bind(addr).await.context("binding listener")?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("serving HTTP")?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("serving HTTP")?;
 
     socket_task.abort();
     let _ = socket_task.await;
@@ -529,10 +571,10 @@ async fn main() -> anyhow::Result<()> {
 /// when cgroup v2 is detected — useful in CI smoke tests where
 /// `kernel.unprivileged_userns_clone=0` blocks the namespace path at
 /// spawn time even though `try_init` succeeds at startup.
-fn select_spawner(network: &config::NetworkConfig) -> Arc<dyn AgentSpawner> {
+fn select_spawner(network: &config::NetworkConfig) -> (Arc<dyn AgentSpawner>, Option<String>) {
     if matches!(std::env::var("HAVN_SPAWNER").as_deref(), Ok("subprocess")) {
         info!("agent spawner: SubprocessSpawner (forced via HAVN_SPAWNER=subprocess)");
-        return Arc::new(SubprocessSpawner::new());
+        return (Arc::new(SubprocessSpawner::new()), None);
     }
 
     #[cfg(target_os = "linux")]
@@ -596,7 +638,7 @@ fn select_spawner(network: &config::NetworkConfig) -> Arc<dyn AgentSpawner> {
                     ),
                     Err(e) => tracing::warn!(error = %e, "veth GC failed; orphans will accumulate"),
                 }
-                return Arc::new(s);
+                return (Arc::new(s), Some(pool.cidr()));
             }
             Err(e) => {
                 tracing::warn!(
@@ -608,7 +650,7 @@ fn select_spawner(network: &config::NetworkConfig) -> Arc<dyn AgentSpawner> {
         }
     }
     info!("agent spawner: SubprocessSpawner (no isolation)");
-    Arc::new(SubprocessSpawner::new())
+    (Arc::new(SubprocessSpawner::new()), None)
 }
 
 /// Refuse to start when the gateway is bound to a non-loopback address

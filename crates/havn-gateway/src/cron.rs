@@ -70,9 +70,11 @@ pub struct CronScheduler {
     /// - the `havn-wakecheck` user exists on this host, AND
     /// - the gateway is running as root (a non-root gateway cannot `setuid`).
     ///
-    /// `None` means wake-checks run as the gateway's UID with the same
-    /// fail-open semantics, and a warning was logged at startup.
+    /// `None` means wake-check scripts are not run (jobs always wake)
+    /// unless `HAVN_WAKECHECK_UNISOLATED` opts into running them as the
+    /// gateway's UID; a warning was logged at startup either way.
     wakecheck_creds: Option<WakeCheckCreds>,
+    allow_unisolated_wakecheck: bool,
 }
 
 impl CronScheduler {
@@ -83,6 +85,23 @@ impl CronScheduler {
         workspace_root: PathBuf,
     ) -> Self {
         let wakecheck_creds = resolve_wakecheck_creds();
+        let allow_unisolated_wakecheck = matches!(
+            std::env::var("HAVN_WAKECHECK_UNISOLATED").as_deref(),
+            Ok("1" | "true")
+        );
+        if wakecheck_creds.is_none() {
+            if allow_unisolated_wakecheck {
+                warn!(
+                    "HAVN_WAKECHECK_UNISOLATED is set: wake-check scripts run as the gateway UID \
+                     and can read its memory, database and config; use only on a trusted dev host"
+                );
+            } else {
+                warn!(
+                    "wake-check scripts are disabled (jobs with a wake_check always wake) because \
+                     they cannot run as the dedicated havn-wakecheck user"
+                );
+            }
+        }
         Self {
             db,
             registry,
@@ -90,6 +109,7 @@ impl CronScheduler {
             workspace_root,
             wake_semaphore: Arc::new(Semaphore::new(WAKE_CHECK_CONCURRENCY)),
             wakecheck_creds,
+            allow_unisolated_wakecheck,
         }
     }
 
@@ -189,8 +209,20 @@ impl CronScheduler {
             return true;
         };
 
+        if self.wakecheck_creds.is_none() && !self.allow_unisolated_wakecheck {
+            debug!("wake-check skipped: no dedicated wake-check user; waking");
+            return true;
+        }
+
         let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(script).kill_on_drop(true);
+        cmd.arg("-c")
+            .arg(script)
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", "/")
+            .current_dir("/")
+            .process_group(0)
+            .kill_on_drop(true);
 
         // Spec §8.5 / §11: wake-checks run as a dedicated unprivileged UID,
         // distinct from the gateway's. Resolved at startup; only effective
@@ -198,37 +230,73 @@ impl CronScheduler {
         // and we already logged the downgrade).
         #[cfg(unix)]
         if let Some(creds) = self.wakecheck_creds {
+            // std drops supplementary groups itself (setgroups(0, NULL)) when a
+            // root parent sets `uid` without explicit groups; pre_exec closures
+            // run after setuid, so they cannot do it.
             cmd.uid(creds.uid).gid(creds.gid);
-            // SAFETY: `setgroups(0, NULL)` drops supplementary groups; it
-            // performs no allocation and touches no shared state, so it
-            // satisfies the post-fork pre-exec contract. Running before
-            // setuid means the call needs CAP_SETGID, which root has.
+            let expected_gid = creds.gid;
+            // SAFETY: getgroups into a stack buffer is async-signal-safe and
+            // allocates nothing. std silently ignores EPERM from its own
+            // setgroups (e.g. inside a user namespace with setgroups=deny),
+            // so verify no supplementary group other than the target gid
+            // survived before running the script.
             unsafe {
-                cmd.pre_exec(|| {
-                    if libc::setgroups(0, std::ptr::null()) != 0 {
+                cmd.pre_exec(move || {
+                    let mut groups = [0 as libc::gid_t; 64];
+                    let n = libc::getgroups(64, groups.as_mut_ptr());
+                    if n < 0 {
                         return Err(std::io::Error::last_os_error());
+                    }
+                    let n = usize::try_from(n).unwrap_or(0);
+                    if groups[..n].iter().any(|g| *g != expected_gid) {
+                        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
                     }
                     Ok(())
                 });
             }
         }
 
-        let output = match timeout(WAKE_CHECK_TIMEOUT, cmd.output()).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        Self::wake_check_stdout(&mut cmd)
+            .await
+            .is_none_or(Self::decide_wake)
+    }
+
+    async fn wake_check_stdout(cmd: &mut Command) -> Option<Vec<u8>> {
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
                 warn!(error = %e, "wake-check exec failed; failing open");
-                return true;
+                return None;
+            }
+        };
+        let pgid = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok());
+        match timeout(WAKE_CHECK_TIMEOUT, child.wait_with_output()).await {
+            Ok(Ok(output)) => Some(output.stdout),
+            Ok(Err(e)) => {
+                warn!(error = %e, "wake-check wait failed; failing open");
+                None
             }
             Err(_) => {
                 warn!(
                     timeout_s = WAKE_CHECK_TIMEOUT.as_secs(),
                     "wake-check timed out; failing open"
                 );
-                return true;
+                if let Some(pgid) = pgid {
+                    // SAFETY: plain syscall on the process group created for
+                    // this wake-check (process_group(0) above).
+                    unsafe {
+                        libc::killpg(pgid, libc::SIGKILL);
+                    }
+                }
+                None
             }
-        };
+        }
+    }
 
-        let mut stdout = output.stdout;
+    fn decide_wake(mut stdout: Vec<u8>) -> bool {
         if stdout.len() > WAKE_CHECK_STDOUT_CAP {
             warn!(
                 bytes = stdout.len(),
@@ -366,18 +434,28 @@ fn resolve_wakecheck_creds() -> Option<WakeCheckCreds> {
     let Some(c) = lookup_user(WAKECHECK_USERNAME) else {
         warn!(
             user = WAKECHECK_USERNAME,
-            "user not found; wake-checks run as gateway UID. \
+            "user not found; wake-check scripts cannot be isolated. \
              Run install.sh (or `useradd --system --no-create-home --shell /usr/sbin/nologin havn-wakecheck`) \
              to enable spec §8.5 / §11 isolation."
         );
         return None;
     };
+    if c.uid == 0 || c.gid == 0 {
+        warn!(
+            user = WAKECHECK_USERNAME,
+            uid = c.uid,
+            gid = c.gid,
+            "wake-check user resolves to uid or gid 0; refusing to use it, so wake-check \
+             scripts cannot be isolated."
+        );
+        return None;
+    }
     if !running_as_root() {
         warn!(
             user = WAKECHECK_USERNAME,
             uid = c.uid,
             "wake-check user resolved but gateway is not root; \
-             cannot setuid — running wake-checks as gateway UID. \
+             cannot setuid, so wake-check scripts cannot be isolated. \
              Production deployments need root or CAP_SETUID."
         );
         return None;
@@ -439,12 +517,48 @@ mod tests {
     use super::*;
 
     fn make_scheduler(db: SqlitePool) -> CronScheduler {
-        CronScheduler::new(
+        let mut s = CronScheduler::new(
             db,
             AgentRegistry::new(),
             WebChatRouter::new(),
             std::env::temp_dir().join(format!("havn-cron-{}", uuid::Uuid::now_v7())),
-        )
+        );
+        s.allow_unisolated_wakecheck = true;
+        s
+    }
+
+    #[tokio::test]
+    async fn wake_check_is_not_executed_without_isolation() {
+        let pool = havn_db::connect_in_memory().await.expect("db");
+        let mut s = make_scheduler(pool);
+        s.wakecheck_creds = None;
+        s.allow_unisolated_wakecheck = false;
+        let marker = std::env::temp_dir().join(format!("havn-wake-{}", uuid::Uuid::now_v7()));
+        let script = format!(
+            "touch {}; echo '{{\"wakeAgent\": false}}'",
+            marker.display()
+        );
+        assert!(s.run_wake_check(&script).await);
+        assert!(!marker.exists(), "script must not run without isolation");
+
+        s.allow_unisolated_wakecheck = true;
+        assert!(!s.run_wake_check(&script).await);
+        assert!(marker.exists(), "control: the opted-in script does run");
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn wake_check_runs_with_a_cleared_environment() {
+        let pool = havn_db::connect_in_memory().await.expect("db");
+        let s = make_scheduler(pool);
+        assert!(
+            std::env::var_os("CARGO").is_some(),
+            "cargo sets CARGO for tests"
+        );
+        assert!(
+            !s.run_wake_check("[ -z \"${CARGO:-}\" ] && echo '{\"wakeAgent\": false}'")
+                .await
+        );
     }
 
     #[tokio::test]
