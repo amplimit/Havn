@@ -16,6 +16,8 @@
 //!
 //! ## What we do
 //!
+//! 0. Write `0` to the agent cgroup's `cgroup.procs` so the child, and
+//!    everything it later forks, is inside the agent cgroup before exec.
 //! 1. `unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWNET)` — three new
 //!    namespaces atomically. The child enters them; the parent is unaffected.
 //! 2. Map the host UID/GID to UID/GID 0 inside the user namespace
@@ -144,6 +146,17 @@ pub unsafe fn write_user_namespace_maps(host_uid: u32, host_gid: u32) -> io::Res
         write_proc_file(c"/proc/self/gid_map", gid.as_bytes())?;
     }
     Ok(())
+}
+
+/// # Safety
+///
+/// Must be called in the child between fork and exec, before
+/// [`unshare_namespaces`], so the write runs with the gateway's own host
+/// credentials (the same ones the cgroup was created with).
+pub unsafe fn join_cgroup(cgroup_procs: &CStr) -> io::Result<()> {
+    // SAFETY: same contract as `write_proc_file`; writing "0" moves the
+    // calling process into the cgroup that owns `cgroup.procs`.
+    unsafe { write_proc_file(cgroup_procs, b"0") }
 }
 
 /// Mark the entire mount tree under `/` as `MS_PRIVATE` so the agent's

@@ -110,6 +110,16 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
             [ "$value" != "max" ] || die "agent cgroup $limit is unlimited ($CGROUP)"
         done
         [ -n "$(cat "$CGROUP/cgroup.procs")" ] || die "agent cgroup has no member processes ($CGROUP)"
+        RUNTIME_PIDS=$(for pid in $(pgrep -x havn-runtime); do
+            if tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q -- "--agent-id $AGENT_ID "; then
+                echo "$pid"
+            fi
+        done)
+        [ -n "$RUNTIME_PIDS" ] || die "no havn-runtime process for agent $AGENT_ID"
+        for pid in $RUNTIME_PIDS; do
+            [ "$(cat "/proc/$pid/cgroup")" = "0::/havn.slice/agent-$AGENT_ID" ] \
+                || die "havn-runtime (pid $pid) is outside the agent cgroup: $(cat "/proc/$pid/cgroup")"
+        done
         ok "NamespaceSpawner isolation: memory.max=$(cat "$CGROUP/memory.max") pids.max=$(cat "$CGROUP/pids.max")"
         ;;
     subprocess)

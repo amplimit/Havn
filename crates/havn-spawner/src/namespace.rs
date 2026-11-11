@@ -32,6 +32,8 @@
 //! back to the unprivileged subprocess spawner with a clear log.
 
 use std::collections::HashMap;
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -186,7 +188,7 @@ impl AgentSpawner for NamespaceSpawner {
         // Network egress flag (spec §6.3 v0.7). Single source of truth
         // is `policy.network_policy.egress_allowed`. havn-init gates
         // /etc/resolv.conf + /etc/ssl writes on it; this spawner gates
-        // `configure_agent_network` (step 5 below) on the same bit.
+        // `configure_agent_network` (step 4 below) on the same bit.
         // Default off — spec §1.5 says "agent processes never see API
         // keys" and the original posture is "no direct outbound,
         // gateway proxies LLM calls"; per-role opt-in restores that
@@ -205,6 +207,9 @@ impl AgentSpawner for NamespaceSpawner {
         cmd.kill_on_drop(true);
 
         // SAFETY: the closure runs between fork and exec in the child. It
+        //   - writes `0` to the agent cgroup's `cgroup.procs` via
+        //     [`crate::ns_setup::join_cgroup`] (raw libc I/O, path prepared
+        //     before fork),
         //   - calls `libc::unshare` (async-signal-safe),
         //   - writes to `/proc/self/{setgroups,uid_map,gid_map}` via
         //     [`crate::ns_setup::write_user_namespace_maps`] (raw libc I/O,
@@ -228,6 +233,12 @@ impl AgentSpawner for NamespaceSpawner {
         // SAFETY: `getuid` / `getgid` are async-signal-safe and infallible.
         let host_uid = unsafe { libc::getuid() };
         let host_gid = unsafe { libc::getgid() };
+        // The child joins its cgroup itself, before exec, so havn-init and
+        // everything it forks (the runtime, tools, subagents) inherit the
+        // limits. Joining from the parent after spawn() races with
+        // havn-init's fork and leaves the runtime outside the cgroup.
+        let cgroup_procs = CString::new(cgroup_path.join("cgroup.procs").as_os_str().as_bytes())
+            .map_err(|e| SpawnerError::Spawn(format!("cgroup path contains NUL: {e}")))?;
         // SAFETY: pre_exec runs in the child after fork, before exec; it
         // restricts itself to the contracts spelled out in `ns_setup`.
         #[allow(
@@ -236,6 +247,7 @@ impl AgentSpawner for NamespaceSpawner {
         )]
         unsafe {
             cmd.as_std_mut().pre_exec(move || {
+                ns_setup::join_cgroup(&cgroup_procs)?;
                 ns_setup::unshare_namespaces()?;
                 ns_setup::write_user_namespace_maps(host_uid, host_gid)?;
                 ns_setup::mark_mounts_private()?;
@@ -252,17 +264,7 @@ impl AgentSpawner for NamespaceSpawner {
             .id()
             .ok_or_else(|| SpawnerError::Spawn("child has no pid".into()))?;
 
-        // 4. Place the child in the cgroup. There's a tiny window between
-        //    spawn and this write where the child runs unconstrained, but
-        //    it's strictly bounded by the kernel scheduler — sub-millisecond.
-        if let Err(e) = self.cgroup.add_pid(&cgroup_path, pid) {
-            warn!(error = %e, "failed to add agent PID to cgroup; killing child to avoid runaway");
-            let _ = self.cgroup.kill_all(&cgroup_path);
-            let _ = self.cgroup.cleanup(&cgroup_path);
-            return Err(map_cgroup_err(&e));
-        }
-
-        // 5. Per-agent veth + NAT setup (spec §4.1, §6.3 v0.7).
+        // 4. Per-agent veth + NAT setup (spec §4.1, §6.3 v0.7).
         //
         //    **Gated on `policy.network_policy.egress_allowed`** (default
         //    false). The pre_exec hook above already unshared
