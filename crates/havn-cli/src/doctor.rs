@@ -207,11 +207,22 @@ fn check_cgroup_v2() -> Verdict {
         line(
             Verdict::Warn,
             "cgroup v2",
-            "not Linux — agent isolation will degrade",
+            "not Linux — the gateway refuses to start unless HAVN_SPAWNER=subprocess (no isolation)",
         );
         return Verdict::Warn;
     }
     if Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            line(
+                Verdict::Warn,
+                "cgroup v2",
+                "mounted, but not running as root — agent isolation needs root (or a cgroup \
+                 delegated with Delegate=yes); otherwise the gateway refuses to start unless \
+                 HAVN_SPAWNER=subprocess",
+            );
+            return Verdict::Warn;
+        }
         line(Verdict::Ok, "cgroup v2", "mounted at /sys/fs/cgroup");
         Verdict::Ok
     } else {

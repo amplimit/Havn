@@ -638,8 +638,9 @@ fn select_spawner(
                 Ok((Arc::new(s), Some(pool.cidr())))
             }
             Err(e) => Err(anyhow::anyhow!(
-                "agent isolation is unavailable: {e}. Run the gateway as root on a cgroup v2 \
-                 host, or set HAVN_SPAWNER=subprocess to run agents WITHOUT isolation (dev only)"
+                "agent isolation is unavailable: {e}. Run the gateway as root (or in a cgroup \
+                 delegated with Delegate=yes) on a cgroup v2 host, or set HAVN_SPAWNER=subprocess \
+                 to run agents WITHOUT isolation (dev only)"
             )),
         }
     }
