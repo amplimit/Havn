@@ -137,8 +137,9 @@ impl ToolRegistry {
     /// Build the standard tool set with two-layer policy enforcement (spec §6):
     ///
     /// 1. **Capability layer (here, build time)** — drop tools whose
-    ///    underlying capability is forbidden outright (`can_use_shell`,
-    ///    `can_access_network`). The LLM never sees these even with no
+    ///    underlying capability is forbidden outright (`can_use_shell`;
+    ///    `can_access_network` plus `network_policy.egress_allowed` for
+    ///    `web_fetch`). The LLM never sees these even with no
     ///    context filter.
     /// 2. **Context layer (per call, see [`Self::schemas_for`] /
     ///    [`Self::execute_for`])** — within an allowed capability set,

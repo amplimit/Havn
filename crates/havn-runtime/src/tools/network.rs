@@ -1,10 +1,9 @@
 //! `web_fetch` tool — HTTP GET / POST via the runtime's reqwest client.
 //!
-//! Spec policy gate: `permissions.can_access_network`. Phase 1 single-user
-//! mode runs all agents under the same network namespace as the gateway, so
-//! once this tool is exposed the agent can reach any host the runtime can.
-//! `NamespaceSpawner` (next vertical) restricts egress at the kernel level
-//! per spec §4.1 / §6.2 `network_policy`.
+//! Spec policy gate: `permissions.can_access_network` AND
+//! `network_policy.egress_allowed`. `NamespaceSpawner` gives the agent's
+//! network namespace a route out only when `egress_allowed` is true, so the
+//! tool is offered only when it can actually reach the network.
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
