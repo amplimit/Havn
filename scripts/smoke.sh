@@ -101,6 +101,14 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
         grep -q "agent spawner: NamespaceSpawner" "$GATEWAY_LOG" \
             || { tail -50 "$GATEWAY_LOG" >&2; die "gateway did not select NamespaceSpawner"; }
         CGROUP="/sys/fs/cgroup/havn.slice/agent-$AGENT_ID"
+        for f in memory.max cpu.max pids.max cgroup.procs; do
+            log "$f: $(tr '
+' ' ' < "$CGROUP/$f" 2>&1)"
+        done
+        if command -v systemctl >/dev/null 2>&1; then
+            log "systemd view of havn.slice: $(systemctl show havn.slice -p LoadState,ActiveState,MemoryMax,TasksMax 2>&1 | tr '
+' ' ')"
+        fi
         for limit in memory.max cpu.max pids.max; do
             [ -f "$CGROUP/$limit" ] || die "agent cgroup is missing $limit ($CGROUP)"
             [ "$(cut -d' ' -f1 "$CGROUP/$limit")" != "max" ] \n                || die "agent cgroup $limit is unlimited ($CGROUP)"
