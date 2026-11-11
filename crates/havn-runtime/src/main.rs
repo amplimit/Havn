@@ -1,7 +1,6 @@
 //! havn agent runtime — LLM loop, tool execution, three-tier memory,
 //! heartbeat, curator daemon, subagent spawning.
 //!
-//! Phase 1 progress:
 //! - Connect to gateway socket, exchange Hello/Welcome.
 //! - Load bootstrap files into a frozen system prompt (spec §5.3, §9.4).
 //! - Open the per-agent `SQLite` (conversations + memory + skills, all with
@@ -12,9 +11,8 @@
 //!   through the [`tools::ToolRegistry`], append a `tool_result` user turn,
 //!   call LLM again. Iterations are capped at [`MAX_TOOL_ITERATIONS`] to
 //!   bound runaway loops.
-//!
-//! Heartbeat daemon, curator, skills loader, and `subagent_spawn` land in
-//! subsequent verticals.
+//! - Heartbeat and cron ticks, the skill library and its curator, and
+//!   same-process subagents (`subagent_spawn`).
 
 mod curator;
 mod curator_scheduler;

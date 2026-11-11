@@ -2,13 +2,14 @@
 //!
 //! Two implementations are provided.
 //!
-//! [`subprocess::SubprocessSpawner`] is the Phase 1 fallback: plain
-//! `tokio::process::Command` exec without isolation. Used during development
-//! and as a portable smoke-test harness.
-//!
 //! [`namespace::NamespaceSpawner`] is the Linux-native isolation backend
-//! (namespace, Landlock, seccomp, cgroup; spec §4.1). Phase 1 ships a stub;
-//! the full implementation lands in a follow-up vertical.
+//! (user/mount/net/pid namespaces, minimal-rootfs pivot, cgroup v2 limits;
+//! the runtime adds Landlock and seccomp; spec §4.1). The gateway refuses to
+//! start when it cannot initialise.
+//!
+//! [`subprocess::SubprocessSpawner`] is plain `tokio::process::Command` exec
+//! without isolation, selected only explicitly with `HAVN_SPAWNER=subprocess`
+//! for development and CI.
 //!
 //! The trait surface is preserved so future backends (gVisor,
 //! Firecracker) can be added without touching the gateway.

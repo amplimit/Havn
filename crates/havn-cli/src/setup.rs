@@ -61,6 +61,8 @@ debounce_ms = 300
 # The gateway refuses to start with a non-loopback listen address
 # unless this flag is true (or `HAVN_TRUST_HEADER=1` is set).
 enabled = false
+# Peers allowed to set X-User-ID (CIDRs or IPs). Empty = loopback only.
+allowed_proxies = []
 "#,
             listen = self.listen,
             db = db.display().to_string(),
