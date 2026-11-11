@@ -47,7 +47,7 @@ nohup havn start >"$GATEWAY_LOG" 2>&1 &
 GW_PID=$!
 cleanup() {
     if [ -n "${AGENT_ID:-}" ]; then
-        curl -fs -X POST "$GATEWAY_URL/agents/$AGENT_ID/stop" -o /dev/null || true
+        curl -fs --max-time 5 -X POST "$GATEWAY_URL/agents/$AGENT_ID/stop" -o /dev/null || true
     fi
     kill "$GW_PID" 2>/dev/null || true
 }
