@@ -1,9 +1,9 @@
 //! `shell` tool — run a bash command in the agent's process context.
 //!
-//! Phase 1 `SubprocessSpawner` runs without isolation, so the shell tool
-//! inherits whatever the runtime can do on the host. The
-//! `NamespaceSpawner` (next vertical) drops this shell into the agent's
-//! mount + network + Landlock-confined namespace per spec §4.1.
+//! Under `NamespaceSpawner` the shell runs inside the agent's namespaces,
+//! cgroup, Landlock and seccomp confinement (spec §4.1). Under the
+//! dev-only `SubprocessSpawner` it inherits whatever the runtime can do on
+//! the host.
 
 use std::fmt::Write as _;
 use std::time::Duration;

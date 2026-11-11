@@ -7,11 +7,10 @@
 //! by handle, decrypts, and compares against the supplied token.
 //!
 //! Frames in both directions are typed JSON via [`havn_proto::channel::
-//! ChannelFrame`]. v0.2 implementation accepts inbound and ping/resume
-//! frames, replies to ping with pong, and routes inbound messages to
-//! the bound agent. Outbound replay buffer + agent → WS push lands in
-//! the next vertical (the `bindings` lookup TODO at the bottom of
-//! `handle_inbound`).
+//! ChannelFrame`]. Inbound messages are routed to the bound agent,
+//! ping gets pong, and agent replies are pushed back as `Outbound`
+//! frames through [`crate::channel_router`], whose replay buffer serves
+//! `resume`.
 //!
 //! Security: webchat is **not** a channel adapter (spec §3.6); this
 //! endpoint is for external daemons only. webchat continues to use

@@ -1,8 +1,8 @@
 //! `file_read` and `file_write` tools — workspace-scoped filesystem access.
 //!
-//! Phase 1 path safety: reject absolute paths and any `..` parent-traversal
-//! component. Phase 1 has no Landlock; the namespace spawner (next vertical)
-//! adds kernel-level enforcement that survives bugs in this code.
+//! Path safety: reject absolute paths and any `..` parent-traversal
+//! component. Landlock and the namespace spawner's minimal rootfs add
+//! kernel-level enforcement that survives bugs in this code.
 
 use std::path::{Component, Path, PathBuf};
 

@@ -1,16 +1,5 @@
 //! havn gateway — message routing, auth, channel adapters, agent lifecycle,
 //! credential resolver, LLM proxy, cron scheduler, config hot reload.
-//!
-//! Phase 1 progress (this binary):
-//! - HTTP server: `/healthz`, `/credentials`, `/agents`, `/v1/llm/anthropic`.
-//! - Unix-socket listener for connecting agent runtime processes
-//!   ([`agent_socket`]); handshake, registry attach, message dispatch.
-//! - In-memory agent registry ([`agent_registry`]) tracking spawned and
-//!   connected agents.
-//! - LLM proxy with Anthropic Messages API + 401/429/402/5xx fallback.
-//!
-//! Still to land in Phase 1: `WebSocket` `WebChat` adapter, heartbeat tick,
-//! cron scheduler, hot reload, real `NamespaceSpawner` isolation.
 
 mod admin_rpc;
 mod agent_registry;

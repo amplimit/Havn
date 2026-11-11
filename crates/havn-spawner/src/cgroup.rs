@@ -13,9 +13,10 @@
 //!       cgroup.kill    ← writing "1" SIGKILLs every PID in this cgroup
 //! ```
 //!
-//! Phase 1.5 deliberately uses *only* cgroup; namespace + Landlock + seccomp
-//! arrive in subsequent verticals. The controller takes the cgroup root as a
-//! parameter so unit tests can substitute a tempdir; production binds
+//! This module covers only the cgroup layer; namespaces live in
+//! `namespace` / `ns_setup`, Landlock and seccomp in the runtime. The
+//! controller takes the cgroup root as a parameter so unit tests can
+//! substitute a tempdir; production binds
 //! `/sys/fs/cgroup` via [`Self::system`].
 
 use std::fs;

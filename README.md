@@ -53,20 +53,26 @@ havn is a self-hosted server that runs a gateway and per-user agents. Identity, 
 curl -fsSL https://raw.githubusercontent.com/amplimit/havn/main/install.sh | bash
 ```
 
-This fetches a statically-linked `havn` binary from [Releases](https://github.com/amplimit/havn/releases) (verified by SHA-256), creates the `havn-wakecheck` sandbox user, and runs `havn setup`. Pin a version with `HAVN_VERSION=v0.1.0`, or force a source build with `HAVN_FROM_SOURCE=1`.
+This fetches a statically-linked `havn` binary from [Releases](https://github.com/amplimit/havn/releases) (verified by SHA-256), creates the `havn-wakecheck` sandbox user, and runs `havn setup`. Pin a version with `HAVN_VERSION=v0.1.1`, or force a source build with `HAVN_FROM_SOURCE=1`.
 
-Then configure and start:
+Then configure and start. Agent isolation (namespaces + cgroup v2) needs the gateway to run as root, or inside a systemd unit with `Delegate=yes`; without it the gateway refuses to start rather than run agents unisolated.
 
 ```bash
+sudo -i                      # the gateway runs as root
+havn setup --non-interactive # once, if install.sh ran setup as another user
+
 # Set the encryption key for credentials (any passphrase you choose)
 export HAVN_AGE_KEY="your-secret-passphrase"
 
-# Add your LLM credential (encrypted at rest)
-havn credential add anthropic sk-ant-...
-
-# Start the gateway (same HAVN_AGE_KEY must be set)
+# Start the gateway and keep it running
 havn start
+
+# In another shell: add your LLM credential (encrypted at rest).
+# `credential add` talks to the running gateway.
+havn credential add anthropic sk-ant-...
 ```
+
+For a dev box without isolation, `HAVN_SPAWNER=subprocess havn start` runs agents as plain unsandboxed processes; do not use it for anything untrusted.
 
 ### Build from source
 
@@ -124,7 +130,7 @@ havn is **infrastructure, not SaaS**. The test: does it require kernel primitive
 - Agents run in isolated Linux namespaces (PID, mount, network, user) with Landlock LSM and seccomp-bpf syscall filtering
 - API keys encrypted at rest with [age](https://age-encryption.org/) — agent processes never see them
 - Per-credential token-per-day and requests-per-minute caps enforced gateway-side
-- WebSocket connections require per-session tokens with origin validation
+- WebChat WebSocket connections are checked against an Origin allowlist (`allowed_origins`) and must present the caller's `ws_token` from `GET /me`; the token identifies the user rather than being a secret, so the Origin check is what blocks cross-site connections
 - No marketplace — skills are local files; sharing via git
 
 ## Configuration
@@ -132,7 +138,6 @@ havn is **infrastructure, not SaaS**. The test: does it require kernel primitive
 Gateway config lives at `~/.config/havn/config.toml`:
 
 ```toml
-[gateway]
 listen = "127.0.0.1:8080"
 db_path = "~/.local/share/havn/havn.db"
 ```
@@ -142,13 +147,18 @@ Config edits are picked up live: hot-reloadable fields (`allowed_origins`, `[[bi
 For non-loopback exposure, configure a reverse proxy and enable trust-header mode:
 
 ```toml
-[gateway]
 listen = "0.0.0.0:8080"
 
-[gateway.trust_header]
+[trust_header]
 enabled = true
+# Peers allowed to set X-User-ID; everyone else gets 403.
+# Empty means loopback only (a proxy on the same host).
 allowed_proxies = ["127.0.0.1/32"]
 ```
+
+In trust-header (multi-user) mode, team roles define what each member's agents may do; a per-agent policy override can only narrow the member's role policy, and the gateway-wide embedding configuration can only be changed in `config.toml`.
+
+Cron jobs may carry a `wake_check` script. It runs on the host as the dedicated `havn-wakecheck` user (created by `install.sh`; the gateway must run as root to switch to it) with a minimal environment. Without that user the script is skipped and the job always wakes.
 
 ## Channel Adapters
 

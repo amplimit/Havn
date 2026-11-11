@@ -19,7 +19,7 @@
 //!   table and network stack,
 //! - the cgroup which already caps memory/CPU/pids.
 //!
-//! Future seccomp filter (next vertical) will additionally restrict the
+//! The seccomp filter in [`crate::seccomp`] additionally restricts the
 //! _syscall surface_ regardless of which paths the agent can see.
 
 #![cfg(target_os = "linux")]
