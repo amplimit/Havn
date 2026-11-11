@@ -310,7 +310,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.workspace_root.clone(),
     );
     let (spawner, isolated_agent_pool): (Arc<dyn AgentSpawner>, Option<String>) =
-        select_spawner(&cfg.network);
+        select_spawner(&cfg.network)?;
     if let Some(proxies) = trusted_proxies.as_deref() {
         match &isolated_agent_pool {
             Some(pool) => {
@@ -557,24 +557,21 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Pick the strongest agent spawner the host supports.
-///
-/// On Linux, prefer [`havn_spawner::namespace::NamespaceSpawner`] —
-/// cgroup-v2 isolation today, full namespace + Landlock + seccomp in
-/// subsequent verticals. Fall back to the unprivileged
-/// [`SubprocessSpawner`] when cgroup v2 is unavailable (e.g. dev box
-/// without `Delegate=yes`, restricted CI, container without cgroup
-/// passthrough). The fallback is logged loudly so operators don't ship
-/// it to production by accident.
-///
-/// Set `HAVN_SPAWNER=subprocess` to force the unprivileged backend even
-/// when cgroup v2 is detected — useful in CI smoke tests where
-/// `kernel.unprivileged_userns_clone=0` blocks the namespace path at
-/// spawn time even though `try_init` succeeds at startup.
-fn select_spawner(network: &config::NetworkConfig) -> (Arc<dyn AgentSpawner>, Option<String>) {
+/// Pick the agent spawner: [`havn_spawner::namespace::NamespaceSpawner`]
+/// (namespaces + Landlock + seccomp + cgroup v2) on Linux. If it cannot
+/// initialise, startup fails instead of silently running agents without
+/// isolation; `HAVN_SPAWNER=subprocess` explicitly selects the unisolated
+/// [`SubprocessSpawner`] for dev boxes and CI. Returns the isolated agent
+/// pool CIDR, or `None` when agents are unisolated.
+fn select_spawner(
+    network: &config::NetworkConfig,
+) -> anyhow::Result<(Arc<dyn AgentSpawner>, Option<String>)> {
     if matches!(std::env::var("HAVN_SPAWNER").as_deref(), Ok("subprocess")) {
-        info!("agent spawner: SubprocessSpawner (forced via HAVN_SPAWNER=subprocess)");
-        return (Arc::new(SubprocessSpawner::new()), None);
+        warn!(
+            "agent spawner: SubprocessSpawner (forced via HAVN_SPAWNER=subprocess); agents run \
+             WITHOUT namespace, Landlock-at-spawn or cgroup isolation"
+        );
+        return Ok((Arc::new(SubprocessSpawner::new()), None));
     }
 
     #[cfg(target_os = "linux")]
@@ -638,19 +635,23 @@ fn select_spawner(network: &config::NetworkConfig) -> (Arc<dyn AgentSpawner>, Op
                     ),
                     Err(e) => tracing::warn!(error = %e, "veth GC failed; orphans will accumulate"),
                 }
-                return (Arc::new(s), Some(pool.cidr()));
+                Ok((Arc::new(s), Some(pool.cidr())))
             }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "NamespaceSpawner unavailable; falling back to SubprocessSpawner WITHOUT isolation. \
-                     Production deployments need systemd cgroup delegation (Delegate=yes) or root."
-                );
-            }
+            Err(e) => Err(anyhow::anyhow!(
+                "agent isolation is unavailable: {e}. Run the gateway as root (or in a cgroup \
+                 delegated with Delegate=yes) on a cgroup v2 host, or set HAVN_SPAWNER=subprocess \
+                 to run agents WITHOUT isolation (dev only)"
+            )),
         }
     }
-    info!("agent spawner: SubprocessSpawner (no isolation)");
-    (Arc::new(SubprocessSpawner::new()), None)
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = network;
+        anyhow::bail!(
+            "agent isolation requires Linux; set HAVN_SPAWNER=subprocess to run agents WITHOUT \
+             isolation (dev only)"
+        )
+    }
 }
 
 /// Refuse to start when the gateway is bound to a non-loopback address
