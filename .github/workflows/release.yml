@@ -24,8 +24,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  audit:
+    uses: ./.github/workflows/audit.yml
+    permissions:
+      contents: read
+      issues: write
+
   build:
     name: build ${{ matrix.target }}
+    needs: [ci, audit]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -43,7 +55,7 @@ jobs:
         # `stable` instead is why an earlier run failed with E0463 "can't find
         # crate for core".)
         run: |
-          rustup show
+          rustup toolchain install
           rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2

@@ -35,6 +35,8 @@ if [ "${HAVN_SKIP_INSTALL:-0}" != "1" ]; then
     HAVN_PROFILE="${HAVN_PROFILE:-debug}" \
     HAVN_SKIP_RUSTUP="${HAVN_SKIP_RUSTUP:-1}" \
         bash ./install.sh
+else
+    havn setup --non-interactive >/dev/null
 fi
 
 # 2. background-start the gateway.
@@ -43,7 +45,13 @@ LOG_DIR="${RUNNER_TEMP:-/tmp}"
 GATEWAY_LOG="$LOG_DIR/havn-gateway.log"
 nohup havn start >"$GATEWAY_LOG" 2>&1 &
 GW_PID=$!
-trap 'kill "$GW_PID" 2>/dev/null || true' EXIT
+cleanup() {
+    if [ -n "${AGENT_ID:-}" ]; then
+        curl -fs --max-time 5 -X POST "$GATEWAY_URL/agents/$AGENT_ID/stop" -o /dev/null || true
+    fi
+    kill "$GW_PID" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 # 3. wait for /healthz.
 log "waiting for /healthz"
@@ -87,6 +95,28 @@ done
 [ "$CONNECTED" = "true" ] \
     || { tail -100 "$GATEWAY_LOG" >&2; die "agent never connected to socket"; }
 ok "agent connected (WebChat endpoint will now accept WS upgrades)"
+
+case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
+    namespace)
+        grep -q "agent spawner: NamespaceSpawner" "$GATEWAY_LOG" \
+            || { tail -50 "$GATEWAY_LOG" >&2; die "gateway did not select NamespaceSpawner"; }
+        CGROUP="/sys/fs/cgroup/havn.slice/agent-$AGENT_ID"
+        for f in memory.max cpu.max pids.max cgroup.procs; do
+            log "$f: $(paste -sd' ' "$CGROUP/$f" 2>&1)"
+        done
+        for limit in memory.max cpu.max pids.max; do
+            [ -f "$CGROUP/$limit" ] || die "agent cgroup is missing $limit ($CGROUP)"
+            value=$(cut -d' ' -f1 "$CGROUP/$limit")
+            [ "$value" != "max" ] || die "agent cgroup $limit is unlimited ($CGROUP)"
+        done
+        [ -n "$(cat "$CGROUP/cgroup.procs")" ] || die "agent cgroup has no member processes ($CGROUP)"
+        ok "NamespaceSpawner isolation: memory.max=$(cat "$CGROUP/memory.max") pids.max=$(cat "$CGROUP/pids.max")"
+        ;;
+    subprocess)
+        grep -q "agent spawner: SubprocessSpawner" "$GATEWAY_LOG" \
+            || die "gateway did not select SubprocessSpawner"
+        ;;
+esac
 
 # 7. verify the WebSocket upgrade is accepted. Curl will return non-zero on
 #    a non-101 response; we use --max-time to bail out of the long-poll.
