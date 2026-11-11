@@ -598,7 +598,7 @@ fn build_anthropic_request(req: &LlmRequest) -> anyhow::Result<AnthropicRequest>
         .get("max_tokens")
         .and_then(serde_json::Value::as_u64)
         .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(1024);
+        .unwrap_or(8192);
     let system = req
         .options
         .get("system")
