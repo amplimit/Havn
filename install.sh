@@ -135,8 +135,14 @@ fi
 
 if $use_source; then
     # 2. apt prerequisites. Skip cleanly if apt is missing (e.g. Alpine / Arch).
-    if command -v apt-get >/dev/null 2>&1; then
-        log "installing build prerequisites via apt"
+    missing=""
+    for tool in cc pkg-config curl git; do
+        command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+    done
+    if [ -z "$missing" ]; then
+        log "build prerequisites already installed; skipping apt"
+    elif command -v apt-get >/dev/null 2>&1; then
+        log "installing build prerequisites via apt (missing:$missing)"
         $SUDO apt-get update -qq
         $SUDO apt-get install -y --no-install-recommends \
             build-essential pkg-config curl ca-certificates git
