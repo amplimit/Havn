@@ -283,6 +283,7 @@ mod tests {
                 max_iterations: SUBAGENT_MAX_ITERATIONS,
                 messages_mirror: None,
                 model: Arc::new(crate::tool_loop::DEFAULT_MODEL.to_string()),
+                max_tokens: crate::tool_loop::DEFAULT_MAX_TOKENS,
                 billing_user_id: None,
             },
             parent_messages: Arc::new(tokio::sync::RwLock::new(Vec::new())),

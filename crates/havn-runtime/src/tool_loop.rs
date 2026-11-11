@@ -52,6 +52,7 @@ pub struct LoopHandle {
     /// `config.model`, fallback to [`DEFAULT_MODEL`]). Subagents
     /// inherit the parent's model — same agent, same compute budget.
     pub model: Arc<String>,
+    pub max_tokens: u32,
     /// Billing override for cross-agent queries (spec §4.4 v0.7). When
     /// `Some(user_id)` every [`LlmRequest`] this loop emits carries the
     /// override, so the gateway resolves credentials and records usage
@@ -62,10 +63,10 @@ pub struct LoopHandle {
     pub billing_user_id: Option<String>,
 }
 
-/// Default token budget for an LLM call. Mirrors `main::DEFAULT_MAX_TOKENS`
-/// — kept as a separate constant here so the loop module compiles standalone
-/// in tests.
-pub const DEFAULT_MAX_TOKENS: u32 = 1024;
+/// Default output-token budget for an agent LLM call when the agent's
+/// `config.max_tokens` does not set one. Sized for tool use: a `file_write`
+/// call carries the whole file in its input.
+pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 /// Default model when the per-call options don't override.
 pub const DEFAULT_MODEL: &str = "claude-opus-4-6";
@@ -255,7 +256,7 @@ async fn call_llm(
     system_prompt: &SystemPrompt,
 ) -> anyhow::Result<LlmResponse> {
     let request_id = Uuid::now_v7().to_string();
-    let mut options = serde_json::json!({ "max_tokens": DEFAULT_MAX_TOKENS });
+    let mut options = serde_json::json!({ "max_tokens": handle.max_tokens });
     if let Some(prompt) = system_prompt.as_text() {
         options["system"] = Value::String(prompt.to_string());
     }
