@@ -458,15 +458,11 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
-    use std::fs::File;
+    use crate::cgroup::{ALL_CONTROLLERS, fake_root};
     use std::path::PathBuf;
 
     fn fake_cgroup_root() -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("havn-ns-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&p).expect("mkdir");
-        File::create(p.join("cgroup.controllers")).expect("touch cgroup.controllers");
-        p
+        fake_root(ALL_CONTROLLERS, ALL_CONTROLLERS)
     }
 
     #[tokio::test]

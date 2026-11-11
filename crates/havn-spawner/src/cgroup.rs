@@ -24,12 +24,14 @@ use std::path::{Path, PathBuf};
 
 use havn_core::ResourceLimits;
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Default systemd-friendly slice name. We don't manage the slice lifecycle —
 /// systemd or the operator does that — but we create the directory if it's
 /// missing and writable.
 const SLICE: &str = "havn.slice";
+
+const REQUIRED_CONTROLLERS: &[&str] = &["cpu", "memory", "pids"];
 
 /// cgroup v2 cpu.max period — the standard 100 ms scheduler window. Quota is
 /// derived per-agent from `cpu_cores * PERIOD_US`.
@@ -58,6 +60,19 @@ pub enum CgroupError {
     },
     #[error("cannot remove cgroup {0}")]
     Cleanup(PathBuf),
+    #[error(
+        "cgroup controllers `{controllers}` are not offered by {file} (kernel built \
+         without them, or the parent cgroup does not delegate them)"
+    )]
+    ControllerUnavailable { file: PathBuf, controllers: String },
+    #[error("cannot enable cgroup controllers `{controllers}` in {file}: {source} ({hint})")]
+    ControllerDelegation {
+        file: PathBuf,
+        controllers: String,
+        hint: &'static str,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// Stats snapshot for a single agent cgroup.
@@ -106,6 +121,7 @@ impl CgroupController {
             );
             return Err(CgroupError::SliceCreate(slice));
         }
+        delegate_controllers(&root, &slice)?;
         Ok(Self { root, slice })
     }
 
@@ -234,6 +250,71 @@ fn format_pids_max(pids_max: u32) -> String {
     }
 }
 
+fn delegate_controllers(root: &Path, slice: &Path) -> Result<(), CgroupError> {
+    let root_available = root.join("cgroup.controllers");
+    let unavailable = absent_from(&root_available, REQUIRED_CONTROLLERS)?;
+    if !unavailable.is_empty() {
+        return Err(CgroupError::ControllerUnavailable {
+            file: root_available,
+            controllers: unavailable.join(" "),
+        });
+    }
+    let root_control = root.join("cgroup.subtree_control");
+    let missing = absent_from(&root_control, REQUIRED_CONTROLLERS)?;
+    if !missing.is_empty() {
+        enable_controllers(&root_control, &missing)?;
+        info!(
+            root = %root.display(),
+            controllers = %missing.join(" "),
+            "enabled cgroup controllers on the cgroup root for havn.slice; this applies \
+             to every top-level cgroup on the host"
+        );
+    }
+    enable_controllers(&slice.join("cgroup.subtree_control"), REQUIRED_CONTROLLERS)
+}
+
+fn absent_from<'a>(list: &Path, controllers: &[&'a str]) -> Result<Vec<&'a str>, CgroupError> {
+    let raw = fs::read_to_string(list).map_err(|e| CgroupError::ReadFailed {
+        file: list.to_path_buf(),
+        source: e,
+    })?;
+    Ok(controllers
+        .iter()
+        .copied()
+        .filter(|wanted| !raw.split_whitespace().any(|token| token == *wanted))
+        .collect())
+}
+
+fn enable_controllers(control: &Path, controllers: &[&str]) -> Result<(), CgroupError> {
+    let request = controllers
+        .iter()
+        .map(|c| format!("+{c}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    fs::write(control, &request).map_err(|e| CgroupError::ControllerDelegation {
+        file: control.to_path_buf(),
+        controllers: request,
+        hint: delegation_hint(&e),
+        source: e,
+    })
+}
+
+fn delegation_hint(err: &io::Error) -> &'static str {
+    match err.raw_os_error() {
+        Some(libc::EBUSY) => {
+            "this cgroup has member processes, which cgroup v2 forbids once it delegates \
+             controllers; move them into a leaf cgroup (inside a container, its own \
+             processes usually sit in the container's root cgroup)"
+        }
+        Some(libc::EACCES | libc::EPERM) => {
+            "the gateway cannot write this cgroupfs file; run it as root or in a cgroup \
+             delegated to its user"
+        }
+        Some(libc::ENOENT) => "the parent cgroup does not offer one of these controllers",
+        _ => "unexpected cgroupfs error",
+    }
+}
+
 fn write_file(path: &Path, contents: &str) -> Result<(), CgroupError> {
     fs::write(path, contents).map_err(|e| CgroupError::WriteFailed {
         file: path.to_path_buf(),
@@ -265,20 +346,121 @@ fn parse_cpu_stat(path: &Path) -> Result<u64, CgroupError> {
 }
 
 #[cfg(test)]
+pub(crate) const ALL_CONTROLLERS: &str = "cpu io memory pids";
+
+#[cfg(test)]
+pub(crate) fn fake_root(available: &str, enabled: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("havn-cg-{}", uuid::Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("mkdir");
+    fs::write(root.join("cgroup.controllers"), available).expect("write cgroup.controllers");
+    fs::write(root.join("cgroup.subtree_control"), enabled).expect("write subtree_control");
+    root
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
-    use std::fs::File;
 
     /// Build a minimal "cgroup v2 root" in a tempdir: contains
     /// `cgroup.controllers` so [`CgroupController::with_root`] is happy.
     fn fake_v2_root() -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("havn-cg-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&p).expect("mkdir");
-        File::create(p.join("cgroup.controllers")).expect("touch cgroup.controllers");
-        p
+        fake_root(ALL_CONTROLLERS, ALL_CONTROLLERS)
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).expect("read")
+    }
+
+    #[test]
+    fn with_root_enables_required_controllers_on_slice() {
+        let root = fake_v2_root();
+        let ctl = CgroupController::with_root(root.clone()).expect("ctl");
+        assert_eq!(
+            read(&ctl.slice().join("cgroup.subtree_control")),
+            "+cpu +memory +pids"
+        );
+        assert_eq!(read(&root.join("cgroup.subtree_control")), ALL_CONTROLLERS);
+    }
+
+    #[test]
+    fn with_root_enables_missing_controllers_on_root_then_slice() {
+        let root = fake_root(ALL_CONTROLLERS, "cpu io");
+        let ctl = CgroupController::with_root(root.clone()).expect("ctl");
+        assert_eq!(read(&root.join("cgroup.subtree_control")), "+memory +pids");
+        assert_eq!(
+            read(&ctl.slice().join("cgroup.subtree_control")),
+            "+cpu +memory +pids"
+        );
+    }
+
+    #[test]
+    fn with_root_writes_root_before_slice() {
+        let root = fake_root(ALL_CONTROLLERS, "cpu io");
+        let slice_control = root.join(SLICE).join("cgroup.subtree_control");
+        std::fs::create_dir_all(&slice_control).expect("mkdir");
+        let err = CgroupController::with_root(root.clone()).expect_err("slice write must fail");
+        let failed = match err {
+            CgroupError::ControllerDelegation { file, .. } => file,
+            other => panic!("expected ControllerDelegation, got {other:?}"),
+        };
+        assert_eq!(failed, slice_control);
+        assert_eq!(read(&root.join("cgroup.subtree_control")), "+memory +pids");
+    }
+
+    #[test]
+    fn with_root_is_idempotent_for_existing_slice() {
+        let root = fake_v2_root();
+        let first = CgroupController::with_root(root.clone()).expect("first");
+        first
+            .create_agent("live", &ResourceLimits::default())
+            .expect("agent");
+        let second = CgroupController::with_root(root).expect("second");
+        assert_eq!(first.slice(), second.slice());
+        assert_eq!(
+            read(&second.slice().join("cgroup.subtree_control")),
+            "+cpu +memory +pids"
+        );
+        assert!(second.slice().join("agent-live").is_dir());
+    }
+
+    #[test]
+    fn with_root_rejects_controller_missing_from_root() {
+        let root = fake_root("cpu io pids", "cpu io pids");
+        let err = CgroupController::with_root(root.clone()).expect_err("must fail");
+        let unavailable = match err {
+            CgroupError::ControllerUnavailable { controllers, .. } => controllers,
+            other => panic!("expected ControllerUnavailable, got {other:?}"),
+        };
+        assert_eq!(unavailable, "memory");
+        assert_eq!(read(&root.join("cgroup.subtree_control")), "cpu io pids");
+    }
+
+    #[test]
+    fn with_root_rejects_slice_without_writable_subtree_control() {
+        let root = fake_v2_root();
+        let control = root.join(SLICE).join("cgroup.subtree_control");
+        std::fs::create_dir_all(&control).expect("mkdir");
+        let err = CgroupController::with_root(root).expect_err("must fail");
+        assert!(
+            matches!(err, CgroupError::ControllerDelegation { ref file, .. } if *file == control),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn with_root_rejects_root_without_subtree_control() {
+        let root = fake_v2_root();
+        std::fs::remove_file(root.join("cgroup.subtree_control")).expect("rm");
+        let err = CgroupController::with_root(root).expect_err("must fail");
+        assert!(matches!(err, CgroupError::ReadFailed { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn delegation_hint_names_no_internal_process_rule_for_ebusy() {
+        let hint = delegation_hint(&io::Error::from_raw_os_error(libc::EBUSY));
+        assert!(hint.contains("member processes"), "{hint}");
     }
 
     #[test]
