@@ -109,7 +109,7 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
             value=$(cut -d' ' -f1 "$CGROUP/$limit")
             [ "$value" != "max" ] || die "agent cgroup $limit is unlimited ($CGROUP)"
         done
-        [ -s "$CGROUP/cgroup.procs" ] || die "agent cgroup has no member processes ($CGROUP)"
+        [ -n "$(cat "$CGROUP/cgroup.procs")" ] || die "agent cgroup has no member processes ($CGROUP)"
         ok "NamespaceSpawner isolation: memory.max=$(cat "$CGROUP/memory.max") pids.max=$(cat "$CGROUP/pids.max")"
         ;;
     subprocess)
