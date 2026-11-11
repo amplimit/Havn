@@ -25,7 +25,7 @@ jobs:
 
       # rust-toolchain.toml is the single toolchain source; install.sh skips its
       # own rustup step when HAVN_SKIP_RUSTUP=1.
-      - run: rustup show
+      - run: rustup toolchain install
 
       # Cache the cargo registry + git index + target/ so re-runs measure the
       # incremental build path (which is what the production SLO targets:
@@ -68,17 +68,27 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - run: rustup show
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: install jq
         run: sudo apt-get update -qq && sudo apt-get install -y jq
       - name: build
         run: cargo build --bins
+      # Agents exec the runtime from inside a fresh user namespace where only
+      # root is mapped, so the binaries must sit on a world-traversable path
+      # (as install.sh arranges), not under the 0750 runner home.
+      - name: install binaries
+        run: |
+          sudo install -m 0755 target/debug/havn target/debug/havn-gateway \
+            target/debug/havn-runtime target/debug/havn-init /usr/local/bin/
       # The real NamespaceSpawner needs cgroup v2 write access, which on a
       # systemd host means running the gateway as root.
       - name: run smoke test as root with NamespaceSpawner
         run: |
-          sudo env "PATH=$PWD/target/debug:$PATH"             RUNNER_TEMP="$RUNNER_TEMP"             HAVN_SKIP_INSTALL=1             HAVN_SMOKE_EXPECT_SPAWNER=namespace             ./scripts/smoke.sh
+          sudo env RUNNER_TEMP="$RUNNER_TEMP" \
+            HAVN_SKIP_INSTALL=1 \
+            HAVN_SMOKE_EXPECT_SPAWNER=namespace \
+            ./scripts/smoke.sh
       - name: upload gateway log on failure
         if: failure()
         uses: actions/upload-artifact@v4

@@ -45,7 +45,13 @@ LOG_DIR="${RUNNER_TEMP:-/tmp}"
 GATEWAY_LOG="$LOG_DIR/havn-gateway.log"
 nohup havn start >"$GATEWAY_LOG" 2>&1 &
 GW_PID=$!
-trap 'kill "$GW_PID" 2>/dev/null || true' EXIT
+cleanup() {
+    if [ -n "${AGENT_ID:-}" ]; then
+        curl -fs -X POST "$GATEWAY_URL/agents/$AGENT_ID/stop" -o /dev/null || true
+    fi
+    kill "$GW_PID" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 # 3. wait for /healthz.
 log "waiting for /healthz"
@@ -97,7 +103,9 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
         CGROUP="/sys/fs/cgroup/havn.slice/agent-$AGENT_ID"
         for limit in memory.max cpu.max pids.max; do
             [ -f "$CGROUP/$limit" ] || die "agent cgroup is missing $limit ($CGROUP)"
+            [ "$(cut -d' ' -f1 "$CGROUP/$limit")" != "max" ] \n                || die "agent cgroup $limit is unlimited ($CGROUP)"
         done
+        [ -s "$CGROUP/cgroup.procs" ] || die "agent cgroup has no member processes ($CGROUP)"
         ok "NamespaceSpawner isolation: memory.max=$(cat "$CGROUP/memory.max") pids.max=$(cat "$CGROUP/pids.max")"
         ;;
     subprocess)
