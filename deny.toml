@@ -11,6 +11,20 @@ ignore = [
     # proc-macro-error2 is unmaintained with no safe upgrade (RUSTSEC-2026-0173);
     # pulled in transitively via age -> i18n-embed-fl. Re-evaluate when age drops it.
     "RUSTSEC-2026-0173",
+    # basic-toml is unmaintained with no safe upgrade (RUSTSEC-2026-0374); pulled in
+    # transitively via age -> i18n-embed-fl -> i18n-config at proc-macro time only.
+    # Re-evaluate when age drops i18n-embed-fl.
+    "RUSTSEC-2026-0374",
+    # rmcp < 3.9 buffers Streamable HTTP response bodies without a bound
+    # (RUSTSEC-2026-0462). havn builds rmcp with default-features = false and only
+    # client + transport-child-process + macros, so that transport is not compiled.
+    # Remove when rmcp is upgraded to >= 3.9.
+    "RUSTSEC-2026-0462",
+    # Bundled SQLite in libsqlite3-sys < 0.39 (RUSTSEC-2026-0459, CVE-2026-119375).
+    # Both sqlx 0.8 and 0.9 cap libsqlite3-sys below 0.39, so no upgrade path exists
+    # yet. Tracked in a repository security advisory; remove once sqlx allows
+    # libsqlite3-sys >= 0.39.
+    "RUSTSEC-2026-0459",
 ]
 
 [licenses]
