@@ -302,11 +302,14 @@ fn enable_controllers(control: &Path, controllers: &[&str]) -> Result<(), Cgroup
 fn delegation_hint(err: &io::Error) -> &'static str {
     match err.raw_os_error() {
         Some(libc::EBUSY) => {
-            "the cgroup has member processes, which cgroup v2 forbids for a cgroup that \
-             delegates controllers; inside a container, move its processes into a leaf \
-             cgroup or run havn on the host"
+            "this cgroup has member processes, which cgroup v2 forbids once it delegates \
+             controllers; move them into a leaf cgroup (inside a container, its own \
+             processes usually sit in the container's root cgroup)"
         }
-        Some(libc::EACCES | libc::EPERM) => "the gateway cannot write cgroupfs; run it as root",
+        Some(libc::EACCES | libc::EPERM) => {
+            "the gateway cannot write this cgroupfs file; run it as root or in a cgroup \
+             delegated to its user"
+        }
         Some(libc::ENOENT) => "the parent cgroup does not offer one of these controllers",
         _ => "unexpected cgroupfs error",
     }
@@ -393,6 +396,20 @@ mod tests {
     }
 
     #[test]
+    fn with_root_writes_root_before_slice() {
+        let root = fake_root(ALL_CONTROLLERS, "cpu io");
+        let slice_control = root.join(SLICE).join("cgroup.subtree_control");
+        std::fs::create_dir_all(&slice_control).expect("mkdir");
+        let err = CgroupController::with_root(root.clone()).expect_err("slice write must fail");
+        let failed = match err {
+            CgroupError::ControllerDelegation { file, .. } => file,
+            other => panic!("expected ControllerDelegation, got {other:?}"),
+        };
+        assert_eq!(failed, slice_control);
+        assert_eq!(read(&root.join("cgroup.subtree_control")), "+memory +pids");
+    }
+
+    #[test]
     fn with_root_is_idempotent_for_existing_slice() {
         let root = fake_v2_root();
         let first = CgroupController::with_root(root.clone()).expect("first");
@@ -412,13 +429,11 @@ mod tests {
     fn with_root_rejects_controller_missing_from_root() {
         let root = fake_root("cpu io pids", "cpu io pids");
         let err = CgroupController::with_root(root.clone()).expect_err("must fail");
-        assert!(
-            matches!(
-                err,
-                CgroupError::ControllerUnavailable { ref controllers, .. } if controllers == "memory"
-            ),
-            "{err:?}"
-        );
+        let unavailable = match err {
+            CgroupError::ControllerUnavailable { controllers, .. } => controllers,
+            other => panic!("expected ControllerUnavailable, got {other:?}"),
+        };
+        assert_eq!(unavailable, "memory");
         assert_eq!(read(&root.join("cgroup.subtree_control")), "cpu io pids");
     }
 
