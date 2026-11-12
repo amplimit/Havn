@@ -5,10 +5,9 @@
   "license": "Apache-2.0",
   "description": "havn dashboard — agent list, chat, credentials, settings (spec §10).",
   "scripts": {
-    "dev": "next dev -p 3000",
+    "dev": "node server.mjs --dev",
     "build": "next build",
     "start": "node server.mjs",
-    "start:plain": "next start -p 3000",
     "lint": "next lint",
     "type-check": "tsc --noEmit"
   },

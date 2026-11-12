@@ -18,23 +18,10 @@ shadows, radii, spacing) are reproduced verbatim.
 ## Dev
 
 ```bash
-# from repo root
 cd apps/dashboard
 npm install                       # one-time
 npm run dev                       # http://localhost:3000
-
-# in another shell, with the gateway already running
-HAVN_GATEWAY_URL=http://127.0.0.1:8080 npm run dev
 ```
-
-The dashboard's dev origin (`http://localhost:3000`) is in the gateway's
-default `allowed_origins` allowlist (spec §11 ClawJacked-class mitigation).
-
-REST hits the gateway via Next's `/api/:path*` proxy (see `next.config.mjs`).
-WebSocket frames bypass that proxy because Next can't transparently upgrade WS
-across origins; the browser opens a direct connection to
-`ws://127.0.0.1:8080/ws/chat/:agent_id?token=...` and the gateway validates the
-`Origin` header.
 
 ## Production
 
@@ -43,6 +30,16 @@ npm run build
 npm start                         # http://localhost:3000
 ```
 
-Or build a static export and serve via the gateway / a CDN — `next.config.mjs`
-takes a single env var (`HAVN_GATEWAY_URL`) for the API hop, plus
-`NEXT_PUBLIC_HAVN_GATEWAY_WS` for the WebSocket origin.
+Both commands run `server.mjs`, which serves the UI and proxies `/api/*`
+(REST) and `/ws/*` (WebChat WebSocket) to the gateway, so the browser only
+talks to the dashboard's origin. Settings, read at startup:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PORT` | `3000` | Dashboard port |
+| `HAVN_GATEWAY_URL` | `http://127.0.0.1:8080` | Gateway address (http only) |
+
+The proxy presents WebSocket upgrades to the gateway with
+`Origin: http://127.0.0.1:<PORT>`. The default port is in the gateway's
+default `allowed_origins`; if you change `PORT`, add
+`http://127.0.0.1:<PORT>` to `allowed_origins` in the gateway config.

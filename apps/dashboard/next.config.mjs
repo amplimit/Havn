@@ -1,7 +1,7 @@
 /**
- * Next.js config — proxies REST + WS to the gateway during dev so the browser
- * doesn't have to hop origins (gateway listens on 127.0.0.1:8080 by default).
- * Production deployments configure the reverse proxy at the edge instead.
+ * Next.js config. `/api/*` and `/ws/*` are proxied to the gateway by
+ * `server.mjs` at runtime, not here, so the gateway address is not baked
+ * into the build.
  */
 /** @type {import('next').NextConfig} */
 const nextConfig = {
@@ -9,12 +9,10 @@ const nextConfig = {
   // Pin the file-tracing root so Next doesn't pick a parent lockfile and
   // emit the multi-lockfile warning.
   outputFileTracingRoot: import.meta.dirname,
-  async rewrites() {
-    const gateway = process.env.HAVN_GATEWAY_URL ?? "http://127.0.0.1:8080";
-    return [
-      { source: "/api/:path*", destination: `${gateway}/:path*` },
-    ];
-  },
+  // `npm run dev` only allows localhost by default; without this, opening
+  // the dev server as 127.0.0.1 blocks its hot-reload socket and the page
+  // never hydrates.
+  allowedDevOrigins: ["127.0.0.1"],
 };
 
 export default nextConfig;
