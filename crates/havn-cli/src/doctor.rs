@@ -437,16 +437,17 @@ const NETWORK_TOOLS: &[(&str, &str)] = &[
 ];
 
 /// Same lookup as `havn_spawner::network::resolve_tool` (absolute `PATH`
-/// entries, then these), so doctor and the gateway agree; the CLI does not
-/// link the spawner.
+/// entries, as root only root-owned ones that are not group/other-writable,
+/// then these), so doctor and the gateway agree; the CLI does not link the
+/// spawner.
 const SBIN_DIRS: &[&str] = &["/usr/local/sbin", "/usr/sbin", "/sbin"];
 
-fn find_tool(name: &str, path_var: Option<&OsString>) -> Option<PathBuf> {
+fn find_tool(name: &str, path_var: Option<&OsString>, root: bool) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt as _;
     let mut dirs: Vec<PathBuf> = path_var
         .map(|p| {
             std::env::split_paths(p)
-                .filter(|d| d.is_absolute())
+                .filter(|d| d.is_absolute() && (!root || root_owned_dir(d)))
                 .collect()
         })
         .unwrap_or_default();
@@ -457,6 +458,12 @@ fn find_tool(name: &str, path_var: Option<&OsString>) -> Option<PathBuf> {
     })
 }
 
+fn root_owned_dir(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    dir.metadata()
+        .is_ok_and(|m| m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0)
+}
+
 fn network_tools_verdict(missing: &[(&str, &str)]) -> (Verdict, String) {
     if missing.is_empty() {
         let bins: Vec<&str> = NETWORK_TOOLS.iter().map(|(bin, _)| *bin).collect();
@@ -464,12 +471,18 @@ fn network_tools_verdict(missing: &[(&str, &str)]) -> (Verdict, String) {
     }
     let bins: Vec<&str> = missing.iter().map(|(bin, _)| *bin).collect();
     let packages: Vec<&str> = missing.iter().map(|(_, pkg)| *pkg).collect();
+    // The gateway checks host routes with `ip` before it starts; the other
+    // two only gate agent egress.
+    let effect = if bins.contains(&"ip") {
+        "the gateway refuses to start"
+    } else {
+        "agents start without outbound network"
+    };
     (
         Verdict::Warn,
         format!(
-            "{} not found — agents start without outbound network; install with \
-             `apt-get install {}` (iptables with the nft or legacy backend) and restart the \
-             gateway",
+            "{} not found — {effect}; install with `apt-get install {}` (iptables with the \
+             nft or legacy backend) and restart the gateway",
             bins.join(", "),
             packages.join(" ")
         ),
@@ -481,10 +494,12 @@ fn check_network_tools() -> Verdict {
         return Verdict::Ok;
     }
     let path_var = std::env::var_os("PATH");
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let root = unsafe { libc::geteuid() } == 0;
     let missing: Vec<(&str, &str)> = NETWORK_TOOLS
         .iter()
         .copied()
-        .filter(|(bin, _)| find_tool(bin, path_var.as_ref()).is_none())
+        .filter(|(bin, _)| find_tool(bin, path_var.as_ref(), root).is_none())
         .collect();
     let (v, msg) = network_tools_verdict(&missing);
     line(v, "network tools", &msg);
@@ -687,8 +702,10 @@ mod tests {
         let (v, msg) = network_tools_verdict(&[("iptables", "iptables"), ("ip", "iproute2")]);
         assert!(matches!(v, Verdict::Warn));
         assert!(msg.starts_with("iptables, ip not found"), "{msg}");
-        assert!(msg.contains("without outbound network"), "{msg}");
+        assert!(msg.contains("refuses to start"), "{msg}");
         assert!(msg.contains("apt-get install iptables iproute2"), "{msg}");
+        let (_, msg) = network_tools_verdict(&[("iptables", "iptables")]);
+        assert!(msg.contains("without outbound network"), "{msg}");
     }
 
     #[test]
@@ -706,9 +723,14 @@ mod tests {
         std::fs::write(&tool, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
         let path = Some(dir.clone().into_os_string());
-        assert_eq!(find_tool("havn-doctor-tool", path.as_ref()), None);
+        assert_eq!(find_tool("havn-doctor-tool", path.as_ref(), false), None);
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(find_tool("havn-doctor-tool", path.as_ref()), Some(tool));
+        assert_eq!(
+            find_tool("havn-doctor-tool", path.as_ref(), false),
+            Some(tool)
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(find_tool("havn-doctor-tool", path.as_ref(), true), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -218,8 +218,8 @@ for bin in $BINARIES; do
 done
 
 # 7. Network tools the gateway runs for agent egress (veth + NAT, spec §4.1).
-# Without them the gateway still starts, but every agent has no outbound
-# network.
+# Without iptables or nsenter the gateway still starts, but every agent has no
+# outbound network; without ip it refuses to start.
 missing_net=""
 for tool in iptables ip nsenter; do
     have_tool "$tool" || missing_net="$missing_net $tool"
@@ -265,12 +265,13 @@ if [ "${HAVN_SKIP_SYSTEMD:-0}" != "1" ] && [ -d /run/systemd/system ]; then
     fi
     # The prefix goes verbatim into ExecStart= and the sed replacement.
     case "$INSTALL_PREFIX" in
-        *[[:space:]]* | *'&'* | *'|'* | *'\'*) prefix_ok=false ;;
+        *[[:space:]]* | *'&'* | *'|'* | *'\'* | *'%'* | *'$'* | *';'* | *"'"* | *'"'*)
+            prefix_ok=false ;;
         /*) prefix_ok=true ;;
         *) prefix_ok=false ;;
     esac
     if ! $prefix_ok; then
-        warn "HAVN_PREFIX '$INSTALL_PREFIX' must be an absolute path without whitespace, '&', '|' or '\\'; skipping the systemd unit"
+        warn "HAVN_PREFIX '$INSTALL_PREFIX' must be an absolute path without whitespace or any of & | \\ % \$ ; ' \"; skipping the systemd unit"
     elif [ -f "$unit_src" ]; then
         sed "s|^ExecStart=/usr/local/bin/|ExecStart=${INSTALL_PREFIX%/}/|" "$unit_src" >"$STAGE/unit"
         $SUDO install -d -m 755 "$UNIT_DIR"

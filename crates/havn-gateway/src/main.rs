@@ -167,15 +167,29 @@ struct AppState {
 )]
 async fn main() -> anyhow::Result<()> {
     // The gateway takes no arguments (config comes from the file and env);
-    // `--version` is the one exception, matching the other binaries.
-    if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
+    // only `--version` and `--help` are answered, matching the other binaries.
+    {
         use std::io::Write as _;
-        writeln!(
-            std::io::stdout(),
-            "havn-gateway {}",
-            env!("CARGO_PKG_VERSION")
-        )?;
-        return Ok(());
+        match std::env::args().nth(1).as_deref() {
+            Some("--version" | "-V") => {
+                writeln!(
+                    std::io::stdout(),
+                    "havn-gateway {}",
+                    env!("CARGO_PKG_VERSION")
+                )?;
+                return Ok(());
+            }
+            Some("--help" | "-h") => {
+                writeln!(
+                    std::io::stdout(),
+                    "Usage: havn-gateway [--version | --help]\n\nRuns the havn gateway. It \
+                     takes no other arguments: config comes from $HAVN_CONFIG or \
+                     ~/.config/havn/config.toml, credentials need HAVN_AGE_KEY."
+                )?;
+                return Ok(());
+            }
+            _ => {}
+        }
     }
     init_tracing();
 
