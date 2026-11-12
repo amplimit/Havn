@@ -135,6 +135,8 @@ async function fetchIdentityHeader() {
   const res = await fetch(new URL("/auth/info", gatewayUrl), {
     signal: AbortSignal.timeout(5_000),
   });
+  // Gateways up to v0.1.2 have no /auth/info and only ever read X-User-ID.
+  if (res.status === 404) return "x-user-id";
   if (!res.ok) throw new Error(`GET /auth/info returned ${res.status}`);
   const body = await res.json();
   const name = typeof body?.identity_header === "string" ? body.identity_header.toLowerCase() : "";
