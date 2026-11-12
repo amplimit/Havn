@@ -33,7 +33,7 @@ use crate::AppState;
 use crate::agent_registry::AgentRegistry;
 use crate::api::{ApiError, WS_SEND_TIMEOUT};
 use crate::auth::AuthedUser;
-use crate::webchat::{ClientMessage, ServerMessage, SessionId, WebChatRouter};
+use crate::webchat::{ClientMessage, ServerMessage, SessionId, TabId, WebChatRouter};
 
 const SESSION_OUTBOUND_CAPACITY: usize = 64;
 
@@ -163,6 +163,12 @@ async fn serve_session<Si, St, E>(
         // Best-effort close.
         let _ = tokio::time::timeout(WS_SEND_TIMEOUT, ws_sink.send(Message::Close(None))).await;
     });
+    let mut cleanup = TabCleanup {
+        router: router.clone(),
+        tab: registration.tab,
+        outbound: outbound.abort_handle(),
+        armed: true,
+    };
 
     // Inbound loop: read WS frames, dispatch as InboundMessage frames to the
     // agent. Ends too when the outbound task does or the router closes the
@@ -233,10 +239,34 @@ async fn serve_session<Si, St, E>(
         }
     }
 
+    cleanup.armed = false;
     router.unregister(registration.tab).await;
     if !outbound_done {
         outbound.abort();
         let _ = outbound.await;
+    }
+}
+
+/// Unregisters the tab and stops its writer when `serve_session` is
+/// dropped before it finishes (for example a cancelled upgrade future).
+struct TabCleanup {
+    router: WebChatRouter,
+    tab: TabId,
+    outbound: tokio::task::AbortHandle,
+    armed: bool,
+}
+
+impl Drop for TabCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.outbound.abort();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let router = self.router.clone();
+            let tab = self.tab;
+            runtime.spawn(async move { router.unregister(tab).await });
+        }
     }
 }
 
@@ -354,6 +384,26 @@ mod tests {
             .await
             .expect("the healthy tab ends with its browser")
             .expect("join");
+        assert_eq!(router.tab_count(session_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_session_still_unregisters_its_tab() {
+        let router = WebChatRouter::new();
+        let agent_id = AgentId::new();
+        let session_id = Uuid::now_v7();
+        let (sink, _inbox) = reading_sink();
+        let (_input, task) = spawn_tab(&router, sink, agent_id, session_id);
+        while router.tab_count(session_id).await < 1 {
+            tokio::task::yield_now().await;
+        }
+
+        task.abort();
+        let _ = task.await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
         assert_eq!(router.tab_count(session_id).await, 0);
     }
 }

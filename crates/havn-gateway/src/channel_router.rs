@@ -87,10 +87,11 @@ struct AccountState {
     /// for replay on reconnect. Oldest-first; aged + capacity-trimmed
     /// on every mutation.
     replay: VecDeque<ReplayEntry>,
-    /// A `Resume` replay is being sent through `tx`. Deliveries are then
-    /// only buffered, and the replay sends them when it catches up, so a
-    /// long replay cannot fill the queue and look like a stall.
-    replaying: bool,
+    /// The sender a `Resume` replay is going through. While it is `tx`,
+    /// deliveries are only buffered and the replay sends them when it
+    /// catches up, so a long replay cannot fill the queue and look like a
+    /// stall. A replay by a superseded connection never matches.
+    replaying: Option<mpsc::Sender<ChannelFrame>>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,7 +138,7 @@ impl ChannelRouter {
         match map.get_mut(&key) {
             Some(state) => {
                 state.tx = Some(tx);
-                state.replaying = false;
+                state.replaying = None;
             }
             None => {
                 map.insert(
@@ -146,7 +147,7 @@ impl ChannelRouter {
                         tx: Some(tx),
                         next_seq: 1,
                         replay: VecDeque::new(),
-                        replaying: false,
+                        replaying: None,
                     },
                 );
             }
@@ -162,7 +163,7 @@ impl ChannelRouter {
             && state.tx.as_ref().is_some_and(|t| t.same_channel(tx))
         {
             state.tx = None;
-            state.replaying = false;
+            state.replaying = None;
         }
     }
 
@@ -200,7 +201,9 @@ impl ChannelRouter {
             match &state.tx {
                 None => return Err(DeliverError::NoSession(key.clone())),
                 // The running replay sends it once it catches up.
-                Some(_) if state.replaying => return Ok(seq),
+                Some(tx) if state.replaying.as_ref().is_some_and(|r| r.same_channel(tx)) => {
+                    return Ok(seq);
+                }
                 Some(tx) => (tx.clone(), frame, seq),
             }
         };
@@ -233,28 +236,41 @@ impl ChannelRouter {
     /// that the gateway never saw, e.g. because the gateway itself
     /// restarted). The caller logs a warn for that case.
     ///
-    /// Starts a replay: until [`Self::replay_more`] reports it caught up,
-    /// new deliveries are only buffered.
-    pub async fn replay_since(&self, key: &AccountKey, since_seq: u64) -> Vec<ChannelFrame> {
+    /// Starts a replay through `tx` when it is the registered sender:
+    /// until [`Self::replay_more`] reports it caught up, new deliveries
+    /// are only buffered.
+    pub async fn replay_since(
+        &self,
+        key: &AccountKey,
+        since_seq: u64,
+        tx: &mpsc::Sender<ChannelFrame>,
+    ) -> Vec<ChannelFrame> {
         let mut map = self.inner.lock().await;
         let Some(state) = map.get_mut(key) else {
             return Vec::new();
         };
-        state.replaying = state.tx.is_some();
+        if state.tx.as_ref().is_some_and(|t| t.same_channel(tx)) {
+            state.replaying = Some(tx.clone());
+        }
         frames_after(state, since_seq)
     }
 
-    /// Frames buffered after `after_seq` while a replay was being sent.
-    /// Empty means the replay caught up: it ends, and deliveries go
-    /// straight to the adapter again.
-    pub async fn replay_more(&self, key: &AccountKey, after_seq: u64) -> Vec<ChannelFrame> {
+    /// Frames buffered after `after_seq` while the replay through `tx`
+    /// was being sent. Empty means it caught up: it ends, and deliveries
+    /// go straight to the adapter again.
+    pub async fn replay_more(
+        &self,
+        key: &AccountKey,
+        after_seq: u64,
+        tx: &mpsc::Sender<ChannelFrame>,
+    ) -> Vec<ChannelFrame> {
         let mut map = self.inner.lock().await;
         let Some(state) = map.get_mut(key) else {
             return Vec::new();
         };
         let frames = frames_after(state, after_seq);
-        if frames.is_empty() {
-            state.replaying = false;
+        if frames.is_empty() && state.replaying.as_ref().is_some_and(|r| r.same_channel(tx)) {
+            state.replaying = None;
         }
         frames
     }
@@ -481,7 +497,7 @@ mod tests {
             .expect("deliver must not wait for the adapter");
         assert!(matches!(r, Err(DeliverError::Stalled(_))), "{r:?}");
         assert_eq!(
-            router.replay_since(&key, 0).await.len(),
+            router.replay_since(&key, 0, &stranger()).await.len(),
             2,
             "the dropped frame stays replayable"
         );
@@ -492,9 +508,41 @@ mod tests {
         );
         assert!(matches!(send().await, Err(DeliverError::NoSession(_))));
         assert_eq!(
-            router.replay_since(&key, 0).await.len(),
+            router.replay_since(&key, 0, &stranger()).await.len(),
             3,
             "replies while the adapter is away are buffered too"
+        );
+    }
+
+    fn stranger() -> mpsc::Sender<ChannelFrame> {
+        mpsc::channel(1).0
+    }
+
+    #[tokio::test]
+    async fn a_superseded_connection_cannot_pause_the_new_one() {
+        let router = ChannelRouter::new();
+        let key = AccountKey::new("telegram", "alice");
+        let (old, _old_rx) = mpsc::channel(8);
+        router.register(key.clone(), old.clone()).await;
+        let (new, mut new_rx) = mpsc::channel(8);
+        router.register(key.clone(), new).await;
+
+        // The old session handles a late Resume after the new one registered.
+        router.replay_since(&key, 0, &old).await;
+        router
+            .deliver(
+                "telegram",
+                "alice",
+                "tg:1",
+                None,
+                ChannelMessageContent::Text { text: "x".into() },
+            )
+            .await
+            .expect("deliver");
+
+        assert!(
+            new_rx.try_recv().is_ok(),
+            "the new adapter gets live frames"
         );
     }
 
@@ -530,8 +578,8 @@ mod tests {
 
         // The reconnected adapter's queue is smaller than the replay.
         let (tx, mut rx) = mpsc::channel(1);
-        router.register(key.clone(), tx).await;
-        let first = router.replay_since(&key, 0).await;
+        router.register(key.clone(), tx.clone()).await;
+        let first = router.replay_since(&key, 0, &tx).await;
         assert_eq!(seqs(&first), vec![1, 2, 3, 4, 5]);
         for _ in 0..3 {
             deliver()
@@ -540,9 +588,9 @@ mod tests {
         }
         assert!(rx.try_recv().is_err(), "nothing bypasses the replay");
 
-        let more = router.replay_more(&key, 5).await;
+        let more = router.replay_more(&key, 5, &tx).await;
         assert_eq!(seqs(&more), vec![6, 7, 8]);
-        assert!(router.replay_more(&key, 8).await.is_empty());
+        assert!(router.replay_more(&key, 8, &tx).await.is_empty());
         deliver().await.expect("live again");
         match rx.try_recv() {
             Ok(ChannelFrame::Outbound(o)) => assert_eq!(o.seq, 9),
@@ -692,7 +740,7 @@ mod tests {
         }
 
         router.unregister(&key, &tx).await;
-        let replayed = router.replay_since(&key, 1).await;
+        let replayed = router.replay_since(&key, 1, &tx).await;
         let seqs: Vec<u64> = replayed
             .iter()
             .filter_map(|f| match f {
@@ -713,7 +761,7 @@ mod tests {
         // doesn't exist yet, replay yields nothing instead of panicking.
         let router = ChannelRouter::new();
         let got = router
-            .replay_since(&AccountKey::new("telegram", "ghost"), 42)
+            .replay_since(&AccountKey::new("telegram", "ghost"), 42, &stranger())
             .await;
         assert!(got.is_empty());
     }

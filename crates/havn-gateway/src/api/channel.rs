@@ -402,7 +402,10 @@ async fn handle_session(
                 };
                 // Deliveries arriving meanwhile are only buffered; keep
                 // replaying until the buffer has nothing newer.
-                let mut frames = state.channel_router.replay_since(&key, r.since_seq).await;
+                let mut frames = state
+                    .channel_router
+                    .replay_since(&key, r.since_seq, &frame_tx)
+                    .await;
                 let mut replayed = 0usize;
                 let mut cursor = r.since_seq;
                 'replay: loop {
@@ -421,7 +424,10 @@ async fn handle_session(
                         }
                         replayed += 1;
                     }
-                    frames = state.channel_router.replay_more(&key, cursor).await;
+                    frames = state
+                        .channel_router
+                        .replay_more(&key, cursor, &frame_tx)
+                        .await;
                     if frames.is_empty() {
                         break;
                     }
