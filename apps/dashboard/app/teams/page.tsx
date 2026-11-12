@@ -57,8 +57,9 @@ export default function TeamsPage() {
           style={{ color: "var(--color-body)", fontSize: 18, lineHeight: 1.4 }}
         >
           Group users for shared agents, shared credentials, and a single
-          audit log. The user who creates a team is auto-promoted to its
-          admin role.
+          audit log. In multi-user deployments the operator creates teams
+          with <code>havn team add</code>; this form only works in
+          single-user mode.
         </p>
       </header>
 
@@ -112,9 +113,8 @@ export default function TeamsPage() {
         <div className="card-elevated px-8 py-12 text-center">
           <p className="display-h3 mb-2">no teams yet</p>
           <p style={{ color: "var(--color-body)" }}>
-            Create one above to start sharing agents and credentials. Or
-            keep your agents personal — havn works fine in single-user
-            mode forever.
+            Ask your operator to add you to a team, or keep your agents
+            personal — havn works fine in single-user mode forever.
           </p>
         </div>
       )}

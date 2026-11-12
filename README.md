@@ -163,7 +163,12 @@ enabled = true
 allowed_proxies = ["127.0.0.1/32"]
 ```
 
-In trust-header (multi-user) mode, team roles define what each member's agents may do; a per-agent policy override can only narrow the member's role policy, and the gateway-wide embedding configuration can only be changed in `config.toml`.
+In trust-header (multi-user) mode:
+
+- The operator creates teams (`havn team add --name <name> --admin <user-id>`). Team roles define what each member's agents may do.
+- Team admins can set any policy on their team's roles, including MCP servers that mount host paths. Appoint them as you would an operator.
+- A per-agent policy override can only narrow the member's role policy.
+- The gateway-wide embedding configuration can only be changed in `config.toml`.
 
 Cron jobs may carry a `wake_check` script. It runs on the host as the dedicated `havn-wakecheck` user (created by `install.sh`; the gateway must run as root to switch to it) with a minimal environment. Without that user the script is skipped and the job always wakes.
 
