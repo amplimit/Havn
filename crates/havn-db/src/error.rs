@@ -24,4 +24,7 @@ pub enum DbError {
 
     #[error("unique-constraint violation on {0}")]
     Conflict(&'static str),
+
+    #[error("random source: {0}")]
+    Random(String),
 }

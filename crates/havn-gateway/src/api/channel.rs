@@ -23,11 +23,13 @@ use axum::response::Response;
 use futures_util::{SinkExt as _, StreamExt as _};
 use havn_core::{InboundMessage, MessageContent};
 use havn_db::repo::agents as agent_repo;
+use havn_db::repo::channel_access;
 use havn_db::repo::credentials::{self as creds, CredentialScope};
 use havn_proto::GatewayToAgent;
 use havn_proto::channel::{ChannelFrame, ChannelInbound, ChannelMessageContent};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -61,6 +63,19 @@ const DM_REJECT_MESSAGE: &str =
 const AGENT_UNREACHABLE_MESSAGE: &str =
     "The agent could not receive your message right now. Please try again later.";
 
+const INVITE_WELCOME_MESSAGE: &str = "Your invite code was accepted. You can now message this bot.";
+
+/// Invite-code attempts allowed per sender and account within
+/// [`INVITE_ATTEMPT_WINDOW`]. Codes carry 80 bits, so this is not what
+/// keeps them unguessable; it stops one sender from hammering the DB.
+const INVITE_ATTEMPT_LIMIT: u32 = 5;
+const INVITE_ATTEMPT_WINDOW: Duration = Duration::from_secs(900);
+/// Senders tracked at once. Once full, the sender whose window started
+/// first is forgotten to make room, so memory stays bounded and a flood
+/// of fresh sender ids cannot lock everyone else out of redeeming. The
+/// limiter only bounds DB load; the codes' 80 bits keep them secret.
+const INVITE_LIMITER_MAX_KEYS: usize = 10_000;
+
 /// Rate-limits rejection messages to unauthorized senders. Without
 /// this an attacker who floods a bot endpoint would trigger equally
 /// many outbound "access denied" replies (reflector amplification).
@@ -93,6 +108,129 @@ impl DmRejectLimiter {
                 true
             }
         }
+    }
+}
+
+/// Outcome of [`InviteAttemptLimiter::check`]. `first` is true once per
+/// window, so the caller logs a refusal once instead of per message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteAttempt {
+    Allowed,
+    /// This sender used up its attempts for the window.
+    Limited {
+        first: bool,
+    },
+}
+
+/// Counts invite-code attempts from unauthorized senders in a fixed
+/// window per key. Same key shape as [`DmRejectLimiter`]. Expired
+/// windows are pruned once per [`INVITE_ATTEMPT_WINDOW`].
+#[derive(Debug, Clone, Default)]
+pub struct InviteAttemptLimiter {
+    state: Arc<std::sync::Mutex<AttemptState>>,
+}
+
+#[derive(Debug, Default)]
+struct AttemptState {
+    windows: HashMap<String, AttemptWindow>,
+    /// Keys in the order their windows started, oldest first. An entry
+    /// goes stale when its key's window is evicted or restarts; stale
+    /// entries are skipped on eviction and dropped on prune.
+    order: VecDeque<(String, Instant)>,
+    last_prune: Option<Instant>,
+    evict_logged: bool,
+}
+
+impl AttemptState {
+    fn is_live(&self, key: &str, start: Instant) -> bool {
+        self.windows.get(key).is_some_and(|w| w.start == start)
+    }
+
+    fn evict_oldest(&mut self) {
+        while let Some((key, start)) = self.order.pop_front() {
+            if self.is_live(&key, start) {
+                self.windows.remove(&key);
+                return;
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AttemptWindow {
+    start: Instant,
+    count: u32,
+    logged: bool,
+}
+
+impl AttemptWindow {
+    fn at(start: Instant) -> Self {
+        Self {
+            start,
+            count: 0,
+            logged: false,
+        }
+    }
+}
+
+impl InviteAttemptLimiter {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Counts the attempt and returns `Allowed` while the key is under
+    /// [`INVITE_ATTEMPT_LIMIT`] for the current window.
+    pub fn check(&self, key: &str) -> InviteAttempt {
+        self.check_at(key, Instant::now())
+    }
+
+    fn check_at(&self, key: &str, now: Instant) -> InviteAttempt {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = &mut *guard;
+        if state
+            .last_prune
+            .is_none_or(|t| now.duration_since(t) >= INVITE_ATTEMPT_WINDOW)
+        {
+            state
+                .windows
+                .retain(|_, w| now.duration_since(w.start) < INVITE_ATTEMPT_WINDOW);
+            let windows = &state.windows;
+            state
+                .order
+                .retain(|(k, start)| windows.get(k).is_some_and(|w| w.start == *start));
+            state.last_prune = Some(now);
+            state.evict_logged = false;
+        }
+        if !state.windows.contains_key(key) && state.windows.len() >= INVITE_LIMITER_MAX_KEYS {
+            state.evict_oldest();
+            if !std::mem::replace(&mut state.evict_logged, true) {
+                warn!(
+                    limit = INVITE_LIMITER_MAX_KEYS,
+                    "invite: attempt limiter is full; forgetting the oldest senders"
+                );
+            }
+        }
+        let window = match state.windows.entry(key.to_string()) {
+            Entry::Occupied(e) => {
+                let window = e.into_mut();
+                if now.duration_since(window.start) >= INVITE_ATTEMPT_WINDOW {
+                    *window = AttemptWindow::at(now);
+                    state.order.push_back((key.to_string(), now));
+                }
+                window
+            }
+            Entry::Vacant(e) => {
+                state.order.push_back((key.to_string(), now));
+                e.insert(AttemptWindow::at(now))
+            }
+        };
+        if window.count >= INVITE_ATTEMPT_LIMIT {
+            let first = !std::mem::replace(&mut window.logged, true);
+            return InviteAttempt::Limited { first };
+        }
+        window.count += 1;
+        InviteAttempt::Allowed
     }
 }
 
@@ -529,23 +667,36 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
         return;
     }
 
-    // --- dm_policy enforcement (spec §3.4, issue #23) ---
+    // --- dm_policy enforcement (spec §3.4, issues #23 and #25) ---
     //
     // The adapter-daemon WS connection is already authenticated (token
     // match above), but the *individual sender* must also be authorized
-    // by the account's dm_policy + allow_from. This is the gate the
-    // audit found missing: without it, any platform user who can reach
-    // the bot gets the full agent toolset.
-    let dm_allowed = state
-        .channels
-        .get(channel)
-        .and_then(|entry| entry.accounts.iter().find(|a| a.id == inb.account_id))
-        .is_some_and(|acct| match acct.dm_policy {
-            DmPolicy::Open => true,
-            DmPolicy::Allowlist => acct.allow_from.iter().any(|id| id == &inb.sender_id),
-        });
+    // by the account's dm_policy, allow_from and invite allowlist. This
+    // is the gate the audit found missing: without it, any platform user
+    // who can reach the bot gets the full agent toolset.
+    let access = sender_access(state, channel, agent_id, &inb).await;
+    if access == SenderAccess::Admitted {
+        let welcome = ChannelMessageContent::Text {
+            text: INVITE_WELCOME_MESSAGE.into(),
+        };
+        if let Err(e) = state
+            .channel_router
+            .deliver(
+                channel,
+                &inb.account_id,
+                &inb.sender_id,
+                Some(inb.channel_message_id.clone()),
+                welcome,
+            )
+            .await
+        {
+            warn!(error = %e, "invite: failed to deliver welcome notice");
+        }
+        // The code itself is not a message for the agent.
+        return;
+    }
 
-    if !dm_allowed {
+    if access == SenderAccess::Denied {
         warn!(
             channel,
             account = %inb.account_id,
@@ -719,6 +870,135 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SenderAccess {
+    /// Forward the message to the agent.
+    Allowed,
+    /// The message redeemed an invite: welcome the sender, do not forward.
+    Admitted,
+    /// Reject as an unauthorized sender.
+    Denied,
+}
+
+/// `dm_policy = "open"` admits everyone. `allowlist` admits TOML
+/// `allow_from` and the DB `channel_allowlist` (read per message, so a
+/// revocation applies to the next one). Anyone else may redeem an invite
+/// code for this account; a failed or rate-limited attempt is `Denied`
+/// exactly like any other message, so the sender cannot tell whether a
+/// code exists.
+async fn sender_access(
+    state: &AppState,
+    channel: &str,
+    agent_id: havn_core::AgentId,
+    inb: &ChannelInbound,
+) -> SenderAccess {
+    let Some(acct) = state
+        .channels
+        .get(channel)
+        .and_then(|entry| entry.accounts.iter().find(|a| a.id == inb.account_id))
+    else {
+        return SenderAccess::Denied;
+    };
+    match acct.dm_policy {
+        DmPolicy::Open => return SenderAccess::Allowed,
+        DmPolicy::Allowlist => {}
+    }
+    if acct.allow_from.iter().any(|id| id == &inb.sender_id) {
+        return SenderAccess::Allowed;
+    }
+    match channel_access::is_allowed(&state.db, channel, &inb.account_id, &inb.sender_id).await {
+        Ok(true) => return SenderAccess::Allowed,
+        Ok(false) => {}
+        Err(e) => {
+            warn!(channel, account = %inb.account_id, error = %e, "dm_policy: allowlist lookup failed; rejecting");
+            return SenderAccess::Denied;
+        }
+    }
+
+    let ChannelMessageContent::Text { text } = &inb.content else {
+        return SenderAccess::Denied;
+    };
+    let Some(code) = channel_access::normalize_code(text) else {
+        return SenderAccess::Denied;
+    };
+    let limiter_key = format!("{channel}|{}|{}", inb.account_id, inb.sender_id);
+    match state.invite_attempt_limiter.check(&limiter_key) {
+        InviteAttempt::Allowed => {}
+        InviteAttempt::Limited { first } => {
+            if first {
+                warn!(
+                    channel,
+                    account = %inb.account_id,
+                    sender = %inb.sender_id,
+                    "invite: too many attempts from this sender; ignoring codes for the rest of the window"
+                );
+            }
+            return SenderAccess::Denied;
+        }
+    }
+    let invite = match channel_access::redeem(
+        &state.db,
+        channel,
+        &inb.account_id,
+        &inb.sender_id,
+        &code,
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        Ok(Some(invite)) => invite,
+        Ok(None) => {
+            warn!(
+                channel,
+                account = %inb.account_id,
+                sender = %inb.sender_id,
+                "invite: failed attempt (unknown, used, revoked, expired or other-account code)"
+            );
+            return SenderAccess::Denied;
+        }
+        Err(e) => {
+            warn!(channel, account = %inb.account_id, error = %e, "invite: redeem failed; rejecting");
+            return SenderAccess::Denied;
+        }
+    };
+    info!(
+        channel,
+        account = %inb.account_id,
+        sender = %inb.sender_id,
+        invite = %invite.id,
+        "invite: sender admitted"
+    );
+    let details = serde_json::json!({
+        "channel": channel,
+        "account_id": inb.account_id,
+        "sender_id": inb.sender_id,
+        "invite_id": invite.id.to_string(),
+    });
+    match agent_repo::find_by_id(&state.db, agent_id).await {
+        Ok(Some(agent)) => {
+            crate::audit::record(
+                &state.db,
+                agent.owner_id,
+                agent.team_id,
+                Some(agent_id),
+                "channel_access.granted",
+                details,
+            )
+            .await;
+        }
+        _ => {
+            crate::audit::record_user_action(
+                &state.db,
+                state.bootstrap_user_id,
+                "channel_access.granted",
+                details,
+            )
+            .await;
+        }
+    }
+    SenderAccess::Admitted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,5 +1032,338 @@ mod tests {
         assert!(limiter.should_send("telegram|bot|tg:1"));
         assert!(limiter.should_send("telegram|bot|tg:2"));
         assert!(!limiter.should_send("telegram|bot|tg:1"));
+    }
+
+    #[test]
+    fn invite_attempt_limiter_caps_each_sender_per_window() {
+        let limiter = InviteAttemptLimiter::new();
+        let start = Instant::now();
+        for _ in 0..INVITE_ATTEMPT_LIMIT {
+            assert_eq!(
+                limiter.check_at("telegram|bot|tg:1", start),
+                InviteAttempt::Allowed
+            );
+        }
+        assert_eq!(
+            limiter.check_at("telegram|bot|tg:1", start),
+            InviteAttempt::Limited { first: true }
+        );
+        assert_eq!(
+            limiter.check_at("telegram|bot|tg:1", start),
+            InviteAttempt::Limited { first: false },
+            "a refused sender is logged once per window"
+        );
+        assert_eq!(
+            limiter.check_at("telegram|bot|tg:2", start),
+            InviteAttempt::Allowed
+        );
+        let later = start + INVITE_ATTEMPT_WINDOW;
+        assert_eq!(
+            limiter.check_at("telegram|bot|tg:1", later),
+            InviteAttempt::Allowed
+        );
+    }
+
+    #[test]
+    fn invite_attempt_limiter_evicts_the_oldest_sender_when_full() {
+        let limiter = InviteAttemptLimiter::new();
+        let start = Instant::now();
+        for i in 0..INVITE_LIMITER_MAX_KEYS {
+            assert_eq!(
+                limiter.check_at(&format!("telegram|bot|tg:{i}"), start),
+                InviteAttempt::Allowed
+            );
+        }
+        for _ in 0..INVITE_ATTEMPT_LIMIT {
+            limiter.check_at("telegram|bot|tg:1", start);
+        }
+        assert_eq!(
+            limiter.check_at("telegram|bot|tg:new", start),
+            InviteAttempt::Allowed,
+            "a new sender is admitted while the limiter is full"
+        );
+        {
+            let state = limiter.state.lock().unwrap();
+            assert_eq!(state.windows.len(), INVITE_LIMITER_MAX_KEYS);
+            assert!(!state.windows.contains_key("telegram|bot|tg:0"));
+        }
+        assert!(
+            matches!(
+                limiter.check_at("telegram|bot|tg:1", start),
+                InviteAttempt::Limited { .. }
+            ),
+            "senders still tracked keep their count"
+        );
+        for i in 0..INVITE_LIMITER_MAX_KEYS {
+            limiter.check_at(&format!("telegram|bot|flood:{i}"), start);
+        }
+        let later = start + INVITE_ATTEMPT_WINDOW;
+        assert_eq!(
+            limiter.check_at("telegram|bot|tg:late", later),
+            InviteAttempt::Allowed
+        );
+        let state = limiter.state.lock().unwrap();
+        assert_eq!(state.windows.len(), 1, "the prune drops expired windows");
+        assert_eq!(state.order.len(), 1, "and their stale order entries");
+    }
+
+    mod invites {
+        #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+        use super::super::*;
+        use crate::config::{ChannelAccount, ChannelBindingConfig, ChannelEntry};
+        use havn_db::repo::audit;
+
+        struct Fixture {
+            state: AppState,
+            agent: mpsc::Receiver<GatewayToAgent>,
+            adapter: mpsc::Receiver<ChannelFrame>,
+        }
+
+        async fn fixture(dm_policy: DmPolicy, allow_from: &[&str]) -> Fixture {
+            let (mut state, _) = crate::auth::tests::state_with(false).await;
+            let agent_id = havn_core::AgentId::new();
+            state.bindings = Arc::new(vec![ChannelBindingConfig {
+                agent_id: agent_id.to_string(),
+                channel: "telegram".into(),
+                account_id: "bot".into(),
+            }]);
+            let mut channels = std::collections::BTreeMap::new();
+            channels.insert(
+                "telegram".to_string(),
+                ChannelEntry {
+                    accounts: ["bot", "other-bot"]
+                        .into_iter()
+                        .map(|id| ChannelAccount {
+                            id: id.into(),
+                            adapter_token_ref: format!("secret:channel:telegram:{id}"),
+                            dm_policy,
+                            allow_from: allow_from.iter().map(|s| (*s).to_string()).collect(),
+                        })
+                        .collect(),
+                },
+            );
+            state.channels = Arc::new(channels);
+            state
+                .registry
+                .register(havn_spawner::AgentHandle::new(agent_id, 1))
+                .await;
+            let (agent_tx, agent) = mpsc::channel(16);
+            state
+                .registry
+                .attach(agent_id, agent_tx)
+                .await
+                .expect("attach");
+            let (adapter_tx, adapter) = mpsc::channel(16);
+            state
+                .channel_router
+                .register(AccountKey::new("telegram", "bot"), adapter_tx)
+                .await;
+            Fixture {
+                state,
+                agent,
+                adapter,
+            }
+        }
+
+        fn text_from(sender: &str, text: &str) -> ChannelInbound {
+            ChannelInbound {
+                seq: 1,
+                account_id: "bot".into(),
+                channel_message_id: "m1".into(),
+                sender_id: sender.into(),
+                content: ChannelMessageContent::Text { text: text.into() },
+                timestamp: chrono::Utc::now(),
+                raw: None,
+            }
+        }
+
+        impl Fixture {
+            async fn send(&mut self, sender: &str, text: &str) {
+                handle_inbound(&self.state, "telegram", text_from(sender, text)).await;
+            }
+
+            fn forwarded(&mut self) -> Vec<String> {
+                let mut out = Vec::new();
+                while let Ok(frame) = self.agent.try_recv() {
+                    if let GatewayToAgent::InboundMessage(m) = frame {
+                        out.push(m.sender_id);
+                    }
+                }
+                out
+            }
+
+            fn replies(&mut self) -> Vec<(String, String)> {
+                let mut out = Vec::new();
+                while let Ok(frame) = self.adapter.try_recv() {
+                    if let ChannelFrame::Outbound(o) = frame
+                        && let ChannelMessageContent::Text { text } = o.content
+                    {
+                        out.push((o.to, text));
+                    }
+                }
+                out
+            }
+
+            async fn invite(&self, account: &str) -> String {
+                channel_access::create_invite(
+                    &self.state.db,
+                    "telegram",
+                    account,
+                    channel_access::DEFAULT_TTL,
+                )
+                .await
+                .expect("invite")
+                .code
+            }
+
+            async fn allowed(&self, sender: &str) -> bool {
+                channel_access::is_allowed(&self.state.db, "telegram", "bot", sender)
+                    .await
+                    .unwrap()
+            }
+        }
+
+        #[tokio::test]
+        async fn valid_code_admits_without_forwarding() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let code = f.invite("bot").await;
+            f.send("tg:1", &code.to_lowercase()).await;
+            assert!(
+                f.forwarded().is_empty(),
+                "the code must not reach the agent"
+            );
+            assert_eq!(
+                f.replies(),
+                vec![("tg:1".to_string(), INVITE_WELCOME_MESSAGE.to_string())]
+            );
+            assert!(f.allowed("tg:1").await);
+            let entries = audit::list(
+                &f.state.db,
+                audit::ListFilter {
+                    action_prefix: Some("channel_access.".into()),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].details["sender_id"], "tg:1");
+
+            f.send("tg:1", "hello").await;
+            assert_eq!(f.forwarded(), vec!["tg:1".to_string()]);
+            assert!(f.replies().is_empty());
+        }
+
+        #[tokio::test]
+        async fn reused_and_other_account_codes_are_rejected_like_any_message() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let code = f.invite("bot").await;
+            f.send("tg:1", &code).await;
+            f.replies();
+            f.send("tg:2", &code).await;
+            let other = f.invite("other-bot").await;
+            f.send("tg:3", &other).await;
+            f.send("tg:4", "not a code").await;
+            assert!(f.forwarded().is_empty());
+            let replies = f.replies();
+            assert_eq!(replies.len(), 3);
+            assert!(
+                replies.iter().all(|(_, text)| text == DM_REJECT_MESSAGE),
+                "a failed code gets the same reply as any other message: {replies:?}"
+            );
+            assert!(!f.allowed("tg:2").await);
+            assert!(!f.allowed("tg:3").await);
+        }
+
+        #[tokio::test]
+        async fn expired_code_is_rejected_like_any_message() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let code = channel_access::create_invite(
+                &f.state.db,
+                "telegram",
+                "bot",
+                chrono::Duration::seconds(-60),
+            )
+            .await
+            .expect("invite")
+            .code;
+            f.send("tg:1", &code).await;
+            assert!(f.forwarded().is_empty());
+            assert_eq!(
+                f.replies(),
+                vec![("tg:1".to_string(), DM_REJECT_MESSAGE.to_string())]
+            );
+            assert!(!f.allowed("tg:1").await);
+        }
+
+        #[tokio::test]
+        async fn revocation_applies_to_the_next_message() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let code = f.invite("bot").await;
+            f.send("tg:1", &code).await;
+            f.send("tg:1", "first").await;
+            assert_eq!(f.forwarded(), vec!["tg:1".to_string()]);
+            channel_access::revoke_sender(&f.state.db, "telegram", "bot", "tg:1")
+                .await
+                .expect("revoke");
+            f.send("tg:1", "second").await;
+            assert!(f.forwarded().is_empty());
+        }
+
+        #[tokio::test]
+        async fn rate_limited_sender_cannot_redeem_even_a_valid_code() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            for _ in 0..INVITE_ATTEMPT_LIMIT {
+                f.send("tg:1", "AAAA-AAAA-AAAA-AAAA").await;
+            }
+            let code = f.invite("bot").await;
+            f.send("tg:1", &code).await;
+            assert!(!f.allowed("tg:1").await);
+            assert!(f.forwarded().is_empty());
+            f.send("tg:2", &code).await;
+            assert!(f.allowed("tg:2").await, "other senders keep their budget");
+        }
+
+        #[tokio::test]
+        async fn new_sender_redeems_while_the_limiter_is_full() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            for i in 0..INVITE_LIMITER_MAX_KEYS {
+                f.state
+                    .invite_attempt_limiter
+                    .check(&format!("telegram|bot|flood:{i}"));
+            }
+            let code = f.invite("bot").await;
+            f.send("tg:new", &code).await;
+            assert!(f.allowed("tg:new").await);
+            assert_eq!(
+                f.replies(),
+                vec![("tg:new".to_string(), INVITE_WELCOME_MESSAGE.to_string())]
+            );
+        }
+
+        #[tokio::test]
+        async fn toml_allow_from_and_invited_senders_are_both_admitted() {
+            let mut f = fixture(DmPolicy::Allowlist, &["tg:toml"]).await;
+            let code = f.invite("bot").await;
+            f.send("tg:db", &code).await;
+            f.send("tg:toml", "hi").await;
+            f.send("tg:db", "hi").await;
+            f.send("tg:nobody", "hi").await;
+            assert_eq!(
+                f.forwarded(),
+                vec!["tg:toml".to_string(), "tg:db".to_string()]
+            );
+        }
+
+        #[tokio::test]
+        async fn open_policy_forwards_codes_unchanged() {
+            let mut f = fixture(DmPolicy::Open, &[]).await;
+            let code = f.invite("bot").await;
+            f.send("tg:1", &code).await;
+            assert_eq!(f.forwarded(), vec!["tg:1".to_string()]);
+            assert!(!f.allowed("tg:1").await);
+        }
     }
 }

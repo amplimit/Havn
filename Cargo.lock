@@ -1682,6 +1682,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "toml 1.2.1+spec-1.1.0",
+ "uuid",
 ]
 
 [[package]]
@@ -1702,9 +1703,11 @@ version = "0.1.3-dev"
 dependencies = [
  "bytemuck",
  "chrono",
+ "getrandom 0.3.4",
  "havn-core",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "tempfile",
  "thiserror 2.0.21",
