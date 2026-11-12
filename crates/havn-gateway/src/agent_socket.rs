@@ -118,21 +118,27 @@ pub async fn run_listener(socket_path: &Path, ctx: AgentSocketCtx) -> anyhow::Re
     }
 }
 
-/// Read the cgroup of the process on the other end of `stream`, at accept
-/// time, before the peer has sent anything: the peer must not be able to
-/// choose when the check runs. The pid from SO_PEERCRED is a number that
-/// could be reused once the peer exits, so when the kernel supports
-/// SO_PEERPIDFD (Linux 6.5+) we pin the process with a pidfd and confirm,
-/// after reading its cgroup, that this same process is still alive.
+/// Read the cgroup of the process on the other end of `stream`, first
+/// thing in the connection's task and before the peer has sent anything,
+/// so the peer cannot choose when the check runs. The pid from SO_PEERCRED
+/// is a number that could be reused once the peer exits. Where the kernel
+/// supports SO_PEERPIDFD (Linux 6.5+) the process is pinned with a pidfd
+/// and must still be alive after its cgroup is read; if the kernel cannot
+/// produce a pidfd for the peer (for example because it already exited),
+/// the connection is refused. Only kernels without SO_PEERPIDFD fall back
+/// to the bare pid, leaving the short window between connect and this read.
 #[cfg(target_os = "linux")]
 async fn peer_cgroup(stream: &UnixStream) -> Option<String> {
     let pid = stream.peer_cred().ok()?.pid()?;
-    let pidfd = peer_pidfd(stream);
+    let pin = peer_pidfd(stream);
+    if matches!(pin, PeerPidfd::Failed) {
+        return None;
+    }
     let contents = tokio::fs::read_to_string(format!("/proc/{pid}/cgroup"))
         .await
         .ok()?;
-    match &pidfd {
-        Some(fd) if !pidfd_alive(fd) => None,
+    match &pin {
+        PeerPidfd::Pinned(fd) if !pidfd_alive(fd) => None,
         _ => Some(contents),
     }
 }
@@ -143,42 +149,68 @@ async fn peer_cgroup(_stream: &UnixStream) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn peer_pidfd(stream: &UnixStream) -> Option<std::os::fd::OwnedFd> {
-    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-    // Not exported by every libc target; the value is the same on all
-    // Linux architectures.
-    const SO_PEERPIDFD: libc::c_int = 77;
-    let mut fd: libc::c_int = -1;
-    let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()).ok()?;
-    // SAFETY: `fd` and `len` are valid for writes of the sizes passed, and
-    // the socket fd is borrowed from a live stream for the whole call.
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            SO_PEERPIDFD,
-            (&raw mut fd).cast(),
-            &raw mut len,
-        )
-    };
-    if rc != 0 || fd < 0 {
-        return None;
+enum PeerPidfd {
+    Pinned(std::os::fd::OwnedFd),
+    /// The kernel (or this architecture) has no SO_PEERPIDFD.
+    Unsupported,
+    /// SO_PEERPIDFD exists but returned no pidfd for this peer.
+    Failed,
+}
+
+#[cfg(target_os = "linux")]
+fn peer_pidfd(stream: &UnixStream) -> PeerPidfd {
+    // libc does not export SO_PEERPIDFD; 77 is the asm-generic value used
+    // by x86_64 and aarch64, the architectures havn is built for.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        const SO_PEERPIDFD: libc::c_int = 77;
+        let mut fd: libc::c_int = -1;
+        let Ok(mut len) = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()) else {
+            return PeerPidfd::Failed;
+        };
+        // SAFETY: `fd` and `len` are valid for writes of the sizes passed,
+        // and the socket fd is borrowed from a live stream for the call.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                SO_PEERPIDFD,
+                (&raw mut fd).cast(),
+                &raw mut len,
+            )
+        };
+        if rc != 0 {
+            let unsupported =
+                std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOPROTOOPT);
+            return if unsupported {
+                PeerPidfd::Unsupported
+            } else {
+                PeerPidfd::Failed
+            };
+        }
+        if fd < 0 {
+            return PeerPidfd::Failed;
+        }
+        // SAFETY: on success getsockopt returned a new pidfd that nothing
+        // else owns, so taking ownership here closes it exactly once.
+        PeerPidfd::Pinned(unsafe { OwnedFd::from_raw_fd(fd) })
     }
-    // SAFETY: on success getsockopt returned a new pidfd that nothing else
-    // owns, so taking ownership here closes it exactly once.
-    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = stream;
+        PeerPidfd::Unsupported
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn pidfd_alive(pidfd: &std::os::fd::OwnedFd) -> bool {
     use std::os::fd::AsRawFd as _;
-    // pidfd_send_signal has the same number on every architecture.
-    const SYS_PIDFD_SEND_SIGNAL: libc::c_long = 424;
     // SAFETY: signal 0 performs only the existence and permission checks;
     // a null siginfo and zero flags are the documented defaults.
     let rc = unsafe {
         libc::syscall(
-            SYS_PIDFD_SEND_SIGNAL,
+            libc::SYS_pidfd_send_signal,
             pidfd.as_raw_fd(),
             0,
             std::ptr::null::<libc::siginfo_t>(),
@@ -1268,10 +1300,48 @@ mod tests {
         let own = std::fs::read_to_string("/proc/self/cgroup").expect("own cgroup");
         assert_eq!(seen, own);
         // SO_PEERPIDFD needs Linux 6.5+; older kernels fall back to the pid.
-        if let Some(pidfd) = peer_pidfd(&ours) {
+        if let PeerPidfd::Pinned(pidfd) = peer_pidfd(&ours) {
             assert!(pidfd_alive(&pidfd));
         }
         drop(theirs);
+    }
+
+    /// A peer that connected and has since exited and been reaped must not
+    /// be checked through its (reusable) pid number.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_that_already_exited_is_not_accepted() {
+        use std::os::unix::net::UnixListener as StdListener;
+        let dir = std::env::temp_dir().join(format!("havn-peer-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("s.sock");
+        let listener = StdListener::bind(&path).expect("bind");
+
+        // A short-lived child process connects and exits; the parent reaps
+        // it before looking at the connection.
+        let status = std::process::Command::new("python3")
+            .arg("-c")
+            .arg("import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])")
+            .arg(&path)
+            .status();
+        let Ok(status) = status else {
+            eprintln!("python3 not available; skipping");
+            return;
+        };
+        assert!(status.success());
+        let (accepted, _) = listener.accept().expect("accept");
+        accepted.set_nonblocking(true).expect("nonblocking");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let seen = rt.block_on(async {
+            let stream = UnixStream::from_std(accepted).expect("tokio stream");
+            peer_cgroup(&stream).await
+        });
+        assert!(seen.is_none(), "an exited peer must be refused: {seen:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
