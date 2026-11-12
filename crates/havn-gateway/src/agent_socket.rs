@@ -206,17 +206,16 @@ fn peer_pidfd(stream: &UnixStream) -> PeerPidfd {
 #[cfg(target_os = "linux")]
 fn pidfd_alive(pidfd: &std::os::fd::OwnedFd) -> bool {
     use std::os::fd::AsRawFd as _;
-    // SAFETY: signal 0 performs only the existence and permission checks;
-    // a null siginfo and zero flags are the documented defaults.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            pidfd.as_raw_fd(),
-            0,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
+    // A pidfd becomes readable when its process exits. poll needs no
+    // permission and is not filtered by seccomp profiles that block
+    // pidfd_send_signal, which would otherwise make every agent look dead.
+    let mut entry = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
     };
+    // SAFETY: `entry` is one valid pollfd and the timeout is zero.
+    let rc = unsafe { libc::poll(&raw mut entry, 1, 0) };
     rc == 0
 }
 
@@ -1340,8 +1339,8 @@ mod tests {
             let stream = UnixStream::from_std(accepted).expect("tokio stream");
             peer_cgroup(&stream).await
         });
-        assert!(seen.is_none(), "an exited peer must be refused: {seen:?}");
         let _ = std::fs::remove_dir_all(&dir);
+        assert!(seen.is_none(), "an exited peer must be refused: {seen:?}");
     }
 
     #[tokio::test]
