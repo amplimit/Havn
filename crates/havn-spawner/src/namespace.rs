@@ -56,6 +56,10 @@ pub struct NamespaceSpawner {
     cgroup: CgroupController,
     state: Arc<Mutex<HashMap<AgentId, AgentState>>>,
     pool: crate::network::AgentSubnetPool,
+    /// Set once the host-wide NAT and isolation rules are in place. Until
+    /// then agents get no network interface at all, even if their policy
+    /// allows egress, rather than an unisolated one.
+    network_ready: bool,
 }
 
 #[derive(Debug)]
@@ -87,6 +91,7 @@ impl NamespaceSpawner {
             cgroup,
             state: Arc::new(Mutex::new(HashMap::new())),
             pool,
+            network_ready: false,
         })
     }
 
@@ -98,7 +103,14 @@ impl NamespaceSpawner {
             cgroup,
             state: Arc::new(Mutex::new(HashMap::new())),
             pool: crate::network::AgentSubnetPool::default(),
+            network_ready: false,
         }
+    }
+
+    /// Record that [`crate::network::ensure_global_nat`] succeeded, so
+    /// agents whose policy allows egress get their veth.
+    pub fn set_network_ready(&mut self) {
+        self.network_ready = true;
     }
 }
 
@@ -299,7 +311,14 @@ impl AgentSpawner for NamespaceSpawner {
         //
         //    Failure is non-fatal: tools needing outbound surface
         //    their own clear errors at tool-use time.
-        if policy.network_policy.egress_allowed {
+        if policy.network_policy.egress_allowed && !self.network_ready {
+            warn!(
+                agent_id = %config.agent_id,
+                "agent policy allows egress but agent network isolation is not in place; \
+                 starting the agent without network access"
+            );
+        }
+        if policy.network_policy.egress_allowed && self.network_ready {
             let net_pid = i32::try_from(pid).unwrap_or(0);
             let net_agent_id = config.agent_id;
             let net_pool = self.pool;

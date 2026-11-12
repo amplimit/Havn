@@ -552,6 +552,38 @@ async fn main() -> anyhow::Result<()> {
 /// isolation; `HAVN_SPAWNER=subprocess` explicitly selects the unisolated
 /// [`SubprocessSpawner`] for dev boxes and CI. Returns the isolated agent
 /// pool CIDR, or `None` when agents are unisolated.
+#[cfg(target_os = "linux")]
+/// Split the network config into the IPv4 DNS servers agents may query
+/// and the addresses they may reach despite the private-range block.
+/// A malformed `agent_private_access` entry stops the gateway: guessing
+/// would either block what the operator wanted open or open more.
+fn isolation_exceptions(
+    network: &config::NetworkConfig,
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let mut dns = Vec::new();
+    for server in &network.agent_dns {
+        if havn_spawner::network::parse_ipv4_net(server).is_some() {
+            dns.push(server.clone());
+        } else {
+            warn!(
+                server,
+                "network.agent_dns entry is not an IPv4 address; agents cannot reach it"
+            );
+        }
+    }
+    let mut reachable = Vec::new();
+    for entry in &network.agent_private_access {
+        match havn_spawner::network::parse_ipv4_net(entry) {
+            Some((_, prefix)) if prefix > 0 => reachable.push(entry.clone()),
+            _ => anyhow::bail!(
+                "network.agent_private_access entry {entry:?} must be an IPv4 address or \
+                 a.b.c.d/n CIDR with n > 0"
+            ),
+        }
+    }
+    Ok((dns, reachable))
+}
+
 fn select_spawner(
     network: &config::NetworkConfig,
 ) -> anyhow::Result<(Arc<dyn AgentSpawner>, Option<String>)> {
@@ -591,21 +623,17 @@ fn select_spawner(
             std::process::exit(2);
         }
         match NamespaceSpawner::try_init_with_pool(pool) {
-            Ok(s) => {
+            Ok(mut s) => {
                 info!(pool_cidr = %pool.cidr(), "agent spawner: NamespaceSpawner (cgroup v2 isolation)");
                 // Per-agent network (spec §4.1, §6.3 v0.7). Idempotent
                 // host-wide setup: MASQUERADE + FORWARD rules +
                 // ip_forward sysctl, all targeting the operator-
                 // configured pool. Failure is non-fatal — agents that
                 // don't need outbound still work.
-                let reachable: Vec<String> = network
-                    .agent_dns
-                    .iter()
-                    .chain(&network.agent_private_access)
-                    .cloned()
-                    .collect();
-                match havn_spawner::network::ensure_global_nat(&pool, &reachable) {
+                let (dns, reachable) = isolation_exceptions(network)?;
+                match havn_spawner::network::ensure_global_nat(&pool, &dns, &reachable) {
                     Ok(primary) => {
+                        s.set_network_ready();
                         info!(primary_iface = %primary, pool_cidr = %pool.cidr(), "per-agent NAT ready");
                     }
                     Err(e) => {
