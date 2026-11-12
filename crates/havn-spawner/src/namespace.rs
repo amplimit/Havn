@@ -480,18 +480,15 @@ impl AgentSpawner for NamespaceSpawner {
             "agent started in cgroup"
         );
 
+        let handle = AgentHandle::new(config.agent_id, pid);
         self.state.lock().await.insert(
             config.agent_id,
             AgentState {
-                child: ChildWatch::start(child, pid),
+                child: ChildWatch::start(child, &handle),
                 cgroup_path,
             },
         );
-
-        Ok(AgentHandle {
-            agent_id: config.agent_id,
-            pid,
-        })
+        Ok(handle)
     }
 
     async fn stop(&self, handle: &AgentHandle) -> Result<()> {
@@ -499,7 +496,7 @@ impl AgentSpawner for NamespaceSpawner {
             let mut guard = self.state.lock().await;
             if guard
                 .get(&handle.agent_id)
-                .is_none_or(|s| s.child.pid() != handle.pid)
+                .is_none_or(|s| !s.child.belongs_to(handle))
             {
                 return Err(SpawnerError::NotFound(handle.agent_id));
             }
@@ -517,7 +514,7 @@ impl AgentSpawner for NamespaceSpawner {
             .lock()
             .await
             .get(&handle.agent_id)
-            .filter(|s| s.child.pid() == handle.pid)
+            .filter(|s| s.child.belongs_to(handle))
             .map(|s| s.child.clone())
             .ok_or(SpawnerError::NotFound(handle.agent_id))?;
         Ok(child.exited().await)

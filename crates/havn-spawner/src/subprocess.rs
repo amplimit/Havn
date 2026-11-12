@@ -103,15 +103,12 @@ impl AgentSpawner for SubprocessSpawner {
 
         info!(agent_id = %config.agent_id, pid, "subprocess agent started");
 
+        let handle = AgentHandle::new(config.agent_id, pid);
         self.children
             .lock()
             .await
-            .insert(config.agent_id, ChildWatch::start(child, pid));
-
-        Ok(AgentHandle {
-            agent_id: config.agent_id,
-            pid,
-        })
+            .insert(config.agent_id, ChildWatch::start(child, &handle));
+        Ok(handle)
     }
 
     async fn stop(&self, handle: &AgentHandle) -> Result<()> {
@@ -119,7 +116,7 @@ impl AgentSpawner for SubprocessSpawner {
             let mut guard = self.children.lock().await;
             if guard
                 .get(&handle.agent_id)
-                .is_none_or(|c| c.pid() != handle.pid)
+                .is_none_or(|c| !c.belongs_to(handle))
             {
                 return Err(SpawnerError::NotFound(handle.agent_id));
             }
@@ -137,7 +134,7 @@ impl AgentSpawner for SubprocessSpawner {
             .lock()
             .await
             .get(&handle.agent_id)
-            .filter(|c| c.pid() == handle.pid)
+            .filter(|c| c.belongs_to(handle))
             .cloned()
             .ok_or(SpawnerError::NotFound(handle.agent_id))?;
         Ok(child.exited().await)
@@ -212,15 +209,13 @@ mod tests {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("exec sleep 60").kill_on_drop(true);
         let child = cmd.spawn().expect("spawn sh");
-        let pid = child.id().expect("pid");
+        let handle = AgentHandle::new(agent_id, child.id().expect("pid"));
         spawner
             .children
             .lock()
             .await
-            .insert(agent_id, ChildWatch::start(child, pid));
+            .insert(agent_id, ChildWatch::start(child, &handle));
         let _ = sleep; // keep the lookup result in scope
-
-        let handle = AgentHandle { agent_id, pid };
         let waiter = {
             let spawner = SubprocessSpawner {
                 children: Arc::clone(&spawner.children),
@@ -235,9 +230,12 @@ mod tests {
             .expect("waiter resolves")
             .expect("join");
         // The waiter either got the exit or found the child already gone.
+        #[cfg(unix)]
         if let Ok(exit) = exit {
             assert_eq!(exit, AgentExit::Signal(libc::SIGTERM));
         }
+        #[cfg(not(unix))]
+        let _ = exit;
 
         // Re-stop should fail with NotFound.
         let err = spawner.stop(&handle).await.expect_err("already stopped");
@@ -252,13 +250,13 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .expect("spawn sh");
-        let pid = child.id().expect("pid");
+        let handle = AgentHandle::new(agent_id, child.id().expect("pid"));
         spawner
             .children
             .lock()
             .await
-            .insert(agent_id, ChildWatch::start(child, pid));
-        AgentHandle { agent_id, pid }
+            .insert(agent_id, ChildWatch::start(child, &handle));
+        handle
     }
 
     #[tokio::test]
@@ -288,9 +286,10 @@ mod tests {
         let spawner = SubprocessSpawner::new();
         let handle = track(&spawner, "exec sleep 60").await;
 
+        // Same pid, as after a pid is recycled, but an earlier spawn.
         let stale = AgentHandle {
-            agent_id: handle.agent_id,
-            pid: handle.pid.wrapping_add(1),
+            serial: handle.serial - 1,
+            ..handle.clone()
         };
         assert!(matches!(
             spawner.stop(&stale).await,

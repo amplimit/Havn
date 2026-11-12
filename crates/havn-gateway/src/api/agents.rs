@@ -395,12 +395,33 @@ pub(crate) async fn start_agent(
         }
         spawned = true;
         let generation = state.registry.register(handle.clone()).await;
+        // A shutdown that began while we spawned has already drained the
+        // registry; this instance is ours to stop.
+        if state.supervisor.shutting_down() {
+            if state
+                .registry
+                .remove_generation(id, generation)
+                .await
+                .is_some()
+                && let Err(e) = state.spawner.stop(&handle).await
+            {
+                warn!(agent_id = %id, error = %e, "spawner.stop failed");
+            }
+            return Err(StartError {
+                spawned,
+                error: ApiError::Conflict("the gateway is shutting down".into()),
+            });
+        }
         crate::supervisor::watch(state, handle, generation);
-        let (actor, action) = match by {
-            StartBy::User(user) => (user, "agent.started"),
-            StartBy::Supervisor(owner) => (owner, "agent.restarted"),
+        let (actor, action, details) = match by {
+            StartBy::User(user) => (user, "agent.started", serde_json::json!({})),
+            StartBy::Supervisor(owner) => (
+                owner,
+                "agent.restarted",
+                serde_json::json!({"by": "supervisor"}),
+            ),
         };
-        audit::record_agent_action(&state.db, actor, id, action, serde_json::json!({})).await;
+        audit::record_agent_action(&state.db, actor, id, action, details).await;
     }
 
     // Poll for handshake. 200ms × 50 = 10s upper bound; subprocess

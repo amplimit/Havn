@@ -4,27 +4,40 @@
 //!
 //! An agent is meant to be running while its DB status is `running`: it is
 //! set when the agent starts and replaced by `stopped` on `POST /stop`.
+//! Status `error` is written only here, when the supervisor gives up on an
+//! agent that was meant to run, so it keeps that intent: the next gateway
+//! start tries such agents again.
 //!
 //! - **Exit**: every spawned instance gets a task waiting on its process
 //!   ([`watch`]). An exit nobody asked for (crash, `kill -9`, OOM kill)
 //!   deregisters the instance at once, so `POST /start` spawns a fresh one
 //!   instead of waiting for a handshake that will never come.
 //! - **Silence**: the runtime sends `LivenessPing` every
-//!   [`havn_proto::LIVENESS_PING_INTERVAL`]. An instance that stops for
-//!   [`LIVENESS_MISSED_PINGS`] intervals while connected (frozen, wedged),
-//!   or never connects in that time, is stopped ([`check_liveness`]).
+//!   [`havn_proto::LIVENESS_PING_INTERVAL`] and the agent socket reader
+//!   counts every frame it receives. An instance quiet for
+//!   [`LIVENESS_MISSED_PINGS`] intervals (frozen, wedged) is stopped, as is
+//!   one that takes minutes to connect or to send its first ping
+//!   ([`check_liveness`]). It must be found quiet on two checks in a row,
+//!   and a check that runs late (the gateway itself stalled) is skipped, so
+//!   pings the gateway has not read yet do not get agents killed.
 //! - **Restart**: either way the instance is cleaned up through the
 //!   spawner and, if the agent is still meant to run, started again with
 //!   exponential backoff ([`RestartPolicy`]). After too many failures in a
-//!   row it is left in status `error` until someone starts it again.
+//!   row it is left in status `error` with a fresh budget for the next
+//!   time it is started.
 //! - **Gateway restart**: agent processes do not outlive the gateway (the
 //!   spawner ties them to it with `PR_SET_PDEATHSIG`, and a clean shutdown
 //!   stops them, [`shut_down`]). At startup [`reconcile`] kills whatever an
 //!   earlier gateway left behind and starts every agent whose status is
-//!   still `running`, so status matches the processes again and cron jobs
-//!   and heartbeats of those agents keep firing.
+//!   still `running` (or `error`), so status matches the processes again
+//!   and cron jobs and heartbeats of those agents keep firing.
+//!
+//! Audit rows written here carry `"by": "supervisor"` in their details.
+//! The audit log needs a real user as actor and there is no system user,
+//! so the agent's owner stands in, which also files the row under the
+//! owner's and the team's audit views.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -36,12 +49,20 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::AppState;
-use crate::agent_registry::Instance;
+use crate::agent_registry::{Instance, LivenessLimits};
 use crate::api::agents::{StartBy, start_agent, start_lock};
 use crate::audit;
 
 /// Missed liveness pings after which a connected agent counts as hung.
 pub const LIVENESS_MISSED_PINGS: u32 = 4;
+
+/// From spawn to Hello. Covers opening agent.db, migrations and skill
+/// indexing on a loaded host.
+const CONNECT_LIMIT: Duration = Duration::from_secs(5 * 60);
+
+/// From Hello to the first ping: the embedder (possibly downloading a
+/// model) and MCP servers start in between.
+const FIRST_PING_LIMIT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, Copy)]
 pub struct RestartPolicy {
@@ -95,6 +116,7 @@ impl RestartPolicy {
 pub struct Supervisor {
     policy: RestartPolicy,
     liveness_interval: Duration,
+    limits: LivenessLimits,
     history: Arc<Mutex<HashMap<AgentId, History>>>,
     shutting_down: Arc<AtomicBool>,
 }
@@ -104,16 +126,22 @@ impl Supervisor {
         Self {
             policy,
             liveness_interval,
+            limits: LivenessLimits {
+                silence: liveness_interval.saturating_mul(LIVENESS_MISSED_PINGS),
+                connect: CONNECT_LIMIT,
+                first_ping: FIRST_PING_LIMIT,
+            },
             history: Arc::new(Mutex::new(HashMap::new())),
             shutting_down: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn shutting_down(&self) -> bool {
-        self.shutting_down.load(Ordering::Relaxed)
+        self.shutting_down.load(Ordering::SeqCst)
     }
 
-    /// Clear an agent's failure history (explicit start, stop or delete).
+    /// Clear an agent's failure history (explicit start, stop, delete, or
+    /// giving up).
     pub async fn forget(&self, id: AgentId) {
         self.history.lock().await.remove(&id);
     }
@@ -123,10 +151,6 @@ impl Supervisor {
         let entry = history.entry(id).or_default();
         let decision = self.policy.next(entry, ran_for);
         (decision, entry.failures)
-    }
-
-    fn silence_limit(&self) -> Duration {
-        self.liveness_interval.saturating_mul(LIVENESS_MISSED_PINGS)
     }
 }
 
@@ -160,11 +184,20 @@ pub(crate) fn watch(state: &AppState, handle: AgentHandle, generation: u64) {
     });
 }
 
-/// Stop every instance that has been silent for too long and recover its
-/// agent. `now` is a parameter so tests can look ahead.
-pub(crate) async fn check_liveness(state: &AppState, now: Instant) {
-    let limit = state.supervisor.silence_limit();
-    for silent in state.registry.silent(now, limit).await {
+/// Instances found quiet by the previous check.
+pub(crate) type Suspects = HashSet<(AgentId, u64)>;
+
+/// Stop every instance found quiet on this check and the one before, and
+/// recover its agent. `now` is a parameter so tests can look ahead.
+pub(crate) async fn check_liveness(state: &AppState, now: Instant, suspects: &mut Suspects) {
+    let silent = state.registry.silent(now, &state.supervisor.limits).await;
+    let previous = std::mem::take(suspects);
+    for silent in silent {
+        let key = (silent.agent_id, silent.generation);
+        if !previous.contains(&key) {
+            suspects.insert(key);
+            continue;
+        }
         let Some(instance) = state
             .registry
             .remove_generation(silent.agent_id, silent.generation)
@@ -180,11 +213,24 @@ pub(crate) async fn check_liveness(state: &AppState, now: Instant) {
 }
 
 pub(crate) async fn run_liveness_checks(state: AppState) {
-    let mut interval = tokio::time::interval(state.supervisor.liveness_interval);
+    let period = state.supervisor.liveness_interval;
+    let mut interval = tokio::time::interval(period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut suspects = Suspects::new();
+    let mut last: Option<Instant> = None;
     loop {
         interval.tick().await;
-        check_liveness(&state, Instant::now()).await;
+        let now = Instant::now();
+        let late = last.is_some_and(|last| now.saturating_duration_since(last) > period * 2);
+        last = Some(now);
+        if late {
+            // The gateway itself was stalled (load, swap, SIGSTOP): pings
+            // may sit unread in the sockets. Judge again next round.
+            warn!("liveness check ran late; skipping this round");
+            suspects.clear();
+            continue;
+        }
+        check_liveness(&state, now, &mut suspects).await;
     }
 }
 
@@ -204,7 +250,8 @@ async fn recover(state: &AppState, instance: Instance, ended: Ended) {
         }
         (Ended::Exited(exit), Some(agent)) => {
             warn!(agent_id = %id, %exit, ran_for_s, "agent process exited");
-            let details = serde_json::json!({"exit": exit, "ran_for_s": ran_for_s});
+            let details =
+                serde_json::json!({"by": "supervisor", "exit": exit, "ran_for_s": ran_for_s});
             audit::record_agent_action(&state.db, agent.owner_id, id, "agent.exited", details)
                 .await;
         }
@@ -213,11 +260,14 @@ async fn recover(state: &AppState, instance: Instance, ended: Ended) {
             warn!(
                 agent_id = %id,
                 silent_for_s,
-                "agent sent no liveness ping in time; stopping it"
+                "agent sent nothing in time; stopping it"
             );
             if let Some(agent) = agent {
-                let details =
-                    serde_json::json!({"silent_for_s": silent_for_s, "ran_for_s": ran_for_s});
+                let details = serde_json::json!({
+                    "by": "supervisor",
+                    "silent_for_s": silent_for_s,
+                    "ran_for_s": ran_for_s,
+                });
                 audit::record_agent_action(
                     &state.db,
                     agent.owner_id,
@@ -294,6 +344,9 @@ fn restart(state: AppState, owner: UserId, id: AgentId, ran_for: Duration) {
 }
 
 async fn give_up(state: &AppState, owner: UserId, id: AgentId, failures: u32) {
+    // Whoever starts it next (an operator, or a chat that auto-starts it)
+    // gets a full budget again.
+    state.supervisor.forget(id).await;
     let agent_lock = start_lock(state, id).await;
     let _guard = agent_lock.lock().await;
     let still_wanted = matches!(
@@ -316,14 +369,17 @@ async fn give_up(state: &AppState, owner: UserId, id: AgentId, failures: u32) {
         owner,
         id,
         "agent.restart_abandoned",
-        serde_json::json!({"failures": failures}),
+        serde_json::json!({"by": "supervisor", "failures": failures}),
     )
     .await;
 }
 
 /// Gateway startup: kill agent processes an earlier gateway left behind,
-/// then start every agent that is still meant to run. Starts proceed in
-/// the background; the agent socket listener must already be accepting.
+/// then start every agent that is still meant to run: status `running`,
+/// and `error`, which only a give-up writes. A failure at the last boot
+/// (spawner unavailable, say) thus does not keep agents down for good.
+/// Starts proceed in the background; the agent socket listener must
+/// already be accepting.
 pub(crate) async fn reconcile(state: &AppState) {
     match state.spawner.reap_orphans().await {
         Ok(0) => {}
@@ -332,6 +388,17 @@ pub(crate) async fn reconcile(state: &AppState) {
             "removed agent cgroups left by an earlier gateway run"
         ),
         Err(e) => warn!(error = %e, "could not look for agent processes from an earlier run"),
+    }
+    match repo::list_with_status(&state.db, AgentStatus::Error).await {
+        Ok(failed) => {
+            for agent in failed {
+                info!(agent_id = %agent.id, name = %agent.name, "retrying agent given up on before");
+                if let Err(e) = repo::set_status(&state.db, agent.id, AgentStatus::Running).await {
+                    warn!(agent_id = %agent.id, error = %e, "could not retry agent");
+                }
+            }
+        }
+        Err(e) => warn!(error = %e, "cannot list failed agents; they stay down"),
     }
     let agents = match repo::list_with_status(&state.db, AgentStatus::Running).await {
         Ok(agents) => agents,
@@ -357,12 +424,10 @@ pub(crate) async fn reconcile(state: &AppState) {
 }
 
 /// Clean gateway shutdown: stop every agent process. Their status stays
-/// `running`, so the next gateway start brings them back.
+/// `running`, so the next gateway start brings them back. A start that is
+/// in progress sees the flag after registering and stops its own instance.
 pub(crate) async fn shut_down(state: &AppState) {
-    state
-        .supervisor
-        .shutting_down
-        .store(true, Ordering::Relaxed);
+    state.supervisor.shutting_down.store(true, Ordering::SeqCst);
     let handles = state.registry.drain().await;
     if handles.is_empty() {
         return;
@@ -387,8 +452,14 @@ mod tests {
     use havn_db::repo::agents::NewAgent;
     use havn_proto::GatewayToAgent;
     use havn_spawner::{AgentSpawnConfig, AgentSpawner, ResourceStats, SpawnerError};
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
     use tokio::sync::{mpsc, watch as watch_channel};
+
+    // Time is not paused in these tests: the in-memory database answers
+    // from sqlx's worker thread, and with a paused clock tokio would jump
+    // ahead (firing sqlx's acquire timeout) while it waits for it. The
+    // restart delays are milliseconds instead and liveness checks take
+    // `now` as a parameter.
 
     #[test]
     fn backoff_doubles_up_to_the_cap_then_gives_up() {
@@ -450,8 +521,10 @@ mod tests {
     struct FakeSpawner {
         registry: AgentRegistry,
         connect: bool,
-        exit_at_once: bool,
+        exit_at_once: AtomicBool,
         fail_spawn: AtomicBool,
+        spawn_delay_ms: AtomicU64,
+        stop_delay_ms: AtomicU64,
         next_pid: AtomicU32,
         spawns: AtomicU32,
         orphans_reaped: AtomicU32,
@@ -460,9 +533,9 @@ mod tests {
 
     #[derive(Debug)]
     struct Proc {
-        pid: u32,
+        handle: AgentHandle,
         exit: watch_channel::Sender<Option<AgentExit>>,
-        socket: Option<mpsc::Receiver<GatewayToAgent>>,
+        socket: Option<(mpsc::Sender<GatewayToAgent>, mpsc::Receiver<GatewayToAgent>)>,
     }
 
     impl FakeSpawner {
@@ -470,8 +543,10 @@ mod tests {
             Self {
                 registry,
                 connect,
-                exit_at_once,
+                exit_at_once: AtomicBool::new(exit_at_once),
                 fail_spawn: AtomicBool::new(false),
+                spawn_delay_ms: AtomicU64::new(0),
+                stop_delay_ms: AtomicU64::new(0),
                 next_pid: AtomicU32::new(100),
                 spawns: AtomicU32::new(0),
                 orphans_reaped: AtomicU32::new(0),
@@ -491,6 +566,16 @@ mod tests {
             proc.socket = None;
             proc.exit.send_replace(Some(AgentExit::Signal(9)));
         }
+
+        /// The gateway side of the agent's current connection.
+        fn connection(&self, id: AgentId) -> mpsc::Sender<GatewayToAgent> {
+            let procs = self.procs.lock().unwrap();
+            procs[&id].socket.as_ref().expect("connected").0.clone()
+        }
+    }
+
+    fn delay(ms: &AtomicU64) -> Duration {
+        Duration::from_millis(ms.load(Ordering::SeqCst))
     }
 
     #[async_trait]
@@ -500,43 +585,51 @@ mod tests {
             config: &AgentSpawnConfig,
             _policy: &Policy,
         ) -> havn_spawner::Result<AgentHandle> {
+            tokio::time::sleep(delay(&self.spawn_delay_ms)).await;
             if self.fail_spawn.load(Ordering::SeqCst) {
                 return Err(SpawnerError::Spawn("no runtime binary".into()));
             }
             self.spawns.fetch_add(1, Ordering::SeqCst);
             let id = config.agent_id;
-            let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
+            let handle = AgentHandle::new(id, self.next_pid.fetch_add(1, Ordering::SeqCst));
             let (exit, _) = watch_channel::channel(None);
-            if self.exit_at_once {
+            let exit_at_once = self.exit_at_once.load(Ordering::SeqCst);
+            if exit_at_once {
                 exit.send_replace(Some(AgentExit::Code(1)));
             }
-            let socket = if self.connect && !self.exit_at_once {
+            let socket = if self.connect && !exit_at_once {
                 let (tx, rx) = mpsc::channel(8);
                 let registry = self.registry.clone();
+                let hello = tx.clone();
                 tokio::spawn(async move {
                     // Hello arrives once the gateway has registered us.
                     for _ in 0..200 {
-                        if registry.attach(id, tx.clone()).await.is_ok() {
+                        if registry.attach(id, hello.clone()).await.is_ok() {
                             return;
                         }
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 });
-                Some(rx)
+                Some((tx, rx))
             } else {
                 None
             };
-            self.procs
-                .lock()
-                .unwrap()
-                .insert(id, Proc { pid, exit, socket });
-            Ok(AgentHandle { agent_id: id, pid })
+            self.procs.lock().unwrap().insert(
+                id,
+                Proc {
+                    handle: handle.clone(),
+                    exit,
+                    socket,
+                },
+            );
+            Ok(handle)
         }
 
         async fn stop(&self, handle: &AgentHandle) -> havn_spawner::Result<()> {
+            tokio::time::sleep(delay(&self.stop_delay_ms)).await;
             let mut procs = self.procs.lock().unwrap();
             match procs.get(&handle.agent_id) {
-                Some(p) if p.pid == handle.pid => {
+                Some(p) if p.handle == *handle => {
                     let proc = procs.remove(&handle.agent_id).expect("present");
                     if proc.exit.borrow().is_none() {
                         proc.exit.send_replace(Some(AgentExit::Signal(15)));
@@ -553,7 +646,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .get(&handle.agent_id)
-                .filter(|p| p.pid == handle.pid)
+                .filter(|p| p.handle == *handle)
                 .map(|p| p.exit.subscribe())
                 .ok_or(SpawnerError::NotFound(handle.agent_id))?;
             let status = exit
@@ -616,6 +709,14 @@ mod tests {
         .id
     }
 
+    async fn running_agent(state: &AppState, owner: UserId) -> AgentId {
+        let id = agent(state, owner, "a").await;
+        crate::api::agents::ensure_running(state, owner, id)
+            .await
+            .expect("start");
+        id
+    }
+
     async fn status(state: &AppState, id: AgentId) -> AgentStatus {
         repo::find_by_id(&state.db, id)
             .await
@@ -638,15 +739,18 @@ mod tests {
         panic!("timed out waiting for: {what}");
     }
 
-    /// `POST /agents/{id}/stop` as the agent's owner.
-    async fn stop(state: &AppState, user: UserId, id: AgentId) {
-        let authed = crate::auth::AuthedUser {
+    fn owner(user: UserId) -> crate::auth::AuthedUser {
+        crate::auth::AuthedUser {
             id: user,
             display_name: "havn".into(),
-        };
+        }
+    }
+
+    /// `POST /agents/{id}/stop` as the agent's owner.
+    async fn stop(state: &AppState, user: UserId, id: AgentId) {
         let _ = crate::api::agents::stop(
             axum::extract::State(state.clone()),
-            authed,
+            owner(user),
             axum::extract::Path(id.to_string()),
         )
         .await
@@ -668,13 +772,25 @@ mod tests {
         .collect()
     }
 
+    fn count(actions: &[String], action: &str) -> usize {
+        actions.iter().filter(|a| *a == action).count()
+    }
+
+    /// Mark the agent's current connection as pinging, as of now.
+    async fn ping(state: &AppState, spawner: &FakeSpawner, id: AgentId) {
+        let tx = spawner.connection(id);
+        state.registry.frame_received(id, &tx, true).await;
+        state.registry.frame_handled(id, &tx).await;
+    }
+
+    fn far_ahead(state: &AppState) -> Instant {
+        Instant::now() + state.supervisor.limits.silence * 2
+    }
+
     #[tokio::test]
     async fn a_crashed_agent_is_restarted() {
         let (state, spawner, user) = fixture(quick_policy(), true, false).await;
-        let id = agent(&state, user, "a").await;
-        crate::api::agents::ensure_running(&state, user, id)
-            .await
-            .expect("start");
+        let id = running_agent(&state, user).await;
 
         spawner.crash(id);
 
@@ -684,11 +800,8 @@ mod tests {
         .await;
         assert_eq!(status(&state, id).await, AgentStatus::Running);
         let actions = audit_actions(&state).await;
-        assert!(actions.contains(&"agent.exited".to_string()), "{actions:?}");
-        assert!(
-            actions.contains(&"agent.restarted".to_string()),
-            "{actions:?}"
-        );
+        assert_eq!(count(&actions, "agent.exited"), 1, "{actions:?}");
+        assert_eq!(count(&actions, "agent.restarted"), 1, "{actions:?}");
     }
 
     #[tokio::test]
@@ -698,10 +811,7 @@ mod tests {
             ..quick_policy()
         };
         let (state, spawner, user) = fixture(policy, true, false).await;
-        let id = agent(&state, user, "a").await;
-        crate::api::agents::ensure_running(&state, user, id)
-            .await
-            .expect("start");
+        let id = running_agent(&state, user).await;
 
         spawner.crash(id);
         eventually("dead instance deregistered", || async {
@@ -723,10 +833,7 @@ mod tests {
     #[tokio::test]
     async fn a_stopped_agent_stays_stopped() {
         let (state, spawner, user) = fixture(quick_policy(), true, false).await;
-        let id = agent(&state, user, "a").await;
-        crate::api::agents::ensure_running(&state, user, id)
-            .await
-            .expect("start");
+        let id = running_agent(&state, user).await;
 
         stop(&state, user, id).await;
 
@@ -734,11 +841,7 @@ mod tests {
         assert_eq!(spawner.spawns(), 1);
         assert!(!state.registry.is_registered(id).await);
         assert_eq!(status(&state, id).await, AgentStatus::Stopped);
-        assert!(
-            !audit_actions(&state)
-                .await
-                .contains(&"agent.exited".to_string())
-        );
+        assert_eq!(count(&audit_actions(&state).await, "agent.exited"), 0);
     }
 
     #[tokio::test]
@@ -748,10 +851,7 @@ mod tests {
             ..quick_policy()
         };
         let (state, spawner, user) = fixture(policy, true, false).await;
-        let id = agent(&state, user, "a").await;
-        crate::api::agents::ensure_running(&state, user, id)
-            .await
-            .expect("start");
+        let id = running_agent(&state, user).await;
         spawner.crash(id);
         eventually("crash noticed", || async {
             !state.registry.is_registered(id).await
@@ -763,6 +863,53 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(spawner.spawns(), 1, "the pending restart must not run");
         assert_eq!(status(&state, id).await, AgentStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn stop_while_the_crash_is_being_cleaned_up_wins() {
+        let (state, spawner, user) = fixture(quick_policy(), true, false).await;
+        let id = running_agent(&state, user).await;
+        // Recovery holds the start lock while the spawner cleans up.
+        spawner.stop_delay_ms.store(200, Ordering::SeqCst);
+        spawner.crash(id);
+        eventually("crash noticed", || async {
+            !state.registry.is_registered(id).await
+        })
+        .await;
+
+        stop(&state, user, id).await;
+
+        tokio::time::sleep(quick_policy().max_delay * 4).await;
+        assert_eq!(spawner.spawns(), 1);
+        assert_eq!(status(&state, id).await, AgentStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn delete_during_a_pending_restart_leaves_nothing_running() {
+        let policy = RestartPolicy {
+            first_delay: Duration::from_millis(200),
+            ..quick_policy()
+        };
+        let (state, spawner, user) = fixture(policy, true, false).await;
+        let id = running_agent(&state, user).await;
+        spawner.crash(id);
+        eventually("crash noticed", || async {
+            !state.registry.is_registered(id).await
+        })
+        .await;
+
+        crate::api::agents::delete(
+            axum::extract::State(state.clone()),
+            owner(user),
+            axum::extract::Path(id.to_string()),
+        )
+        .await
+        .expect("delete");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(spawner.spawns(), 1);
+        assert!(!state.registry.is_registered(id).await);
+        assert!(repo::find_by_id(&state.db, id).await.expect("db").is_none());
     }
 
     #[tokio::test]
@@ -781,19 +928,38 @@ mod tests {
         tokio::time::sleep(quick_policy().max_delay * 4).await;
         assert_eq!(spawner.spawns(), 1 + quick_policy().max_failures);
         let actions = audit_actions(&state).await;
-        assert!(
-            actions.contains(&"agent.restart_abandoned".to_string()),
-            "{actions:?}"
-        );
+        assert_eq!(count(&actions, "agent.restart_abandoned"), 1, "{actions:?}");
+    }
+
+    #[tokio::test]
+    async fn an_auto_start_after_giving_up_gets_a_fresh_budget() {
+        let (state, spawner, user) = fixture(quick_policy(), true, true).await;
+        let id = agent(&state, user, "a").await;
+        let _ = crate::api::agents::ensure_running(&state, user, id).await;
+        eventually("marked as failed", || async {
+            status(&state, id).await == AgentStatus::Error
+        })
+        .await;
+
+        // The cause is fixed; a chat connect starts the agent again.
+        spawner.exit_at_once.store(false, Ordering::SeqCst);
+        crate::api::agents::ensure_running(&state, user, id)
+            .await
+            .expect("auto-start");
+        let before = spawner.spawns();
+        spawner.crash(id);
+
+        eventually("restarted, not given up on", || async {
+            spawner.spawns() == before + 1 && state.registry.is_connected(id).await
+        })
+        .await;
+        assert_eq!(status(&state, id).await, AgentStatus::Running);
     }
 
     #[tokio::test]
     async fn restarts_retry_while_spawning_fails() {
         let (state, spawner, user) = fixture(quick_policy(), true, false).await;
-        let id = agent(&state, user, "a").await;
-        crate::api::agents::ensure_running(&state, user, id)
-            .await
-            .expect("start");
+        let id = running_agent(&state, user).await;
         spawner.fail_spawn.store(true, Ordering::SeqCst);
         spawner.crash(id);
 
@@ -805,26 +971,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_silent_agent_is_stopped_and_restarted() {
+    async fn a_silent_agent_is_stopped_and_restarted_on_the_second_check() {
         let (state, spawner, user) = fixture(quick_policy(), true, false).await;
-        let id = agent(&state, user, "a").await;
-        crate::api::agents::ensure_running(&state, user, id)
-            .await
-            .expect("start");
-        state.registry.record_ping(id).await;
+        let id = running_agent(&state, user).await;
+        ping(&state, &spawner, id).await;
+        let mut suspects = Suspects::new();
 
-        check_liveness(&state, Instant::now()).await;
-        assert_eq!(spawner.spawns(), 1, "a pinging agent is left alone");
+        check_liveness(&state, Instant::now(), &mut suspects).await;
+        assert!(suspects.is_empty(), "a pinging agent is left alone");
 
-        let later = Instant::now() + state.supervisor.silence_limit() * 2;
-        check_liveness(&state, later).await;
+        check_liveness(&state, far_ahead(&state), &mut suspects).await;
+        assert!(
+            state.registry.is_registered(id).await,
+            "one check is not enough"
+        );
+        assert_eq!(suspects.len(), 1);
+
+        check_liveness(&state, far_ahead(&state), &mut suspects).await;
         eventually("restarted and connected", || async {
             spawner.spawns() == 2 && state.registry.is_connected(id).await
         })
         .await;
         let actions = audit_actions(&state).await;
-        assert!(
-            actions.contains(&"agent.unresponsive".to_string()),
+        assert_eq!(count(&actions, "agent.unresponsive"), 1, "{actions:?}");
+    }
+
+    #[tokio::test]
+    async fn a_ping_between_checks_clears_the_suspicion() {
+        let (state, spawner, user) = fixture(quick_policy(), true, false).await;
+        let id = running_agent(&state, user).await;
+        ping(&state, &spawner, id).await;
+        let mut suspects = Suspects::new();
+
+        check_liveness(&state, far_ahead(&state), &mut suspects).await;
+        assert_eq!(suspects.len(), 1);
+        // Buffered pings get read once the gateway catches up.
+        ping(&state, &spawner, id).await;
+        check_liveness(&state, Instant::now(), &mut suspects).await;
+        assert!(suspects.is_empty());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(spawner.spawns(), 1);
+        assert!(state.registry.is_connected(id).await);
+    }
+
+    #[tokio::test]
+    async fn exit_and_silence_together_restart_once() {
+        let (state, spawner, user) = fixture(quick_policy(), true, false).await;
+        let id = running_agent(&state, user).await;
+        ping(&state, &spawner, id).await;
+        let mut suspects = Suspects::new();
+        check_liveness(&state, far_ahead(&state), &mut suspects).await;
+
+        spawner.crash(id);
+        check_liveness(&state, far_ahead(&state), &mut suspects).await;
+
+        eventually("restarted and connected", || async {
+            spawner.spawns() == 2 && state.registry.is_connected(id).await
+        })
+        .await;
+        tokio::time::sleep(quick_policy().max_delay * 4).await;
+        assert_eq!(spawner.spawns(), 2);
+        let actions = audit_actions(&state).await;
+        assert_eq!(
+            count(&actions, "agent.exited") + count(&actions, "agent.unresponsive"),
+            1,
             "{actions:?}"
         );
     }
@@ -857,6 +1067,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconcile_retries_agents_given_up_on_before() {
+        let (state, _spawner, user) = fixture(quick_policy(), true, false).await;
+        let id = agent(&state, user, "a").await;
+        repo::set_status(&state.db, id, AgentStatus::Error)
+            .await
+            .expect("status");
+
+        reconcile(&state).await;
+
+        eventually("restored", || async {
+            state.registry.is_connected(id).await
+        })
+        .await;
+        assert_eq!(status(&state, id).await, AgentStatus::Running);
+    }
+
+    #[tokio::test]
     async fn reconcile_marks_an_agent_that_cannot_start_as_failed() {
         let (state, spawner, user) = fixture(quick_policy(), true, false).await;
         let id = agent(&state, user, "a").await;
@@ -876,10 +1103,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_stops_agents_and_keeps_them_running_in_the_db() {
         let (state, spawner, user) = fixture(quick_policy(), true, false).await;
-        let id = agent(&state, user, "a").await;
-        crate::api::agents::ensure_running(&state, user, id)
-            .await
-            .expect("start");
+        let id = running_agent(&state, user).await;
 
         shut_down(&state).await;
 
@@ -888,5 +1112,24 @@ mod tests {
         tokio::time::sleep(quick_policy().max_delay * 4).await;
         assert_eq!(spawner.spawns(), 1, "nothing is restarted during shutdown");
         assert_eq!(status(&state, id).await, AgentStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn a_spawn_in_progress_at_shutdown_stops_its_own_instance() {
+        let (state, spawner, user) = fixture(quick_policy(), true, false).await;
+        let id = agent(&state, user, "a").await;
+        spawner.spawn_delay_ms.store(200, Ordering::SeqCst);
+        let start = {
+            let state = state.clone();
+            tokio::spawn(async move { crate::api::agents::ensure_running(&state, user, id).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        shut_down(&state).await;
+
+        assert!(start.await.expect("join").is_err());
+        assert_eq!(spawner.spawns(), 1);
+        assert!(!state.registry.is_registered(id).await);
+        assert!(spawner.procs.lock().unwrap().is_empty(), "instance stopped");
     }
 }

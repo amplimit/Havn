@@ -218,6 +218,13 @@ unsafe fn fork_and_exec_runtime(
     agent_dns: &[String],
     landlock_rules: &(Vec<PathBuf>, Vec<PathBuf>),
 ) -> i32 {
+    let lifeline = match ns_setup::ParentLifeline::new() {
+        Ok(lifeline) => lifeline,
+        Err(e) => {
+            eprintln!("havn-init: pipe failed: {e}");
+            return 1;
+        }
+    };
     // SAFETY: `fork` is async-signal-safe; we branch immediately on the
     // documented return values without touching any inherited mutex.
     let pid = unsafe { libc::fork() };
@@ -231,8 +238,14 @@ unsafe fn fork_and_exec_runtime(
             // The runtime must not outlive this reaper: if the reaper is
             // killed (with the gateway, or by hand), so is the runtime and,
             // with it as PID 1, everything in its namespace.
+            // The lifeline covers a reaper that died before the prctl.
             if let Err(e) = ns_setup::kill_with_parent(None) {
                 eprintln!("havn-init: PR_SET_PDEATHSIG failed: {e}");
+                // SAFETY: `_exit` is async-signal-safe.
+                unsafe { libc::_exit(1) };
+            }
+            if !lifeline.parent_alive() {
+                eprintln!("havn-init: reaper exited before the runtime started");
                 // SAFETY: `_exit` is async-signal-safe.
                 unsafe { libc::_exit(1) };
             }
@@ -282,6 +295,7 @@ unsafe fn fork_and_exec_runtime(
             unsafe { libc::_exit(1) };
         }
         child_pid => {
+            lifeline.hold();
             // Parent: install signal forwarder so spawner.stop() reaches
             // the inner runtime, then block in waitpid for the inner.
             // SAFETY: ns_setup::install_signal_forwarder writes a static

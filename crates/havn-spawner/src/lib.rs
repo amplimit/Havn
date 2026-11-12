@@ -311,11 +311,25 @@ pub fn decode_extra_mounts(s: &str) -> Result<Vec<ExtraMount>, String> {
 /// Opaque handle to a spawned agent process.
 ///
 /// Spawner implementations track per-agent state (process handle, cgroup path, …)
-/// internally; consumers see only the agent ID and OS pid.
-#[derive(Debug, Clone)]
+/// internally; consumers see only the agent ID, the OS pid and `serial`,
+/// which identifies this one spawn: unlike the pid it is never reused, so
+/// a handle to an earlier instance cannot act on a later one.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentHandle {
     pub agent_id: AgentId,
     pub pid: u32,
+    pub serial: u64,
+}
+
+impl AgentHandle {
+    pub fn new(agent_id: AgentId, pid: u32) -> Self {
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            agent_id,
+            pid,
+            serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -377,13 +391,13 @@ enum StopSignal {
 /// is never hit.
 #[derive(Debug, Clone)]
 pub(crate) struct ChildWatch {
-    pid: u32,
+    serial: u64,
     exit: tokio::sync::watch::Receiver<Option<AgentExit>>,
     signals: tokio::sync::mpsc::UnboundedSender<StopSignal>,
 }
 
 impl ChildWatch {
-    pub(crate) fn start(mut child: tokio::process::Child, pid: u32) -> Self {
+    pub(crate) fn start(mut child: tokio::process::Child, handle: &AgentHandle) -> Self {
         let (exit_tx, exit) = tokio::sync::watch::channel(None);
         let (signals, mut requests) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
@@ -395,11 +409,15 @@ impl ChildWatch {
             };
             exit_tx.send_replace(Some(AgentExit::from(status)));
         });
-        Self { pid, exit, signals }
+        Self {
+            serial: handle.serial,
+            exit,
+            signals,
+        }
     }
 
-    pub(crate) fn pid(&self) -> u32 {
-        self.pid
+    pub(crate) fn belongs_to(&self, handle: &AgentHandle) -> bool {
+        self.serial == handle.serial
     }
 
     pub(crate) fn terminate(&self) {

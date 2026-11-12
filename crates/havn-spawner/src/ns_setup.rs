@@ -176,9 +176,9 @@ pub fn kill_with_parent(expected_parent: Option<libc::pid_t>) -> io::Result<()> 
         libc::prctl(
             libc::PR_SET_PDEATHSIG,
             libc::SIGKILL as libc::c_ulong,
-            0_u64,
-            0_u64,
-            0_u64,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
         )
     };
     if rc != 0 {
@@ -189,6 +189,55 @@ pub fn kill_with_parent(expected_parent: Option<libc::pid_t>) -> io::Result<()> 
         return Err(io::Error::from_raw_os_error(libc::ESRCH));
     }
     Ok(())
+}
+
+/// Tells a forked child whether its parent is still alive where `getppid`
+/// cannot (the parent is outside the child's PID namespace): the parent
+/// keeps the write end open for as long as it lives.
+#[derive(Debug)]
+pub struct ParentLifeline {
+    read: libc::c_int,
+    write: libc::c_int,
+}
+
+impl ParentLifeline {
+    /// Create before `fork`.
+    pub fn new() -> io::Result<Self> {
+        let mut fds: [libc::c_int; 2] = [-1; 2];
+        // SAFETY: `fds` is a valid two-element array for pipe2 to fill.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            read: fds[0],
+            write: fds[1],
+        })
+    }
+
+    /// Parent side after `fork`: the write end stays open until this
+    /// process exits.
+    pub fn hold(self) {
+        // SAFETY: closing the read end this value owns.
+        unsafe { libc::close(self.read) };
+    }
+
+    /// Child side after `fork`: false once the parent has exited. Call it
+    /// after `PR_SET_PDEATHSIG`, which covers the parent dying later.
+    pub fn parent_alive(self) -> bool {
+        // SAFETY: closing the write end this value owns; the parent's copy
+        // is now the only one, so its exit hangs up the pipe.
+        unsafe { libc::close(self.write) };
+        let mut entry = libc::pollfd {
+            fd: self.read,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd, zero timeout.
+        let rc = unsafe { libc::poll(&raw mut entry, 1, 0) };
+        // SAFETY: closing the read end this value owns.
+        unsafe { libc::close(self.read) };
+        rc == 0
+    }
 }
 
 /// Mark the entire mount tree under `/` as `MS_PRIVATE` so the agent's
@@ -964,6 +1013,20 @@ mod tests {
         .expect("spawning thread");
         let status = child.wait().expect("wait");
         assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+    }
+
+    #[test]
+    fn lifeline_reports_whether_another_write_end_is_open() {
+        let lifeline = ParentLifeline::new().expect("pipe");
+        // SAFETY: duplicating a valid fd; the copy stands in for the parent.
+        let parent = unsafe { libc::dup(lifeline.write) };
+        assert!(parent >= 0);
+        assert!(lifeline.parent_alive());
+        // SAFETY: closing the duplicate made above.
+        unsafe { libc::close(parent) };
+
+        let orphaned = ParentLifeline::new().expect("pipe");
+        assert!(!orphaned.parent_alive(), "no parent holds the write end");
     }
 
     #[test]
