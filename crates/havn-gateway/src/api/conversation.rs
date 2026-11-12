@@ -77,6 +77,7 @@ pub async fn list(
             channel_id: channel_id.clone(),
             limit,
         },
+        true,
     )
     .await?;
     let views = turns

@@ -524,12 +524,18 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tokio::select! {
                     maybe = writer_rx.recv() => match maybe {
-                        Some(frame) => {
-                            if let Err(e) = write_frame(&mut write, &frame).await {
+                        Some(frame) => match write_frame(&mut write, &frame).await {
+                            Ok(()) => {}
+                            // Rejected before anything was written: the
+                            // stream is intact, only this frame is lost.
+                            Err(havn_proto::FrameError::FrameTooLarge(size)) => {
+                                error!(size, "dropping an outbound frame over the size limit");
+                            }
+                            Err(e) => {
                                 error!(error = %e, "agent writer failed");
                                 break;
                             }
-                        }
+                        },
                         None => break,
                     },
                     () = writer_shutdown.notified() => {
@@ -1320,11 +1326,42 @@ fn init_tracing() {
         .init();
 }
 
-/// Handle a dashboard-initiated `memory_forget` (spec §5.2 nuance —
-/// agent.db is single-writer; routing through the runtime preserves
-/// the typed-memory invariants in `havn_db::agent::memory::forget`).
-/// Upper bound on rows returned to the dashboard per request.
-const MAX_DATA_ROWS: u32 = 500;
+/// Upper bound on rows returned to the dashboard per request (matches the
+/// gateway's largest page size).
+const MAX_DATA_ROWS: u32 = 1000;
+/// Serialized size budget for one data reply, well under the 4 MiB frame
+/// limit (which would otherwise drop the reply).
+const MAX_DATA_REPLY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Serialize `rows`, keeping as many as fit in `budget` bytes: the first
+/// ones, or the last ones when `keep_last` (chronological lists, where the
+/// newest are at the end).
+fn rows_within_budget<T: serde::Serialize>(
+    rows: Vec<T>,
+    budget: usize,
+    keep_last: bool,
+) -> Result<Vec<serde_json::Value>, String> {
+    let ordered: Box<dyn Iterator<Item = T>> = if keep_last {
+        Box::new(rows.into_iter().rev())
+    } else {
+        Box::new(rows.into_iter())
+    };
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for row in ordered {
+        let value = serde_json::to_value(row).map_err(|e| e.to_string())?;
+        let size = serde_json::to_vec(&value).map_err(|e| e.to_string())?.len();
+        if used + size > budget {
+            break;
+        }
+        used += size;
+        kept.push(value);
+    }
+    if keep_last {
+        kept.reverse();
+    }
+    Ok(kept)
+}
 
 /// Answer a dashboard read with rows from this agent's own database.
 async fn handle_data_request(req: DataRequest, ctx: Ctx) {
@@ -1338,7 +1375,11 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                     None => memory::list_active(&ctx.pool, limit).await,
                 }
                 .map_err(|e| e.to_string())?;
-                serde_json::to_value(entries).map_err(|e| e.to_string())
+                Ok(serde_json::Value::Array(rows_within_budget(
+                    entries,
+                    MAX_DATA_REPLY_BYTES,
+                    false,
+                )?))
             }
             DataQuery::Skills { limit } => {
                 let limit = limit.min(MAX_DATA_ROWS);
@@ -1348,7 +1389,11 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                 let archived = skills_index::list_archived(&ctx.pool, limit)
                     .await
                     .map_err(|e| e.to_string())?;
-                Ok(serde_json::json!({ "active": active, "archived": archived }))
+                let half = MAX_DATA_REPLY_BYTES / 2;
+                Ok(serde_json::json!({
+                    "active": rows_within_budget(active, half, false)?,
+                    "archived": rows_within_budget(archived, half, false)?,
+                }))
             }
             DataQuery::Conversation { channel_id, limit } => {
                 let turns = conversations::recent_with_channel(
@@ -1358,7 +1403,11 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-                serde_json::to_value(turns).map_err(|e| e.to_string())
+                Ok(serde_json::Value::Array(rows_within_budget(
+                    turns,
+                    MAX_DATA_REPLY_BYTES,
+                    true,
+                )?))
             }
         }
     }
@@ -1382,6 +1431,9 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
     }
 }
 
+/// Handle a dashboard-initiated `memory_forget` (spec §5.2 nuance —
+/// agent.db is single-writer; routing through the runtime preserves
+/// the typed-memory invariants in `havn_db::agent::memory::forget`).
 async fn handle_memory_forget(req: MemoryForgetRequest, ctx: Ctx) {
     use havn_db::agent::memory;
     let request_id = req.request_id.clone();

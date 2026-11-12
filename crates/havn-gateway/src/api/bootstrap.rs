@@ -154,10 +154,21 @@ fn read_soul_with_fallback(workspace: &WorkspaceDir) -> Result<Option<String>, A
 }
 
 fn read_optional(workspace: &WorkspaceDir, name: &str) -> Result<Option<String>, ApiError> {
-    let text = workspace
-        .read_text(name, MAX_BOOTSTRAP_BYTES as u64)
-        .map_err(|e| ApiError::Internal(format!("reading {name}: {e}")))?;
-    Ok(text.filter(|s| !s.trim().is_empty()))
+    match workspace.read_text(name, MAX_BOOTSTRAP_BYTES as u64) {
+        Ok(text) => Ok(text.filter(|s| !s.trim().is_empty())),
+        // Too large, a symlink or not a regular file: the agent put
+        // something there that the dashboard will not show.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData || is_symlink_error(&e) => {
+            tracing::warn!(file = name, error = %e, "bootstrap file not shown");
+            Ok(None)
+        }
+        Err(e) => Err(ApiError::Internal(format!("reading {name}: {e}"))),
+    }
+}
+
+/// `O_NOFOLLOW` on a symlink fails with ELOOP.
+fn is_symlink_error(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ELOOP)
 }
 
 fn write_or_clear(workspace: &WorkspaceDir, name: &str, content: &str) -> Result<(), ApiError> {

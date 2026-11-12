@@ -102,6 +102,7 @@ pub async fn list(
             memory_kind: q.kind.clone(),
             limit,
         },
+        false,
     )
     .await?;
 

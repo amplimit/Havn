@@ -79,6 +79,7 @@ pub async fn list(
         havn_proto::DataQuery::Skills {
             limit: DEFAULT_LIMIT,
         },
+        false,
     )
     .await?;
     Ok(Json(ListResponse {
@@ -138,25 +139,33 @@ pub async fn curator_reports(
     }))
 }
 
-/// Cap on one curator report and on how many are returned.
+/// Caps on one curator report, on how many are returned and on their
+/// total size.
 const MAX_REPORT_BYTES: u64 = 1024 * 1024;
 const MAX_REPORTS: usize = 200;
+const MAX_REPORTS_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 
 /// `None` when the workspace or its `.curator` directory does not exist.
 fn read_curator_reports(workspace: &std::path::Path) -> Option<Vec<CuratorReportFile>> {
     let ws = crate::agent_files::WorkspaceDir::open(workspace).ok()?;
     let dir = ws.subdir(".curator").ok().flatten()?;
-    let mut files = dir.regular_files().unwrap_or_default();
-    files.retain(|(name, _)| name.ends_with(".md"));
+    let mut files = dir
+        .regular_files(|name| name.ends_with(".md"), MAX_REPORTS)
+        .unwrap_or_default();
     files.sort_by(|a, b| b.0.cmp(&a.0));
-    files.truncate(MAX_REPORTS);
+    let mut total = 0usize;
     let reports = files
         .into_iter()
         .map(|(name, metadata)| {
-            let body = match dir.read_text(&name, MAX_REPORT_BYTES) {
-                Ok(Some(text)) => text,
-                _ => "(failed to read report)".into(),
+            let body = if total >= MAX_REPORTS_TOTAL_BYTES {
+                "(omitted: report size limit reached)".into()
+            } else {
+                match dir.read_text(&name, MAX_REPORT_BYTES) {
+                    Ok(Some(text)) => text,
+                    _ => "(failed to read report)".into(),
+                }
             };
+            total += body.len();
             CuratorReportFile {
                 size_bytes: metadata.len(),
                 modified_at: metadata.modified().ok().and_then(|t| {

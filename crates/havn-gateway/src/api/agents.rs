@@ -460,17 +460,26 @@ pub(crate) async fn resolve_agent(
 }
 
 /// Read rows from an agent's own database for the dashboard. The agent's
-/// runtime runs the query (it is started if needed) and returns the rows
-/// over its socket; the gateway never opens agent.db, which the agent can
-/// write.
+/// runtime runs the query and returns the rows over its socket; the
+/// gateway never opens agent.db, which the agent can write. A stopped
+/// agent is started only when `start_if_stopped` (the chat view, which
+/// starts it anyway); otherwise the read fails with 409, so looking at an
+/// agent does not restart one the operator stopped.
 pub(crate) async fn agent_data<T: serde::de::DeserializeOwned>(
     state: &AppState,
     by_user: havn_core::UserId,
     id: AgentId,
     query: havn_proto::DataQuery,
+    start_if_stopped: bool,
 ) -> Result<T, ApiError> {
     use havn_proto::{AdminOutcome, DataRequest, GatewayToAgent};
-    ensure_running(state, by_user, id).await?;
+    if start_if_stopped {
+        ensure_running(state, by_user, id).await?;
+    } else if !state.registry.is_connected(id).await {
+        return Err(ApiError::Conflict(
+            "agent is not running; start it to see this".into(),
+        ));
+    }
     let request_id = uuid::Uuid::now_v7().to_string();
     let req = DataRequest {
         request_id: request_id.clone(),

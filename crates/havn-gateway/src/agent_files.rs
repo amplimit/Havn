@@ -111,15 +111,27 @@ impl WorkspaceDir {
         }
     }
 
-    /// Names and metadata of the regular files directly in this directory
-    /// (symlinks and other entry types are skipped).
-    pub fn regular_files(&self) -> io::Result<Vec<(String, Metadata)>> {
+    /// Names and metadata of up to `max` regular files directly in this
+    /// directory whose names `accept` (symlinks and other entry types are
+    /// skipped). Stops early, so a directory with millions of entries costs
+    /// at most `max` lookups.
+    pub fn regular_files(
+        &self,
+        accept: impl Fn(&str) -> bool,
+        max: usize,
+    ) -> io::Result<Vec<(String, Metadata)>> {
         let mut files = Vec::new();
         for entry in std::fs::read_dir(self.proc_path())? {
+            if files.len() >= max {
+                break;
+            }
             let entry = entry?;
             let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
+            if !accept(&name) {
+                continue;
+            }
             let Ok(meta) = std::fs::symlink_metadata(self.child(&name)?) else {
                 continue;
             };
@@ -244,7 +256,7 @@ mod tests {
         std::fs::create_dir(root.join("c.md")).expect("c");
         let ws = WorkspaceDir::open(&root).expect("open");
         let names: Vec<String> = ws
-            .regular_files()
+            .regular_files(|name| name.ends_with(".md"), 10)
             .expect("list")
             .into_iter()
             .map(|(n, _)| n)
