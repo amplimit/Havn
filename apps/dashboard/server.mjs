@@ -1,7 +1,8 @@
 /**
- * Custom Next.js server that ALSO proxies WebSocket upgrades to the
- * gateway. The default `next.config.mjs::rewrites` only proxies HTTP;
- * WS connections to /ws/* would otherwise die at the Next layer.
+ * Custom Next.js server for both `npm run dev` (`--dev`) and
+ * `npm start`. It proxies `/api/*` (HTTP) and `/ws/*` (WebSocket) to
+ * the gateway at runtime, so `HAVN_GATEWAY_URL` takes effect without
+ * a rebuild and dev and production share one code path.
  *
  * This is the cleanest fit for spec §1.7: the gateway stays loopback-
  * only (no `trust_header` + no public bind), and the dashboard plays
@@ -10,35 +11,75 @@
  * deployments would put a real auth proxy between the browser and
  * this dashboard, then forward X-User-ID to gateway via fetch headers).
  *
- * WS path: browser opens `ws://<public-host>:8101/ws/chat/<id>?token=…`,
- * we open a raw TCP socket to `127.0.0.1:8100`, replay the original
- * Upgrade request bytes, then pipe the two sockets together. No npm
- * dependency — pure Node `http` + `net`.
+ * WS path: browser opens `ws://<dashboard-host>:3000/ws/chat/<id>?token=…`,
+ * we open a raw TCP socket to the gateway (default `127.0.0.1:8080`),
+ * replay the original Upgrade request bytes, then pipe the two sockets
+ * together. No npm dependency — pure Node `http` + `net`.
  */
 
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import { connect as netConnect } from "node:net";
 import next from "next";
 
-const PORT = Number(process.env.PORT ?? 8101);
+const DEV = process.argv.includes("--dev");
+const PORT = Number(process.env.PORT ?? 3000);
 const HOSTNAME = process.env.HOSTNAME ?? "0.0.0.0";
-const GATEWAY = process.env.HAVN_GATEWAY_URL ?? "http://127.0.0.1:8100";
+const GATEWAY = process.env.HAVN_GATEWAY_URL ?? "http://127.0.0.1:8080";
 const WS_PREFIX = "/ws/";
+const API_PREFIX = "/api/";
 
 const gatewayUrl = new URL(GATEWAY);
 const GATEWAY_HOST = gatewayUrl.hostname;
-const GATEWAY_PORT = Number(gatewayUrl.port || (gatewayUrl.protocol === "https:" ? 443 : 80));
+const GATEWAY_PORT = Number(gatewayUrl.port || 80);
+if (gatewayUrl.protocol !== "http:") {
+  console.error(`HAVN_GATEWAY_URL must be an http:// URL (got ${GATEWAY})`);
+  process.exit(1);
+}
 
-const app = next({ dev: false, hostname: HOSTNAME, port: PORT });
+const app = next({ dev: DEV, hostname: HOSTNAME, port: PORT });
 await app.prepare();
 const handle = app.getRequestHandler();
+const nextUpgrade = app.getUpgradeHandler();
 
-const server = createServer((req, res) => handle(req, res));
+function proxyApi(req, res) {
+  const upstream = httpRequest(
+    {
+      host: GATEWAY_HOST,
+      port: GATEWAY_PORT,
+      method: req.method,
+      path: req.url.slice(API_PREFIX.length - 1),
+      headers: { ...req.headers, host: `${GATEWAY_HOST}:${GATEWAY_PORT}` },
+    },
+    (upstreamRes) => {
+      res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
+      upstreamRes.pipe(res);
+    },
+  );
+  upstream.on("error", (err) => {
+    console.warn(`[gateway proxy] ${err.code ?? err.message}: ${req.method} ${req.url}`);
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    res.writeHead(502, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "gateway unreachable" }));
+  });
+  req.pipe(upstream);
+}
+
+const server = createServer((req, res) => {
+  if (req.url?.startsWith(API_PREFIX)) {
+    proxyApi(req, res);
+    return;
+  }
+  handle(req, res);
+});
 
 server.on("upgrade", (req, clientSocket, head) => {
-  // Only proxy /ws/* — anything else is a misuse, refuse cleanly.
+  // /ws/* goes to the gateway; everything else (Next's dev HMR socket)
+  // goes to Next.
   if (!req.url?.startsWith(WS_PREFIX)) {
-    clientSocket.destroy();
+    nextUpgrade(req, clientSocket, head);
     return;
   }
   const upstream = netConnect({ host: GATEWAY_HOST, port: GATEWAY_PORT }, () => {
@@ -76,28 +117,9 @@ server.on("upgrade", (req, clientSocket, head) => {
 
 server.listen(PORT, HOSTNAME, () => {
   console.log(`havn dashboard listening on http://${HOSTNAME}:${PORT}`);
-  console.log(`  WS upgrades proxy → ${GATEWAY_HOST}:${GATEWAY_PORT}`);
+  console.log(`  /api and /ws proxy → ${GATEWAY_HOST}:${GATEWAY_PORT}${DEV ? " (dev)" : ""}`);
 });
 
-// Next.js's internal HTTP proxy bubbles up ECONNREFUSED as an
-// uncaughtException when the gateway is briefly down (e.g. during a
-// restart). Without this guard the whole dashboard process exits and
-// any open browser tabs go dead. We log + swallow these specific
-// proxy errors and let the in-flight request return its 502; any
-// genuinely-unexpected error still crashes (we don't want to swallow
-// real bugs).
-process.on("uncaughtException", (err) => {
-  if (
-    err && typeof err === "object" &&
-    ("code" in err && (err.code === "ECONNREFUSED" || err.code === "ECONNRESET" ||
-                       err.code === "ETIMEDOUT" || err.code === "EPIPE"))
-  ) {
-    console.warn(`[gateway proxy] ${err.code}: gateway unreachable — request returns 5xx`);
-    return;
-  }
-  console.error("uncaughtException — exiting:", err);
-  process.exit(1);
-});
 process.on("unhandledRejection", (reason) => {
   console.warn("[unhandledRejection]", reason);
 });

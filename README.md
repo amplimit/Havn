@@ -82,15 +82,22 @@ cargo build --release
 # …then the same credential / start steps as above.
 ```
 
-Then open the dashboard at `http://localhost:3000`, create an agent, and start chatting.
-
 ### Dashboard
 
+The dashboard is not part of the release binaries; run it from a checkout of
+the same version, with Node.js 22+, on the gateway host:
+
 ```bash
-cd apps/dashboard
+git clone --branch v0.1.1 https://github.com/amplimit/havn
+cd havn/apps/dashboard
 npm install
-npm run dev
+npm run build
+npm start                    # http://localhost:3000
 ```
+
+Then open `http://localhost:3000`, create an agent, and start chatting. For
+development, `npm run dev` serves the same app with hot reload. See
+[apps/dashboard/README.md](apps/dashboard/README.md) for settings.
 
 ## Project Structure
 

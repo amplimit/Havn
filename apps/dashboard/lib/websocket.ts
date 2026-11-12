@@ -37,7 +37,7 @@ function resolveGatewayUrl(): string {
   }
   // SSR fallback — never actually reached because `openChat` is always
   // called from a `"use client"` page, but TS needs the branch.
-  return "ws://127.0.0.1:8101";
+  return "ws://127.0.0.1:3000";
 }
 
 export function openChat(

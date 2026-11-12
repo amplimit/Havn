@@ -1,9 +1,8 @@
 /**
  * Thin REST client for the gateway management API (spec §8.3, §10.3).
  *
- * Calls go through Next's `/api/:path*` proxy in dev (see `next.config.mjs`)
- * so the browser stays on a single origin. Production reverse proxies
- * handle the same hop at the edge.
+ * Calls go to `/api/*` on the dashboard's own origin; `server.mjs`
+ * proxies them to the gateway.
  */
 
 const BASE = "/api";
