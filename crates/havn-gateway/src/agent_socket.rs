@@ -478,7 +478,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
     let response = match build_anthropic_request(&req) {
         Ok(ar) => {
             if !llm_proxy::model_allowed(&policy.allowed_models, &ar.model) {
-                warn!(%agent_id, model = %ar.model, "refusing LLM request for a model the policy does not allow");
+                warn!(%agent_id, model = ?ar.model, "refusing LLM request for a model the policy does not allow");
                 let _ = ctx
                     .registry
                     .send(

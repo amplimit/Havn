@@ -584,12 +584,13 @@ async fn main() -> anyhow::Result<()> {
         workspace_dir: Arc::clone(&workspace_dir),
         writer_tx: writer_tx.clone(),
         pending: Arc::clone(&pending),
-        // Curator runs at most once per 7 days and processes ≤100
-        // skills per pass; pinning to the cheaper Sonnet keeps the
-        // cost imperceptible. Operators can override the default
-        // model per-agent via Welcome.policy or env in a future
-        // pass; for now, hard-code the cheap baseline.
-        model: "claude-sonnet-4-6".into(),
+        // The agent's own model: one the operator's credentials and the
+        // policy's allowed_models already cover. A fixed model would fail
+        // on every pass for agents restricted to other models or
+        // providers.
+        model: model
+            .clone()
+            .unwrap_or_else(|| crate::tool_loop::DEFAULT_MODEL.to_string()),
     };
     let curator_last_inbound = Arc::clone(&last_inbound);
     let _curator_task = tokio::spawn(async move {
