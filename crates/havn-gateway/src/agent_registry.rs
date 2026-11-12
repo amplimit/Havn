@@ -24,7 +24,8 @@ use havn_proto::GatewayToAgent;
 use havn_spawner::AgentHandle;
 use serde::Serialize;
 use thiserror::Error;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc};
+use tracing::warn;
 
 #[derive(Debug, Clone, Default)]
 pub struct AgentRegistry {
@@ -39,14 +40,21 @@ struct Entry {
     registered_at: Instant,
     /// Set after the agent's runtime process connects and exchanges Hello.
     tx: Option<mpsc::Sender<GatewayToAgent>>,
+    /// In-flight caps, kept per agent so reconnecting does not reset them.
+    llm_slots: Arc<Semaphore>,
+    query_slots: Arc<Semaphore>,
+    /// Tells the writer of the connection that attached `tx` to give up;
+    /// set and cleared together with `tx`.
+    disconnect: Option<Arc<Notify>>,
     connected_at: Option<Instant>,
     /// When the connection's reader last received or finished handling a
     /// frame, and whether a `LivenessPing` has been among them.
     last_frame: Option<Instant>,
     pinging: bool,
-    /// The reader is handling a frame. Gateway-side work (a slow delivery)
-    /// keeps it from reading pings, which must not count against the agent.
-    busy: bool,
+    /// Since when the reader has been handling a frame. Gateway-side work
+    /// (a slow delivery) keeps it from reading pings, which counts against
+    /// the agent only past [`LivenessLimits::busy`].
+    busy_since: Option<Instant>,
 }
 
 /// How long an instance may stay quiet before it counts as hung.
@@ -58,19 +66,21 @@ pub struct LivenessLimits {
     pub connect: Duration,
     /// From Hello to the first ping: embedder and MCP server start-up.
     pub first_ping: Duration,
+    /// Handling one frame; past this the connection counts as hung too.
+    pub busy: Duration,
 }
 
 impl Entry {
     /// How long the instance has been quiet, if that exceeds the limit
     /// for the phase it is in.
     fn overdue(&self, now: Instant, limits: &LivenessLimits) -> Option<Duration> {
-        if self.busy {
-            return None;
-        }
-        let (since, limit) = match (self.pinging, self.last_frame, self.connected_at) {
-            (true, Some(frame), _) => (frame, limits.silence),
-            (_, _, Some(connected)) => (connected, limits.first_ping),
-            (_, _, None) => (self.registered_at, limits.connect),
+        let (since, limit) = match (self.busy_since, self.pinging, self.last_frame) {
+            (Some(busy), _, _) => (busy, limits.busy),
+            (None, true, Some(frame)) => (frame, limits.silence),
+            (None, _, _) => match self.connected_at {
+                Some(connected) => (connected, limits.first_ping),
+                None => (self.registered_at, limits.connect),
+            },
         };
         let quiet = now.saturating_duration_since(since);
         (quiet > limit).then_some(quiet)
@@ -97,6 +107,18 @@ pub struct Silent {
     pub agent_id: AgentId,
     pub generation: u64,
     pub silent_for: Duration,
+}
+
+/// Caps on `LlmRequest` / `AgentQuery` frames one agent may have handled at
+/// once. Each is a gateway task outside the agent's cgroup; frames over the
+/// cap get an immediate error reply.
+pub const MAX_INFLIGHT_LLM_REQUESTS: usize = 16;
+pub const MAX_INFLIGHT_AGENT_QUERIES: usize = 8;
+
+#[derive(Debug, Clone, Copy)]
+pub enum Slot {
+    Llm,
+    Query,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -128,7 +150,15 @@ pub enum SendError {
     NotRegistered(AgentId),
     #[error("outbound channel closed")]
     ChannelClosed,
+    #[error("agent {0} is not draining its outbound queue")]
+    Stalled(AgentId),
 }
+
+/// Longest a sender waits for room in an agent's outbound queue. An agent
+/// whose queue stays full that long is not keeping up, so it is
+/// disconnected: anything it is waiting for then fails at once instead of
+/// being silently dropped.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl AgentRegistry {
     #[must_use]
@@ -141,7 +171,7 @@ impl AgentRegistry {
     pub async fn register(&self, handle: AgentHandle) -> u64 {
         let id = handle.agent_id;
         let generation = self.generations.fetch_add(1, Ordering::Relaxed) + 1;
-        self.inner.lock().await.insert(
+        let replaced = self.inner.lock().await.insert(
             id,
             Entry {
                 handle,
@@ -151,10 +181,64 @@ impl AgentRegistry {
                 connected_at: None,
                 last_frame: None,
                 pinging: false,
-                busy: false,
+                busy_since: None,
+                llm_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_LLM_REQUESTS)),
+                query_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_AGENT_QUERIES)),
+                disconnect: None,
             },
         );
+        // Nothing can reach a connection of the replaced entry any more.
+        if let Some(signal) = replaced.and_then(|e| e.disconnect) {
+            signal.notify_waiters();
+        }
         generation
+    }
+
+    /// Take one in-flight slot for `agent_id`, or `None` when its cap is
+    /// reached or it is not registered.
+    pub async fn try_reserve(&self, agent_id: AgentId, slot: Slot) -> Option<OwnedSemaphorePermit> {
+        let slots = {
+            let map = self.inner.lock().await;
+            let entry = map.get(&agent_id)?;
+            match slot {
+                Slot::Llm => Arc::clone(&entry.llm_slots),
+                Slot::Query => Arc::clone(&entry.query_slots),
+            }
+        };
+        slots.try_acquire_owned().ok()
+    }
+
+    /// The signal that closes the connection that attached `tx`. A waiter
+    /// only sees signals sent after it called `notified()`.
+    pub async fn disconnect_signal(
+        &self,
+        agent_id: AgentId,
+        tx: &mpsc::Sender<GatewayToAgent>,
+    ) -> Option<Arc<Notify>> {
+        let map = self.inner.lock().await;
+        let entry = map.get(&agent_id)?;
+        if !entry.tx.as_ref().is_some_and(|t| t.same_channel(tx)) {
+            return None;
+        }
+        entry.disconnect.clone()
+    }
+
+    /// Close the agent's live connection, or only the one that attached
+    /// `tx` when given; checked and signalled under one lock.
+    pub async fn disconnect(&self, agent_id: AgentId, tx: Option<&mpsc::Sender<GatewayToAgent>>) {
+        let map = self.inner.lock().await;
+        let Some(entry) = map.get(&agent_id) else {
+            return;
+        };
+        let current = match (tx, entry.tx.as_ref()) {
+            (Some(tx), Some(live)) => live.same_channel(tx),
+            (None, live) => live.is_some(),
+            (Some(_), None) => false,
+        };
+        if current && let Some(signal) = &entry.disconnect {
+            warn!(%agent_id, "agent is not keeping up with its outbound queue; disconnecting");
+            signal.notify_waiters();
+        }
     }
 
     /// Wire the outbound channel after a successful Hello/Welcome.
@@ -174,6 +258,7 @@ impl AgentRegistry {
         }
         entry.tx = Some(tx);
         entry.connected_at = Some(Instant::now());
+        entry.disconnect = Some(Arc::new(Notify::new()));
         Ok(())
     }
 
@@ -201,7 +286,7 @@ impl AgentRegistry {
         {
             entry.last_frame = Some(at);
             entry.pinging |= ping;
-            entry.busy = true;
+            entry.busy_since = Some(at);
         }
     }
 
@@ -211,7 +296,7 @@ impl AgentRegistry {
             && entry.is_connection(tx)
         {
             entry.last_frame = Some(Instant::now());
-            entry.busy = false;
+            entry.busy_since = None;
         }
     }
 
@@ -240,7 +325,8 @@ impl AgentRegistry {
             && entry.is_connection(tx)
         {
             entry.tx = None;
-            entry.busy = false;
+            entry.busy_since = None;
+            entry.disconnect = None;
         }
     }
 
@@ -271,16 +357,42 @@ impl AgentRegistry {
             .collect()
     }
 
-    /// Send a frame to a connected agent. Errors if not registered or not connected.
+    async fn sender(&self, agent_id: AgentId) -> Result<mpsc::Sender<GatewayToAgent>, SendError> {
+        let map = self.inner.lock().await;
+        let entry = map
+            .get(&agent_id)
+            .ok_or(SendError::NotRegistered(agent_id))?;
+        entry.tx.clone().ok_or(SendError::NotConnected(agent_id))
+    }
+
+    /// Send a frame to a connected agent, waiting at most [`SEND_TIMEOUT`]
+    /// for queue space; on timeout the agent is disconnected. Errors if not
+    /// registered, not connected or stalled.
     pub async fn send(&self, agent_id: AgentId, frame: GatewayToAgent) -> Result<(), SendError> {
-        let tx = {
-            let map = self.inner.lock().await;
-            let entry = map
-                .get(&agent_id)
-                .ok_or(SendError::NotRegistered(agent_id))?;
-            entry.tx.clone().ok_or(SendError::NotConnected(agent_id))?
-        };
-        tx.send(frame).await.map_err(|_| SendError::ChannelClosed)
+        let tx = self.sender(agent_id).await?;
+        match tx.send_timeout(frame, SEND_TIMEOUT).await {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::SendTimeoutError::Closed(_)) => Err(SendError::ChannelClosed),
+            Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
+                // Only the connection that stalled; a newer one may be live.
+                self.disconnect(agent_id, Some(&tx)).await;
+                Err(SendError::Stalled(agent_id))
+            }
+        }
+    }
+
+    /// Like [`Self::send`], but fails at once when the queue is full. For
+    /// callers that serve many agents in one pass.
+    pub async fn try_send(
+        &self,
+        agent_id: AgentId,
+        frame: GatewayToAgent,
+    ) -> Result<(), SendError> {
+        let tx = self.sender(agent_id).await?;
+        tx.try_send(frame).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => SendError::Stalled(agent_id),
+            mpsc::error::TrySendError::Closed(_) => SendError::ChannelClosed,
+        })
     }
 
     #[allow(
@@ -420,6 +532,96 @@ mod tests {
         assert!(matches!(err, SendError::NotConnected(_)));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn send_to_a_full_queue_gives_up_and_disconnects() {
+        let reg = AgentRegistry::new();
+        let handle = fake_handle();
+        let id = handle.agent_id;
+        reg.register(handle).await;
+        let (tx, _rx) = mpsc::channel::<GatewayToAgent>(1);
+        reg.attach(id, tx.clone()).await.expect("attach");
+        reg.send(id, GatewayToAgent::HeartbeatTick)
+            .await
+            .expect("first frame fits");
+        let signal = reg.disconnect_signal(id, &tx).await.expect("connected");
+        let disconnected = signal.notified();
+
+        let started = tokio::time::Instant::now();
+        let err = reg
+            .send(id, GatewayToAgent::HeartbeatTick)
+            .await
+            .expect_err("a full queue must not block forever");
+        assert!(matches!(err, SendError::Stalled(_)), "{err:?}");
+        assert!(started.elapsed() >= SEND_TIMEOUT);
+
+        let err = reg
+            .try_send(id, GatewayToAgent::HeartbeatTick)
+            .await
+            .expect_err("try_send fails at once");
+        assert!(matches!(err, SendError::Stalled(_)), "{err:?}");
+        tokio::time::timeout(Duration::from_secs(1), disconnected)
+            .await
+            .expect("the stalled connection is told to close");
+    }
+
+    #[tokio::test]
+    async fn disconnect_reaches_only_the_connection_it_names() {
+        let reg = AgentRegistry::new();
+        let handle = fake_handle();
+        let id = handle.agent_id;
+        reg.register(handle).await;
+        let (old, old_rx) = mpsc::channel::<GatewayToAgent>(1);
+        reg.attach(id, old.clone()).await.expect("attach");
+        let old_signal = reg.disconnect_signal(id, &old).await.expect("old");
+        drop(old_rx);
+        let (new, _new_rx) = mpsc::channel::<GatewayToAgent>(1);
+        reg.attach(id, new.clone()).await.expect("reconnect");
+        let new_signal = reg.disconnect_signal(id, &new).await.expect("new");
+        assert!(reg.disconnect_signal(id, &old).await.is_none());
+        let new_disconnected = new_signal.notified();
+        tokio::pin!(new_disconnected);
+
+        reg.disconnect(id, Some(&old)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut new_disconnected)
+                .await
+                .is_err(),
+            "a stall on the old connection leaves the new one alone"
+        );
+
+        reg.disconnect(id, None).await;
+        tokio::time::timeout(Duration::from_secs(1), new_disconnected)
+            .await
+            .expect("the live connection is closed");
+        drop(old_signal);
+    }
+
+    #[tokio::test]
+    async fn inflight_slots_survive_a_reconnect() {
+        let reg = AgentRegistry::new();
+        let handle = fake_handle();
+        let id = handle.agent_id;
+        reg.register(handle).await;
+        let (first, first_rx) = mpsc::channel::<GatewayToAgent>(1);
+        reg.attach(id, first).await.expect("attach");
+        let mut held = Vec::new();
+        for _ in 0..MAX_INFLIGHT_LLM_REQUESTS {
+            held.push(reg.try_reserve(id, Slot::Llm).await.expect("slot"));
+        }
+        assert!(reg.try_reserve(id, Slot::Llm).await.is_none());
+
+        drop(first_rx);
+        let (second, _second_rx) = mpsc::channel::<GatewayToAgent>(1);
+        reg.attach(id, second).await.expect("reconnect");
+        assert!(
+            reg.try_reserve(id, Slot::Llm).await.is_none(),
+            "reconnecting does not hand out more slots"
+        );
+        assert!(reg.try_reserve(id, Slot::Query).await.is_some());
+        drop(held);
+        assert!(reg.try_reserve(id, Slot::Llm).await.is_some());
+    }
+
     #[tokio::test]
     async fn detach_keeps_handle() {
         let reg = AgentRegistry::new();
@@ -460,6 +662,7 @@ mod tests {
         silence: Duration::from_secs(60),
         connect: Duration::from_secs(300),
         first_ping: Duration::from_secs(600),
+        busy: Duration::from_secs(600),
     };
 
     #[tokio::test]
@@ -522,12 +725,18 @@ mod tests {
         reg.attach(id, tx.clone()).await.expect("attach");
         let start = Instant::now();
 
-        // A frame whose delivery stalls on the gateway side.
+        // A frame whose delivery stalls on the gateway side: excused for a
+        // while, but not forever.
         reg.frame_received_at(id, &tx, true, start).await;
         assert!(
-            reg.silent(start + LIMITS.silence * 10, &LIMITS)
+            reg.silent(start + LIMITS.silence * 5, &LIMITS)
                 .await
                 .is_empty()
+        );
+        assert_eq!(
+            reg.silent(start + LIMITS.busy * 2, &LIMITS).await.len(),
+            1,
+            "a reader stuck on one frame for too long counts as hung"
         );
         reg.frame_handled(id, &tx).await;
         assert_eq!(

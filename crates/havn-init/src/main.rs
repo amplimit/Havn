@@ -232,6 +232,7 @@ unsafe fn fork_and_exec_runtime(
         -1 => {
             let err = std::io::Error::last_os_error();
             eprintln!("havn-init: fork failed: {err}");
+            lifeline.close();
             1
         }
         0 => {

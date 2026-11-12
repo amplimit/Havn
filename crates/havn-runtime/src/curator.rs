@@ -30,10 +30,10 @@ use std::time::Duration;
 use anyhow::{Context as _, anyhow};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use havn_db::agent::skills_index::{self, CuratableSkill};
-use havn_proto::{AgentToGateway, LlmOutcome, LlmRequest, LlmResponse};
+use havn_proto::{AgentToGateway, LlmOutcome, LlmRequest};
 use serde::Deserialize;
 use sqlx::SqlitePool;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -203,10 +203,8 @@ async fn run_consolidation(
     skills: &[CuratableSkill],
 ) -> anyhow::Result<(Vec<Consolidation>, Vec<Pruning>)> {
     let prompt = build_consolidation_prompt(skills);
-    let request_id = Uuid::now_v7().to_string();
-
     let llm_req = LlmRequest {
-        request_id: request_id.clone(),
+        request_id: Uuid::now_v7().to_string(),
         model: bridge.model.clone(),
         messages: serde_json::json!([
             { "role": "user", "content": prompt }
@@ -218,24 +216,8 @@ async fn run_consolidation(
         billing_user_id: None,
     };
 
-    let (resp_tx, resp_rx) = oneshot::channel();
-    bridge
-        .pending
-        .lock()
-        .await
-        .insert(request_id.clone(), resp_tx);
-    bridge
-        .writer_tx
-        .send(AgentToGateway::LlmRequest(llm_req))
-        .await
-        .map_err(|e| {
-            // Best-effort cleanup of the pending entry.
-            anyhow!("enqueue LlmRequest: {e}")
-        })?;
-
-    let response: LlmResponse = resp_rx
-        .await
-        .map_err(|_| anyhow!("LlmResponse channel closed for curator pass"))?;
+    let response =
+        crate::tool_loop::request_llm(&bridge.writer_tx, &bridge.pending, llm_req).await?;
 
     let body = match response.outcome {
         LlmOutcome::Ok => extract_text(&response.provider_response)

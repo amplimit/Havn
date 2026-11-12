@@ -321,6 +321,7 @@ pub(crate) mod tests {
                 crate::supervisor::RestartPolicy::default(),
                 havn_proto::LIVENESS_PING_INTERVAL,
             ),
+            max_tokens_ceiling: crate::config::DEFAULT_MAX_TOKENS_CEILING,
         };
         (app, bootstrap)
     }

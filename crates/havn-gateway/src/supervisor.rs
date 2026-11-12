@@ -64,6 +64,11 @@ const CONNECT_LIMIT: Duration = Duration::from_secs(5 * 60);
 /// model) and MCP servers start in between.
 const FIRST_PING_LIMIT: Duration = Duration::from_secs(10 * 60);
 
+/// How long the socket reader may spend on one frame before the agent
+/// counts as hung all the same. Deliveries do not block (`try_send`), so
+/// only a wedged gateway-side handler gets near this.
+const BUSY_LIMIT: Duration = Duration::from_secs(10 * 60);
+
 #[derive(Debug, Clone, Copy)]
 pub struct RestartPolicy {
     pub first_delay: Duration,
@@ -130,6 +135,7 @@ impl Supervisor {
                 silence: liveness_interval.saturating_mul(LIVENESS_MISSED_PINGS),
                 connect: CONNECT_LIMIT,
                 first_ping: FIRST_PING_LIMIT,
+                busy: BUSY_LIMIT,
             },
             history: Arc::new(Mutex::new(HashMap::new())),
             shutting_down: Arc::new(AtomicBool::new(false)),

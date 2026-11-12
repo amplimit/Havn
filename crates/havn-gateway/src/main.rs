@@ -158,6 +158,9 @@ struct AppState {
     pub keyring: Option<keyring::KeyRing>,
     /// Restart bookkeeping for agents whose process exits or goes silent.
     pub supervisor: supervisor::Supervisor,
+    /// `[llm] max_tokens_ceiling`, applied to the LLM test endpoint as
+    /// to agent calls.
+    pub max_tokens_ceiling: u32,
 }
 
 #[tokio::main]
@@ -385,6 +388,7 @@ async fn main() -> anyhow::Result<()> {
             supervisor::RestartPolicy::default(),
             havn_proto::LIVENESS_PING_INTERVAL,
         ),
+        max_tokens_ceiling: cfg.llm.max_tokens_ceiling,
     };
 
     // Background task: agent socket listener.
@@ -408,6 +412,7 @@ async fn main() -> anyhow::Result<()> {
         query_broker,
         embedding_config: embedding_config.clone(),
         multi_user: cfg.trust_header.enabled,
+        max_tokens_ceiling: cfg.llm.max_tokens_ceiling,
         verify_peer_cgroup: isolated_agent_pool.is_some(),
         extra_mounts: cfg.extra_mounts.clone(),
         tmpfs_mounts: cfg.tmpfs_mounts.clone(),

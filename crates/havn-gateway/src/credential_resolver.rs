@@ -13,15 +13,13 @@
 //! every member's agents fall back to it. Per-user caps live in the
 //! credential's `limits.per_user.{max_tokens_per_day,
 //! max_requests_per_minute}` JSON path so admins can prevent one
-//! heavy user from draining the team's daily quota — see [`per_user_ceilings_remaining`].
-//!
-//! [`daily_tokens_remaining`] enforces the credential-WIDE daily token
-//! cap (still relevant for team creds — the team-level ceiling sits
-//! ABOVE any per-user ceiling).
+//! heavy user from draining the team's daily quota — see [`credential_caps`],
+//! which also reads the credential-wide daily token cap. The LLM proxy
+//! enforces them by reserving each request's tokens before the call.
 
 use havn_core::UserId;
 use havn_db::DbError;
-use havn_db::repo::credential_usage;
+use havn_db::repo::credential_usage::Caps;
 use havn_db::repo::credentials::{self as repo, Credential, CredentialScope};
 use havn_db::repo::team_memberships;
 use sqlx::SqlitePool;
@@ -84,49 +82,7 @@ pub async fn resolve_for_user(
     Ok(chain)
 }
 
-/// Remaining daily token budget for `cred` overall (spec §7.3 v0.6).
-///
-/// Returns:
-/// - `Ok(None)` — no `max_tokens_per_day` cap, or cap = 0 (treated as
-///   unlimited per spec §7.3). Proxy proceeds without a gate.
-/// - `Ok(Some(remaining))` — `remaining > 0` means usable; `≤ 0`
-///   means today's cap is exhausted and the proxy must skip.
-/// - `Err(_)` — DB failure; proxy treats as fail-safe-skip.
-pub async fn daily_tokens_remaining(
-    db: &SqlitePool,
-    cred: &Credential,
-) -> Result<Option<i64>, DbError> {
-    let cap = cred
-        .limits
-        .get("max_tokens_per_day")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0);
-    if cap <= 0 {
-        return Ok(None);
-    }
-    let today_start = today_start_utc_rfc3339();
-    let used = credential_usage::tokens_since(db, cred.id, &today_start).await?;
-    Ok(Some(cap - used))
-}
-
-/// Outcome of the per-user ceiling check. `Ok` either way (the call
-/// site only treats the rate-limited variants as "skip this credential
-/// for this user").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PerUserVerdict {
-    /// No per-user limits configured, or all limits leave headroom.
-    Allowed,
-    /// At least one per-user limit is exhausted for `user_id` against
-    /// `cred` — credential resolver moves to the next entry in the
-    /// chain. Spec §7.2: equivalent to "credential exhausted, try
-    /// next" for the *requesting user*; other users on the same
-    /// credential are unaffected.
-    DenyTokens,
-    DenyRequests,
-}
-
-/// Per-user-quota gate for team-shared credentials. Reads the
-/// `limits.per_user` sub-object:
+/// The caps `cred.limits` sets (spec §7.3 / §10.3):
 ///
 /// ```json
 /// "limits": {
@@ -138,63 +94,30 @@ pub enum PerUserVerdict {
 /// }
 /// ```
 ///
-/// Both per-user fields are optional. When absent, returns `Allowed`
-/// — admins didn't configure a per-user clamp on this credential.
-///
-/// Spec §10.3: "shared keys with per-user token / RPM caps" is the
-/// admin pattern this enables. Without the per-user ceiling, one
-/// runaway agent on a team key drains the daily budget and causes
-/// `429`-style fallthrough for everyone else.
-pub async fn per_user_ceilings_remaining(
-    db: &SqlitePool,
-    cred: &Credential,
-    user_id: UserId,
-) -> Result<PerUserVerdict, DbError> {
-    let Some(per_user) = cred.limits.get("per_user").and_then(|v| v.as_object()) else {
-        return Ok(PerUserVerdict::Allowed);
+/// Every field is optional; a missing, non-positive or non-integer value
+/// means no cap. The per-user caps let a team admin stop one heavy user
+/// from draining a shared key; the credential-wide cap sits above them.
+/// `agent_tokens` is left at 0 for the caller to fill from the agent's
+/// policy.
+#[must_use]
+pub fn credential_caps(cred: &Credential) -> Caps {
+    let positive = |v: Option<&serde_json::Value>| {
+        v.and_then(serde_json::Value::as_i64)
+            .filter(|&n| n > 0)
+            .unwrap_or(0)
     };
-
-    if let Some(token_cap) = per_user
-        .get("max_tokens_per_day")
-        .and_then(serde_json::Value::as_i64)
-        .filter(|&n| n > 0)
-    {
-        let today_start = today_start_utc_rfc3339();
-        let used =
-            credential_usage::tokens_since_for_user(db, cred.id, user_id, &today_start).await?;
-        if used >= token_cap {
-            debug!(
-                cred = %cred.id, %user_id, used, token_cap,
-                "per-user daily token cap exhausted"
-            );
-            return Ok(PerUserVerdict::DenyTokens);
-        }
+    let per_user = cred.limits.get("per_user");
+    Caps {
+        credential_tokens: positive(cred.limits.get("max_tokens_per_day")),
+        user_tokens: positive(per_user.and_then(|p| p.get("max_tokens_per_day"))),
+        user_requests_per_minute: positive(per_user.and_then(|p| p.get("max_requests_per_minute"))),
+        agent_tokens: 0,
     }
-
-    if let Some(rpm_cap) = per_user
-        .get("max_requests_per_minute")
-        .and_then(serde_json::Value::as_i64)
-        .filter(|&n| n > 0)
-    {
-        let one_minute_ago = minute_ago_utc_rfc3339();
-        let recent =
-            credential_usage::requests_since_for_user(db, cred.id, user_id, &one_minute_ago)
-                .await?;
-        if recent >= rpm_cap {
-            debug!(
-                cred = %cred.id, %user_id, recent, rpm_cap,
-                "per-user RPM cap exhausted"
-            );
-            return Ok(PerUserVerdict::DenyRequests);
-        }
-    }
-
-    Ok(PerUserVerdict::Allowed)
 }
 
 /// "Today" boundary in the same RFC 3339 / UTC format as `created_at` columns,
 /// so lexicographic comparison in the SQL `WHERE created_at >= ?` matches.
-fn today_start_utc_rfc3339() -> String {
+pub fn today_start_utc_rfc3339() -> String {
     chrono::Utc::now()
         .format("%Y-%m-%dT00:00:00.000Z")
         .to_string()
@@ -204,7 +127,7 @@ fn today_start_utc_rfc3339() -> String {
 /// the gateway's `now()` and SQLite's `strftime('now')` is sub-second
 /// in practice; a one-minute window is wide enough that this doesn't
 /// matter operationally.
-fn minute_ago_utc_rfc3339() -> String {
+pub fn minute_ago_utc_rfc3339() -> String {
     (chrono::Utc::now() - chrono::Duration::seconds(60))
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string()
@@ -217,7 +140,6 @@ mod tests {
     use super::*;
     use havn_core::Policy;
     use havn_db::connect_in_memory;
-    use havn_db::repo::credential_usage::{NewUsage, record as record_usage};
     use havn_db::repo::credentials::NewCredential;
     use havn_db::repo::roles::{NewRole, create as create_role};
     use havn_db::repo::teams::{NewTeam, create as create_team};
@@ -357,107 +279,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlimited_when_no_cap_or_zero_cap() {
+    async fn caps_are_read_from_limits() {
         let pool = connect_in_memory().await.expect("connect");
         let owner = create_user(&pool, NewUser { display_name: "u" })
             .await
             .expect("user")
             .id;
-        let no_cap = make_cred(&pool, owner, serde_json::json!({})).await;
-        assert!(
-            daily_tokens_remaining(&pool, &no_cap)
-                .await
-                .expect("query")
-                .is_none()
-        );
-        let zero_cap = make_cred(&pool, owner, serde_json::json!({"max_tokens_per_day": 0})).await;
-        assert!(
-            daily_tokens_remaining(&pool, &zero_cap)
-                .await
-                .expect("query")
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn per_user_token_cap_exhausts_after_threshold() {
-        let pool = connect_in_memory().await.expect("connect");
-        let owner = create_user(&pool, NewUser { display_name: "u" })
-            .await
-            .expect("user")
-            .id;
-        // Per-user cap of 100 tokens/day, no overall cap.
-        let cred = make_cred(
+        let none = make_cred(&pool, owner, serde_json::json!({})).await;
+        assert_eq!(credential_caps(&none), Caps::default());
+        let zero = make_cred(
+            &pool,
+            owner,
+            serde_json::json!({"max_tokens_per_day": 0, "max_usd_per_day": 5.0}),
+        )
+        .await;
+        assert_eq!(credential_caps(&zero), Caps::default());
+        let all = make_cred(
             &pool,
             owner,
             serde_json::json!({
-                "per_user": { "max_tokens_per_day": 100 }
+                "max_tokens_per_day": 100_000,
+                "per_user": { "max_tokens_per_day": 5_000, "max_requests_per_minute": 30 }
             }),
         )
         .await;
-
-        // No usage yet → allowed.
-        let v = per_user_ceilings_remaining(&pool, &cred, owner)
-            .await
-            .expect("query");
-        assert_eq!(v, PerUserVerdict::Allowed);
-
-        // Burn 100 tokens → exhausted.
-        record_usage(
-            &pool,
-            NewUsage {
-                credential_id: cred.id,
-                user_id: owner,
-                agent_id: None,
-                provider: "anthropic",
-                model: "claude-sonnet-4-6",
-                tokens_in: 60,
-                tokens_out: 40,
-            },
-        )
-        .await
-        .expect("usage");
-        let v = per_user_ceilings_remaining(&pool, &cred, owner)
-            .await
-            .expect("query");
-        assert_eq!(v, PerUserVerdict::DenyTokens);
-    }
-
-    #[tokio::test]
-    async fn per_user_rpm_cap_blocks_after_threshold() {
-        let pool = connect_in_memory().await.expect("connect");
-        let owner = create_user(&pool, NewUser { display_name: "u" })
-            .await
-            .expect("user")
-            .id;
-        let cred = make_cred(
-            &pool,
-            owner,
-            serde_json::json!({
-                "per_user": { "max_requests_per_minute": 2 }
-            }),
-        )
-        .await;
-
-        for _ in 0..2 {
-            record_usage(
-                &pool,
-                NewUsage {
-                    credential_id: cred.id,
-                    user_id: owner,
-                    agent_id: None,
-                    provider: "anthropic",
-                    model: "claude-sonnet-4-6",
-                    tokens_in: 1,
-                    tokens_out: 1,
-                },
-            )
-            .await
-            .expect("usage");
-        }
-        let v = per_user_ceilings_remaining(&pool, &cred, owner)
-            .await
-            .expect("query");
-        assert_eq!(v, PerUserVerdict::DenyRequests);
+        assert_eq!(
+            credential_caps(&all),
+            Caps {
+                credential_tokens: 100_000,
+                user_tokens: 5_000,
+                user_requests_per_minute: 30,
+                agent_tokens: 0,
+            }
+        );
     }
 }

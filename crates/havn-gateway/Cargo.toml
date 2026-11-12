@@ -39,5 +39,9 @@ age.workspace = true
 secrecy.workspace = true
 async-trait.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true

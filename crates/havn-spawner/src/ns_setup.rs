@@ -214,6 +214,15 @@ impl ParentLifeline {
         })
     }
 
+    /// When `fork` failed.
+    pub fn close(self) {
+        // SAFETY: closing both ends this value owns.
+        unsafe {
+            libc::close(self.read);
+            libc::close(self.write);
+        }
+    }
+
     /// Parent side after `fork`: the write end stays open until this
     /// process exits.
     pub fn hold(self) {
