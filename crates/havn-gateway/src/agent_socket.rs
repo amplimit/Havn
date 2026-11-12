@@ -408,7 +408,7 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
     // 4. Writer task: drain mpsc → wire
     let disconnect = ctx
         .registry
-        .disconnect_signal(agent_id)
+        .disconnect_signal(agent_id, &tx)
         .await
         .unwrap_or_default();
     let mut writer_task = tokio::spawn(run_writer(write, rx, agent_id, ctx.clone(), disconnect));
@@ -613,11 +613,16 @@ async fn oversized_reply(
 /// Reply to a request refused before it was handled. A queue too full to
 /// take even that means the agent is not reading, so it is disconnected.
 async fn refuse(ctx: &AgentSocketCtx, agent_id: AgentId, refusal: GatewayToAgent) {
-    if let Err(e) = ctx.registry.try_send(agent_id, refusal).await {
-        debug!(%agent_id, error = %e, "could not deliver a refusal");
-        if matches!(e, SendError::Stalled(_)) {
-            ctx.registry.disconnect(agent_id).await;
+    match ctx.registry.try_send(agent_id, refusal).await {
+        Ok(()) => {}
+        Err(SendError::Stalled(_)) => {
+            warn!(
+                %agent_id,
+                "outbound queue is full, so a refusal cannot be sent; disconnecting the agent"
+            );
+            ctx.registry.disconnect(agent_id, None).await;
         }
+        Err(e) => debug!(%agent_id, error = %e, "could not deliver a refusal"),
     }
 }
 

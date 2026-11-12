@@ -400,16 +400,29 @@ async fn handle_session(
                 let Some(frame_tx) = registered.upgrade() else {
                     break;
                 };
-                let frames = state.channel_router.replay_since(&key, r.since_seq).await;
-                let replayed = frames.len();
-                for frame in frames {
-                    if frame_tx.send(frame).await.is_err() {
-                        warn!(
-                            channel = %channel_id,
-                            account = %account_id,
-                            since_seq = r.since_seq,
-                            "channel WS: outbound mpsc closed mid-replay"
-                        );
+                // Deliveries arriving meanwhile are only buffered; keep
+                // replaying until the buffer has nothing newer.
+                let mut frames = state.channel_router.replay_since(&key, r.since_seq).await;
+                let mut replayed = 0usize;
+                let mut cursor = r.since_seq;
+                'replay: loop {
+                    for frame in frames {
+                        if let ChannelFrame::Outbound(o) = &frame {
+                            cursor = cursor.max(o.seq);
+                        }
+                        if frame_tx.send(frame).await.is_err() {
+                            warn!(
+                                channel = %channel_id,
+                                account = %account_id,
+                                since_seq = r.since_seq,
+                                "channel WS: outbound mpsc closed mid-replay"
+                            );
+                            break 'replay;
+                        }
+                        replayed += 1;
+                    }
+                    frames = state.channel_router.replay_more(&key, cursor).await;
+                    if frames.is_empty() {
                         break;
                     }
                 }

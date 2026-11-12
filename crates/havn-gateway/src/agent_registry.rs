@@ -34,8 +34,9 @@ struct Entry {
     /// In-flight caps, kept per agent so reconnecting does not reset them.
     llm_slots: Arc<Semaphore>,
     query_slots: Arc<Semaphore>,
-    /// Tells the live connection's writer to give up on the agent.
-    disconnect: Arc<Notify>,
+    /// Tells the writer of the connection that attached `tx` to give up;
+    /// set and cleared together with `tx`.
+    disconnect: Option<Arc<Notify>>,
 }
 
 /// Caps on `LlmRequest` / `AgentQuery` frames one agent may have handled at
@@ -98,16 +99,20 @@ impl AgentRegistry {
     /// Record the spawner-returned handle. Subsequent `attach` will wire the tx.
     pub async fn register(&self, handle: AgentHandle) {
         let id = handle.agent_id;
-        self.inner.lock().await.insert(
+        let replaced = self.inner.lock().await.insert(
             id,
             Entry {
                 handle,
                 tx: None,
                 llm_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_LLM_REQUESTS)),
                 query_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_AGENT_QUERIES)),
-                disconnect: Arc::new(Notify::new()),
+                disconnect: None,
             },
         );
+        // Nothing can reach a connection of the replaced entry any more.
+        if let Some(signal) = replaced.and_then(|e| e.disconnect) {
+            signal.notify_waiters();
+        }
     }
 
     /// Take one in-flight slot for `agent_id`, or `None` when its cap is
@@ -124,21 +129,36 @@ impl AgentRegistry {
         slots.try_acquire_owned().ok()
     }
 
-    /// The signal [`Self::disconnect`] sends to the agent's live connection.
-    /// A waiter only sees signals sent after it called `notified()`.
-    pub async fn disconnect_signal(&self, agent_id: AgentId) -> Option<Arc<Notify>> {
-        self.inner
-            .lock()
-            .await
-            .get(&agent_id)
-            .map(|e| Arc::clone(&e.disconnect))
+    /// The signal that closes the connection that attached `tx`. A waiter
+    /// only sees signals sent after it called `notified()`.
+    pub async fn disconnect_signal(
+        &self,
+        agent_id: AgentId,
+        tx: &mpsc::Sender<GatewayToAgent>,
+    ) -> Option<Arc<Notify>> {
+        let map = self.inner.lock().await;
+        let entry = map.get(&agent_id)?;
+        if !entry.tx.as_ref().is_some_and(|t| t.same_channel(tx)) {
+            return None;
+        }
+        entry.disconnect.clone()
     }
 
-    /// Close the agent's live connection.
-    pub async fn disconnect(&self, agent_id: AgentId) {
-        if let Some(entry) = self.inner.lock().await.get(&agent_id) {
+    /// Close the agent's live connection, or only the one that attached
+    /// `tx` when given; checked and signalled under one lock.
+    pub async fn disconnect(&self, agent_id: AgentId, tx: Option<&mpsc::Sender<GatewayToAgent>>) {
+        let map = self.inner.lock().await;
+        let Some(entry) = map.get(&agent_id) else {
+            return;
+        };
+        let current = match (tx, entry.tx.as_ref()) {
+            (Some(tx), Some(live)) => live.same_channel(tx),
+            (None, live) => live.is_some(),
+            (Some(_), None) => false,
+        };
+        if current && let Some(signal) = &entry.disconnect {
             warn!(%agent_id, "agent is not keeping up with its outbound queue; disconnecting");
-            entry.disconnect.notify_waiters();
+            signal.notify_waiters();
         }
     }
 
@@ -158,6 +178,7 @@ impl AgentRegistry {
             return Err(AttachError::AlreadyConnected(agent_id));
         }
         entry.tx = Some(tx);
+        entry.disconnect = Some(Arc::new(Notify::new()));
         Ok(())
     }
 
@@ -173,6 +194,7 @@ impl AgentRegistry {
                 .is_some_and(|current| current.same_channel(tx))
         {
             entry.tx = None;
+            entry.disconnect = None;
         }
     }
 
@@ -199,16 +221,7 @@ impl AgentRegistry {
             Err(mpsc::error::SendTimeoutError::Closed(_)) => Err(SendError::ChannelClosed),
             Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
                 // Only the connection that stalled; a newer one may be live.
-                let still_live = self
-                    .inner
-                    .lock()
-                    .await
-                    .get(&agent_id)
-                    .and_then(|e| e.tx.as_ref())
-                    .is_some_and(|current| current.same_channel(&tx));
-                if still_live {
-                    self.disconnect(agent_id).await;
-                }
+                self.disconnect(agent_id, Some(&tx)).await;
                 Err(SendError::Stalled(agent_id))
             }
         }
@@ -375,11 +388,11 @@ mod tests {
         let id = handle.agent_id;
         reg.register(handle).await;
         let (tx, _rx) = mpsc::channel::<GatewayToAgent>(1);
-        reg.attach(id, tx).await.expect("attach");
+        reg.attach(id, tx.clone()).await.expect("attach");
         reg.send(id, GatewayToAgent::HeartbeatTick)
             .await
             .expect("first frame fits");
-        let signal = reg.disconnect_signal(id).await.expect("registered");
+        let signal = reg.disconnect_signal(id, &tx).await.expect("connected");
         let disconnected = signal.notified();
 
         let started = tokio::time::Instant::now();
@@ -398,6 +411,38 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), disconnected)
             .await
             .expect("the stalled connection is told to close");
+    }
+
+    #[tokio::test]
+    async fn disconnect_reaches_only_the_connection_it_names() {
+        let reg = AgentRegistry::new();
+        let handle = fake_handle();
+        let id = handle.agent_id;
+        reg.register(handle).await;
+        let (old, old_rx) = mpsc::channel::<GatewayToAgent>(1);
+        reg.attach(id, old.clone()).await.expect("attach");
+        let old_signal = reg.disconnect_signal(id, &old).await.expect("old");
+        drop(old_rx);
+        let (new, _new_rx) = mpsc::channel::<GatewayToAgent>(1);
+        reg.attach(id, new.clone()).await.expect("reconnect");
+        let new_signal = reg.disconnect_signal(id, &new).await.expect("new");
+        assert!(reg.disconnect_signal(id, &old).await.is_none());
+        let new_disconnected = new_signal.notified();
+        tokio::pin!(new_disconnected);
+
+        reg.disconnect(id, Some(&old)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut new_disconnected)
+                .await
+                .is_err(),
+            "a stall on the old connection leaves the new one alone"
+        );
+
+        reg.disconnect(id, None).await;
+        tokio::time::timeout(Duration::from_secs(1), new_disconnected)
+            .await
+            .expect("the live connection is closed");
+        drop(old_signal);
     }
 
     #[tokio::test]

@@ -1,10 +1,11 @@
 //! In-memory router for `WebSocket` `WebChat` sessions.
 //!
-//! Each open browser `WebSocket` maps 1:1 to a `SessionId` (UUID v7) which is
-//! used as the `channel_id` in inbound/outbound messages. When an agent
-//! returns an `OutboundMessage`, the gateway looks up the matching session
-//! here and pushes the reply onto its mpsc; the per-session writer task
-//! drains that mpsc onto the `WebSocket`.
+//! Each open browser `WebSocket` is one tab of a session; the `SessionId` is
+//! used as the `channel_id` in inbound/outbound messages and is shared by
+//! every tab the same user has open on the same agent. When an agent
+//! returns an `OutboundMessage`, the gateway pushes the reply onto the mpsc
+//! of every tab of the matching session; each tab's writer task drains its
+//! mpsc onto its `WebSocket`.
 //!
 //! WebChat is havn's built-in console (spec §3.6), not a channel adapter.
 //! External channel adapters (Telegram, Slack, …) speak the HTTP+WS protocol
@@ -16,23 +17,36 @@ use std::sync::Arc;
 use havn_core::{AgentId, MessageContent, OutboundMessage};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::warn;
 use uuid::Uuid;
 
 pub type SessionId = Uuid;
 
+/// One open `WebSocket`.
+pub type TabId = Uuid;
+
 #[derive(Debug, Clone, Default)]
 pub struct WebChatRouter {
-    inner: Arc<Mutex<HashMap<SessionId, Session>>>,
+    inner: Arc<Mutex<HashMap<TabId, Tab>>>,
 }
 
 #[derive(Debug)]
-struct Session {
+struct Tab {
+    session_id: SessionId,
     /// Agent the session is bound to. Only that agent's messages are
     /// delivered to it.
     agent_id: AgentId,
     tx: mpsc::Sender<ServerMessage>,
+    closed: Arc<Notify>,
+}
+
+/// A registered tab. `closed` fires when the router drops the tab because
+/// it stopped reading; its handler then closes the socket.
+#[derive(Debug)]
+pub struct Registration {
+    pub tab: TabId,
+    pub closed: Arc<Notify>,
 }
 
 /// Wire types over the WebSocket frame.
@@ -71,31 +85,37 @@ impl WebChatRouter {
         Self::default()
     }
 
+    /// Add a tab to `session_id`. Other open tabs of the session stay
+    /// registered and keep getting replies.
     pub async fn register(
         &self,
         session_id: SessionId,
         agent_id: AgentId,
         tx: mpsc::Sender<ServerMessage>,
-    ) {
-        self.inner
-            .lock()
-            .await
-            .insert(session_id, Session { agent_id, tx });
+    ) -> Registration {
+        let tab = Uuid::now_v7();
+        let closed = Arc::new(Notify::new());
+        self.inner.lock().await.insert(
+            tab,
+            Tab {
+                session_id,
+                agent_id,
+                tx,
+                closed: Arc::clone(&closed),
+            },
+        );
+        Registration { tab, closed }
     }
 
-    /// Remove the session registered with `tx`. A newer tab that re-used
-    /// the session id under its own sender keeps its entry.
-    pub async fn unregister(&self, session_id: SessionId, tx: &mpsc::Sender<ServerMessage>) {
-        let mut map = self.inner.lock().await;
-        if map.get(&session_id).is_some_and(|s| s.tx.same_channel(tx)) {
-            map.remove(&session_id);
-        }
+    pub async fn unregister(&self, tab: TabId) {
+        self.inner.lock().await.remove(&tab);
     }
 
-    /// Forward an `OutboundMessage` from `agent_id` to its originating `WebChat` session.
-    /// `channel_id` MUST be the session's UUID v7 string (set by the WS handler when
-    /// it constructed the `InboundMessage`). Sessions of other agents are reported
-    /// as missing.
+    /// Forward an `OutboundMessage` from `agent_id` to every open tab of its
+    /// originating `WebChat` session. `channel_id` MUST be the session id
+    /// (set by the WS handler when it constructed the `InboundMessage`).
+    /// Sessions of other agents are reported as missing. Succeeds when at
+    /// least one tab took the message.
     pub async fn deliver(
         &self,
         agent_id: AgentId,
@@ -106,13 +126,16 @@ impl WebChatRouter {
             .parse()
             .map_err(|_| DeliverError::InvalidChannelId(msg.channel_id.clone()))?;
 
-        let tx = {
+        let targets: Vec<_> = {
             let map = self.inner.lock().await;
-            map.get(&session_id)
-                .filter(|s| s.agent_id == agent_id)
-                .map(|s| s.tx.clone())
-                .ok_or(DeliverError::NoSession(session_id))?
+            map.iter()
+                .filter(|(_, t)| t.agent_id == agent_id && t.session_id == session_id)
+                .map(|(id, t)| (*id, t.tx.clone()))
+                .collect()
         };
+        if targets.is_empty() {
+            return Err(DeliverError::NoSession(session_id));
+        }
 
         let server_msg = match msg.content {
             MessageContent::Text { text } => ServerMessage::AgentMessage { content: text },
@@ -121,15 +144,24 @@ impl WebChatRouter {
                 content: format!("(unsupported content variant: {other:?})"),
             },
         };
-        self.offer(session_id, &tx, server_msg).await
+        let mut result = Err(DeliverError::WriterClosed);
+        for (tab, tx) in targets {
+            match self.offer(session_id, tab, &tx, server_msg.clone()).await {
+                Ok(()) => result = Ok(()),
+                Err(e) if result.is_err() => result = Err(e),
+                Err(_) => {}
+            }
+        }
+        result
     }
 
     /// Queue `msg` without waiting. The caller is an agent's reader loop, so
-    /// a browser that stops reading must not hold it up: its session is
-    /// dropped instead, which ends its writer task and closes the socket.
+    /// a browser that stops reading must not hold it up: its tab is dropped
+    /// instead and told to close its socket.
     async fn offer(
         &self,
         session_id: SessionId,
+        tab: TabId,
         tx: &mpsc::Sender<ServerMessage>,
         msg: ServerMessage,
     ) -> Result<(), DeliverError> {
@@ -137,11 +169,10 @@ impl WebChatRouter {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(DeliverError::WriterClosed),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                let mut map = self.inner.lock().await;
-                if map.get(&session_id).is_some_and(|s| s.tx.same_channel(tx)) {
-                    map.remove(&session_id);
+                if let Some(dropped) = self.inner.lock().await.remove(&tab) {
+                    dropped.closed.notify_one();
                 }
-                warn!(%session_id, "webchat session outbound queue is full; closing the session");
+                warn!(%session_id, %tab, "webchat tab outbound queue is full; closing the tab");
                 Err(DeliverError::Stalled(session_id))
             }
         }
@@ -149,14 +180,29 @@ impl WebChatRouter {
 
     #[allow(dead_code, reason = "consumed by upcoming dashboard endpoints")]
     pub async fn agent_for_session(&self, session_id: SessionId) -> Option<AgentId> {
-        self.inner.lock().await.get(&session_id).map(|s| s.agent_id)
+        self.inner
+            .lock()
+            .await
+            .values()
+            .find(|t| t.session_id == session_id)
+            .map(|t| t.agent_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn tab_count(&self, session_id: SessionId) -> usize {
+        self.inner
+            .lock()
+            .await
+            .values()
+            .filter(|t| t.session_id == session_id)
+            .count()
     }
 
     /// Fan-out a proactive `OutboundMessage` (e.g. heartbeat output) to every
-    /// open `WebChat` session bound to `agent_id`. Returns the number of sessions
-    /// the message was successfully queued onto. Closed senders are skipped
-    /// silently — the per-session writer task already handles that path —
-    /// and sessions whose queue is full are dropped (see [`Self::offer`]).
+    /// open `WebChat` tab bound to `agent_id`. Returns the number of tabs the
+    /// message was successfully queued onto. Closed senders are skipped
+    /// silently — the per-tab writer task already handles that path — and
+    /// tabs whose queue is full are dropped (see [`Self::offer`]).
     pub async fn broadcast(&self, agent_id: AgentId, msg: OutboundMessage) -> usize {
         let server_msg = match msg.content {
             MessageContent::Text { text } => ServerMessage::AgentMessage { content: text },
@@ -164,18 +210,17 @@ impl WebChatRouter {
                 content: format!("(unsupported content variant: {other:?})"),
             },
         };
-        let targets: Vec<(SessionId, mpsc::Sender<ServerMessage>)> = self
-            .inner
-            .lock()
-            .await
-            .iter()
-            .filter(|(_, s)| s.agent_id == agent_id)
-            .map(|(id, s)| (*id, s.tx.clone()))
-            .collect();
+        let targets: Vec<_> = {
+            let map = self.inner.lock().await;
+            map.iter()
+                .filter(|(_, t)| t.agent_id == agent_id)
+                .map(|(id, t)| (t.session_id, *id, t.tx.clone()))
+                .collect()
+        };
         let mut delivered = 0usize;
-        for (session_id, tx) in targets {
+        for (session_id, tab, tx) in targets {
             if self
-                .offer(session_id, &tx, server_msg.clone())
+                .offer(session_id, tab, &tx, server_msg.clone())
                 .await
                 .is_ok()
             {
@@ -315,7 +360,7 @@ mod tests {
         let agent_id = AgentId::new();
         let stalled = Uuid::now_v7();
         let (stalled_tx, _stalled_rx) = mpsc::channel::<ServerMessage>(1);
-        router.register(stalled, agent_id, stalled_tx).await;
+        let stalled_tab = router.register(stalled, agent_id, stalled_tx).await;
         let (healthy_tx, mut healthy_rx) = mpsc::channel::<ServerMessage>(8);
         router.register(Uuid::now_v7(), agent_id, healthy_tx).await;
 
@@ -337,6 +382,12 @@ mod tests {
             router.agent_for_session(stalled).await.is_none(),
             "the stalled session is dropped"
         );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stalled_tab.closed.notified(),
+        )
+        .await
+        .expect("its handler is told to close the socket");
     }
 
     #[tokio::test]
@@ -371,23 +422,37 @@ mod tests {
         let agent_id = AgentId::new();
         let session_id = Uuid::now_v7();
         let (tx, _rx) = mpsc::channel::<ServerMessage>(8);
-        router.register(session_id, agent_id, tx.clone()).await;
-        router.unregister(session_id, &tx).await;
+        let registration = router.register(session_id, agent_id, tx).await;
+        router.unregister(registration.tab).await;
         assert!(router.agent_for_session(session_id).await.is_none());
     }
 
     #[tokio::test]
-    async fn stale_unregister_keeps_a_newer_tab() {
+    async fn every_open_tab_of_a_session_gets_replies() {
         let router = WebChatRouter::new();
         let agent_id = AgentId::new();
         let session_id = Uuid::now_v7();
-        let (old, _old_rx) = mpsc::channel::<ServerMessage>(8);
-        router.register(session_id, agent_id, old.clone()).await;
-        let (new, _new_rx) = mpsc::channel::<ServerMessage>(8);
-        router.register(session_id, agent_id, new).await;
+        let (first, mut first_rx) = mpsc::channel::<ServerMessage>(8);
+        let first_tab = router.register(session_id, agent_id, first).await;
+        let (second, mut second_rx) = mpsc::channel::<ServerMessage>(8);
+        router.register(session_id, agent_id, second).await;
+        let reply = |t: &str| OutboundMessage {
+            channel_id: session_id.to_string(),
+            ..text(t)
+        };
 
-        router.unregister(session_id, &old).await;
+        router
+            .deliver(agent_id, reply("both"))
+            .await
+            .expect("deliver");
+        assert!(first_rx.try_recv().is_ok());
+        assert!(second_rx.try_recv().is_ok());
 
-        assert_eq!(router.agent_for_session(session_id).await, Some(agent_id));
+        router.unregister(first_tab.tab).await;
+        router
+            .deliver(agent_id, reply("second only"))
+            .await
+            .expect("the other tab is still open");
+        assert!(second_rx.try_recv().is_ok());
     }
 }
