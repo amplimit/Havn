@@ -55,11 +55,16 @@ send. Keep it on `127.0.0.1` and reach it through one of:
 - **An SSH tunnel** (single user): `ssh -L 3000:127.0.0.1:3000 <server>`,
   then open `http://localhost:3000`.
 - **An authenticating reverse proxy** on the same host (multi-user). The
-  proxy logs the user in and sets `X-User-ID` itself, replacing any value
-  the client sent. Set `HAVN_DASHBOARD_TRUSTED_PROXIES` to the address
-  the proxy connects from (for example `127.0.0.1`); from any other peer
-  the dashboard drops `X-User-ID`.
+  proxy logs the user in and sets `X-User-ID` to that user's havn user id
+  (the UUID from `havn user add`) on every request it forwards, replacing
+  any value the client sent, including on routes it does not
+  authenticate. Set `HAVN_DASHBOARD_TRUSTED_PROXIES` to the exact address
+  the proxy connects from (for example `127.0.0.1`; no ranges or host
+  names); from any other peer the dashboard drops `X-User-ID`.
+  Trusting `127.0.0.1` trusts every process on the host, including other
+  OS users and agents run with `HAVN_SPAWNER=subprocess`.
 
 Setting `HAVN_DASHBOARD_HOST=0.0.0.0` exposes the dashboard without
-authentication; do that only behind a firewall that admits nothing but
-the proxy.
+authentication to every network the host is on, including the per-agent
+interfaces that sandboxed agents with network access can reach. Do that
+only behind a firewall that admits nothing but the proxy.
