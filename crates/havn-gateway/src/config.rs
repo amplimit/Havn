@@ -98,6 +98,15 @@ pub struct GatewayConfig {
     /// override (internal DNS, conflicting CIDR with VPN/Docker, …).
     #[serde(default)]
     pub network: NetworkConfig,
+    /// LLM proxy settings.
+    ///
+    /// TOML form:
+    /// ```toml
+    /// [llm]
+    /// max_tokens_ceiling = 16000
+    /// ```
+    #[serde(default)]
+    pub llm: LlmConfig,
     /// Channel-adapter account configuration (spec §3.4). Keyed by
     /// channel id ("telegram", "slack", …); each value lists the
     /// operator-controlled accounts (bot identities) on that channel.
@@ -255,6 +264,32 @@ pub struct NetworkConfig {
     pub agent_private_access: Vec<String>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct LlmConfig {
+    /// Upper bound on `max_tokens` for every LLM call the gateway proxies,
+    /// whatever the agent's config or the runtime asks for. The proxy also
+    /// clamps to the model's own output limit where it knows it. Default
+    /// [`DEFAULT_MAX_TOKENS_CEILING`], the largest output limit of a known
+    /// model; 0 is rejected.
+    ///
+    /// While a call runs it holds a reservation of up to this many output
+    /// tokens against the token caps it is billed to. On shared credentials
+    /// with small caps, a lower value keeps one user's large `max_tokens`
+    /// from tying up the remaining budget of everyone else.
+    pub max_tokens_ceiling: u32,
+}
+
+pub const DEFAULT_MAX_TOKENS_CEILING: u32 = 128_000;
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens_ceiling: DEFAULT_MAX_TOKENS_CEILING,
+        }
+    }
+}
+
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
@@ -284,6 +319,7 @@ impl Default for GatewayConfig {
             tmpfs_mounts: Vec::new(),
             seccomp: SeccompConfig::default(),
             network: NetworkConfig::default(),
+            llm: LlmConfig::default(),
             channels: std::collections::BTreeMap::new(),
             bindings: Vec::new(),
         }
@@ -380,7 +416,15 @@ impl GatewayConfig {
         let raw = std::fs::read_to_string(path)?;
         let parsed: Self = toml::from_str(&raw)?;
         parsed.validate_channel_ids()?;
+        parsed.validate_llm()?;
         Ok(parsed)
+    }
+
+    fn validate_llm(&self) -> anyhow::Result<()> {
+        if self.llm.max_tokens_ceiling == 0 {
+            anyhow::bail!("[llm] max_tokens_ceiling must be at least 1");
+        }
+        Ok(())
     }
 
     /// Reject `|` (the `channel_id_codec` separator) in any channel
@@ -721,6 +765,25 @@ mod tests {
         );
         let r = GatewayConfig::load_from(&p);
         assert!(r.is_ok(), "well-formed config should load: {:?}", r.err());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn llm_max_tokens_ceiling_defaults_and_must_be_positive() {
+        assert_eq!(
+            GatewayConfig::default().llm.max_tokens_ceiling,
+            DEFAULT_MAX_TOKENS_CEILING
+        );
+        let p = write_tmp_config("[llm]\nmax_tokens_ceiling = 16000\n");
+        let cfg = GatewayConfig::load_from(&p).expect("load");
+        assert_eq!(cfg.llm.max_tokens_ceiling, 16_000);
+        let _ = std::fs::remove_file(&p);
+        let p = write_tmp_config("[llm]\nmax_tokens_ceiling = 0\n");
+        let msg = format!(
+            "{:#}",
+            GatewayConfig::load_from(&p).expect_err("zero rejected")
+        );
+        assert!(msg.contains("max_tokens_ceiling"), "{msg}");
         let _ = std::fs::remove_file(&p);
     }
 }

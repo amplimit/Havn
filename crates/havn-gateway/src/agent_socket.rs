@@ -73,6 +73,9 @@ pub struct AgentSocketCtx {
     /// without a side-channel.
     pub embedding_config: Arc<arc_swap::ArcSwap<serde_json::Value>>,
     pub multi_user: bool,
+    /// `[llm] max_tokens_ceiling`: upper bound on `max_tokens` for every
+    /// proxied LLM call, whatever the agent's config asks for.
+    pub max_tokens_ceiling: u32,
     /// True when agents run under `NamespaceSpawner`, each in its own
     /// `agent-<id>` cgroup. The gateway then accepts a connection for an
     /// agent only from a process in that cgroup. With the unisolated
@@ -251,6 +254,11 @@ fn cgroup_belongs_to_agent(contents: &str, agent_id: AgentId) -> bool {
         .any(|path| path.trim_end() == expected)
 }
 
+/// At most 64 chars of a peer-supplied string, for logging.
+fn clip(s: &str) -> &str {
+    s.char_indices().nth(64).map_or(s, |(end, _)| &s[..end])
+}
+
 async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::Result<()> {
     // Every sandbox sees the same socket, so the agent id in Hello is only
     // a claim. The peer's process comes from the kernel and cannot be
@@ -274,14 +282,18 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
     };
 
     if version != PROTOCOL_VERSION {
+        // Both values come from the peer before anything is verified.
+        let (agent_id_str, version) = (clip(&agent_id_str), clip(&version));
         warn!(
-            agent_id = %agent_id_str,
-            agent_version = %version,
+            agent_id = ?agent_id_str,
+            agent_version = ?version,
             gateway_version = PROTOCOL_VERSION,
             "refusing agent: runtime protocol version differs from the gateway's; \
              install the havn-runtime that ships with this gateway"
         );
-        anyhow::bail!("protocol version mismatch (agent {version}, gateway {PROTOCOL_VERSION})");
+        anyhow::bail!(
+            "protocol version mismatch (agent {version:?}, gateway {PROTOCOL_VERSION})"
+        );
     }
 
     let agent_id = AgentId::from_str(&agent_id_str)
@@ -786,20 +798,26 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                 }
                 None => owner_id,
             };
+            let billing = llm_proxy::Billing {
+                user_id: billing_user,
+                agent_id: Some(agent_id),
+                agent_team: agent.team_id,
+                budget: policy.budget.clone(),
+            };
             match llm_proxy::complete_with_provider(
                 &ctx.db,
                 &ctx.http,
                 ring,
-                billing_user,
-                agent.team_id,
+                &billing,
                 &provider,
                 &ar,
+                ctx.max_tokens_ceiling,
             )
             .await
             {
                 Ok(resp) => {
                     let usage = LlmUsage {
-                        input_tokens: resp.usage.input_tokens,
+                        input_tokens: resp.usage.total_input_tokens(),
                         output_tokens: resp.usage.output_tokens,
                     };
                     LlmResponse {
@@ -1339,6 +1357,7 @@ mod tests {
                 serde_json::json!({"provider": "disabled"}),
             )),
             multi_user,
+            max_tokens_ceiling: crate::config::DEFAULT_MAX_TOKENS_CEILING,
             verify_peer_cgroup,
             extra_mounts: Vec::new(),
             tmpfs_mounts: Vec::new(),
@@ -1619,6 +1638,8 @@ mod tests {
         let (verdict, reply) = hello_with_version(&ctx, agent, "0.1.0").await;
 
         let err = verdict.expect_err("an older runtime must be refused at Hello");
+        assert_eq!(clip(&"x".repeat(100)).len(), 64);
+        assert_eq!(clip("0.1.0"), "0.1.0");
         assert!(
             err.to_string().contains("protocol version mismatch"),
             "{err:#}"

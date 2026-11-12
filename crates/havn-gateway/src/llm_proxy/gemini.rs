@@ -334,22 +334,20 @@ fn gemini_to_anthropic(raw: &Value, model: &str) -> Result<AnthropicResponse, St
         stop_reason
     };
 
-    let usage = raw.get("usageMetadata").map_or(
-        AnthropicUsage {
-            input_tokens: 0,
-            output_tokens: 0,
-        },
-        |u| AnthropicUsage {
-            input_tokens: u
-                .get("promptTokenCount")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            output_tokens: u
-                .get("candidatesTokenCount")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        },
-    );
+    // Thinking tokens are billed as output but reported apart from the
+    // candidates. The JSON mapping omits zero counts, so a missing output
+    // count is 0; a missing prompt count (never 0) means no usage.
+    let usage = raw
+        .get("usageMetadata")
+        .and_then(|u| {
+            let count = |key: &str| u.get(key).and_then(Value::as_u64).unwrap_or(0);
+            Some(AnthropicUsage {
+                input_tokens: u.get("promptTokenCount")?.as_u64()?,
+                output_tokens: count("candidatesTokenCount") + count("thoughtsTokenCount"),
+                ..AnthropicUsage::default()
+            })
+        })
+        .unwrap_or_else(AnthropicUsage::unreported);
 
     Ok(AnthropicResponse {
         id: raw
@@ -514,6 +512,24 @@ mod tests {
         assert_eq!(blocks[0]["text"], "hello!");
         assert_eq!(canon.usage.input_tokens, 5);
         assert_eq!(canon.usage.output_tokens, 2);
+    }
+
+    #[test]
+    fn thinking_tokens_count_as_output() {
+        let raw = json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "hi"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 2, "thoughtsTokenCount": 40}
+        });
+        let canon = gemini_to_anthropic(&raw, "gemini-2.5-pro").expect("parse");
+        assert_eq!(canon.usage.output_tokens, 42);
+        assert!(!canon.usage.unreported);
+        let mut partial = raw.clone();
+        partial["usageMetadata"] = json!({"candidatesTokenCount": 2});
+        let canon = gemini_to_anthropic(&partial, "gemini-2.5-pro").expect("parse");
+        assert!(canon.usage.unreported);
     }
 
     #[test]
