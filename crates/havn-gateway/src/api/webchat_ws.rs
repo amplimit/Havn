@@ -178,13 +178,16 @@ async fn handle_session(socket: WebSocket, state: AppState, agent_id: AgentId, s
             // Inform the user; the socket stays open in case the agent comes back.
             let _ = state
                 .webchat_router
-                .deliver(havn_core::OutboundMessage {
-                    channel_id: session_id.to_string(),
-                    content: MessageContent::Text {
-                        text: format!("Couldn't reach the agent: {e}"),
+                .deliver(
+                    agent_id,
+                    havn_core::OutboundMessage {
+                        channel_id: session_id.to_string(),
+                        content: MessageContent::Text {
+                            text: format!("Couldn't reach the agent: {e}"),
+                        },
+                        reply_to: None,
                     },
-                    reply_to: None,
-                })
+                )
                 .await;
         }
     }

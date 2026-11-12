@@ -393,6 +393,8 @@ async fn main() -> anyhow::Result<()> {
         http,
         webchat_router,
         channel_router: channel_router_state.clone(),
+        bindings: Arc::new(cfg.bindings.clone()),
+        channels: Arc::new(cfg.channels.clone()),
         cron_scheduler: cron_scheduler.clone(),
         admin_rpc,
         query_broker,
