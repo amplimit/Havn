@@ -72,7 +72,7 @@ pub async fn record(pool: &SqlitePool, channel_id: &str, role: Role, content: &s
 /// know the channel id ahead of time. Newest-first internally then
 /// reversed so callers get chronological order — matches what the
 /// chat UI wants to render top-to-bottom.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnWithChannel {
     pub channel_id: String,
     pub role: Role,

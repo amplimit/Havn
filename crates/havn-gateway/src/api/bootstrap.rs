@@ -26,6 +26,8 @@ use std::path::Path as StdPath;
 use tokio::fs;
 use tracing::info;
 
+use crate::agent_files::WorkspaceDir;
+
 use crate::AppState;
 use crate::api::ApiError;
 use crate::audit;
@@ -75,11 +77,11 @@ pub async fn get(
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
     let id = agent.id;
     let workspace = crate::api::agents::workspace_for(&state, id);
-    Ok(Json(BootstrapView {
-        system: read_soul_with_fallback(&workspace).await?,
-        user: read_optional(&workspace, USER_MD).await?,
-        heartbeat: read_optional(&workspace, HEARTBEAT_MD).await?,
-    }))
+    if !workspace.exists() {
+        return Ok(Json(BootstrapView::default()));
+    }
+    let view = blocking(move || read_view(&open_workspace(&workspace)?)).await?;
+    Ok(Json(view))
 }
 
 pub async fn put(
@@ -101,18 +103,33 @@ pub async fn put(
             .map_err(|e| ApiError::Internal(format!("creating workspace: {e}")))?;
     }
     let mut touched: Vec<&'static str> = Vec::new();
-    if let Some(s) = &req.system {
-        write_or_clear(&workspace, SOUL_MD, s).await?;
-        touched.push(SOUL_MD);
+    for (name, body) in [
+        (SOUL_MD, &req.system),
+        (USER_MD, &req.user),
+        (HEARTBEAT_MD, &req.heartbeat),
+    ] {
+        if body.is_some() {
+            touched.push(name);
+        }
     }
-    if let Some(s) = &req.user {
-        write_or_clear(&workspace, USER_MD, s).await?;
-        touched.push(USER_MD);
-    }
-    if let Some(s) = &req.heartbeat {
-        write_or_clear(&workspace, HEARTBEAT_MD, s).await?;
-        touched.push(HEARTBEAT_MD);
-    }
+    let ws_path = workspace.clone();
+    let view = blocking(move || {
+        let ws = open_workspace(&ws_path)?;
+        for (name, body) in [
+            (SOUL_MD, &req.system),
+            (USER_MD, &req.user),
+            (HEARTBEAT_MD, &req.heartbeat),
+        ] {
+            if let Some(body) = body {
+                write_or_clear(&ws, name, body)?;
+            }
+        }
+        // Re-read so the dashboard sees what's actually on disk now —
+        // `Some("")` PATCHes round-trip to `None` (file removed), which
+        // matches the runtime's "empty = no section" semantics.
+        read_view(&ws)
+    })
+    .await?;
     if !touched.is_empty() {
         audit::record_user_action(
             &state.db,
@@ -123,62 +140,75 @@ pub async fn put(
         .await;
         info!(agent_id = %id, files = ?touched, "bootstrap files updated");
     }
-    // Re-read so the dashboard sees what's actually on disk now —
-    // `Some("")` PATCHes round-trip to `None` (file removed), which
-    // matches the runtime's "empty = no section" semantics.
-    Ok(Json(BootstrapView {
-        system: read_soul_with_fallback(&workspace).await?,
-        user: read_optional(&workspace, USER_MD).await?,
-        heartbeat: read_optional(&workspace, HEARTBEAT_MD).await?,
-    }))
+    Ok(Json(view))
 }
 
 /// Read the persona file: try SOUL.md first, fall back to SYSTEM.md for
 /// v0.6 backward compat.
-async fn read_soul_with_fallback(workspace: &StdPath) -> Result<Option<String>, ApiError> {
-    let soul = read_optional(workspace, SOUL_MD).await?;
+fn read_soul_with_fallback(workspace: &WorkspaceDir) -> Result<Option<String>, ApiError> {
+    let soul = read_optional(workspace, SOUL_MD)?;
     if soul.is_some() {
         return Ok(soul);
     }
-    read_optional(workspace, LEGACY_SYSTEM_MD).await
+    read_optional(workspace, LEGACY_SYSTEM_MD)
 }
 
-async fn read_optional(workspace: &StdPath, name: &str) -> Result<Option<String>, ApiError> {
-    let path = workspace.join(name);
-    match fs::read_to_string(&path).await {
-        Ok(s) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(s))
-            }
+fn read_optional(workspace: &WorkspaceDir, name: &str) -> Result<Option<String>, ApiError> {
+    match workspace.read_text(name, MAX_BOOTSTRAP_BYTES as u64) {
+        Ok(text) => Ok(text.filter(|s| !s.trim().is_empty())),
+        // Too large, a symlink or not a regular file: the agent put
+        // something there that the dashboard will not show.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData || is_symlink_error(&e) => {
+            tracing::warn!(file = name, error = %e, "bootstrap file not shown");
+            Ok(None)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(ApiError::Internal(format!("reading {name}: {e}"))),
     }
 }
 
-async fn write_or_clear(workspace: &StdPath, name: &str, content: &str) -> Result<(), ApiError> {
+/// `O_NOFOLLOW` on a symlink fails with ELOOP.
+fn is_symlink_error(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ELOOP)
+}
+
+fn write_or_clear(workspace: &WorkspaceDir, name: &str, content: &str) -> Result<(), ApiError> {
     if content.len() > MAX_BOOTSTRAP_BYTES {
         return Err(ApiError::BadRequest(format!(
             "{name} body exceeds {MAX_BOOTSTRAP_BYTES} byte cap (got {})",
             content.len()
         )));
     }
-    let path = workspace.join(name);
     if content.trim().is_empty() {
         // Empty body → remove file. Runtime treats absent + empty
         // identically; persisting an empty file would leave behind
         // something the agent's I/O has to skip on every session.
-        match fs::remove_file(&path).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(ApiError::Internal(format!("removing {name}: {e}"))),
-        }
+        workspace
+            .remove(name)
+            .map_err(|e| ApiError::Internal(format!("removing {name}: {e}")))
     } else {
-        fs::write(&path, content)
-            .await
+        workspace
+            .write_text(name, content)
             .map_err(|e| ApiError::Internal(format!("writing {name}: {e}")))
     }
+}
+
+fn read_view(workspace: &WorkspaceDir) -> Result<BootstrapView, ApiError> {
+    Ok(BootstrapView {
+        system: read_soul_with_fallback(workspace)?,
+        user: read_optional(workspace, USER_MD)?,
+        heartbeat: read_optional(workspace, HEARTBEAT_MD)?,
+    })
+}
+
+/// Open the agent's workspace without following agent-controlled paths.
+fn open_workspace(path: &StdPath) -> Result<WorkspaceDir, ApiError> {
+    WorkspaceDir::open(path).map_err(|e| ApiError::Internal(format!("opening workspace: {e}")))
+}
+
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| ApiError::Internal(format!("workspace task: {e}")))?
 }

@@ -2,6 +2,7 @@
 //! credential resolver, LLM proxy, cron scheduler, config hot reload.
 
 mod admin_rpc;
+mod agent_files;
 mod agent_registry;
 mod agent_socket;
 mod api;
