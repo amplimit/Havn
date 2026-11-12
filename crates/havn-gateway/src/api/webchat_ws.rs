@@ -9,7 +9,7 @@
 //! `WebSocket`. The agent itself must already be running (registered and
 //! connected to the agent socket); the handler returns 503 otherwise.
 //!
-//! Per-session lifecycle: register with [`WebChatRouter`](crate::webchat::WebChatRouter)
+//! Per-session lifecycle: register with [`WebChatRouter`]
 //! → spawn writer task draining mpsc → read WS frames → wrap as `InboundMessage`
 //! with `channel_id = session_id` → forward to agent. Agent's `OutboundMessage`
 //! reaches us via the agent socket handler, which calls

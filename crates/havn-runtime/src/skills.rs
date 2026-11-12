@@ -330,7 +330,7 @@ pub async fn relevant_for(
 /// kind-style discriminator in v1); Row is `CuratableSkill` —
 /// the same shape `list_curatable` returns, so callers can bridge
 /// to a slimmer `RetrievedSkill` if they prefer.
-struct SkillsSource<'a> {
+pub(crate) struct SkillsSource<'a> {
     pool: &'a SqlitePool,
 }
 

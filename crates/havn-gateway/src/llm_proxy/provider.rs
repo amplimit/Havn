@@ -16,7 +16,7 @@
 //!    always did for Anthropic.
 //!
 //! Provider selection is data-driven by the credential's `provider` string
-//! ([`super::AnthropicProvider::NAME`] etc). Model-name inference exists for
+//! ([`super::anthropic::AnthropicProvider::NAME`] etc). Model-name inference exists for
 //! callers that don't carry an explicit hint — see [`provider_for_model`].
 
 use async_trait::async_trait;

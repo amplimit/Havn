@@ -5,9 +5,10 @@
 //! prompt}`, the runtime sends an [`AgentToGateway::AgentQuery`] frame
 //! down the agent socket. The gateway broker validates same-owner,
 //! checks the target is connected, dispatches an
-//! [`GatewayToAgent::IncomingQuery`] to agent B, and routes B's reply
-//! back as [`GatewayToAgent::AgentQueryResult`]. The tool's pending
-//! oneshot wakes; we return the text (and optional transcript) as a
+//! [`GatewayToAgent::IncomingQuery`](havn_proto::GatewayToAgent::IncomingQuery)
+//! to agent B, and routes B's reply back as
+//! [`GatewayToAgent::AgentQueryResult`](havn_proto::GatewayToAgent::AgentQueryResult).
+//! The tool's pending oneshot wakes; we return the text (and optional transcript) as a
 //! `tool_result`.
 //!
 //! Recursion guard: this tool is **not** registered when the runtime is
@@ -28,7 +29,7 @@ use uuid::Uuid;
 
 use crate::tools::{Tool, ToolCtx, ToolResult};
 
-/// Hard cap mirroring the gateway's [`AGENT_QUERY_MAX_TIMEOUT_SECS`].
+/// Hard cap mirroring the gateway's `AGENT_QUERY_MAX_TIMEOUT_SECS`.
 /// Kept in sync deliberately — the gateway clamps too, but a shorter
 /// runtime ceiling means an LLM that asks for an absurd timeout still
 /// gets a useful tool_result instead of waiting full 5 minutes for
