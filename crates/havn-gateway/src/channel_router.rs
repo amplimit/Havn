@@ -110,9 +110,10 @@ pub enum DeliverError {
     /// closed concurrently. Treated like NoSession by the caller.
     #[error("adapter writer closed")]
     WriterClosed,
-    /// The adapter's outbound queue is full: it is not reading. The frame
-    /// stays in the replay buffer for `Resume`.
-    #[error("adapter for {0:?} is not reading its queue")]
+    /// The adapter's outbound queue is full: it is not reading. Its
+    /// sender is dropped, which closes its WS; the frame stays in the
+    /// replay buffer so the reconnecting adapter's `Resume` gets it.
+    #[error("adapter for {0:?} is not reading its queue; disconnected it")]
     Stalled(AccountKey),
 }
 
@@ -146,11 +147,14 @@ impl ChannelRouter {
         }
     }
 
-    /// Mark the adapter as disconnected but keep the `AccountState` —
-    /// the replay buffer and seq counter survive until the next
-    /// reconnect (or until the gateway restarts). Idempotent.
-    pub async fn unregister(&self, key: &AccountKey) {
-        if let Some(state) = self.inner.lock().await.get_mut(key) {
+    /// Mark the adapter holding `tx` as disconnected but keep the
+    /// `AccountState` — the replay buffer and seq counter survive until
+    /// the next reconnect (or until the gateway restarts). A newer
+    /// connection that already replaced `tx` is left alone. Idempotent.
+    pub async fn unregister(&self, key: &AccountKey, tx: &mpsc::Sender<ChannelFrame>) {
+        if let Some(state) = self.inner.lock().await.get_mut(key)
+            && state.tx.as_ref().is_some_and(|t| t.same_channel(tx))
+        {
             state.tx = None;
         }
     }
@@ -192,11 +196,20 @@ impl ChannelRouter {
         };
         // Never wait on the adapter: it serves every agent bound to its
         // account, and the caller is an agent's reader loop.
-        tx.try_send(frame).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => DeliverError::Stalled(key),
-            mpsc::error::TrySendError::Closed(_) => DeliverError::WriterClosed,
-        })?;
-        Ok(seq)
+        match tx.try_send(frame) {
+            Ok(()) => Ok(seq),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(DeliverError::WriterClosed),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    channel = %key.channel,
+                    account = %key.account_id,
+                    seq,
+                    "channel adapter is not reading; disconnecting it so it resumes"
+                );
+                self.unregister(&key, &tx).await;
+                Err(DeliverError::Stalled(key))
+            }
+        }
     }
 
     /// Collect buffered outbound frames with `seq > since_seq` for
@@ -415,10 +428,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_to_a_full_adapter_queue_fails_at_once() {
+    async fn deliver_to_a_full_adapter_queue_fails_at_once_and_disconnects_it() {
         let router = ChannelRouter::new();
         let key = AccountKey::new("telegram", "alice");
-        let (tx, _rx) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel(1);
         router.register(key.clone(), tx).await;
         let send = || {
             router.deliver(
@@ -439,6 +452,36 @@ mod tests {
             2,
             "the dropped frame stays replayable"
         );
+        assert!(rx.recv().await.is_some(), "the queued frame");
+        assert!(
+            rx.recv().await.is_none(),
+            "the router dropped its sender, so the adapter's WS closes"
+        );
+        assert!(matches!(send().await, Err(DeliverError::NoSession(_))));
+    }
+
+    #[tokio::test]
+    async fn stale_unregister_keeps_a_newer_adapter() {
+        let router = ChannelRouter::new();
+        let key = AccountKey::new("telegram", "alice");
+        let (old, _old_rx) = mpsc::channel(8);
+        router.register(key.clone(), old.clone()).await;
+        let (new, mut new_rx) = mpsc::channel(8);
+        router.register(key.clone(), new).await;
+
+        router.unregister(&key, &old).await;
+
+        router
+            .deliver(
+                "telegram",
+                "alice",
+                "tg:1",
+                None,
+                ChannelMessageContent::Text { text: "x".into() },
+            )
+            .await
+            .expect("the newer adapter is still registered");
+        assert!(new_rx.recv().await.is_some());
     }
 
     #[tokio::test]
@@ -479,7 +522,7 @@ mod tests {
         let router = ChannelRouter::new();
         let key = AccountKey::new("telegram", "alice");
         let (tx1, _rx1) = mpsc::channel(8);
-        router.register(key.clone(), tx1).await;
+        router.register(key.clone(), tx1.clone()).await;
         router
             .deliver(
                 "telegram",
@@ -491,7 +534,7 @@ mod tests {
             .await
             .expect("deliver");
 
-        router.unregister(&key).await;
+        router.unregister(&key, &tx1).await;
         let (tx2, mut rx2) = mpsc::channel(8);
         router.register(key.clone(), tx2).await;
         let seq = router
@@ -516,8 +559,8 @@ mod tests {
         let router = ChannelRouter::new();
         let key = AccountKey::new("telegram", "alice");
         let (tx, _rx) = mpsc::channel(8);
-        router.register(key.clone(), tx).await;
-        router.unregister(&key).await;
+        router.register(key.clone(), tx.clone()).await;
+        router.unregister(&key, &tx).await;
         let r = router
             .deliver(
                 "telegram",
@@ -538,7 +581,7 @@ mod tests {
         let router = ChannelRouter::new();
         let key = AccountKey::new("telegram", "alice");
         let (tx, mut rx) = mpsc::channel(8);
-        router.register(key.clone(), tx).await;
+        router.register(key.clone(), tx.clone()).await;
         for i in 0..3 {
             router
                 .deliver(
@@ -558,7 +601,7 @@ mod tests {
             let _ = rx.recv().await.expect("frame");
         }
 
-        router.unregister(&key).await;
+        router.unregister(&key, &tx).await;
         let replayed = router.replay_since(&key, 1).await;
         let seqs: Vec<u64> = replayed
             .iter()

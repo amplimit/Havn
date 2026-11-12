@@ -27,11 +27,13 @@ use havn_proto::{
 use sqlx::SqlitePool;
 use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::agent_registry::AgentRegistry;
+use crate::agent_registry::{
+    AgentRegistry, MAX_INFLIGHT_AGENT_QUERIES, MAX_INFLIGHT_LLM_REQUESTS, SendError, Slot,
+};
 use crate::cron::CronScheduler;
 use crate::llm_proxy::{self, AnthropicMessage, AnthropicRequest};
 use crate::policy_resolver;
@@ -41,16 +43,18 @@ use havn_db::repo::agents as agents_repo;
 
 const OUTBOUND_QUEUE_CAPACITY: usize = 64;
 
-/// Per-connection caps on `LlmRequest` / `AgentQuery` frames being handled
-/// at once. Each is a gateway task outside the agent's cgroup; frames over
-/// the cap get an immediate error reply.
-const MAX_INFLIGHT_LLM_REQUESTS: usize = 16;
-const MAX_INFLIGHT_AGENT_QUERIES: usize = 8;
-
 /// Longest one frame write may take. A runtime that stops reading its socket
 /// is disconnected after this, which also releases every task waiting for
 /// room in its outbound queue.
 const AGENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Replacements tried for one frame over the size limit (a query result
+/// first loses its transcript, then becomes an error); then it is dropped.
+const MAX_SUBSTITUTIONS: usize = 2;
+
+/// Longest request id accepted from an agent. Ids are echoed in replies, so
+/// an oversized one would make even an error reply unsendable.
+const MAX_REQUEST_ID_BYTES: usize = 128;
 
 #[derive(Clone)]
 pub struct AgentSocketCtx {
@@ -402,7 +406,12 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
     info!(%agent_id, "agent connected");
 
     // 4. Writer task: drain mpsc → wire
-    let mut writer_task = tokio::spawn(run_writer(write, rx, agent_id, ctx.query_broker.clone()));
+    let disconnect = ctx
+        .registry
+        .disconnect_signal(agent_id)
+        .await
+        .unwrap_or_default();
+    let mut writer_task = tokio::spawn(run_writer(write, rx, agent_id, ctx.clone(), disconnect));
 
     // 5. Reader loop; the connection also ends when the writer gives up.
     let reader_result = tokio::select! {
@@ -427,22 +436,45 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
     Ok(())
 }
 
+/// Write queued frames until the queue closes, a write fails or stalls, or
+/// the registry asks for this agent to be disconnected.
 async fn run_writer<W>(
+    write: W,
+    rx: mpsc::Receiver<GatewayToAgent>,
+    agent_id: AgentId,
+    ctx: AgentSocketCtx,
+    disconnect: Arc<Notify>,
+) where
+    W: AsyncWrite + Unpin,
+{
+    let disconnected = disconnect.notified();
+    tokio::select! {
+        () = write_frames(write, rx, agent_id, &ctx) => {}
+        () = disconnected => {}
+    }
+}
+
+async fn write_frames<W>(
     mut write: W,
     mut rx: mpsc::Receiver<GatewayToAgent>,
     agent_id: AgentId,
-    query_broker: crate::query_broker::QueryBroker,
+    ctx: &AgentSocketCtx,
 ) where
     W: AsyncWrite + Unpin,
 {
     while let Some(frame) = rx.recv().await {
         let mut next = Some(frame);
+        let mut substitutions = 0;
         while let Some(frame) = next.take() {
             match tokio::time::timeout(AGENT_WRITE_TIMEOUT, write_frame(&mut write, &frame)).await {
                 Ok(Ok(())) => {}
                 // Rejected before anything was written: the stream is intact.
+                Ok(Err(FrameError::FrameTooLarge(size))) if substitutions < MAX_SUBSTITUTIONS => {
+                    substitutions += 1;
+                    next = oversized_reply(agent_id, frame, size, substitutions, ctx).await;
+                }
                 Ok(Err(FrameError::FrameTooLarge(size))) => {
-                    next = oversized_reply(agent_id, frame, size, &query_broker).await;
+                    error!(%agent_id, size, "replacement frame is still over the size limit; dropping it");
                 }
                 Ok(Err(e)) => {
                     error!(%agent_id, error = %e, "agent writer failed");
@@ -463,11 +495,13 @@ async fn run_writer<W>(
 
 /// `frame` is over [`MAX_FRAME_BYTES`] and cannot be sent. Fail whoever is
 /// waiting on it; returns the smaller frame to send in its place, if any.
+/// `attempt` counts the replacements tried for this frame, from 1.
 async fn oversized_reply(
     agent_id: AgentId,
     frame: GatewayToAgent,
     size: usize,
-    query_broker: &crate::query_broker::QueryBroker,
+    attempt: usize,
+    ctx: &AgentSocketCtx,
 ) -> Option<GatewayToAgent> {
     let limit = format!("{size} bytes exceeds the {MAX_FRAME_BYTES}-byte frame limit");
     match frame {
@@ -482,7 +516,9 @@ async fn oversized_reply(
                 usage: resp.usage,
             }))
         }
-        GatewayToAgent::AgentQueryResult(result) if !result.transcript.is_null() => {
+        GatewayToAgent::AgentQueryResult(result)
+            if attempt == 1 && !result.transcript.is_null() =>
+        {
             warn!(%agent_id, request_id = %result.request_id, size, "AgentQueryResult too large; dropping its transcript");
             Some(GatewayToAgent::AgentQueryResult(AgentQueryResult {
                 transcript: serde_json::Value::String(format!(
@@ -504,7 +540,7 @@ async fn oversized_reply(
         }
         GatewayToAgent::IncomingQuery(query) => {
             warn!(%agent_id, size, "IncomingQuery too large; failing the query");
-            query_broker
+            ctx.query_broker
                 .resolve(
                     agent_id,
                     AgentQueryResponse {
@@ -519,9 +555,68 @@ async fn oversized_reply(
                 .await;
             None
         }
+        GatewayToAgent::InboundMessage(msg) => {
+            warn!(%agent_id, size, "InboundMessage too large; telling the sender");
+            let notice = "This message is too large for the agent to receive.".to_string();
+            if let Some((channel, account_id, sender_id)) =
+                crate::channel_id_codec::decode(&msg.channel_id)
+            {
+                let _ = ctx
+                    .channel_router
+                    .deliver(
+                        channel,
+                        account_id,
+                        sender_id,
+                        None,
+                        havn_proto::channel::ChannelMessageContent::Text { text: notice },
+                    )
+                    .await;
+            } else {
+                let _ = ctx
+                    .webchat_router
+                    .deliver(
+                        agent_id,
+                        havn_core::OutboundMessage {
+                            channel_id: msg.channel_id,
+                            content: havn_core::MessageContent::Text { text: notice },
+                            reply_to: None,
+                        },
+                    )
+                    .await;
+            }
+            None
+        }
+        GatewayToAgent::MemoryForgetRequest(havn_proto::MemoryForgetRequest {
+            request_id, ..
+        })
+        | GatewayToAgent::SkillPinRequest(havn_proto::SkillPinRequest { request_id, .. })
+        | GatewayToAgent::DataRequest(havn_proto::DataRequest { request_id, .. }) => {
+            warn!(%agent_id, size, "admin request too large; failing it");
+            ctx.admin_rpc
+                .resolve(
+                    agent_id,
+                    &request_id,
+                    havn_proto::AdminOutcome::Error {
+                        message: format!("request of {limit}"),
+                    },
+                )
+                .await;
+            None
+        }
         _ => {
             error!(%agent_id, size, "dropping an outbound frame over the size limit");
             None
+        }
+    }
+}
+
+/// Reply to a request refused before it was handled. A queue too full to
+/// take even that means the agent is not reading, so it is disconnected.
+async fn refuse(ctx: &AgentSocketCtx, agent_id: AgentId, refusal: GatewayToAgent) {
+    if let Err(e) = ctx.registry.try_send(agent_id, refusal).await {
+        debug!(%agent_id, error = %e, "could not deliver a refusal");
+        if matches!(e, SendError::Stalled(_)) {
+            ctx.registry.disconnect(agent_id).await;
         }
     }
 }
@@ -534,8 +629,6 @@ async fn run_reader<R>(
 where
     R: AsyncBufRead + Unpin,
 {
-    let llm_slots = Arc::new(Semaphore::new(MAX_INFLIGHT_LLM_REQUESTS));
-    let query_slots = Arc::new(Semaphore::new(MAX_INFLIGHT_AGENT_QUERIES));
     while let Some(frame) = read_frame::<_, AgentToGateway>(reader).await? {
         match frame {
             AgentToGateway::Hello { .. } => {
@@ -652,7 +745,11 @@ where
                 }
             }
             AgentToGateway::LlmRequest(req) => {
-                let Ok(permit) = Arc::clone(&llm_slots).try_acquire_owned() else {
+                if req.request_id.len() > MAX_REQUEST_ID_BYTES {
+                    warn!(%agent_id, len = req.request_id.len(), "dropping LlmRequest with an oversized request_id");
+                    continue;
+                }
+                let Some(permit) = ctx.registry.try_reserve(agent_id, Slot::Llm).await else {
                     warn!(%agent_id, limit = MAX_INFLIGHT_LLM_REQUESTS, "too many LLM requests in flight; refusing one");
                     let refusal = GatewayToAgent::LlmResponse(LlmResponse {
                         request_id: req.request_id,
@@ -664,9 +761,7 @@ where
                         provider_response: serde_json::Value::Null,
                         usage: None,
                     });
-                    if let Err(e) = ctx.registry.try_send(agent_id, refusal).await {
-                        debug!(%agent_id, error = %e, "could not deliver LlmRequest refusal");
-                    }
+                    refuse(ctx, agent_id, refusal).await;
                     continue;
                 };
                 let ctx_cloned = ctx.clone();
@@ -704,7 +799,11 @@ where
                 // block the caller's reader loop; at most
                 // MAX_INFLIGHT_AGENT_QUERIES per caller, each bounded by
                 // the timeout enforced inside the handler.
-                let Ok(permit) = Arc::clone(&query_slots).try_acquire_owned() else {
+                if query.request_id.len() > MAX_REQUEST_ID_BYTES {
+                    warn!(%agent_id, len = query.request_id.len(), "dropping AgentQuery with an oversized request_id");
+                    continue;
+                }
+                let Some(permit) = ctx.registry.try_reserve(agent_id, Slot::Query).await else {
                     warn!(%agent_id, limit = MAX_INFLIGHT_AGENT_QUERIES, "too many agent queries in flight; refusing one");
                     let refusal = GatewayToAgent::AgentQueryResult(AgentQueryResult {
                         request_id: query.request_id,
@@ -716,9 +815,7 @@ where
                         text: String::new(),
                         transcript: serde_json::Value::Null,
                     });
-                    if let Err(e) = ctx.registry.try_send(agent_id, refusal).await {
-                        debug!(%agent_id, error = %e, "could not deliver AgentQuery refusal");
-                    }
+                    refuse(ctx, agent_id, refusal).await;
                     continue;
                 };
                 let ctx_cloned = ctx.clone();
@@ -1642,14 +1739,37 @@ mod tests {
         }
     }
 
+    fn spawn_writer<W>(
+        ctx: &AgentSocketCtx,
+        write: W,
+        agent_id: AgentId,
+    ) -> (
+        mpsc::Sender<GatewayToAgent>,
+        Arc<Notify>,
+        tokio::task::JoinHandle<()>,
+    )
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel(8);
+        let disconnect = Arc::new(Notify::new());
+        let writer = tokio::spawn(run_writer(
+            write,
+            rx,
+            agent_id,
+            ctx.clone(),
+            Arc::clone(&disconnect),
+        ));
+        (tx, disconnect, writer)
+    }
+
     #[tokio::test]
     async fn oversized_frames_fail_whoever_waits_on_them() {
+        let ctx = ctx_with(false, false).await;
         let agent_id = AgentId::new();
-        let broker = crate::query_broker::QueryBroker::new();
-        let (dispatch_id, query_rx) = broker.register(agent_id).await;
-        let (tx, rx) = mpsc::channel(8);
+        let (dispatch_id, query_rx) = ctx.query_broker.register(agent_id).await;
         let (client, server) = tokio::io::duplex(64 * 1024);
-        let writer = tokio::spawn(run_writer(server, rx, agent_id, broker.clone()));
+        let (tx, _, writer) = spawn_writer(&ctx, server, agent_id);
         let big = "x".repeat(MAX_FRAME_BYTES);
 
         let frames = [
@@ -1720,16 +1840,80 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn writer_disconnects_an_agent_that_stops_reading() {
-        let (tx, rx) = mpsc::channel(8);
-        let (_client, server) = tokio::io::duplex(64);
-        let writer = tokio::spawn(run_writer(
-            server,
-            rx,
-            AgentId::new(),
-            crate::query_broker::QueryBroker::new(),
+    #[tokio::test]
+    async fn replacements_that_are_still_too_large_are_dropped() {
+        let ctx = ctx_with(false, false).await;
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (tx, _, writer) = spawn_writer(&ctx, server, AgentId::new());
+        let big = "x".repeat(MAX_FRAME_BYTES);
+
+        // The error reply echoes the id, so it is as large as the original.
+        tx.send(GatewayToAgent::LlmResponse(LlmResponse {
+            request_id: big.clone(),
+            outcome: LlmOutcome::Ok,
+            provider_response: serde_json::Value::Null,
+            usage: None,
+        }))
+        .await
+        .expect("queue");
+        // Dropping the transcript is not enough; the error reply is.
+        tx.send(GatewayToAgent::AgentQueryResult(AgentQueryResult {
+            request_id: "q".into(),
+            outcome: AgentQueryOutcome::Ok,
+            text: big.clone(),
+            transcript: serde_json::json!([big]),
+        }))
+        .await
+        .expect("queue");
+        drop(tx);
+
+        let mut reader = BufReader::new(client);
+        let frame = tokio::time::timeout(
+            Duration::from_secs(10),
+            read_frame::<_, GatewayToAgent>(&mut reader),
+        )
+        .await
+        .expect("the writer does not spin");
+        match frame {
+            Ok(Some(GatewayToAgent::AgentQueryResult(r))) => {
+                assert_eq!(r.request_id, "q");
+                assert!(
+                    matches!(r.outcome, AgentQueryOutcome::Error { .. }),
+                    "{:?}",
+                    r.outcome
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            read_frame::<_, GatewayToAgent>(&mut reader).await,
+            Ok(None)
         ));
+        writer.await.expect("writer");
+    }
+
+    #[tokio::test]
+    async fn writer_stops_when_the_registry_disconnects_the_agent() {
+        let ctx = ctx_with(false, false).await;
+        let (_client, server) = tokio::io::duplex(64);
+        let (tx, disconnect, writer) = spawn_writer(&ctx, server, AgentId::new());
+        tokio::task::yield_now().await;
+
+        disconnect.notify_waiters();
+
+        tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("the writer stops")
+            .expect("join");
+        assert!(tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn writer_disconnects_an_agent_that_stops_reading() {
+        let ctx = ctx_with(false, false).await;
+        tokio::time::pause();
+        let (_client, server) = tokio::io::duplex(64);
+        let (tx, _, writer) = spawn_writer(&ctx, server, AgentId::new());
         tx.send(GatewayToAgent::LlmResponse(LlmResponse {
             request_id: "r".into(),
             outcome: LlmOutcome::Ok,

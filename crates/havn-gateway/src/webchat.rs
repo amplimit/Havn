@@ -83,8 +83,13 @@ impl WebChatRouter {
             .insert(session_id, Session { agent_id, tx });
     }
 
-    pub async fn unregister(&self, session_id: SessionId) {
-        self.inner.lock().await.remove(&session_id);
+    /// Remove the session registered with `tx`. A newer tab that re-used
+    /// the session id under its own sender keeps its entry.
+    pub async fn unregister(&self, session_id: SessionId, tx: &mpsc::Sender<ServerMessage>) {
+        let mut map = self.inner.lock().await;
+        if map.get(&session_id).is_some_and(|s| s.tx.same_channel(tx)) {
+            map.remove(&session_id);
+        }
     }
 
     /// Forward an `OutboundMessage` from `agent_id` to its originating `WebChat` session.
@@ -366,8 +371,23 @@ mod tests {
         let agent_id = AgentId::new();
         let session_id = Uuid::now_v7();
         let (tx, _rx) = mpsc::channel::<ServerMessage>(8);
-        router.register(session_id, agent_id, tx).await;
-        router.unregister(session_id).await;
+        router.register(session_id, agent_id, tx.clone()).await;
+        router.unregister(session_id, &tx).await;
         assert!(router.agent_for_session(session_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_unregister_keeps_a_newer_tab() {
+        let router = WebChatRouter::new();
+        let agent_id = AgentId::new();
+        let session_id = Uuid::now_v7();
+        let (old, _old_rx) = mpsc::channel::<ServerMessage>(8);
+        router.register(session_id, agent_id, old.clone()).await;
+        let (new, _new_rx) = mpsc::channel::<ServerMessage>(8);
+        router.register(session_id, agent_id, new).await;
+
+        router.unregister(session_id, &old).await;
+
+        assert_eq!(router.agent_for_session(session_id).await, Some(agent_id));
     }
 }

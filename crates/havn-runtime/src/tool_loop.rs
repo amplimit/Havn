@@ -24,7 +24,7 @@ use havn_proto::{
 };
 use serde_json::Value;
 use tokio::io::AsyncWrite;
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot};
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
@@ -91,6 +91,17 @@ const ELIDED_TOOL_RESULT: &str =
 
 /// Room left in a frame for the enum tag around an [`LlmRequest`].
 const FRAME_TAG_BYTES: usize = 64;
+
+/// Replacements tried for one outbound frame over the size limit (a query
+/// answer first loses its transcript, then becomes an error); then it is
+/// dropped.
+const MAX_SUBSTITUTIONS: usize = 2;
+
+/// LLM requests this runtime keeps outstanding at once, the same as the
+/// gateway's per-agent cap: further calls wait here rather than being
+/// refused by the gateway.
+const MAX_INFLIGHT_LLM_REQUESTS: usize = 16;
+static LLM_SLOTS: Semaphore = Semaphore::const_new(MAX_INFLIGHT_LLM_REQUESTS);
 
 /// Typed loop outcome — caller-distinguishable success vs. degraded paths.
 ///
@@ -361,31 +372,58 @@ pub async fn request_llm(
     pending: &Pending,
     req: LlmRequest,
 ) -> anyhow::Result<LlmResponse> {
+    let _slot = LLM_SLOTS
+        .acquire()
+        .await
+        .map_err(|e| anyhow!("LLM request slots closed: {e}"))?;
     let request_id = req.request_id.clone();
     let (resp_tx, resp_rx) = oneshot::channel();
     pending.lock().await.insert(request_id.clone(), resp_tx);
+    let _entry = PendingEntry {
+        pending,
+        request_id: request_id.clone(),
+    };
 
-    if let Err(e) = writer_tx.send(AgentToGateway::LlmRequest(req)).await {
-        pending.lock().await.remove(&request_id);
-        return Err(anyhow!("failed to enqueue LlmRequest: {e}"));
-    }
+    writer_tx
+        .send(AgentToGateway::LlmRequest(req))
+        .await
+        .map_err(|e| anyhow!("failed to enqueue LlmRequest: {e}"))?;
 
     match tokio::time::timeout(LLM_RESPONSE_TIMEOUT, resp_rx).await {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(_)) => Err(anyhow!("LlmResponse channel closed for {request_id}")),
-        Err(_) => {
-            pending.lock().await.remove(&request_id);
-            Err(anyhow!(
-                "no LlmResponse for {request_id} within {}s",
-                LLM_RESPONSE_TIMEOUT.as_secs()
-            ))
+        Err(_) => Err(anyhow!(
+            "no LlmResponse for {request_id} within {}s",
+            LLM_RESPONSE_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// Removes a request's pending entry however its call ends, including when
+/// the calling future is dropped.
+struct PendingEntry<'a> {
+    pending: &'a Pending,
+    request_id: String,
+}
+
+impl Drop for PendingEntry<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.pending.try_lock() {
+            map.remove(&self.request_id);
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let pending = Arc::clone(self.pending);
+            let request_id = std::mem::take(&mut self.request_id);
+            runtime.spawn(async move {
+                pending.lock().await.remove(&request_id);
+            });
         }
     }
 }
 
 /// Write one frame to the gateway. A frame over [`MAX_FRAME_BYTES`] is
 /// rejected before anything is written, so the stream stays usable: whoever
-/// waits on it gets an error (see [`oversized_frame`]).
+/// waits on it gets an error (see [`oversized_frame`]). A replacement that
+/// is still too large is tried at most [`MAX_SUBSTITUTIONS`] times.
 pub async fn write_outbound<W>(
     write: &mut W,
     frame: AgentToGateway,
@@ -396,12 +434,20 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut next = Some(frame);
+    let mut substitutions = 0;
     while let Some(frame) = next.take() {
         match write_frame(write, &frame).await {
             Ok(()) => {}
-            Err(FrameError::FrameTooLarge(size)) => {
+            Err(FrameError::FrameTooLarge(size)) if substitutions < MAX_SUBSTITUTIONS => {
                 error!(size, "outbound frame over the size limit");
-                next = oversized_frame(frame, size, pending, queries).await;
+                substitutions += 1;
+                next = oversized_frame(frame, size, substitutions, pending, queries).await;
+            }
+            Err(FrameError::FrameTooLarge(size)) => {
+                error!(
+                    size,
+                    "replacement frame is still over the size limit; dropping it"
+                );
             }
             Err(e) => return Err(e),
         }
@@ -410,10 +456,12 @@ where
 }
 
 /// Fail the local caller waiting on an unsendable request, or build the
-/// smaller frame to send in place of an unsendable reply.
+/// smaller frame to send in place of an unsendable reply. `attempt` counts
+/// the replacements tried for this frame, from 1.
 async fn oversized_frame(
     frame: AgentToGateway,
     size: usize,
+    attempt: usize,
     pending: &Pending,
     queries: &PendingQueries,
 ) -> Option<AgentToGateway> {
@@ -448,7 +496,7 @@ async fn oversized_frame(
             }
             None
         }
-        AgentToGateway::AgentQueryResponse(resp) if !resp.transcript.is_null() => {
+        AgentToGateway::AgentQueryResponse(resp) if attempt == 1 && !resp.transcript.is_null() => {
             Some(AgentToGateway::AgentQueryResponse(AgentQueryResponse {
                 transcript: Value::String(format!("transcript omitted: answer of {limit}")),
                 ..resp
@@ -602,6 +650,73 @@ mod tests {
             "{:?}",
             response.outcome
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_llm_call_leaves_no_pending_entry() {
+        let (tx, _rx) = mpsc::channel(8);
+        let (pending, _) = maps();
+        let call = tokio::spawn({
+            let pending = Arc::clone(&pending);
+            async move { request_llm(&tx, &pending, request("r1")).await }
+        });
+        while pending.lock().await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+
+        call.abort();
+        let _ = call.await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replacements_that_are_still_too_large_are_dropped() {
+        let (pending, queries) = maps();
+        let big = "x".repeat(MAX_FRAME_BYTES);
+        let mut wire = Vec::new();
+
+        // The error reply echoes the id, so it is as large as the original.
+        let unsendable = AgentToGateway::AgentQueryResponse(AgentQueryResponse {
+            request_id: big.clone(),
+            outcome: AgentQueryOutcome::Ok,
+            text: String::new(),
+            transcript: Value::Null,
+        });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            write_outbound(&mut wire, unsendable, &pending, &queries),
+        )
+        .await
+        .expect("the writer does not spin")
+        .expect("write");
+        assert!(wire.is_empty());
+
+        // Dropping the transcript is not enough; the error reply is.
+        let answer = AgentToGateway::AgentQueryResponse(AgentQueryResponse {
+            request_id: "q".into(),
+            outcome: AgentQueryOutcome::Ok,
+            text: big.clone(),
+            transcript: serde_json::json!([big]),
+        });
+        write_outbound(&mut wire, answer, &pending, &queries)
+            .await
+            .expect("write");
+        let mut reader = tokio::io::BufReader::new(wire.as_slice());
+        match havn_proto::read_frame::<_, AgentToGateway>(&mut reader).await {
+            Ok(Some(AgentToGateway::AgentQueryResponse(r))) => {
+                assert_eq!(r.request_id, "q");
+                assert!(
+                    matches!(r.outcome, AgentQueryOutcome::Error { .. }),
+                    "{:?}",
+                    r.outcome
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[tokio::test]

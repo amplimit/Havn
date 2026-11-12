@@ -30,7 +30,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::api::ApiError;
+use crate::api::{ApiError, WS_SEND_TIMEOUT};
 use crate::auth::AuthedUser;
 use crate::webchat::{ClientMessage, ServerMessage, SessionId};
 
@@ -110,13 +110,16 @@ async fn handle_session(socket: WebSocket, state: AppState, agent_id: AgentId, s
 
     let (mut ws_sink, mut ws_stream) = socket.split();
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(SESSION_OUTBOUND_CAPACITY);
+    // The router holds the only sender: when it drops a stalled session,
+    // the outbound task below ends and so does this session.
+    let registered = tx.downgrade();
     state
         .webchat_router
         .register(session_id, agent_id, tx)
         .await;
 
     // Outbound task: drain mpsc, send to WS.
-    let outbound = tokio::spawn(async move {
+    let mut outbound = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             let json = match serde_json::to_string(&msg) {
                 Ok(j) => j,
@@ -125,16 +128,33 @@ async fn handle_session(socket: WebSocket, state: AppState, agent_id: AgentId, s
                     break;
                 }
             };
-            if ws_sink.send(Message::Text(json.into())).await.is_err() {
-                break;
+            match tokio::time::timeout(WS_SEND_TIMEOUT, ws_sink.send(Message::Text(json.into())))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    warn!(%session_id, "webchat client is not reading; closing the session");
+                    break;
+                }
             }
         }
         // Best-effort close.
-        let _ = ws_sink.send(Message::Close(None)).await;
+        let _ = tokio::time::timeout(WS_SEND_TIMEOUT, ws_sink.send(Message::Close(None))).await;
     });
 
-    // Inbound loop: read WS frames, dispatch as InboundMessage frames to the agent.
-    while let Some(frame) = ws_stream.next().await {
+    // Inbound loop: read WS frames, dispatch as InboundMessage frames to the
+    // agent. Ends too when the outbound task does, closing the socket.
+    let mut outbound_done = false;
+    loop {
+        let frame = tokio::select! {
+            frame = ws_stream.next() => frame,
+            _ = &mut outbound => {
+                outbound_done = true;
+                None
+            }
+        };
+        let Some(frame) = frame else { break };
         let msg = match frame {
             Ok(m) => m,
             Err(e) => {
@@ -192,8 +212,12 @@ async fn handle_session(socket: WebSocket, state: AppState, agent_id: AgentId, s
         }
     }
 
-    state.webchat_router.unregister(session_id).await;
-    outbound.abort();
-    let _ = outbound.await;
+    if let Some(tx) = registered.upgrade() {
+        state.webchat_router.unregister(session_id, &tx).await;
+    }
+    if !outbound_done {
+        outbound.abort();
+        let _ = outbound.await;
+    }
     info!(%agent_id, %session_id, "webchat session closed");
 }

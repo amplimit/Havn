@@ -35,7 +35,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::AppState;
-use crate::api::ApiError;
+use crate::api::{ApiError, WS_SEND_TIMEOUT};
 use crate::channel_id_codec;
 use crate::channel_router::{self, AccountKey};
 use crate::config::DmPolicy;
@@ -56,6 +56,10 @@ const DM_REJECT_COOLDOWN: Duration = Duration::from_secs(300);
 
 const DM_REJECT_MESSAGE: &str =
     "This bot is not available to you. Please contact the system administrator.";
+
+/// Sent back when an inbound message could not be handed to the agent.
+const AGENT_UNREACHABLE_MESSAGE: &str =
+    "The agent could not receive your message right now. Please try again later.";
 
 /// Rate-limits rejection messages to unauthorized senders. Without
 /// this an attacker who floods a bot endpoint would trigger equally
@@ -267,10 +271,10 @@ async fn handle_session(
 
     let key = AccountKey::new(&channel_id, &account_id);
     let (frame_tx, mut frame_rx) = mpsc::channel::<ChannelFrame>(ADAPTER_OUTBOUND_CAPACITY);
-    state
-        .channel_router
-        .register(key.clone(), frame_tx.clone())
-        .await;
+    // The router holds the only lasting sender: when it drops a stalled
+    // adapter, the outbound task below ends and so does this session.
+    let registered = frame_tx.downgrade();
+    state.channel_router.register(key.clone(), frame_tx).await;
 
     // Separate mpsc for raw WS control frames (Pong replies to
     // protocol-level Pings). Keeps `ChannelRouter` typed on
@@ -283,36 +287,48 @@ async fn handle_session(
 
     // Outbound task: drain both mpscs, write to WS. tokio::select!
     // gives equal priority. Closes WS when either mpsc is dropped or
-    // any write fails.
-    let outbound = tokio::spawn(async move {
+    // any write fails or stalls.
+    let mut outbound = tokio::spawn(async move {
         loop {
-            tokio::select! {
+            let message = tokio::select! {
                 maybe_frame = frame_rx.recv() => {
                     let Some(frame) = maybe_frame else { break };
-                    let s = match serde_json::to_string(&frame) {
-                        Ok(s) => s,
+                    match serde_json::to_string(&frame) {
+                        Ok(s) => Message::Text(s.into()),
                         Err(e) => {
                             warn!(error = %e, "channel WS: failed to serialize outbound frame");
                             break;
                         }
-                    };
-                    if ws_sink.send(Message::Text(s.into())).await.is_err() {
-                        break;
                     }
                 }
                 maybe_raw = raw_rx.recv() => {
                     let Some(raw) = maybe_raw else { break };
-                    if ws_sink.send(raw).await.is_err() {
-                        break;
-                    }
+                    raw
+                }
+            };
+            match tokio::time::timeout(WS_SEND_TIMEOUT, ws_sink.send(message)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    warn!("channel adapter is not reading its WS; closing it");
+                    break;
                 }
             }
         }
-        let _ = ws_sink.send(Message::Close(None)).await;
+        let _ = tokio::time::timeout(WS_SEND_TIMEOUT, ws_sink.send(Message::Close(None))).await;
     });
 
     let mut mismatch_count: u32 = 0;
-    while let Some(frame) = ws_stream.next().await {
+    let mut outbound_done = false;
+    loop {
+        let frame = tokio::select! {
+            frame = ws_stream.next() => frame,
+            _ = &mut outbound => {
+                outbound_done = true;
+                None
+            }
+        };
+        let Some(frame) = frame else { break };
         let msg = match frame {
             Ok(m) => m,
             Err(e) => {
@@ -381,6 +397,9 @@ async fn handle_session(
                 // seq > since_seq through the adapter's mpsc. Empty
                 // result is the cold-start case (no state, e.g.
                 // gateway restarted between disconnect and reconnect).
+                let Some(frame_tx) = registered.upgrade() else {
+                    break;
+                };
                 let frames = state.channel_router.replay_since(&key, r.since_seq).await;
                 let replayed = frames.len();
                 for frame in frames {
@@ -435,9 +454,13 @@ async fn handle_session(
         }
     }
 
-    state.channel_router.unregister(&key).await;
-    outbound.abort();
-    let _ = outbound.await;
+    if let Some(frame_tx) = registered.upgrade() {
+        state.channel_router.unregister(&key, &frame_tx).await;
+    }
+    if !outbound_done {
+        outbound.abort();
+        let _ = outbound.await;
+    }
     info!(channel = %channel_id, account = %account_id, "channel WS closed");
 }
 
@@ -583,7 +606,7 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
     };
     let msg = InboundMessage {
         channel_id: encoded_channel_id,
-        sender_id: inb.sender_id,
+        sender_id: inb.sender_id.clone(),
         channel: channel.to_string(),
         content,
         timestamp: inb.timestamp,
@@ -658,6 +681,22 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
             error = ?e,
             "channel inbound: failed to forward to agent (offline?)"
         );
+        let notice = ChannelMessageContent::Text {
+            text: AGENT_UNREACHABLE_MESSAGE.into(),
+        };
+        if let Err(e) = state
+            .channel_router
+            .deliver(
+                channel,
+                &inb.account_id,
+                &inb.sender_id,
+                Some(inb.channel_message_id.clone()),
+                notice,
+            )
+            .await
+        {
+            warn!(error = %e, "channel inbound: failed to tell the sender the agent is unreachable");
+        }
     }
 }
 
