@@ -1,9 +1,12 @@
 //! Unix-socket listener for connecting agent runtime processes.
 //!
 //! Each connected agent gets one accepted socket. The handshake is:
+//! 0. Before reading anything, the gateway looks up the peer's cgroup.
+//!    With verification on, a peer outside every agent cgroup is closed.
+//!    The connection then needs a handshake slot (`MAX_PENDING_HANDSHAKES`
+//!    in all, `MAX_PENDING_HANDSHAKES_PER_AGENT` per agent cgroup), held
+//!    until Welcome; without one it is closed straight away.
 //! 1. Agent sends `Hello { agent_id, version }` within `HELLO_TIMEOUT`.
-//!    At most `MAX_PENDING_HANDSHAKES` connections may be between accept
-//!    and Welcome at once; further ones are closed straight away.
 //! 2. Gateway validates protocol version and that the agent was registered
 //!    via the lifecycle endpoint (`POST /agents/:id/start`).
 //! 3. Gateway replies `Welcome { session_token }`.
@@ -14,9 +17,11 @@
 //!    - every frame, `LivenessPing` included, is recorded in the registry;
 //!      the supervisor restarts agents that go quiet (`crate::supervisor`)
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr as _;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -52,11 +57,21 @@ const REGISTRATION_WAIT: std::time::Duration = std::time::Duration::from_secs(10
 /// How long a connected peer has to send Hello.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Connections allowed between accept and Welcome at once, the
-/// registration wait included. The rest are closed as soon as accepted.
+/// Connections allowed between the peer lookup and Welcome at once, the
+/// registration wait included. The rest are closed as soon as looked up.
 const MAX_PENDING_HANDSHAKES: usize = 64;
 
-/// Least time between two warnings about connections refused for that cap.
+/// Share of `MAX_PENDING_HANDSHAKES` one agent cgroup may hold, so a
+/// compromised agent cannot keep every other agent from connecting.
+const MAX_PENDING_HANDSHAKES_PER_AGENT: usize = 2;
+
+/// Connections allowed between accept and the end of their peer lookup.
+const MAX_PEER_LOOKUPS: usize = 256;
+
+/// Longest the peer cgroup lookup may take.
+const PEER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Refused connections are counted and reported once per interval.
 const REFUSAL_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Longest one frame write may take. A runtime that stops reading its socket
@@ -149,44 +164,161 @@ pub async fn run_listener(socket_path: &Path, ctx: AgentSocketCtx) -> anyhow::Re
         .with_context(|| format!("binding agent socket {}", socket_path.display()))?;
     info!(path = %socket_path.display(), "agent socket listening");
 
-    serve(
-        listener,
-        ctx,
-        Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES)),
-    )
-    .await
+    let admission = Admission::new(
+        MAX_PEER_LOOKUPS,
+        MAX_PENDING_HANDSHAKES,
+        MAX_PENDING_HANDSHAKES_PER_AGENT,
+    );
+    serve(listener, ctx, Arc::new(admission)).await
 }
 
-/// Accept connections, each holding one of `handshakes` until its Welcome
-/// is sent or it is refused.
+type PendingPerAgent = Arc<std::sync::Mutex<HashMap<AgentId, usize>>>;
+
+/// Limits on connections that have not finished the handshake, and counts
+/// of the connections refused since the last report.
+struct Admission {
+    lookups: Arc<Semaphore>,
+    handshakes: Arc<Semaphore>,
+    per_agent: PendingPerAgent,
+    per_agent_limit: usize,
+    busy: AtomicU64,
+    foreign: AtomicU64,
+}
+
+/// One connection's place in the handshake limits, given back on drop.
+struct HandshakeSlot {
+    _global: OwnedSemaphorePermit,
+    agent: Option<(AgentId, PendingPerAgent)>,
+}
+
+impl Admission {
+    fn new(lookups: usize, handshakes: usize, per_agent_limit: usize) -> Self {
+        Self {
+            lookups: Arc::new(Semaphore::new(lookups)),
+            handshakes: Arc::new(Semaphore::new(handshakes)),
+            per_agent: Arc::default(),
+            per_agent_limit,
+            busy: AtomicU64::new(0),
+            foreign: AtomicU64::new(0),
+        }
+    }
+
+    /// A handshake slot for a connection from `agent`'s cgroup (`None`
+    /// when peers are not verified), unless a limit is reached.
+    fn try_admit(&self, agent: Option<AgentId>) -> Option<HandshakeSlot> {
+        let mut pending = self
+            .per_agent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(id) = agent
+            && pending.get(&id).copied().unwrap_or(0) >= self.per_agent_limit
+        {
+            return None;
+        }
+        let global = Arc::clone(&self.handshakes).try_acquire_owned().ok()?;
+        if let Some(id) = agent {
+            *pending.entry(id).or_default() += 1;
+        }
+        Some(HandshakeSlot {
+            _global: global,
+            agent: agent.map(|id| (id, Arc::clone(&self.per_agent))),
+        })
+    }
+}
+
+impl Drop for HandshakeSlot {
+    fn drop(&mut self) {
+        let Some((id, per_agent)) = self.agent.take() else {
+            return;
+        };
+        let mut pending = per_agent.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = pending.get_mut(&id) {
+            *count -= 1;
+            if *count == 0 {
+                pending.remove(&id);
+            }
+        }
+    }
+}
+
+/// Accept connections until accepting fails, reporting refusals on the side.
 async fn serve(
     listener: UnixListener,
     ctx: AgentSocketCtx,
-    handshakes: Arc<Semaphore>,
+    admission: Arc<Admission>,
 ) -> anyhow::Result<()> {
-    let mut refused: u64 = 0;
-    let mut last_warning: Option<tokio::time::Instant> = None;
+    tokio::select! {
+        result = accept_connections(listener, ctx, Arc::clone(&admission)) => result,
+        () = report_refusals(&admission) => Ok(()),
+    }
+}
+
+async fn accept_connections(
+    listener: UnixListener,
+    ctx: AgentSocketCtx,
+    admission: Arc<Admission>,
+) -> anyhow::Result<()> {
     loop {
         let (stream, _addr) = listener.accept().await.context("accept")?;
-        let Ok(handshake) = Arc::clone(&handshakes).try_acquire_owned() else {
-            drop(stream);
-            refused += 1;
-            if last_warning.is_none_or(|at| at.elapsed() >= REFUSAL_WARN_INTERVAL) {
-                warn!(
-                    refused,
-                    "refusing agent connections: too many handshakes in progress"
-                );
-                refused = 0;
-                last_warning = Some(tokio::time::Instant::now());
-            }
+        let Ok(lookup) = Arc::clone(&admission.lookups).try_acquire_owned() else {
+            admission.busy.fetch_add(1, Ordering::Relaxed);
             continue;
         };
         let ctx = ctx.clone();
+        let admission = Arc::clone(&admission);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, ctx, handshake).await {
+            let peer_cgroup = if ctx.verify_peer_cgroup {
+                tokio::time::timeout(PEER_LOOKUP_TIMEOUT, peer_cgroup(&stream))
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            drop(lookup);
+            let peer_agent = peer_cgroup.as_deref().and_then(peer_agent);
+            if ctx.verify_peer_cgroup && peer_agent.is_none() {
+                debug!(
+                    peer_cgroup = peer_cgroup.as_deref().map(str::trim_end),
+                    "closing agent socket connection from outside every agent cgroup"
+                );
+                admission.foreign.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            let Some(slot) = admission.try_admit(peer_agent) else {
+                admission.busy.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            if let Err(e) = handle_connection(stream, ctx, peer_cgroup, slot).await {
                 warn!(error = ?e, "agent connection ended with error");
             }
         });
+    }
+}
+
+/// Log the refusals counted in each `REFUSAL_WARN_INTERVAL`, at most one
+/// warning of each kind per interval.
+async fn report_refusals(admission: &Admission) {
+    let mut ticks = tokio::time::interval(REFUSAL_WARN_INTERVAL);
+    ticks.tick().await;
+    loop {
+        ticks.tick().await;
+        let busy = admission.busy.swap(0, Ordering::Relaxed);
+        if busy > 0 {
+            warn!(
+                refused = busy,
+                interval_s = REFUSAL_WARN_INTERVAL.as_secs(),
+                "refused agent connections: too many handshakes in progress"
+            );
+        }
+        let foreign = admission.foreign.swap(0, Ordering::Relaxed);
+        if foreign > 0 {
+            warn!(
+                refused = foreign,
+                interval_s = REFUSAL_WARN_INTERVAL.as_secs(),
+                "refused agent socket connections from processes outside every agent cgroup"
+            );
+        }
     }
 }
 
@@ -292,29 +424,39 @@ fn pidfd_alive(pidfd: &std::os::fd::OwnedFd) -> bool {
 }
 
 fn peer_cgroup_is_agents(contents: Option<&str>, agent_id: AgentId) -> bool {
+    contents.and_then(peer_agent) == Some(agent_id)
+}
+
+/// The agent whose cgroup `contents` (a `/proc/<pid>/cgroup`) names.
+fn peer_agent(contents: &str) -> Option<AgentId> {
     #[cfg(target_os = "linux")]
     {
-        contents.is_some_and(|c| cgroup_belongs_to_agent(c, agent_id))
+        cgroup_agent(contents)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (contents, agent_id);
-        false
+        let _ = contents;
+        None
     }
 }
 
 /// Parse `/proc/<pid>/cgroup` (cgroup v2: a single `0::<path>` line, shown
 /// relative to the gateway's cgroup root, the same root the spawner
-/// creates `havn.slice` under) and require exactly the agent's cgroup.
+/// creates `havn.slice` under) and accept exactly an agent's cgroup.
 /// Comparing the whole path matters: a cgroup the agent creates below its
 /// own, even one named after another agent, does not match.
 #[cfg(target_os = "linux")]
-fn cgroup_belongs_to_agent(contents: &str, agent_id: AgentId) -> bool {
-    let expected = format!("/{}/agent-{agent_id}", havn_spawner::cgroup::SLICE);
+fn cgroup_agent(contents: &str) -> Option<AgentId> {
+    let prefix = format!("/{}/agent-", havn_spawner::cgroup::SLICE);
     contents
         .lines()
         .filter_map(|line| line.strip_prefix("0::"))
-        .any(|path| path.trim_end() == expected)
+        .find_map(|path| {
+            let id = path.trim_end().strip_prefix(&prefix)?;
+            AgentId::from_str(id)
+                .ok()
+                .filter(|parsed| parsed.to_string() == id)
+        })
 }
 
 /// At most 64 chars of a peer-supplied string, for logging.
@@ -325,16 +467,12 @@ fn clip(s: &str) -> &str {
 async fn handle_connection(
     stream: UnixStream,
     ctx: AgentSocketCtx,
-    handshake: OwnedSemaphorePermit,
+    peer_cgroup: Option<String>,
+    handshake: HandshakeSlot,
 ) -> anyhow::Result<()> {
     // Every sandbox sees the same socket, so the agent id in Hello is only
     // a claim. The peer's process comes from the kernel and cannot be
-    // forged; look up its cgroup now, before reading anything from it.
-    let peer_cgroup = if ctx.verify_peer_cgroup {
-        peer_cgroup(&stream).await
-    } else {
-        None
-    };
+    // forged; `peer_cgroup` was looked up before anything was read from it.
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
 
@@ -459,41 +597,42 @@ async fn handle_connection(
     };
 
     let session_token = Uuid::now_v7().to_string();
-    let welcome = write_frame(
-        &mut write,
-        &GatewayToAgent::Welcome {
-            session_token: session_token.clone(),
-            policy,
-            agent_name,
-            model,
-            max_tokens,
-            embedding: ctx.embedding_config.load().as_ref().clone(),
-            // Wire form is `{path: String, mode: "ro"|"rw"}`; we
-            // translate from the spawner type once at handshake. Empty
-            // when the operator didn't configure any.
-            extra_mounts: ctx
-                .extra_mounts
-                .iter()
-                .map(|m| havn_proto::ExtraMountWire {
-                    path: m.path.display().to_string(),
-                    mode: m.mode.as_wire_str().to_string(),
-                })
-                .collect(),
-            tmpfs_mounts: ctx
-                .tmpfs_mounts
-                .iter()
-                .map(|m| havn_proto::TmpfsMountWire {
-                    path: m.path.display().to_string(),
-                    size_mb: m.size_mb,
-                })
-                .collect(),
-            seccomp_allow_extra: ctx.seccomp_allow_extra.clone(),
-        },
-    )
-    .await;
-    if let Err(e) = welcome {
+    let welcome = GatewayToAgent::Welcome {
+        session_token: session_token.clone(),
+        policy,
+        agent_name,
+        model,
+        max_tokens,
+        embedding: ctx.embedding_config.load().as_ref().clone(),
+        // Wire form is `{path: String, mode: "ro"|"rw"}`; we
+        // translate from the spawner type once at handshake. Empty
+        // when the operator didn't configure any.
+        extra_mounts: ctx
+            .extra_mounts
+            .iter()
+            .map(|m| havn_proto::ExtraMountWire {
+                path: m.path.display().to_string(),
+                mode: m.mode.as_wire_str().to_string(),
+            })
+            .collect(),
+        tmpfs_mounts: ctx
+            .tmpfs_mounts
+            .iter()
+            .map(|m| havn_proto::TmpfsMountWire {
+                path: m.path.display().to_string(),
+                size_mb: m.size_mb,
+            })
+            .collect(),
+        seccomp_allow_extra: ctx.seccomp_allow_extra.clone(),
+    };
+    let write_welcome = write_frame(&mut write, &welcome);
+    let sent = match tokio::time::timeout(AGENT_WRITE_TIMEOUT, write_welcome).await {
+        Ok(sent) => sent.context("sending Welcome"),
+        Err(_) => Err(anyhow::anyhow!("sending Welcome timed out")),
+    };
+    if let Err(e) = sent {
         ctx.registry.detach(agent_id, &tx).await;
-        return Err(e).context("sending Welcome");
+        return Err(e);
     }
     drop(handshake);
 
@@ -2073,8 +2212,13 @@ mod tests {
         version: &str,
     ) -> (anyhow::Result<()>, Option<GatewayToAgent>) {
         let (client, server) = UnixStream::pair().expect("socket pair");
-        let slots = Arc::new(Semaphore::new(1));
-        let gateway = tokio::spawn(handle_connection(server, ctx.clone(), take_slot(&slots)));
+        let cgroup = if ctx.verify_peer_cgroup {
+            peer_cgroup(&server).await
+        } else {
+            None
+        };
+        let slot = admission(1).try_admit(None).expect("free slot");
+        let gateway = tokio::spawn(handle_connection(server, ctx.clone(), cgroup, slot));
         let (client_read, mut client_write) = client.into_split();
         send_hello(&mut client_write, agent_id, version).await;
         let mut reader = BufReader::new(client_read);
@@ -2085,8 +2229,12 @@ mod tests {
         (verdict, reply)
     }
 
-    fn take_slot(slots: &Arc<Semaphore>) -> OwnedSemaphorePermit {
-        Arc::clone(slots).try_acquire_owned().expect("free slot")
+    fn admission(handshakes: usize) -> Arc<Admission> {
+        Arc::new(Admission::new(
+            MAX_PEER_LOOKUPS,
+            handshakes,
+            MAX_PENDING_HANDSHAKES_PER_AGENT,
+        ))
     }
 
     async fn send_hello<W>(write: &mut W, agent_id: AgentId, version: &str)
@@ -2132,16 +2280,17 @@ mod tests {
     async fn silent_peer_is_dropped_after_the_hello_timeout() {
         let ctx = ctx_with(false, false).await;
         tokio::time::pause();
-        let slots = Arc::new(Semaphore::new(1));
+        let admission = admission(1);
+        let slot = admission.try_admit(None).expect("free slot");
         let (client, server) = UnixStream::pair().expect("socket pair");
         let started = tokio::time::Instant::now();
 
-        let verdict = handle_connection(server, ctx, take_slot(&slots)).await;
+        let verdict = handle_connection(server, ctx, None, slot).await;
 
         let err = verdict.expect_err("a peer that never says Hello is dropped");
         assert!(err.to_string().contains("no Hello"), "{err:#}");
         assert!(started.elapsed() >= HELLO_TIMEOUT);
-        assert_eq!(slots.available_permits(), 1);
+        assert_eq!(admission.handshakes.available_permits(), 1);
         drop(client);
     }
 
@@ -2151,12 +2300,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("agent.sock");
         let listener = UnixListener::bind(&path).expect("bind");
-        let slots = Arc::new(Semaphore::new(1));
-        let server = tokio::spawn(serve(listener, ctx.clone(), Arc::clone(&slots)));
+        let admission = admission(1);
+        let server = tokio::spawn(serve(listener, ctx.clone(), Arc::clone(&admission)));
 
         // One connection that has not said Hello takes the only slot.
         let pending = UnixStream::connect(&path).await.expect("connect");
-        wait_for_free_slots(&slots, 0).await;
+        wait_for_free_slots(&admission.handshakes, 0).await;
 
         // Closed at once, not left waiting for a Hello it never sends.
         let extra = UnixStream::connect(&path).await.expect("connect");
@@ -2165,7 +2314,8 @@ mod tests {
             reply.is_none(),
             "an extra connection must be closed: {reply:?}"
         );
-        assert_eq!(slots.available_permits(), 0);
+        assert_eq!(admission.handshakes.available_permits(), 0);
+        assert_eq!(admission.busy.load(Ordering::Relaxed), 1);
 
         // Once the pending connection is welcomed, its slot is free again.
         let (pending_read, mut pending_write) = pending.into_split();
@@ -2177,7 +2327,7 @@ mod tests {
             matches!(reply, Some(GatewayToAgent::Welcome { .. })),
             "{reply:?}"
         );
-        wait_for_free_slots(&slots, 1).await;
+        wait_for_free_slots(&admission.handshakes, 1).await;
 
         let next = UnixStream::connect(&path).await.expect("connect");
         let (next_read, mut next_write) = next.into_split();
@@ -2191,42 +2341,97 @@ mod tests {
         server.abort();
     }
 
+    #[test]
+    fn one_agent_cannot_take_every_handshake_slot() {
+        let admission = Admission::new(
+            MAX_PEER_LOOKUPS,
+            MAX_PENDING_HANDSHAKES,
+            MAX_PENDING_HANDSHAKES_PER_AGENT,
+        );
+        let greedy = AgentId::new();
+        let held: Vec<HandshakeSlot> = (0..MAX_PENDING_HANDSHAKES)
+            .filter_map(|_| admission.try_admit(Some(greedy)))
+            .collect();
+        assert_eq!(held.len(), MAX_PENDING_HANDSHAKES_PER_AGENT);
+
+        let other = admission.try_admit(Some(AgentId::new()));
+        assert!(other.is_some(), "another agent must still get a slot");
+
+        drop(held);
+        assert!(admission.try_admit(Some(greedy)).is_some());
+        drop(other);
+        assert_eq!(
+            admission.handshakes.available_permits(),
+            MAX_PENDING_HANDSHAKES
+        );
+        assert!(
+            admission
+                .per_agent
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_outside_every_agent_cgroup_is_closed_before_taking_a_slot() {
+        let ctx = ctx_with(false, true).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let admission = admission(1);
+        let server = tokio::spawn(serve(listener, ctx, Arc::clone(&admission)));
+
+        // The test process is not in an agent cgroup.
+        let peer = UnixStream::connect(&path).await.expect("connect");
+        let reply = read_reply(&mut BufReader::new(peer)).await;
+
+        assert!(reply.is_none(), "the peer must be closed: {reply:?}");
+        assert_eq!(admission.foreign.load(Ordering::Relaxed), 1);
+        assert_eq!(admission.busy.load(Ordering::Relaxed), 0);
+        assert_eq!(admission.handshakes.available_permits(), 1);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn handshake_slot_is_held_through_the_registration_wait() {
         let ctx = ctx_with(false, false).await;
-        let slots = Arc::new(Semaphore::new(1));
-        let agent_id = AgentId::new();
+        tokio::time::pause();
+        let admission = admission(1);
+        let slot = admission.try_admit(None).expect("free slot");
         let (client, server) = UnixStream::pair().expect("socket pair");
-        let gateway = tokio::spawn(handle_connection(server, ctx.clone(), take_slot(&slots)));
-        let (client_read, mut client_write) = client.into_split();
-        send_hello(&mut client_write, agent_id, PROTOCOL_VERSION).await;
+        let started = tokio::time::Instant::now();
+        let gateway = tokio::spawn(handle_connection(server, ctx.clone(), None, slot));
+        let (_client_read, mut client_write) = client.into_split();
 
-        // The Hello came before the registration, so the gateway waits.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(slots.available_permits(), 0);
-        ctx.registry.register(AgentHandle::new(agent_id, 1)).await;
+        // The agent is never registered: only the registration wait keeps
+        // the connection open this long and then refuses it as unregistered.
+        send_hello(&mut client_write, AgentId::new(), PROTOCOL_VERSION).await;
+        tokio::time::sleep(REGISTRATION_WAIT - Duration::from_secs(1)).await;
+        assert!(!gateway.is_finished());
+        assert_eq!(admission.handshakes.available_permits(), 0);
 
-        let mut reader = BufReader::new(client_read);
-        let reply = read_reply(&mut reader).await;
-        assert!(
-            matches!(reply, Some(GatewayToAgent::Welcome { .. })),
-            "{reply:?}"
-        );
-        wait_for_free_slots(&slots, 1).await;
-        assert!(!gateway.is_finished(), "the connection itself stays open");
-
-        drop(client_write);
-        drop(reader);
-        let _ = gateway.await.expect("join");
+        let err = gateway
+            .await
+            .expect("join")
+            .expect_err("an unregistered agent is refused");
+        assert!(err.to_string().contains("not registered"), "{err:#}");
+        assert!(started.elapsed() >= REGISTRATION_WAIT);
+        assert_eq!(admission.handshakes.available_permits(), 1);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn cgroup_path_must_name_the_agent() {
+        fn cgroup_belongs_to_agent(contents: &str, agent_id: AgentId) -> bool {
+            cgroup_agent(contents) == Some(agent_id)
+        }
         let id = AgentId::new();
         let other = AgentId::new();
         let own = format!("0::/havn.slice/agent-{id}\n");
         assert!(cgroup_belongs_to_agent(&own, id));
+        let braced = format!("0::/havn.slice/agent-{{{id}}}\n");
+        assert_eq!(cgroup_agent(&braced), None, "only the canonical id form");
         assert!(!cgroup_belongs_to_agent(
             &format!("0::/elsewhere/havn.slice/agent-{id}\n"),
             id

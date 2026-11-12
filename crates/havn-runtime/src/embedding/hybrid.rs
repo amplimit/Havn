@@ -39,7 +39,8 @@
 //!
 //! The scorer is generic over [`HybridSource`]; concrete impls live
 //! in [`crate::mcp`]'s sibling vertical: [`MemorySource`] here for
-//! typed memory. New sources (conversations? curator reports?)
+//! typed memory, [`crate::skills::SkillsSource`] for the skill index.
+//! New sources (conversations? curator reports?)
 //! plug in by impl-ing the trait without touching the scorer.
 
 use async_trait::async_trait;
