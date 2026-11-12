@@ -40,11 +40,29 @@ const HOP_BY_HOP = new Set([
   "upgrade",
 ]);
 
-const gatewayUrl = new URL(GATEWAY);
-if (gatewayUrl.protocol !== "http:" || gatewayUrl.pathname !== "/") {
-  console.error(`HAVN_GATEWAY_URL must be http://host:port with no path (got ${GATEWAY})`);
-  process.exit(1);
+function parseGatewayUrl(raw) {
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    url = null;
+  }
+  const plain =
+    url !== null &&
+    url.protocol === "http:" &&
+    url.pathname === "/" &&
+    !url.search &&
+    !url.hash &&
+    !url.username &&
+    !url.password;
+  if (!plain) {
+    console.error(`HAVN_GATEWAY_URL must be http://host:port with nothing else (got ${raw})`);
+    process.exit(1);
+  }
+  return url;
 }
+
+const gatewayUrl = parseGatewayUrl(GATEWAY);
 const GATEWAY_HOST = gatewayUrl.hostname.replace(/^\[|\]$/g, "");
 const GATEWAY_PORT = Number(gatewayUrl.port || 80);
 
@@ -81,6 +99,8 @@ function proxyApi(req, res) {
     },
   );
   upstream.on("error", (err) => {
+    // The client went away and we cancelled the request ourselves.
+    if (res.destroyed) return;
     console.warn(`[gateway proxy] ${err.code ?? err.message}: ${req.method} ${req.url}`);
     if (res.headersSent) {
       res.destroy();
@@ -109,6 +129,8 @@ server.on("upgrade", (req, clientSocket, head) => {
     // In dev, Next registers its own upgrade listener on this server for
     // its hot-reload socket; leave those to it. Nothing else is served
     // over WebSocket.
+    // If the dev server restarts while a tab is open, reload the tab: Next
+    // only attaches that listener after its first page request.
     if (DEV && req.url?.startsWith("/_next/")) return;
     clientSocket.destroy();
     return;
