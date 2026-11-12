@@ -11,6 +11,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -70,6 +73,9 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Both jobs build the debug binaries the same way.
+          shared-key: debug-bins-as-root
       - name: install jq
         run: sudo apt-get update -qq && sudo apt-get install -y jq
       - name: build
@@ -89,10 +95,69 @@ jobs:
             HAVN_SKIP_INSTALL=1 \
             HAVN_SMOKE_EXPECT_SPAWNER=namespace \
             ./scripts/smoke.sh
+      # The misbehaving-agent tests run unprivileged in ci.yml; the one that
+      # needs the agent's cgroup to identify it runs here, as root.
+      - name: misbehaving agent under NamespaceSpawner
+        run: |
+          exe="$(cargo test -p havn-gateway --test misbehaving_agent --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .target.name == "misbehaving_agent") | .executable')"
+          [ -x "$exe" ] || { echo "::error::misbehaving_agent test binary not found"; exit 1; }
+          sudo "$exe" --ignored --test-threads=1 --nocapture
       - name: upload gateway log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: gateway-log-namespace
           path: ${{ runner.temp }}/havn-gateway.log
+          if-no-files-found: ignore
+
+  readme-deploy:
+    # Install, set up and start havn and the dashboard with the commands in
+    # README.md (building this checkout instead of downloading a release),
+    # then chat with an agent through the dashboard in a headless browser.
+    # A mock provider stands in for the LLM API: CI has no key.
+    name: README deployment and dashboard chat
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PLAYWRIGHT_VERSION: 1.64.1
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Both jobs build the debug binaries the same way.
+          shared-key: debug-bins-as-root
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/dashboard/package-lock.json
+      - name: cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ env.PLAYWRIGHT_VERSION }}
+      - name: install Playwright
+        run: |
+          npm install --prefix "$RUNNER_TEMP/playwright" --no-save --no-package-lock \
+            --no-audit --no-fund "playwright@$PLAYWRIGHT_VERSION"
+          "$RUNNER_TEMP/playwright/node_modules/.bin/playwright" install --with-deps --only-shell chromium
+      - name: deploy as README.md says, then chat through the dashboard
+        run: ./scripts/readme-deploy.sh
+        env:
+          # Debug build for CI time, as in the smoke job; the README's
+          # commands are otherwise followed as written.
+          HAVN_PROFILE: debug
+          HAVN_SKIP_RUSTUP: '1'
+          PLAYWRIGHT_DIR: ${{ runner.temp }}/playwright
+      - name: upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: readme-deploy-logs
+          path: |
+            ${{ runner.temp }}/readme-gateway.log
+            ${{ runner.temp }}/readme-dashboard.log
+            ${{ runner.temp }}/dashboard-chat.png
           if-no-files-found: ignore

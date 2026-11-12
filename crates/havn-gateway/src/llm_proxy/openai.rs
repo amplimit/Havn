@@ -28,11 +28,11 @@ use serde_json::{Value, json};
 use super::provider::{LlmProvider, ProviderError};
 use super::{AnthropicMessage, AnthropicRequest, AnthropicResponse, AnthropicUsage};
 
-const OPENAI_URL: &str = "https://api.openai.com/v1/chat/completions";
-const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+const OPENAI_URL: &str = "https://api.openai.com/v1";
+const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1";
 
 /// OpenAI-compatible Chat Completions provider. The same translator backs
-/// OpenAI itself and OpenRouter — the only differences are `base_url` and a
+/// OpenAI itself and OpenRouter — the only differences are the base URL and a
 /// couple of optional headers that OpenRouter recommends for analytics.
 #[derive(Debug)]
 pub struct OpenAiProvider {
@@ -75,16 +75,24 @@ impl LlmProvider for OpenAiProvider {
         self.name
     }
 
+    fn default_base_url(&self) -> &'static str {
+        self.base_url
+    }
+
     async fn complete(
         &self,
         http: &reqwest::Client,
+        base_url: &str,
         api_key: &str,
         request: &AnthropicRequest,
     ) -> Result<AnthropicResponse, ProviderError> {
         let body = anthropic_to_openai(request, self.max_tokens_field)
             .map_err(|e| ProviderError::Translation(format!("request build: {e}")))?;
 
-        let mut builder = http.post(self.base_url).bearer_auth(api_key).json(&body);
+        let mut builder = http
+            .post(format!("{base_url}/chat/completions"))
+            .bearer_auth(api_key)
+            .json(&body);
         for (k, v) in self.extra_headers {
             builder = builder.header(*k, *v);
         }

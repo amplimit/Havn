@@ -28,7 +28,6 @@ mod workspace;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
@@ -163,9 +162,9 @@ struct AppState {
     pub keyring: Option<keyring::KeyRing>,
     /// Restart bookkeeping for agents whose process exits or goes silent.
     pub supervisor: supervisor::Supervisor,
-    /// `[llm] max_tokens_ceiling`, applied to the LLM test endpoint as
-    /// to agent calls.
-    pub max_tokens_ceiling: u32,
+    /// `[llm]` settings, applied to the LLM test endpoint as to agent
+    /// calls.
+    pub llm: Arc<config::LlmConfig>,
 }
 
 #[tokio::main]
@@ -371,11 +370,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .pool_idle_timeout(Duration::from_secs(60))
-        .build()
-        .context("building HTTP client")?;
+    let http = llm_proxy::http_client().context("building HTTP client")?;
 
     let registry = AgentRegistry::new();
     let webchat_router = WebChatRouter::new();
@@ -439,6 +434,17 @@ async fn main() -> anyhow::Result<()> {
     // updates both AppState (for GET reads) and AgentSocketCtx (for
     // the next agent's Welcome frame) without a separate plumbing path.
     let embedding_config = Arc::new(ArcSwap::from_pointee(cfg.embedding.clone()));
+    for (provider, url) in &cfg.llm.base_url {
+        info!(provider = %provider, url = %url, "provider calls go to [llm.base_url]");
+        if config::is_plaintext_to_another_host(url) {
+            warn!(
+                provider = %provider,
+                url = %url,
+                "[llm.base_url] is plain http to another host: API keys cross the network unencrypted"
+            );
+        }
+    }
+    let llm = Arc::new(cfg.llm.clone());
     let state = AppState {
         db: db.clone(),
         bootstrap_user_id: user.id,
@@ -471,7 +477,7 @@ async fn main() -> anyhow::Result<()> {
             supervisor::RestartPolicy::default(),
             havn_proto::LIVENESS_PING_INTERVAL,
         ),
-        max_tokens_ceiling: cfg.llm.max_tokens_ceiling,
+        llm: Arc::clone(&llm),
     };
 
     // Background task: agent socket listener.
@@ -495,7 +501,7 @@ async fn main() -> anyhow::Result<()> {
         query_broker,
         embedding_config: embedding_config.clone(),
         multi_user: cfg.trust_header.enabled,
-        max_tokens_ceiling: cfg.llm.max_tokens_ceiling,
+        llm,
         verify_peer_cgroup: isolated_agent_pool.is_some(),
         extra_mounts: cfg.extra_mounts.clone(),
         tmpfs_mounts: cfg.tmpfs_mounts.clone(),

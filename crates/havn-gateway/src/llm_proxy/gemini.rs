@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use super::provider::{LlmProvider, ProviderError};
 use super::{AnthropicMessage, AnthropicRequest, AnthropicResponse, AnthropicUsage};
 
-const BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
+const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
 #[derive(Debug, Default)]
 pub struct GeminiProvider;
@@ -38,9 +38,14 @@ impl LlmProvider for GeminiProvider {
         Self::NAME
     }
 
+    fn default_base_url(&self) -> &'static str {
+        BASE_URL
+    }
+
     async fn complete(
         &self,
         http: &reqwest::Client,
+        base_url: &str,
         api_key: &str,
         request: &AnthropicRequest,
     ) -> Result<AnthropicResponse, ProviderError> {
@@ -55,7 +60,7 @@ impl LlmProvider for GeminiProvider {
         let body = anthropic_to_gemini(request)
             .map_err(|e| ProviderError::Translation(format!("request build: {e}")))?;
 
-        let url = format!("{BASE}/{}:generateContent", request.model);
+        let url = format!("{base_url}/models/{}:generateContent", request.model);
         // Gemini accepts `?key=...` query param OR `x-goog-api-key` header;
         // header keeps the key out of URL logs and works the same way.
         let resp = http

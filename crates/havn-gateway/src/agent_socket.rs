@@ -121,9 +121,9 @@ pub struct AgentSocketCtx {
     /// without a side-channel.
     pub embedding_config: Arc<arc_swap::ArcSwap<serde_json::Value>>,
     pub multi_user: bool,
-    /// `[llm] max_tokens_ceiling`: upper bound on `max_tokens` for every
-    /// proxied LLM call, whatever the agent's config asks for.
-    pub max_tokens_ceiling: u32,
+    /// `[llm]` settings: the `max_tokens` ceiling for every proxied LLM
+    /// call, whatever the agent's config asks for, and provider base URLs.
+    pub llm: Arc<crate::config::LlmConfig>,
     /// True when agents run under `NamespaceSpawner`, each in its own
     /// `agent-<id>` cgroup. The gateway then accepts a connection for an
     /// agent only from a process in that cgroup. With the unisolated
@@ -1328,13 +1328,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                 budget: policy.budget.clone(),
             };
             match llm_proxy::complete_with_provider(
-                &ctx.db,
-                &ctx.http,
-                ring,
-                &billing,
-                &provider,
-                &ar,
-                ctx.max_tokens_ceiling,
+                &ctx.db, &ctx.http, ring, &billing, &provider, &ar, &ctx.llm,
             )
             .await
             {
@@ -1880,7 +1874,7 @@ mod tests {
                 serde_json::json!({"provider": "disabled"}),
             )),
             multi_user,
-            max_tokens_ceiling: crate::config::DEFAULT_MAX_TOKENS_CEILING,
+            llm: Arc::new(crate::config::LlmConfig::default()),
             verify_peer_cgroup,
             extra_mounts: Vec::new(),
             tmpfs_mounts: Vec::new(),
