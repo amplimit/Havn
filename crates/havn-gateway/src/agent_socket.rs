@@ -73,6 +73,11 @@ pub struct AgentSocketCtx {
     /// without a side-channel.
     pub embedding_config: Arc<arc_swap::ArcSwap<serde_json::Value>>,
     pub multi_user: bool,
+    /// True when agents run under `NamespaceSpawner`, each in its own
+    /// `agent-<id>` cgroup. The gateway then accepts a connection for an
+    /// agent only from a process in that cgroup. With the unisolated
+    /// subprocess spawner there is nothing to check against.
+    pub verify_peer_cgroup: bool,
     /// Operator-declared extra bind-mounts shipped to each runtime in
     /// Welcome so it can add Landlock entries (spec §4.1 v0.7). Cloned
     /// from `GatewayConfig::extra_mounts` at startup; same list the
@@ -119,7 +124,142 @@ pub async fn run_listener(socket_path: &Path, ctx: AgentSocketCtx) -> anyhow::Re
     }
 }
 
+/// Read the cgroup of the process on the other end of `stream`, first
+/// thing in the connection's task and before the peer has sent anything,
+/// so the peer cannot choose when the check runs. The pid from SO_PEERCRED
+/// is a number that could be reused once the peer exits. Where the kernel
+/// supports SO_PEERPIDFD (Linux 6.5+) the process is pinned with a pidfd
+/// and must still be alive after its cgroup is read; if the kernel cannot
+/// produce a pidfd for the peer (for example because it already exited),
+/// the connection is refused. Only kernels without SO_PEERPIDFD fall back
+/// to the bare pid, leaving the short window between connect and this read.
+#[cfg(target_os = "linux")]
+async fn peer_cgroup(stream: &UnixStream) -> Option<String> {
+    let pid = stream.peer_cred().ok()?.pid()?;
+    let pin = peer_pidfd(stream);
+    if matches!(pin, PeerPidfd::Failed) {
+        return None;
+    }
+    let contents = tokio::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .await
+        .ok()?;
+    match &pin {
+        PeerPidfd::Pinned(fd) if !pidfd_alive(fd) => None,
+        _ => Some(contents),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn peer_cgroup(_stream: &UnixStream) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+enum PeerPidfd {
+    Pinned(std::os::fd::OwnedFd),
+    /// The kernel (or this architecture) has no SO_PEERPIDFD.
+    Unsupported,
+    /// SO_PEERPIDFD exists but returned no pidfd for this peer.
+    Failed,
+}
+
+#[cfg(target_os = "linux")]
+fn peer_pidfd(stream: &UnixStream) -> PeerPidfd {
+    // libc does not export SO_PEERPIDFD; 77 is the asm-generic value used
+    // by x86_64 and aarch64, the architectures havn is built for.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        const SO_PEERPIDFD: libc::c_int = 77;
+        let mut fd: libc::c_int = -1;
+        let Ok(mut len) = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()) else {
+            return PeerPidfd::Failed;
+        };
+        // SAFETY: `fd` and `len` are valid for writes of the sizes passed,
+        // and the socket fd is borrowed from a live stream for the call.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                SO_PEERPIDFD,
+                (&raw mut fd).cast(),
+                &raw mut len,
+            )
+        };
+        if rc != 0 {
+            let unsupported =
+                std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOPROTOOPT);
+            return if unsupported {
+                PeerPidfd::Unsupported
+            } else {
+                PeerPidfd::Failed
+            };
+        }
+        if fd < 0 {
+            return PeerPidfd::Failed;
+        }
+        // SAFETY: on success getsockopt returned a new pidfd that nothing
+        // else owns, so taking ownership here closes it exactly once.
+        PeerPidfd::Pinned(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = stream;
+        PeerPidfd::Unsupported
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_alive(pidfd: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsRawFd as _;
+    // A pidfd becomes readable when its process exits. poll needs no
+    // permission and is not filtered by seccomp profiles that block
+    // pidfd_send_signal, which would otherwise make every agent look dead.
+    let mut entry = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `entry` is one valid pollfd and the timeout is zero.
+    let rc = unsafe { libc::poll(&raw mut entry, 1, 0) };
+    rc == 0
+}
+
+fn peer_cgroup_is_agents(contents: Option<&str>, agent_id: AgentId) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        contents.is_some_and(|c| cgroup_belongs_to_agent(c, agent_id))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (contents, agent_id);
+        false
+    }
+}
+
+/// Parse `/proc/<pid>/cgroup` (cgroup v2: a single `0::<path>` line, shown
+/// relative to the gateway's cgroup root, the same root the spawner
+/// creates `havn.slice` under) and require exactly the agent's cgroup.
+/// Comparing the whole path matters: a cgroup the agent creates below its
+/// own, even one named after another agent, does not match.
+#[cfg(target_os = "linux")]
+fn cgroup_belongs_to_agent(contents: &str, agent_id: AgentId) -> bool {
+    let expected = format!("/{}/agent-{agent_id}", havn_spawner::cgroup::SLICE);
+    contents
+        .lines()
+        .filter_map(|line| line.strip_prefix("0::"))
+        .any(|path| path.trim_end() == expected)
+}
+
 async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::Result<()> {
+    // Every sandbox sees the same socket, so the agent id in Hello is only
+    // a claim. The peer's process comes from the kernel and cannot be
+    // forged; look up its cgroup now, before reading anything from it.
+    let peer_cgroup = if ctx.verify_peer_cgroup {
+        peer_cgroup(&stream).await
+    } else {
+        None
+    };
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
 
@@ -139,6 +279,23 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
 
     let agent_id = AgentId::from_str(&agent_id_str)
         .with_context(|| format!("parsing agent_id {agent_id_str:?}"))?;
+
+    if ctx.verify_peer_cgroup && !peer_cgroup_is_agents(peer_cgroup.as_deref(), agent_id) {
+        warn!(
+            %agent_id,
+            peer_cgroup = peer_cgroup.as_deref().map(str::trim_end),
+            "refusing agent connection: the connecting process is not in that agent's cgroup"
+        );
+        anyhow::bail!("agent {agent_id}: connecting process is not in the agent's cgroup");
+    }
+
+    // Attach before sending Welcome, so a second connection for an agent
+    // that is already connected is refused before it learns anything.
+    let (tx, mut rx) = mpsc::channel::<GatewayToAgent>(OUTBOUND_QUEUE_CAPACITY);
+    ctx.registry
+        .attach(agent_id, tx.clone())
+        .await
+        .with_context(|| format!("refusing connection for agent {agent_id}"))?;
 
     // 2. Resolve policy + send Welcome.
     //
@@ -192,7 +349,7 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
     };
 
     let session_token = Uuid::now_v7().to_string();
-    write_frame(
+    let welcome = write_frame(
         &mut write,
         &GatewayToAgent::Welcome {
             session_token: session_token.clone(),
@@ -223,17 +380,13 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
             seccomp_allow_extra: ctx.seccomp_allow_extra.clone(),
         },
     )
-    .await
-    .context("sending Welcome")?;
+    .await;
+    if let Err(e) = welcome {
+        ctx.registry.detach(agent_id, &tx).await;
+        return Err(e).context("sending Welcome");
+    }
 
     info!(%agent_id, "agent connected");
-
-    // 3. Wire outbound channel
-    let (tx, mut rx) = mpsc::channel::<GatewayToAgent>(OUTBOUND_QUEUE_CAPACITY);
-    ctx.registry
-        .attach(agent_id, tx)
-        .await
-        .with_context(|| format!("attach: agent {agent_id} not registered"))?;
 
     // 4. Writer task: drain mpsc → wire
     let writer_task = tokio::spawn(async move {
@@ -249,7 +402,7 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
     let result = run_reader(&mut reader, agent_id, &ctx).await;
 
     // 6. Cleanup
-    ctx.registry.detach(agent_id).await;
+    ctx.registry.detach(agent_id, &tx).await;
     writer_task.abort();
     let _ = writer_task.await;
 
@@ -1086,7 +1239,7 @@ mod tests {
     use havn_spawner::AgentHandle;
     use std::time::Duration;
 
-    async fn ctx_with(multi_user: bool) -> AgentSocketCtx {
+    async fn ctx_with(multi_user: bool, verify_peer_cgroup: bool) -> AgentSocketCtx {
         let db = connect_in_memory().await.expect("db");
         let registry = AgentRegistry::new();
         let webchat_router = WebChatRouter::new();
@@ -1102,12 +1255,15 @@ mod tests {
             http: reqwest::Client::new(),
             webchat_router,
             channel_router: crate::channel_router::ChannelRouter::new(),
+            bindings: Arc::new(Vec::new()),
+            channels: Arc::new(std::collections::BTreeMap::new()),
             admin_rpc: crate::admin_rpc::AdminRpc::new(),
             query_broker: crate::query_broker::QueryBroker::new(),
             embedding_config: Arc::new(arc_swap::ArcSwap::from_pointee(
                 serde_json::json!({"provider": "disabled"}),
             )),
             multi_user,
+            verify_peer_cgroup,
             extra_mounts: Vec::new(),
             tmpfs_mounts: Vec::new(),
             seccomp_allow_extra: Vec::new(),
@@ -1161,7 +1317,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_query_is_refused_when_policy_forbids_it() {
-        let ctx = ctx_with(false).await;
+        let ctx = ctx_with(false, false).await;
         let owner = create_user(&ctx.db, NewUser { display_name: "o" })
             .await
             .expect("user")
@@ -1191,7 +1347,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_query_is_dispatched_when_policy_allows_it() {
-        let ctx = ctx_with(false).await;
+        let ctx = ctx_with(false, false).await;
         let owner = create_user(&ctx.db, NewUser { display_name: "o" })
             .await
             .expect("user")
@@ -1210,6 +1366,177 @@ mod tests {
         assert!(
             matches!(frame, GatewayToAgent::IncomingQuery(_)),
             "{frame:?}"
+        );
+    }
+
+    async fn registered_agent(ctx: &AgentSocketCtx) -> AgentId {
+        let agent_id = AgentId::new();
+        ctx.registry
+            .register(AgentHandle { agent_id, pid: 1 })
+            .await;
+        agent_id
+    }
+
+    /// Connect over a socket pair, send Hello for `agent_id`, and return
+    /// the gateway's verdict plus whatever it wrote back.
+    async fn hello(
+        ctx: &AgentSocketCtx,
+        agent_id: AgentId,
+    ) -> (anyhow::Result<()>, Option<GatewayToAgent>) {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let gateway = tokio::spawn(handle_connection(server, ctx.clone()));
+        let (client_read, mut client_write) = client.into_split();
+        write_frame(
+            &mut client_write,
+            &AgentToGateway::Hello {
+                agent_id: agent_id.to_string(),
+                version: PROTOCOL_VERSION.into(),
+            },
+        )
+        .await
+        .expect("send hello");
+        let mut reader = BufReader::new(client_read);
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_frame::<_, GatewayToAgent>(&mut reader),
+        )
+        .await
+        .expect("gateway answers or closes")
+        .ok()
+        .flatten();
+        drop(client_write);
+        drop(reader);
+        let verdict = gateway.await.expect("join");
+        (verdict, reply)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_path_must_name_the_agent() {
+        let id = AgentId::new();
+        let other = AgentId::new();
+        let own = format!("0::/havn.slice/agent-{id}\n");
+        assert!(cgroup_belongs_to_agent(&own, id));
+        assert!(!cgroup_belongs_to_agent(
+            &format!("0::/elsewhere/havn.slice/agent-{id}\n"),
+            id
+        ));
+        assert!(
+            !cgroup_belongs_to_agent(&format!("0::/havn.slice/agent-{other}/agent-{id}\n"), id),
+            "a cgroup created inside another agent's cgroup must not match"
+        );
+        assert!(!cgroup_belongs_to_agent(&own, other));
+        assert!(!cgroup_belongs_to_agent(
+            &format!("0::/havn.slice/agent-{id}-x\n"),
+            id
+        ));
+        assert!(!cgroup_belongs_to_agent(
+            &format!("0::/havn.slice/agent-{id}/nested\n"),
+            id
+        ));
+        assert!(!cgroup_belongs_to_agent(
+            &format!("1:name=systemd:/havn.slice/agent-{id}\n"),
+            id
+        ));
+        assert!(!cgroup_belongs_to_agent("0::/user.slice\n", id));
+        assert!(!cgroup_belongs_to_agent("", id));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn peer_cgroup_reads_the_connecting_process() {
+        let (ours, theirs) = UnixStream::pair().expect("socket pair");
+        let seen = peer_cgroup(&ours).await.expect("peer cgroup");
+        let own = std::fs::read_to_string("/proc/self/cgroup").expect("own cgroup");
+        assert_eq!(seen, own);
+        // SO_PEERPIDFD needs Linux 6.5+; older kernels fall back to the pid.
+        if let PeerPidfd::Pinned(pidfd) = peer_pidfd(&ours) {
+            assert!(pidfd_alive(&pidfd));
+        }
+        drop(theirs);
+    }
+
+    /// A peer that connected and has since exited and been reaped must not
+    /// be checked through its (reusable) pid number.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_that_already_exited_is_not_accepted() {
+        use std::os::unix::net::UnixListener as StdListener;
+        let dir = std::env::temp_dir().join(format!("havn-peer-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("s.sock");
+        let listener = StdListener::bind(&path).expect("bind");
+
+        // A short-lived child process connects and exits; the parent reaps
+        // it before looking at the connection.
+        let status = std::process::Command::new("python3")
+            .arg("-c")
+            .arg("import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])")
+            .arg(&path)
+            .status();
+        let Ok(status) = status else {
+            eprintln!("python3 not available; skipping");
+            return;
+        };
+        assert!(status.success());
+        let (accepted, _) = listener.accept().expect("accept");
+        accepted.set_nonblocking(true).expect("nonblocking");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let seen = rt.block_on(async {
+            let stream = UnixStream::from_std(accepted).expect("tokio stream");
+            peer_cgroup(&stream).await
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(seen.is_none(), "an exited peer must be refused: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn connection_from_outside_the_agents_cgroup_is_refused() {
+        let ctx = ctx_with(false, true).await;
+        let victim = registered_agent(&ctx).await;
+
+        let (verdict, reply) = hello(&ctx, victim).await;
+
+        assert!(verdict.is_err(), "the claim must be rejected");
+        assert!(reply.is_none(), "no Welcome may be sent: {reply:?}");
+        assert!(!ctx.registry.is_connected(victim).await);
+    }
+
+    #[tokio::test]
+    async fn second_connection_cannot_take_over_a_connected_agent() {
+        let ctx = ctx_with(false, false).await;
+        let agent = registered_agent(&ctx).await;
+        let (live, mut live_rx) = mpsc::channel::<GatewayToAgent>(8);
+        ctx.registry.attach(agent, live).await.expect("attach");
+
+        let (verdict, reply) = hello(&ctx, agent).await;
+
+        assert!(verdict.is_err(), "the second connection must be rejected");
+        assert!(reply.is_none(), "no Welcome may be sent: {reply:?}");
+        ctx.registry
+            .send(agent, GatewayToAgent::HeartbeatTick)
+            .await
+            .expect("send");
+        assert!(matches!(
+            live_rx.recv().await,
+            Some(GatewayToAgent::HeartbeatTick)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unverified_mode_still_accepts_a_registered_agent() {
+        let ctx = ctx_with(false, false).await;
+        let agent = registered_agent(&ctx).await;
+
+        let (_, reply) = hello(&ctx, agent).await;
+
+        assert!(
+            matches!(reply, Some(GatewayToAgent::Welcome { .. })),
+            "{reply:?}"
         );
     }
 }
