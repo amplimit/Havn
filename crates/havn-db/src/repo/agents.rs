@@ -87,6 +87,45 @@ pub async fn create(pool: &SqlitePool, new: NewAgent<'_>) -> Result<Agent> {
     find_by_id(pool, id).await?.ok_or(DbError::NotFound)
 }
 
+/// Like [`create`], but only while `new.owner_id` owns fewer than
+/// `max_total` agents and, for a team agent, fewer than `max_in_team` in
+/// that team. Count and insert are one statement (SQLite takes the write
+/// lock before reading), so concurrent creates cannot both pass the check.
+/// `Ok(None)` when a quota is full.
+pub async fn create_within_quota(
+    pool: &SqlitePool,
+    new: NewAgent<'_>,
+    max_total: u32,
+    max_in_team: u32,
+) -> Result<Option<Agent>> {
+    let id = AgentId::new();
+    let config = serde_json::to_string(&new.config).map_err(|e| DbError::InvalidValue {
+        column: "agents.config",
+        message: e.to_string(),
+    })?;
+    let inserted = sqlx::query(
+        "INSERT INTO agents (id, owner_id, team_id, name, config) \
+         SELECT ?1, ?2, ?3, ?4, ?5 \
+         WHERE (SELECT COUNT(*) FROM agents WHERE owner_id = ?2) < ?6 \
+           AND (?3 IS NULL \
+                OR (SELECT COUNT(*) FROM agents WHERE owner_id = ?2 AND team_id = ?3) < ?7)",
+    )
+    .bind(id.to_string())
+    .bind(new.owner_id.to_string())
+    .bind(new.team_id.map(|t| t.to_string()))
+    .bind(new.name)
+    .bind(config)
+    .bind(i64::from(max_total))
+    .bind(i64::from(max_in_team))
+    .execute(pool)
+    .await
+    .map_err(map_unique("agents.(owner_id,name)"))?;
+    if inserted.rows_affected() == 0 {
+        return Ok(None);
+    }
+    find_by_id(pool, id).await
+}
+
 pub async fn find_by_id(pool: &SqlitePool, id: AgentId) -> Result<Option<Agent>> {
     let row: Option<AgentRow> = sqlx::query_as::<_, AgentRow>(
         "SELECT id, owner_id, team_id, name, status, host, pid, config, created_at, updated_at \
@@ -125,6 +164,34 @@ pub async fn count_for_owner(pool: &SqlitePool, owner_id: UserId) -> Result<u32>
         .fetch_one(pool)
         .await?;
     Ok(u32::try_from(n).unwrap_or(u32::MAX))
+}
+
+/// Number of agents `owner_id` owns in `team_id` (the team role's
+/// `max_agents` gate).
+pub async fn count_for_owner_in_team(
+    pool: &SqlitePool,
+    owner_id: UserId,
+    team_id: TeamId,
+) -> Result<u32> {
+    let n: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agents WHERE owner_id = ?1 AND team_id = ?2")
+            .bind(owner_id.to_string())
+            .bind(team_id.to_string())
+            .fetch_one(pool)
+            .await?;
+    Ok(u32::try_from(n).unwrap_or(u32::MAX))
+}
+
+pub async fn list_for_team(pool: &SqlitePool, team_id: TeamId) -> Result<Vec<Agent>> {
+    let rows: Vec<AgentRow> = sqlx::query_as::<_, AgentRow>(
+        "SELECT id, owner_id, team_id, name, status, host, pid, config, created_at, updated_at \
+         FROM agents WHERE team_id = ?1 ORDER BY created_at",
+    )
+    .bind(team_id.to_string())
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(Agent::try_from).collect()
 }
 
 pub async fn list_for_owner(pool: &SqlitePool, owner_id: UserId) -> Result<Vec<Agent>> {
@@ -271,6 +338,42 @@ mod tests {
         .await
         .expect("create user")
         .id
+    }
+
+    #[tokio::test]
+    async fn create_within_quota_refuses_past_either_limit() {
+        let pool = connect_in_memory().await.expect("connect");
+        let owner = make_user(&pool, "q").await;
+        let team = crate::repo::teams::create(&pool, crate::repo::teams::NewTeam { name: "t" })
+            .await
+            .expect("team");
+        let new = |name: &'static str, team_id: Option<TeamId>| NewAgent {
+            owner_id: owner,
+            team_id,
+            name,
+            config: serde_json::json!({}),
+        };
+        let attempt = |n: &'static str| create_within_quota(&pool, new(n, Some(team.id)), 10, 2);
+        let (a, b, c, d) = tokio::join!(attempt("a"), attempt("b"), attempt("c"), attempt("d"));
+        let created = [a, b, c, d]
+            .into_iter()
+            .map(|r| r.expect("query"))
+            .filter(Option::is_some)
+            .count();
+        assert_eq!(created, 2, "team limit");
+        assert!(
+            create_within_quota(&pool, new("e", None), 3, 0)
+                .await
+                .expect("query")
+                .is_some()
+        );
+        assert!(
+            create_within_quota(&pool, new("f", None), 3, 0)
+                .await
+                .expect("query")
+                .is_none(),
+            "user-wide limit"
+        );
     }
 
     #[tokio::test]

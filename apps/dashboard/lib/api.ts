@@ -11,6 +11,8 @@ export type AgentView = {
   id: string;
   name: string;
   status: "created" | "running" | "paused" | "stopped" | "error";
+  /** Team the agent was created in; null for a personal agent. */
+  team_id: string | null;
   config: Record<string, unknown>;
   pid: number | null;
   created_at: string;
@@ -110,6 +112,8 @@ export type TeamView = {
   created_at: string;
   /** True when the calling user holds this team's admin role. */
   is_admin: boolean;
+  /** True when the caller's role in the team allows another agent there. */
+  can_create_agents: boolean;
 };
 
 export type TeamAgentView = {
@@ -276,10 +280,14 @@ export const api = {
   agents: {
     list: () => request<AgentView[]>("/agents"),
     get: (id: string) => request<AgentView>(`/agents/${id}`),
-    create: (name: string, config: Record<string, unknown> = {}) =>
+    create: (
+      name: string,
+      config: Record<string, unknown> = {},
+      teamId: string | null = null,
+    ) =>
       request<AgentView>("/agents", {
         method: "POST",
-        body: JSON.stringify({ name, config }),
+        body: JSON.stringify({ name, config, team_id: teamId }),
       }),
     /** PATCH agent — rename and/or shallow-merge config keys.
      * Pass null in a config value to clear that key. */

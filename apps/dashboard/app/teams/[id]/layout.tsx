@@ -21,7 +21,7 @@ const TABS: Array<{ slug: string; label: string; adminOnly: boolean }> = [
   { slug: "members", label: "members", adminOnly: true },
   { slug: "roles", label: "roles", adminOnly: true },
   { slug: "credentials", label: "credentials", adminOnly: false },
-  { slug: "usage", label: "usage", adminOnly: false },
+  { slug: "usage", label: "usage", adminOnly: true },
   { slug: "audit", label: "audit log", adminOnly: true },
 ];
 

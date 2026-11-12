@@ -389,7 +389,12 @@ async fn main() -> anyhow::Result<()> {
             )
         }
         Some(other) => return Err(anyhow!("expected Welcome, got {other:?}")),
-        None => return Err(anyhow!("connection closed before Welcome")),
+        None => {
+            return Err(anyhow!(
+                "connection closed before Welcome (the gateway refuses a runtime whose \
+                 protocol version {PROTOCOL_VERSION} differs from its own; see the gateway log)"
+            ));
+        }
     };
 
     // 3b. Sandbox application — moved from pre-Welcome to here so the
@@ -1070,6 +1075,7 @@ async fn handle_cron(tick: CronTick, ctx: Ctx) {
                 }
                 CronResult {
                     job_id: job_id.clone(),
+                    run_id: tick.run_id.clone(),
                     outcome: CronOutcome::Success,
                     output: text,
                     silent,
@@ -1079,6 +1085,7 @@ async fn handle_cron(tick: CronTick, ctx: Ctx) {
                 error!(%job_id, error = %e, "cron tool-use loop failed");
                 CronResult {
                     job_id: job_id.clone(),
+                    run_id: tick.run_id.clone(),
                     outcome: CronOutcome::Error {
                         message: e.to_string(),
                     },

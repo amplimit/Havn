@@ -32,7 +32,7 @@ pub mod provider;
 
 use std::borrow::Cow;
 
-use havn_core::{AgentId, BudgetExhaustAction, BudgetPolicy, UserId};
+use havn_core::{AgentId, BudgetExhaustAction, BudgetPolicy, TeamId, UserId};
 use havn_db::repo::credential_usage::{self, Caps, Reservation};
 use havn_db::repo::credentials::Credential;
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,9 @@ pub struct Billing {
     pub user_id: UserId,
     /// `None` for gateway-direct calls (the test endpoint).
     pub agent_id: Option<AgentId>,
+    /// The calling agent's team; limits the team credentials tried (see
+    /// [`resolve_for_user`]). `None` for personal agents and direct calls.
+    pub agent_team: Option<TeamId>,
     /// The agent's policy budget; ignored without `agent_id`.
     pub budget: BudgetPolicy,
 }
@@ -86,6 +89,7 @@ impl Billing {
         Self {
             user_id,
             agent_id: None,
+            agent_team: None,
             budget: BudgetPolicy::default(),
         }
     }
@@ -312,7 +316,7 @@ async fn complete_through(
     let request = with_max_tokens(request, max_tokens);
     let request = request.as_ref();
 
-    let chain = resolve_for_user(db, billing.user_id, route.name).await?;
+    let chain = resolve_for_user(db, billing.user_id, billing.agent_team, route.name).await?;
     if chain.is_empty() {
         return Err(ProxyError::NoCredential(route.name.to_string()));
     }
@@ -1056,6 +1060,7 @@ mod tests {
                 billing: Billing {
                     user_id,
                     agent_id: Some(agent_id),
+                    agent_team: None,
                     budget: BudgetPolicy::default(),
                 },
             }

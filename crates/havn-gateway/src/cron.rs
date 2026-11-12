@@ -6,7 +6,8 @@
 //! sends a `CronTick` frame to the corresponding agent. Output capture and
 //! `[SILENT]` suppression happen on the way back via [`record_result`],
 //! invoked by the agent socket handler when an `AgentToGateway::CronResult`
-//! frame arrives.
+//! frame arrives. Each tick carries a gateway-assigned `run_id`; a result is
+//! accepted only for a run that is still pending, once.
 //!
 //! Per-tick state is in-memory; long-lived state lives in `cron_jobs`
 //! (next_run_at, enabled) and `cron_runs` (history). Restarting the
@@ -18,18 +19,20 @@
     reason = "schema column names like next_run_at / cron_runs read better unquoted"
 )]
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
-use chrono::Utc;
-use havn_core::{AgentId, MessageContent, OutboundMessage};
+use chrono::{DateTime, Utc};
+use havn_core::{AgentId, CronJobId, MessageContent, OutboundMessage};
 use havn_db::DbError;
 use havn_db::repo::cron::{
     self, CronJob, NewCronRun, RunOutcome, Schedule, advance_after_run, record_run,
 };
 use havn_proto::{CronOutcome, CronTick, GatewayToAgent};
 use sqlx::SqlitePool;
+use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tokio::time::{MissedTickBehavior, timeout};
@@ -52,11 +55,25 @@ const WAKE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const WAKE_CHECK_STDOUT_CAP: usize = 64 * 1024;
 /// Default global concurrency for wake-check subprocesses (spec §8.5: 16).
 const WAKE_CHECK_CONCURRENCY: usize = 16;
+/// Max bytes of a `CronResult` output written to disk and broadcast.
+const CRON_OUTPUT_CAP: usize = 256 * 1024;
+/// How long a dispatched run waits for its `CronResult`; a later result is
+/// rejected as expired. Entries are dropped after twice this, after which a
+/// result is indistinguishable from an unsolicited one.
+const PENDING_RUN_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 
 #[derive(Clone, Copy, Debug)]
 struct WakeCheckCreds {
     uid: u32,
     gid: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingRun {
+    agent_id: AgentId,
+    job_id: CronJobId,
+    dispatched_at: DateTime<Utc>,
+    dispatched: Instant,
 }
 
 #[derive(Clone)]
@@ -75,6 +92,8 @@ pub struct CronScheduler {
     /// gateway's UID; a warning was logged at startup either way.
     wakecheck_creds: Option<WakeCheckCreds>,
     allow_unisolated_wakecheck: bool,
+    /// Runs sent to an agent and not yet answered, keyed by `run_id`.
+    pending: Arc<Mutex<HashMap<String, PendingRun>>>,
 }
 
 impl CronScheduler {
@@ -110,6 +129,50 @@ impl CronScheduler {
             wake_semaphore: Arc::new(Semaphore::new(WAKE_CHECK_CONCURRENCY)),
             wakecheck_creds,
             allow_unisolated_wakecheck,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn pending_runs(&self) -> MutexGuard<'_, HashMap<String, PendingRun>> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Record a run about to be sent to `agent_id` and return its id.
+    fn track_dispatch(&self, agent_id: AgentId, job_id: CronJobId) -> String {
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let mut pending = self.pending_runs();
+        pending.retain(|_, run| run.dispatched.elapsed() < PENDING_RUN_TTL * 2);
+        pending.insert(
+            run_id.clone(),
+            PendingRun {
+                agent_id,
+                job_id,
+                dispatched_at: Utc::now(),
+                dispatched: Instant::now(),
+            },
+        );
+        run_id
+    }
+
+    /// Remove and return the pending run `run_id` if it was sent to
+    /// `agent_id` for `job_id` and has not expired.
+    fn take_pending(
+        &self,
+        agent_id: AgentId,
+        job_id: CronJobId,
+        run_id: &str,
+    ) -> Result<PendingRun, CronError> {
+        let mut pending = self.pending_runs();
+        let not_pending = || CronError::NotPending(run_id.to_string());
+        let run = *pending.get(run_id).ok_or_else(not_pending)?;
+        if run.agent_id != agent_id || run.job_id != job_id {
+            return Err(not_pending());
+        }
+        pending.remove(run_id);
+        if run.dispatched.elapsed() < PENDING_RUN_TTL {
+            Ok(run)
+        } else {
+            Err(CronError::ExpiredRun(run_id.to_string()))
         }
     }
 
@@ -183,13 +246,16 @@ impl CronScheduler {
 
         // 3. Send CronTick. Advance schedule eagerly so we don't double-fire if
         //    the agent takes a while; the next tick will see the new next_run_at.
+        let run_id = self.track_dispatch(agent_id, job_id);
         let frame = GatewayToAgent::CronTick(CronTick {
             job_id: job_id.to_string(),
+            run_id: run_id.clone(),
             prompt: job.prompt.clone(),
             enabled_toolsets: job.enabled_toolsets.clone(),
         });
         if let Err(e) = self.registry.send(agent_id, frame).await {
             warn!(%job_id, %agent_id, error = %e, "could not deliver CronTick");
+            self.pending_runs().remove(&run_id);
             return;
         }
         let now = Utc::now();
@@ -256,16 +322,22 @@ impl CronScheduler {
             }
         }
 
+        // stderr goes to /dev/null, so only stdout is ever buffered here.
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
         Self::wake_check_stdout(&mut cmd)
             .await
-            .is_none_or(Self::decide_wake)
+            .is_none_or(|stdout| Self::decide_wake(&stdout))
     }
 
+    /// Spawn the wake-check and read at most [`WAKE_CHECK_STDOUT_CAP`] bytes
+    /// of its stdout. `None` (fail open) on spawn/read errors, on timeout,
+    /// and as soon as the script writes more than the cap. The script's
+    /// process group is killed in every case, so nothing it started in the
+    /// background outlives the check.
     async fn wake_check_stdout(cmd: &mut Command) -> Option<Vec<u8>> {
-        let child = match cmd.spawn() {
+        let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
                 warn!(error = %e, "wake-check exec failed; failing open");
@@ -273,10 +345,40 @@ impl CronScheduler {
             }
         };
         let pgid = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok());
-        match timeout(WAKE_CHECK_TIMEOUT, child.wait_with_output()).await {
-            Ok(Ok(output)) => Some(output.stdout),
+        let Some(stdout) = child.stdout.take() else {
+            warn!("wake-check stdout was not piped; failing open");
+            kill_group(pgid);
+            return None;
+        };
+        let limit = u64::try_from(WAKE_CHECK_STDOUT_CAP)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let run = async {
+            let mut buf = Vec::new();
+            stdout.take(limit).read_to_end(&mut buf).await?;
+            if buf.len() > WAKE_CHECK_STDOUT_CAP {
+                return Ok(None);
+            }
+            // EOF: the script closed stdout. Kill the group before reaping
+            // the leader (an unreaped leader keeps the pgid from being
+            // reused), so background children die with it.
+            kill_group(pgid);
+            child.wait().await?;
+            Ok::<_, std::io::Error>(Some(buf))
+        };
+        match timeout(WAKE_CHECK_TIMEOUT, run).await {
+            Ok(Ok(Some(buf))) => Some(buf),
+            Ok(Ok(None)) => {
+                warn!(
+                    cap = WAKE_CHECK_STDOUT_CAP,
+                    "wake-check stdout exceeded the cap; killed, failing open"
+                );
+                kill_group(pgid);
+                None
+            }
             Ok(Err(e)) => {
-                warn!(error = %e, "wake-check wait failed; failing open");
+                warn!(error = %e, "wake-check read failed; failing open");
+                kill_group(pgid);
                 None
             }
             Err(_) => {
@@ -284,30 +386,15 @@ impl CronScheduler {
                     timeout_s = WAKE_CHECK_TIMEOUT.as_secs(),
                     "wake-check timed out; failing open"
                 );
-                if let Some(pgid) = pgid {
-                    // SAFETY: plain syscall on the process group created for
-                    // this wake-check (process_group(0) above).
-                    unsafe {
-                        libc::killpg(pgid, libc::SIGKILL);
-                    }
-                }
+                kill_group(pgid);
                 None
             }
         }
     }
 
-    fn decide_wake(mut stdout: Vec<u8>) -> bool {
-        if stdout.len() > WAKE_CHECK_STDOUT_CAP {
-            warn!(
-                bytes = stdout.len(),
-                cap = WAKE_CHECK_STDOUT_CAP,
-                "wake-check stdout truncated"
-            );
-            stdout.truncate(WAKE_CHECK_STDOUT_CAP);
-        }
-
+    fn decide_wake(stdout: &[u8]) -> bool {
         // Last non-empty line of stdout.
-        let stdout_str = String::from_utf8_lossy(&stdout);
+        let stdout_str = String::from_utf8_lossy(stdout);
         let last_line = stdout_str
             .lines()
             .map(str::trim)
@@ -328,23 +415,36 @@ impl CronScheduler {
     }
 
     /// Called by the agent socket handler when the runtime returns a
-    /// `CronResult` frame. Persists the output to disk, records a `cron_runs`
-    /// row, and (unless `silent`) broadcasts the output to the agent's open
-    /// WebChat sessions.
+    /// `CronResult` frame. Accepts it only for a run dispatched to
+    /// `agent_id` that is still pending, then persists the output (capped at
+    /// [`CRON_OUTPUT_CAP`]) to disk, records a `cron_runs` row, and (unless
+    /// `silent`) broadcasts the output to the agent's open WebChat sessions.
     pub async fn record_result(
         &self,
         agent_id: AgentId,
-        result: havn_proto::CronResult,
+        mut result: havn_proto::CronResult,
     ) -> Result<(), CronError> {
         use std::str::FromStr as _;
-        let job_id = havn_core::CronJobId::from_str(&result.job_id)
+        let job_id = CronJobId::from_str(&result.job_id)
             .map_err(|_| CronError::InvalidJobId(result.job_id.clone()))?;
+        let run = self.take_pending(agent_id, job_id, &result.run_id)?;
 
         let job = cron::find_by_id(&self.db, job_id)
             .await?
             .ok_or(CronError::UnknownJob(job_id))?;
         if job.agent_id != agent_id {
             return Err(CronError::AgentMismatch);
+        }
+
+        if result.output.len() > CRON_OUTPUT_CAP {
+            warn!(
+                %job_id,
+                bytes = result.output.len(),
+                cap = CRON_OUTPUT_CAP,
+                "cron output truncated"
+            );
+            let end = result.output.floor_char_boundary(CRON_OUTPUT_CAP);
+            result.output.truncate(end);
         }
 
         let now = Utc::now();
@@ -373,7 +473,7 @@ impl CronScheduler {
             &self.db,
             NewCronRun {
                 job_id,
-                started_at: now,
+                started_at: run.dispatched_at,
                 finished_at: Some(now),
                 output_path: output_path.to_string_lossy().as_ref(),
                 silent: result.silent,
@@ -409,6 +509,10 @@ pub enum CronError {
     UnknownJob(havn_core::CronJobId),
     #[error("agent does not own job")]
     AgentMismatch,
+    #[error("no pending run {0:?} for this agent and job")]
+    NotPending(String),
+    #[error("result for an expired run {0:?}")]
+    ExpiredRun(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("db: {0}")]
@@ -472,6 +576,16 @@ fn resolve_wakecheck_creds() -> Option<WakeCheckCreds> {
 #[cfg(not(unix))]
 const fn resolve_wakecheck_creds() -> Option<WakeCheckCreds> {
     None
+}
+
+fn kill_group(pgid: Option<libc::pid_t>) {
+    if let Some(pgid) = pgid {
+        // SAFETY: plain syscall on the process group created for this
+        // wake-check (`process_group(0)` in `run_wake_check`).
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -620,5 +734,199 @@ mod tests {
         let pool = havn_db::connect_in_memory().await.expect("db");
         let s = make_scheduler(pool);
         assert!(s.run_wake_check("echo 'definitely not json'").await);
+    }
+
+    #[tokio::test]
+    async fn endless_wake_check_output_is_cut_at_the_cap() {
+        let pool = havn_db::connect_in_memory().await.expect("db");
+        let s = make_scheduler(pool);
+        let marker = std::env::temp_dir().join(format!("havn-wake-{}", uuid::Uuid::now_v7()));
+        let started = Instant::now();
+        assert!(
+            s.run_wake_check(&format!("yes; touch {}", marker.display()))
+                .await,
+            "over-cap output fails open"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "reading must stop at the cap, not at the timeout: {:?}",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!marker.exists(), "the script must be killed at the cap");
+    }
+
+    #[tokio::test]
+    async fn wake_check_output_at_the_cap_is_still_parsed() {
+        let pool = havn_db::connect_in_memory().await.expect("db");
+        let s = make_scheduler(pool);
+        let line = "{\"wakeAgent\": false}\n";
+        let padding = WAKE_CHECK_STDOUT_CAP - line.len() - 1;
+        let script = format!(
+            "head -c {padding} /dev/zero | tr '\\0' a; echo; printf '{{\"wakeAgent\": false}}\\n'"
+        );
+        assert!(!s.run_wake_check(&script).await);
+    }
+
+    fn process_gone(pid: &str) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            // Killed but not yet reaped by init.
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+        }
+    }
+
+    #[tokio::test]
+    async fn wake_check_background_children_are_killed() {
+        let pool = havn_db::connect_in_memory().await.expect("db");
+        let s = make_scheduler(pool);
+        let pidfile = std::env::temp_dir().join(format!("havn-wake-{}", uuid::Uuid::now_v7()));
+        let script = format!(
+            "sleep 60 >/dev/null 2>&1 & echo $! > {}; echo '{{\"wakeAgent\": false}}'",
+            pidfile.display()
+        );
+        assert!(!s.run_wake_check(&script).await, "the result still counts");
+        let pid = std::fs::read_to_string(&pidfile).expect("pid file");
+        let pid = pid.trim();
+        let _ = std::fs::remove_file(&pidfile);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !process_gone(pid) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            process_gone(pid),
+            "background child {pid} outlived the check"
+        );
+    }
+
+    async fn job_fixture(pool: &SqlitePool) -> (AgentId, CronJobId) {
+        use havn_db::repo::agents::{NewAgent, create as create_agent};
+        use havn_db::repo::users::{NewUser, create as create_user};
+        let user = create_user(pool, NewUser { display_name: "u" })
+            .await
+            .expect("user");
+        let agent = create_agent(
+            pool,
+            NewAgent {
+                owner_id: user.id,
+                team_id: None,
+                name: "a",
+                config: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("agent");
+        let job = cron::create(
+            pool,
+            cron::NewCronJob {
+                agent_id: agent.id,
+                name: "j",
+                prompt: "p",
+                schedule: &Schedule::Interval { seconds: 3600 },
+                next_run_at: Utc::now(),
+                wake_check: None,
+                deliver: "local",
+                enabled_toolsets: &[],
+            },
+        )
+        .await
+        .expect("job");
+        (agent.id, job.id)
+    }
+
+    fn result_for(job_id: CronJobId, run_id: &str, output: String) -> havn_proto::CronResult {
+        havn_proto::CronResult {
+            job_id: job_id.to_string(),
+            run_id: run_id.into(),
+            outcome: CronOutcome::Success,
+            output,
+            silent: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn cron_result_is_accepted_once_and_only_for_a_dispatched_run() {
+        let pool = havn_db::connect_in_memory().await.expect("db");
+        let s = make_scheduler(pool.clone());
+        let (agent_id, job_id) = job_fixture(&pool).await;
+        let unsolicited = s
+            .record_result(agent_id, result_for(job_id, "", "x".into()))
+            .await;
+        assert!(
+            matches!(unsolicited, Err(CronError::NotPending(_))),
+            "{unsolicited:?}"
+        );
+
+        let run_id = s.track_dispatch(agent_id, job_id);
+        let other_agent = s
+            .record_result(AgentId::new(), result_for(job_id, &run_id, "x".into()))
+            .await;
+        assert!(
+            matches!(other_agent, Err(CronError::NotPending(_))),
+            "{other_agent:?}"
+        );
+
+        s.record_result(agent_id, result_for(job_id, &run_id, "x".into()))
+            .await
+            .expect("the dispatched run is accepted");
+        let duplicate = s
+            .record_result(agent_id, result_for(job_id, &run_id, "x".into()))
+            .await;
+        assert!(
+            matches!(duplicate, Err(CronError::NotPending(_))),
+            "{duplicate:?}"
+        );
+        let runs = cron::list_runs_for_job(&pool, job_id, 10)
+            .await
+            .expect("runs");
+        assert_eq!(runs.len(), 1, "one row per dispatched run");
+    }
+
+    #[tokio::test]
+    async fn cron_result_for_an_expired_run_is_rejected() {
+        let pool = havn_db::connect_in_memory().await.expect("db");
+        let s = make_scheduler(pool.clone());
+        let (agent_id, job_id) = job_fixture(&pool).await;
+        let run_id = s.track_dispatch(agent_id, job_id);
+        if let Some(run) = s.pending_runs().get_mut(&run_id) {
+            run.dispatched = Instant::now()
+                .checked_sub(PENDING_RUN_TTL + Duration::from_secs(1))
+                .expect("monotonic clock is old enough");
+        }
+        let late = s
+            .record_result(agent_id, result_for(job_id, &run_id, "x".into()))
+            .await;
+        assert!(matches!(late, Err(CronError::ExpiredRun(_))), "{late:?}");
+        let again = s
+            .record_result(agent_id, result_for(job_id, &run_id, "x".into()))
+            .await;
+        assert!(matches!(again, Err(CronError::NotPending(_))), "{again:?}");
+        assert!(
+            cron::list_runs_for_job(&pool, job_id, 10)
+                .await
+                .expect("runs")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_cron_output_is_capped() {
+        let pool = havn_db::connect_in_memory().await.expect("db");
+        let s = make_scheduler(pool.clone());
+        let (agent_id, job_id) = job_fixture(&pool).await;
+        let run_id = s.track_dispatch(agent_id, job_id);
+        let output = "\u{e9}".repeat(CRON_OUTPUT_CAP);
+        s.record_result(agent_id, result_for(job_id, &run_id, output))
+            .await
+            .expect("recorded");
+        let runs = cron::list_runs_for_job(&pool, job_id, 10)
+            .await
+            .expect("runs");
+        let stored = std::fs::read(&runs[0].output_path).expect("output file");
+        assert!(stored.len() <= CRON_OUTPUT_CAP, "{} bytes", stored.len());
+        assert!(stored.len() > CRON_OUTPUT_CAP - 4);
+        assert!(String::from_utf8(stored).is_ok(), "cut on a char boundary");
     }
 }
