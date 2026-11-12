@@ -104,6 +104,11 @@ landlock = "0.4"
 # surface as a defence-in-depth on top of namespaces + Landlock (spec §4.1).
 seccompiler = "0.5"
 
+# Invite codes for channel DMs (issue #25): OS randomness for the code,
+# SHA-256 for the stored hash.
+getrandom = "0.3"
+sha2 = "0.10"
+
 # Testing
 tokio-test = "0.4"
 tempfile = "3"

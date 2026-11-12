@@ -119,6 +119,8 @@ struct AppState {
     /// issue #23). Prevents the bot from becoming a traffic reflector
     /// when unauthorized senders spam it.
     pub dm_reject_limiter: crate::api::channel::DmRejectLimiter,
+    /// Per-sender budget for invite-code attempts (issue #25).
+    pub invite_attempt_limiter: crate::api::channel::InviteAttemptLimiter,
     pub webchat_router: WebChatRouter,
     /// Origins accepted on the `WebChat` WS endpoint (spec §11). Hot-reloaded
     /// via the config watcher (spec §8.4) — readers swap-load atomically.
@@ -251,23 +253,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Warn on accounts whose dm_policy will reject everyone (allowlist
-    // with no entries). The operator likely forgot to add allow_from or
-    // meant to set dm_policy = "open". Better a startup warning than a
-    // silent "bot doesn't reply" mystery.
-    for (channel_name, entry) in &cfg.channels {
-        for acct in &entry.accounts {
-            if acct.dm_policy == config::DmPolicy::Allowlist && acct.allow_from.is_empty() {
-                warn!(
-                    channel = %channel_name,
-                    account = %acct.id,
-                    "dm_policy is 'allowlist' with empty allow_from — all inbound messages \
-                     will be rejected; set dm_policy = 'open' or add entries to allow_from"
-                );
-            }
-        }
-    }
-
     if let Some(parent) = cfg.db_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -283,6 +268,63 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("opening database at {}", cfg.db_path.display()))?;
     info!("database ready");
+
+    // Warn on accounts whose dm_policy will reject everyone (allowlist
+    // with no allow_from and nobody admitted by invite yet). The operator
+    // likely forgot allow_from, an invite, or meant dm_policy = "open".
+    // Better a startup warning than a silent "bot doesn't reply" mystery.
+    for (channel_name, entry) in &cfg.channels {
+        for acct in &entry.accounts {
+            if acct.dm_policy != config::DmPolicy::Allowlist || !acct.allow_from.is_empty() {
+                continue;
+            }
+            let admitted =
+                havn_db::repo::channel_access::count_allowed(&db, channel_name, &acct.id)
+                    .await
+                    .unwrap_or(0);
+            if admitted == 0 {
+                warn!(
+                    channel = %channel_name,
+                    account = %acct.id,
+                    "dm_policy is 'allowlist' with empty allow_from and no invited senders — \
+                     all inbound messages will be rejected; add entries to allow_from, admit \
+                     senders with `havn invite create`, or set dm_policy = 'open'"
+                );
+            }
+        }
+    }
+
+    // Invite grants outlive config edits: flag the ones for accounts that
+    // are gone or no longer `allowlist`, since they come back into effect
+    // if the account returns.
+    match havn_db::repo::channel_access::list_allowed(&db).await {
+        Ok(grants) => {
+            let mut inactive: std::collections::BTreeMap<(&str, &str), (usize, &str)> =
+                std::collections::BTreeMap::new();
+            for g in &grants {
+                if let Some(reason) =
+                    config::inactive_grant_reason(&cfg.channels, &g.channel, &g.account_id)
+                {
+                    inactive
+                        .entry((g.channel.as_str(), g.account_id.as_str()))
+                        .or_insert((0, reason))
+                        .0 += 1;
+                }
+            }
+            for ((channel, account), (senders, reason)) in inactive {
+                warn!(
+                    channel,
+                    account,
+                    senders,
+                    reason,
+                    "invited senders are not in effect but are kept, and apply again if the \
+                     account returns as 'allowlist'; remove them with \
+                     `havn access revoke --all --channel <channel> --account <account>`"
+                );
+            }
+        }
+        Err(e) => warn!(error = %e, "could not read the invite allowlist"),
+    }
 
     let user = havn_db::repo::users::ensure_default(&db)
         .await
@@ -421,6 +463,7 @@ async fn main() -> anyhow::Result<()> {
         bindings: Arc::new(cfg.bindings.clone()),
         channel_router: channel_router_state.clone(),
         dm_reject_limiter: crate::api::channel::DmRejectLimiter::new(),
+        invite_attempt_limiter: crate::api::channel::InviteAttemptLimiter::new(),
         webchat_router: webchat_router.clone(),
         allowed_origins,
         admin_rpc: admin_rpc.clone(),

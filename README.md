@@ -91,7 +91,7 @@ journalctl -u havn -f
 
 Keep `/etc/havn/havn.env` mode 0600 and owned by root, and write the key with an editor rather than `echo`, which leaves it in the shell history. systemd takes the value inside single quotes literally; it must not contain `'` or `\`.
 
-Agent cgroups are `/sys/fs/cgroup/havn.slice/agent-<id>`. The gateway creates that top-level cgroup itself and moves agents into it, outside the unit's own cgroup, so this is not systemd delegation; `Delegate=yes` only keeps the cpu, memory and pids controllers enabled from the root cgroup down. `/sys/fs/cgroup/havn.slice` is also where systemd would put a slice unit called `havn.slice`: never create such a unit, set `Slice=havn.slice`, or run anything with `--slice=havn`, or systemd adopts the cgroup, rewrites its controllers (which can drop the agents' memory limits) and may remove it. Put local changes in a drop-in (`systemctl edit havn`) rather than editing the installed file, which a re-install overwrites.
+Agent cgroups are `/sys/fs/cgroup/havn/agent-<id>`. The gateway creates that top-level cgroup itself and moves agents into it, outside the unit's own cgroup, so this is not systemd delegation; `Delegate=yes` only keeps the cpu, memory and pids controllers enabled from the root cgroup down. `havn` is not a unit name, so systemd leaves the cgroup alone. Older gateways used `/sys/fs/cgroup/havn.slice`: at start-up the gateway kills the agents still running there, removes their cgroups, and removes `havn.slice` itself unless systemd has an active `havn.slice` unit or something else lives in it. Put local changes in a drop-in (`systemctl edit havn`) rather than editing the installed file, which a re-install overwrites.
 
 ### Build from source
 
@@ -347,7 +347,36 @@ Havn ships a stable HTTP + WebSocket protocol at `/api/v1/channel` for external 
 | Slack | — | Planned |
 | Discord | — | Planned |
 
-An agent can only send through the channel accounts that `[[bindings]]` binds to it. With an account's `dm_policy = "allowlist"` (the default) it can only message senders in `allow_from`; with `dm_policy = "open"` it can message anyone the bot can reach on that platform, so use `open` only for bots meant to be public.
+An agent can only send through the channel accounts that `[[bindings]]` binds to it. With an account's `dm_policy = "allowlist"` (the default) it can only message senders in `allow_from` or admitted with an invite code (below); with `dm_policy = "open"` it can message anyone the bot can reach on that platform, so use `open` only for bots meant to be public.
+
+### Invite codes
+
+Instead of adding every team member to `allow_from` and restarting the gateway, an operator can hand out one-time invite codes for an `allowlist` account:
+
+```sh
+havn invite create --channel telegram --account acme-bot           # expires in 24h
+havn invite create --channel telegram --account acme-bot --expires 2h
+```
+
+The command prints a code such as `7K3M-QX9P-2HWD-RT4B` once. Send it to the person over a channel you trust (the way you hand out the code is what vouches for them). They message the code to the bot in a private chat; case, dashes and spaces don't matter. The gateway then adds their sender id to the account's allowlist, marks the code used, records a `channel_access.granted` audit entry and replies with a short welcome. The code itself is not passed to the agent. Their later messages reach the agent like those of anyone in `allow_from`.
+
+- A code works once, only for the channel and account it was created for, and expires after `--expires` (default 24h, at most 30d). havn stores only its SHA-256 hash.
+- A wrong, used, expired or revoked code gets the same reply as any other message from an unknown sender, so a sender can't tell whether a code exists. Each sender gets 5 attempts per account every 15 minutes, and failed attempts are logged.
+- On `dm_policy = "open"` accounts everyone is already admitted, so codes are passed to the agent as ordinary messages.
+
+Manage invites and admitted senders with the same direct-database commands as `havn user` (no gateway restart needed):
+
+```sh
+havn invite list [--channel telegram] [--account acme-bot]   # status of each invite; codes are never shown again
+havn invite revoke <invite-id>                               # an unused invite
+havn access list [--channel telegram] [--account acme-bot]   # allow_from entries and invited senders
+havn access revoke --channel telegram --account acme-bot tg:123456789
+havn access revoke --all --account acme-bot [--channel telegram]   # every invited sender of the account
+```
+
+`access revoke` applies to the sender's next message, and the agent can no longer message them either. Entries in `allow_from` can only be removed from the config file; `access revoke` warns when a sender it removed is still listed there.
+
+Invited senders are stored per account and outlive config edits. If an account is removed or switched to `open`, its grants stop applying but are kept, and apply again if the account comes back as `allowlist`. The gateway warns about such grants at start-up and `access list` marks them; clear them with `havn access revoke --all`.
 
 ## Capability Packs
 

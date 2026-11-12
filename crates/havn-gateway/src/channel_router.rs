@@ -360,7 +360,9 @@ impl OutboundRefusal {
         match self {
             Self::NotBound => "agent is not bound to this channel account",
             Self::UnknownAccount => "channel account is not configured",
-            Self::RecipientNotAllowed => "recipient is not in the account's allow_from",
+            Self::RecipientNotAllowed => {
+                "recipient is not in the account's allow_from or invite allowlist"
+            }
         }
     }
 }
@@ -369,7 +371,9 @@ impl OutboundRefusal {
 /// `recipient`. The agent must be the one `[[bindings]]` binds to the
 /// account. Under `dm_policy = "allowlist"` the recipient must be in
 /// `allow_from`; under `open` anyone on the platform can already talk to
-/// the agent, so any recipient is allowed.
+/// the agent, so any recipient is allowed. `RecipientNotAllowed` only
+/// covers the TOML list: the caller still checks the invite allowlist
+/// in the DB (issue #25).
 pub fn outbound_permitted(
     bindings: &[ChannelBindingConfig],
     channels: &std::collections::BTreeMap<String, ChannelEntry>,

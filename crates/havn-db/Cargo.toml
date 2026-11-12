@@ -18,6 +18,8 @@ chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytemuck.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

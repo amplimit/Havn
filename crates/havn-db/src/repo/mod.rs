@@ -10,6 +10,7 @@ use crate::DbError;
 
 pub mod agents;
 pub mod audit;
+pub mod channel_access;
 pub mod credential_usage;
 pub mod credentials;
 pub mod cron;

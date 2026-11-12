@@ -415,6 +415,7 @@ pub(crate) mod tests {
             bindings: Arc::new(Vec::new()),
             channel_router: crate::channel_router::ChannelRouter::new(),
             dm_reject_limiter: crate::api::channel::DmRejectLimiter::new(),
+            invite_attempt_limiter: crate::api::channel::InviteAttemptLimiter::new(),
             webchat_router: WebChatRouter::new(),
             allowed_origins: Arc::new(ArcSwap::from_pointee(Vec::new())),
             admin_rpc: crate::admin_rpc::AdminRpc::new(),
