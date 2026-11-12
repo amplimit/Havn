@@ -302,14 +302,10 @@ fn default_data_dir() -> PathBuf {
 }
 
 fn default_allowed_origins() -> Vec<String> {
-    // Match the dashboard's default port (`apps/dashboard/server.mjs`
-    // listens on 8101 and rewrites Origin to a canonical loopback
-    // value — see `app/agents/[id]/page.tsx` chat header). The
-    // `:3000` form is kept for `next dev` (which still defaults to
-    // 3000) so the dev workflow round-trips without a config edit.
+    // The dashboard (`apps/dashboard/server.mjs`, dev and production)
+    // listens on 3000 and presents WebSocket upgrades with
+    // `Origin: http://127.0.0.1:3000`.
     vec![
-        "http://127.0.0.1:8101".into(),
-        "http://localhost:8101".into(),
         "http://127.0.0.1:3000".into(),
         "http://localhost:3000".into(),
     ]

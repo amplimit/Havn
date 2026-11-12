@@ -19,6 +19,7 @@
 
 import { createServer, request as httpRequest } from "node:http";
 import { connect as netConnect } from "node:net";
+import { pipeline } from "node:stream";
 import next from "next";
 
 const DEV = process.argv.includes("--dev");
@@ -27,19 +28,39 @@ const HOSTNAME = process.env.HOSTNAME ?? "0.0.0.0";
 const GATEWAY = process.env.HAVN_GATEWAY_URL ?? "http://127.0.0.1:8080";
 const WS_PREFIX = "/ws/";
 const API_PREFIX = "/api/";
+const HOP_BY_HOP = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
 
 const gatewayUrl = new URL(GATEWAY);
-const GATEWAY_HOST = gatewayUrl.hostname;
-const GATEWAY_PORT = Number(gatewayUrl.port || 80);
-if (gatewayUrl.protocol !== "http:") {
-  console.error(`HAVN_GATEWAY_URL must be an http:// URL (got ${GATEWAY})`);
+if (gatewayUrl.protocol !== "http:" || gatewayUrl.pathname !== "/") {
+  console.error(`HAVN_GATEWAY_URL must be http://host:port with no path (got ${GATEWAY})`);
   process.exit(1);
 }
+const GATEWAY_HOST = gatewayUrl.hostname.replace(/^\[|\]$/g, "");
+const GATEWAY_PORT = Number(gatewayUrl.port || 80);
 
 const app = next({ dev: DEV, hostname: HOSTNAME, port: PORT });
 await app.prepare();
 const handle = app.getRequestHandler();
-const nextUpgrade = app.getUpgradeHandler();
+
+function endToEndHeaders(headers) {
+  const out = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (value !== undefined && !HOP_BY_HOP.has(name.toLowerCase())) {
+      out[name] = value;
+    }
+  }
+  return out;
+}
 
 function proxyApi(req, res) {
   const upstream = httpRequest(
@@ -48,11 +69,15 @@ function proxyApi(req, res) {
       port: GATEWAY_PORT,
       method: req.method,
       path: req.url.slice(API_PREFIX.length - 1),
-      headers: { ...req.headers, host: `${GATEWAY_HOST}:${GATEWAY_PORT}` },
+      headers: { ...endToEndHeaders(req.headers), host: gatewayUrl.host },
     },
     (upstreamRes) => {
-      res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
-      upstreamRes.pipe(res);
+      res.writeHead(upstreamRes.statusCode ?? 502, endToEndHeaders(upstreamRes.headers));
+      // A response cut off by the gateway must not leave the browser
+      // waiting on a half-sent body.
+      pipeline(upstreamRes, res, (err) => {
+        if (err) res.destroy();
+      });
     },
   );
   upstream.on("error", (err) => {
@@ -64,6 +89,10 @@ function proxyApi(req, res) {
     res.writeHead(502, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "gateway unreachable" }));
   });
+  res.on("close", () => {
+    if (!res.writableFinished) upstream.destroy();
+  });
+  req.on("error", () => upstream.destroy());
   req.pipe(upstream);
 }
 
@@ -76,10 +105,12 @@ const server = createServer((req, res) => {
 });
 
 server.on("upgrade", (req, clientSocket, head) => {
-  // /ws/* goes to the gateway; everything else (Next's dev HMR socket)
-  // goes to Next.
   if (!req.url?.startsWith(WS_PREFIX)) {
-    nextUpgrade(req, clientSocket, head);
+    // In dev, Next registers its own upgrade listener on this server for
+    // its hot-reload socket; leave those to it. Nothing else is served
+    // over WebSocket.
+    if (DEV && req.url?.startsWith("/_next/")) return;
+    clientSocket.destroy();
     return;
   }
   const upstream = netConnect({ host: GATEWAY_HOST, port: GATEWAY_PORT }, () => {

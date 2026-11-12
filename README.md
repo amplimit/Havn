@@ -84,11 +84,11 @@ cargo build --release
 
 ### Dashboard
 
-The dashboard is not part of the release binaries; run it from a checkout of
-the same version, with Node.js 22+, on the gateway host:
+The dashboard is not part of the release binaries. Run it on the gateway
+host with Node.js 22+, from your source checkout or a fresh clone:
 
 ```bash
-git clone --branch v0.1.1 https://github.com/amplimit/havn
+git clone https://github.com/amplimit/havn   # skip if you built from source
 cd havn/apps/dashboard
 npm install
 npm run build
