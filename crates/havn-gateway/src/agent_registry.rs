@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use havn_core::AgentId;
 use havn_proto::GatewayToAgent;
@@ -18,6 +19,7 @@ use havn_spawner::AgentHandle;
 use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc};
+use tracing::warn;
 
 #[derive(Debug, Clone, Default)]
 pub struct AgentRegistry {
@@ -60,7 +62,15 @@ pub enum SendError {
     NotRegistered(AgentId),
     #[error("outbound channel closed")]
     ChannelClosed,
+    #[error("agent {0} is not draining its outbound queue")]
+    Stalled(AgentId),
 }
+
+/// Longest a sender waits for room in an agent's outbound queue. The queue
+/// only stays full when the agent stops reading its socket; its writer then
+/// disconnects it (`agent_socket::AGENT_WRITE_TIMEOUT`), so waiting longer
+/// than this only ties up the sending task.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl AgentRegistry {
     #[must_use]
@@ -116,16 +126,41 @@ impl AgentRegistry {
         self.inner.lock().await.remove(&agent_id).map(|e| e.handle)
     }
 
-    /// Send a frame to a connected agent. Errors if not registered or not connected.
+    async fn sender(&self, agent_id: AgentId) -> Result<mpsc::Sender<GatewayToAgent>, SendError> {
+        let map = self.inner.lock().await;
+        let entry = map
+            .get(&agent_id)
+            .ok_or(SendError::NotRegistered(agent_id))?;
+        entry.tx.clone().ok_or(SendError::NotConnected(agent_id))
+    }
+
+    /// Send a frame to a connected agent, waiting at most [`SEND_TIMEOUT`]
+    /// for queue space. Errors if not registered, not connected or stalled.
     pub async fn send(&self, agent_id: AgentId, frame: GatewayToAgent) -> Result<(), SendError> {
-        let tx = {
-            let map = self.inner.lock().await;
-            let entry = map
-                .get(&agent_id)
-                .ok_or(SendError::NotRegistered(agent_id))?;
-            entry.tx.clone().ok_or(SendError::NotConnected(agent_id))?
-        };
-        tx.send(frame).await.map_err(|_| SendError::ChannelClosed)
+        let tx = self.sender(agent_id).await?;
+        tx.send_timeout(frame, SEND_TIMEOUT)
+            .await
+            .map_err(|e| match e {
+                mpsc::error::SendTimeoutError::Timeout(_) => {
+                    warn!(%agent_id, "agent outbound queue stayed full; dropping frame");
+                    SendError::Stalled(agent_id)
+                }
+                mpsc::error::SendTimeoutError::Closed(_) => SendError::ChannelClosed,
+            })
+    }
+
+    /// Like [`Self::send`], but fails at once when the queue is full. For
+    /// callers that serve many agents in one pass.
+    pub async fn try_send(
+        &self,
+        agent_id: AgentId,
+        frame: GatewayToAgent,
+    ) -> Result<(), SendError> {
+        let tx = self.sender(agent_id).await?;
+        tx.try_send(frame).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => SendError::Stalled(agent_id),
+            mpsc::error::TrySendError::Closed(_) => SendError::ChannelClosed,
+        })
     }
 
     #[allow(
@@ -266,6 +301,33 @@ mod tests {
             .await
             .expect_err("not connected");
         assert!(matches!(err, SendError::NotConnected(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_to_a_full_queue_gives_up() {
+        let reg = AgentRegistry::new();
+        let handle = fake_handle();
+        let id = handle.agent_id;
+        reg.register(handle).await;
+        let (tx, _rx) = mpsc::channel::<GatewayToAgent>(1);
+        reg.attach(id, tx).await.expect("attach");
+        reg.send(id, GatewayToAgent::HeartbeatTick)
+            .await
+            .expect("first frame fits");
+
+        let started = tokio::time::Instant::now();
+        let err = reg
+            .send(id, GatewayToAgent::HeartbeatTick)
+            .await
+            .expect_err("a full queue must not block forever");
+        assert!(matches!(err, SendError::Stalled(_)), "{err:?}");
+        assert!(started.elapsed() >= SEND_TIMEOUT);
+
+        let err = reg
+            .try_send(id, GatewayToAgent::HeartbeatTick)
+            .await
+            .expect_err("try_send fails at once");
+        assert!(matches!(err, SendError::Stalled(_)), "{err:?}");
     }
 
     #[tokio::test]

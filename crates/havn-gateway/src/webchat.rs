@@ -17,6 +17,7 @@ use havn_core::{AgentId, MessageContent, OutboundMessage};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc};
+use tracing::warn;
 use uuid::Uuid;
 
 pub type SessionId = Uuid;
@@ -60,6 +61,8 @@ pub enum DeliverError {
     NoSession(SessionId),
     #[error("session writer closed")]
     WriterClosed,
+    #[error("webchat session {0} is not reading; closed it")]
+    Stalled(SessionId),
 }
 
 impl WebChatRouter {
@@ -113,9 +116,30 @@ impl WebChatRouter {
                 content: format!("(unsupported content variant: {other:?})"),
             },
         };
-        tx.send(server_msg)
-            .await
-            .map_err(|_| DeliverError::WriterClosed)
+        self.offer(session_id, &tx, server_msg).await
+    }
+
+    /// Queue `msg` without waiting. The caller is an agent's reader loop, so
+    /// a browser that stops reading must not hold it up: its session is
+    /// dropped instead, which ends its writer task and closes the socket.
+    async fn offer(
+        &self,
+        session_id: SessionId,
+        tx: &mpsc::Sender<ServerMessage>,
+        msg: ServerMessage,
+    ) -> Result<(), DeliverError> {
+        match tx.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(DeliverError::WriterClosed),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let mut map = self.inner.lock().await;
+                if map.get(&session_id).is_some_and(|s| s.tx.same_channel(tx)) {
+                    map.remove(&session_id);
+                }
+                warn!(%session_id, "webchat session outbound queue is full; closing the session");
+                Err(DeliverError::Stalled(session_id))
+            }
+        }
     }
 
     #[allow(dead_code, reason = "consumed by upcoming dashboard endpoints")]
@@ -126,7 +150,8 @@ impl WebChatRouter {
     /// Fan-out a proactive `OutboundMessage` (e.g. heartbeat output) to every
     /// open `WebChat` session bound to `agent_id`. Returns the number of sessions
     /// the message was successfully queued onto. Closed senders are skipped
-    /// silently — the per-session writer task already handles that path.
+    /// silently — the per-session writer task already handles that path —
+    /// and sessions whose queue is full are dropped (see [`Self::offer`]).
     pub async fn broadcast(&self, agent_id: AgentId, msg: OutboundMessage) -> usize {
         let server_msg = match msg.content {
             MessageContent::Text { text } => ServerMessage::AgentMessage { content: text },
@@ -134,10 +159,21 @@ impl WebChatRouter {
                 content: format!("(unsupported content variant: {other:?})"),
             },
         };
-        let map = self.inner.lock().await;
+        let targets: Vec<(SessionId, mpsc::Sender<ServerMessage>)> = self
+            .inner
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, s)| s.agent_id == agent_id)
+            .map(|(id, s)| (*id, s.tx.clone()))
+            .collect();
         let mut delivered = 0usize;
-        for session in map.values() {
-            if session.agent_id == agent_id && session.tx.send(server_msg.clone()).await.is_ok() {
+        for (session_id, tx) in targets {
+            if self
+                .offer(session_id, &tx, server_msg.clone())
+                .await
+                .is_ok()
+            {
                 delivered += 1;
             }
         }
@@ -258,6 +294,70 @@ mod tests {
         }
         // The unrelated agent's session must NOT have received it.
         assert!(rx_other.try_recv().is_err());
+    }
+
+    fn text(t: &str) -> OutboundMessage {
+        OutboundMessage {
+            channel_id: "broadcast".into(),
+            content: MessageContent::Text { text: t.into() },
+            reply_to: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_session_does_not_block_others_and_is_dropped() {
+        let router = WebChatRouter::new();
+        let agent_id = AgentId::new();
+        let stalled = Uuid::now_v7();
+        let (stalled_tx, _stalled_rx) = mpsc::channel::<ServerMessage>(1);
+        router.register(stalled, agent_id, stalled_tx).await;
+        let (healthy_tx, mut healthy_rx) = mpsc::channel::<ServerMessage>(8);
+        router.register(Uuid::now_v7(), agent_id, healthy_tx).await;
+
+        assert_eq!(router.broadcast(agent_id, text("one")).await, 2);
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            router.broadcast(agent_id, text("two")),
+        )
+        .await
+        .expect("a stalled session must not block the broadcast");
+        assert_eq!(n, 1);
+        for expected in ["one", "two"] {
+            match healthy_rx.try_recv().expect("frame") {
+                ServerMessage::AgentMessage { content } => assert_eq!(content, expected),
+                ServerMessage::Error { .. } => panic!("unexpected Error"),
+            }
+        }
+        assert!(
+            router.agent_for_session(stalled).await.is_none(),
+            "the stalled session is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_to_a_stalled_session_fails_at_once() {
+        let router = WebChatRouter::new();
+        let agent_id = AgentId::new();
+        let session_id = Uuid::now_v7();
+        let (tx, _rx) = mpsc::channel::<ServerMessage>(1);
+        router.register(session_id, agent_id, tx).await;
+        let to_session = |t: &str| OutboundMessage {
+            channel_id: session_id.to_string(),
+            ..text(t)
+        };
+
+        router
+            .deliver(agent_id, to_session("one"))
+            .await
+            .expect("first fits");
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            router.deliver(agent_id, to_session("two")),
+        )
+        .await
+        .expect("deliver must not wait for the browser")
+        .expect_err("queue is full");
+        assert!(matches!(err, DeliverError::Stalled(_)), "{err:?}");
     }
 
     #[tokio::test]

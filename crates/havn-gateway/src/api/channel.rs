@@ -253,9 +253,8 @@ fn tokens_match(a: &[u8], b: &[u8]) -> bool {
 const MAX_ACCOUNT_MISMATCHES: u32 = 10;
 
 /// mpsc capacity for outbound frames queued toward this WS. 64 is
-/// generous — a slow adapter would pile up replies; the bounded
-/// channel applies natural backpressure to the gateway-side
-/// `channel_router::deliver` call (which awaits the send).
+/// generous; once it is full `channel_router::deliver` refuses further
+/// frames (they stay in the replay buffer) instead of waiting.
 const ADAPTER_OUTBOUND_CAPACITY: usize = 64;
 
 async fn handle_session(

@@ -13,15 +13,23 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::anyhow;
-use havn_proto::{AgentToGateway, LlmOutcome, LlmRequest, LlmResponse};
+use havn_proto::codec::MAX_FRAME_BYTES;
+use havn_proto::{
+    AdminOutcome, AgentQueryOutcome, AgentQueryResponse, AgentQueryResult, AgentToGateway,
+    DataResponse, FrameError, LlmOutcome, LlmRequest, LlmResponse, MemoryForgetResponse,
+    SkillPinResponse, write_frame,
+};
 use serde_json::Value;
+use tokio::io::AsyncWrite;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::system_prompt::SystemPrompt;
+use crate::tools::agent_query::PendingQueries;
 use crate::tools::{ToolCtx, ToolRegistry, ToolResult};
 
 /// Shared map of in-flight LLM requests keyed by request_id. Both the
@@ -70,6 +78,19 @@ pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 /// Default model when the per-call options don't override.
 pub const DEFAULT_MODEL: &str = "claude-opus-4-6";
+
+/// Upper bound on waiting for the gateway's answer to one LLM request. The
+/// gateway's provider calls time out long before this (120 s per
+/// credential), so it only fires when an answer is lost.
+pub const LLM_RESPONSE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Stands in for a tool result removed to keep a request within
+/// [`MAX_FRAME_BYTES`].
+const ELIDED_TOOL_RESULT: &str =
+    "[tool output removed: the conversation outgrew the size limit for one LLM request]";
+
+/// Room left in a frame for the enum tag around an [`LlmRequest`].
+const FRAME_TAG_BYTES: usize = 64;
 
 /// Typed loop outcome — caller-distinguishable success vs. degraded paths.
 ///
@@ -140,7 +161,7 @@ pub async fn run_typed(
         if let Some(mirror) = &handle.messages_mirror {
             *mirror.write().await = messages.clone();
         }
-        let response = call_llm(handle, context, messages.clone(), system_prompt)
+        let response = call_llm(handle, context, messages, system_prompt)
             .await
             .map_err(RunError::Infra)?;
         let provider_response = match response.outcome {
@@ -252,7 +273,7 @@ async fn execute_tool_uses(
 async fn call_llm(
     handle: &LoopHandle,
     context: &'static str,
-    messages: Vec<Value>,
+    messages: &mut [Value],
     system_prompt: &SystemPrompt,
 ) -> anyhow::Result<LlmResponse> {
     let request_id = Uuid::now_v7().to_string();
@@ -264,33 +285,203 @@ async fn call_llm(
         options["tools"] = handle.registry.schemas_for(context);
     }
 
-    let llm_req = LlmRequest {
+    let build = |messages: &[Value]| LlmRequest {
         request_id: request_id.clone(),
         model: handle.model.as_str().into(),
-        messages: Value::Array(messages),
-        options,
+        messages: Value::Array(messages.to_vec()),
+        options: options.clone(),
         billing_user_id: handle.billing_user_id.clone(),
     };
+    let mut llm_req = build(messages);
+    // The frame adds its `"type"` tag to the request's own JSON.
+    let budget = MAX_FRAME_BYTES - FRAME_TAG_BYTES;
+    let size = serde_json::to_vec(&llm_req)?.len();
+    if size > budget {
+        let excess = elide_tool_results(messages, size - budget);
+        if excess > 0 {
+            return Ok(LlmResponse {
+                request_id,
+                outcome: LlmOutcome::Error {
+                    message: format!(
+                        "the conversation is {excess} bytes over the {MAX_FRAME_BYTES}-byte \
+                         limit for one LLM request, even without its tool results"
+                    ),
+                },
+                provider_response: Value::Null,
+                usage: None,
+            });
+        }
+        warn!(
+            size,
+            "conversation over the frame limit; removed old tool results"
+        );
+        llm_req = build(messages);
+    }
 
+    request_llm(&handle.writer_tx, &handle.pending, llm_req).await
+}
+
+/// Replace tool results in `messages`, oldest first, with a short note until
+/// at least `excess` bytes of serialized JSON are saved. Returns the bytes
+/// still missing (0 once enough was removed).
+fn elide_tool_results(messages: &mut [Value], mut excess: usize) -> usize {
+    let note = Value::String(ELIDED_TOOL_RESULT.into());
+    let note_len = json_len(&note);
+    for message in messages.iter_mut() {
+        let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in blocks {
+            if excess == 0 {
+                return 0;
+            }
+            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let Some(content) = block.get_mut("content") else {
+                continue;
+            };
+            let len = json_len(content);
+            if len > note_len {
+                *content = note.clone();
+                excess = excess.saturating_sub(len - note_len);
+            }
+        }
+    }
+    excess
+}
+
+fn json_len(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(0, |v| v.len())
+}
+
+/// Send `req` and wait for its `LlmResponse`, at most [`LLM_RESPONSE_TIMEOUT`].
+pub async fn request_llm(
+    writer_tx: &mpsc::Sender<AgentToGateway>,
+    pending: &Pending,
+    req: LlmRequest,
+) -> anyhow::Result<LlmResponse> {
+    let request_id = req.request_id.clone();
     let (resp_tx, resp_rx) = oneshot::channel();
-    handle
-        .pending
-        .lock()
-        .await
-        .insert(request_id.clone(), resp_tx);
+    pending.lock().await.insert(request_id.clone(), resp_tx);
 
-    if let Err(e) = handle
-        .writer_tx
-        .send(AgentToGateway::LlmRequest(llm_req))
-        .await
-    {
-        handle.pending.lock().await.remove(&request_id);
+    if let Err(e) = writer_tx.send(AgentToGateway::LlmRequest(req)).await {
+        pending.lock().await.remove(&request_id);
         return Err(anyhow!("failed to enqueue LlmRequest: {e}"));
     }
 
-    resp_rx
-        .await
-        .map_err(|_| anyhow!("LlmResponse channel closed for {request_id}"))
+    match tokio::time::timeout(LLM_RESPONSE_TIMEOUT, resp_rx).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(_)) => Err(anyhow!("LlmResponse channel closed for {request_id}")),
+        Err(_) => {
+            pending.lock().await.remove(&request_id);
+            Err(anyhow!(
+                "no LlmResponse for {request_id} within {}s",
+                LLM_RESPONSE_TIMEOUT.as_secs()
+            ))
+        }
+    }
+}
+
+/// Write one frame to the gateway. A frame over [`MAX_FRAME_BYTES`] is
+/// rejected before anything is written, so the stream stays usable: whoever
+/// waits on it gets an error (see [`oversized_frame`]).
+pub async fn write_outbound<W>(
+    write: &mut W,
+    frame: AgentToGateway,
+    pending: &Pending,
+    queries: &PendingQueries,
+) -> Result<(), FrameError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut next = Some(frame);
+    while let Some(frame) = next.take() {
+        match write_frame(write, &frame).await {
+            Ok(()) => {}
+            Err(FrameError::FrameTooLarge(size)) => {
+                error!(size, "outbound frame over the size limit");
+                next = oversized_frame(frame, size, pending, queries).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Fail the local caller waiting on an unsendable request, or build the
+/// smaller frame to send in place of an unsendable reply.
+async fn oversized_frame(
+    frame: AgentToGateway,
+    size: usize,
+    pending: &Pending,
+    queries: &PendingQueries,
+) -> Option<AgentToGateway> {
+    let limit = format!("{size} bytes exceeds the {MAX_FRAME_BYTES}-byte frame limit");
+    let admin_error = || AdminOutcome::Error {
+        message: format!("reply of {limit}"),
+    };
+    match frame {
+        AgentToGateway::LlmRequest(req) => {
+            if let Some(tx) = pending.lock().await.remove(&req.request_id) {
+                let _ = tx.send(LlmResponse {
+                    request_id: req.request_id,
+                    outcome: LlmOutcome::Error {
+                        message: format!("LLM request of {limit}"),
+                    },
+                    provider_response: Value::Null,
+                    usage: None,
+                });
+            }
+            None
+        }
+        AgentToGateway::AgentQuery(query) => {
+            if let Some(tx) = queries.lock().await.remove(&query.request_id) {
+                let _ = tx.send(AgentQueryResult {
+                    request_id: query.request_id,
+                    outcome: AgentQueryOutcome::Error {
+                        message: format!("agent query of {limit}"),
+                    },
+                    text: String::new(),
+                    transcript: Value::Null,
+                });
+            }
+            None
+        }
+        AgentToGateway::AgentQueryResponse(resp) if !resp.transcript.is_null() => {
+            Some(AgentToGateway::AgentQueryResponse(AgentQueryResponse {
+                transcript: Value::String(format!("transcript omitted: answer of {limit}")),
+                ..resp
+            }))
+        }
+        AgentToGateway::AgentQueryResponse(resp) => {
+            Some(AgentToGateway::AgentQueryResponse(AgentQueryResponse {
+                request_id: resp.request_id,
+                outcome: AgentQueryOutcome::Error {
+                    message: format!("answer of {limit}"),
+                },
+                text: String::new(),
+                transcript: Value::Null,
+            }))
+        }
+        AgentToGateway::MemoryForgetResponse(resp) => {
+            Some(AgentToGateway::MemoryForgetResponse(MemoryForgetResponse {
+                request_id: resp.request_id,
+                outcome: admin_error(),
+            }))
+        }
+        AgentToGateway::SkillPinResponse(resp) => {
+            Some(AgentToGateway::SkillPinResponse(SkillPinResponse {
+                request_id: resp.request_id,
+                outcome: admin_error(),
+            }))
+        }
+        AgentToGateway::DataResponse(resp) => Some(AgentToGateway::DataResponse(DataResponse {
+            request_id: resp.request_id,
+            outcome: admin_error(),
+        })),
+        _ => None,
+    }
 }
 
 /// Concatenate `text` blocks from an Anthropic content array.
@@ -306,4 +497,140 @@ fn extract_text(content: &Value) -> Option<String> {
         }
     }
     if text.is_empty() { None } else { Some(text) }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+
+    fn request(request_id: &str) -> LlmRequest {
+        LlmRequest {
+            request_id: request_id.into(),
+            model: DEFAULT_MODEL.into(),
+            messages: serde_json::json!([{ "role": "user", "content": "hi" }]),
+            options: serde_json::json!({}),
+            billing_user_id: None,
+        }
+    }
+
+    fn maps() -> (Pending, PendingQueries) {
+        (
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+    }
+
+    fn tool_turn(id: usize, size: usize) -> Value {
+        serde_json::json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": format!("t{id}"),
+                "content": "x".repeat(size),
+                "is_error": false,
+            }],
+        })
+    }
+
+    #[test]
+    fn oldest_tool_results_are_removed_first() {
+        let mut messages: Vec<Value> = (0..20).map(|i| tool_turn(i, 256 * 1024)).collect();
+        let budget = MAX_FRAME_BYTES - FRAME_TAG_BYTES;
+        let excess = json_len(&Value::Array(messages.clone())) - budget;
+
+        assert_eq!(elide_tool_results(&mut messages, excess), 0);
+
+        assert!(json_len(&Value::Array(messages.clone())) <= budget);
+        assert_eq!(messages[0]["content"][0]["content"], ELIDED_TOOL_RESULT);
+        assert_eq!(
+            messages[19]["content"][0]["content"].as_str().map(str::len),
+            Some(256 * 1024),
+            "the newest tool result is kept"
+        );
+    }
+
+    #[test]
+    fn removal_reports_what_it_could_not_save() {
+        let mut messages = vec![serde_json::json!({ "role": "user", "content": "x".repeat(1000) })];
+        assert_eq!(elide_tool_results(&mut messages, 10), 10);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_an_llm_response_is_bounded() {
+        let (tx, _rx) = mpsc::channel(8);
+        let (pending, _) = maps();
+
+        let err = request_llm(&tx, &pending, request("r1"))
+            .await
+            .expect_err("no answer ever arrives");
+
+        assert!(err.to_string().contains("within"), "{err}");
+        assert!(
+            pending.lock().await.is_empty(),
+            "the pending entry is removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_llm_request_fails_its_caller() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (pending, queries) = maps();
+        let mut req = request("big");
+        req.messages =
+            serde_json::json!([{ "role": "user", "content": "x".repeat(MAX_FRAME_BYTES) }]);
+        let call = tokio::spawn({
+            let pending = Arc::clone(&pending);
+            async move { request_llm(&tx, &pending, req).await }
+        });
+
+        let frame = rx.recv().await.expect("queued");
+        let mut wire = Vec::new();
+        write_outbound(&mut wire, frame, &pending, &queries)
+            .await
+            .expect("the stream stays usable");
+        assert!(wire.is_empty(), "nothing is written");
+
+        let response = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("the caller is answered at once")
+            .expect("join")
+            .expect("response");
+        assert!(
+            matches!(response.outcome, LlmOutcome::Error { .. }),
+            "{:?}",
+            response.outcome
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_query_answer_loses_only_its_transcript() {
+        let (pending, queries) = maps();
+        let answer = AgentToGateway::AgentQueryResponse(AgentQueryResponse {
+            request_id: "q".into(),
+            outcome: AgentQueryOutcome::Ok,
+            text: "answer".into(),
+            transcript: serde_json::json!(["x".repeat(MAX_FRAME_BYTES)]),
+        });
+
+        let mut wire = Vec::new();
+        write_outbound(&mut wire, answer, &pending, &queries)
+            .await
+            .expect("write");
+
+        let mut reader = tokio::io::BufReader::new(wire.as_slice());
+        match havn_proto::read_frame::<_, AgentToGateway>(&mut reader).await {
+            Ok(Some(AgentToGateway::AgentQueryResponse(r))) => {
+                assert!(
+                    matches!(r.outcome, AgentQueryOutcome::Ok),
+                    "{:?}",
+                    r.outcome
+                );
+                assert_eq!(r.text, "answer");
+                assert!(r.transcript.is_string(), "{:?}", r.transcript);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 }

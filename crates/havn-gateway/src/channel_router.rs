@@ -110,6 +110,10 @@ pub enum DeliverError {
     /// closed concurrently. Treated like NoSession by the caller.
     #[error("adapter writer closed")]
     WriterClosed,
+    /// The adapter's outbound queue is full: it is not reading. The frame
+    /// stays in the replay buffer for `Resume`.
+    #[error("adapter for {0:?} is not reading its queue")]
+    Stalled(AccountKey),
 }
 
 impl ChannelRouter {
@@ -186,9 +190,12 @@ impl ChannelRouter {
             push_replay(&key, &mut state.replay, seq, frame.clone());
             (tx, frame, seq)
         };
-        tx.send(frame)
-            .await
-            .map_err(|_| DeliverError::WriterClosed)?;
+        // Never wait on the adapter: it serves every agent bound to its
+        // account, and the caller is an agent's reader loop.
+        tx.try_send(frame).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => DeliverError::Stalled(key),
+            mpsc::error::TrySendError::Closed(_) => DeliverError::WriterClosed,
+        })?;
         Ok(seq)
     }
 
@@ -405,6 +412,33 @@ mod tests {
             )
             .await;
         assert!(matches!(r, Err(DeliverError::NoSession(_))));
+    }
+
+    #[tokio::test]
+    async fn deliver_to_a_full_adapter_queue_fails_at_once() {
+        let router = ChannelRouter::new();
+        let key = AccountKey::new("telegram", "alice");
+        let (tx, _rx) = mpsc::channel(1);
+        router.register(key.clone(), tx).await;
+        let send = || {
+            router.deliver(
+                "telegram",
+                "alice",
+                "tg:1",
+                None,
+                ChannelMessageContent::Text { text: "x".into() },
+            )
+        };
+        send().await.expect("first fits");
+        let r = tokio::time::timeout(Duration::from_secs(5), send())
+            .await
+            .expect("deliver must not wait for the adapter");
+        assert!(matches!(r, Err(DeliverError::Stalled(_))), "{r:?}");
+        assert_eq!(
+            router.replay_since(&key, 0).await.len(),
+            2,
+            "the dropped frame stays replayable"
+        );
     }
 
     #[tokio::test]

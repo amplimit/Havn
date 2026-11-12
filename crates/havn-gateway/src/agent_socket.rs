@@ -14,18 +14,20 @@
 use std::path::Path;
 use std::str::FromStr as _;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use havn_core::{AgentId, UserId};
+use havn_proto::codec::MAX_FRAME_BYTES;
 use havn_proto::{
-    AgentQuery, AgentQueryOutcome, AgentQueryResult, AgentToGateway, FrameError, GatewayToAgent,
-    IncomingQuery, LlmOutcome, LlmRequest, LlmResponse, LlmUsage, PROTOCOL_VERSION, read_frame,
-    write_frame,
+    AgentQuery, AgentQueryOutcome, AgentQueryResponse, AgentQueryResult, AgentToGateway,
+    FrameError, GatewayToAgent, IncomingQuery, LlmOutcome, LlmRequest, LlmResponse, LlmUsage,
+    PROTOCOL_VERSION, read_frame, write_frame,
 };
 use sqlx::SqlitePool;
-use tokio::io::{AsyncBufRead, BufReader};
+use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -38,6 +40,17 @@ use havn_core::Policy;
 use havn_db::repo::agents as agents_repo;
 
 const OUTBOUND_QUEUE_CAPACITY: usize = 64;
+
+/// Per-connection caps on `LlmRequest` / `AgentQuery` frames being handled
+/// at once. Each is a gateway task outside the agent's cgroup; frames over
+/// the cap get an immediate error reply.
+const MAX_INFLIGHT_LLM_REQUESTS: usize = 16;
+const MAX_INFLIGHT_AGENT_QUERIES: usize = 8;
+
+/// Longest one frame write may take. A runtime that stops reading its socket
+/// is disconnected after this, which also releases every task waiting for
+/// room in its outbound queue.
+const AGENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct AgentSocketCtx {
@@ -291,7 +304,7 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
 
     // Attach before sending Welcome, so a second connection for an agent
     // that is already connected is refused before it learns anything.
-    let (tx, mut rx) = mpsc::channel::<GatewayToAgent>(OUTBOUND_QUEUE_CAPACITY);
+    let (tx, rx) = mpsc::channel::<GatewayToAgent>(OUTBOUND_QUEUE_CAPACITY);
     ctx.registry
         .attach(agent_id, tx.clone())
         .await
@@ -389,20 +402,20 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
     info!(%agent_id, "agent connected");
 
     // 4. Writer task: drain mpsc → wire
-    let writer_task = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if let Err(e) = write_frame(&mut write, &frame).await {
-                error!(error = %e, "agent writer failed");
-                break;
-            }
-        }
-    });
+    let mut writer_task = tokio::spawn(run_writer(write, rx, agent_id, ctx.query_broker.clone()));
 
-    // 5. Reader loop
-    let result = run_reader(&mut reader, agent_id, &ctx).await;
+    // 5. Reader loop; the connection also ends when the writer gives up.
+    let reader_result = tokio::select! {
+        result = run_reader(&mut reader, agent_id, &ctx) => Some(result),
+        _ = &mut writer_task => None,
+    };
 
     // 6. Cleanup
     ctx.registry.detach(agent_id, &tx).await;
+    let Some(result) = reader_result else {
+        warn!(%agent_id, "agent writer stopped; connection closed");
+        return Ok(());
+    };
     writer_task.abort();
     let _ = writer_task.await;
 
@@ -414,6 +427,105 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
     Ok(())
 }
 
+async fn run_writer<W>(
+    mut write: W,
+    mut rx: mpsc::Receiver<GatewayToAgent>,
+    agent_id: AgentId,
+    query_broker: crate::query_broker::QueryBroker,
+) where
+    W: AsyncWrite + Unpin,
+{
+    while let Some(frame) = rx.recv().await {
+        let mut next = Some(frame);
+        while let Some(frame) = next.take() {
+            match tokio::time::timeout(AGENT_WRITE_TIMEOUT, write_frame(&mut write, &frame)).await {
+                Ok(Ok(())) => {}
+                // Rejected before anything was written: the stream is intact.
+                Ok(Err(FrameError::FrameTooLarge(size))) => {
+                    next = oversized_reply(agent_id, frame, size, &query_broker).await;
+                }
+                Ok(Err(e)) => {
+                    error!(%agent_id, error = %e, "agent writer failed");
+                    return;
+                }
+                Err(_) => {
+                    warn!(
+                        %agent_id,
+                        timeout_s = AGENT_WRITE_TIMEOUT.as_secs(),
+                        "agent is not reading its socket; disconnecting"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// `frame` is over [`MAX_FRAME_BYTES`] and cannot be sent. Fail whoever is
+/// waiting on it; returns the smaller frame to send in its place, if any.
+async fn oversized_reply(
+    agent_id: AgentId,
+    frame: GatewayToAgent,
+    size: usize,
+    query_broker: &crate::query_broker::QueryBroker,
+) -> Option<GatewayToAgent> {
+    let limit = format!("{size} bytes exceeds the {MAX_FRAME_BYTES}-byte frame limit");
+    match frame {
+        GatewayToAgent::LlmResponse(resp) => {
+            warn!(%agent_id, request_id = %resp.request_id, size, "LlmResponse too large; replying with an error");
+            Some(GatewayToAgent::LlmResponse(LlmResponse {
+                request_id: resp.request_id,
+                outcome: LlmOutcome::Error {
+                    message: format!("provider response of {limit}"),
+                },
+                provider_response: serde_json::Value::Null,
+                usage: resp.usage,
+            }))
+        }
+        GatewayToAgent::AgentQueryResult(result) if !result.transcript.is_null() => {
+            warn!(%agent_id, request_id = %result.request_id, size, "AgentQueryResult too large; dropping its transcript");
+            Some(GatewayToAgent::AgentQueryResult(AgentQueryResult {
+                transcript: serde_json::Value::String(format!(
+                    "transcript omitted: result of {limit}"
+                )),
+                ..result
+            }))
+        }
+        GatewayToAgent::AgentQueryResult(result) => {
+            warn!(%agent_id, request_id = %result.request_id, size, "AgentQueryResult too large; replying with an error");
+            Some(GatewayToAgent::AgentQueryResult(AgentQueryResult {
+                request_id: result.request_id,
+                outcome: AgentQueryOutcome::Error {
+                    message: format!("answer of {limit}"),
+                },
+                text: String::new(),
+                transcript: serde_json::Value::Null,
+            }))
+        }
+        GatewayToAgent::IncomingQuery(query) => {
+            warn!(%agent_id, size, "IncomingQuery too large; failing the query");
+            query_broker
+                .resolve(
+                    agent_id,
+                    AgentQueryResponse {
+                        request_id: query.request_id,
+                        outcome: AgentQueryOutcome::Error {
+                            message: format!("query of {limit}"),
+                        },
+                        text: String::new(),
+                        transcript: serde_json::Value::Null,
+                    },
+                )
+                .await;
+            None
+        }
+        _ => {
+            error!(%agent_id, size, "dropping an outbound frame over the size limit");
+            None
+        }
+    }
+}
+
 async fn run_reader<R>(
     reader: &mut R,
     agent_id: AgentId,
@@ -422,6 +534,8 @@ async fn run_reader<R>(
 where
     R: AsyncBufRead + Unpin,
 {
+    let llm_slots = Arc::new(Semaphore::new(MAX_INFLIGHT_LLM_REQUESTS));
+    let query_slots = Arc::new(Semaphore::new(MAX_INFLIGHT_AGENT_QUERIES));
     while let Some(frame) = read_frame::<_, AgentToGateway>(reader).await? {
         match frame {
             AgentToGateway::Hello { .. } => {
@@ -538,9 +652,27 @@ where
                 }
             }
             AgentToGateway::LlmRequest(req) => {
+                let Ok(permit) = Arc::clone(&llm_slots).try_acquire_owned() else {
+                    warn!(%agent_id, limit = MAX_INFLIGHT_LLM_REQUESTS, "too many LLM requests in flight; refusing one");
+                    let refusal = GatewayToAgent::LlmResponse(LlmResponse {
+                        request_id: req.request_id,
+                        outcome: LlmOutcome::Error {
+                            message: format!(
+                                "this agent already has {MAX_INFLIGHT_LLM_REQUESTS} LLM requests in flight; retry when one finishes"
+                            ),
+                        },
+                        provider_response: serde_json::Value::Null,
+                        usage: None,
+                    });
+                    if let Err(e) = ctx.registry.try_send(agent_id, refusal).await {
+                        debug!(%agent_id, error = %e, "could not deliver LlmRequest refusal");
+                    }
+                    continue;
+                };
                 let ctx_cloned = ctx.clone();
                 tokio::spawn(async move {
                     handle_llm_request(agent_id, req, ctx_cloned).await;
+                    drop(permit);
                 });
             }
             AgentToGateway::LivenessPing => {
@@ -569,12 +701,30 @@ where
             }
             AgentToGateway::AgentQuery(query) => {
                 // Caller-side initiation. Spawn so a slow target doesn't
-                // block the caller's reader loop — the per-target
-                // concurrency cap and timeout enforcement happens
-                // inside the handler.
+                // block the caller's reader loop; at most
+                // MAX_INFLIGHT_AGENT_QUERIES per caller, each bounded by
+                // the timeout enforced inside the handler.
+                let Ok(permit) = Arc::clone(&query_slots).try_acquire_owned() else {
+                    warn!(%agent_id, limit = MAX_INFLIGHT_AGENT_QUERIES, "too many agent queries in flight; refusing one");
+                    let refusal = GatewayToAgent::AgentQueryResult(AgentQueryResult {
+                        request_id: query.request_id,
+                        outcome: AgentQueryOutcome::Error {
+                            message: format!(
+                                "this agent already has {MAX_INFLIGHT_AGENT_QUERIES} queries in flight; retry when one finishes"
+                            ),
+                        },
+                        text: String::new(),
+                        transcript: serde_json::Value::Null,
+                    });
+                    if let Err(e) = ctx.registry.try_send(agent_id, refusal).await {
+                        debug!(%agent_id, error = %e, "could not deliver AgentQuery refusal");
+                    }
+                    continue;
+                };
                 let ctx_cloned = ctx.clone();
                 tokio::spawn(async move {
                     handle_agent_query(agent_id, query, ctx_cloned).await;
+                    drop(permit);
                 });
             }
             AgentToGateway::AgentQueryResponse(resp) => {
@@ -1426,6 +1576,174 @@ mod tests {
             matches!(frame, GatewayToAgent::IncomingQuery(_)),
             "{frame:?}"
         );
+    }
+
+    fn llm_request(request_id: &str) -> LlmRequest {
+        LlmRequest {
+            request_id: request_id.into(),
+            model: "claude-test".into(),
+            messages: serde_json::json!([{ "role": "user", "content": "hi" }]),
+            options: serde_json::json!({}),
+            billing_user_id: None,
+        }
+    }
+
+    fn refused(outcome: &LlmOutcome) -> bool {
+        matches!(outcome, LlmOutcome::Error { message } if message.contains("in flight"))
+    }
+
+    #[tokio::test]
+    async fn llm_requests_over_the_inflight_cap_are_refused_at_once() {
+        let ctx = ctx_with(false, false).await;
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (agent, mut rx) = connected_agent(&ctx, owner, "busy", serde_json::json!({})).await;
+        let mut bytes = Vec::new();
+        for i in 0..=MAX_INFLIGHT_LLM_REQUESTS {
+            write_frame(
+                &mut bytes,
+                &AgentToGateway::LlmRequest(llm_request(&format!("r{i}"))),
+            )
+            .await
+            .expect("encode");
+        }
+
+        // Hold the pool's only connection: every accepted request then
+        // blocks on its database lookup and stays in flight.
+        let held = ctx.db.acquire().await.expect("connection");
+        run_reader(&mut BufReader::new(bytes.as_slice()), agent, &ctx)
+            .await
+            .expect("reader");
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the refusal is immediate")
+            .expect("frame");
+        match frame {
+            GatewayToAgent::LlmResponse(r) => {
+                assert_eq!(r.request_id, format!("r{MAX_INFLIGHT_LLM_REQUESTS}"));
+                assert!(refused(&r.outcome), "{:?}", r.outcome);
+            }
+            other => panic!("unexpected frame {other:?}"),
+        }
+
+        drop(held);
+        for _ in 0..MAX_INFLIGHT_LLM_REQUESTS {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("accepted requests finish")
+                .expect("frame")
+            {
+                GatewayToAgent::LlmResponse(r) => assert!(!refused(&r.outcome), "{:?}", r.outcome),
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_frames_fail_whoever_waits_on_them() {
+        let agent_id = AgentId::new();
+        let broker = crate::query_broker::QueryBroker::new();
+        let (dispatch_id, query_rx) = broker.register(agent_id).await;
+        let (tx, rx) = mpsc::channel(8);
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let writer = tokio::spawn(run_writer(server, rx, agent_id, broker.clone()));
+        let big = "x".repeat(MAX_FRAME_BYTES);
+
+        let frames = [
+            GatewayToAgent::IncomingQuery(IncomingQuery {
+                request_id: dispatch_id,
+                caller_agent_id: AgentId::new().to_string(),
+                billing_user_id: "u".into(),
+                prompt: big.clone(),
+                include_transcript: false,
+            }),
+            GatewayToAgent::LlmResponse(LlmResponse {
+                request_id: "llm".into(),
+                outcome: LlmOutcome::Ok,
+                provider_response: serde_json::json!({ "content": big }),
+                usage: None,
+            }),
+            GatewayToAgent::AgentQueryResult(AgentQueryResult {
+                request_id: "q".into(),
+                outcome: AgentQueryOutcome::Ok,
+                text: "answer".into(),
+                transcript: serde_json::json!([big]),
+            }),
+        ];
+        for frame in frames {
+            tx.send(frame).await.expect("queue");
+        }
+        drop(tx);
+
+        let mut reader = BufReader::new(client);
+        match read_frame::<_, GatewayToAgent>(&mut reader).await {
+            Ok(Some(GatewayToAgent::LlmResponse(r))) => {
+                assert_eq!(r.request_id, "llm");
+                assert!(
+                    matches!(r.outcome, LlmOutcome::Error { .. }),
+                    "{:?}",
+                    r.outcome
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match read_frame::<_, GatewayToAgent>(&mut reader).await {
+            Ok(Some(GatewayToAgent::AgentQueryResult(r))) => {
+                assert_eq!(r.request_id, "q");
+                assert!(
+                    matches!(r.outcome, AgentQueryOutcome::Ok),
+                    "{:?}",
+                    r.outcome
+                );
+                assert_eq!(r.text, "answer");
+                assert!(r.transcript.is_string(), "transcript is replaced by a note");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            read_frame::<_, GatewayToAgent>(&mut reader).await,
+            Ok(None)
+        ));
+        writer.await.expect("writer");
+
+        let answer = tokio::time::timeout(Duration::from_secs(5), query_rx)
+            .await
+            .expect("the caller is not left waiting")
+            .expect("answer");
+        assert!(
+            matches!(answer.outcome, AgentQueryOutcome::Error { .. }),
+            "{:?}",
+            answer.outcome
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_disconnects_an_agent_that_stops_reading() {
+        let (tx, rx) = mpsc::channel(8);
+        let (_client, server) = tokio::io::duplex(64);
+        let writer = tokio::spawn(run_writer(
+            server,
+            rx,
+            AgentId::new(),
+            crate::query_broker::QueryBroker::new(),
+        ));
+        tx.send(GatewayToAgent::LlmResponse(LlmResponse {
+            request_id: "r".into(),
+            outcome: LlmOutcome::Ok,
+            provider_response: serde_json::json!({ "content": "x".repeat(1024) }),
+            usage: None,
+        }))
+        .await
+        .expect("queue");
+
+        tokio::time::timeout(AGENT_WRITE_TIMEOUT * 2, writer)
+            .await
+            .expect("the writer gives up on the agent")
+            .expect("join");
+        assert!(tx.is_closed(), "tasks waiting on the queue are released");
     }
 
     async fn registered_agent(ctx: &AgentSocketCtx) -> AgentId {
