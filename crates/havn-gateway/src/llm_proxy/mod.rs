@@ -40,6 +40,7 @@ use sqlx::SqlitePool;
 use thiserror::Error;
 use tracing::{info, warn};
 
+use crate::config::LlmConfig;
 use crate::credential_resolver::{
     credential_caps, minute_ago_utc_rfc3339, resolve_for_user, today_start_utc_rfc3339,
 };
@@ -239,19 +240,10 @@ pub async fn complete(
     keyring: &KeyRing,
     billing: &Billing,
     request: &AnthropicRequest,
-    max_tokens_ceiling: u32,
+    llm: &LlmConfig,
 ) -> Result<AnthropicResponse, ProxyError> {
     let provider_name = provider::provider_for_model(&request.model);
-    complete_with_provider(
-        db,
-        http,
-        keyring,
-        billing,
-        provider_name,
-        request,
-        max_tokens_ceiling,
-    )
-    .await
+    complete_with_provider(db, http, keyring, billing, provider_name, request, llm).await
 }
 
 /// Like [`complete`], but the caller has already decided which provider to
@@ -263,11 +255,16 @@ pub async fn complete_with_provider(
     billing: &Billing,
     provider_name: &str,
     request: &AnthropicRequest,
-    max_tokens_ceiling: u32,
+    llm: &LlmConfig,
 ) -> Result<AnthropicResponse, ProxyError> {
+    let provider = dispatch_provider(provider_name)?;
     let route = Route {
-        provider: dispatch_provider(provider_name)?,
+        provider,
         name: provider_name,
+        base_url: llm
+            .base_url
+            .get(provider_name)
+            .map_or(provider.default_base_url(), |url| url.trim_end_matches('/')),
     };
     complete_through(
         db,
@@ -276,17 +273,18 @@ pub async fn complete_with_provider(
         route,
         billing,
         request,
-        max_tokens_ceiling,
+        llm.max_tokens_ceiling,
     )
     .await
 }
 
-/// The provider implementation a call goes through and the provider name
-/// its credentials are stored under.
+/// The provider implementation a call goes through, the provider name
+/// its credentials are stored under, and the API base URL it calls.
 #[derive(Clone, Copy)]
 struct Route<'a> {
     provider: &'a dyn LlmProvider,
     name: &'a str,
+    base_url: &'a str,
 }
 
 fn with_max_tokens(request: &AnthropicRequest, max_tokens: u32) -> Cow<'_, AnthropicRequest> {
@@ -392,7 +390,7 @@ async fn complete_through(
         let granted = u32::try_from(reserved.tokens_out).unwrap_or(request.max_tokens);
         let attempt_request = with_max_tokens(request, granted.min(request.max_tokens));
 
-        match try_one(http, keyring, route.provider, &cred, &attempt_request).await {
+        match try_one(http, keyring, route, &cred, &attempt_request).await {
             Attempt::Ok(resp) => {
                 if resp.usage.unreported {
                     warn!(
@@ -705,23 +703,21 @@ pub async fn anthropic_complete(
     keyring: &KeyRing,
     billing: &Billing,
     request: &AnthropicRequest,
-    max_tokens_ceiling: u32,
+    llm: &LlmConfig,
 ) -> Result<AnthropicResponse, ProxyError> {
-    complete_with_provider(
-        db,
-        http,
-        keyring,
-        billing,
-        "anthropic",
-        request,
-        max_tokens_ceiling,
-    )
-    .await
+    complete_with_provider(db, http, keyring, billing, "anthropic", request, llm).await
+}
+
+/// Whether `name` is a provider the proxy can call.
+#[must_use]
+pub fn is_provider(name: &str) -> bool {
+    dispatch_provider(name).is_ok()
 }
 
 fn dispatch_provider(name: &str) -> Result<&'static dyn LlmProvider, ProxyError> {
     // Static dispatch — providers are stateless or hold only `&'static`
-    // config (base_url, extra headers), so each lives as a const value.
+    // config (default base URL, extra headers), so each lives as a const
+    // value; the operator's `[llm.base_url]` travels in the `Route`.
     // Adding a new provider means one new arm here plus its module.
     static ANTHROPIC: anthropic::AnthropicProvider = anthropic::AnthropicProvider;
     static GEMINI: gemini::GeminiProvider = gemini::GeminiProvider;
@@ -740,7 +736,7 @@ fn dispatch_provider(name: &str) -> Result<&'static dyn LlmProvider, ProxyError>
 async fn try_one(
     http: &reqwest::Client,
     keyring: &KeyRing,
-    provider: &dyn LlmProvider,
+    route: Route<'_>,
     cred: &Credential,
     request: &AnthropicRequest,
 ) -> Attempt {
@@ -765,7 +761,11 @@ async fn try_one(
         };
     };
 
-    match provider.complete(http, api_key, request).await {
+    match route
+        .provider
+        .complete(http, route.base_url, api_key, request)
+        .await
+    {
         Ok(resp) => Attempt::Ok(resp),
         Err(e) => classify(e),
     }
@@ -984,9 +984,14 @@ mod tests {
                 "anthropic"
             }
 
+            fn default_base_url(&self) -> &'static str {
+                "http://fake.invalid"
+            }
+
             async fn complete(
                 &self,
                 _http: &reqwest::Client,
+                _base_url: &str,
                 api_key: &str,
                 request: &AnthropicRequest,
             ) -> Result<AnthropicResponse, ProviderError> {
@@ -1094,6 +1099,7 @@ mod tests {
                 Route {
                     provider,
                     name: "anthropic",
+                    base_url: provider.default_base_url(),
                 },
                 billing,
                 request,

@@ -104,6 +104,9 @@ pub struct GatewayConfig {
     /// ```toml
     /// [llm]
     /// max_tokens_ceiling = 16000
+    ///
+    /// [llm.base_url]
+    /// anthropic = "https://llm-gateway.internal.example"
     /// ```
     #[serde(default)]
     pub llm: LlmConfig,
@@ -278,6 +281,12 @@ pub struct LlmConfig {
     /// with small caps, a lower value keeps one user's large `max_tokens`
     /// from tying up the remaining budget of everyone else.
     pub max_tokens_ceiling: u32,
+    /// API base URL per provider (`anthropic`, `openai`, `openrouter`,
+    /// `gemini`) in place of the provider's public one, for an
+    /// API-compatible endpoint or a test double. The provider's credentials
+    /// are sent there. Operator config only; agents and API users cannot set
+    /// it.
+    pub base_url: std::collections::BTreeMap<String, String>,
 }
 
 pub const DEFAULT_MAX_TOKENS_CEILING: u32 = 128_000;
@@ -286,6 +295,7 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             max_tokens_ceiling: DEFAULT_MAX_TOKENS_CEILING,
+            base_url: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -423,6 +433,25 @@ impl GatewayConfig {
     fn validate_llm(&self) -> anyhow::Result<()> {
         if self.llm.max_tokens_ceiling == 0 {
             anyhow::bail!("[llm] max_tokens_ceiling must be at least 1");
+        }
+        for (provider, url) in &self.llm.base_url {
+            if !crate::llm_proxy::is_provider(provider) {
+                anyhow::bail!("[llm.base_url] names an unknown provider {provider:?}");
+            }
+            let plain = reqwest::Url::parse(url).is_ok_and(|u| {
+                matches!(u.scheme(), "http" | "https")
+                    && u.has_host()
+                    && u.username().is_empty()
+                    && u.password().is_none()
+                    && u.query().is_none()
+                    && u.fragment().is_none()
+            });
+            if !plain {
+                anyhow::bail!(
+                    "[llm.base_url] {provider} = {url:?} must be an http(s) URL without \
+                     credentials, query or fragment"
+                );
+            }
         }
         Ok(())
     }
@@ -818,5 +847,28 @@ mod tests {
         );
         assert!(msg.contains("max_tokens_ceiling"), "{msg}");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn llm_base_url_must_name_a_provider_and_be_a_plain_url() {
+        let p = write_tmp_config("[llm.base_url]\nanthropic = \"http://127.0.0.1:9000\"\n");
+        let cfg = GatewayConfig::load_from(&p).expect("load");
+        assert_eq!(
+            cfg.llm.base_url.get("anthropic").map(String::as_str),
+            Some("http://127.0.0.1:9000")
+        );
+        let _ = std::fs::remove_file(&p);
+        for bad in [
+            "[llm.base_url]\nacme = \"https://llm.example\"\n",
+            "[llm.base_url]\nopenai = \"ftp://llm.example\"\n",
+            "[llm.base_url]\nopenai = \"https://user:pw@llm.example\"\n",
+            "[llm.base_url]\ngemini = \"https://llm.example/v1?key=x\"\n",
+            "[llm.base_url]\nopenrouter = \"not a url\"\n",
+        ] {
+            let p = write_tmp_config(bad);
+            let msg = format!("{:#}", GatewayConfig::load_from(&p).expect_err(bad));
+            assert!(msg.contains("[llm.base_url]"), "{msg}");
+            let _ = std::fs::remove_file(&p);
+        }
     }
 }

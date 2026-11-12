@@ -41,8 +41,8 @@ pub enum ProviderError {
     /// HTTP 4xx other than 401/402/429 — caller's request is malformed.
     /// Fatal; do not iterate.
     BadRequest { status: u16, body: String },
-    /// Network / TLS / DNS failure. Try next (the next credential may target
-    /// a different base_url and succeed).
+    /// Network / TLS / DNS failure. Try next (the next credential may be
+    /// served by a healthier upstream path).
     Transport(String),
     /// Provider returned a body we couldn't translate into canonical shape.
     /// Fatal — iterating won't fix a shape bug.
@@ -76,11 +76,17 @@ pub trait LlmProvider: Send + Sync {
     )]
     fn name(&self) -> &'static str;
 
-    /// Make one call against `api_key` for the given canonical request.
-    /// Translation in/out happens inside this call.
+    /// The provider's public API base URL, used unless `[llm.base_url]`
+    /// names another one for this provider.
+    fn default_base_url(&self) -> &'static str;
+
+    /// Make one call against `api_key` at `base_url` (no trailing slash) for
+    /// the given canonical request. Translation in/out happens inside this
+    /// call.
     async fn complete(
         &self,
         http: &reqwest::Client,
+        base_url: &str,
         api_key: &str,
         request: &AnthropicRequest,
     ) -> Result<AnthropicResponse, ProviderError>;

@@ -53,7 +53,7 @@ pub async fn anthropic(
         ring,
         &llm_proxy::Billing::user(user.id),
         &req,
-        state.max_tokens_ceiling,
+        &state.llm,
     )
     .await
     .map_err(map_proxy_error)?;

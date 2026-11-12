@@ -201,6 +201,13 @@ db_path = "~/.local/share/havn/havn.db"
 max_tokens_ceiling = 16000   # 0 is rejected
 ```
 
+To send a provider's calls to another endpoint that speaks the same API (an internal LLM gateway, or a mock in tests), set its base URL under `[llm.base_url]`. The provider's credentials are sent there as well, so use `https` for anything not on the gateway host. Only the operator's config can set it, not agents or API users, and it applies on `havn gateway restart`. The keys and their defaults are `anthropic` (`https://api.anthropic.com`), `openai` (`https://api.openai.com/v1`), `openrouter` (`https://openrouter.ai/api/v1`) and `gemini` (`https://generativelanguage.googleapis.com/v1beta`):
+
+```toml
+[llm.base_url]
+anthropic = "https://llm-gateway.internal.example"
+```
+
 Config edits are picked up live: hot-reloadable fields (`allowed_origins`, `[[bindings]]`, `[[channels]]`) apply in place, while deploy-time fields (`listen`, `db_path`, paths) are logged as needing a `havn gateway restart` to apply — the gateway never restarts itself. Per-agent resource limits come from the agent's role policy, not a global config block.
 
 For non-loopback exposure, configure a reverse proxy and enable trust-header mode:

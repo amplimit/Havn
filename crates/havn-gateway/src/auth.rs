@@ -424,7 +424,7 @@ pub(crate) mod tests {
             )),
             agent_env_passthrough: Arc::new(Vec::new()),
             keyring: None,
-            max_tokens_ceiling: crate::config::DEFAULT_MAX_TOKENS_CEILING,
+            llm: Arc::new(crate::config::LlmConfig::default()),
         };
         (app, bootstrap)
     }
