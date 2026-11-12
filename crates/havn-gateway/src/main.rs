@@ -61,12 +61,15 @@ struct AppState {
     /// is off (single-user loopback mode, spec §1.7).
     pub bootstrap_user_id: UserId,
     /// `Some` when `trust_header` is enabled: the `auth::AuthedUser`
-    /// extractor reads `X-User-ID` only from connections whose peer address
-    /// is in this list (`allowed_proxies`, loopback when empty), then looks
-    /// it up in the `users` table; anything else → 403. Required (gateway
-    /// refuses to start) for any non-loopback listen address — see startup
-    /// guard in [`enforce_listen_safety`].
+    /// extractor reads the identity header only from connections whose peer
+    /// address is in this list (`allowed_proxies`, loopback when empty), then
+    /// looks it up in the `users` table; anything else → 403. Required
+    /// (gateway refuses to start) for any non-loopback listen address — see
+    /// startup guard in [`enforce_listen_safety`].
     pub trusted_proxies: Option<Arc<Vec<auth::IpCidr>>>,
+    /// Header carrying the identity (`trust_header.header`) and whether its
+    /// value may match an internal user id.
+    pub identity: auth::IdentityHeader,
     pub http: reqwest::Client,
     pub registry: AgentRegistry,
     pub spawner: Arc<dyn AgentSpawner>,
@@ -170,6 +173,9 @@ async fn main() -> anyhow::Result<()> {
 
     enforce_listen_safety(&cfg.listen, cfg.trust_header.enabled)
         .context("listen-address safety check (spec §1.7)")?;
+    let identity = auth::IdentityHeader::from_config(&cfg.trust_header)
+        .map_err(anyhow::Error::msg)
+        .context("parsing gateway.trust_header.header")?;
     let trusted_proxies = if cfg.trust_header.enabled {
         let proxies = auth::trusted_proxies(&cfg.trust_header.allowed_proxies)
             .map_err(anyhow::Error::msg)
@@ -177,13 +183,16 @@ async fn main() -> anyhow::Result<()> {
         if cfg.trust_header.allowed_proxies.is_empty() && !is_loopback(&cfg.listen) {
             warn!(
                 listen = %cfg.listen,
+                header = %identity.name,
                 "trust_header.allowed_proxies is empty, so only loopback peers may set \
-                 X-User-ID; a reverse proxy on another host will get 403"
+                 the identity header; a reverse proxy on another host will get 403"
             );
         }
         info!(
             ?proxies,
-            "trust_header enabled; X-User-ID accepted only from these peers"
+            header = %identity.name,
+            match_user_id = identity.match_user_id,
+            "trust_header enabled; identity header accepted only from these peers"
         );
         Some(Arc::new(proxies))
     } else {
@@ -311,7 +320,7 @@ async fn main() -> anyhow::Result<()> {
                     loopback_trusted = proxies.iter().any(|p| p.covers_loopback()),
                     "agents run without network isolation and share the host network: any \
                      trusted proxy range that contains a host address (loopback included) \
-                     lets them send X-User-ID as any user"
+                     lets them send the identity header as any user"
                 );
             }
         }
@@ -356,6 +365,7 @@ async fn main() -> anyhow::Result<()> {
         db: db.clone(),
         bootstrap_user_id: user.id,
         trusted_proxies,
+        identity,
         http: http.clone(),
         registry: registry.clone(),
         spawner,
@@ -760,7 +770,7 @@ fn enforce_listen_safety(listen: &str, trust_header_enabled: bool) -> anyhow::Re
             tracing::info!(
                 listen,
                 "non-loopback listen with trust_header enabled — gateway is \
-                 expecting a reverse proxy to set X-User-ID. The gateway will \
+                 expecting a reverse proxy to set the identity header. The gateway will \
                  NOT authenticate users itself; ensure the proxy is the only \
                  way packets reach this address."
             );
@@ -776,10 +786,11 @@ fn enforce_listen_safety(listen: &str, trust_header_enabled: bool) -> anyhow::Re
          it without an upstream proxy + trust_header would let any caller \
          act as the bootstrap user.\n\
          \n\
-         Fix: set [gateway.trust_header] enabled = true in config.toml \
+         Fix: set [trust_header] enabled = true in config.toml \
          (or HAVN_TRUST_HEADER=1 in the env), put a reverse proxy that \
-         emits X-User-ID in front of the gateway, and provision users via \
-         `havn user add <id> --display-name \"...\"`. See spec §1.7."
+         sets the identity header in front of the gateway, and provision users \
+         via `havn user add --external-id <value> --display-name \"...\"`. \
+         See spec §1.7."
     );
 }
 

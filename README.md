@@ -165,9 +165,13 @@ listen = "0.0.0.0:8080"
 
 [trust_header]
 enabled = true
-# Peers allowed to set X-User-ID; everyone else gets 403.
+# Peers allowed to set the identity header; everyone else gets 403.
 # Empty means loopback only (a proxy on the same host).
 allowed_proxies = ["127.0.0.1/32"]
+# Header carrying the user's identity (default "X-User-ID").
+header = "X-Forwarded-Email"
+# Match header values against external ids only (see below).
+match_user_id = false
 ```
 
 In trust-header (multi-user) mode:
@@ -178,6 +182,108 @@ In trust-header (multi-user) mode:
 - The gateway-wide embedding configuration can only be changed in `config.toml`.
 
 Cron jobs may carry a `wake_check` script. It runs on the host as the dedicated `havn-wakecheck` user (created by `install.sh`; the gateway must run as root to switch to it) with a minimal environment. Without that user the script is skipped and the job always wakes.
+
+### Multi-user mode behind an SSO proxy
+
+The gateway reads the user's identity from one header, `trust_header.header` (default `X-User-ID`), and only on connections from an `allowed_proxies` peer. It resolves the value to a havn user in this order:
+
+1. When `match_user_id = true` (the default) and the value is a UUID: the user with that internal id.
+2. The user whose external id equals the value. Matching is exact and case-sensitive: `Alice@example.com` and `alice@example.com` are different identities, so provision the value exactly as your proxy emits it.
+
+Anything else gets 403; users are never created on the fly. A request carrying the header more than once is refused. Set `match_user_id = false` whenever users can choose their own username at the identity provider, otherwise a user could pick another user's internal id as their name.
+
+Provision users with the value the proxy will send:
+
+```sh
+havn user add --external-id alice@example.com --display-name "Alice"   # generates the internal id
+havn user add 0190a3c4-... --display-name "Bob"                         # internal id only (X-User-ID setups)
+havn user list                                                          # id, name, external id
+havn user set-external-id <existing-id> ops@example.com                 # e.g. the single-user bootstrap user
+```
+
+The dashboard forwards the same header to the gateway. Give it the same name in `HAVN_DASHBOARD_IDENTITY_HEADER`, and list the address the SSO proxy connects from in `HAVN_DASHBOARD_TRUSTED_PROXIES`; it drops the header, and other common identity headers such as `Remote-User` and `X-Forwarded-Email`, from every other peer, and drops `X-User-ID` from every peer when another header is configured. When the dashboard runs on the gateway host, the gateway sees the dashboard as a loopback peer, so `allowed_proxies = ["127.0.0.1/32"]` covers it. Route both the UI and `/api` and `/ws` through the SSO proxy, without unauthenticated paths: a path the proxy skips would pass through whatever header the client sent.
+
+#### oauth2-proxy
+
+oauth2-proxy in front of the dashboard, all on one host. `--pass-user-headers` (on by default) makes oauth2-proxy replace `X-Forwarded-User` and `X-Forwarded-Email` on every request it forwards upstream, WebSocket upgrades included:
+
+```sh
+oauth2-proxy \
+  --http-address=0.0.0.0:4180 \
+  --upstream=http://127.0.0.1:3000/ \
+  --provider=oidc --oidc-issuer-url=https://sso.example.com \
+  --client-id=havn --client-secret-file=/etc/oauth2-proxy/client-secret \
+  --cookie-secret-file=/etc/oauth2-proxy/cookie-secret \
+  --email-domain=example.com \
+  --pass-user-headers=true
+
+HAVN_DASHBOARD_TRUSTED_PROXIES=127.0.0.1 \
+HAVN_DASHBOARD_IDENTITY_HEADER=X-Forwarded-Email \
+npm start   # in apps/dashboard
+```
+
+```toml
+[trust_header]
+enabled = true
+allowed_proxies = ["127.0.0.1/32"]
+header = "X-Forwarded-Email"
+match_user_id = false
+```
+
+```sh
+havn user add --external-id alice@example.com --display-name "Alice"
+```
+
+To key users on the provider's user id instead of the email, use `X-Forwarded-User` in both places and provision the value oauth2-proxy logs for each user. When oauth2-proxy runs as an nginx `auth_request` endpoint instead of in front of the dashboard, start it with `--set-xauthrequest` and copy its `X-Auth-Request-Email` response header into the forwarded request as in the next recipe.
+
+#### nginx `auth_request` with Authelia
+
+nginx terminates TLS, asks Authelia whether the request is authenticated, and copies Authelia's `Remote-User` response header into the request to the dashboard. `proxy_set_header` replaces whatever `Remote-User` the client sent:
+
+```nginx
+location /internal/authelia/authz {
+    internal;
+    proxy_pass http://127.0.0.1:9091/api/authz/auth-request;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    proxy_set_header X-Original-Method $request_method;
+    proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+    proxy_set_header X-Forwarded-For $remote_addr;
+}
+
+location / {
+    auth_request /internal/authelia/authz;
+    auth_request_set $user $upstream_http_remote_user;
+    auth_request_set $redirection_url $upstream_http_location;
+    error_page 401 =302 $redirection_url;
+
+    proxy_set_header Remote-User $user;
+    proxy_set_header X-User-ID "";
+    proxy_set_header Host $host;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;   # map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+    proxy_pass http://127.0.0.1:3000;
+}
+```
+
+```sh
+HAVN_DASHBOARD_TRUSTED_PROXIES=127.0.0.1 HAVN_DASHBOARD_IDENTITY_HEADER=Remote-User npm start
+```
+
+```toml
+[trust_header]
+enabled = true
+allowed_proxies = ["127.0.0.1/32"]
+header = "Remote-User"
+match_user_id = false
+```
+
+```sh
+havn user add --external-id alice --display-name "Alice"   # the Authelia username
+```
+
+The same pattern works for Cloudflare Access (`header = "Cf-Access-Authenticated-User-Email"`, with `allowed_proxies` set to the address `cloudflared` connects from) and any other proxy that replaces a header with the authenticated user's name.
 
 ## Channel Adapters
 

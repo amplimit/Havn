@@ -6,8 +6,11 @@
  *
  * The dashboard has no login of its own, so it listens on 127.0.0.1 by
  * default. In multi-user mode an authenticating proxy in front of it
- * sets X-User-ID; that header is forwarded to the gateway only from the
+ * sets the identity header (HAVN_DASHBOARD_IDENTITY_HEADER, default
+ * X-User-ID); that header is forwarded to the gateway only from the
  * peers listed in HAVN_DASHBOARD_TRUSTED_PROXIES and dropped otherwise.
+ * X-User-ID is always dropped unless it is the configured header, and
+ * other common identity headers are dropped from untrusted peers.
  *
  * WS path: browser opens `ws://<dashboard-host>:3000/ws/chat/<id>?token=…`,
  * we open a raw TCP socket to the gateway (default `127.0.0.1:8080`),
@@ -31,7 +34,14 @@ const TRUSTED_PROXIES = (process.env.HAVN_DASHBOARD_TRUSTED_PROXIES ?? "")
   .split(",")
   .map((entry) => entry.trim())
   .filter(Boolean);
-const IDENTITY_HEADER = "x-user-id";
+const DEFAULT_IDENTITY_HEADER = "x-user-id";
+const IDENTITY_HEADER = (process.env.HAVN_DASHBOARD_IDENTITY_HEADER || DEFAULT_IDENTITY_HEADER)
+  .trim()
+  .toLowerCase();
+if (!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(IDENTITY_HEADER)) {
+  console.error(`HAVN_DASHBOARD_IDENTITY_HEADER is not a valid header name (got ${IDENTITY_HEADER})`);
+  process.exit(1);
+}
 const MAX_UPGRADE_RESPONSE_HEAD = 16 * 1024;
 const GATEWAY = process.env.HAVN_GATEWAY_URL ?? "http://127.0.0.1:8080";
 const WS_PREFIX = "/ws/";
@@ -89,6 +99,32 @@ function mayAssertIdentity(req) {
   return TRUSTED_PROXIES.includes(peerAddress(req));
 }
 
+// Headers common SSO proxies use for the user's identity. An untrusted
+// peer never gets any of them through, so a gateway configured with one
+// of these names stays safe even if this server is left on another name.
+const KNOWN_IDENTITY_HEADERS = new Set([
+  DEFAULT_IDENTITY_HEADER,
+  "remote-user",
+  "remote-email",
+  "x-remote-user",
+  "x-forwarded-user",
+  "x-forwarded-email",
+  "x-forwarded-preferred-username",
+  "x-auth-request-user",
+  "x-auth-request-email",
+  "cf-access-authenticated-user-email",
+]);
+
+// The configured identity header passes only from a trusted peer;
+// X-User-ID never passes when another header is configured, so a gateway
+// left on the default name cannot be reached with a client-chosen value.
+function dropsIdentity(name, trusted) {
+  const lower = name.toLowerCase();
+  if (lower === IDENTITY_HEADER) return !trusted;
+  if (lower === DEFAULT_IDENTITY_HEADER) return true;
+  return !trusted && KNOWN_IDENTITY_HEADERS.has(lower);
+}
+
 function endToEndHeaders(headers) {
   const out = {};
   for (const [name, value] of Object.entries(headers)) {
@@ -101,11 +137,14 @@ function endToEndHeaders(headers) {
 
 function forwardedHeaders(req) {
   const headers = { ...endToEndHeaders(req.headers), host: gatewayUrl.host };
-  if (!mayAssertIdentity(req)) delete headers[IDENTITY_HEADER];
+  const trusted = mayAssertIdentity(req);
+  for (const name of Object.keys(headers)) {
+    if (dropsIdentity(name, trusted)) delete headers[name];
+  }
   // A chunked request body must stay chunked upstream. Without framing,
   // Node writes the decoded body of a GET/DELETE/OPTIONS as raw bytes on
   // a keep-alive connection, and the gateway parses them as a second
-  // request (which would carry whatever X-User-ID the client chose).
+  // request (which would carry whatever identity the client chose).
   if (req.headers["transfer-encoding"] !== undefined) {
     headers["transfer-encoding"] = "chunked";
   }
@@ -182,7 +221,7 @@ server.on("upgrade", (req, clientSocket, head) => {
     const trusted = mayAssertIdentity(req);
     const headerLines = Object.entries(req.headers)
       .filter(([k, v]) => v !== undefined && k.toLowerCase() !== "origin")
-      .filter(([k]) => trusted || k.toLowerCase() !== IDENTITY_HEADER)
+      .filter(([k]) => !dropsIdentity(k, trusted))
       .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(", ") : v}`);
     headerLines.push(`origin: ${canonicalOrigin}`);
     const requestLine = `${req.method} ${req.url} HTTP/${req.httpVersion}`;
@@ -228,7 +267,7 @@ server.on("upgrade", (req, clientSocket, head) => {
 server.listen(PORT, HOST, () => {
   console.log(`havn dashboard listening on http://${HOST}:${PORT}`);
   console.log(
-    `  X-User-ID accepted from: ${TRUSTED_PROXIES.length ? TRUSTED_PROXIES.join(", ") : "nobody"}`,
+    `  ${IDENTITY_HEADER} accepted from: ${TRUSTED_PROXIES.length ? TRUSTED_PROXIES.join(", ") : "nobody"}`,
   );
   console.log(`  /api and /ws proxy → ${GATEWAY_HOST}:${GATEWAY_PORT}${DEV ? " (dev)" : ""}`);
 });

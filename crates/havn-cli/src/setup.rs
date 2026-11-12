@@ -54,15 +54,25 @@ debounce_ms = 300
 # Spec §1.7: havn does no auth. Single-user loopback installs leave
 # this `false` — the bootstrap user owns everything. To run multi-user,
 # put a reverse proxy in front (Authelia, Keycloak, Cloudflare Access,
-# Tailscale, nginx auth_request, …) that emits X-User-ID, set this to
-# `true`, change `listen` above to a non-loopback address, and
-# pre-provision users with `havn user add <id> --display-name "..."`.
+# Tailscale, nginx auth_request, …) that emits the user's identity in
+# `header`, set this to `true`, change `listen` above to a non-loopback
+# address, and pre-provision users with
+# `havn user add --external-id <value> --display-name "..."` (or
+# `havn user add <uuid> ...` when the proxy sends havn user ids).
 #
 # The gateway refuses to start with a non-loopback listen address
 # unless this flag is true (or `HAVN_TRUST_HEADER=1` is set).
 enabled = false
-# Peers allowed to set X-User-ID (CIDRs or IPs). Empty = loopback only.
+# Peers allowed to set the identity header (CIDRs or IPs). Empty =
+# loopback only.
 allowed_proxies = []
+# Header carrying the identity, e.g. "X-Forwarded-User", "Remote-User",
+# "Cf-Access-Authenticated-User-Email". Values are matched exactly
+# (case-sensitive) against user ids and `--external-id` values.
+header = "X-User-ID"
+# Set false when the proxy emits usernames users can choose themselves,
+# so a value is only ever matched against external ids.
+match_user_id = true
 "#,
             listen = self.listen,
             db = db.display().to_string(),

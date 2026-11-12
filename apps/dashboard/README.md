@@ -39,7 +39,8 @@ talks to the dashboard's origin. Settings, read at startup:
 | `PORT` | `3000` | Dashboard port |
 | `HAVN_DASHBOARD_HOST` | `127.0.0.1` | Listen address |
 | `HAVN_GATEWAY_URL` | `http://127.0.0.1:8080` | Gateway address (http only) |
-| `HAVN_DASHBOARD_TRUSTED_PROXIES` | empty | Comma-separated peer addresses allowed to set `X-User-ID` |
+| `HAVN_DASHBOARD_TRUSTED_PROXIES` | empty | Comma-separated peer addresses allowed to set the identity header |
+| `HAVN_DASHBOARD_IDENTITY_HEADER` | `X-User-ID` | Identity header forwarded to the gateway; must match `trust_header.header` in the gateway config |
 
 The proxy presents WebSocket upgrades to the gateway with
 `Origin: http://127.0.0.1:<PORT>`. The default port is in the gateway's
@@ -49,18 +50,24 @@ default `allowed_origins`; if you change `PORT`, add
 ## Access from another machine
 
 The dashboard has no login of its own: anyone who can reach it acts as
-the single-user operator, or as whatever `X-User-ID` they are allowed to
-send. Keep it on `127.0.0.1` and reach it through one of:
+the single-user operator, or as whatever identity header they are allowed
+to send. Keep it on `127.0.0.1` and reach it through one of:
 
 - **An SSH tunnel** (single user): `ssh -L 3000:127.0.0.1:3000 <server>`,
   then open `http://localhost:3000`.
 - **An authenticating reverse proxy** on the same host (multi-user). The
-  proxy logs the user in and sets `X-User-ID` to that user's havn user id
-  (the UUID from `havn user add`) on every request it forwards, replacing
-  any value the client sent, including on routes it does not
-  authenticate. Set `HAVN_DASHBOARD_TRUSTED_PROXIES` to the exact address
-  the proxy connects from (for example `127.0.0.1`; no ranges or host
-  names); from any other peer the dashboard drops `X-User-ID`.
+  proxy logs the user in and sets the identity header
+  (`HAVN_DASHBOARD_IDENTITY_HEADER`, for example `X-Forwarded-User`) to
+  the user's havn user id or external id (`havn user add --external-id`)
+  on every request it forwards, replacing any value the client sent,
+  including on routes it does not authenticate. Set
+  `HAVN_DASHBOARD_TRUSTED_PROXIES` to the exact address the proxy connects
+  from (for example `127.0.0.1`; no ranges or host names); from any other
+  peer the dashboard drops the identity header and other common identity
+  headers (`Remote-User`, `X-Forwarded-User`, `X-Forwarded-Email`, ...).
+  `X-User-ID` is dropped from every peer when another header is configured. See the
+  [main README](../../README.md#multi-user-mode-behind-an-sso-proxy) for
+  proxy recipes.
   Trusting `127.0.0.1` trusts every process on the host, including other
   OS users and agents run with `HAVN_SPAWNER=subprocess`.
 
