@@ -105,8 +105,9 @@ pub fn generate_code() -> Result<String> {
 }
 
 /// Canonical form of something a user typed: dashes (including the
-/// Unicode dashes and minus sign that editors and chat apps substitute),
-/// whitespace and zero-width characters dropped, upper-cased, and the
+/// Unicode dashes, minus sign and fullwidth, small and soft hyphens that
+/// editors and chat apps substitute), whitespace and zero-width
+/// characters dropped, upper-cased, and the
 /// Crockford look-alikes (O to 0, I and L to 1) folded. `None` unless
 /// the result is exactly one code.
 #[must_use]
@@ -117,6 +118,9 @@ pub fn normalize_code(input: &str) -> Option<String> {
             c,
             '-' | '\u{2010}'..='\u{2015}'
                 | '\u{2212}'
+                | '\u{ff0d}'
+                | '\u{fe63}'
+                | '\u{ad}'
                 | '\u{200b}'..='\u{200d}'
                 | '\u{2060}'
                 | '\u{feff}'
@@ -475,6 +479,8 @@ mod tests {
             "7K3M\u{2212}QX9P\u{2011}2HWD\u{2015}RT4B",
             "\u{feff}7K3M-\u{200b}QX9P-2HWD\u{200d}-RT4B\u{2060}",
             "\u{a0}7K3M QX9P\u{a0}2HWD RT4B\u{a0}",
+            "7K3M\u{ff0d}QX9P\u{fe63}2HWD\u{ad}RT4B",
+            "7K3M\u{ad}QX9P\u{ad}2HWD\u{ad}RT4B\u{ad}",
         ] {
             assert_eq!(
                 normalize_code(pasted).as_deref(),

@@ -28,7 +28,8 @@ use havn_db::repo::credentials::{self as creds, CredentialScope};
 use havn_proto::GatewayToAgent;
 use havn_proto::channel::{ChannelFrame, ChannelInbound, ChannelMessageContent};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -69,9 +70,10 @@ const INVITE_WELCOME_MESSAGE: &str = "Your invite code was accepted. You can now
 /// keeps them unguessable; it stops one sender from hammering the DB.
 const INVITE_ATTEMPT_LIMIT: u32 = 5;
 const INVITE_ATTEMPT_WINDOW: Duration = Duration::from_secs(900);
-/// Senders tracked at once. Once full, senders not yet tracked are
-/// refused until the next prune, so a flood of fresh sender ids cannot
-/// grow the map without bound.
+/// Senders tracked at once. Once full, the sender whose window started
+/// first is forgotten to make room, so memory stays bounded and a flood
+/// of fresh sender ids cannot lock everyone else out of redeeming. The
+/// limiter only bounds DB load; the codes' 80 bits keep them secret.
 const INVITE_LIMITER_MAX_KEYS: usize = 10_000;
 
 /// Rate-limits rejection messages to unauthorized senders. Without
@@ -118,10 +120,6 @@ pub enum InviteAttempt {
     Limited {
         first: bool,
     },
-    /// The limiter tracks [`INVITE_LIMITER_MAX_KEYS`] senders already.
-    Full {
-        first: bool,
-    },
 }
 
 /// Counts invite-code attempts from unauthorized senders in a fixed
@@ -135,8 +133,27 @@ pub struct InviteAttemptLimiter {
 #[derive(Debug, Default)]
 struct AttemptState {
     windows: HashMap<String, AttemptWindow>,
+    /// Keys in the order their windows started, oldest first. An entry
+    /// goes stale when its key's window is evicted or restarts; stale
+    /// entries are skipped on eviction and dropped on prune.
+    order: VecDeque<(String, Instant)>,
     last_prune: Option<Instant>,
-    full_logged: bool,
+    evict_logged: bool,
+}
+
+impl AttemptState {
+    fn is_live(&self, key: &str, start: Instant) -> bool {
+        self.windows.get(key).is_some_and(|w| w.start == start)
+    }
+
+    fn evict_oldest(&mut self) {
+        while let Some((key, start)) = self.order.pop_front() {
+            if self.is_live(&key, start) {
+                self.windows.remove(&key);
+                return;
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -169,7 +186,8 @@ impl InviteAttemptLimiter {
     }
 
     fn check_at(&self, key: &str, now: Instant) -> InviteAttempt {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = &mut *guard;
         if state
             .last_prune
             .is_none_or(|t| now.duration_since(t) >= INVITE_ATTEMPT_WINDOW)
@@ -177,20 +195,36 @@ impl InviteAttemptLimiter {
             state
                 .windows
                 .retain(|_, w| now.duration_since(w.start) < INVITE_ATTEMPT_WINDOW);
+            let windows = &state.windows;
+            state
+                .order
+                .retain(|(k, start)| windows.get(k).is_some_and(|w| w.start == *start));
             state.last_prune = Some(now);
-            state.full_logged = false;
+            state.evict_logged = false;
         }
         if !state.windows.contains_key(key) && state.windows.len() >= INVITE_LIMITER_MAX_KEYS {
-            let first = !std::mem::replace(&mut state.full_logged, true);
-            return InviteAttempt::Full { first };
+            state.evict_oldest();
+            if !std::mem::replace(&mut state.evict_logged, true) {
+                warn!(
+                    limit = INVITE_LIMITER_MAX_KEYS,
+                    "invite: attempt limiter is full; forgetting the oldest senders"
+                );
+            }
         }
-        let window = state
-            .windows
-            .entry(key.to_string())
-            .or_insert_with(|| AttemptWindow::at(now));
-        if now.duration_since(window.start) >= INVITE_ATTEMPT_WINDOW {
-            *window = AttemptWindow::at(now);
-        }
+        let window = match state.windows.entry(key.to_string()) {
+            Entry::Occupied(e) => {
+                let window = e.into_mut();
+                if now.duration_since(window.start) >= INVITE_ATTEMPT_WINDOW {
+                    *window = AttemptWindow::at(now);
+                    state.order.push_back((key.to_string(), now));
+                }
+                window
+            }
+            Entry::Vacant(e) => {
+                state.order.push_back((key.to_string(), now));
+                e.insert(AttemptWindow::at(now))
+            }
+        };
         if window.count >= INVITE_ATTEMPT_LIMIT {
             let first = !std::mem::replace(&mut window.logged, true);
             return InviteAttempt::Limited { first };
@@ -901,15 +935,6 @@ async fn sender_access(
             }
             return SenderAccess::Denied;
         }
-        InviteAttempt::Full { first } => {
-            if first {
-                warn!(
-                    limit = INVITE_LIMITER_MAX_KEYS,
-                    "invite: attempt limiter is full; ignoring codes from new senders until it is pruned"
-                );
-            }
-            return SenderAccess::Denied;
-        }
     }
     let invite = match channel_access::redeem(
         &state.db,
@@ -1040,7 +1065,7 @@ mod tests {
     }
 
     #[test]
-    fn invite_attempt_limiter_refuses_new_senders_when_full() {
+    fn invite_attempt_limiter_evicts_the_oldest_sender_when_full() {
         let limiter = InviteAttemptLimiter::new();
         let start = Instant::now();
         for i in 0..INVITE_LIMITER_MAX_KEYS {
@@ -1049,27 +1074,37 @@ mod tests {
                 InviteAttempt::Allowed
             );
         }
+        for _ in 0..INVITE_ATTEMPT_LIMIT {
+            limiter.check_at("telegram|bot|tg:1", start);
+        }
         assert_eq!(
             limiter.check_at("telegram|bot|tg:new", start),
-            InviteAttempt::Full { first: true }
-        );
-        assert_eq!(
-            limiter.check_at("telegram|bot|tg:other", start),
-            InviteAttempt::Full { first: false }
-        );
-        assert_eq!(
-            limiter.check_at("telegram|bot|tg:0", start),
             InviteAttempt::Allowed,
-            "senders already tracked keep their budget"
+            "a new sender is admitted while the limiter is full"
         );
+        {
+            let state = limiter.state.lock().unwrap();
+            assert_eq!(state.windows.len(), INVITE_LIMITER_MAX_KEYS);
+            assert!(!state.windows.contains_key("telegram|bot|tg:0"));
+        }
+        assert!(
+            matches!(
+                limiter.check_at("telegram|bot|tg:1", start),
+                InviteAttempt::Limited { .. }
+            ),
+            "senders still tracked keep their count"
+        );
+        for i in 0..INVITE_LIMITER_MAX_KEYS {
+            limiter.check_at(&format!("telegram|bot|flood:{i}"), start);
+        }
         let later = start + INVITE_ATTEMPT_WINDOW;
         assert_eq!(
-            limiter.check_at("telegram|bot|tg:new", later),
-            InviteAttempt::Allowed,
-            "the prune after a window frees the slots"
+            limiter.check_at("telegram|bot|tg:late", later),
+            InviteAttempt::Allowed
         );
-        let len = limiter.state.lock().unwrap().windows.len();
-        assert_eq!(len, 1);
+        let state = limiter.state.lock().unwrap();
+        assert_eq!(state.windows.len(), 1, "the prune drops expired windows");
+        assert_eq!(state.order.len(), 1, "and their stale order entries");
     }
 
     mod invites {
@@ -1289,6 +1324,23 @@ mod tests {
             assert!(f.forwarded().is_empty());
             f.send("tg:2", &code).await;
             assert!(f.allowed("tg:2").await, "other senders keep their budget");
+        }
+
+        #[tokio::test]
+        async fn new_sender_redeems_while_the_limiter_is_full() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            for i in 0..INVITE_LIMITER_MAX_KEYS {
+                f.state
+                    .invite_attempt_limiter
+                    .check(&format!("telegram|bot|flood:{i}"));
+            }
+            let code = f.invite("bot").await;
+            f.send("tg:new", &code).await;
+            assert!(f.allowed("tg:new").await);
+            assert_eq!(
+                f.replies(),
+                vec![("tg:new".to_string(), INVITE_WELCOME_MESSAGE.to_string())]
+            );
         }
 
         #[tokio::test]
