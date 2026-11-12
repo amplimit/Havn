@@ -1,0 +1,49 @@
+# Reference systemd unit for the havn gateway.
+#
+# install.sh copies it to /usr/local/lib/systemd/system/havn.service; it is
+# not enabled. Put local changes in a drop-in (`systemctl edit havn`) so a
+# re-install does not overwrite them. To use it:
+#
+#   install -d -m 700 /etc/havn
+#   install -m 600 /dev/null /etc/havn/havn.env
+#   echo 'HAVN_AGE_KEY=<your passphrase>' > /etc/havn/havn.env
+#   havn setup --non-interactive        # as root, once
+#   systemctl enable --now havn
+#   journalctl -u havn -f
+
+[Unit]
+Description=havn gateway
+Documentation=https://github.com/amplimit/havn
+# The gateway finds the host's outbound interface for agent NAT at startup.
+Wants=network-online.target
+After=network-online.target
+# Stop retrying after five failed starts in five minutes (e.g. a bad config).
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Runs as root: agent namespaces, the per-agent cgroups and the NAT rules
+# need it.
+ExecStart=/usr/local/bin/havn-gateway
+# Same config and data paths as `havn setup` run by root
+# (~/.config/havn/config.toml, ~/.local/share/havn). Set HAVN_CONFIG in the
+# environment file to use another config file.
+Environment=HOME=/root
+# HAVN_AGE_KEY=... (and any other HAVN_* settings), one per line. Keep the
+# file mode 600.
+EnvironmentFile=/etc/havn/havn.env
+# The gateway creates each agent's cgroup under /sys/fs/cgroup/havn.slice,
+# a top-level cgroup it manages itself, outside this unit's cgroup.
+# Delegate=yes makes systemd keep the cpu, memory and pids controllers
+# enabled on the path from the root and leave cgroups below the unit to the
+# gateway. Do not set Slice=havn.slice: systemd would then own the
+# havn.slice cgroup that the gateway writes agent cgroups into.
+Delegate=yes
+# Stopping the unit does not signal the agents (they are outside its
+# cgroup); each agent exits when its connection to the gateway closes.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

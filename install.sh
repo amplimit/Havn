@@ -21,6 +21,7 @@
 #   HAVN_SKIP_RUSTUP=1  ./install.sh                    # CI runner already has Rust
 #   HAVN_SKIP_USER=1    ./install.sh                    # no system-user creation
 #   HAVN_SKIP_SETUP=1   ./install.sh                    # no `havn setup` (CI)
+#   HAVN_SKIP_SYSTEMD=1 ./install.sh                    # no systemd unit install
 #
 # Exit codes: 0 ok; non-zero on any step failure (no partial state assumed).
 
@@ -35,6 +36,26 @@ log() { printf '\033[1;36m▶\033[0m %s\n' "$*" >&2; }
 ok()  { printf '\033[1;32m✓\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[1;33m!\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
+
+# `command -v`, plus the sbin directories an unprivileged PATH often lacks
+# (iptables and ip live there on Debian / Ubuntu).
+have_tool() {
+    command -v "$1" >/dev/null 2>&1 && return 0
+    local dir
+    for dir in /usr/local/sbin /usr/sbin /sbin; do
+        [ -x "$dir/$1" ] && return 0
+    done
+    return 1
+}
+
+APT_UPDATED=false
+apt_install() {
+    if ! $APT_UPDATED; then
+        $SUDO apt-get update -qq
+        APT_UPDATED=true
+    fi
+    $SUDO apt-get install -y --no-install-recommends "$@"
+}
 
 # Resolve `sudo` — empty string when running as root or when sudo is absent
 # and we already have permission (the per-call check below catches misuse).
@@ -85,8 +106,7 @@ try_prebuilt() {
     # lacks it (cheap — not the build-essential toolchain).
     if ! command -v curl >/dev/null 2>&1; then
         if command -v apt-get >/dev/null 2>&1; then
-            $SUDO apt-get update -qq
-            $SUDO apt-get install -y --no-install-recommends curl ca-certificates
+            apt_install curl ca-certificates
         else
             warn "curl not found and apt unavailable; building from source"; return 1
         fi
@@ -139,15 +159,19 @@ if $use_source; then
     for tool in cc pkg-config curl git; do
         command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
     done
+    # A `cc` without libc headers / startup files (no libc6-dev) passes the
+    # check above but fails the bundled C builds (sqlite, aws-lc) late.
+    if command -v cc >/dev/null 2>&1; then
+        printf '#include <stdio.h>\nint main(void) { return puts("") < 0; }\n' >"$STAGE/probe.c"
+        cc "$STAGE/probe.c" -o "$STAGE/probe" >/dev/null 2>&1 || missing="$missing libc-headers"
+    fi
     if [ -z "$missing" ]; then
         log "build prerequisites already installed; skipping apt"
     elif command -v apt-get >/dev/null 2>&1; then
         log "installing build prerequisites via apt (missing:$missing)"
-        $SUDO apt-get update -qq
-        $SUDO apt-get install -y --no-install-recommends \
-            build-essential pkg-config curl ca-certificates git
+        apt_install build-essential pkg-config curl ca-certificates git
     else
-        log "apt-get not found; assuming build-essential / pkg-config / git are already installed"
+        warn "apt-get not found; install these yourself if the build fails:$missing (C compiler, libc headers, pkg-config, curl, git)"
     fi
 
     # 3. rustup (skipped on CI runners that already have a toolchain).
@@ -193,7 +217,24 @@ for bin in $BINARIES; do
     $SUDO install -m 755 "$ARTIFACT_DIR/$bin" "$INSTALL_PREFIX/$bin"
 done
 
-# 7. Create the dedicated `havn-wakecheck` system user (spec §8.5 / §11).
+# 7. Network tools the gateway runs for agent egress (veth + NAT, spec §4.1).
+# Without them the gateway still starts, but every agent has no outbound
+# network.
+missing_net=""
+for tool in iptables ip nsenter; do
+    have_tool "$tool" || missing_net="$missing_net $tool"
+done
+if [ -z "$missing_net" ]; then
+    ok "network tools present (iptables, ip, nsenter)"
+elif command -v apt-get >/dev/null 2>&1; then
+    log "installing network tools via apt (missing:$missing_net)"
+    apt_install iptables iproute2 util-linux \
+        || warn "apt-get failed; agents will have no outbound network until iptables, iproute2 and util-linux are installed"
+else
+    warn "missing:$missing_net — agents will have no outbound network; install iptables (nft or legacy backend), iproute2 (ip) and util-linux (nsenter)"
+fi
+
+# 8. Create the dedicated `havn-wakecheck` system user (spec §8.5 / §11).
 # Wake-check subprocesses setuid to this UID so a malicious cron config can't
 # touch the gateway's data directory or hold its credentials.
 if [ "${HAVN_SKIP_USER:-0}" != "1" ]; then
@@ -211,7 +252,30 @@ if [ "${HAVN_SKIP_USER:-0}" != "1" ]; then
     fi
 fi
 
-# 8. Run `havn setup --non-interactive` so the data dir + config exist on first run.
+# 9. Reference systemd unit, installed but not enabled. The vendor path keeps
+# operator changes (drop-ins, or a copy in /etc/systemd/system) intact on
+# re-install.
+readonly UNIT_DIR="/usr/local/lib/systemd/system"
+unit_installed=false
+if [ "${HAVN_SKIP_SYSTEMD:-0}" != "1" ] && [ -d /run/systemd/system ]; then
+    if $use_source; then
+        unit_src="$SRC_DIR/contrib/systemd/havn.service"
+    else
+        unit_src="$STAGE/havn.service"
+    fi
+    if [ -f "$unit_src" ]; then
+        sed "s|^ExecStart=/usr/local/bin/|ExecStart=${INSTALL_PREFIX%/}/|" "$unit_src" >"$STAGE/unit"
+        $SUDO install -d -m 755 "$UNIT_DIR"
+        $SUDO install -m 644 "$STAGE/unit" "$UNIT_DIR/havn.service"
+        $SUDO systemctl daemon-reload || warn "systemctl daemon-reload failed"
+        unit_installed=true
+        ok "installed $UNIT_DIR/havn.service (not enabled)"
+    else
+        warn "this release ships no havn.service; see contrib/systemd/havn.service in the repository"
+    fi
+fi
+
+# 10. Run `havn setup --non-interactive` so the data dir + config exist on first run.
 if [ "${HAVN_SKIP_SETUP:-0}" != "1" ]; then
     log "running havn setup --non-interactive"
     "$INSTALL_PREFIX/havn" setup --non-interactive
@@ -221,8 +285,18 @@ ok "install complete"
 cat <<EOF >&2
 
 next:
-  havn start                                    # launch the gateway
+  havn start                                    # launch the gateway (as root)
   havn credential add anthropic <YOUR_API_KEY>  # in another shell, after gateway is up
   havn agent create my-first-agent
   open http://127.0.0.1:8080/healthz            # confirm the gateway responds
+  havn doctor                                   # check isolation and network prerequisites
 EOF
+if $unit_installed; then
+    cat <<EOF >&2
+
+or run the gateway under systemd:
+  sudo install -d -m 700 /etc/havn
+  sudo install -m 600 /dev/null /etc/havn/havn.env   # then add HAVN_AGE_KEY=<passphrase>
+  sudo systemctl enable --now havn
+EOF
+fi

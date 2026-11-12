@@ -9,13 +9,19 @@
 //!   → gateway refuses to boot.
 //! - `runtime_binary` / `init_binary` paths in config point at stale
 //!   targets (built debug-only, then `cargo clean`).
-//! - cgroup v2 not mounted → spawner crashes per-agent.
+//! - cgroup v2 not mounted, or `havn.slice` cannot be created / written
+//!   → the gateway refuses to start with isolation.
+//! - `iptables` / `ip` / `nsenter` missing → agents start without
+//!   outbound network.
 //! - Stale PID file → `havn gateway start --detach` refuses.
 //! - Database schema out of sync (migration didn't run).
 //! - Gateway is up but no listen socket (rare, but happens when the
 //!   OS denies bind).
 
-use std::path::Path;
+use std::ffi::{CString, OsString};
+use std::io;
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::{Path, PathBuf};
 
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
@@ -73,6 +79,10 @@ pub async fn run() -> anyhow::Result<()> {
     let v = check_landlock();
     mark!(v);
     let v = check_cgroup_v2();
+    mark!(v);
+    let v = check_cgroup_slice();
+    mark!(v);
+    let v = check_network_tools();
     mark!(v);
     let v = check_db(&cfg).await;
     mark!(v);
@@ -252,18 +262,7 @@ fn check_cgroup_v2() -> Verdict {
         );
         return Verdict::Warn;
     }
-    if Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
-        // SAFETY: geteuid has no preconditions and cannot fail.
-        if unsafe { libc::geteuid() } != 0 {
-            line(
-                Verdict::Warn,
-                "cgroup v2",
-                "mounted, but not running as root — agent isolation needs root (or a cgroup \
-                 delegated with Delegate=yes); otherwise the gateway refuses to start unless \
-                 HAVN_SPAWNER=subprocess",
-            );
-            return Verdict::Warn;
-        }
+    if Path::new(CGROUP_ROOT).join("cgroup.controllers").exists() {
         line(Verdict::Ok, "cgroup v2", "mounted at /sys/fs/cgroup");
         Verdict::Ok
     } else {
@@ -274,6 +273,177 @@ fn check_cgroup_v2() -> Verdict {
         );
         Verdict::Fail
     }
+}
+
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// `havn_spawner::cgroup::SLICE`; the CLI does not link the spawner.
+const CGROUP_SLICE: &str = "havn.slice";
+
+const REQUIRED_CONTROLLERS: &[&str] = &["cpu", "memory", "pids"];
+
+/// What the gateway's cgroup setup needs, gathered without creating the
+/// slice or touching `cgroup.subtree_control`.
+#[derive(Debug)]
+struct SliceProbe {
+    slice: PathBuf,
+    slice_exists: bool,
+    /// Write access to the slice, or to the cgroup root while the slice
+    /// does not exist yet.
+    writable: io::Result<()>,
+    /// The cgroup root's `cgroup.controllers`.
+    controllers: io::Result<String>,
+    root_user: bool,
+}
+
+fn probe_slice(root: &Path) -> SliceProbe {
+    let slice = root.join(CGROUP_SLICE);
+    let slice_exists = slice.is_dir();
+    let writable = writable(if slice_exists { &slice } else { root });
+    SliceProbe {
+        slice,
+        slice_exists,
+        writable,
+        controllers: std::fs::read_to_string(root.join("cgroup.controllers")),
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        root_user: unsafe { libc::geteuid() } == 0,
+    }
+}
+
+fn writable(path: &Path) -> io::Result<()> {
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `c` is a valid NUL-terminated path for the duration of the call.
+    if unsafe { libc::access(c.as_ptr(), libc::W_OK) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+const SLICE_HINT: &str = "run the gateway as root (see contrib/systemd/havn.service), or set \
+                          HAVN_SPAWNER=subprocess to run agents WITHOUT isolation (dev only)";
+
+fn slice_verdict(p: &SliceProbe) -> (Verdict, String) {
+    let slice = p.slice.display();
+    if let Err(e) = &p.writable {
+        let what = if p.slice_exists {
+            format!("{slice} is not writable")
+        } else {
+            format!("cannot create {slice}")
+        };
+        return (
+            Verdict::Warn,
+            format!("{what} ({e}) — the gateway refuses to start; {SLICE_HINT}"),
+        );
+    }
+    let raw = match &p.controllers {
+        Ok(raw) => raw,
+        Err(e) => {
+            return (
+                Verdict::Warn,
+                format!("cannot read cgroup.controllers at the cgroup root: {e}"),
+            );
+        }
+    };
+    let missing: Vec<&str> = REQUIRED_CONTROLLERS
+        .iter()
+        .copied()
+        .filter(|c| !raw.split_whitespace().any(|t| t == *c))
+        .collect();
+    if !missing.is_empty() {
+        return (
+            Verdict::Warn,
+            format!(
+                "cgroup controllers `{}` are not offered at the cgroup root — the gateway \
+                 refuses to start",
+                missing.join(" ")
+            ),
+        );
+    }
+    if !p.root_user {
+        return (
+            Verdict::Warn,
+            format!(
+                "{slice} is writable, but not running as root — agent isolation also needs \
+                 root for namespaces and NAT; {SLICE_HINT}"
+            ),
+        );
+    }
+    let state = if p.slice_exists {
+        "is writable"
+    } else {
+        "can be created"
+    };
+    (Verdict::Ok, format!("{slice} {state}"))
+}
+
+fn check_cgroup_slice() -> Verdict {
+    let root = Path::new(CGROUP_ROOT);
+    if !cfg!(target_os = "linux") || !root.join("cgroup.controllers").exists() {
+        return Verdict::Ok;
+    }
+    let (v, msg) = slice_verdict(&probe_slice(root));
+    line(v, "cgroup slice", &msg);
+    v
+}
+
+/// Binaries the spawner execs for per-agent networking, with the Debian /
+/// Ubuntu package that ships each.
+const NETWORK_TOOLS: &[(&str, &str)] = &[
+    ("iptables", "iptables"),
+    ("ip", "iproute2"),
+    ("nsenter", "util-linux"),
+];
+
+/// An unprivileged shell often lacks the sbin directories on `PATH`, while
+/// the root gateway has them.
+const SBIN_DIRS: &[&str] = &["/usr/local/sbin", "/usr/sbin", "/sbin"];
+
+fn find_tool(name: &str, path_var: Option<&OsString>) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut dirs: Vec<PathBuf> = path_var
+        .map(|p| std::env::split_paths(p).collect())
+        .unwrap_or_default();
+    dirs.extend(SBIN_DIRS.iter().map(PathBuf::from));
+    dirs.into_iter().map(|d| d.join(name)).find(|p| {
+        p.metadata()
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    })
+}
+
+fn network_tools_verdict(missing: &[(&str, &str)]) -> (Verdict, String) {
+    if missing.is_empty() {
+        let bins: Vec<&str> = NETWORK_TOOLS.iter().map(|(bin, _)| *bin).collect();
+        return (Verdict::Ok, format!("{} found", bins.join(", ")));
+    }
+    let bins: Vec<&str> = missing.iter().map(|(bin, _)| *bin).collect();
+    let packages: Vec<&str> = missing.iter().map(|(_, pkg)| *pkg).collect();
+    (
+        Verdict::Warn,
+        format!(
+            "{} not found — agents start without outbound network; install with \
+             `apt-get install {}` (iptables with the nft or legacy backend) and restart the \
+             gateway",
+            bins.join(", "),
+            packages.join(" ")
+        ),
+    )
+}
+
+fn check_network_tools() -> Verdict {
+    if !cfg!(target_os = "linux") {
+        return Verdict::Ok;
+    }
+    let path_var = std::env::var_os("PATH");
+    let missing: Vec<(&str, &str)> = NETWORK_TOOLS
+        .iter()
+        .copied()
+        .filter(|(bin, _)| find_tool(bin, path_var.as_ref()).is_none())
+        .collect();
+    let (v, msg) = network_tools_verdict(&missing);
+    line(v, "network tools", &msg);
+    v
 }
 
 async fn check_db(cfg: &CliConfig) -> Verdict {
@@ -372,5 +542,104 @@ async fn check_gateway_reachable(cfg: &CliConfig) -> Verdict {
             );
             Verdict::Fail
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn probe(slice_exists: bool, writable: io::Result<()>, root_user: bool) -> SliceProbe {
+        SliceProbe {
+            slice: PathBuf::from("/sys/fs/cgroup/havn.slice"),
+            slice_exists,
+            writable,
+            controllers: Ok("cpuset cpu io memory hugetlb pids rdma misc\n".into()),
+            root_user,
+        }
+    }
+
+    fn denied() -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::EACCES))
+    }
+
+    #[test]
+    fn uncreatable_slice_warns_with_fix_hint() {
+        let (v, msg) = slice_verdict(&probe(false, denied(), false));
+        assert!(matches!(v, Verdict::Warn));
+        assert!(
+            msg.contains("cannot create /sys/fs/cgroup/havn.slice"),
+            "{msg}"
+        );
+        assert!(msg.contains("run the gateway as root"), "{msg}");
+    }
+
+    #[test]
+    fn unwritable_existing_slice_warns() {
+        let (v, msg) = slice_verdict(&probe(true, denied(), true));
+        assert!(matches!(v, Verdict::Warn));
+        assert!(msg.contains("is not writable"), "{msg}");
+    }
+
+    #[test]
+    fn read_only_cgroupfs_warns_even_as_root() {
+        let ro = Err(io::Error::from_raw_os_error(libc::EROFS));
+        let (v, _) = slice_verdict(&probe(false, ro, true));
+        assert!(matches!(v, Verdict::Warn));
+    }
+
+    #[test]
+    fn missing_controller_warns() {
+        let mut p = probe(true, Ok(()), true);
+        p.controllers = Ok("cpu io pids\n".into());
+        let (v, msg) = slice_verdict(&p);
+        assert!(matches!(v, Verdict::Warn));
+        assert!(msg.contains("`memory`"), "{msg}");
+    }
+
+    #[test]
+    fn writable_slice_without_root_warns() {
+        let (v, msg) = slice_verdict(&probe(true, Ok(()), false));
+        assert!(matches!(v, Verdict::Warn));
+        assert!(msg.contains("not running as root"), "{msg}");
+    }
+
+    #[test]
+    fn creatable_slice_as_root_is_ok() {
+        let (v, msg) = slice_verdict(&probe(false, Ok(()), true));
+        assert!(matches!(v, Verdict::Ok));
+        assert!(msg.contains("can be created"), "{msg}");
+    }
+
+    #[test]
+    fn missing_network_tools_warn_with_packages() {
+        let (v, msg) = network_tools_verdict(&[("iptables", "iptables"), ("ip", "iproute2")]);
+        assert!(matches!(v, Verdict::Warn));
+        assert!(msg.starts_with("iptables, ip not found"), "{msg}");
+        assert!(msg.contains("without outbound network"), "{msg}");
+        assert!(msg.contains("apt-get install iptables iproute2"), "{msg}");
+    }
+
+    #[test]
+    fn present_network_tools_are_ok() {
+        let (v, _) = network_tools_verdict(&[]);
+        assert!(matches!(v, Verdict::Ok));
+    }
+
+    #[test]
+    fn find_tool_needs_an_executable_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("havn-doctor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = dir.join("havn-doctor-tool");
+        std::fs::write(&tool, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = Some(dir.clone().into_os_string());
+        assert_eq!(find_tool("havn-doctor-tool", path.as_ref()), None);
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(find_tool("havn-doctor-tool", path.as_ref()), Some(tool));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
