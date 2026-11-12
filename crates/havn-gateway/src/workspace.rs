@@ -38,21 +38,25 @@ const BOOTSTRAP_FILES: &[&str] = &["SOUL.md", "USER.md", "HEARTBEAT.md"];
 /// Idempotent — safe to call on an existing workspace.
 pub async fn ensure(workspace_dir: &Path) -> std::io::Result<()> {
     tokio::fs::create_dir_all(workspace_dir).await?;
-    tokio::fs::create_dir_all(workspace_dir.join("skills")).await?;
-
-    let readme_path = workspace_dir.join("README.md");
-    if !tokio::fs::try_exists(&readme_path).await? {
-        tokio::fs::write(&readme_path, README).await?;
-    }
-
-    for name in BOOTSTRAP_FILES {
-        let path = workspace_dir.join(name);
-        if !tokio::fs::try_exists(&path).await? {
-            tokio::fs::write(&path, "").await?;
+    let workspace_dir = workspace_dir.to_path_buf();
+    // The workspace is agent-writable: create missing entries without
+    // following anything the agent may have put there.
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let ws = crate::agent_files::WorkspaceDir::open(&workspace_dir)?;
+        // mkdir does not follow a symlink in its last component; an
+        // existing entry of any kind is left alone.
+        match std::fs::create_dir(workspace_dir.join("skills")) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+            _ => {}
         }
-    }
-
-    Ok(())
+        ws.create_if_missing("README.md", README)?;
+        for name in BOOTSTRAP_FILES {
+            ws.create_if_missing(name, "")?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 #[cfg(test)]

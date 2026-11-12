@@ -121,54 +121,22 @@ pub async fn curator_reports(
 ) -> Result<Json<CuratorReportsResponse>, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
     let agent_id = agent.id;
-    let dir = state
+    let workspace = state
         .workspace_root
         .join(agent_id.to_string())
-        .join("workspace")
-        .join(".curator");
-    if !tokio::fs::try_exists(&dir).await.unwrap_or(false) {
+        .join("workspace");
+    // The workspace is agent-writable: open it and `.curator` without
+    // following symlinks and read only regular files.
+    let found = tokio::task::spawn_blocking(move || read_curator_reports(&workspace))
+        .await
+        .map_err(|e| ApiError::Internal(format!("curator reports task: {e}")))?;
+    let Some(mut reports) = found else {
         return Ok(Json(CuratorReportsResponse {
             agent_id: agent_id.to_string(),
             reports: Vec::new(),
             uninitialised: true,
         }));
-    }
-    let mut reports = Vec::new();
-    let mut entries = match tokio::fs::read_dir(&dir).await {
-        Ok(e) => e,
-        Err(_) => {
-            return Ok(Json(CuratorReportsResponse {
-                agent_id: agent_id.to_string(),
-                reports,
-                uninitialised: false,
-            }));
-        }
     };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("md") {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let metadata = match entry.metadata().await {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let body = tokio::fs::read_to_string(&path)
-            .await
-            .unwrap_or_else(|_| "(failed to read report)".into());
-        reports.push(CuratorReportFile {
-            name: name.to_string(),
-            size_bytes: metadata.len(),
-            modified_at: metadata.modified().ok().and_then(|t| {
-                let dur = t.duration_since(std::time::UNIX_EPOCH).ok()?;
-                DateTime::<Utc>::from_timestamp(dur.as_secs() as i64, dur.subsec_nanos())
-            }),
-            body,
-        });
-    }
     // Newest first.
     reports.sort_by(|a, b| b.name.cmp(&a.name));
     Ok(Json(CuratorReportsResponse {
@@ -176,6 +144,42 @@ pub async fn curator_reports(
         reports,
         uninitialised: false,
     }))
+}
+
+/// Cap on one curator report and on how many are returned.
+const MAX_REPORT_BYTES: u64 = 1024 * 1024;
+const MAX_REPORTS: usize = 200;
+
+/// `None` when the workspace or its `.curator` directory does not exist.
+fn read_curator_reports(workspace: &std::path::Path) -> Option<Vec<CuratorReportFile>> {
+    let ws = crate::agent_files::WorkspaceDir::open(workspace).ok()?;
+    let dir = ws.subdir(".curator").ok().flatten()?;
+    let mut files = dir.regular_files().unwrap_or_default();
+    files.retain(|(name, _)| name.ends_with(".md"));
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.truncate(MAX_REPORTS);
+    let reports = files
+        .into_iter()
+        .map(|(name, metadata)| {
+            let body = match dir.read_text(&name, MAX_REPORT_BYTES) {
+                Ok(Some(text)) => text,
+                _ => "(failed to read report)".into(),
+            };
+            CuratorReportFile {
+                size_bytes: metadata.len(),
+                modified_at: metadata.modified().ok().and_then(|t| {
+                    let dur = t.duration_since(std::time::UNIX_EPOCH).ok()?;
+                    DateTime::<Utc>::from_timestamp(
+                        i64::try_from(dur.as_secs()).ok()?,
+                        dur.subsec_nanos(),
+                    )
+                }),
+                name,
+                body,
+            }
+        })
+        .collect();
+    Some(reports)
 }
 
 /// `POST /agents/:id/skills/:name/pin` and `.../unpin` — flip the
