@@ -1,10 +1,16 @@
-//! PreToolUse hooks — operator-defined deny rules that run before each
-//! tool dispatch (Claude Code pattern, validated by web research as a
-//! top user-praise feature).
+//! PreToolUse hooks — deny rules that run before each tool dispatch
+//! (Claude Code pattern).
 //!
-//! From the user's seat: in `workspace/.havn/hooks.yaml` you write a
-//! few lines of YAML to forbid specific tool calls before they reach
-//! the OS — no per-call confirmation prompt, no surprise. Example:
+//! Rules come from two layers, applied together:
+//!
+//! 1. The policy the gateway resolves for the agent and ships in the
+//!    Welcome frame (`policy.hooks`). The agent cannot edit it, so these
+//!    are the operator's rules.
+//! 2. An optional `<workspace>/.havn/hooks.yaml`. The agent can write its
+//!    workspace, so this file can only add rules on top of the policy's;
+//!    deleting or rewriting it never removes a policy rule.
+//!
+//! Both use the same shape (the policy form nests it under `hooks:`):
 //!
 //! ```yaml
 //! pre_tool_use:
@@ -18,27 +24,38 @@
 //!       - "://internal\\.corp\\.net"
 //! ```
 //!
-//! The runtime loads `hooks.yaml` once per session start (Phase 2 —
-//! hot-reload comes with the gateway's reload subsystem extension if a
-//! user asks). On every tool dispatch, [`HookSet::veto`] runs each
-//! pattern matching the tool name against a *flattened-string view* of
-//! the input (the shell tool's `command` field, the file_write's
-//! `path`, etc.). On match, dispatch returns a structured tool_result
-//! error so the LLM sees and adapts its plan.
+//! Hooks are guardrails against model mistakes, not a security
+//! boundary: each pattern is a regex on a *flattened-string view* of the
+//! input (the shell tool's `command` field, the file_write's `path`,
+//! etc.), and a determined agent can phrase the same action so no
+//! pattern matches (`rm  -rf`, `cd / && rm -rf`, a script file).
+//! Enforcement belongs to the policy permissions (`can_use_shell`,
+//! `can_access_network`, `network_policy`, mounts) and the sandbox.
+//!
+//! The runtime loads both layers once per session start. On every tool
+//! dispatch, [`HookSet::veto`] runs each pattern matching the tool name;
+//! on match, dispatch returns a structured tool_result error so the LLM
+//! sees and adapts its plan.
 //!
 //! Design notes vs Claude Code:
 //! - Claude Code lets hooks shell out to external commands; we keep
 //!   the v1 surface to in-process regex match. External-command hooks
 //!   add an exec/seccomp surface that's not worth the complexity until
 //!   real users ask for it.
-//! - Both forbid and allow modes exist in the literature; we ship
-//!   deny-only for v1 because the failure mode is fail-safe (hook
-//!   error → tool denied → user sees the deny in the result).
+//! - Deny-only. The gateway validates policy hooks strictly where a
+//!   policy is written (`Policy::validate`). The workspace file is read
+//!   leniently: unknown keys are ignored, and invalid patterns and rules
+//!   past the caps are dropped with a warning. A file that is not valid
+//!   YAML drops the workspace layer; the policy rules always apply.
+//! - Patterns compile once per session start, with twice the size limit
+//!   the gateway validates against, so a regex crate upgrade that grows
+//!   compiled programs does not stop agents from starting.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use havn_core::{HookPolicy, MAX_HOOK_PATTERN_LEN, MAX_HOOK_PATTERNS, MAX_HOOK_RULES};
 use regex::Regex;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -63,57 +80,123 @@ pub struct HookSet {
 /// Live handle to the hook set, swappable atomically on reload.
 pub type Hooks = Arc<ArcSwap<HookSet>>;
 
+/// Build the session's hook set: the policy's rules plus any rules in
+/// `<workspace>/.havn/hooks.yaml`. The workspace file can only add rules.
+/// An invalid policy pattern is an error. The rule and pattern caps
+/// apply to the workspace file, not to the policy: a resolved policy can
+/// hold the union of several validated ones. A reload must also go
+/// through here so it keeps the policy rules.
+pub async fn load(policy: &HookPolicy, workspace: &Path) -> Result<HookSet, String> {
+    let mut set = compile(policy).map_err(|e| format!("policy hooks: {e}"))?;
+    let workspace_rules = load_from_workspace(workspace).await.rules;
+    set.rules.extend(workspace_rules);
+    if !set.is_empty() {
+        info!(
+            policy_rules = policy.pre_tool_use.len(),
+            total_rules = set.rules.len(),
+            "PreToolUse hooks loaded"
+        );
+    }
+    Ok(set)
+}
+
 /// Default file location: `<workspace>/.havn/hooks.yaml`. Missing file
-/// is fine; returns an empty HookSet so the dispatch path is a no-op.
-pub async fn load_from_workspace(workspace: &Path) -> HookSet {
+/// is fine; returns an empty HookSet.
+async fn load_from_workspace(workspace: &Path) -> HookSet {
     let path = workspace.join(".havn").join("hooks.yaml");
     let content = match tokio::fs::read_to_string(&path).await {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            debug!(path = %path.display(), "no hooks.yaml; PreToolUse hooks inactive");
+            debug!(path = %path.display(), "no workspace hooks.yaml");
             return HookSet::default();
         }
         Err(e) => {
-            warn!(path = %path.display(), error = %e, "reading hooks.yaml failed; PreToolUse hooks inactive");
+            warn!(path = %path.display(), error = %e, "reading hooks.yaml failed; workspace hooks inactive");
             return HookSet::default();
         }
     };
     match parse(&content) {
-        Ok(set) => {
-            info!(rules = set.rules.len(), "PreToolUse hooks loaded");
-            set
-        }
+        Ok(set) => set,
         Err(e) => {
-            warn!(error = %e, "hooks.yaml malformed; PreToolUse hooks inactive (fail-safe)");
+            warn!(error = %e, "hooks.yaml malformed; workspace hooks inactive, policy hooks still apply");
             HookSet::default()
         }
     }
 }
 
-/// Parse a hooks YAML body. Public for tests + future hot-reload.
-pub fn parse(yaml: &str) -> Result<HookSet, String> {
+const COMPILE_SIZE_LIMIT: usize = 2 * havn_core::HOOK_REGEX_SIZE_LIMIT;
+
+/// Lenient parse of the workspace file; only YAML that does not parse at
+/// all is an error.
+fn parse(yaml: &str) -> Result<HookSet, String> {
     #[derive(Deserialize)]
-    struct Raw {
+    struct File {
         #[serde(default)]
-        pre_tool_use: Vec<RawHook>,
+        pre_tool_use: Vec<Rule>,
     }
     #[derive(Deserialize)]
-    struct RawHook {
+    struct Rule {
         tool: String,
         #[serde(default)]
         deny: Vec<String>,
     }
-    let raw: Raw = serde_norway::from_str(yaml).map_err(|e| format!("yaml: {e}"))?;
-    let mut rules = Vec::with_capacity(raw.pre_tool_use.len());
-    for h in raw.pre_tool_use {
+    let file: File = serde_norway::from_str(yaml).map_err(|e| format!("yaml: {e}"))?;
+    if file.pre_tool_use.len() > MAX_HOOK_RULES {
+        warn!(
+            ignored = file.pre_tool_use.len() - MAX_HOOK_RULES,
+            "hooks.yaml has more than {MAX_HOOK_RULES} rules; ignoring the rest"
+        );
+    }
+    let mut patterns_left = MAX_HOOK_PATTERNS;
+    let mut rules = Vec::new();
+    'rules: for rule in file.pre_tool_use.into_iter().take(MAX_HOOK_RULES) {
+        if rule.tool.trim().is_empty() {
+            warn!("hooks.yaml rule with an empty tool ignored");
+            continue;
+        }
+        let mut deny = Vec::with_capacity(rule.deny.len());
+        for pattern in &rule.deny {
+            if patterns_left == 0 {
+                warn!(
+                    "hooks.yaml has more than {MAX_HOOK_PATTERNS} deny patterns; ignoring the rest"
+                );
+                rules.push(ToolHook {
+                    tool: rule.tool,
+                    deny,
+                });
+                break 'rules;
+            }
+            if pattern.len() > MAX_HOOK_PATTERN_LEN {
+                warn!(tool = %rule.tool, "hooks.yaml pattern longer than {MAX_HOOK_PATTERN_LEN} bytes ignored");
+                continue;
+            }
+            match havn_core::compile_hook_pattern(pattern, COMPILE_SIZE_LIMIT) {
+                Ok(re) => {
+                    deny.push(re);
+                    patterns_left -= 1;
+                }
+                Err(e) => warn!(tool = %rule.tool, error = %e, "hooks.yaml pattern ignored"),
+            }
+        }
+        rules.push(ToolHook {
+            tool: rule.tool,
+            deny,
+        });
+    }
+    Ok(HookSet { rules })
+}
+
+fn compile(hooks: &HookPolicy) -> Result<HookSet, String> {
+    let mut rules = Vec::with_capacity(hooks.pre_tool_use.len());
+    for h in &hooks.pre_tool_use {
         let mut compiled = Vec::with_capacity(h.deny.len());
         for pat in &h.deny {
-            let re =
-                Regex::new(pat).map_err(|e| format!("regex {pat:?} for tool {:?}: {e}", h.tool))?;
+            let re = havn_core::compile_hook_pattern(pat, COMPILE_SIZE_LIMIT)
+                .map_err(|e| format!("tool {:?}: {e}", h.tool))?;
             compiled.push(re);
         }
         rules.push(ToolHook {
-            tool: h.tool,
+            tool: h.tool.clone(),
             deny: compiled,
         });
     }
@@ -162,10 +245,24 @@ impl HookSet {
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
+
+    /// Tool names that rules target but `known` does not contain. A
+    /// typo here would otherwise leave a rule that never fires.
+    pub fn unknown_tools<'a>(&'a self, known: &[&str]) -> Vec<&'a str> {
+        let mut unknown: Vec<&str> = self
+            .rules
+            .iter()
+            .map(|r| r.tool.as_str())
+            .filter(|t| !known.contains(t))
+            .collect();
+        unknown.sort_unstable();
+        unknown.dedup();
+        unknown
+    }
 }
 
 /// Construct a fresh atomically-swappable handle from a starting
-/// `HookSet` (typically the result of `load_from_workspace`).
+/// `HookSet` (typically the result of [`load`]).
 pub fn handle(initial: HookSet) -> Hooks {
     Arc::new(ArcSwap::from_pointee(initial))
 }
@@ -187,9 +284,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_invalid_regex() {
-        let yaml = "pre_tool_use:\n  - tool: shell\n    deny: [\"[unclosed\"]\n";
-        assert!(parse(yaml).is_err());
+    fn parse_skips_invalid_regex_only() {
+        let set =
+            set_with("pre_tool_use:\n  - tool: shell\n    deny: [\"[unclosed\", \"^sudo \"]\n");
+        assert!(matches!(set.veto("shell", "sudo ls"), Veto::Deny { .. }));
+        assert_eq!(set.rules[0].deny.len(), 1);
     }
 
     #[test]
@@ -224,26 +323,128 @@ mod tests {
         }
     }
 
+    fn workspace_with(yaml: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let havn_dir = dir.path().join(".havn");
+        std::fs::create_dir_all(&havn_dir).expect("mkdir");
+        if let Some(yaml) = yaml {
+            std::fs::write(havn_dir.join("hooks.yaml"), yaml).expect("write");
+        }
+        dir
+    }
+
     #[tokio::test]
     async fn load_missing_file_yields_empty_set() {
-        let dir = std::env::temp_dir().join(format!("havn-hooks-{}", uuid::Uuid::now_v7()));
-        tokio::fs::create_dir_all(&dir).await.expect("mkdir");
-        // .havn/hooks.yaml deliberately not created.
-        let set = load_from_workspace(&dir).await;
+        let dir = workspace_with(None);
+        let set = load(&HookPolicy::default(), dir.path())
+            .await
+            .expect("load");
         assert!(set.is_empty());
     }
 
     #[tokio::test]
     async fn load_real_file_parses() {
-        let dir = std::env::temp_dir().join(format!("havn-hooks-{}", uuid::Uuid::now_v7()));
-        let havn_dir = dir.join(".havn");
-        tokio::fs::create_dir_all(&havn_dir).await.expect("mkdir");
-        let yaml = "pre_tool_use:\n  - tool: shell\n    deny:\n      - \"^rm -rf\"\n";
-        tokio::fs::write(havn_dir.join("hooks.yaml"), yaml)
+        let dir = workspace_with(Some(
+            "pre_tool_use:\n  - tool: shell\n    deny:\n      - \"^rm -rf\"\n",
+        ));
+        let set = load(&HookPolicy::default(), dir.path())
             .await
-            .expect("write");
-        let set = load_from_workspace(&dir).await;
+            .expect("load");
         assert_eq!(set.rules.len(), 1);
         assert!(matches!(set.veto("shell", "rm -rf /"), Veto::Deny { .. }));
+    }
+
+    #[test]
+    fn workspace_file_keeps_rules_up_to_the_caps() {
+        let rules: String = (0..=MAX_HOOK_RULES)
+            .map(|i| format!("  - tool: shell\n    deny: [\"^p{i}$\"]\n"))
+            .collect();
+        let set = set_with(&format!("pre_tool_use:\n{rules}"));
+        assert_eq!(set.rules.len(), MAX_HOOK_RULES);
+        assert!(matches!(set.veto("shell", "p0"), Veto::Deny { .. }));
+        let last = MAX_HOOK_RULES - 1;
+        assert!(matches!(
+            set.veto("shell", &format!("p{last}")),
+            Veto::Deny { .. }
+        ));
+        assert!(matches!(
+            set.veto("shell", &format!("p{MAX_HOOK_RULES}")),
+            Veto::Allow
+        ));
+
+        let patterns = (0..=MAX_HOOK_PATTERNS)
+            .map(|i| format!("\"^q{i}$\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let set = set_with(&format!(
+            "pre_tool_use:\n  - tool: shell\n    deny: [{patterns}]\n  - tool: file_read\n    deny: [\"x\"]\n"
+        ));
+        let kept: usize = set.rules.iter().map(|r| r.deny.len()).sum();
+        assert_eq!(kept, MAX_HOOK_PATTERNS);
+        assert!(matches!(set.veto("shell", "q0"), Veto::Deny { .. }));
+        assert!(matches!(set.veto("file_read", "x"), Veto::Allow));
+    }
+
+    #[test]
+    fn workspace_file_ignores_unknown_keys() {
+        let set = set_with(
+            "version: 1\npre_tool_use:\n  - tool: shell\n    note: legacy\n    deny: [\"^sudo \"]\n",
+        );
+        assert!(matches!(set.veto("shell", "sudo ls"), Veto::Deny { .. }));
+    }
+
+    #[test]
+    fn unknown_tools_lists_rule_targets_missing_from_registry() {
+        let set = set_with(
+            "pre_tool_use:\n  - tool: shell\n    deny: [\"x\"]\n  - tool: shel\n    deny: [\"x\"]\n",
+        );
+        assert_eq!(set.unknown_tools(&["shell", "file_read"]), vec!["shel"]);
+    }
+
+    fn policy_denying_echo() -> HookPolicy {
+        serde_norway::from_str("pre_tool_use:\n  - tool: shell\n    deny: [\"^echo\"]\n")
+            .expect("policy hooks")
+    }
+
+    #[tokio::test]
+    async fn policy_hooks_deny_without_workspace_file() {
+        let dir = workspace_with(None);
+        let set = load(&policy_denying_echo(), dir.path())
+            .await
+            .expect("load");
+        assert!(matches!(set.veto("shell", "echo hi"), Veto::Deny { .. }));
+        assert!(matches!(set.veto("shell", "ls"), Veto::Allow));
+    }
+
+    #[tokio::test]
+    async fn workspace_hooks_add_rules_to_policy() {
+        let dir = workspace_with(Some(
+            "pre_tool_use:\n  - tool: shell\n    deny: [\"^sudo \"]\n",
+        ));
+        let set = load(&policy_denying_echo(), dir.path())
+            .await
+            .expect("load");
+        assert!(matches!(set.veto("shell", "echo hi"), Veto::Deny { .. }));
+        assert!(matches!(
+            set.veto("shell", "sudo apt update"),
+            Veto::Deny { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn workspace_file_cannot_remove_policy_rule() {
+        let policy = policy_denying_echo();
+        for yaml in [
+            "pre_tool_use: []\n",
+            "pre_tool_use:\n  - tool: shell\n    deny: []\n",
+            "pre_tool_use: [not: valid: yaml\n",
+        ] {
+            let dir = workspace_with(Some(yaml));
+            let set = load(&policy, dir.path()).await.expect("load");
+            assert!(
+                matches!(set.veto("shell", "echo hi"), Veto::Deny { .. }),
+                "workspace {yaml:?} removed the policy rule"
+            );
+        }
     }
 }

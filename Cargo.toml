@@ -70,8 +70,9 @@ arc-swap = "1"
 # of serde_yaml (serde_yml was archived as unsound — RUSTSEC-2025-0068).
 serde_norway = "0.9"
 
-# PreToolUse hook patterns — operator declares regex denies in
-# workspace/.havn/hooks.yaml; runtime checks before tool dispatch.
+# PreToolUse hook patterns — regex denies from the policy (`hooks`) and
+# workspace/.havn/hooks.yaml; havn-core validates them, the runtime
+# checks them before tool dispatch.
 regex = "1"
 
 # Pure-byte view over `&[f32]` ↔ `&[u8]` for storing embedding vectors

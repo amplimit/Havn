@@ -630,6 +630,22 @@ mod tests {
             matches!(invalid, Err(ApiError::BadRequest(_))),
             "{invalid:?}"
         );
+        let bad_hooks = create_agent(
+            State(f.state.clone()),
+            f.admin.clone(),
+            Json(crate::api::agents::CreateAgentRequest {
+                name: "bad-hooks".into(),
+                config: Some(serde_json::json!({
+                    "policy": { "hooks": { "pre_tool_use": [{ "tool": "shell", "deny": ["[unclosed"] }] } }
+                })),
+                team_id: Some(f.team.to_string()),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(bad_hooks, Err(ApiError::BadRequest(_))),
+            "a team agent's policy override is validated too: {bad_hooks:?}"
+        );
 
         assert_eq!(
             team_agent_names(&f, &f.viewer).await.expect("members list"),

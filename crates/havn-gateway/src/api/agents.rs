@@ -117,6 +117,9 @@ pub async fn create(
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name must be non-empty".into()));
     }
+    if let Some(raw) = req.config.as_ref().and_then(|c| c.get("policy")) {
+        check_policy_override(raw)?;
+    }
 
     // Spec §6.3 enforcement: max_agents is checked here, before INSERT.
     // policy_resolver::for_user is the single source of truth for "what
@@ -216,6 +219,10 @@ pub async fn patch(
         }
     }
 
+    if let Some(raw) = req.config.as_ref().and_then(|c| c.get("policy")) {
+        check_policy_override(raw)?;
+    }
+
     // Shallow-merge config patch on top of existing config.
     let merged_config = req.config.as_ref().map(|patch| {
         let mut base = agent.config.as_object().cloned().unwrap_or_default();
@@ -251,6 +258,18 @@ pub async fn patch(
     info!(agent_id = %id, by = %user.id, "agent patched");
     let connected = state.registry.is_connected(id).await;
     Ok(Json(AgentView::from_agent(updated, connected)))
+}
+
+/// Rejects a `config.policy` override that the policy resolver would
+/// drop as malformed: dropping it would also drop its restrictions.
+fn check_policy_override(raw: &serde_json::Value) -> Result<(), ApiError> {
+    if raw.is_null() {
+        return Ok(());
+    }
+    let policy = serde_json::from_value::<havn_core::Policy>(raw.clone())
+        .map_err(|e| ApiError::BadRequest(format!("config.policy: {e}")))?;
+    policy.validate()?;
+    Ok(())
 }
 
 pub async fn start(
@@ -636,8 +655,27 @@ pub(crate) fn embedding_env_passthrough(embedding: &serde_json::Value) -> Vec<St
 
 #[cfg(test)]
 mod tests {
-    use super::embedding_env_passthrough;
+    use super::{check_policy_override, embedding_env_passthrough};
     use serde_json::json;
+
+    #[test]
+    fn policy_override_must_parse_and_validate() {
+        assert!(check_policy_override(&json!(null)).is_ok());
+        assert!(
+            check_policy_override(&json!({
+                "permissions": { "can_use_shell": false },
+                "hooks": { "pre_tool_use": [{ "tool": "shell", "deny": ["^echo"] }] }
+            }))
+            .is_ok()
+        );
+        for bad in [
+            json!({ "permissions": { "can_use_shell": "no" } }),
+            json!({ "hooks": { "pre_tool_use": [{ "tool": "shell", "deny": ["[unclosed"] }] } }),
+            json!({ "hooks": { "pre_tool_use": [{ "tool": "", "deny": ["x"] }] } }),
+        ] {
+            assert!(check_policy_override(&bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn passthrough_is_empty_unless_openai_embeddings() {

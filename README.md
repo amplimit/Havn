@@ -166,6 +166,25 @@ havn is **infrastructure, not SaaS**. The test: does it require kernel primitive
 - WebChat WebSocket connections are checked against an Origin allowlist (`allowed_origins`) and must present the caller's `ws_token` from `GET /me`; the token identifies the user rather than being a secret, so the Origin check is what blocks cross-site connections
 - No marketplace — skills are local files; sharing via git
 
+## Tool Hooks
+
+PreToolUse hooks refuse a tool call before it runs when one of its regex patterns matches the call's main input (the shell command, the file path, the URL). The agent sees the refusal as the tool result and can adjust its plan.
+
+Operators put hooks in the policy (a role's policy, or a per-agent override), under `hooks`:
+
+```json
+"hooks": {
+  "pre_tool_use": [
+    { "tool": "shell", "deny": ["^rm -rf", "^sudo "] },
+    { "tool": "web_fetch", "deny": ["://internal\\.corp\\.net"] }
+  ]
+}
+```
+
+An agent workspace can also contain `.havn/hooks.yaml` with the same `pre_tool_use` list, so an existing file can be pasted into the policy as is. The agent can edit its own workspace, so this file can only add rules: the runtime applies the policy's rules and the file's rules together, and changing or deleting the file never removes a policy rule. Both are read when the agent starts. A per-agent policy override can add hook rules but cannot remove its owner's, and a user with several roles gets every role's rules. A policy holds at most 64 rules and 256 patterns of up to 1024 bytes each, and an invalid policy is rejected when it is saved. The workspace file is read leniently: unknown keys are ignored, and invalid patterns and rules beyond those caps are skipped with a warning. A rule for a tool the agent does not have is logged as a warning when the agent starts.
+
+Hooks are guardrails against model mistakes, not a security boundary. A pattern matches text, and an agent that wants to can run the same action in a form no pattern matches (`rm  -rf`, `cd / && rm -rf`, a script file). To actually prevent an action, use the policy permissions (`can_use_shell`, `can_access_network`), `network_policy`, the mounts an agent gets, and the sandbox described above.
+
 ## Configuration
 
 Gateway config lives at `~/.config/havn/config.toml`:

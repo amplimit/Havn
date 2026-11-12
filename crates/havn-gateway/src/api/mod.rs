@@ -81,6 +81,18 @@ impl From<DbError> for ApiError {
     }
 }
 
+impl From<havn_core::Error> for ApiError {
+    fn from(e: havn_core::Error) -> Self {
+        use havn_core::Error;
+        match e {
+            Error::InvalidPolicy(_) | Error::InvalidId(_) | Error::InvalidMessage(_) => {
+                Self::BadRequest(e.to_string())
+            }
+            other => Self::Internal(other.to_string()),
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match &self {

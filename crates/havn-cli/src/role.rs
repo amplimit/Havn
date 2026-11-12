@@ -110,5 +110,10 @@ async fn load_policy_file(path: &str) -> anyhow::Result<Policy> {
     let body = tokio::fs::read_to_string(Path::new(path))
         .await
         .with_context(|| format!("reading policy from {path}"))?;
-    serde_json::from_str::<Policy>(&body).with_context(|| format!("parsing policy {path}"))
+    let policy =
+        serde_json::from_str::<Policy>(&body).with_context(|| format!("parsing policy {path}"))?;
+    policy
+        .validate()
+        .with_context(|| format!("validating policy {path}"))?;
+    Ok(policy)
 }

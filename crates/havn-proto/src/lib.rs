@@ -534,6 +534,10 @@ mod tests {
                 disabled: vec!["shell".into(), "web_fetch".into()],
             },
         );
+        policy.hooks.pre_tool_use.push(havn_core::ToolHookRule {
+            tool: "shell".into(),
+            deny: vec!["^echo".into()],
+        });
 
         let frame = GatewayToAgent::Welcome {
             session_token: "tok".into(),
@@ -567,6 +571,7 @@ mod tests {
                 .map(|e| e.disabled.len()),
             Some(2)
         );
+        assert_eq!(parsed_policy.hooks, policy.hooks);
     }
 
     #[test]
@@ -584,6 +589,7 @@ mod tests {
         };
         // Default policy mirrors havn-core's defaults.
         assert!(policy.permissions.can_use_shell);
+        assert!(policy.hooks.pre_tool_use.is_empty());
         assert_eq!(max_tokens, None);
     }
 }
