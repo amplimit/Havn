@@ -1,9 +1,10 @@
 //! `/teams` and `/teams/{id}` endpoints (spec §8.3, §10.3).
 //!
 //! Teams group users for shared agents, shared credentials, and a
-//! single audit log. Creation is open to any authenticated user — the
-//! creator is auto-promoted to the team's `admin` role so they can
-//! invite others. Renames and deletion are admin-only.
+//! single audit log. In multi-user mode the operator creates teams with
+//! `havn team add`; in single-user mode the API may create them and the
+//! creator becomes the team's `admin`. Renames and deletion are
+//! admin-only.
 //!
 //! Sub-resources live in sibling modules:
 //! - `/teams/{id}/members` → [`super::members`]
@@ -77,7 +78,8 @@ pub async fn list(
     Ok(Json(views))
 }
 
-/// `POST /teams` — create a team and auto-add the creator as admin.
+/// `POST /teams` — single-user mode only: create a team and add the
+/// creator as admin.
 /// Atomic enough: if the role create or membership add fails after
 /// the team is inserted, we leave a half-created team behind. The CLI
 /// `havn team delete` cleans up; in practice a failure here is rare
