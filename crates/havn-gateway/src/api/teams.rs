@@ -88,6 +88,16 @@ pub async fn create(
     user: AuthedUser,
     Json(req): Json<CreateTeamRequest>,
 ) -> Result<(StatusCode, Json<TeamView>), ApiError> {
+    // The creator becomes the team's admin and admins set role policies,
+    // so letting any user create a team would let any user grant
+    // themselves any policy. In multi-user mode teams are provisioned by
+    // the operator with `havn team add`.
+    if state.trusted_proxies.is_some() {
+        return Err(ApiError::Forbidden(
+            "teams are created by the operator with `havn team add --name <name> --admin <user-id>`"
+                .into(),
+        ));
+    }
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name must be non-empty".into()));
     }
@@ -396,4 +406,47 @@ fn member_default_policy() -> Policy {
     p.permissions.can_spawn_subagents = false;
     p.admin_visibility.can_view_audit_log = false;
     p
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use crate::auth::tests::state_with;
+
+    fn request() -> Json<CreateTeamRequest> {
+        Json(CreateTeamRequest {
+            name: "self-made".into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn create_is_rejected_in_multi_user_mode() {
+        let (state, user_id) = state_with(true).await;
+        let user = AuthedUser {
+            id: user_id,
+            display_name: "member".into(),
+        };
+        let err = create(State(state.clone()), user, request())
+            .await
+            .expect_err("trust_header mode must refuse");
+        assert!(matches!(err, ApiError::Forbidden(_)), "{err:?}");
+        let teams = repo::list_all(&state.db).await.expect("list teams");
+        assert!(teams.is_empty(), "no team may be created: {teams:?}");
+    }
+
+    #[tokio::test]
+    async fn create_is_allowed_in_single_user_mode() {
+        let (state, user_id) = state_with(false).await;
+        let user = AuthedUser {
+            id: user_id,
+            display_name: "operator".into(),
+        };
+        let (status, Json(team)) = create(State(state.clone()), user, request())
+            .await
+            .expect("single-user mode allows team creation");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(team.name, "self-made");
+    }
 }
