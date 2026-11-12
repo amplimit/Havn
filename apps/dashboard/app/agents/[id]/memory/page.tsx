@@ -23,8 +23,8 @@ const KIND_HINT: Record<MemoryKind, string> = {
 
 /**
  * `/agents/[id]/memory` — view + prune what the agent remembers.
- * Reads go straight to agent.db RO (works even when the agent is
- * offline). Delete buttons route through the agent socket as
+ * Reads are answered by the running agent from its own agent.db (409
+ * when it is stopped). Delete buttons route through the agent socket as
  * `MemoryForgetRequest` frames so agent.db stays single-writer
  * (spec §5.2). The "delete" button shows a 409-aware message when
  * the agent isn't running.

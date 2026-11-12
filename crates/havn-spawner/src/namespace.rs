@@ -16,14 +16,13 @@
 //!   `proc`, and exec's the runtime. Combined with the user ns this means
 //!   the agent's `ps -ef` / `ls /proc` shows nothing from the host or
 //!   other agents (spec §4.1).
-//! - **Landlock + seccomp** — applied inside the runtime itself
-//!   (`havn-runtime/src/{sandbox,seccomp}.rs`) right before the LLM loop
-//!   starts, so the syscall + filesystem surfaces are restricted in
-//!   addition to the namespace boundary.
-//!
-//! Still deferred (spec §4.1): `pivot_root` to a minimal rootfs. Landlock
-//! covers the same threat model in practice; `pivot_root` is defence in
-//! depth on top of it.
+//! - **Landlock** — rules computed here ([`crate::filesystem_rules`]) and
+//!   applied by `havn-init` right before it execs the runtime, so every
+//!   runtime thread and tool process inherits them.
+//! - **seccomp** — installed by the runtime on all of its threads (TSYNC)
+//!   before the LLM loop starts (`havn-runtime/src/seccomp.rs`).
+//! - **Minimal rootfs** — `havn-init` `pivot_root`s into it before exec
+//!   ([`crate::ns_setup::pivot_root_into_minimal_rootfs`]).
 //!
 //! Compared to [`crate::subprocess::SubprocessSpawner`], this spawner
 //! requires either root or systemd cgroup delegation
@@ -56,6 +55,10 @@ pub struct NamespaceSpawner {
     cgroup: CgroupController,
     state: Arc<Mutex<HashMap<AgentId, AgentState>>>,
     pool: crate::network::AgentSubnetPool,
+    /// Set once the host-wide NAT and isolation rules are in place. Until
+    /// then agents get no network interface at all, even if their policy
+    /// allows egress, rather than an unisolated one.
+    network_ready: bool,
 }
 
 #[derive(Debug)]
@@ -87,6 +90,7 @@ impl NamespaceSpawner {
             cgroup,
             state: Arc::new(Mutex::new(HashMap::new())),
             pool,
+            network_ready: false,
         })
     }
 
@@ -98,7 +102,14 @@ impl NamespaceSpawner {
             cgroup,
             state: Arc::new(Mutex::new(HashMap::new())),
             pool: crate::network::AgentSubnetPool::default(),
+            network_ready: false,
         }
+    }
+
+    /// Record that [`crate::network::ensure_global_nat`] succeeded, so
+    /// agents whose policy allows egress get their veth.
+    pub fn set_network_ready(&mut self) {
+        self.network_ready = true;
     }
 }
 
@@ -148,6 +159,30 @@ impl AgentSpawner for NamespaceSpawner {
             .envs(crate::agent_environment(&config.env_passthrough, |name| {
                 std::env::var_os(name)
             }));
+        // Operator opt-out for kernels without Landlock; the runtime
+        // refuses to start without Landlock otherwise. Forwarded on its
+        // own because HAVN_* variables are never passed through.
+        if std::env::var_os("HAVN_ALLOW_NO_LANDLOCK").as_deref() == Some(std::ffi::OsStr::new("1"))
+        {
+            cmd.env("HAVN_ALLOW_NO_LANDLOCK", "1");
+        }
+        // Landlock rules havn-init applies right before exec'ing the runtime,
+        // so every runtime thread and every tool process is confined.
+        let (landlock_rw, landlock_ro) = crate::filesystem_rules::allowlist(
+            &config.workspace_dir,
+            &config.extra_mounts,
+            &config.tmpfs_mounts,
+            policy,
+            &config.runtime_binary,
+        );
+        cmd.env(
+            crate::filesystem_rules::RW_ENV,
+            crate::filesystem_rules::encode(&landlock_rw),
+        )
+        .env(
+            crate::filesystem_rules::RO_ENV,
+            crate::filesystem_rules::encode(&landlock_ro),
+        );
         cmd.arg(&config.runtime_binary)
             .arg("--agent-id")
             .arg(config.agent_id.to_string())
@@ -299,7 +334,14 @@ impl AgentSpawner for NamespaceSpawner {
         //
         //    Failure is non-fatal: tools needing outbound surface
         //    their own clear errors at tool-use time.
-        if policy.network_policy.egress_allowed {
+        if policy.network_policy.egress_allowed && !self.network_ready {
+            warn!(
+                agent_id = %config.agent_id,
+                "agent policy allows egress but agent network isolation is not in place; \
+                 starting the agent without network access"
+            );
+        }
+        if policy.network_policy.egress_allowed && self.network_ready {
             let net_pid = i32::try_from(pid).unwrap_or(0);
             let net_agent_id = config.agent_id;
             let net_pool = self.pool;

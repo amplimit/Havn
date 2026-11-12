@@ -5,11 +5,11 @@
 //! the per-agent override (`Agent.config["policy"]`): applied as written
 //! in single-user mode, clamped to the owner's policy in multi-user mode.
 //!
-//! Resolution runs once per agent connection — during the gateway-side
-//! `Welcome` handshake — and the resulting snapshot is shipped to the
-//! runtime in the `Welcome` frame. Mid-session policy edits do NOT affect
-//! the running session (matching spec §9.4 frozen-prompt invariant for the
-//! related case); the next session picks up the new value.
+//! The snapshot shipped to the runtime in the `Welcome` frame (and the
+//! sandbox set up at spawn) is resolved once per agent connection, so
+//! mid-session policy edits do not change the running runtime's tools or
+//! sandbox. Gateway-side checks on each request (queries, LLM calls)
+//! resolve the policy again and therefore see edits immediately.
 
 use havn_core::{Policy, UserId};
 use havn_db::repo::agents::Agent;

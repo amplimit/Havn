@@ -1,16 +1,13 @@
 //! `GET /agents/:id/conversation` — recent webchat history (spec §5.2).
 //!
-//! Reads `agent.db` read-only and returns the last N turns for the
+//! Asks the agent's runtime for the last N turns of the
 //! caller's stable webchat channel (UUIDv5 derived from
 //! `(user_id, agent_id)` — same derivation as `webchat_ws::handle_session`).
 //! Lets the dashboard restore the conversation when the user navigates
 //! away and comes back.
 //!
-//! Spec §5.2 nuance: agent.db is single-writer (the runtime) but
-//! the gateway can open it read-only; we use the same `connect_read_only`
-//! pattern as `api::memory::list`. The endpoint works whether the
-//! agent runtime is running or not — the conversations table is on
-//! disk and immutable from the gateway side.
+//! The runtime reads its own agent.db (it is started if needed); the
+//! gateway never opens the file, which the agent can write.
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -71,34 +68,18 @@ pub async fn list(
     )
     .to_string();
 
-    let agent_db_path = state
-        .workspace_root
-        .join(agent_id.to_string())
-        .join("workspace")
-        .join("agent.db");
-    if !tokio::fs::try_exists(&agent_db_path).await.unwrap_or(false) {
-        return Ok(Json(ConversationResponse {
-            agent_id: agent_id.to_string(),
-            channel_id,
-            turns: Vec::new(),
-            uninitialised: true,
-        }));
-    }
-
-    let pool = match havn_db::agent::connect_read_only(&agent_db_path).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(
-                agent_id = %id,
-                error = %e,
-                "conversation list: opening agent.db RO failed"
-            );
-            return Err(ApiError::Internal("opening agent.db".into()));
-        }
-    };
-
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-    let turns = conversations::recent_with_channel(&pool, &channel_id, limit).await?;
+    let turns: Vec<conversations::TurnWithChannel> = crate::api::agents::agent_data(
+        &state,
+        user.id,
+        agent_id,
+        havn_proto::DataQuery::Conversation {
+            channel_id: channel_id.clone(),
+            limit,
+        },
+        true,
+    )
+    .await?;
     let views = turns
         .into_iter()
         .map(|t| TurnView {

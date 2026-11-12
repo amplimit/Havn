@@ -1,10 +1,11 @@
 //! `/agents/:id/memory` — admin view of the agent's typed memory
-//! (spec §9.4, §5.2 nuance — see `havn_db::agent::connect_read_only`).
+//! (spec §9.4).
 //!
 //! Lets the user see, in the dashboard, exactly what the agent has
 //! remembered about them, grouped by kind, with the supersedes audit
-//! trail. Reads go straight to agent.db (RO connection) so the
-//! dashboard works even when the runtime is offline.
+//! trail. The agent's runtime reads its own agent.db and returns the
+//! rows (it is started if it is not running); the gateway never opens
+//! the file, which the agent can write.
 //!
 //! `DELETE /agents/:id/memory/:key` routes the request through the
 //! agent socket as a [`havn_proto::MemoryForgetRequest`] frame —
@@ -15,7 +16,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
-use havn_db::agent::memory::{self, Kind};
+use havn_db::agent::memory;
 use havn_proto::{AdminOutcome, GatewayToAgent, MemoryForgetRequest};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -77,9 +78,8 @@ impl From<memory::Entry> for MemoryEntryView {
 pub struct ListResponse {
     pub agent_id: String,
     pub entries: Vec<MemoryEntryView>,
-    /// True when the dashboard should render "agent isn't running OR
-    /// has no memory yet" rather than "0 of N". The agent.db file
-    /// hasn't been opened by the agent runtime even once.
+    /// Kept for API compatibility; always false now that the running agent
+    /// answers (a stopped agent gets 409 instead).
     pub uninitialised: bool,
 }
 
@@ -92,49 +92,18 @@ pub async fn list(
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
     let agent_id = agent.id;
 
-    let agent_db_path = state
-        .workspace_root
-        .join(agent_id.to_string())
-        .join("workspace")
-        .join("agent.db");
-    if !tokio::fs::try_exists(&agent_db_path).await.unwrap_or(false) {
-        return Ok(Json(ListResponse {
-            agent_id: agent_id.to_string(),
-            entries: Vec::new(),
-            uninitialised: true,
-        }));
-    }
-
-    let pool = match havn_db::agent::connect_read_only(&agent_db_path).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(
-                agent_id = %id,
-                error = %e,
-                "memory list: opening agent.db RO failed"
-            );
-            return Err(ApiError::Internal("opening agent.db".into()));
-        }
-    };
-
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-    let kinds: Vec<Kind> = q
-        .kind
-        .as_deref()
-        .and_then(Kind::parse)
-        .map(|k| vec![k])
-        .unwrap_or_default();
-
-    // We use list_active for the unfiltered case; for kind filter we
-    // run a tiny query inline since memory's public surface only
-    // exposes FTS search by kind. The dashboard's "filter by kind"
-    // case is small enough that this duplication isn't worth a new
-    // repo function for now — refactor when a third caller appears.
-    let entries = if kinds.is_empty() {
-        memory::list_active(&pool, limit).await?
-    } else {
-        list_active_by_kind(&pool, &kinds[0], limit).await?
-    };
+    let entries: Vec<memory::Entry> = crate::api::agents::agent_data(
+        &state,
+        user.id,
+        agent_id,
+        havn_proto::DataQuery::Memory {
+            memory_kind: q.kind.clone(),
+            limit,
+        },
+        false,
+    )
+    .await?;
 
     let views = entries.into_iter().map(MemoryEntryView::from).collect();
     Ok(Json(ListResponse {
@@ -181,6 +150,7 @@ pub async fn forget(
         .admin_rpc
         .call(
             &request_id,
+            agent_id,
             || async move {
                 registry
                     .send(agent_for_send, GatewayToAgent::MemoryForgetRequest(req))
@@ -216,61 +186,4 @@ pub async fn forget(
             "agent disconnected before reply arrived; retry once the agent reconnects".into(),
         )),
     }
-}
-
-/// Active rows of a single kind, newest first. Inline because the
-/// memory repo's public API only filters by kind on the FTS path.
-async fn list_active_by_kind(
-    pool: &sqlx::SqlitePool,
-    kind: &Kind,
-    limit: u32,
-) -> Result<Vec<memory::Entry>, havn_db::DbError> {
-    use chrono::Duration as ChronoDuration;
-    // Borrow the recent_events query shape for the kind+limit case;
-    // it returns the same Entry struct.
-    if matches!(kind, Kind::Event) {
-        // Use a wide window so the dashboard sees the full event tail.
-        return memory::recent_events(pool, ChronoDuration::days(365), limit).await;
-    }
-    // For non-event kinds, all active rows of that kind, newest first.
-    use sqlx::Row as _;
-    let rows = sqlx::query(
-        "SELECT id, key, value, kind, source, ttl_days, archived_at, created_at, updated_at, \
-                recall_count, last_recalled_at, supersedes_id \
-         FROM memory \
-         WHERE archived_at IS NULL AND kind = ?1 \
-         ORDER BY updated_at DESC LIMIT ?2",
-    )
-    .bind(kind.as_str())
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
-    // Hand-deserialise into Entry; we can't reuse memory::Entry's
-    // FromRow because it's private to the memory module.
-    let entries = rows
-        .into_iter()
-        .filter_map(|r| {
-            Some(memory::Entry {
-                id: r.try_get::<String, _>("id").ok()?,
-                key: r.try_get::<String, _>("key").ok()?,
-                value: r.try_get::<String, _>("value").ok()?,
-                kind: Kind::parse(&r.try_get::<String, _>("kind").ok()?)
-                    .unwrap_or(Kind::Preference),
-                source: havn_db::agent::memory::Source::parse(
-                    &r.try_get::<String, _>("source").ok()?,
-                )
-                .unwrap_or(havn_db::agent::memory::Source::AgentInferred),
-                ttl_days: r.try_get::<Option<i64>, _>("ttl_days").ok()?,
-                archived_at: r.try_get::<Option<DateTime<Utc>>, _>("archived_at").ok()?,
-                created_at: r.try_get::<DateTime<Utc>, _>("created_at").ok()?,
-                updated_at: r.try_get::<DateTime<Utc>, _>("updated_at").ok()?,
-                recall_count: r.try_get::<i64, _>("recall_count").ok()?,
-                last_recalled_at: r
-                    .try_get::<Option<DateTime<Utc>>, _>("last_recalled_at")
-                    .ok()?,
-                supersedes_id: r.try_get::<Option<String>, _>("supersedes_id").ok()?,
-            })
-        })
-        .collect();
-    Ok(entries)
 }

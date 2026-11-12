@@ -72,7 +72,7 @@ havn start
 havn credential add anthropic sk-ant-...
 ```
 
-For a dev box without isolation, `HAVN_SPAWNER=subprocess havn start` runs agents as plain unsandboxed processes; do not use it for anything untrusted.
+For a dev box without isolation, `HAVN_SPAWNER=subprocess havn start` runs agents as plain unsandboxed processes, and the gateway cannot tell which agent a connection comes from; do not use it for anything untrusted.
 
 ### Build from source
 
@@ -95,9 +95,13 @@ npm run build
 npm start                    # http://localhost:3000
 ```
 
-Then open `http://localhost:3000`, create an agent, and start chatting. For
-development, `npm run dev` serves the same app with hot reload. See
-[apps/dashboard/README.md](apps/dashboard/README.md) for settings.
+Then open `http://localhost:3000`, create an agent, and start chatting. The
+dashboard listens on 127.0.0.1 only and has no login of its own; from
+another machine use an SSH tunnel (`ssh -L 3000:127.0.0.1:3000 <server>`) or
+an authenticating reverse proxy. For development, `npm run dev` serves the
+same app with hot reload. See
+[apps/dashboard/README.md](apps/dashboard/README.md) for settings and
+multi-user setup.
 
 ## Project Structure
 
@@ -135,8 +139,11 @@ havn is **infrastructure, not SaaS**. The test: does it require kernel primitive
 ## Security Model
 
 - Agents run in isolated Linux namespaces (PID, mount, network, user) with Landlock LSM and seccomp-bpf syscall filtering
+- Agents do not start if Landlock is not available (kernel 5.13+ with `landlock` in the `lsm=` list; `havn doctor` checks it). To run agents without filesystem restriction on such a kernel anyway, start the gateway with `HAVN_ALLOW_NO_LANDLOCK=1`
+- Agents with network egress reach the public internet only: traffic to the gateway host (including Docker-published ports), other agents, private, link-local (including cloud metadata), CGNAT and reserved addresses is dropped in `mangle PREROUTING` before any other firewall rule, and the host end of the agent link has no IPv6. The configured `agent_dns` servers stay reachable on port 53, also when they run on the gateway host; list other internal addresses agents may use under `[network] agent_private_access = ["10.0.5.20", "192.168.1.0/24"]`. If these rules cannot be installed (no `iptables`), agents get no network access at all. A `firewall-cmd --reload` or similar flush removes them; agents started afterwards get no network until the gateway restarts. A host-wide rule that redirects port 53 to a local resolver also breaks agent DNS, since the redirected destination is no longer an `agent_dns` server
 - API keys encrypted at rest with [age](https://age-encryption.org/) — agent processes never see them
 - Per-credential token-per-day and requests-per-minute caps enforced gateway-side
+- A policy's `allowed_models` is enforced by the gateway; entries are exact model names, or `*` for any model. For agents without network egress, the gateway also refuses LLM requests that would make the provider fetch a URL (URL-sourced images and documents, provider-side tools, models with built-in web search under common names); restrict `allowed_models` to be sure an agent cannot pick a model with its own web access
 - WebChat WebSocket connections are checked against an Origin allowlist (`allowed_origins`) and must present the caller's `ws_token` from `GET /me`; the token identifies the user rather than being a secret, so the Origin check is what blocks cross-site connections
 - No marketplace — skills are local files; sharing via git
 
@@ -163,7 +170,12 @@ enabled = true
 allowed_proxies = ["127.0.0.1/32"]
 ```
 
-In trust-header (multi-user) mode, team roles define what each member's agents may do; a per-agent policy override can only narrow the member's role policy, and the gateway-wide embedding configuration can only be changed in `config.toml`.
+In trust-header (multi-user) mode:
+
+- The operator creates teams (`havn team add --name <name> --admin <user-id>`). Team roles define what each member's agents may do.
+- Team admins can set any policy on their team's roles, including MCP servers that mount host paths. Appoint them as you would an operator.
+- A per-agent policy override can only narrow the member's role policy.
+- The gateway-wide embedding configuration can only be changed in `config.toml`.
 
 Cron jobs may carry a `wake_check` script. It runs on the host as the dedicated `havn-wakecheck` user (created by `install.sh`; the gateway must run as root to switch to it) with a minimal environment. Without that user the script is skipped and the job always wakes.
 
@@ -176,6 +188,8 @@ Havn ships a stable HTTP + WebSocket protocol at `/api/v1/channel` for external 
 | Telegram | [havn-channel-telegram](https://github.com/amplimit/havn-channel-telegram) | Available |
 | Slack | — | Planned |
 | Discord | — | Planned |
+
+An agent can only send through the channel accounts that `[[bindings]]` binds to it. With an account's `dm_policy = "allowlist"` (the default) it can only message senders in `allow_from`; with `dm_policy = "open"` it can message anyone the bot can reach on that platform, so use `open` only for bots meant to be public.
 
 ## Capability Packs
 

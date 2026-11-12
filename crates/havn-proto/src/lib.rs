@@ -44,6 +44,8 @@ pub enum AgentToGateway {
     /// Reply to a [`GatewayToAgent::SkillPinRequest`]. Same correlation
     /// shape as `MemoryForgetResponse`.
     SkillPinResponse(SkillPinResponse),
+    /// Reply to a [`GatewayToAgent::DataRequest`].
+    DataResponse(DataResponse),
     /// Caller-side initiation of a cross-agent query (spec §4.4 v0.7).
     /// The gateway routes this to `target_agent_id`, which must be owned
     /// by the same user. Replies arrive as
@@ -156,6 +158,10 @@ pub enum GatewayToAgent {
     /// `MemoryForgetRequest` — pins live in `skills_index` which the
     /// runtime owns.
     SkillPinRequest(SkillPinRequest),
+    /// Dashboard read of the agent's own database. The runtime runs the
+    /// query and returns the rows, so the gateway never opens agent.db,
+    /// which the agent can write.
+    DataRequest(DataRequest),
     /// Graceful shutdown request — agent should close cleanly within 5s,
     /// after which the spawner sends SIGKILL.
     Shutdown,
@@ -194,6 +200,35 @@ pub struct SkillPinRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillPinResponse {
+    pub request_id: String,
+    pub outcome: AdminOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataRequest {
+    pub request_id: String,
+    pub query: DataQuery,
+}
+
+/// Rows the dashboard reads from an agent's database. Results come back
+/// as JSON in [`AdminOutcome::Ok`]'s `details`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DataQuery {
+    /// Active memory entries, optionally of one kind (`identity`,
+    /// `preference`, `project`, `event`, ...).
+    Memory {
+        memory_kind: Option<String>,
+        limit: u32,
+    },
+    /// `{"active": [...], "archived": [...]}` skill rows.
+    Skills { limit: u32 },
+    /// The newest turns of one conversation channel.
+    Conversation { channel_id: String, limit: u32 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataResponse {
     pub request_id: String,
     pub outcome: AdminOutcome,
 }

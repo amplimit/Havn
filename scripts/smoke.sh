@@ -120,6 +120,18 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
             [ "$(cat "/proc/$pid/cgroup")" = "0::/havn.slice/agent-$AGENT_ID" ] \
                 || die "havn-runtime (pid $pid) is outside the agent cgroup: $(cat "/proc/$pid/cgroup")"
         done
+        for pid in $RUNTIME_PIDS; do
+            for task in /proc/"$pid"/task/*; do
+                grep -q '^Seccomp:[[:space:]]*2$' "$task/status" \
+                    || die "runtime thread $task has no seccomp filter"
+                grep -q '^NoNewPrivs:[[:space:]]*1$' "$task/status" \
+                    || die "runtime thread $task lacks no_new_privs"
+            done
+            if tr '\0' '\n' < "/proc/$pid/environ" | grep -q '^HAVN_LANDLOCK_R[WO]='; then
+                die "havn-runtime (pid $pid) still carries the Landlock rule lists"
+            fi
+        done
+        ok "every runtime thread is under seccomp with no_new_privs"
         ok "NamespaceSpawner isolation: memory.max=$(cat "$CGROUP/memory.max") pids.max=$(cat "$CGROUP/pids.max")"
         ;;
     subprocess)
@@ -139,7 +151,7 @@ for pid in $AGENT_PIDS; do
         die "agent process $pid ($(cat "/proc/$pid/comm")) inherited HAVN_AGE_KEY from the gateway"
     fi
 done
-ok "agent environment: $(printf '%s\n' "$ENVIRON" | cut -d= -f1 | paste -sd' ')"
+ok "agent environment: $(printf '%s\n' "$ENVIRON" | grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' | tr -d = | paste -sd' ')"
 
 # 7. verify the WebSocket upgrade is accepted. Curl will return non-zero on
 #    a non-101 response; we use --max-time to bail out of the long-poll.

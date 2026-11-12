@@ -28,9 +28,8 @@ pub struct WebChatRouter {
 
 #[derive(Debug)]
 struct Session {
-    /// Agent the session is bound to. Used by `agent_for_session` for the
-    /// dashboard's agent-status surface; no other code currently reads it.
-    #[allow(dead_code, reason = "consumed by upcoming dashboard endpoints")]
+    /// Agent the session is bound to. Only that agent's messages are
+    /// delivered to it.
     agent_id: AgentId,
     tx: mpsc::Sender<ServerMessage>,
 }
@@ -85,10 +84,15 @@ impl WebChatRouter {
         self.inner.lock().await.remove(&session_id);
     }
 
-    /// Forward an `OutboundMessage` from an agent to its originating `WebChat` session.
+    /// Forward an `OutboundMessage` from `agent_id` to its originating `WebChat` session.
     /// `channel_id` MUST be the session's UUID v7 string (set by the WS handler when
-    /// it constructed the `InboundMessage`).
-    pub async fn deliver(&self, msg: OutboundMessage) -> Result<(), DeliverError> {
+    /// it constructed the `InboundMessage`). Sessions of other agents are reported
+    /// as missing.
+    pub async fn deliver(
+        &self,
+        agent_id: AgentId,
+        msg: OutboundMessage,
+    ) -> Result<(), DeliverError> {
         let session_id: SessionId = msg
             .channel_id
             .parse()
@@ -97,6 +101,7 @@ impl WebChatRouter {
         let tx = {
             let map = self.inner.lock().await;
             map.get(&session_id)
+                .filter(|s| s.agent_id == agent_id)
                 .map(|s| s.tx.clone())
                 .ok_or(DeliverError::NoSession(session_id))?
         };
@@ -160,13 +165,36 @@ mod tests {
             content: MessageContent::Text { text: "hi".into() },
             reply_to: None,
         };
-        router.deliver(outbound).await.expect("deliver");
+        router.deliver(agent_id, outbound).await.expect("deliver");
 
         let received = rx.recv().await.expect("recv");
         match received {
             ServerMessage::AgentMessage { content } => assert_eq!(content, "hi"),
             ServerMessage::Error { .. } => panic!("expected AgentMessage, got Error"),
         }
+    }
+
+    #[tokio::test]
+    async fn deliver_refuses_another_agents_session() {
+        let router = WebChatRouter::new();
+        let owner = AgentId::new();
+        let session_id: SessionId = Uuid::now_v7();
+        let (tx, mut rx) = mpsc::channel::<ServerMessage>(8);
+        router.register(session_id, owner, tx).await;
+
+        let outbound = OutboundMessage {
+            channel_id: session_id.to_string(),
+            content: MessageContent::Text {
+                text: "injected".into(),
+            },
+            reply_to: None,
+        };
+        let err = router
+            .deliver(AgentId::new(), outbound)
+            .await
+            .expect_err("another agent must not reach this session");
+        assert!(matches!(err, DeliverError::NoSession(_)), "{err:?}");
+        assert!(rx.try_recv().is_err(), "nothing may reach the session");
     }
 
     #[tokio::test]
@@ -177,7 +205,10 @@ mod tests {
             content: MessageContent::Text { text: "hi".into() },
             reply_to: None,
         };
-        let err = router.deliver(outbound).await.expect_err("should fail");
+        let err = router
+            .deliver(AgentId::new(), outbound)
+            .await
+            .expect_err("should fail");
         assert!(matches!(err, DeliverError::NoSession(_)), "{err:?}");
     }
 
@@ -189,7 +220,10 @@ mod tests {
             content: MessageContent::Text { text: "hi".into() },
             reply_to: None,
         };
-        let err = router.deliver(outbound).await.expect_err("should fail");
+        let err = router
+            .deliver(AgentId::new(), outbound)
+            .await
+            .expect_err("should fail");
         assert!(matches!(err, DeliverError::InvalidChannelId(_)), "{err:?}");
     }
 

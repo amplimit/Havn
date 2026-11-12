@@ -15,7 +15,8 @@ import {
  *   - what the curator has consolidated / archived (its `.curator/`
  *     report log).
  *
- * Mirrors `/memory` in shape and data flow (gateway opens agent.db RO).
+ * Skill rows come from the running agent, which reads its own agent.db;
+ * curator reports are read from its workspace.
  * Pin/unpin and skill_manage CRUD live on the agent socket — surfaced
  * here once the dashboard-write proto frames land.
  */
@@ -35,14 +36,17 @@ export default function SkillsPage({
   const [pinError, setPinError] = useState<string | null>(null);
 
   async function load() {
-    const [s, r] = await Promise.all([
+    // Curator reports are files and stay readable while the agent is
+    // stopped; the skill list needs the running agent (409 otherwise).
+    const [s, r] = await Promise.allSettled([
       api.skills.list(id),
       api.skills.curatorReports(id),
     ]);
-    setActive(s.active);
-    setArchived(s.archived);
-    setUninitialised(s.uninitialised);
-    setReports(r.reports);
+    if (r.status === "fulfilled") setReports(r.value.reports);
+    if (s.status === "rejected") throw s.reason;
+    setActive(s.value.active);
+    setArchived(s.value.archived);
+    setUninitialised(s.value.uninitialised);
     setError(null);
   }
 

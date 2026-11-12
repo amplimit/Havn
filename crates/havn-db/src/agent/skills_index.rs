@@ -7,12 +7,13 @@
 //! is the index that retrieval and the curator pass query.
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use crate::Result;
 use crate::agent::hybrid_common::{EmbeddedCandidate, FtsHit, bytes_to_f32};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Source {
     Bundled,
     Workspace,
@@ -27,7 +28,7 @@ impl Source {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CuratableSkill {
     pub id: String,
     pub name: String,

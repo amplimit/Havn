@@ -38,33 +38,6 @@ pub async fn connect<P: AsRef<Path>>(path: P) -> Result<SqlitePool> {
     Ok(pool)
 }
 
-/// Open `path` read-only — for admin/audit views in the gateway that
-/// need to surface what the agent has remembered about the user
-/// without going through the live agent socket. Never runs migrations
-/// (a freshly-installed agent that hasn't run yet has no DB; that's OK
-/// for the read paths — they return empty and the dashboard renders
-/// "no data yet").
-///
-/// **Spec §5.2 nuance:** the rule "gateway never reads agent-local
-/// SQLite directly" is preserved for *write* and *consistency-critical
-/// read* paths (those still flow through the agent socket). Read-only
-/// admin views — listing memory rows for the dashboard — are an
-/// explicit exception: SQLite WAL supports concurrent readers, and
-/// requiring the agent to be running just to view "what does it
-/// remember about me" makes the dashboard worse than useful.
-pub async fn connect_read_only<P: AsRef<Path>>(path: P) -> Result<SqlitePool> {
-    let opts = SqliteConnectOptions::new()
-        .filename(path)
-        .read_only(true)
-        .create_if_missing(false)
-        .busy_timeout(Duration::from_secs(2));
-    let pool = SqlitePoolOptions::new()
-        .max_connections(2)
-        .connect_with(opts)
-        .await?;
-    Ok(pool)
-}
-
 /// In-memory pool for tests. Single connection so all queries see the same data.
 #[doc(hidden)]
 pub async fn connect_in_memory() -> Result<SqlitePool> {

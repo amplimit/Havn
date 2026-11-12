@@ -17,11 +17,12 @@
 //!
 //! ## When it applies
 //!
-//! Called once in [`super::main`] after Landlock has been installed. Runs
-//! late enough that startup syscalls (file I/O for bootstrap files, cgroup
-//! attach, socket connect) have completed. Inherited across `execve` and
-//! `fork` so subprocesses spawned by the `shell` tool get the same
-//! restrictions.
+//! Called once in [`super::main`] after Landlock is in place. Runs late
+//! enough that startup syscalls (file I/O for bootstrap files, cgroup
+//! attach, socket connect) have completed. Installed on every thread of
+//! the process at once (TSYNC), since the tokio workers that run tools
+//! already exist, and inherited across `execve` and `fork` so subprocesses
+//! spawned by the `shell` tool get the same restrictions.
 //!
 //! ## What's in the list
 //!
@@ -29,7 +30,9 @@
 //! `init_module`. Extended with the canonical "dangerous syscalls" set
 //! every mainstream container runtime blocks:
 //!
-//! - mount-table manipulation (`mount`, `umount2`, `pivot_root`)
+//! - mount-table manipulation (`mount`, `umount2`, `pivot_root`, `chroot`, and
+//!   the new mount API: `fsopen`, `fsconfig`, `fsmount`, `fspick`,
+//!   `move_mount`, `open_tree`, `open_tree_attr`, `mount_setattr`)
 //! - kernel-module loading (`init_module`, `finit_module`, `delete_module`)
 //! - kernel reboot / replacement (`reboot`, `kexec_load`, `kexec_file_load`)
 //! - process inspection / injection (`ptrace`, `process_vm_readv`,
@@ -106,7 +109,14 @@ pub fn restrict_syscalls(allow_extra: &[String]) -> Result<(), SeccompError> {
         .try_into()
         .map_err(|e| SeccompError::Compile(format!("{e:?}")))?;
 
-    seccompiler::apply_filter(&program).map_err(|e| SeccompError::Apply(e.to_string()))?;
+    // TSYNC: install on every thread of the process (the tokio workers
+    // already exist), not only the calling one; it also sets
+    // no_new_privs on all of them.
+    seccompiler::apply_filter_all_threads(&program)
+        .map_err(|e| SeccompError::Apply(e.to_string()))?;
+    #[cfg(target_arch = "x86_64")]
+    seccompiler::apply_filter_all_threads(&x32_guard())
+        .map_err(|e| SeccompError::Apply(e.to_string()))?;
 
     info!(
         blocked = blocked.len(),
@@ -114,6 +124,36 @@ pub fn restrict_syscalls(allow_extra: &[String]) -> Result<(), SeccompError> {
         "seccomp filter installed"
     );
     Ok(())
+}
+
+/// x32 system calls report the x86_64 audit architecture with bit 30 set
+/// in the number, so the blocklist above (which matches exact numbers)
+/// would not see them. This filter kills any such call. It runs before
+/// the kernel looks the number up, so it applies whether or not the
+/// kernel has x32 support.
+#[cfg(target_arch = "x86_64")]
+fn x32_guard() -> BpfProgram {
+    use seccompiler::sock_filter;
+    const LD_W_ABS: u16 = 0x20;
+    const JEQ_K: u16 = 0x15;
+    const JGE_K: u16 = 0x35;
+    const RET_K: u16 = 0x06;
+    const ARCH_OFFSET: u32 = 4;
+    const NR_OFFSET: u32 = 0;
+    const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+    const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+    const RET_ALLOW: u32 = 0x7fff_0000;
+    const RET_KILL_PROCESS: u32 = 0x8000_0000;
+    let insn = |code, jt, jf, k| sock_filter { code, jt, jf, k };
+    vec![
+        insn(LD_W_ABS, 0, 0, ARCH_OFFSET),
+        // Not x86_64 (the main filter kills those): allow.
+        insn(JEQ_K, 0, 2, AUDIT_ARCH_X86_64),
+        insn(LD_W_ABS, 0, 0, NR_OFFSET),
+        insn(JGE_K, 1, 0, X32_SYSCALL_BIT),
+        insn(RET_K, 0, 0, RET_ALLOW),
+        insn(RET_K, 0, 0, RET_KILL_PROCESS),
+    ]
 }
 
 /// Build the blocklist with operator-declared relaxations applied.
@@ -181,6 +221,11 @@ const SYS_KEXEC_FILE_LOAD: i64 = 294;
 #[cfg(not(target_arch = "aarch64"))]
 const SYS_KEXEC_FILE_LOAD: i64 = libc::SYS_kexec_file_load;
 
+/// `open_tree_attr` (Linux 6.15) is open_tree plus mount_setattr in one call;
+/// libc has no constant for it yet. The number is the same on x86_64 and
+/// aarch64.
+const SYS_OPEN_TREE_ATTR: i64 = 467;
+
 /// Syscalls that hard-kill the agent process if invoked. Listed by
 /// architecture-portable `libc::SYS_*` constants where the kernel name
 /// matches across `x86_64` + `aarch64`. Any syscall not in this list runs
@@ -191,6 +236,15 @@ const DANGEROUS_SYSCALLS: &[i64] = &[
     libc::SYS_umount2,
     libc::SYS_pivot_root,
     libc::SYS_chroot,
+    // The Linux 5.2+ mount API reaches the same ground as mount(2).
+    libc::SYS_fsopen,
+    libc::SYS_fsconfig,
+    libc::SYS_fsmount,
+    libc::SYS_fspick,
+    libc::SYS_move_mount,
+    libc::SYS_open_tree,
+    libc::SYS_mount_setattr,
+    SYS_OPEN_TREE_ATTR,
     // ── kernel modules ──────────────────────────────────────────────
     libc::SYS_init_module,
     libc::SYS_finit_module,
@@ -235,6 +289,10 @@ mod tests {
         for required in &[
             libc::SYS_mount,
             libc::SYS_umount2,
+            libc::SYS_fsopen,
+            libc::SYS_fsmount,
+            libc::SYS_move_mount,
+            libc::SYS_open_tree,
             libc::SYS_reboot,
             libc::SYS_kexec_load,
             libc::SYS_ptrace,
@@ -271,6 +329,8 @@ mod tests {
         // table is intentionally narrow — operators cannot let a pack
         // call `mount` even if they paste it in config.
         assert!(blocked.contains(&libc::SYS_mount));
+        assert!(blocked.contains(&libc::SYS_fsmount));
+        assert!(blocked.contains(&libc::SYS_open_tree));
         assert!(blocked.contains(&libc::SYS_ptrace));
         assert!(blocked.contains(&libc::SYS_bpf));
         assert!(blocked.contains(&libc::SYS_init_module));
@@ -330,5 +390,101 @@ mod tests {
         )
         .expect("filter");
         let _: BpfProgram = filter.try_into().expect("compile to BPF");
+    }
+
+    /// The probe children below die from SIGSYS on purpose; keep them from
+    /// leaving core files behind.
+    fn no_core_dump() {
+        let limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: setrlimit reads one valid rlimit struct.
+        unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const limit) };
+    }
+
+    /// Applies the real filter in a separate copy of this test binary and
+    /// checks that the kernel kills it on the new mount API.
+    #[test]
+    fn new_mount_api_kills_the_agent() {
+        const PROBE: &str = "HAVN_SECCOMP_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            no_core_dump();
+            restrict_syscalls(&[]).expect("install filter");
+            // SAFETY: fsopen with a valid NUL-terminated name and no flags;
+            // the filter is expected to kill the process before it returns.
+            unsafe { libc::syscall(libc::SYS_fsopen, c"tmpfs".as_ptr(), 0) };
+            std::process::exit(0);
+        }
+        use std::os::unix::process::ExitStatusExt as _;
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "seccomp::tests::new_mount_api_kills_the_agent"])
+            .env(PROBE, "1")
+            .status()
+            .expect("run probe");
+        assert_eq!(status.signal(), Some(libc::SIGSYS), "{status:?}");
+    }
+
+    /// 32-bit system calls (int 0x80) use a different syscall table, so the
+    /// filter must kill on an architecture mismatch rather than allow it.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn i386_syscalls_are_refused() {
+        const PROBE: &str = "HAVN_SECCOMP_I386_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            no_core_dump();
+            restrict_syscalls(&[]).expect("install filter");
+            let mut nr: i64 = 20; // getpid in the i386 table
+            // SAFETY: int 0x80 with eax=20 is the i386 getpid syscall; it takes
+            // no arguments. Kernels before 4.17 also zeroed r8-r11.
+            unsafe {
+                std::arch::asm!(
+                    "int 0x80",
+                    inout("rax") nr,
+                    lateout("r8") _,
+                    lateout("r9") _,
+                    lateout("r10") _,
+                    lateout("r11") _,
+                );
+            }
+            // Reaching this line means the call was allowed.
+            std::process::exit(i32::from(nr < 0));
+        }
+        use std::os::unix::process::ExitStatusExt as _;
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "seccomp::tests::i386_syscalls_are_refused"])
+            .env(PROBE, "1")
+            .status()
+            .expect("run probe");
+        // SIGSYS: the filter killed it. SIGSEGV: the kernel has no 32-bit
+        // syscall entry at all (ia32 emulation off), which also refuses it.
+        assert!(
+            matches!(status.signal(), Some(libc::SIGSYS | libc::SIGSEGV)),
+            "{status:?}"
+        );
+    }
+
+    /// x32 system calls (number | 0x4000_0000) must be killed even though
+    /// the blocklist matches exact numbers.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x32_syscalls_are_refused() {
+        const PROBE: &str = "HAVN_SECCOMP_X32_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            no_core_dump();
+            restrict_syscalls(&[]).expect("install filter");
+            // SAFETY: getpid takes no arguments; with the x32 bit set it is
+            // either killed by the filter or rejected with ENOSYS.
+            let rc = unsafe { libc::syscall(0x4000_0000 | libc::SYS_getpid) };
+            // Reaching this line means the call was allowed.
+            std::process::exit(i32::from(rc < 0));
+        }
+        use std::os::unix::process::ExitStatusExt as _;
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "seccomp::tests::x32_syscalls_are_refused"])
+            .env(PROBE, "1")
+            .status()
+            .expect("run probe");
+        assert_eq!(status.signal(), Some(libc::SIGSYS), "{status:?}");
     }
 }

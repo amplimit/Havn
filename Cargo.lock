@@ -1800,6 +1800,7 @@ version = "0.1.0-dev"
 dependencies = [
  "async-trait",
  "havn-core",
+ "landlock",
  "libc",
  "serde",
  "thiserror 2.0.21",

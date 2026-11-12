@@ -41,8 +41,9 @@ use havn_core::{InboundMessage, MessageContent, OutboundMessage, Policy};
 use havn_db::agent::conversations::{self as conversations, Role};
 use havn_proto::{
     AdminOutcome, AgentQueryOutcome, AgentQueryResponse, AgentToGateway, CronOutcome, CronResult,
-    CronTick, GatewayToAgent, IncomingQuery, MemoryForgetRequest, MemoryForgetResponse,
-    PROTOCOL_VERSION, SkillPinRequest, SkillPinResponse, read_frame, write_frame,
+    CronTick, DataQuery, DataRequest, DataResponse, GatewayToAgent, IncomingQuery,
+    MemoryForgetRequest, MemoryForgetResponse, PROTOCOL_VERSION, SkillPinRequest, SkillPinResponse,
+    read_frame, write_frame,
 };
 use sqlx::SqlitePool;
 use tokio::io::BufReader;
@@ -309,17 +310,31 @@ async fn main() -> anyhow::Result<()> {
                 None
             } else {
                 match serde_json::from_value::<embedding::EmbeddingConfig>(emb_value.clone()) {
-                    Ok(cfg) => match cfg.instantiate() {
-                        Ok(eh) => eh,
-                        Err(e) => {
-                            warn!(
-                                provider = cfg.provider_name(),
-                                error = %e,
-                                "embedding provider failed to initialise; hybrid retrieval disabled"
+                    Ok(mut cfg) => {
+                        // Landlock is already in force here, so the
+                        // model cache defaults to a workspace directory.
+                        if let embedding::EmbeddingConfig::Local(local) = &mut cfg
+                            && local.cache_dir.is_none()
+                        {
+                            local.cache_dir = Some(
+                                args.workspace
+                                    .join(".havn/models")
+                                    .to_string_lossy()
+                                    .into_owned(),
                             );
-                            None
                         }
-                    },
+                        match cfg.instantiate() {
+                            Ok(eh) => eh,
+                            Err(e) => {
+                                warn!(
+                                    provider = cfg.provider_name(),
+                                    error = %e,
+                                    "embedding provider failed to initialise; hybrid retrieval disabled"
+                                );
+                                None
+                            }
+                        }
+                    }
                     Err(e) => {
                         warn!(
                             raw = %emb_value,
@@ -332,13 +347,10 @@ async fn main() -> anyhow::Result<()> {
             };
             let provider_label = embedder.as_ref().map_or("disabled", |e| e.name());
             // Translate the Welcome's `extra_mounts` wire vec into
-            // (path, ro?) pairs for the Landlock step below. The
-            // *bind-mounts themselves* are already in place — havn-
-            // init applied them before pivot_root. We only extend
-            // the LSM allowlist here so the agent can actually
-            // touch the bound paths; without a Landlock entry the
-            // kernel denies access even though the file exists in
-            // the namespace.
+            // (path, ro?) pairs for the Landlock step below, which
+            // only runs without havn-init (subprocess spawner); under
+            // the namespace spawner havn-init already added these
+            // paths to the rules it applied before exec.
             let extra_mount_pairs: Vec<(std::path::PathBuf, bool)> = extra_mounts_wire
                 .into_iter()
                 .map(|m| {
@@ -347,8 +359,8 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .collect();
             // Tmpfs mounts get rw access in Landlock — they exist
-            // precisely so the workload can write to them. The
-            // tmpfs *itself* is mounted by havn-init pre-pivot.
+            // precisely so the workload can write to them (same
+            // split as above for who applies the rule).
             let tmpfs_paths: Vec<std::path::PathBuf> = tmpfs_mounts_wire
                 .into_iter()
                 .map(|m| std::path::PathBuf::from(m.path))
@@ -389,6 +401,9 @@ async fn main() -> anyhow::Result<()> {
     //     between Welcome and now is acceptable — no user-controlled
     //     code runs in that window (only fastembed init from a
     //     gateway-supplied config string).
+    //     Under the namespace spawner the Landlock rules are already in
+    //     place: havn-init applies them before exec so that every thread
+    //     is covered (hence the `local-embed` cache default above).
     #[cfg(target_os = "linux")]
     {
         // Union the MCP-server extra paths from policy (spec §13
@@ -432,11 +447,40 @@ async fn main() -> anyhow::Result<()> {
         for path in &tmpfs_mounts {
             allow_rw.push(path.as_path());
         }
-        if let Err(e) = sandbox::restrict_filesystem(&args.workspace, &allow_rw, &allow_ro) {
-            warn!(error = %e, "Landlock restriction failed; continuing without LSM enforcement");
+        // A sandbox layer that cannot be installed is an error, not a
+        // reason to run the agent without it. (A kernel without Landlock
+        // is reported by restrict_filesystem as "not enforced", not here.)
+        if std::env::var("HAVN_LANDLOCK_APPLIED").as_deref() == Ok("1") {
+            // havn-init applied the rules before exec, covering every
+            // thread of this process.
+            info!("landlock applied before exec by havn-init");
+        } else if init::is_pid_one() {
+            // PID 1 means the namespace spawner started us through
+            // havn-init, which should have applied the rules; applying
+            // them here would leave the worker threads unconfined.
+            return Err(anyhow!(
+                "running as PID 1 but havn-init did not apply the Landlock rules \
+                 (mismatched havn-init?); refusing to start"
+            ));
+        } else {
+            // Without havn-init (subprocess spawner) this only confines
+            // the calling thread; that mode is not isolated anyway.
+            sandbox::restrict_filesystem(&args.workspace, &allow_rw, &allow_ro)
+                .map_err(|e| anyhow!("Landlock restriction failed: {e}"))?;
         }
-        if let Err(e) = seccomp::restrict_syscalls(&seccomp_allow_extra) {
-            warn!(error = %e, "seccomp restriction failed; continuing without syscall filtering");
+        match seccomp::restrict_syscalls(&seccomp_allow_extra) {
+            Ok(()) => {}
+            // An operator typo in seccomp.allow_extra must not leave the
+            // agent unfiltered: apply the full blocklist instead.
+            Err(seccomp::SeccompError::UnknownSyscall(name)) => {
+                warn!(
+                    name,
+                    "unknown or unrelaxable seccomp.allow_extra entry; applying the full blocklist"
+                );
+                seccomp::restrict_syscalls(&[])
+                    .map_err(|e| anyhow!("seccomp restriction failed: {e}"))?;
+            }
+            Err(e) => return Err(anyhow!("seccomp restriction failed: {e}")),
         }
     }
 
@@ -523,12 +567,18 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tokio::select! {
                     maybe = writer_rx.recv() => match maybe {
-                        Some(frame) => {
-                            if let Err(e) = write_frame(&mut write, &frame).await {
+                        Some(frame) => match write_frame(&mut write, &frame).await {
+                            Ok(()) => {}
+                            // Rejected before anything was written: the
+                            // stream is intact, only this frame is lost.
+                            Err(havn_proto::FrameError::FrameTooLarge(size)) => {
+                                error!(size, "dropping an outbound frame over the size limit");
+                            }
+                            Err(e) => {
                                 error!(error = %e, "agent writer failed");
                                 break;
                             }
-                        }
+                        },
                         None => break,
                     },
                     () = writer_shutdown.notified() => {
@@ -584,12 +634,13 @@ async fn main() -> anyhow::Result<()> {
         workspace_dir: Arc::clone(&workspace_dir),
         writer_tx: writer_tx.clone(),
         pending: Arc::clone(&pending),
-        // Curator runs at most once per 7 days and processes ≤100
-        // skills per pass; pinning to the cheaper Sonnet keeps the
-        // cost imperceptible. Operators can override the default
-        // model per-agent via Welcome.policy or env in a future
-        // pass; for now, hard-code the cheap baseline.
-        model: "claude-sonnet-4-6".into(),
+        // The agent's own model: one the operator's credentials and the
+        // policy's allowed_models already cover. A fixed model would fail
+        // on every pass for agents restricted to other models or
+        // providers.
+        model: model
+            .clone()
+            .unwrap_or_else(|| crate::tool_loop::DEFAULT_MODEL.to_string()),
     };
     let curator_last_inbound = Arc::clone(&last_inbound);
     let _curator_task = tokio::spawn(async move {
@@ -779,6 +830,12 @@ where
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
                     handle_skill_pin(req, ctx).await;
+                });
+            }
+            GatewayToAgent::DataRequest(req) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    handle_data_request(req, ctx).await;
                 });
             }
             GatewayToAgent::IncomingQuery(query) => {
@@ -1311,6 +1368,111 @@ fn init_tracing() {
         .with(filter)
         .with(fmt::layer())
         .init();
+}
+
+/// Upper bound on rows returned to the dashboard per request (matches the
+/// gateway's largest page size).
+const MAX_DATA_ROWS: u32 = 1000;
+/// Serialized size budget for one data reply, well under the 4 MiB frame
+/// limit (which would otherwise drop the reply).
+const MAX_DATA_REPLY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Serialize `rows`, keeping as many as fit in `budget` bytes: the first
+/// ones, or the last ones when `keep_last` (chronological lists, where the
+/// newest are at the end).
+fn rows_within_budget<T: serde::Serialize>(
+    rows: Vec<T>,
+    budget: usize,
+    keep_last: bool,
+) -> Result<Vec<serde_json::Value>, String> {
+    let ordered: Box<dyn Iterator<Item = T>> = if keep_last {
+        Box::new(rows.into_iter().rev())
+    } else {
+        Box::new(rows.into_iter())
+    };
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for row in ordered {
+        let value = serde_json::to_value(row).map_err(|e| e.to_string())?;
+        let size = serde_json::to_vec(&value).map_err(|e| e.to_string())?.len();
+        if used + size > budget {
+            break;
+        }
+        used += size;
+        kept.push(value);
+    }
+    if keep_last {
+        kept.reverse();
+    }
+    Ok(kept)
+}
+
+/// Answer a dashboard read with rows from this agent's own database.
+async fn handle_data_request(req: DataRequest, ctx: Ctx) {
+    use havn_db::agent::{memory, skills_index};
+    let result: Result<serde_json::Value, String> = async {
+        match req.query {
+            DataQuery::Memory { memory_kind, limit } => {
+                let limit = limit.min(MAX_DATA_ROWS);
+                let entries = match memory_kind.as_deref().and_then(memory::Kind::parse) {
+                    Some(kind) => memory::list_active_of_kind(&ctx.pool, kind, limit).await,
+                    None => memory::list_active(&ctx.pool, limit).await,
+                }
+                .map_err(|e| e.to_string())?;
+                Ok(serde_json::Value::Array(rows_within_budget(
+                    entries,
+                    MAX_DATA_REPLY_BYTES,
+                    false,
+                )?))
+            }
+            DataQuery::Skills { limit } => {
+                let limit = limit.min(MAX_DATA_ROWS);
+                let active = skills_index::list_all_active(&ctx.pool, limit)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let archived = skills_index::list_archived(&ctx.pool, limit)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let half = MAX_DATA_REPLY_BYTES / 2;
+                Ok(serde_json::json!({
+                    "active": rows_within_budget(active, half, false)?,
+                    "archived": rows_within_budget(archived, half, false)?,
+                }))
+            }
+            DataQuery::Conversation { channel_id, limit } => {
+                let turns = conversations::recent_with_channel(
+                    &ctx.pool,
+                    &channel_id,
+                    limit.min(MAX_DATA_ROWS),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Ok(serde_json::Value::Array(rows_within_budget(
+                    turns,
+                    MAX_DATA_REPLY_BYTES,
+                    true,
+                )?))
+            }
+        }
+    }
+    .await;
+    let outcome = match result {
+        Ok(details) => AdminOutcome::Ok { details },
+        Err(message) => {
+            warn!(%message, "data request failed");
+            AdminOutcome::Error { message }
+        }
+    };
+    if let Err(e) = ctx
+        .writer_tx
+        .send(AgentToGateway::DataResponse(DataResponse {
+            request_id: req.request_id,
+            outcome,
+        }))
+        .await
+    {
+        error!(error = ?e, "could not enqueue DataResponse");
+    }
 }
 
 /// Handle a dashboard-initiated `memory_forget` (spec §5.2 nuance —

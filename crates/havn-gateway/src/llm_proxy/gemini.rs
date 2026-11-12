@@ -44,6 +44,14 @@ impl LlmProvider for GeminiProvider {
         api_key: &str,
         request: &AnthropicRequest,
     ) -> Result<AnthropicResponse, ProviderError> {
+        // The model name becomes part of the URL path, so it must not be able
+        // to add path segments, a query string or a fragment.
+        if !is_plain_model_name(&request.model) {
+            return Err(ProviderError::BadRequest {
+                status: 400,
+                body: format!("invalid Gemini model name {:?}", request.model),
+            });
+        }
         let body = anthropic_to_gemini(request)
             .map_err(|e| ProviderError::Translation(format!("request build: {e}")))?;
 
@@ -85,6 +93,12 @@ impl LlmProvider for GeminiProvider {
         gemini_to_anthropic(&raw, &request.model)
             .map_err(|e| ProviderError::Translation(format!("response translate: {e}")))
     }
+}
+
+fn is_plain_model_name(model: &str) -> bool {
+    let mut chars = model.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 fn anthropic_to_gemini(req: &AnthropicRequest) -> Result<Value, String> {
@@ -355,6 +369,24 @@ fn gemini_to_anthropic(raw: &Value, model: &str) -> Result<AnthropicResponse, St
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn model_names_cannot_change_the_url() {
+        for ok in ["gemini-2.5-flash", "gemini-2.0-flash-001", "gemini_exp.1"] {
+            assert!(is_plain_model_name(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "../cachedContents",
+            "gemini-2.5-flash:countTokens?x=",
+            "a/b",
+            "a#b",
+            ".hidden",
+            "gemini 2.5",
+        ] {
+            assert!(!is_plain_model_name(bad), "{bad}");
+        }
+    }
 
     fn req(messages: Vec<AnthropicMessage>, system: Option<&str>) -> AnthropicRequest {
         AnthropicRequest {

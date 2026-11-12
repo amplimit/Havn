@@ -11,6 +11,7 @@
 //! while introducing the typed write path (`remember`).
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -19,7 +20,7 @@ use crate::agent::hybrid_common::{EmbeddedCandidate, FtsHit, bytes_to_f32};
 
 /// What flavour of fact a memory row holds. Spec §9.4 — see the docstring
 /// on each variant for default lifetime and use case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
     /// Stable facts about the user as a person. Never auto-expires.
     Identity,
@@ -79,7 +80,7 @@ impl Kind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Source {
     UserTold,
     AgentInferred,
@@ -102,7 +103,7 @@ impl Source {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
     pub id: String,
     pub key: String,
@@ -632,6 +633,25 @@ pub async fn recent_events(
 
 /// List active rows for the dashboard. Newest first; bounded by `limit`
 /// (caller paginates if needed).
+/// Active entries of one kind, newest first (events: the last year).
+pub async fn list_active_of_kind(pool: &SqlitePool, kind: Kind, limit: u32) -> Result<Vec<Entry>> {
+    if kind == Kind::Event {
+        return recent_events(pool, ChronoDuration::days(365), limit).await;
+    }
+    let rows: Vec<EntryRow> = sqlx::query_as::<_, EntryRow>(
+        "SELECT id, key, value, kind, source, ttl_days, archived_at, created_at, updated_at, \
+                recall_count, last_recalled_at, supersedes_id \
+         FROM memory \
+         WHERE archived_at IS NULL AND kind = ?1 \
+         ORDER BY updated_at DESC LIMIT ?2",
+    )
+    .bind(kind.as_str())
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(Entry::from).collect())
+}
+
 pub async fn list_active(pool: &SqlitePool, limit: u32) -> Result<Vec<Entry>> {
     let rows: Vec<EntryRow> = sqlx::query_as::<_, EntryRow>(
         "SELECT id, key, value, kind, source, ttl_days, archived_at, created_at, updated_at, \

@@ -1,9 +1,10 @@
 //! `/teams` and `/teams/{id}` endpoints (spec §8.3, §10.3).
 //!
 //! Teams group users for shared agents, shared credentials, and a
-//! single audit log. Creation is open to any authenticated user — the
-//! creator is auto-promoted to the team's `admin` role so they can
-//! invite others. Renames and deletion are admin-only.
+//! single audit log. In multi-user mode the operator creates teams with
+//! `havn team add`; in single-user mode the API may create them and the
+//! creator becomes the team's `admin`. Renames and deletion are
+//! admin-only.
 //!
 //! Sub-resources live in sibling modules:
 //! - `/teams/{id}/members` → [`super::members`]
@@ -77,7 +78,8 @@ pub async fn list(
     Ok(Json(views))
 }
 
-/// `POST /teams` — create a team and auto-add the creator as admin.
+/// `POST /teams` — single-user mode only: create a team and add the
+/// creator as admin.
 /// Atomic enough: if the role create or membership add fails after
 /// the team is inserted, we leave a half-created team behind. The CLI
 /// `havn team delete` cleans up; in practice a failure here is rare
@@ -88,6 +90,16 @@ pub async fn create(
     user: AuthedUser,
     Json(req): Json<CreateTeamRequest>,
 ) -> Result<(StatusCode, Json<TeamView>), ApiError> {
+    // The creator becomes the team's admin and admins set role policies,
+    // so letting any user create a team would let any user grant
+    // themselves any policy. In multi-user mode teams are provisioned by
+    // the operator with `havn team add`.
+    if state.trusted_proxies.is_some() {
+        return Err(ApiError::Forbidden(
+            "teams are created by the operator with `havn team add --name <name> --admin <user-id>`"
+                .into(),
+        ));
+    }
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name must be non-empty".into()));
     }
@@ -396,4 +408,47 @@ fn member_default_policy() -> Policy {
     p.permissions.can_spawn_subagents = false;
     p.admin_visibility.can_view_audit_log = false;
     p
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use crate::auth::tests::state_with;
+
+    fn request() -> Json<CreateTeamRequest> {
+        Json(CreateTeamRequest {
+            name: "self-made".into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn create_is_rejected_in_multi_user_mode() {
+        let (state, user_id) = state_with(true).await;
+        let user = AuthedUser {
+            id: user_id,
+            display_name: "member".into(),
+        };
+        let err = create(State(state.clone()), user, request())
+            .await
+            .expect_err("trust_header mode must refuse");
+        assert!(matches!(err, ApiError::Forbidden(_)), "{err:?}");
+        let teams = repo::list_all(&state.db).await.expect("list teams");
+        assert!(teams.is_empty(), "no team may be created: {teams:?}");
+    }
+
+    #[tokio::test]
+    async fn create_is_allowed_in_single_user_mode() {
+        let (state, user_id) = state_with(false).await;
+        let user = AuthedUser {
+            id: user_id,
+            display_name: "operator".into(),
+        };
+        let (status, Json(team)) = create(State(state.clone()), user, request())
+            .await
+            .expect("single-user mode allows team creation");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(team.name, "self-made");
+    }
 }

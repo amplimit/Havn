@@ -14,7 +14,8 @@
 //! ```
 //!
 //! This module covers only the cgroup layer; namespaces live in
-//! `namespace` / `ns_setup`, Landlock and seccomp in the runtime. The
+//! `namespace` / `ns_setup`, Landlock in `filesystem_rules` (applied by
+//! `havn-init`), seccomp in the runtime. The
 //! controller takes the cgroup root as a parameter so unit tests can
 //! substitute a tempdir; production binds
 //! `/sys/fs/cgroup` via [`Self::system`].
@@ -30,7 +31,7 @@ use tracing::{debug, info, warn};
 /// Default systemd-friendly slice name. We don't manage the slice lifecycle —
 /// systemd or the operator does that — but we create the directory if it's
 /// missing and writable.
-const SLICE: &str = "havn.slice";
+pub const SLICE: &str = "havn.slice";
 
 const REQUIRED_CONTROLLERS: &[&str] = &["cpu", "memory", "pids"];
 
