@@ -44,7 +44,8 @@ havn is a self-hosted server that runs a gateway and per-user agents. Identity, 
 **Requirements:**
 
 - **OS** — Linux only. Ubuntu 24.04 LTS recommended. Agent isolation relies on kernel features (user namespaces, Landlock ≥ 5.13, seccomp, cgroup v2) without macOS/Windows equivalents.
-- **Rust** — 1.94+ — only for building from source. The installer downloads a prebuilt static binary by default, so no toolchain is needed.
+- **Network tools** — `iptables` (nft or legacy backend), `ip` (iproute2) and `nsenter` (util-linux) on the gateway host, used to give agents outbound network. Without `iptables` or `nsenter` the gateway still starts, but every agent runs with no network access; without `ip` it refuses to start (it checks the host routes for the agent address pool). `install.sh` installs them via apt when they are missing; `havn doctor` checks for them. Minimal and container images (e.g. Docker `ubuntu:24.04`) often lack `iptables` and `iproute2`.
+- **Rust** — 1.94+ — only for building from source (plus a C compiler and libc headers, e.g. `build-essential`). The installer downloads a prebuilt static binary by default, so no toolchain is needed.
 - **Node.js** — 22+ (for the dashboard only)
 
 ### Install (prebuilt — no toolchain, no compile)
@@ -55,7 +56,7 @@ curl -fsSL https://raw.githubusercontent.com/amplimit/havn/main/install.sh | bas
 
 This fetches a statically-linked `havn` binary from [Releases](https://github.com/amplimit/havn/releases) (verified by SHA-256), creates the `havn-wakecheck` sandbox user, and runs `havn setup`. Pin a version with `HAVN_VERSION=v0.1.1`, or force a source build with `HAVN_FROM_SOURCE=1`.
 
-Then configure and start. Agent isolation (namespaces + cgroup v2) needs the gateway to run as root, or inside a systemd unit with `Delegate=yes`; without it the gateway refuses to start rather than run agents unisolated.
+Then configure and start. Agent isolation (namespaces + cgroup v2) needs the gateway to run as root, either from a root shell or under the [systemd unit](#run-under-systemd); without it the gateway refuses to start rather than run agents unisolated. `havn doctor` reports what is missing (cgroup slice, network tools, Landlock).
 
 ```bash
 sudo -i                      # the gateway runs as root
@@ -73,6 +74,24 @@ havn credential add anthropic sk-ant-...
 ```
 
 For a dev box without isolation, `HAVN_SPAWNER=subprocess havn start` runs agents as plain unsandboxed processes, and the gateway cannot tell which agent a connection comes from; do not use it for anything untrusted.
+
+### Run under systemd
+
+On hosts running systemd, `install.sh` installs a reference unit at `/usr/local/lib/systemd/system/havn.service` (source: [contrib/systemd/havn.service](contrib/systemd/havn.service), also in the release tarball). It is not enabled. It runs the gateway as root with `HOME=/root`, so it uses the config and data under `/root` (install.sh runs `havn setup` for root when it installs the unit), reads `HAVN_AGE_KEY` from `/etc/havn/havn.env`, and restarts on failure:
+
+```bash
+sudo -i
+HOME=/root havn setup --non-interactive         # once; install.sh already did this
+install -d -m 700 -o root -g root /etc/havn
+install -m 600 -o root -g root /dev/null /etc/havn/havn.env
+$EDITOR /etc/havn/havn.env                      # add: HAVN_AGE_KEY='your-secret-passphrase'
+systemctl enable --now havn
+journalctl -u havn -f
+```
+
+Keep `/etc/havn/havn.env` mode 0600 and owned by root, and write the key with an editor rather than `echo`, which leaves it in the shell history. systemd takes the value inside single quotes literally; it must not contain `'` or `\`.
+
+Agent cgroups are `/sys/fs/cgroup/havn.slice/agent-<id>`. The gateway creates that top-level cgroup itself and moves agents into it, outside the unit's own cgroup, so this is not systemd delegation; `Delegate=yes` only keeps the cpu, memory and pids controllers enabled from the root cgroup down. `/sys/fs/cgroup/havn.slice` is also where systemd would put a slice unit called `havn.slice`: never create such a unit, set `Slice=havn.slice`, or run anything with `--slice=havn`, or systemd adopts the cgroup, rewrites its controllers (which can drop the agents' memory limits) and may remove it. Put local changes in a drop-in (`systemctl edit havn`) rather than editing the installed file, which a re-install overwrites.
 
 ### Build from source
 
@@ -147,6 +166,25 @@ havn is **infrastructure, not SaaS**. The test: does it require kernel primitive
 - WebChat WebSocket connections are checked against an Origin allowlist (`allowed_origins`) and must present the caller's `ws_token` from `GET /me`; the token identifies the user rather than being a secret, so the Origin check is what blocks cross-site connections
 - No marketplace — skills are local files; sharing via git
 
+## Tool Hooks
+
+PreToolUse hooks refuse a tool call before it runs when one of its regex patterns matches the call's main input (the shell command, the file path, the URL). The agent sees the refusal as the tool result and can adjust its plan.
+
+Operators put hooks in the policy (a role's policy, or a per-agent override), under `hooks`:
+
+```json
+"hooks": {
+  "pre_tool_use": [
+    { "tool": "shell", "deny": ["^rm -rf", "^sudo "] },
+    { "tool": "web_fetch", "deny": ["://internal\\.corp\\.net"] }
+  ]
+}
+```
+
+An agent workspace can also contain `.havn/hooks.yaml` with the same `pre_tool_use` list, so an existing file can be pasted into the policy as is. The agent can edit its own workspace, so this file can only add rules: the runtime applies the policy's rules and the file's rules together, and changing or deleting the file never removes a policy rule. Both are read when the agent starts. A per-agent policy override can add hook rules but cannot remove its owner's, and a user with several roles gets every role's rules. A policy holds at most 64 rules and 256 patterns of up to 1024 bytes each, and an invalid policy is rejected when it is saved. The workspace file is read leniently: unknown keys are ignored, and invalid patterns and rules beyond those caps are skipped with a warning. A rule for a tool the agent does not have is logged as a warning when the agent starts.
+
+Hooks are guardrails against model mistakes, not a security boundary. A pattern matches text, and an agent that wants to can run the same action in a form no pattern matches (`rm  -rf`, `cd / && rm -rf`, a script file). To actually prevent an action, use the policy permissions (`can_use_shell`, `can_access_network`), `network_policy`, the mounts an agent gets, and the sandbox described above.
+
 ## Configuration
 
 Gateway config lives at `~/.config/havn/config.toml`:
@@ -172,9 +210,11 @@ listen = "0.0.0.0:8080"
 
 [trust_header]
 enabled = true
-# Peers allowed to set X-User-ID; everyone else gets 403.
-# Empty means loopback only (a proxy on the same host).
-allowed_proxies = ["127.0.0.1/32"]
+# Peers allowed to set the identity header (the address your proxy
+# connects from); everyone else gets 403. Empty means loopback only.
+allowed_proxies = ["192.0.2.10/32"]
+# Header carrying the user's identity (default "X-User-ID").
+header = "X-Forwarded-Email"
 ```
 
 In trust-header (multi-user) mode:
@@ -185,6 +225,110 @@ In trust-header (multi-user) mode:
 - The gateway-wide embedding configuration can only be changed in `config.toml`.
 
 Cron jobs may carry a `wake_check` script. It runs on the host as the dedicated `havn-wakecheck` user (created by `install.sh`; the gateway must run as root to switch to it) with a minimal environment. Without that user the script is skipped and the job always wakes.
+
+### Multi-user mode behind an SSO proxy
+
+The gateway reads the user's identity from one header, `trust_header.header` (default `X-User-ID`), and only on connections from an `allowed_proxies` peer. It resolves the value to a havn user in this order:
+
+1. When `match_user_id` is on and the value is an internal user id in canonical form (lowercase, hyphenated): that user. `match_user_id` defaults to on for `X-User-ID` and off for any other header. Turn it on for another header only if users cannot choose their own names at the identity provider, otherwise a user could take another user's internal id as their name.
+2. The user whose external id equals the value. Matching is exact and case-sensitive: `Alice@example.com` and `alice@example.com` are different identities, so provision the value exactly as your proxy emits it. External ids are visible ASCII (inner spaces allowed), without commas, and cannot be UUIDs.
+
+Anything else gets 403; users are never created on the fly. A request carrying the header more than once is refused. The header name cannot be one HTTP already uses (`Host`, `Cookie`, `Authorization`, `Connection`, ...).
+
+Provision users with the value the proxy will send:
+
+```sh
+havn user add --external-id alice@example.com --display-name "Alice"   # generates the internal id
+havn user add 0190a3c4-... --display-name "Bob"                         # internal id only (X-User-ID setups)
+havn user list                                                          # id, name, external id
+havn user set-external-id <existing-id> ops@example.com                 # e.g. the single-user bootstrap user
+havn user set-external-id <existing-id> --clear
+```
+
+The dashboard asks the gateway for the header name at startup (`GET /auth/info`) and forwards that header only from the addresses in `HAVN_DASHBOARD_TRUSTED_PROXIES`. It drops other common identity headers such as `X-User-ID`, `Remote-User` and `X-Forwarded-Email` from every peer, and refuses `/api` and `/ws` requests while it does not know the name. It marks each forwarded request with `X-Havn-Identity-Header` naming the header it filtered for, and the gateway refuses a request marked for another name, so renaming `trust_header.header` cannot open a window before the dashboard notices. `HAVN_DASHBOARD_IDENTITY_HEADER` is optional; when set, the dashboard refuses to start if the gateway reads another header. When the dashboard runs on the gateway host, the gateway sees the dashboard as a loopback peer, so `allowed_proxies = ["127.0.0.1/32"]` and `listen = "127.0.0.1:8080"` cover it. Route both the UI and `/api` and `/ws` through the SSO proxy, without unauthenticated paths: a path the proxy skips would pass through whatever header the client sent.
+
+#### oauth2-proxy
+
+oauth2-proxy (a current v7 release) in front of the dashboard, all on one host, with a TLS-terminating proxy in front of oauth2-proxy. `--pass-user-headers` (on by default) makes oauth2-proxy replace `X-Forwarded-User` and `X-Forwarded-Email` on every request it forwards upstream, WebSocket upgrades included:
+
+```sh
+oauth2-proxy \
+  --http-address=127.0.0.1:4180 \
+  --upstream=http://127.0.0.1:3000/ \
+  --provider=oidc --oidc-issuer-url=https://sso.example.com \
+  --client-id=havn --client-secret-file=/etc/oauth2-proxy/client-secret \
+  --cookie-secret-file=/etc/oauth2-proxy/cookie-secret \
+  --email-domain=example.com \
+  --pass-user-headers=true
+
+HAVN_DASHBOARD_TRUSTED_PROXIES=127.0.0.1 \
+HAVN_DASHBOARD_IDENTITY_HEADER=X-Forwarded-Email \
+npm start   # in apps/dashboard
+```
+
+```toml
+listen = "127.0.0.1:8080"
+
+[trust_header]
+enabled = true
+allowed_proxies = ["127.0.0.1/32"]
+header = "X-Forwarded-Email"
+```
+
+```sh
+havn user add --external-id alice@example.com --display-name "Alice"
+```
+
+`X-Forwarded-User` carries the OIDC `sub` claim. Many providers (Keycloak, Authentik) use a UUID there, which cannot be an external id, so key users on the email. When oauth2-proxy runs as an nginx `auth_request` endpoint instead of in front of the dashboard, start it with `--set-xauthrequest` and copy its `X-Auth-Request-Email` response header into the forwarded request as in the next recipe.
+
+#### nginx `auth_request` with Authelia
+
+nginx terminates TLS, asks Authelia whether the request is authenticated, and copies Authelia's `Remote-User` response header into the request to the dashboard. `proxy_set_header` replaces whatever `Remote-User` the client sent:
+
+```nginx
+location /internal/authelia/authz {
+    internal;
+    proxy_pass http://127.0.0.1:9091/api/authz/auth-request;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    proxy_set_header X-Original-Method $request_method;
+    proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+    proxy_set_header X-Forwarded-For $remote_addr;
+}
+
+location / {
+    auth_request /internal/authelia/authz;
+    auth_request_set $user $upstream_http_remote_user;
+    auth_request_set $redirection_url $upstream_http_location;
+    error_page 401 =302 $redirection_url;
+
+    proxy_set_header Remote-User $user;
+    proxy_set_header Host $host;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;   # map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+    proxy_pass http://127.0.0.1:3000;
+}
+```
+
+```sh
+HAVN_DASHBOARD_TRUSTED_PROXIES=127.0.0.1 HAVN_DASHBOARD_IDENTITY_HEADER=Remote-User npm start
+```
+
+```toml
+listen = "127.0.0.1:8080"
+
+[trust_header]
+enabled = true
+allowed_proxies = ["127.0.0.1/32"]
+header = "Remote-User"
+```
+
+```sh
+havn user add --external-id alice --display-name "Alice"   # the Authelia username
+```
+
+The same pattern works for any other proxy that replaces a header with the authenticated user's name. With Cloudflare Access, use `header = "Cf-Access-Authenticated-User-Email"` and set `allowed_proxies` to the address `cloudflared` connects from. havn does not check the `Cf-Access-Jwt-Assertion` token, so the origin must be reachable only through `cloudflared`, and an Access bypass policy forwards requests nobody has authenticated.
 
 ## Channel Adapters
 

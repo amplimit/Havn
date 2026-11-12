@@ -24,6 +24,40 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  version:
+    # Binaries report the workspace version (`havn --version`), so the tag
+    # must match it: before tagging vX.Y.Z, set `[workspace.package] version`
+    # and the internal crates in `[workspace.dependencies]` to X.Y.Z.
+    name: tag matches workspace version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: compare tag and Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != ''
+        env:
+          TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
+        run: |
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)"
+          echo "workspace version: ${version:-<none>}"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match workspace version ${version:-<none>}; set it to ${TAG#v} in Cargo.toml before tagging"
+            exit 1
+          fi
+          stale="$(grep -E '^havn-[a-z]+ = \{' Cargo.toml | grep -Fv "version = \"$version\"" || true)"
+          if [ -n "$stale" ]; then
+            echo "::error::internal crate versions in [workspace.dependencies] differ from $version:"
+            echo "$stale"
+            exit 1
+          fi
+      - name: Cargo.lock matches the version bump
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != ''
+        # Fails when the bump commit did not refresh Cargo.lock
+        # (`cargo update -w`). `rustup toolchain install` fetches the
+        # toolchain pinned in rust-toolchain.toml.
+        run: |
+          rustup toolchain install
+          cargo metadata --locked --format-version 1 >/dev/null
+
   ci:
     uses: ./.github/workflows/ci.yml
     permissions:
@@ -37,7 +71,7 @@ jobs:
 
   build:
     name: build ${{ matrix.target }}
-    needs: [ci, audit]
+    needs: [version, ci, audit]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -94,7 +128,8 @@ jobs:
           mkdir -p dist
           tar -czf "dist/${asset}" \
             -C "target/${triple}/release" \
-            havn havn-gateway havn-runtime havn-init
+            havn havn-gateway havn-runtime havn-init \
+            -C "${GITHUB_WORKSPACE}/contrib/systemd" havn.service
           ( cd dist && sha256sum "${asset}" > "${asset}.sha256" )
           echo "asset=${asset}" >> "$GITHUB_OUTPUT"
           ls -lh dist

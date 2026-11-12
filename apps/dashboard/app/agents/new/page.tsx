@@ -1,22 +1,47 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useState } from "react";
-import { api } from "@/lib/api";
+import { useEffect, useState } from "react";
+import { api, type TeamView } from "@/lib/api";
 
 export default function NewAgentPage() {
   const router = useRouter();
   const [name, setName] = useState("");
   const [model, setModel] = useState("claude-opus-4-7");
+  const [teams, setTeams] = useState<TeamView[]>([]);
+  const [teamId, setTeamId] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const wanted = new URLSearchParams(window.location.search).get("team");
+    (async () => {
+      try {
+        const t = await api.teams.list();
+        if (cancelled) return;
+        setTeams(t);
+        if (wanted && t.some((team) => team.id === wanted && team.can_create_agents))
+          setTeamId(wanted);
+      } catch {
+        // Without the team list the agent is created as a personal agent.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     setSubmitting(true);
     setError(null);
     try {
-      const agent = await api.agents.create(name.trim(), { model });
+      const agent = await api.agents.create(
+        name.trim(),
+        { model },
+        teamId || null,
+      );
       router.push(`/agents/${agent.id}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -56,6 +81,34 @@ export default function NewAgentPage() {
             Must be unique within your account. Lowercase / hyphens recommended.
           </p>
         </div>
+
+        {teams.length > 0 && (
+          <div className="mb-5">
+            <label htmlFor="team" className="label">
+              team
+            </label>
+            <select
+              id="team"
+              value={teamId}
+              onChange={(e) => setTeamId(e.target.value)}
+              className="input"
+            >
+              <option value="">none (personal agent)</option>
+              {teams.map((t) => (
+                <option key={t.id} value={t.id} disabled={!t.can_create_agents}>
+                  {t.can_create_agents ? t.name : `${t.name} (agent limit reached)`}
+                </option>
+              ))}
+            </select>
+            <p
+              className="mt-1.5 text-xs"
+              style={{ color: "var(--color-body)" }}
+            >
+              A team agent runs under your role in that team and counts
+              toward that role&apos;s agent limit.
+            </p>
+          </div>
+        )}
 
         <div className="mb-7">
           <label htmlFor="model" className="label">

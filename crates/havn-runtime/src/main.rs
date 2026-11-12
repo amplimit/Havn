@@ -389,7 +389,12 @@ async fn main() -> anyhow::Result<()> {
             )
         }
         Some(other) => return Err(anyhow!("expected Welcome, got {other:?}")),
-        None => return Err(anyhow!("connection closed before Welcome")),
+        None => {
+            return Err(anyhow!(
+                "connection closed before Welcome (the gateway refuses a runtime whose \
+                 protocol version {PROTOCOL_VERSION} differs from its own; see the gateway log)"
+            ));
+        }
     };
 
     // 3b. Sandbox application — moved from pre-Welcome to here so the
@@ -484,11 +489,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // 4. Load PreToolUse hooks from `<workspace>/.havn/hooks.yaml`.
-    //    Empty / missing file → no-op handle. Both the parent and
-    //    subagent registries share the SAME handle so a hot-reload
-    //    (future) flips both atomically.
-    let hooks = hooks::handle(hooks::load_from_workspace(&args.workspace).await);
+    // 4. Load PreToolUse hooks: the policy's rules plus any rules the
+    //    workspace `.havn/hooks.yaml` adds (it cannot remove policy
+    //    rules). Both the parent and subagent registries share the SAME
+    //    handle so a hot-reload (future) flips both atomically.
+    let hooks = hooks::handle(
+        hooks::load(&policy.hooks, &args.workspace)
+            .await
+            .map_err(|e| anyhow!("loading PreToolUse hooks failed: {e}"))?,
+    );
 
     // 4a. MCP servers (spec §13 Phase 3). Spawned AFTER Landlock +
     //     seccomp so each MCP child process inherits both: Landlock
@@ -717,6 +726,16 @@ async fn main() -> anyhow::Result<()> {
         can_query_other_agents = policy.permissions.can_query_other_agents,
         "parent tool registry built"
     );
+    {
+        let snapshot = hooks.load();
+        let unknown = snapshot.unknown_tools(&parent_registry.names());
+        if !unknown.is_empty() {
+            warn!(
+                tools = ?unknown,
+                "PreToolUse hook rules name tools this agent does not have; they never fire"
+            );
+        }
+    }
 
     // 7. Reader loop dispatches gateway → agent frames.
     let ctx = Ctx {
@@ -1073,6 +1092,7 @@ async fn handle_cron(tick: CronTick, ctx: Ctx) {
                 }
                 CronResult {
                     job_id: job_id.clone(),
+                    run_id: tick.run_id.clone(),
                     outcome: CronOutcome::Success,
                     output: text,
                     silent,
@@ -1082,6 +1102,7 @@ async fn handle_cron(tick: CronTick, ctx: Ctx) {
                 error!(%job_id, error = %e, "cron tool-use loop failed");
                 CronResult {
                     job_id: job_id.clone(),
+                    run_id: tick.run_id.clone(),
                     outcome: CronOutcome::Error {
                         message: e.to_string(),
                     },

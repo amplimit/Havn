@@ -33,7 +33,7 @@ pub struct GatewayConfig {
     pub allowed_origins: Vec<String>,
     pub reload: ReloadConfig,
     /// Trust-header configuration (spec §1.7). When enabled, the
-    /// gateway resolves the calling user from the `X-User-ID` header
+    /// gateway resolves the calling user from the identity header
     /// set by an upstream reverse proxy. Required for any non-loopback
     /// listen address; the startup guard refuses to bind otherwise.
     pub trust_header: TrustHeaderConfig,
@@ -491,11 +491,11 @@ impl Default for ReloadConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TrustHeaderConfig {
-    /// `true` to accept `X-User-ID` from upstream and resolve identity
-    /// against the `users` table. Required for any non-loopback
+    /// `true` to accept the identity header from upstream and resolve
+    /// identity against the `users` table. Required for any non-loopback
     /// listen address (spec §1.7); the gateway refuses to start
     /// otherwise. Default `false` so a fresh single-user install on
     /// loopback works out of the box.
@@ -505,6 +505,26 @@ pub struct TrustHeaderConfig {
     /// only (`127.0.0.0/8`, `::1`), which fits a reverse proxy on the same
     /// host. An invalid entry stops the gateway at startup.
     pub allowed_proxies: Vec<String>,
+    /// Name of the header carrying the user's identity, for example
+    /// `X-Forwarded-User`, `Remote-User` or
+    /// `Cf-Access-Authenticated-User-Email`.
+    pub header: String,
+    /// `true` lets a header value that is a canonical UUID match an internal
+    /// user id before external ids are tried. Unset means `true` for the
+    /// default `X-User-ID` header and `false` for any other: usernames an
+    /// SSO lets users choose must never resolve to another user's id.
+    pub match_user_id: Option<bool>,
+}
+
+impl Default for TrustHeaderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_proxies: Vec::new(),
+            header: "X-User-ID".into(),
+            match_user_id: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -528,6 +548,19 @@ mod tests {
         assert_eq!(parsed.reload.debounce_ms, 300);
         assert!(parsed.channels.is_empty());
         assert!(parsed.bindings.is_empty());
+        assert_eq!(parsed.trust_header.header, "X-User-ID");
+        assert_eq!(parsed.trust_header.match_user_id, None);
+    }
+
+    #[test]
+    fn trust_header_name_is_configurable() {
+        let parsed: GatewayConfig = toml::from_str(
+            "[trust_header]\nenabled = true\nheader = \"X-Forwarded-User\"\nmatch_user_id = false",
+        )
+        .expect("parse");
+        assert_eq!(parsed.trust_header.header, "X-Forwarded-User");
+        assert_eq!(parsed.trust_header.match_user_id, Some(false));
+        assert!(parsed.trust_header.allowed_proxies.is_empty());
     }
 
     #[test]

@@ -17,7 +17,7 @@ use havn_core::{RoleId, TeamId, UserId};
 use havn_db::repo::team_memberships::{self, MembershipDetail};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr as _;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::AppState;
 use crate::api::ApiError;
@@ -241,7 +241,27 @@ pub async fn remove(
         serde_json::json!({"user_id": member.to_string()}),
     )
     .await;
-    info!(team = %team, %member, "member removed");
+    // Their agents in this team keep running under a role they no longer
+    // hold otherwise; stop them (they are kept, each stop is audited, and
+    // they cannot be started again while the owner is outside the team).
+    // The removal stands even if a stop fails.
+    match crate::api::agents::stop_team_agents(
+        &state,
+        team,
+        Some(member),
+        user.id,
+        "owner removed from team",
+    )
+    .await
+    {
+        Ok(stopped) => info!(team = %team, %member, agents_stopped = stopped, "member removed"),
+        Err(e) => warn!(
+            team = %team,
+            %member,
+            error = %e,
+            "member removed, but stopping their team agents failed"
+        ),
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

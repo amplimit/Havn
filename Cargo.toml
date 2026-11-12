@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-dev"
+version = "0.1.3-dev"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
@@ -22,11 +22,11 @@ authors = ["Amplimit <oss@amplimit.com>"]
 
 [workspace.dependencies]
 # Internal crates — path locally, version when published.
-havn-core = { path = "crates/havn-core", version = "0.1.0-dev" }
-havn-proto = { path = "crates/havn-proto", version = "0.1.0-dev" }
-havn-spawner = { path = "crates/havn-spawner", version = "0.1.0-dev" }
-havn-db = { path = "crates/havn-db", version = "0.1.0-dev" }
-havn-init = { path = "crates/havn-init", version = "0.1.0-dev" }
+havn-core = { path = "crates/havn-core", version = "0.1.3-dev" }
+havn-proto = { path = "crates/havn-proto", version = "0.1.3-dev" }
+havn-spawner = { path = "crates/havn-spawner", version = "0.1.3-dev" }
+havn-db = { path = "crates/havn-db", version = "0.1.3-dev" }
+havn-init = { path = "crates/havn-init", version = "0.1.3-dev" }
 
 # Async runtime
 tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "sync", "time", "fs", "process"] }
@@ -70,8 +70,9 @@ arc-swap = "1"
 # of serde_yaml (serde_yml was archived as unsound — RUSTSEC-2025-0068).
 serde_norway = "0.9"
 
-# PreToolUse hook patterns — operator declares regex denies in
-# workspace/.havn/hooks.yaml; runtime checks before tool dispatch.
+# PreToolUse hook patterns — regex denies from the policy (`hooks`) and
+# workspace/.havn/hooks.yaml; havn-core validates them, the runtime
+# checks them before tool dispatch.
 regex = "1"
 
 # Pure-byte view over `&[f32]` ↔ `&[u8]` for storing embedding vectors

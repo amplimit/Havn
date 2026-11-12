@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 pub use codec::{FrameError, read_frame, write_frame};
 
 /// Current wire-protocol version. Mismatch on `Hello` is a hard error.
-pub const PROTOCOL_VERSION: &str = "0.1.0";
+/// 0.2.0: `CronTick`/`CronResult` carry `run_id`.
+pub const PROTOCOL_VERSION: &str = "0.2.0";
 
 /// How often a runtime sends [`AgentToGateway::LivenessPing`] once it is
 /// up. The gateway restarts an agent that stays connected but silent for
@@ -450,6 +451,10 @@ fn default_tmpfs_size_mb() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronTick {
     pub job_id: String,
+    /// Gateway-assigned id of this run. The runtime echoes it in the
+    /// matching [`CronResult`]; the gateway accepts one result per id.
+    #[serde(default)]
+    pub run_id: String,
     /// Free-form prompt to inject as the first (and only) user turn.
     pub prompt: String,
     /// Subset of tool names to expose for this run (empty = the agent's
@@ -461,6 +466,9 @@ pub struct CronTick {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronResult {
     pub job_id: String,
+    /// The `run_id` of the [`CronTick`] this result answers.
+    #[serde(default)]
+    pub run_id: String,
     pub outcome: CronOutcome,
     /// Final assistant text. May start with the literal sentinel `[SILENT]`
     /// to suppress delivery while still recording the run for audit.
@@ -531,6 +539,10 @@ mod tests {
                 disabled: vec!["shell".into(), "web_fetch".into()],
             },
         );
+        policy.hooks.pre_tool_use.push(havn_core::ToolHookRule {
+            tool: "shell".into(),
+            deny: vec!["^echo".into()],
+        });
 
         let frame = GatewayToAgent::Welcome {
             session_token: "tok".into(),
@@ -564,6 +576,7 @@ mod tests {
                 .map(|e| e.disabled.len()),
             Some(2)
         );
+        assert_eq!(parsed_policy.hooks, policy.hooks);
     }
 
     #[test]
@@ -581,6 +594,7 @@ mod tests {
         };
         // Default policy mirrors havn-core's defaults.
         assert!(policy.permissions.can_use_shell);
+        assert!(policy.hooks.pre_tool_use.is_empty());
         assert_eq!(max_tokens, None);
     }
 }

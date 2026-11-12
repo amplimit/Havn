@@ -16,5 +16,7 @@ pub use ids::{
 pub use message::{InboundMessage, MessageContent, OutboundMessage};
 pub use policy::{
     AdminVisibility, BudgetExhaustAction, BudgetPolicy, ChannelAllowance, ContextToolsetEntry,
-    ContextToolsets, McpServerConfig, NetworkPolicy, Permissions, Policy, ResourceLimits,
+    ContextToolsets, HOOK_REGEX_SIZE_LIMIT, HookPolicy, MAX_HOOK_PATTERN_LEN, MAX_HOOK_PATTERNS,
+    MAX_HOOK_RULES, McpServerConfig, NetworkPolicy, Permissions, Policy, ResourceLimits,
+    ToolHookRule, compile_hook_pattern,
 };

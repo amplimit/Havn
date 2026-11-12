@@ -28,8 +28,8 @@
 //!   ([`crate::ns_setup::pivot_root_into_minimal_rootfs`]).
 //!
 //! Compared to [`crate::subprocess::SubprocessSpawner`], this spawner
-//! requires either root or systemd cgroup delegation
-//! (`Delegate=yes` in the gateway's unit file). [`NamespaceSpawner::try_init`]
+//! requires root (it creates `havn.slice` at the cgroup root and moves
+//! agents into it). [`NamespaceSpawner::try_init`]
 //! probes for that at startup and returns an error so the caller can fall
 //! back to the unprivileged subprocess spawner with a clear log.
 
@@ -84,7 +84,7 @@ impl NamespaceSpawner {
         Self::try_init_with_pool(crate::network::AgentSubnetPool::default())
     }
 
-    /// Variant of [`try_init`] that takes an explicit per-agent network
+    /// Variant of [`Self::try_init`] that takes an explicit per-agent network
     /// pool. Used by the gateway when `[network] agent_pool_cidr` is
     /// configured to something other than the default.
     pub fn try_init_with_pool(pool: crate::network::AgentSubnetPool) -> Result<Self> {

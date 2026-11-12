@@ -1,9 +1,11 @@
 //! Per-agent policy resolution (spec §6).
 //!
 //! `for_user` derives a user's policy from their team roles (or the
-//! single-user default when they belong to no team). `for_session` adds
-//! the per-agent override (`Agent.config["policy"]`): applied as written
-//! in single-user mode, clamped to the owner's policy in multi-user mode.
+//! single-user default when they belong to no team); `for_team_member`
+//! is the user's role policy in one team, which governs agents created in
+//! that team. `for_session` adds the per-agent override
+//! (`Agent.config["policy"]`): applied as written in single-user mode,
+//! clamped to the owner's policy in multi-user mode.
 //!
 //! The snapshot shipped to the runtime in the `Welcome` frame (and the
 //! sandbox set up at spawn) is resolved once per agent connection, so
@@ -11,7 +13,7 @@
 //! sandbox. Gateway-side checks on each request (queries, LLM calls)
 //! resolve the policy again and therefore see edits immediately.
 
-use havn_core::{Policy, UserId};
+use havn_core::{Policy, TeamId, UserId};
 use havn_db::repo::agents::Agent;
 use sqlx::SqlitePool;
 use tracing::warn;
@@ -29,21 +31,18 @@ use tracing::warn;
 /// Walks `team_memberships → roles → policy` for `user_id`. When the
 /// user belongs to one or more teams, returns the most-permissive
 /// combination of their role policies themselves ([`Policy::widen_with`]),
-/// so a role's restrictions hold; `HAVN_MAX_AGENTS_PER_USER` caps
+/// so a role's restrictions hold (hook deny rules are the exception: every
+/// role's rules are kept); `HAVN_MAX_AGENTS_PER_USER` caps
 /// `max_agents`. When the user belongs to no team, returns the single-user
 /// default. Lookup failures fall back to a restrictive policy.
 ///
-/// The "max wins" merge is deliberate: a user who is admin of team A
-/// and a viewer of team B should get the union of capabilities,
-/// because they're the same human. Per-team scoping (e.g. "you can
-/// only spawn shell tools on team A's agents") is a future refinement
-/// and would live on the agent's policy override, not here.
+/// The "max wins" merge is deliberate for the user's own (team-less)
+/// agents: a user who is admin of team A and a viewer of team B gets the
+/// union of capabilities, because they're the same human. An agent created
+/// in a team is governed by [`for_team_member`] instead.
 pub async fn for_user(db: &SqlitePool, user_id: UserId) -> Policy {
     let mut base = Policy::default();
-    let env_cap = std::env::var("HAVN_MAX_AGENTS_PER_USER")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|&n| n > 0);
+    let env_cap = max_agents_env_cap();
     base.max_agents = env_cap.unwrap_or(50);
 
     let memberships = match havn_db::repo::team_memberships::list_for_user(db, user_id).await {
@@ -81,6 +80,46 @@ pub async fn for_user(db: &SqlitePool, user_id: UserId) -> Policy {
     policy
 }
 
+/// The policy of `user_id`'s role in `team_id`, with
+/// `HAVN_MAX_AGENTS_PER_USER` capping `max_agents`. A user who is not a
+/// member (for example, removed after creating a team agent), or whose role
+/// cannot be loaded, gets the most restrictive policy.
+pub async fn for_team_member(db: &SqlitePool, user_id: UserId, team_id: TeamId) -> Policy {
+    let membership = match havn_db::repo::team_memberships::find(db, user_id, team_id).await {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            warn!(%user_id, %team_id, "not a member of the team; using the most restrictive policy");
+            return restrictive_fallback();
+        }
+        Err(e) => {
+            warn!(%user_id, %team_id, error = %e, "team membership lookup failed; using the most restrictive policy");
+            return restrictive_fallback();
+        }
+    };
+    let mut policy = match havn_db::repo::roles::find_by_id(db, membership.role_id).await {
+        Ok(Some(role)) => role.policy,
+        Ok(None) => {
+            warn!(%user_id, role_id = %membership.role_id, "membership references a missing role");
+            return restrictive_fallback();
+        }
+        Err(e) => {
+            warn!(%user_id, role_id = %membership.role_id, error = %e, "role lookup failed");
+            return restrictive_fallback();
+        }
+    };
+    if let Some(cap) = max_agents_env_cap() {
+        policy.max_agents = policy.max_agents.min(cap);
+    }
+    policy
+}
+
+fn max_agents_env_cap() -> Option<u32> {
+    std::env::var("HAVN_MAX_AGENTS_PER_USER")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+}
+
 fn restrictive_fallback() -> Policy {
     let mut p = Policy::default();
     p.max_agents = 0;
@@ -92,10 +131,12 @@ fn restrictive_fallback() -> Policy {
 }
 
 /// Per-agent override only — pure / sync. Returns `None` when the
-/// agent has no `config.policy` field, or `Some(default)` when the
-/// override JSON is malformed (we tighten on misconfig). Public for
-/// tests; production code should use [`for_session`] which folds
-/// this into the full chain.
+/// agent has no `config.policy` field or when it is malformed (logged;
+/// the chain then falls through to the owner's policy). `PATCH
+/// /agents/{id}` rejects a malformed override, so the latter only
+/// happens for config written another way. Public for tests;
+/// production code should use [`for_session`] which folds this into
+/// the full chain.
 pub fn override_for(agent: &Agent) -> Option<Policy> {
     let raw = agent.config.get("policy")?;
     match serde_json::from_value::<Policy>(raw.clone()) {
@@ -111,9 +152,19 @@ pub fn override_for(agent: &Agent) -> Option<Policy> {
     }
 }
 
-/// Full per-session resolution chain (spec §6.3): the owner's policy,
-/// with the per-agent override applied on top (clamped to the owner's
-/// policy when `multi_user`).
+/// The owner's policy as it applies to `agent`: their role in the agent's
+/// team for a team agent, else [`for_user`].
+pub async fn for_owner(db: &SqlitePool, agent: &Agent) -> Policy {
+    match agent.team_id {
+        Some(team_id) => for_team_member(db, agent.owner_id, team_id).await,
+        None => for_user(db, agent.owner_id).await,
+    }
+}
+
+/// Full per-session resolution chain (spec §6.3): the owner's policy
+/// ([`for_owner`]), with the per-agent override applied on top (clamped
+/// to the owner's policy when `multi_user`). In both modes the owner's
+/// hook rules are kept, so an override can add hooks but not remove them.
 ///
 /// This is what *both* the spawn-time path (cgroup limits) and the
 /// Welcome handshake (runtime tool registry) consult, so the agent
@@ -124,10 +175,13 @@ pub fn override_for(agent: &Agent) -> Option<Policy> {
 /// registry but their cgroup was still capped at the system default
 /// 512 MiB. Drift fix.
 pub async fn for_session(db: &SqlitePool, agent: &Agent, multi_user: bool) -> Policy {
-    let owner = for_user(db, agent.owner_id).await;
+    let owner = for_owner(db, agent).await;
     match override_for(agent) {
         Some(p) if multi_user => p.clamp_to(&owner),
-        Some(p) => p,
+        Some(mut p) => {
+            p.hooks = p.hooks.union(&owner.hooks);
+            p
+        }
         None => owner,
     }
 }
@@ -306,6 +360,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn team_agent_gets_the_owners_role_in_that_team() {
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let uid = user_in_roles(&db, &["member", "admin"]).await;
+        let teams = havn_db::repo::team_memberships::list_for_user(&db, uid)
+            .await
+            .expect("teams");
+        let team_of = |name: &str| {
+            teams
+                .iter()
+                .find(|t| t.team_name == name)
+                .expect("team")
+                .team_id
+        };
+        let mut agent = agent_with(json!({}));
+        agent.owner_id = uid;
+
+        agent.team_id = Some(team_of("team-0"));
+        let p = for_session(&db, &agent, true).await;
+        assert!(!p.permissions.can_use_shell, "member role in team-0");
+        assert_eq!(p.max_agents, 5);
+
+        agent.team_id = Some(team_of("team-1"));
+        let p = for_session(&db, &agent, true).await;
+        assert!(p.permissions.can_use_shell, "admin role in team-1");
+
+        let other =
+            havn_db::repo::teams::create(&db, havn_db::repo::teams::NewTeam { name: "elsewhere" })
+                .await
+                .expect("team");
+        agent.team_id = Some(other.id);
+        let p = for_session(&db, &agent, true).await;
+        assert_eq!(p.max_agents, 0, "a non-member owner is restricted");
+        assert!(!p.permissions.can_use_shell);
+    }
+
+    #[tokio::test]
     async fn override_mcp_servers_need_a_role_grant() {
         let db = havn_db::connect_in_memory().await.expect("db");
         let mut agent = agent_with(json!({
@@ -318,6 +408,81 @@ mod tests {
         let p = for_session(&db, &agent, true).await;
         assert!(!p.permissions.can_use_mcp);
         assert!(p.mcp_servers.is_empty());
+    }
+
+    async fn user_in_role_denying_echo(db: &SqlitePool) -> havn_core::UserId {
+        use havn_db::repo::{roles as role_repo, team_memberships, teams, users};
+        let user = users::create(db, users::NewUser { display_name: "m" })
+            .await
+            .expect("user");
+        let team = teams::create(db, teams::NewTeam { name: "hooks" })
+            .await
+            .expect("team");
+        let mut policy = Policy::default();
+        policy.hooks.pre_tool_use.push(havn_core::ToolHookRule {
+            tool: "shell".into(),
+            deny: vec!["^echo".into()],
+        });
+        let role = role_repo::create(
+            db,
+            role_repo::NewRole {
+                team_id: Some(team.id),
+                name: "guarded",
+                policy: &policy,
+            },
+        )
+        .await
+        .expect("role");
+        team_memberships::add(db, user.id, team.id, role.id)
+            .await
+            .expect("membership");
+        user.id
+    }
+
+    fn denies_echo(p: &Policy) -> bool {
+        p.hooks
+            .pre_tool_use
+            .iter()
+            .any(|r| r.tool == "shell" && r.deny.iter().any(|d| d == "^echo"))
+    }
+
+    #[tokio::test]
+    async fn override_cannot_remove_role_hooks() {
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let owner = user_in_role_denying_echo(&db).await;
+        for config in [
+            json!({ "policy": { "hooks": { "pre_tool_use": [] } } }),
+            json!({ "policy": { "permissions": { "can_use_shell": "yes" } } }),
+        ] {
+            let mut agent = agent_with(config.clone());
+            agent.owner_id = owner;
+            for multi_user in [true, false] {
+                let p = for_session(&db, &agent, multi_user).await;
+                assert!(denies_echo(&p), "{config} multi_user={multi_user}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn team_agent_keeps_its_roles_hooks() {
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let owner = user_in_role_denying_echo(&db).await;
+        let team = havn_db::repo::team_memberships::list_for_user(&db, owner)
+            .await
+            .expect("teams")[0]
+            .team_id;
+        for config in [
+            json!({}),
+            json!({ "policy": { "hooks": { "pre_tool_use": [] } } }),
+        ] {
+            let mut agent = agent_with(config.clone());
+            agent.owner_id = owner;
+            agent.team_id = Some(team);
+            for multi_user in [true, false] {
+                let p = for_session(&db, &agent, multi_user).await;
+                assert!(denies_echo(&p), "{config} multi_user={multi_user}");
+            }
+        }
     }
 
     #[tokio::test]

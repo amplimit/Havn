@@ -275,6 +275,11 @@ fn cgroup_belongs_to_agent(contents: &str, agent_id: AgentId) -> bool {
         .any(|path| path.trim_end() == expected)
 }
 
+/// At most 64 chars of a peer-supplied string, for logging.
+fn clip(s: &str) -> &str {
+    s.char_indices().nth(64).map_or(s, |(end, _)| &s[..end])
+}
+
 async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::Result<()> {
     // Every sandbox sees the same socket, so the agent id in Hello is only
     // a claim. The peer's process comes from the kernel and cannot be
@@ -298,7 +303,16 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
     };
 
     if version != PROTOCOL_VERSION {
-        anyhow::bail!("protocol version mismatch (agent {version}, gateway {PROTOCOL_VERSION})");
+        // Both values come from the peer before anything is verified.
+        let (agent_id_str, version) = (clip(&agent_id_str), clip(&version));
+        warn!(
+            agent_id = ?agent_id_str,
+            agent_version = ?version,
+            gateway_version = PROTOCOL_VERSION,
+            "refusing agent: runtime protocol version differs from the gateway's; \
+             install the havn-runtime that ships with this gateway"
+        );
+        anyhow::bail!("protocol version mismatch (agent {version:?}, gateway {PROTOCOL_VERSION})");
     }
 
     let agent_id = AgentId::from_str(&agent_id_str)
@@ -824,8 +838,17 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
         AgentToGateway::LivenessPing => {}
         AgentToGateway::CronResult(result) => {
             let job_id = result.job_id.clone();
-            if let Err(e) = ctx.cron_scheduler.record_result(agent_id, result).await {
-                warn!(%agent_id, %job_id, error = %e, "cron result recording failed");
+            match ctx.cron_scheduler.record_result(agent_id, result).await {
+                Ok(()) => {}
+                Err(e @ crate::cron::CronError::NotPending(_)) => {
+                    warn!(%agent_id, %job_id, error = %e, "rejecting unsolicited CronResult");
+                }
+                Err(e @ crate::cron::CronError::ExpiredRun(_)) => {
+                    info!(%agent_id, %job_id, error = %e, "dropping CronResult: result for an expired run");
+                }
+                Err(e) => {
+                    warn!(%agent_id, %job_id, error = %e, "cron result recording failed");
+                }
             }
         }
         AgentToGateway::MemoryForgetResponse(resp) => {
@@ -1067,6 +1090,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
             let billing = llm_proxy::Billing {
                 user_id: billing_user,
                 agent_id: Some(agent_id),
+                agent_team: agent.team_id,
                 budget: policy.budget.clone(),
             };
             match llm_proxy::complete_with_provider(
@@ -1992,6 +2016,14 @@ mod tests {
         ctx: &AgentSocketCtx,
         agent_id: AgentId,
     ) -> (anyhow::Result<()>, Option<GatewayToAgent>) {
+        hello_with_version(ctx, agent_id, PROTOCOL_VERSION).await
+    }
+
+    async fn hello_with_version(
+        ctx: &AgentSocketCtx,
+        agent_id: AgentId,
+        version: &str,
+    ) -> (anyhow::Result<()>, Option<GatewayToAgent>) {
         let (client, server) = UnixStream::pair().expect("socket pair");
         let gateway = tokio::spawn(handle_connection(server, ctx.clone()));
         let (client_read, mut client_write) = client.into_split();
@@ -1999,7 +2031,7 @@ mod tests {
             &mut client_write,
             &AgentToGateway::Hello {
                 agent_id: agent_id.to_string(),
-                version: PROTOCOL_VERSION.into(),
+                version: version.into(),
             },
         )
         .await
@@ -2154,6 +2186,23 @@ mod tests {
             matches!(reply, Some(GatewayToAgent::Welcome { .. })),
             "{reply:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_with_another_protocol_version_is_refused() {
+        let ctx = ctx_with(false, false).await;
+        let agent = registered_agent(&ctx).await;
+
+        let (verdict, reply) = hello_with_version(&ctx, agent, "0.1.0").await;
+
+        let err = verdict.expect_err("an older runtime must be refused at Hello");
+        assert_eq!(clip(&"x".repeat(100)).len(), 64);
+        assert_eq!(clip("0.1.0"), "0.1.0");
+        assert!(
+            err.to_string().contains("protocol version mismatch"),
+            "{err:#}"
+        );
+        assert!(reply.is_none(), "no Welcome may be sent: {reply:?}");
     }
 
     #[tokio::test]
