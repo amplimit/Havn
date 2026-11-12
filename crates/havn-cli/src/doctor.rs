@@ -9,7 +9,8 @@
 //!   → gateway refuses to boot.
 //! - `runtime_binary` / `init_binary` paths in config point at stale
 //!   targets (built debug-only, then `cargo clean`).
-//! - cgroup v2 not mounted, or `havn.slice` cannot be created / written
+//! - cgroup v2 not mounted, or the agent cgroup parent `havn` cannot be
+//!   created / written
 //!   → the gateway refuses to start with isolation.
 //! - `iptables` / `ip` / `nsenter` missing → agents start without
 //!   outbound network.
@@ -80,7 +81,7 @@ pub async fn run() -> anyhow::Result<()> {
     mark!(v);
     let v = check_cgroup_v2();
     mark!(v);
-    let v = check_cgroup_slice();
+    let v = check_cgroup_parent();
     mark!(v);
     let v = check_network_tools();
     mark!(v);
@@ -277,18 +278,15 @@ fn check_cgroup_v2() -> Verdict {
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
-/// `havn_spawner::cgroup::SLICE`; the CLI does not link the spawner.
-const CGROUP_SLICE: &str = "havn.slice";
-
 const REQUIRED_CONTROLLERS: &[&str] = &["cpu", "memory", "pids"];
 
 /// What the gateway's cgroup setup needs, gathered without creating the
-/// slice or touching `cgroup.subtree_control`.
+/// agent cgroup parent or touching `cgroup.subtree_control`.
 #[derive(Debug)]
-struct SliceProbe {
-    slice: PathBuf,
-    slice_exists: bool,
-    /// Write access to the slice, or to the cgroup root while the slice
+struct ParentProbe {
+    parent: PathBuf,
+    parent_exists: bool,
+    /// Write access to the parent, or to the cgroup root while the parent
     /// does not exist yet.
     writable: io::Result<()>,
     /// The cgroup root's `cgroup.controllers`.
@@ -303,16 +301,16 @@ struct SliceProbe {
     root_user: bool,
 }
 
-fn probe_slice(root: &Path) -> SliceProbe {
-    let slice = root.join(CGROUP_SLICE);
-    let slice_exists = slice.is_dir();
-    let writable = writable(if slice_exists { &slice } else { root });
+fn probe_parent(root: &Path) -> ParentProbe {
+    let parent = root.join(havn_core::AGENT_CGROUP_PARENT);
+    let parent_exists = parent.is_dir();
+    let writable = writable(if parent_exists { &parent } else { root });
     let root_busy = root.join("cgroup.type").exists()
         && std::fs::read_to_string(root.join("cgroup.procs"))
             .is_ok_and(|procs| !procs.trim().is_empty());
-    SliceProbe {
-        slice,
-        slice_exists,
+    ParentProbe {
+        parent,
+        parent_exists,
         writable,
         controllers: std::fs::read_to_string(root.join("cgroup.controllers")),
         subtree_control: std::fs::read_to_string(root.join("cgroup.subtree_control"))
@@ -342,30 +340,30 @@ fn writable(path: &Path) -> io::Result<()> {
     }
 }
 
-const SLICE_HINT: &str = "run the gateway as root (see contrib/systemd/havn.service), or set \
+const PARENT_HINT: &str = "run the gateway as root (see contrib/systemd/havn.service), or set \
                           HAVN_SPAWNER=subprocess to run agents WITHOUT isolation (dev only)";
 
-fn slice_verdict(p: &SliceProbe) -> (Verdict, String) {
-    let slice = p.slice.display();
+fn parent_verdict(p: &ParentProbe) -> (Verdict, String) {
+    let parent = p.parent.display();
     if let Err(e) = &p.writable {
         let denied = matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM));
         if denied && !p.root_user {
             return (
                 Verdict::Warn,
                 format!(
-                    "cannot check {slice} as non-root ({e}); the gateway runs as root, so run \
+                    "cannot check {parent} as non-root ({e}); the gateway runs as root, so run \
                      `sudo havn doctor`"
                 ),
             );
         }
-        let what = if p.slice_exists {
-            format!("{slice} is not writable")
+        let what = if p.parent_exists {
+            format!("{parent} is not writable")
         } else {
-            format!("cannot create {slice}")
+            format!("cannot create {parent}")
         };
         return (
             Verdict::Warn,
-            format!("{what} ({e}) — the gateway refuses to start; {SLICE_HINT}"),
+            format!("{what} ({e}) — the gateway refuses to start; {PARENT_HINT}"),
         );
     }
     let raw = match &p.controllers {
@@ -405,27 +403,73 @@ fn slice_verdict(p: &SliceProbe) -> (Verdict, String) {
         return (
             Verdict::Warn,
             format!(
-                "{slice} is writable, but not running as root — agent isolation also needs \
-                 root for namespaces and NAT; {SLICE_HINT}"
+                "{parent} is writable, but not running as root — agent isolation also needs \
+                 root for namespaces and NAT; {PARENT_HINT}"
             ),
         );
     }
-    let state = if p.slice_exists {
+    let state = if p.parent_exists {
         "is writable"
     } else {
         "can be created"
     };
-    (Verdict::Ok, format!("{slice} {state}"))
+    (Verdict::Ok, format!("{parent} {state}"))
 }
 
-fn check_cgroup_slice() -> Verdict {
+fn check_cgroup_parent() -> Verdict {
     let root = Path::new(CGROUP_ROOT);
     if !cfg!(target_os = "linux") || !root.join("cgroup.controllers").exists() {
         return Verdict::Ok;
     }
-    let (v, msg) = slice_verdict(&probe_slice(root));
-    line(v, "cgroup slice", &msg);
-    v
+    let (v, msg) = parent_verdict(&probe_parent(root));
+    line(v, "agent cgroups", &msg);
+    let retired = root.join(RETIRED_CGROUP_PARENT);
+    if !retired.is_dir() {
+        return v;
+    }
+    let agents = std::fs::read_dir(&retired).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.path().is_dir()
+                    && e.file_name().to_str().is_some_and(|name| {
+                        !name.contains('.')
+                            && name
+                                .strip_prefix(havn_core::AGENT_CGROUP_PREFIX)
+                                .is_some_and(|id| id.parse::<havn_core::AgentId>().is_ok())
+                    })
+            })
+            .count()
+    });
+    let (rv, msg) = retired_parent_verdict(&retired, agents);
+    line(rv, "old cgroups", &msg);
+    match (v, rv) {
+        (Verdict::Ok, Verdict::Warn) => Verdict::Warn,
+        _ => v,
+    }
+}
+
+/// `havn_spawner::cgroup::RETIRED_PARENT`; the CLI does not link the spawner.
+const RETIRED_CGROUP_PARENT: &str = "havn.slice";
+
+fn retired_parent_verdict(retired: &Path, agents: usize) -> (Verdict, String) {
+    let path = retired.display();
+    if agents == 0 {
+        return (
+            Verdict::Ok,
+            format!(
+                "{path} is left from an older gateway; the gateway removes it at start-up \
+                 unless systemd manages havn.slice"
+            ),
+        );
+    }
+    (
+        Verdict::Warn,
+        format!(
+            "{path} holds {agents} agent cgroup(s) of an older gateway; restart the gateway \
+             to kill those agents and remove them"
+        ),
+    )
 }
 
 /// Binaries the spawner execs for per-agent networking, with the Debian /
@@ -611,10 +655,10 @@ mod tests {
 
     use super::*;
 
-    fn probe(slice_exists: bool, writable: io::Result<()>, root_user: bool) -> SliceProbe {
-        SliceProbe {
-            slice: PathBuf::from("/sys/fs/cgroup/havn.slice"),
-            slice_exists,
+    fn probe(parent_exists: bool, writable: io::Result<()>, root_user: bool) -> ParentProbe {
+        ParentProbe {
+            parent: PathBuf::from("/sys/fs/cgroup/havn"),
+            parent_exists,
             writable,
             controllers: Ok("cpuset cpu io memory hugetlb pids rdma misc\n".into()),
             subtree_control: "cpu memory pids\n".into(),
@@ -628,19 +672,16 @@ mod tests {
     }
 
     #[test]
-    fn uncreatable_slice_as_root_warns_with_fix_hint() {
-        let (v, msg) = slice_verdict(&probe(false, denied(), true));
+    fn uncreatable_parent_as_root_warns_with_fix_hint() {
+        let (v, msg) = parent_verdict(&probe(false, denied(), true));
         assert!(matches!(v, Verdict::Warn));
-        assert!(
-            msg.contains("cannot create /sys/fs/cgroup/havn.slice"),
-            "{msg}"
-        );
+        assert!(msg.contains("cannot create /sys/fs/cgroup/havn "), "{msg}");
         assert!(msg.contains("run the gateway as root"), "{msg}");
     }
 
     #[test]
     fn denied_as_non_root_asks_for_sudo() {
-        let (v, msg) = slice_verdict(&probe(false, denied(), false));
+        let (v, msg) = parent_verdict(&probe(false, denied(), false));
         assert!(matches!(v, Verdict::Warn));
         assert!(msg.contains("sudo havn doctor"), "{msg}");
         assert!(!msg.contains("refuses to start"), "{msg}");
@@ -651,18 +692,18 @@ mod tests {
         let mut p = probe(true, Ok(()), true);
         p.subtree_control = "cpu pids\n".into();
         p.root_busy = true;
-        let (v, msg) = slice_verdict(&p);
+        let (v, msg) = parent_verdict(&p);
         assert!(matches!(v, Verdict::Warn));
         assert!(msg.contains("`memory`") && msg.contains("EBUSY"), "{msg}");
 
         p.root_busy = false;
-        let (v, _) = slice_verdict(&p);
+        let (v, _) = parent_verdict(&p);
         assert!(matches!(v, Verdict::Ok));
     }
 
     #[test]
-    fn unwritable_existing_slice_warns() {
-        let (v, msg) = slice_verdict(&probe(true, denied(), true));
+    fn unwritable_existing_parent_warns() {
+        let (v, msg) = parent_verdict(&probe(true, denied(), true));
         assert!(matches!(v, Verdict::Warn));
         assert!(msg.contains("is not writable"), "{msg}");
     }
@@ -670,7 +711,7 @@ mod tests {
     #[test]
     fn read_only_cgroupfs_warns_even_as_root() {
         let ro = Err(io::Error::from_raw_os_error(libc::EROFS));
-        let (v, _) = slice_verdict(&probe(false, ro, true));
+        let (v, _) = parent_verdict(&probe(false, ro, true));
         assert!(matches!(v, Verdict::Warn));
     }
 
@@ -678,21 +719,32 @@ mod tests {
     fn missing_controller_warns() {
         let mut p = probe(true, Ok(()), true);
         p.controllers = Ok("cpu io pids\n".into());
-        let (v, msg) = slice_verdict(&p);
+        let (v, msg) = parent_verdict(&p);
         assert!(matches!(v, Verdict::Warn));
         assert!(msg.contains("`memory`"), "{msg}");
     }
 
     #[test]
-    fn writable_slice_without_root_warns() {
-        let (v, msg) = slice_verdict(&probe(true, Ok(()), false));
+    fn writable_parent_without_root_warns() {
+        let (v, msg) = parent_verdict(&probe(true, Ok(()), false));
         assert!(matches!(v, Verdict::Warn));
         assert!(msg.contains("not running as root"), "{msg}");
     }
 
     #[test]
-    fn creatable_slice_as_root_is_ok() {
-        let (v, msg) = slice_verdict(&probe(false, Ok(()), true));
+    fn leftover_havn_slice_is_reported() {
+        let retired = Path::new("/sys/fs/cgroup/havn.slice");
+        let (v, msg) = retired_parent_verdict(retired, 0);
+        assert!(matches!(v, Verdict::Ok));
+        assert!(msg.contains("removes it at start-up"), "{msg}");
+        let (v, msg) = retired_parent_verdict(retired, 2);
+        assert!(matches!(v, Verdict::Warn));
+        assert!(msg.contains("holds 2 agent cgroup(s)"), "{msg}");
+    }
+
+    #[test]
+    fn creatable_parent_as_root_is_ok() {
+        let (v, msg) = parent_verdict(&probe(false, Ok(()), true));
         assert!(matches!(v, Verdict::Ok));
         assert!(msg.contains("can be created"), "{msg}");
     }
