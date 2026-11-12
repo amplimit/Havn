@@ -382,6 +382,9 @@ where
             AgentToGateway::SkillPinResponse(resp) => {
                 ctx.admin_rpc.resolve(&resp.request_id, resp.outcome).await;
             }
+            AgentToGateway::DataResponse(resp) => {
+                ctx.admin_rpc.resolve(&resp.request_id, resp.outcome).await;
+            }
             AgentToGateway::AgentQuery(query) => {
                 // Caller-side initiation. Spawn so a slow target doesn't
                 // block the caller's reader loop — the per-target

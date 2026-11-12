@@ -41,8 +41,9 @@ use havn_core::{InboundMessage, MessageContent, OutboundMessage, Policy};
 use havn_db::agent::conversations::{self as conversations, Role};
 use havn_proto::{
     AdminOutcome, AgentQueryOutcome, AgentQueryResponse, AgentToGateway, CronOutcome, CronResult,
-    CronTick, GatewayToAgent, IncomingQuery, MemoryForgetRequest, MemoryForgetResponse,
-    PROTOCOL_VERSION, SkillPinRequest, SkillPinResponse, read_frame, write_frame,
+    CronTick, DataQuery, DataRequest, DataResponse, GatewayToAgent, IncomingQuery,
+    MemoryForgetRequest, MemoryForgetResponse, PROTOCOL_VERSION, SkillPinRequest, SkillPinResponse,
+    read_frame, write_frame,
 };
 use sqlx::SqlitePool;
 use tokio::io::BufReader;
@@ -781,6 +782,12 @@ where
                     handle_skill_pin(req, ctx).await;
                 });
             }
+            GatewayToAgent::DataRequest(req) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    handle_data_request(req, ctx).await;
+                });
+            }
             GatewayToAgent::IncomingQuery(query) => {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
@@ -1316,6 +1323,65 @@ fn init_tracing() {
 /// Handle a dashboard-initiated `memory_forget` (spec §5.2 nuance —
 /// agent.db is single-writer; routing through the runtime preserves
 /// the typed-memory invariants in `havn_db::agent::memory::forget`).
+/// Upper bound on rows returned to the dashboard per request.
+const MAX_DATA_ROWS: u32 = 500;
+
+/// Answer a dashboard read with rows from this agent's own database.
+async fn handle_data_request(req: DataRequest, ctx: Ctx) {
+    use havn_db::agent::{memory, skills_index};
+    let result: Result<serde_json::Value, String> = async {
+        match req.query {
+            DataQuery::Memory { memory_kind, limit } => {
+                let limit = limit.min(MAX_DATA_ROWS);
+                let entries = match memory_kind.as_deref().and_then(memory::Kind::parse) {
+                    Some(kind) => memory::list_active_of_kind(&ctx.pool, kind, limit).await,
+                    None => memory::list_active(&ctx.pool, limit).await,
+                }
+                .map_err(|e| e.to_string())?;
+                serde_json::to_value(entries).map_err(|e| e.to_string())
+            }
+            DataQuery::Skills { limit } => {
+                let limit = limit.min(MAX_DATA_ROWS);
+                let active = skills_index::list_all_active(&ctx.pool, limit)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let archived = skills_index::list_archived(&ctx.pool, limit)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({ "active": active, "archived": archived }))
+            }
+            DataQuery::Conversation { channel_id, limit } => {
+                let turns = conversations::recent_with_channel(
+                    &ctx.pool,
+                    &channel_id,
+                    limit.min(MAX_DATA_ROWS),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                serde_json::to_value(turns).map_err(|e| e.to_string())
+            }
+        }
+    }
+    .await;
+    let outcome = match result {
+        Ok(details) => AdminOutcome::Ok { details },
+        Err(message) => {
+            warn!(%message, "data request failed");
+            AdminOutcome::Error { message }
+        }
+    };
+    if let Err(e) = ctx
+        .writer_tx
+        .send(AgentToGateway::DataResponse(DataResponse {
+            request_id: req.request_id,
+            outcome,
+        }))
+        .await
+    {
+        error!(error = ?e, "could not enqueue DataResponse");
+    }
+}
+
 async fn handle_memory_forget(req: MemoryForgetRequest, ctx: Ctx) {
     use havn_db::agent::memory;
     let request_id = req.request_id.clone();

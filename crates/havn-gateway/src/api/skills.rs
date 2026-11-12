@@ -1,8 +1,8 @@
 //! `/agents/:id/skills`, `/agents/:id/curator/reports`, and the
 //! pin/unpin endpoints (spec §9.3, §9.5).
 //!
-//! Reads open agent.db RO so the dashboard works even when the
-//! runtime is offline. Pin / unpin route through the agent socket as
+//! Skill rows are read by the agent's runtime from its own agent.db
+//! (started if needed); the gateway never opens the file. Pin / unpin route through the agent socket as
 //! [`havn_proto::SkillPinRequest`] frames so `skills_index` stays
 //! single-writer (spec §5.2). The dashboard surfaces "agent must be
 //! running" if the runtime is offline (HTTP 409).
@@ -11,7 +11,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
-use havn_db::agent::skills_index::{self, CuratableSkill, Source};
+use havn_db::agent::skills_index::{CuratableSkill, Source};
 use havn_proto::{AdminOutcome, GatewayToAgent, SkillPinRequest};
 use serde::Serialize;
 use std::time::Duration;
@@ -67,28 +67,20 @@ pub async fn list(
 ) -> Result<Json<ListResponse>, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
     let agent_id = agent.id;
-    let agent_db_path = state
-        .workspace_root
-        .join(agent_id.to_string())
-        .join("workspace")
-        .join("agent.db");
-    if !tokio::fs::try_exists(&agent_db_path).await.unwrap_or(false) {
-        return Ok(Json(ListResponse {
-            agent_id: agent_id.to_string(),
-            active: Vec::new(),
-            archived: Vec::new(),
-            uninitialised: true,
-        }));
+    #[derive(serde::Deserialize)]
+    struct Rows {
+        active: Vec<CuratableSkill>,
+        archived: Vec<CuratableSkill>,
     }
-    let pool = match havn_db::agent::connect_read_only(&agent_db_path).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(agent_id = %id, error = %e, "skills list: opening agent.db RO failed");
-            return Err(ApiError::Internal("opening agent.db".into()));
-        }
-    };
-    let active = skills_index::list_all_active(&pool, DEFAULT_LIMIT).await?;
-    let archived = skills_index::list_archived(&pool, DEFAULT_LIMIT).await?;
+    let Rows { active, archived } = crate::api::agents::agent_data(
+        &state,
+        user.id,
+        agent_id,
+        havn_proto::DataQuery::Skills {
+            limit: DEFAULT_LIMIT,
+        },
+    )
+    .await?;
     Ok(Json(ListResponse {
         agent_id: agent_id.to_string(),
         active: active.into_iter().map(SkillView::from).collect(),

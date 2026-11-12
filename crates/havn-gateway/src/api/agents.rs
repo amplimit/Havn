@@ -459,6 +459,48 @@ pub(crate) async fn resolve_agent(
         .ok_or(ApiError::NotFound)
 }
 
+/// Read rows from an agent's own database for the dashboard. The agent's
+/// runtime runs the query (it is started if needed) and returns the rows
+/// over its socket; the gateway never opens agent.db, which the agent can
+/// write.
+pub(crate) async fn agent_data<T: serde::de::DeserializeOwned>(
+    state: &AppState,
+    by_user: havn_core::UserId,
+    id: AgentId,
+    query: havn_proto::DataQuery,
+) -> Result<T, ApiError> {
+    use havn_proto::{AdminOutcome, DataRequest, GatewayToAgent};
+    ensure_running(state, by_user, id).await?;
+    let request_id = uuid::Uuid::now_v7().to_string();
+    let req = DataRequest {
+        request_id: request_id.clone(),
+        query,
+    };
+    let registry = state.registry.clone();
+    let reply = state
+        .admin_rpc
+        .call(
+            &request_id,
+            || async move {
+                registry
+                    .send(id, GatewayToAgent::DataRequest(req))
+                    .await
+                    .map_err(|e| format!("send: {e}"))
+            },
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("agent did not answer: {e}")))?;
+    match reply {
+        AdminOutcome::Ok { details } => serde_json::from_value(details)
+            .map_err(|e| ApiError::Internal(format!("unexpected reply from agent: {e}"))),
+        AdminOutcome::Error { message } => Err(ApiError::Internal(message)),
+        other => Err(ApiError::Internal(format!(
+            "unexpected reply from agent: {other:?}"
+        ))),
+    }
+}
+
 pub(crate) fn workspace_for(state: &AppState, id: AgentId) -> std::path::PathBuf {
     state.workspace_root.join(id.to_string()).join("workspace")
 }
