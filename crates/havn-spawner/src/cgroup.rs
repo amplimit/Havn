@@ -30,7 +30,7 @@ use tracing::{debug, info, warn};
 /// Default systemd-friendly slice name. We don't manage the slice lifecycle —
 /// systemd or the operator does that — but we create the directory if it's
 /// missing and writable.
-const SLICE: &str = "havn.slice";
+pub const SLICE: &str = "havn.slice";
 
 const REQUIRED_CONTROLLERS: &[&str] = &["cpu", "memory", "pids"];
 

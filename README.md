@@ -72,7 +72,7 @@ havn start
 havn credential add anthropic sk-ant-...
 ```
 
-For a dev box without isolation, `HAVN_SPAWNER=subprocess havn start` runs agents as plain unsandboxed processes; do not use it for anything untrusted.
+For a dev box without isolation, `HAVN_SPAWNER=subprocess havn start` runs agents as plain unsandboxed processes, and the gateway cannot tell which agent a connection comes from; do not use it for anything untrusted.
 
 ### Build from source
 

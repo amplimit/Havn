@@ -47,6 +47,8 @@ pub struct RegisteredAgent {
 pub enum AttachError {
     #[error("agent {0} is not registered (was the lifecycle endpoint called?)")]
     NotRegistered(AgentId),
+    #[error("agent {0} already has a live connection")]
+    AlreadyConnected(AgentId),
 }
 
 #[derive(Debug, Error)]
@@ -85,6 +87,11 @@ impl AgentRegistry {
         let entry = map
             .get_mut(&agent_id)
             .ok_or(AttachError::NotRegistered(agent_id))?;
+        // A second connection must not take over a live one; the runtime
+        // only reconnects after its previous connection is gone.
+        if entry.tx.as_ref().is_some_and(|live| !live.is_closed()) {
+            return Err(AttachError::AlreadyConnected(agent_id));
+        }
         entry.tx = Some(tx);
         Ok(())
     }
@@ -181,6 +188,52 @@ mod tests {
         let listed = reg.list().await;
         assert_eq!(listed.len(), 1);
         assert!(listed[0].connected);
+    }
+
+    #[tokio::test]
+    async fn attach_refuses_to_replace_a_live_connection() {
+        let reg = AgentRegistry::new();
+        let handle = fake_handle();
+        let id = handle.agent_id;
+        reg.register(handle).await;
+
+        let (first, mut first_rx) = mpsc::channel::<GatewayToAgent>(8);
+        reg.attach(id, first).await.expect("first attach");
+        let (second, _second_rx) = mpsc::channel::<GatewayToAgent>(8);
+        let err = reg
+            .attach(id, second)
+            .await
+            .expect_err("second connection must be refused");
+        assert!(matches!(err, AttachError::AlreadyConnected(_)), "{err:?}");
+
+        reg.send(id, GatewayToAgent::HeartbeatTick)
+            .await
+            .expect("send");
+        assert!(
+            matches!(first_rx.recv().await, Some(GatewayToAgent::HeartbeatTick)),
+            "frames keep going to the original connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_after_the_previous_connection_closed_succeeds() {
+        let reg = AgentRegistry::new();
+        let handle = fake_handle();
+        let id = handle.agent_id;
+        reg.register(handle).await;
+
+        let (first, first_rx) = mpsc::channel::<GatewayToAgent>(8);
+        reg.attach(id, first).await.expect("first attach");
+        drop(first_rx);
+        let (second, mut second_rx) = mpsc::channel::<GatewayToAgent>(8);
+        reg.attach(id, second).await.expect("reconnect");
+        reg.send(id, GatewayToAgent::HeartbeatTick)
+            .await
+            .expect("send");
+        assert!(matches!(
+            second_rx.recv().await,
+            Some(GatewayToAgent::HeartbeatTick)
+        ));
     }
 
     #[tokio::test]

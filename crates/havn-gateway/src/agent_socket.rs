@@ -67,6 +67,11 @@ pub struct AgentSocketCtx {
     /// without a side-channel.
     pub embedding_config: Arc<arc_swap::ArcSwap<serde_json::Value>>,
     pub multi_user: bool,
+    /// True when agents run under `NamespaceSpawner`, each in its own
+    /// `agent-<id>` cgroup. The gateway then accepts a connection for an
+    /// agent only from a process in that cgroup. With the unisolated
+    /// subprocess spawner there is nothing to check against.
+    pub verify_peer_cgroup: bool,
     /// Operator-declared extra bind-mounts shipped to each runtime in
     /// Welcome so it can add Landlock entries (spec §4.1 v0.7). Cloned
     /// from `GatewayConfig::extra_mounts` at startup; same list the
@@ -113,7 +118,46 @@ pub async fn run_listener(socket_path: &Path, ctx: AgentSocketCtx) -> anyhow::Re
     }
 }
 
+/// Whether process `pid` is in the cgroup the spawner created for
+/// `agent_id`. Sandboxed processes cannot leave their cgroup (they cannot
+/// see or write the cgroup filesystem), so this ties the connection to
+/// the agent that was spawned.
+async fn peer_in_agent_cgroup(pid: Option<i32>, agent_id: AgentId) -> bool {
+    let Some(pid) = pid else {
+        return false;
+    };
+    #[cfg(target_os = "linux")]
+    {
+        match tokio::fs::read_to_string(format!("/proc/{pid}/cgroup")).await {
+            Ok(contents) => cgroup_belongs_to_agent(&contents, agent_id),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, agent_id);
+        false
+    }
+}
+
+/// Parse `/proc/<pid>/cgroup` (cgroup v2: a single `0::<path>` line, shown
+/// relative to the gateway's cgroup root, the same root the spawner
+/// creates `havn.slice` under) and require exactly the agent's cgroup.
+/// Comparing the whole path matters: a cgroup the agent creates below its
+/// own, even one named after another agent, does not match.
+#[cfg(target_os = "linux")]
+fn cgroup_belongs_to_agent(contents: &str, agent_id: AgentId) -> bool {
+    let expected = format!("/{}/agent-{agent_id}", havn_spawner::cgroup::SLICE);
+    contents
+        .lines()
+        .filter_map(|line| line.strip_prefix("0::"))
+        .any(|path| path.trim_end() == expected)
+}
+
 async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::Result<()> {
+    // Every sandbox sees the same socket, so the agent id in Hello is only
+    // a claim. The peer's pid comes from the kernel and cannot be forged.
+    let peer_pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
 
@@ -133,6 +177,23 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
 
     let agent_id = AgentId::from_str(&agent_id_str)
         .with_context(|| format!("parsing agent_id {agent_id_str:?}"))?;
+
+    if ctx.verify_peer_cgroup && !peer_in_agent_cgroup(peer_pid, agent_id).await {
+        warn!(
+            %agent_id,
+            ?peer_pid,
+            "refusing agent connection: the connecting process is not in that agent's cgroup"
+        );
+        anyhow::bail!("agent {agent_id}: connecting process is not in the agent's cgroup");
+    }
+
+    // Attach before sending Welcome, so a second connection for an agent
+    // that is already connected is refused before it learns anything.
+    let (tx, mut rx) = mpsc::channel::<GatewayToAgent>(OUTBOUND_QUEUE_CAPACITY);
+    ctx.registry
+        .attach(agent_id, tx)
+        .await
+        .with_context(|| format!("attach: agent {agent_id}"))?;
 
     // 2. Resolve policy + send Welcome.
     //
@@ -186,7 +247,7 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
     };
 
     let session_token = Uuid::now_v7().to_string();
-    write_frame(
+    let welcome = write_frame(
         &mut write,
         &GatewayToAgent::Welcome {
             session_token: session_token.clone(),
@@ -217,17 +278,13 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
             seccomp_allow_extra: ctx.seccomp_allow_extra.clone(),
         },
     )
-    .await
-    .context("sending Welcome")?;
+    .await;
+    if let Err(e) = welcome {
+        ctx.registry.detach(agent_id).await;
+        return Err(e).context("sending Welcome");
+    }
 
     info!(%agent_id, "agent connected");
-
-    // 3. Wire outbound channel
-    let (tx, mut rx) = mpsc::channel::<GatewayToAgent>(OUTBOUND_QUEUE_CAPACITY);
-    ctx.registry
-        .attach(agent_id, tx)
-        .await
-        .with_context(|| format!("attach: agent {agent_id} not registered"))?;
 
     // 4. Writer task: drain mpsc → wire
     let writer_task = tokio::spawn(async move {
@@ -1024,4 +1081,163 @@ async fn audit_pre_dispatch(
         }),
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use havn_db::connect_in_memory;
+    use havn_spawner::AgentHandle;
+    use std::time::Duration;
+
+    async fn ctx_with(verify_peer_cgroup: bool) -> AgentSocketCtx {
+        let db = connect_in_memory().await.expect("db");
+        let registry = AgentRegistry::new();
+        let webchat_router = WebChatRouter::new();
+        AgentSocketCtx {
+            cron_scheduler: CronScheduler::new(
+                db.clone(),
+                registry.clone(),
+                webchat_router.clone(),
+                std::env::temp_dir(),
+            ),
+            registry,
+            db,
+            http: reqwest::Client::new(),
+            webchat_router,
+            channel_router: crate::channel_router::ChannelRouter::new(),
+            admin_rpc: crate::admin_rpc::AdminRpc::new(),
+            query_broker: crate::query_broker::QueryBroker::new(),
+            embedding_config: Arc::new(arc_swap::ArcSwap::from_pointee(
+                serde_json::json!({"provider": "disabled"}),
+            )),
+            multi_user: false,
+            verify_peer_cgroup,
+            extra_mounts: Vec::new(),
+            tmpfs_mounts: Vec::new(),
+            seccomp_allow_extra: Vec::new(),
+            keyring: None,
+        }
+    }
+
+    async fn registered_agent(ctx: &AgentSocketCtx) -> AgentId {
+        let agent_id = AgentId::new();
+        ctx.registry
+            .register(AgentHandle { agent_id, pid: 1 })
+            .await;
+        agent_id
+    }
+
+    /// Connect over a socket pair, send Hello for `agent_id`, and return
+    /// the gateway's verdict plus whatever it wrote back.
+    async fn hello(
+        ctx: &AgentSocketCtx,
+        agent_id: AgentId,
+    ) -> (anyhow::Result<()>, Option<GatewayToAgent>) {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let gateway = tokio::spawn(handle_connection(server, ctx.clone()));
+        let (client_read, mut client_write) = client.into_split();
+        write_frame(
+            &mut client_write,
+            &AgentToGateway::Hello {
+                agent_id: agent_id.to_string(),
+                version: PROTOCOL_VERSION.into(),
+            },
+        )
+        .await
+        .expect("send hello");
+        let mut reader = BufReader::new(client_read);
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_frame::<_, GatewayToAgent>(&mut reader),
+        )
+        .await
+        .expect("gateway answers or closes")
+        .ok()
+        .flatten();
+        drop(client_write);
+        drop(reader);
+        let verdict = gateway.await.expect("join");
+        (verdict, reply)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_path_must_name_the_agent() {
+        let id = AgentId::new();
+        let other = AgentId::new();
+        let own = format!("0::/havn.slice/agent-{id}\n");
+        assert!(cgroup_belongs_to_agent(&own, id));
+        assert!(!cgroup_belongs_to_agent(
+            &format!("0::/elsewhere/havn.slice/agent-{id}\n"),
+            id
+        ));
+        assert!(
+            !cgroup_belongs_to_agent(&format!("0::/havn.slice/agent-{other}/agent-{id}\n"), id),
+            "a cgroup created inside another agent's cgroup must not match"
+        );
+        assert!(!cgroup_belongs_to_agent(&own, other));
+        assert!(!cgroup_belongs_to_agent(
+            &format!("0::/havn.slice/agent-{id}-x\n"),
+            id
+        ));
+        assert!(!cgroup_belongs_to_agent(
+            &format!("0::/havn.slice/agent-{id}/nested\n"),
+            id
+        ));
+        assert!(!cgroup_belongs_to_agent(
+            &format!("1:name=systemd:/havn.slice/agent-{id}\n"),
+            id
+        ));
+        assert!(!cgroup_belongs_to_agent("0::/user.slice\n", id));
+        assert!(!cgroup_belongs_to_agent("", id));
+    }
+
+    #[tokio::test]
+    async fn connection_from_outside_the_agents_cgroup_is_refused() {
+        let ctx = ctx_with(true).await;
+        let victim = registered_agent(&ctx).await;
+
+        let (verdict, reply) = hello(&ctx, victim).await;
+
+        assert!(verdict.is_err(), "the claim must be rejected");
+        assert!(reply.is_none(), "no Welcome may be sent: {reply:?}");
+        assert!(!ctx.registry.is_connected(victim).await);
+    }
+
+    #[tokio::test]
+    async fn second_connection_cannot_take_over_a_connected_agent() {
+        let ctx = ctx_with(false).await;
+        let agent = registered_agent(&ctx).await;
+        let (live, mut live_rx) = mpsc::channel::<GatewayToAgent>(8);
+        ctx.registry.attach(agent, live).await.expect("attach");
+
+        let (verdict, reply) = hello(&ctx, agent).await;
+
+        assert!(verdict.is_err(), "the second connection must be rejected");
+        assert!(reply.is_none(), "no Welcome may be sent: {reply:?}");
+        ctx.registry
+            .send(agent, GatewayToAgent::HeartbeatTick)
+            .await
+            .expect("send");
+        assert!(matches!(
+            live_rx.recv().await,
+            Some(GatewayToAgent::HeartbeatTick)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unverified_mode_still_accepts_a_registered_agent() {
+        let ctx = ctx_with(false).await;
+        let agent = registered_agent(&ctx).await;
+
+        let (_, reply) = hello(&ctx, agent).await;
+
+        assert!(
+            matches!(reply, Some(GatewayToAgent::Welcome { .. })),
+            "{reply:?}"
+        );
+    }
 }
