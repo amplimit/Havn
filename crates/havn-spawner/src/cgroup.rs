@@ -28,7 +28,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use havn_core::{AGENT_CGROUP_PARENT, AGENT_CGROUP_PREFIX, ResourceLimits};
+use havn_core::{AGENT_CGROUP_PARENT, AGENT_CGROUP_PREFIX, AgentId, ResourceLimits};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -189,7 +189,7 @@ impl CgroupController {
 
     /// Every per-agent cgroup currently under the parent.
     pub fn agent_cgroups(&self) -> Vec<PathBuf> {
-        agent_dirs(&self.parent)
+        agent_dirs(&self.parent, |name| name.starts_with(AGENT_CGROUP_PREFIX))
     }
 
     /// `<root>/havn.slice`, if a gateway before #66 left it.
@@ -198,8 +198,10 @@ impl CgroupController {
     }
 
     /// Agent cgroups a gateway before #66 left under `<root>/havn.slice`.
+    /// Only `agent-<uuid>` counts: systemd units in a `havn.slice` unit
+    /// (`agent-backup.service`, say) are not ours and are never killed.
     pub fn retired_agent_cgroups(&self) -> Vec<PathBuf> {
-        agent_dirs(&self.root.join(RETIRED_PARENT))
+        agent_dirs(&self.root.join(RETIRED_PARENT), is_retired_agent)
     }
 
     /// Remove `<root>/havn.slice` once its agent cgroups are gone. It is
@@ -319,20 +321,24 @@ const CONTROL_FILES: &[&str] = &[
     "cgroup.subtree_control",
 ];
 
-fn agent_dirs(parent: &Path) -> Vec<PathBuf> {
+fn agent_dirs(parent: &Path, matches: impl Fn(&str) -> bool) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(parent) else {
         return Vec::new();
     };
     entries
         .filter_map(Result::ok)
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with(AGENT_CGROUP_PREFIX)
-        })
+        .filter(|e| e.file_name().to_str().is_some_and(&matches))
         .map(|e| e.path())
         .filter(|p| p.is_dir())
         .collect()
+}
+
+fn is_retired_agent(name: &str) -> bool {
+    !name.contains('.')
+        && name
+            .strip_prefix(AGENT_CGROUP_PREFIX)
+            .and_then(|id| id.parse::<AgentId>().ok().filter(|a| a.to_string() == id))
+            .is_some()
 }
 
 fn format_memory_max(memory_mb: u64) -> String {
@@ -790,7 +796,9 @@ mod tests {
         assert!(ctl.retired_parent().is_none());
         assert!(ctl.retired_agent_cgroups().is_empty());
         let current = ctl.create_agent("now", &ResourceLimits::default()).unwrap();
-        let mut old = retired_parent_with(&root, &["a", "b"]);
+        let (a, b) = (AgentId::new().to_string(), AgentId::new().to_string());
+        let mut old = retired_parent_with(&root, &[&a, &b]);
+        retired_parent_with(&root, &["x", "x.service", "backup.service"]);
         let mut found = ctl.retired_agent_cgroups();
         found.sort();
         old.sort();
@@ -804,7 +812,7 @@ mod tests {
         let root = fake_v2_root();
         let ctl = CgroupController::with_root(root.clone()).expect("ctl");
         let parent = root.join(RETIRED_PARENT);
-        let agents = retired_parent_with(&root, &["a"]);
+        let agents = retired_parent_with(&root, &[&AgentId::new().to_string()]);
 
         assert!(
             !ctl.remove_retired_parent(SliceUnit::Inactive),
@@ -822,6 +830,20 @@ mod tests {
             !ctl.remove_retired_parent(SliceUnit::Inactive),
             "already gone"
         );
+    }
+
+    #[test]
+    fn retired_agent_names_must_be_agent_ids() {
+        let id = AgentId::new();
+        assert!(is_retired_agent(&format!("agent-{id}")));
+        assert!(!is_retired_agent(&format!("agent-{id}.service")));
+        assert!(!is_retired_agent(&format!(
+            "agent-{}",
+            id.to_string().replace('-', "")
+        )));
+        assert!(!is_retired_agent("agent-backup.service"));
+        assert!(!is_retired_agent("agent-x"));
+        assert!(!is_retired_agent(&id.to_string()));
     }
 
     #[test]

@@ -132,9 +132,15 @@ impl NamespaceSpawner {
     }
 
     /// systemd's view of a `havn.slice` unit. Without systemd as init
-    /// (no `<runtime>/system`) nothing can own `/havn.slice`.
+    /// (no `<runtime>/system`) nothing can own `/havn.slice`, unless the
+    /// cgroup root has `init.scope`: a container sharing the host's cgroup
+    /// namespace, whose hierarchy the host's systemd owns.
     async fn slice_unit(&self) -> SliceUnit {
         if !self.systemd_runtime.join("system").exists() {
+            if self.cgroup.root().join("init.scope").exists() {
+                warn!("the cgroup hierarchy belongs to a systemd this gateway cannot ask");
+                return SliceUnit::Unknown;
+            }
             return SliceUnit::Inactive;
         }
         let systemctl = match crate::network::resolve_tool("systemctl") {
@@ -753,7 +759,8 @@ mod tests {
         let current = ctl
             .create_agent("now", &Policy::default().resource_limits)
             .expect("current");
-        let retired = retired_parent_with(&root, &["x", "y"]);
+        let ids = [AgentId::new().to_string(), AgentId::new().to_string()];
+        let retired = retired_parent_with(&root, &[&ids[0], &ids[1]]);
         let spawner =
             NamespaceSpawner::with_controller(ctl.clone()).with_systemd_runtime(without_systemd());
 
@@ -771,7 +778,7 @@ mod tests {
     async fn reap_orphans_keeps_havn_slice_holding_other_cgroups() {
         let root = fake_cgroup_root();
         let ctl = CgroupController::with_root(root.clone()).expect("ctl");
-        let retired = retired_parent_with(&root, &["x"]);
+        let retired = retired_parent_with(&root, &[&AgentId::new().to_string()]);
         let other = root.join(RETIRED_PARENT).join("unrelated.service");
         std::fs::create_dir(&other).expect("other");
         let spawner =
@@ -780,5 +787,38 @@ mod tests {
         assert_eq!(spawner.reap_orphans().await.expect("reap"), 1);
         assert!(!retired[0].exists());
         assert!(other.is_dir());
+    }
+
+    #[tokio::test]
+    async fn reap_orphans_leaves_systemd_units_in_havn_slice_alone() {
+        let root = fake_cgroup_root();
+        let ctl = CgroupController::with_root(root.clone()).expect("ctl");
+        let units = retired_parent_with(&root, &["x.service", "backup"]);
+        for unit in &units {
+            std::fs::write(unit.join("cgroup.events"), "populated 1\n").expect("events");
+        }
+        let spawner =
+            NamespaceSpawner::with_controller(ctl).with_systemd_runtime(without_systemd());
+
+        assert_eq!(spawner.reap_orphans().await.expect("reap"), 0);
+        for unit in &units {
+            assert!(unit.is_dir(), "{}", unit.display());
+            assert!(!unit.join("cgroup.kill").exists(), "{}", unit.display());
+        }
+        assert!(root.join(RETIRED_PARENT).is_dir());
+    }
+
+    #[tokio::test]
+    async fn reap_orphans_keeps_havn_slice_when_the_host_systemd_owns_the_hierarchy() {
+        let root = fake_cgroup_root();
+        std::fs::create_dir(root.join("init.scope")).expect("init.scope");
+        let ctl = CgroupController::with_root(root.clone()).expect("ctl");
+        let retired = retired_parent_with(&root, &[&AgentId::new().to_string()]);
+        let spawner =
+            NamespaceSpawner::with_controller(ctl).with_systemd_runtime(without_systemd());
+
+        assert_eq!(spawner.reap_orphans().await.expect("reap"), 1);
+        assert!(!retired[0].exists());
+        assert!(root.join(RETIRED_PARENT).is_dir());
     }
 }

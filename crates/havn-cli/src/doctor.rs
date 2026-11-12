@@ -423,7 +423,53 @@ fn check_cgroup_parent() -> Verdict {
     }
     let (v, msg) = parent_verdict(&probe_parent(root));
     line(v, "agent cgroups", &msg);
-    v
+    let retired = root.join(RETIRED_CGROUP_PARENT);
+    if !retired.is_dir() {
+        return v;
+    }
+    let agents = std::fs::read_dir(&retired).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.path().is_dir()
+                    && e.file_name().to_str().is_some_and(|name| {
+                        !name.contains('.')
+                            && name
+                                .strip_prefix(havn_core::AGENT_CGROUP_PREFIX)
+                                .is_some_and(|id| id.parse::<havn_core::AgentId>().is_ok())
+                    })
+            })
+            .count()
+    });
+    let (rv, msg) = retired_parent_verdict(&retired, agents);
+    line(rv, "old cgroups", &msg);
+    match (v, rv) {
+        (Verdict::Ok, Verdict::Warn) => Verdict::Warn,
+        _ => v,
+    }
+}
+
+/// `havn_spawner::cgroup::RETIRED_PARENT`; the CLI does not link the spawner.
+const RETIRED_CGROUP_PARENT: &str = "havn.slice";
+
+fn retired_parent_verdict(retired: &Path, agents: usize) -> (Verdict, String) {
+    let path = retired.display();
+    if agents == 0 {
+        return (
+            Verdict::Ok,
+            format!(
+                "{path} is left from an older gateway; the gateway removes it at start-up \
+                 unless systemd manages havn.slice"
+            ),
+        );
+    }
+    (
+        Verdict::Warn,
+        format!(
+            "{path} holds {agents} agent cgroup(s) of an older gateway; restart the gateway \
+             to kill those agents and remove them"
+        ),
+    )
 }
 
 /// Binaries the spawner execs for per-agent networking, with the Debian /
@@ -683,6 +729,17 @@ mod tests {
         let (v, msg) = parent_verdict(&probe(true, Ok(()), false));
         assert!(matches!(v, Verdict::Warn));
         assert!(msg.contains("not running as root"), "{msg}");
+    }
+
+    #[test]
+    fn leftover_havn_slice_is_reported() {
+        let retired = Path::new("/sys/fs/cgroup/havn.slice");
+        let (v, msg) = retired_parent_verdict(retired, 0);
+        assert!(matches!(v, Verdict::Ok));
+        assert!(msg.contains("removes it at start-up"), "{msg}");
+        let (v, msg) = retired_parent_verdict(retired, 2);
+        assert!(matches!(v, Verdict::Warn));
+        assert!(msg.contains("holds 2 agent cgroup(s)"), "{msg}");
     }
 
     #[test]

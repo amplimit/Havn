@@ -265,7 +265,7 @@ fn peer_cgroup_is_agents(contents: Option<&str>, agent_id: AgentId) -> bool {
 /// relative to the gateway's cgroup root, the same root the spawner
 /// creates `havn` under) and require exactly the agent's cgroup.
 /// Comparing the whole path matters: a cgroup the agent creates below its
-/// own, even one named after another agent, does not match. So does
+/// own, even one named after another agent, does not match. Neither does
 /// `/havn.slice/agent-<id>`, where gateways before #66 put agents: those
 /// belong to a gateway that is gone.
 #[cfg(target_os = "linux")]
