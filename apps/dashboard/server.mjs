@@ -11,8 +11,11 @@
  * never disagree; HAVN_DASHBOARD_IDENTITY_HEADER, when set, must match it.
  * That header is forwarded only from the peers listed in
  * HAVN_DASHBOARD_TRUSTED_PROXIES; other common identity headers are
- * dropped from every peer. Until the gateway has reported the name,
- * /api and /ws requests are refused.
+ * dropped from every peer, as is every name the gateway reported before.
+ * Each forwarded request carries `x-havn-identity-header` naming the
+ * header it was filtered for; the gateway refuses it when that is not
+ * its own (after a rename, until the next refresh). Until the gateway has
+ * reported the name, /api and /ws requests are refused.
  *
  * WS path: browser opens `ws://<dashboard-host>:3000/ws/chat/<id>?token=…`,
  * we open a raw TCP socket to the gateway (default `127.0.0.1:8080`),
@@ -46,6 +49,7 @@ if (EXPECTED_IDENTITY_HEADER !== null && !HEADER_NAME.test(EXPECTED_IDENTITY_HEA
   process.exit(1);
 }
 const IDENTITY_REFRESH_MS = 10_000;
+const FILTERED_FOR_HEADER = "x-havn-identity-header";
 const MAX_UPGRADE_RESPONSE_HEAD = 16 * 1024;
 const GATEWAY = process.env.HAVN_GATEWAY_URL ?? "http://127.0.0.1:8080";
 const WS_PREFIX = "/ws/";
@@ -119,6 +123,8 @@ const KNOWN_IDENTITY_HEADERS = new Set([
   "cf-access-authenticated-user-email",
 ]);
 if (EXPECTED_IDENTITY_HEADER !== null) KNOWN_IDENTITY_HEADERS.add(EXPECTED_IDENTITY_HEADER);
+// Every name the gateway ever reported joins the set, so a rename never
+// lets the previous name through from untrusted clients.
 
 // The header the gateway reads, or null while it has not told us.
 let identityHeader = null;
@@ -147,6 +153,7 @@ function learnIdentityHeader() {
         process.exit(1);
       }
       if (name !== identityHeader) console.log(`  identity header (from the gateway): ${name}`);
+      KNOWN_IDENTITY_HEADERS.add(name);
       identityHeader = name;
       lastIdentityError = null;
     })
@@ -175,6 +182,7 @@ async function identityKnown() {
 // other known identity header is dropped from every peer.
 function dropsIdentity(name, trusted) {
   const lower = name.toLowerCase();
+  if (lower === FILTERED_FOR_HEADER) return true;
   if (lower === identityHeader) return !trusted;
   return KNOWN_IDENTITY_HEADERS.has(lower);
 }
@@ -201,6 +209,9 @@ function forwardedHeaders(req) {
   for (const name of Object.keys(headers)) {
     if (dropsIdentity(name, trusted)) delete headers[name];
   }
+  // "none" if an upstream error cleared the name meanwhile; the gateway
+  // then refuses the request.
+  headers[FILTERED_FOR_HEADER] = identityHeader ?? "none";
   // A chunked request body must stay chunked upstream. Without framing,
   // Node writes the decoded body of a GET/DELETE/OPTIONS as raw bytes on
   // a keep-alive connection, and the gateway parses them as a second
@@ -236,10 +247,10 @@ function proxyApi(req, res) {
     },
   );
   upstream.on("error", (err) => {
-    // The gateway may come back with another identity header.
-    if (err.code === "ECONNREFUSED") identityHeader = null;
     // The client went away and we cancelled the request ourselves.
     if (res.destroyed) return;
+    // The gateway may come back with another identity header.
+    identityHeader = null;
     console.warn(`[gateway proxy] ${err.code ?? err.message}: ${req.method} ${req.url}`);
     if (res.headersSent) {
       res.destroy();
@@ -310,6 +321,7 @@ function proxyUpgrade(req, clientSocket, head) {
       .filter(([k]) => !dropsIdentity(k, trusted))
       .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(", ") : v}`);
     headerLines.push(`origin: ${canonicalOrigin}`);
+    headerLines.push(`${FILTERED_FOR_HEADER}: ${identityHeader ?? "none"}`);
     const requestLine = `${req.method} ${req.url} HTTP/${req.httpVersion}`;
     upstream.write(`${requestLine}\r\n${headerLines.join("\r\n")}\r\n\r\n`);
 
@@ -344,8 +356,8 @@ function proxyUpgrade(req, clientSocket, head) {
     upstream.destroy();
     clientSocket.destroy();
   };
-  upstream.on("error", (err) => {
-    if (err.code === "ECONNREFUSED") identityHeader = null;
+  upstream.on("error", () => {
+    identityHeader = null;
     tearDown();
   });
   upstream.on("close", () => clientSocket.destroy());

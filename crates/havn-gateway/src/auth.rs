@@ -39,6 +39,11 @@ use crate::config::TrustHeaderConfig;
 
 pub const DEFAULT_HEADER: &str = "x-user-id";
 
+/// Set by the dashboard proxy to the identity header name it filtered
+/// requests for. A different name means it let other identity headers
+/// through, so its request must not be trusted.
+pub const FILTERED_FOR_HEADER: &str = "x-havn-identity-header";
+
 // Names a proxy or HTTP itself gives another meaning; carrying identity in
 // one of them would break requests or let the client's value through.
 const RESERVED_HEADERS: &[&str] = &[
@@ -47,11 +52,15 @@ const RESERVED_HEADERS: &[&str] = &[
     "content-length",
     "cookie",
     "host",
+    "keep-alive",
     "origin",
+    "proxy-authorization",
+    "proxy-connection",
     "te",
     "trailer",
     "transfer-encoding",
     "upgrade",
+    FILTERED_FOR_HEADER,
 ];
 
 #[derive(Debug, Clone)]
@@ -253,6 +262,19 @@ pub async fn resolve(parts: &Parts, app: &AppState) -> Result<AuthedUser, ApiErr
             ));
         }
         let header = &app.identity.name;
+        // Absent for proxies other than the dashboard, which set the
+        // identity header themselves.
+        let filtered_for_other = parts.headers.get_all(FILTERED_FOR_HEADER).iter().any(|v| {
+            !v.as_bytes()
+                .trim_ascii()
+                .eq_ignore_ascii_case(header.as_str().as_bytes())
+        });
+        if filtered_for_other {
+            return Err(ApiError::Forbidden(format!(
+                "the dashboard proxy filtered this request for another identity header than \
+                 {header}; it reloads the gateway's header name shortly"
+            )));
+        }
         let mut values = parts.headers.get_all(header).iter();
         let first = values.next();
         // A proxy that appends instead of replacing would leave the
@@ -628,9 +650,43 @@ pub(crate) mod tests {
         assert!(matches!(err, ApiError::Forbidden(_)), "{err:?}");
     }
 
+    #[tokio::test]
+    async fn dashboard_filtering_for_another_header_is_refused() {
+        let (mut app, _bs) = state_with(true).await;
+        with_header(&mut app, "X-Authentik-Username", None);
+        let alice = add_external(&app, "alice").await;
+        let request = |filtered_for: Option<&str>| {
+            let mut builder = Request::builder().header("X-Authentik-Username", "alice");
+            if let Some(name) = filtered_for {
+                builder = builder.header(FILTERED_FOR_HEADER, name);
+            }
+            let (parts, _) = builder.body(()).expect("req").into_parts();
+            from_peer(parts, "127.0.0.1:50000")
+        };
+        // A dashboard still filtering for the name from before a rename.
+        let err = resolve(&request(Some("x-forwarded-user")), &app)
+            .await
+            .expect_err("stale dashboard");
+        assert!(matches!(err, ApiError::Forbidden(_)), "{err:?}");
+        let ok = resolve(&request(Some("X-Authentik-Username")), &app).await;
+        assert_eq!(ok.expect("current name").id, alice);
+        let ok = resolve(&request(None), &app).await;
+        assert_eq!(ok.expect("other proxies").id, alice);
+    }
+
     #[test]
     fn invalid_header_name_is_rejected() {
-        for name in ["X User", "Host", "cookie", "Authorization", "Connection"] {
+        for name in [
+            "X User",
+            "Host",
+            "cookie",
+            "Authorization",
+            "Connection",
+            "Proxy-Authorization",
+            "Keep-Alive",
+            "Proxy-Connection",
+            "X-Havn-Identity-Header",
+        ] {
             let cfg = TrustHeaderConfig {
                 header: name.into(),
                 ..TrustHeaderConfig::default()

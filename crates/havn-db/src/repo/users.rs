@@ -72,17 +72,21 @@ pub async fn set_external_id(
     external_id: Option<&str>,
 ) -> Result<Option<String>> {
     check_external_id(external_id)?;
-    let previous = find_by_id(pool, id).await?.ok_or(DbError::NotFound)?;
-    let res = sqlx::query("UPDATE users SET external_id = ?2 WHERE id = ?1")
+    let mut tx = pool.begin().await?;
+    let previous: Option<Option<String>> =
+        sqlx::query_scalar("SELECT external_id FROM users WHERE id = ?1")
+            .bind(id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+    let previous = previous.ok_or(DbError::NotFound)?;
+    sqlx::query("UPDATE users SET external_id = ?2 WHERE id = ?1")
         .bind(id.to_string())
         .bind(external_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(unique_violation)?;
-    if res.rows_affected() == 0 {
-        return Err(DbError::NotFound);
-    }
-    Ok(previous.external_id)
+    tx.commit().await?;
+    Ok(previous)
 }
 
 // The gateway sees a trimmed header value of visible ASCII; Node joins a

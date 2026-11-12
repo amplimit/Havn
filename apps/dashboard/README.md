@@ -65,7 +65,10 @@ to send. Keep it on `127.0.0.1` and reach it through one of:
   no ranges or host names). The dashboard learns the header name from the
   gateway (`GET /auth/info`) at startup and every 10 seconds, forwards it
   only from those addresses, and drops other common identity headers
-  (`X-User-ID`, `Remote-User`, `X-Forwarded-Email`, ...) from every peer.
+  (`X-User-ID`, `Remote-User`, `X-Forwarded-Email`, ..., and every name
+  the gateway reported before) from every peer. Each forwarded request
+  names the header it was filtered for in `X-Havn-Identity-Header`; the
+  gateway refuses it if that is not its own.
   While the gateway has not reported the name, `/api` and `/ws` get 503.
   See the [main README](../../README.md#multi-user-mode-behind-an-sso-proxy)
   for proxy recipes.
