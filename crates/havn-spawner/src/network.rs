@@ -358,9 +358,8 @@ fn isolation_rules(pool_cidr: &str, dns: &[String], reachable: &[String]) -> Vec
             ]));
         }
     }
-    for dest in reachable {
-        rules.push(rule(&["-A", EGRESS_CHAIN, "-d", dest, "-j", "RETURN"]));
-    }
+    // The host itself, broadcast and other agents stay unreachable even
+    // when an operator exception (below) covers their addresses.
     rules.push(rule(&[
         "-A",
         EGRESS_CHAIN,
@@ -382,17 +381,34 @@ fn isolation_rules(pool_cidr: &str, dns: &[String], reachable: &[String]) -> Vec
         "DROP",
     ]));
     rules.push(rule(&["-A", EGRESS_CHAIN, "-d", pool_cidr, "-j", "DROP"]));
+    for dest in reachable {
+        rules.push(rule(&["-A", EGRESS_CHAIN, "-d", dest, "-j", "RETURN"]));
+    }
     for dest in BLOCKED_DESTINATIONS {
         rules.push(rule(&["-A", EGRESS_CHAIN, "-d", dest, "-j", "DROP"]));
     }
     rules
 }
 
-/// Rebuild [`EGRESS_CHAIN`] and make sure the only jump to it is the first
-/// rule of `mangle PREROUTING`.
+/// `mangle` chains whose packets from agent veths go through
+/// [`EGRESS_CHAIN`]: PREROUTING sees the destination before any DNAT,
+/// INPUT and FORWARD see it after (a REDIRECT, DNAT or transparent proxy
+/// rule another tool installed cannot steer agent traffic around it).
+const HOOK_CHAINS: &[&str] = &["PREROUTING", "INPUT", "FORWARD"];
+
+/// `iptables -w`: wait for the xtables lock instead of failing when
+/// another tool (Docker, fail2ban) holds it.
+fn iptables() -> Command {
+    let mut cmd = Command::new("iptables");
+    cmd.arg("-w");
+    cmd
+}
+
+/// Rebuild [`EGRESS_CHAIN`] and make sure the only jump to it from each
+/// of [`HOOK_CHAINS`] is that chain's first rule.
 fn apply_isolation(pool_cidr: &str, dns: &[String], reachable: &[String]) -> Result<()> {
     // -N fails if the chain exists; -F then empties it either way.
-    let _ = Command::new("iptables")
+    let _ = iptables()
         .args(["-t", "mangle", "-N", EGRESS_CHAIN])
         .output()?;
     run_iptables(&["-t", "mangle", "-F", EGRESS_CHAIN])?;
@@ -401,28 +417,52 @@ fn apply_isolation(pool_cidr: &str, dns: &[String], reachable: &[String]) -> Res
         args.extend(rule.iter().map(String::as_str));
         run_iptables(&args)?;
     }
-    // Remove any existing jump (possibly no longer first), then insert it
-    // at the top.
     let hook = ["-i", HOST_IFACE_MATCH, "-j", EGRESS_CHAIN];
-    loop {
-        let mut del = vec!["-t", "mangle", "-D", "PREROUTING"];
-        del.extend(hook);
-        if !Command::new("iptables")
-            .args(&del)
+    for chain in HOOK_CHAINS {
+        // Remove any existing jump (possibly no longer first), then
+        // insert it at the top.
+        loop {
+            let mut del = vec!["-t", "mangle", "-D", chain];
+            del.extend(hook);
+            if !iptables().args(&del).output()?.status.success() {
+                break;
+            }
+        }
+        let mut ins = vec!["-t", "mangle", "-I", chain, "1"];
+        ins.extend(hook);
+        run_iptables(&ins)?;
+    }
+    Ok(())
+}
+
+/// Whether every isolation hook is still installed. A firewall reload
+/// (firewalld, netfilter-persistent) can remove them while the gateway
+/// runs; agents are then started without network access.
+fn isolation_in_place() -> Result<bool> {
+    for chain in HOOK_CHAINS {
+        let present = iptables()
+            .args([
+                "-t",
+                "mangle",
+                "-C",
+                chain,
+                "-i",
+                HOST_IFACE_MATCH,
+                "-j",
+                EGRESS_CHAIN,
+            ])
             .output()?
             .status
-            .success()
-        {
-            break;
+            .success();
+        if !present {
+            return Ok(false);
         }
     }
-    let mut ins = vec!["-t", "mangle", "-I", "PREROUTING", "1"];
-    ins.extend(hook);
-    run_iptables(&ins)
+    Ok(true)
 }
 
 fn run_iptables(args: &[&str]) -> Result<()> {
-    let out = Command::new("iptables").args(args).output()?;
+    let out = iptables().args(args).output()?;
     if out.status.success() {
         return Ok(());
     }
@@ -454,6 +494,13 @@ pub fn configure_agent_network(
 ) -> Result<AgentNetwork> {
     let net = network_for(agent_id, *pool);
     let pid = child_pid.to_string();
+    if !isolation_in_place()? {
+        return Err(NetworkError::CommandFailed(
+            "agent network isolation rules are missing (was the firewall reloaded?); \
+             restart the gateway to reinstall them"
+                .into(),
+        ));
+    }
 
     // Host side
     run_ip(&[
@@ -484,6 +531,15 @@ pub fn configure_agent_network(
         && e.kind() != std::io::ErrorKind::NotFound
     {
         return Err(NetworkError::Io(e));
+    }
+    // Strict reverse-path filtering drops packets whose source is not the
+    // agent's own address (spoofing another agent), and arp_ignore keeps
+    // the host from announcing its other addresses on the agent link.
+    for (knob, value) in [("rp_filter", "1\n"), ("arp_ignore", "1\n")] {
+        std::fs::write(
+            format!("/proc/sys/net/ipv4/conf/{}/{knob}", net.host_iface),
+            value,
+        )?;
     }
     run_ip(&["link", "set", &net.ns_iface, "addrgenmode", "none"])?;
     run_ip(&["link", "set", &net.host_iface, "up"])?;
@@ -652,11 +708,11 @@ fn add_iptables_rule_idempotent(rule: &[&str]) -> Result<()> {
     if let Some(pos) = check.iter().position(|a| *a == "-A" || *a == "-I") {
         check[pos] = "-C";
     }
-    let probe = Command::new("iptables").args(&check).output()?;
+    let probe = iptables().args(&check).output()?;
     if probe.status.success() {
         return Ok(()); // already there
     }
-    let add = Command::new("iptables").args(rule).output()?;
+    let add = iptables().args(rule).output()?;
     if !add.status.success() {
         let stderr = String::from_utf8_lossy(&add.stderr).trim().to_string();
         if stderr.to_lowercase().contains("permission")
@@ -741,8 +797,12 @@ mod tests {
         let local = pos("--dst-type LOCAL -j DROP");
         let pool = pos("-d 10.42.0.0/16 -j DROP");
         let private = pos("-d 10.0.0.0/8 -j DROP");
-        assert!(dns_udp < local && dns_tcp < local && exception < local);
-        assert!(local < private && pool < private);
+        assert!(dns_udp < local && dns_tcp < local);
+        assert!(
+            local < exception && pool < exception,
+            "an exception must not reopen the host or other agents"
+        );
+        assert!(exception < private);
         for dest in [
             "169.254.0.0/16",
             "172.16.0.0/12",

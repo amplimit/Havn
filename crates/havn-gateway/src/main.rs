@@ -562,7 +562,7 @@ fn isolation_exceptions(
 ) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let mut dns = Vec::new();
     for server in &network.agent_dns {
-        if havn_spawner::network::parse_ipv4_net(server).is_some() {
+        if matches!(havn_spawner::network::parse_ipv4_net(server), Some((_, 32))) {
             dns.push(server.clone());
         } else {
             warn!(
