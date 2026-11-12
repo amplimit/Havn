@@ -791,7 +791,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
             {
                 Ok(resp) => {
                     let usage = LlmUsage {
-                        input_tokens: resp.usage.input_tokens,
+                        input_tokens: resp.usage.total_input_tokens(),
                         output_tokens: resp.usage.output_tokens,
                     };
                     LlmResponse {

@@ -335,18 +335,19 @@ fn gemini_to_anthropic(raw: &Value, model: &str) -> Result<AnthropicResponse, St
     };
 
     // Thinking tokens are billed as output but reported apart from the
-    // candidates.
+    // candidates. The JSON mapping omits zero counts, so a missing output
+    // count is 0; a missing prompt count (never 0) means no usage.
     let usage = raw
         .get("usageMetadata")
-        .filter(|u| u.is_object())
-        .map_or_else(AnthropicUsage::unreported, |u| {
+        .and_then(|u| {
             let count = |key: &str| u.get(key).and_then(Value::as_u64).unwrap_or(0);
-            AnthropicUsage {
-                input_tokens: count("promptTokenCount"),
+            Some(AnthropicUsage {
+                input_tokens: u.get("promptTokenCount")?.as_u64()?,
                 output_tokens: count("candidatesTokenCount") + count("thoughtsTokenCount"),
                 ..AnthropicUsage::default()
-            }
-        });
+            })
+        })
+        .unwrap_or_else(AnthropicUsage::unreported);
 
     Ok(AnthropicResponse {
         id: raw
@@ -525,6 +526,10 @@ mod tests {
         let canon = gemini_to_anthropic(&raw, "gemini-2.5-pro").expect("parse");
         assert_eq!(canon.usage.output_tokens, 42);
         assert!(!canon.usage.unreported);
+        let mut partial = raw.clone();
+        partial["usageMetadata"] = json!({"candidatesTokenCount": 2});
+        let canon = gemini_to_anthropic(&partial, "gemini-2.5-pro").expect("parse");
+        assert!(canon.usage.unreported);
     }
 
     #[test]

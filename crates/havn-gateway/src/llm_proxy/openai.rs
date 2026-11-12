@@ -354,17 +354,16 @@ fn openai_to_anthropic(raw: &Value) -> Result<AnthropicResponse, String> {
 
     // `completion_tokens` includes reasoning tokens and `prompt_tokens`
     // includes cached ones.
-    let usage =
-        raw.get("usage")
-            .filter(|u| u.is_object())
-            .map_or_else(AnthropicUsage::unreported, |u| AnthropicUsage {
-                input_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
-                output_tokens: u
-                    .get("completion_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
+    let usage = raw
+        .get("usage")
+        .and_then(|u| {
+            Some(AnthropicUsage {
+                input_tokens: u.get("prompt_tokens")?.as_u64()?,
+                output_tokens: u.get("completion_tokens")?.as_u64()?,
                 ..AnthropicUsage::default()
-            });
+            })
+        })
+        .unwrap_or_else(AnthropicUsage::unreported);
 
     Ok(AnthropicResponse {
         id,
@@ -522,6 +521,14 @@ mod tests {
             "choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}]
         });
         assert!(openai_to_anthropic(&raw).expect("parse").usage.unreported);
+        let mut partial = raw.clone();
+        partial["usage"] = json!({"prompt_tokens": 12});
+        assert!(
+            openai_to_anthropic(&partial)
+                .expect("parse")
+                .usage
+                .unreported
+        );
     }
 
     #[test]

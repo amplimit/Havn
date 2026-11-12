@@ -52,15 +52,23 @@ use provider::{LlmProvider, classify};
 const MIN_OUTPUT_TOKENS: u32 = 256;
 
 /// ASCII bytes of request text counted as one input token when reserving
-/// (tokenizers average about 4 for English); every other byte counts as a
-/// token of its own. This over-reserves; the reservation is settled to
-/// the provider's reported usage once the call returns.
+/// (tokenizers average about 4 for English). Other characters count as one
+/// token each (CJK text runs at roughly 1 to 1.5 characters per token), and
+/// characters outside the BMP as one per UTF-8 byte. This over-reserves;
+/// the reservation is settled to the provider's reported usage once the
+/// call returns.
 const ASCII_BYTES_PER_TOKEN: u64 = 2;
 
 /// Least tokens reserved per image or document block, whatever its source.
 /// Claude bills at most about 1,600 tokens for an image at standard
 /// resolution and about 4,800 at high resolution.
 const IMAGE_TOKENS: u64 = 5_000;
+
+/// Least tokens reserved for a URL-sourced document, whose size the
+/// gateway cannot see: a large PDF runs to 100k-300k tokens. A base64
+/// document is instead counted from its data, so a huge one can be
+/// refused outright.
+const URL_DOCUMENT_TOKENS: u64 = 100_000;
 
 /// Who an LLM call is billed to and the agent budget it must fit in.
 #[derive(Debug, Clone)]
@@ -591,11 +599,11 @@ async fn warn_over_agent_budget(
 }
 
 /// Upper estimate of a request's input tokens (system prompt, messages,
-/// tool definitions): ASCII text at [`ASCII_BYTES_PER_TOKEN`], every
-/// other byte as a token of its own. An image block counts as at least
-/// [`IMAGE_TOKENS`] whatever its source, without its base64 data; a
-/// document block as at least [`IMAGE_TOKENS`], its data included. Tool
-/// inputs are plain data the model wrote and are counted as text.
+/// tool definitions), text counted as [`ASCII_BYTES_PER_TOKEN`] describes.
+/// An image block counts as at least [`IMAGE_TOKENS`] whatever its source,
+/// without its base64 data; a document block as at least [`IMAGE_TOKENS`]
+/// with its data included, or [`URL_DOCUMENT_TOKENS`] when it comes from a
+/// URL. Tool inputs are plain data the model wrote and are counted as text.
 fn input_token_estimate(request: &AnthropicRequest) -> i64 {
     #[derive(Default)]
     struct Count {
@@ -606,9 +614,13 @@ fn input_token_estimate(request: &AnthropicRequest) -> i64 {
 
     impl Count {
         fn text(&mut self, s: &str) {
-            let ascii = s.bytes().filter(u8::is_ascii).count() as u64;
-            self.ascii += ascii;
-            self.other += s.len() as u64 - ascii;
+            for c in s.chars() {
+                match c.len_utf8() {
+                    1 => self.ascii += 1,
+                    4 => self.other += 4,
+                    _ => self.other += 1,
+                }
+            }
         }
 
         fn tokens(&self) -> u64 {
@@ -625,9 +637,15 @@ fn input_token_estimate(request: &AnthropicRequest) -> i64 {
                 }
                 serde_json::Value::Object(map) => {
                     let kind = map.get("type").and_then(serde_json::Value::as_str);
+                    let url_source = map
+                        .get("source")
+                        .and_then(|source| source.get("type"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("url");
                     let (blocks, floor) = match kind {
                         _ if !blocks => (false, None),
                         Some("tool_use") => (false, None),
+                        Some("document") if url_source => (true, Some(URL_DOCUMENT_TOKENS)),
                         Some("image" | "document") => (true, Some(IMAGE_TOKENS)),
                         _ => (true, None),
                     };
@@ -1288,12 +1306,19 @@ mod tests {
             let pdf = json!([{"type": "document", "source": {"type": "base64",
                 "media_type": "application/pdf", "data": "A".repeat(100_000)}}]);
             assert!(estimate(pdf) > 50_000);
+            let url_pdf = json!([{"type": "document", "source": {"type": "url",
+                "url": "https://example.test/big.pdf"}}]);
+            assert_eq!(
+                estimate(url_pdf),
+                2 + i64::try_from(URL_DOCUMENT_TOKENS).unwrap()
+            );
         }
 
         #[test]
         fn input_estimate_counts_non_ascii_bytes_and_tool_inputs() {
-            // 100 three-byte characters are 300 tokens.
-            assert_eq!(estimate(json!("\u{4e2d}".repeat(100))), 302);
+            // A CJK character is one token; one outside the BMP is four.
+            assert_eq!(estimate(json!("\u{4e2d}\u{6587}".repeat(50))), 102);
+            assert_eq!(estimate(json!("\u{20000}".repeat(10))), 42);
             // An "image" inside tool input is data, counted in full.
             let tool_use = json!([{"type": "tool_use", "id": "t", "name": "n", "input":
                 {"type": "image", "source": {"data": "A".repeat(100_000)}}}]);
