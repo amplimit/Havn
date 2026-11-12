@@ -1,9 +1,10 @@
 "use client";
 
 /**
- * `/teams/[id]/usage` — token totals per member (spec §10.3
- * "Resource Dashboard"). Spec §7.3 / v0.6: token counts only, no
- * USD. Operators compute $ in their own analytics from this data.
+ * `/teams/[id]/usage` — token totals per member of the team's agents
+ * and credentials (spec §10.3 "Resource Dashboard"; team admins only).
+ * Spec §7.3 / v0.6: token counts only, no USD. Operators compute $ in
+ * their own analytics from this data.
  *
  * Default window 30 days; the picker also offers 7 / 90 / 365.
  */

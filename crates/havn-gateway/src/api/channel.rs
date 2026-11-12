@@ -436,7 +436,7 @@ async fn handle_session(
         }
     }
 
-    state.channel_router.unregister(&key).await;
+    state.channel_router.unregister(&key, &frame_tx).await;
     outbound.abort();
     let _ = outbound.await;
     info!(channel = %channel_id, account = %account_id, "channel WS closed");

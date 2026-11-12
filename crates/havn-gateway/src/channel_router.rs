@@ -144,10 +144,15 @@ impl ChannelRouter {
 
     /// Mark the adapter as disconnected but keep the `AccountState` —
     /// the replay buffer and seq counter survive until the next
-    /// reconnect (or until the gateway restarts). Idempotent.
-    pub async fn unregister(&self, key: &AccountKey) {
+    /// reconnect (or until the gateway restarts). Only clears the slot
+    /// while it still holds `tx` (the sender this connection
+    /// registered): when a reconnect registered first, the old
+    /// connection's teardown must not drop the new sender. Idempotent.
+    pub async fn unregister(&self, key: &AccountKey, tx: &mpsc::Sender<ChannelFrame>) {
         if let Some(state) = self.inner.lock().await.get_mut(key) {
-            state.tx = None;
+            if state.tx.as_ref().is_some_and(|cur| cur.same_channel(tx)) {
+                state.tx = None;
+            }
         }
     }
 
@@ -445,7 +450,7 @@ mod tests {
         let router = ChannelRouter::new();
         let key = AccountKey::new("telegram", "alice");
         let (tx1, _rx1) = mpsc::channel(8);
-        router.register(key.clone(), tx1).await;
+        router.register(key.clone(), tx1.clone()).await;
         router
             .deliver(
                 "telegram",
@@ -457,7 +462,7 @@ mod tests {
             .await
             .expect("deliver");
 
-        router.unregister(&key).await;
+        router.unregister(&key, &tx1).await;
         let (tx2, mut rx2) = mpsc::channel(8);
         router.register(key.clone(), tx2).await;
         let seq = router
@@ -482,8 +487,8 @@ mod tests {
         let router = ChannelRouter::new();
         let key = AccountKey::new("telegram", "alice");
         let (tx, _rx) = mpsc::channel(8);
-        router.register(key.clone(), tx).await;
-        router.unregister(&key).await;
+        router.register(key.clone(), tx.clone()).await;
+        router.unregister(&key, &tx).await;
         let r = router
             .deliver(
                 "telegram",
@@ -504,7 +509,7 @@ mod tests {
         let router = ChannelRouter::new();
         let key = AccountKey::new("telegram", "alice");
         let (tx, mut rx) = mpsc::channel(8);
-        router.register(key.clone(), tx).await;
+        router.register(key.clone(), tx.clone()).await;
         for i in 0..3 {
             router
                 .deliver(
@@ -524,7 +529,7 @@ mod tests {
             let _ = rx.recv().await.expect("frame");
         }
 
-        router.unregister(&key).await;
+        router.unregister(&key, &tx).await;
         let replayed = router.replay_since(&key, 1).await;
         let seqs: Vec<u64> = replayed
             .iter()
@@ -538,6 +543,46 @@ mod tests {
             vec![2, 3],
             "replay returns frames strictly after since_seq"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_unregister_keeps_the_reconnected_sender() {
+        // Reconnect race: the new connection registers before the old
+        // connection's teardown runs its unregister.
+        let router = ChannelRouter::new();
+        let key = AccountKey::new("telegram", "alice");
+        let (old_tx, _old_rx) = mpsc::channel(8);
+        router.register(key.clone(), old_tx.clone()).await;
+        let (new_tx, mut new_rx) = mpsc::channel(8);
+        router.register(key.clone(), new_tx.clone()).await;
+        router.unregister(&key, &old_tx).await;
+
+        router
+            .deliver(
+                "telegram",
+                "alice",
+                "tg:1",
+                None,
+                ChannelMessageContent::Text { text: "x".into() },
+            )
+            .await
+            .expect("the new connection still receives replies");
+        assert!(matches!(
+            new_rx.recv().await,
+            Some(ChannelFrame::Outbound(_))
+        ));
+
+        router.unregister(&key, &new_tx).await;
+        let r = router
+            .deliver(
+                "telegram",
+                "alice",
+                "tg:1",
+                None,
+                ChannelMessageContent::Text { text: "y".into() },
+            )
+            .await;
+        assert!(matches!(r, Err(DeliverError::NoSession(_))), "{r:?}");
     }
 
     #[tokio::test]

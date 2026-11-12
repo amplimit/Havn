@@ -127,6 +127,22 @@ pub async fn count_for_owner(pool: &SqlitePool, owner_id: UserId) -> Result<u32>
     Ok(u32::try_from(n).unwrap_or(u32::MAX))
 }
 
+/// Number of agents `owner_id` owns in `team_id` (the team role's
+/// `max_agents` gate).
+pub async fn count_for_owner_in_team(
+    pool: &SqlitePool,
+    owner_id: UserId,
+    team_id: TeamId,
+) -> Result<u32> {
+    let n: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agents WHERE owner_id = ?1 AND team_id = ?2")
+            .bind(owner_id.to_string())
+            .bind(team_id.to_string())
+            .fetch_one(pool)
+            .await?;
+    Ok(u32::try_from(n).unwrap_or(u32::MAX))
+}
+
 pub async fn list_for_owner(pool: &SqlitePool, owner_id: UserId) -> Result<Vec<Agent>> {
     let rows: Vec<AgentRow> = sqlx::query_as::<_, AgentRow>(
         "SELECT id, owner_id, team_id, name, status, host, pid, config, created_at, updated_at \

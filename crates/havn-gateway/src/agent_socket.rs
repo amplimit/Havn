@@ -548,8 +548,14 @@ where
             }
             AgentToGateway::CronResult(result) => {
                 let job_id = result.job_id.clone();
-                if let Err(e) = ctx.cron_scheduler.record_result(agent_id, result).await {
-                    warn!(%agent_id, %job_id, error = %e, "cron result recording failed");
+                match ctx.cron_scheduler.record_result(agent_id, result).await {
+                    Ok(()) => {}
+                    Err(e @ crate::cron::CronError::NotPending(_)) => {
+                        warn!(%agent_id, %job_id, error = %e, "rejecting unsolicited CronResult");
+                    }
+                    Err(e) => {
+                        warn!(%agent_id, %job_id, error = %e, "cron result recording failed");
+                    }
                 }
             }
             AgentToGateway::MemoryForgetResponse(resp) => {

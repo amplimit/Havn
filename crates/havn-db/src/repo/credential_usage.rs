@@ -113,9 +113,8 @@ pub async fn requests_since_for_user(
 }
 
 /// Per-user token totals within a team since `since_rfc3339`. Drives
-/// the dashboard's `/teams/:id/usage` view. Joined to `users.display_name`
-/// and `agents.team_id` so we get one row per user with their total —
-/// no N+1 lookups in the handler.
+/// the dashboard's `/teams/:id/usage` view: one row per user, joined to
+/// `users.display_name`, so the handler does no N+1 lookups.
 #[derive(Debug, Clone)]
 pub struct TeamUserUsage {
     pub user_id: UserId,
@@ -125,11 +124,13 @@ pub struct TeamUserUsage {
     pub call_count: i64,
 }
 
-/// Rollup query: for every member of `team_id` that's used a credential
-/// since `since_rfc3339`, return their token totals. Includes calls
-/// against either user-scoped or team-scoped credentials, joined via
-/// agents.team_id (so a member's calls on their personal agent only
-/// count when that agent is associated to the team).
+/// Rollup query: the team's usage since `since_rfc3339`, per user. Counts
+/// only calls billed to one of the team's credentials or made by one of the
+/// team's agents (`agents.team_id`, through `credential_usages.agent_id`);
+/// a member's usage of their own credentials on their own agents is not
+/// included. Every current member gets a row (zero when unused); a
+/// non-member appears when they used the team's resources (a former
+/// member, or a cross-agent caller billed for a team agent's work).
 ///
 /// Spec §10.3 admin view: "aggregate CPU / memory / token usage per
 /// user / credential". Token usage is the live one.
@@ -139,17 +140,25 @@ pub async fn list_team_usage(
     since_rfc3339: &str,
 ) -> Result<Vec<TeamUserUsage>> {
     let rows: Vec<UsageRow> = sqlx::query_as::<_, UsageRow>(
-        "SELECT u.id AS user_id, \
+        "WITH scoped AS ( \
+             SELECT cu.user_id, cu.tokens_in, cu.tokens_out \
+             FROM credential_usages cu \
+             WHERE cu.created_at >= ?2 \
+               AND (cu.agent_id IN (SELECT id FROM agents WHERE team_id = ?1) \
+                    OR cu.credential_id IN \
+                       (SELECT id FROM credentials WHERE scope = 'team' AND scope_id = ?1)) \
+         ), people AS ( \
+             SELECT user_id FROM team_memberships WHERE team_id = ?1 \
+             UNION SELECT user_id FROM scoped \
+         ) \
+         SELECT u.id AS user_id, \
                 u.display_name AS display_name, \
-                COALESCE(SUM(cu.tokens_in), 0)  AS tokens_in, \
-                COALESCE(SUM(cu.tokens_out), 0) AS tokens_out, \
-                COUNT(cu.id)                    AS call_count \
-         FROM team_memberships m \
-         JOIN users u ON u.id = m.user_id \
-         LEFT JOIN credential_usages cu \
-              ON cu.user_id = m.user_id \
-             AND cu.created_at >= ?2 \
-         WHERE m.team_id = ?1 \
+                COALESCE(SUM(s.tokens_in), 0)  AS tokens_in, \
+                COALESCE(SUM(s.tokens_out), 0) AS tokens_out, \
+                COUNT(s.user_id)               AS call_count \
+         FROM people p \
+         JOIN users u ON u.id = p.user_id \
+         LEFT JOIN scoped s ON s.user_id = p.user_id \
          GROUP BY u.id, u.display_name \
          ORDER BY (tokens_in + tokens_out) DESC, u.display_name",
     )

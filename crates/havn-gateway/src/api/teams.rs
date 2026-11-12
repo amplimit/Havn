@@ -346,9 +346,9 @@ pub struct TeamUsageResponse {
     pub entries: Vec<TeamUsageEntry>,
 }
 
-/// `GET /teams/{id}/usage?days=30` — token totals per member.
-/// Spec §10.3 admin view. Members can read their own team's usage
-/// even without admin role — visibility into shared spend is healthy.
+/// `GET /teams/{id}/usage?days=30` — token totals per user of the team's
+/// agents and credentials (see `list_team_usage`). Spec §10.3 admin view:
+/// admin-only, since it shows every member's activity.
 pub async fn usage(
     State(state): State<AppState>,
     user: AuthedUser,
@@ -356,7 +356,7 @@ pub async fn usage(
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<TeamUsageResponse>, ApiError> {
     let id = parse_id(&id)?;
-    perm::require_member(&state.db, user.id, id).await?;
+    perm::require_admin(&state.db, user.id, id).await?;
 
     let days = q.days.unwrap_or(30).min(365);
     let since = Utc::now() - ChronoDuration::days(days.into());
@@ -450,5 +450,273 @@ mod tests {
             .expect("single-user mode allows team creation");
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(team.name, "self-made");
+    }
+
+    struct TeamFixture {
+        state: AppState,
+        team: TeamId,
+        admin: AuthedUser,
+        member: AuthedUser,
+        viewer: AuthedUser,
+        outsider: AuthedUser,
+    }
+
+    async fn team_fixture() -> TeamFixture {
+        use havn_db::repo::users::{NewUser, create as create_user};
+        let (state, admin_id) = state_with(true).await;
+        let team = repo::create(&state.db, NewTeam { name: "t" })
+            .await
+            .expect("team");
+        let role = |name: &'static str, max_agents: u32| {
+            let db = state.db.clone();
+            async move {
+                let policy = Policy {
+                    max_agents,
+                    ..admin_default_policy()
+                };
+                create_role(
+                    &db,
+                    NewRole {
+                        team_id: Some(team.id),
+                        name,
+                        policy: &policy,
+                    },
+                )
+                .await
+                .expect("role")
+                .id
+            }
+        };
+        let admin_role = role("admin", 50).await;
+        let member_role = role("member", 1).await;
+        let viewer_role = role("viewer", 0).await;
+        let user = |name: &'static str| {
+            let db = state.db.clone();
+            async move {
+                let u = create_user(&db, NewUser { display_name: name })
+                    .await
+                    .expect("user");
+                AuthedUser {
+                    id: u.id,
+                    display_name: name.into(),
+                }
+            }
+        };
+        let admin = AuthedUser {
+            id: admin_id,
+            display_name: "admin".into(),
+        };
+        let member = user("member").await;
+        let viewer = user("viewer").await;
+        let outsider = user("outsider").await;
+        for (u, r) in [
+            (&admin, admin_role),
+            (&member, member_role),
+            (&viewer, viewer_role),
+        ] {
+            team_memberships::add(&state.db, u.id, team.id, r)
+                .await
+                .expect("membership");
+        }
+        TeamFixture {
+            state,
+            team: team.id,
+            admin,
+            member,
+            viewer,
+            outsider,
+        }
+    }
+
+    fn agent_request(
+        name: &str,
+        team: Option<TeamId>,
+    ) -> Json<crate::api::agents::CreateAgentRequest> {
+        Json(crate::api::agents::CreateAgentRequest {
+            name: name.into(),
+            config: None,
+            team_id: team.map(|t| t.to_string()),
+        })
+    }
+
+    async fn team_agent_names(f: &TeamFixture, user: &AuthedUser) -> Result<Vec<String>, ApiError> {
+        let Json(agents) = list_agents(
+            State(f.state.clone()),
+            user.clone(),
+            Path(f.team.to_string()),
+        )
+        .await?;
+        Ok(agents.into_iter().map(|a| a.name).collect())
+    }
+
+    #[tokio::test]
+    async fn agents_are_created_in_a_team_within_the_role_quota() {
+        use crate::api::agents::create as create_agent;
+        let f = team_fixture().await;
+        let (status, Json(agent)) = create_agent(
+            State(f.state.clone()),
+            f.member.clone(),
+            agent_request("shared", Some(f.team)),
+        )
+        .await
+        .expect("member may create a team agent");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(agent.team_id, Some(f.team.to_string()));
+
+        let over_quota = create_agent(
+            State(f.state.clone()),
+            f.member.clone(),
+            agent_request("second", Some(f.team)),
+        )
+        .await;
+        assert!(
+            matches!(over_quota, Err(ApiError::Forbidden(_))),
+            "{over_quota:?}"
+        );
+        let (_, Json(personal)) = create_agent(
+            State(f.state.clone()),
+            f.admin.clone(),
+            agent_request("personal", None),
+        )
+        .await
+        .expect("personal agent");
+        assert_eq!(personal.team_id, None);
+
+        for user in [&f.viewer, &f.outsider] {
+            let denied = create_agent(
+                State(f.state.clone()),
+                user.clone(),
+                agent_request("nope", Some(f.team)),
+            )
+            .await;
+            assert!(matches!(denied, Err(ApiError::Forbidden(_))), "{denied:?}");
+        }
+        let invalid = create_agent(
+            State(f.state.clone()),
+            f.admin.clone(),
+            Json(crate::api::agents::CreateAgentRequest {
+                name: "bad".into(),
+                config: None,
+                team_id: Some("not-a-uuid".into()),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(invalid, Err(ApiError::BadRequest(_))),
+            "{invalid:?}"
+        );
+
+        assert_eq!(
+            team_agent_names(&f, &f.viewer).await.expect("members list"),
+            ["shared"]
+        );
+        let outsider = team_agent_names(&f, &f.outsider).await;
+        assert!(
+            matches!(outsider, Err(ApiError::Forbidden(_))),
+            "{outsider:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn team_usage_counts_only_team_resources_and_is_admin_only() {
+        use havn_core::UserId;
+        use havn_db::repo::agents::{NewAgent, create as create_agent_row};
+        use havn_db::repo::credential_usage::{NewUsage, record};
+        use havn_db::repo::credentials::{CredentialScope, NewCredential, create as create_cred};
+        let f = team_fixture().await;
+        let db = &f.state.db;
+        let cred = |scope: CredentialScope, scope_id: String| async move {
+            create_cred(
+                db,
+                NewCredential {
+                    scope,
+                    scope_id: &scope_id,
+                    provider: "llm:anthropic",
+                    name: None,
+                    api_key_ciphertext: b"x",
+                    priority: 0,
+                    limits: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("credential")
+            .id
+        };
+        let team_cred = cred(CredentialScope::Team, f.team.to_string()).await;
+        let own_cred = cred(CredentialScope::User, f.member.id.to_string()).await;
+        let agent = |team_id: Option<TeamId>, name: &'static str| async move {
+            create_agent_row(
+                db,
+                NewAgent {
+                    owner_id: f.member.id,
+                    team_id,
+                    name,
+                    config: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("agent")
+            .id
+        };
+        let team_agent = agent(Some(f.team), "team-agent").await;
+        let own_agent = agent(None, "own-agent").await;
+        let spend = |user: UserId, credential, agent_id, tokens: i64| async move {
+            record(
+                db,
+                NewUsage {
+                    credential_id: credential,
+                    user_id: user,
+                    agent_id,
+                    provider: "anthropic",
+                    model: "m",
+                    tokens_in: tokens,
+                    tokens_out: 0,
+                },
+            )
+            .await
+            .expect("usage");
+        };
+        // Counted: team credential, and team agent on a personal credential.
+        spend(f.member.id, team_cred, Some(own_agent), 10).await;
+        spend(f.member.id, own_cred, Some(team_agent), 100).await;
+        // Not counted: a member's own credential on their own agent.
+        spend(f.member.id, own_cred, Some(own_agent), 1000).await;
+        spend(f.member.id, own_cred, None, 10_000).await;
+
+        let read = |user: AuthedUser| {
+            usage(
+                State(f.state.clone()),
+                user,
+                Path(f.team.to_string()),
+                Query(UsageQuery { days: None }),
+            )
+        };
+        let Json(resp) = read(f.admin.clone()).await.expect("admin reads usage");
+        let member = resp
+            .entries
+            .iter()
+            .find(|e| e.user_id == f.member.id.to_string())
+            .expect("member row");
+        assert_eq!(member.tokens_in, 110);
+        assert_eq!(member.call_count, 2);
+        let admin = resp
+            .entries
+            .iter()
+            .find(|e| e.user_id == f.admin.id.to_string())
+            .expect("members without usage are listed");
+        assert_eq!(admin.tokens_in, 0);
+        assert!(
+            !resp
+                .entries
+                .iter()
+                .any(|e| e.user_id == f.outsider.id.to_string()),
+            "{:?}",
+            resp.entries
+        );
+
+        for user in [f.member.clone(), f.outsider.clone()] {
+            let denied = read(user).await;
+            assert!(matches!(denied, Err(ApiError::Forbidden(_))), "{denied:?}");
+        }
     }
 }

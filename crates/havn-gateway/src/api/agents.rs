@@ -2,6 +2,9 @@
 //!
 //! Lifecycle:
 //! - `POST /agents` — create DB row + workspace dir. Status `created`.
+//!   With `team_id`, the agent belongs to that team: the caller must be a
+//!   member whose team role allows another agent (`max_agents`), and the
+//!   agent then runs under that role's policy.
 //! - `POST /agents/{id}/start` — spawn runtime process via the spawner,
 //!   register the handle. Status `running` once the agent connects.
 //! - `POST /agents/{id}/stop` — request graceful shutdown via socket frame,
@@ -12,7 +15,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
-use havn_core::AgentId;
+use havn_core::{AgentId, TeamId};
 use havn_db::repo::agents::{self as repo, Agent, AgentStatus, NewAgent};
 use havn_proto::GatewayToAgent;
 use havn_spawner::AgentSpawnConfig;
@@ -25,6 +28,7 @@ use crate::AppState;
 use crate::api::ApiError;
 use crate::audit;
 use crate::auth::AuthedUser;
+use crate::perm;
 use crate::policy_resolver;
 use crate::workspace;
 
@@ -33,6 +37,8 @@ pub struct CreateAgentRequest {
     pub name: String,
     #[serde(default)]
     pub config: Option<serde_json::Value>,
+    #[serde(default)]
+    pub team_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +57,7 @@ pub struct AgentView {
     pub id: String,
     pub name: String,
     pub status: String,
+    pub team_id: Option<String>,
     pub config: serde_json::Value,
     pub pid: Option<i64>,
     pub created_at: DateTime<Utc>,
@@ -68,6 +75,7 @@ impl AgentView {
             id: a.id.to_string(),
             name: a.name,
             status: a.status.as_str().into(),
+            team_id: a.team_id.map(|t| t.to_string()),
             config: a.config,
             pid: a.pid,
             created_at: a.created_at,
@@ -122,11 +130,29 @@ pub async fn create(
         )));
     }
 
+    let team_id = match req.team_id.as_deref() {
+        None => None,
+        Some(raw) => {
+            let team_id = TeamId::from_str(raw)
+                .map_err(|_| ApiError::BadRequest("invalid team id".into()))?;
+            perm::require_member(&state.db, user.id, team_id).await?;
+            let role_policy = policy_resolver::for_team_member(&state.db, user.id, team_id).await;
+            let in_team = repo::count_for_owner_in_team(&state.db, user.id, team_id).await?;
+            if in_team >= role_policy.max_agents {
+                return Err(ApiError::Forbidden(format!(
+                    "your role in team {team_id} allows {} agents and you already have {in_team} there",
+                    role_policy.max_agents
+                )));
+            }
+            Some(team_id)
+        }
+    };
+
     let agent = repo::create(
         &state.db,
         NewAgent {
             owner_id: user.id,
-            team_id: None,
+            team_id,
             name: req.name.trim(),
             config: req.config.unwrap_or_else(|| serde_json::json!({})),
         },
@@ -144,7 +170,10 @@ pub async fn create(
         user.id,
         agent.id,
         "agent.created",
-        serde_json::json!({"name": agent.name}),
+        serde_json::json!({
+            "name": agent.name,
+            "team_id": agent.team_id.map(|t| t.to_string()),
+        }),
     )
     .await;
     Ok((

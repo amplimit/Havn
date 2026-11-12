@@ -150,9 +150,9 @@ pub async fn create(
     let agent_id = agent.id;
 
     // Spec §6.3 enforcement: `can_schedule_cron` is a per-user
-    // capability; refuse here before INSERT so a denied user can never
-    // get a cron job into the table.
-    let user_policy = crate::policy_resolver::for_user(&state.db, user.id).await;
+    // capability (the owner's team role for a team agent); refuse here
+    // before INSERT so a denied user can never get a cron job into the table.
+    let user_policy = crate::policy_resolver::for_owner(&state.db, &agent).await;
     if !user_policy.permissions.can_schedule_cron {
         return Err(ApiError::Forbidden(
             "this user's policy does not allow scheduling cron jobs (can_schedule_cron=false)"

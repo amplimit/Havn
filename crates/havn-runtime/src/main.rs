@@ -1057,6 +1057,7 @@ async fn handle_cron(tick: CronTick, ctx: Ctx) {
                 }
                 CronResult {
                     job_id: job_id.clone(),
+                    run_id: tick.run_id.clone(),
                     outcome: CronOutcome::Success,
                     output: text,
                     silent,
@@ -1066,6 +1067,7 @@ async fn handle_cron(tick: CronTick, ctx: Ctx) {
                 error!(%job_id, error = %e, "cron tool-use loop failed");
                 CronResult {
                     job_id: job_id.clone(),
+                    run_id: tick.run_id.clone(),
                     outcome: CronOutcome::Error {
                         message: e.to_string(),
                     },

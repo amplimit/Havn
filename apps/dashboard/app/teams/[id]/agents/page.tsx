@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * `/teams/[id]/agents` — every agent associated with this team
+ * `/teams/[id]/agents` — every agent created in this team
  * (spec §10.3 admin view "Team Agents"). Members can view; admins
  * who want to bulk-stop click into individual agents (the lifecycle
  * endpoints already gate on owner_id, so cross-user start/stop from
@@ -72,9 +72,11 @@ export default function TeamAgentsPage({
       <div className="card-elevated px-8 py-12 text-center">
         <p className="display-h3 mb-2">no team agents</p>
         <p style={{ color: "var(--color-body)" }}>
-          Members create agents from the main sidebar; assign one to this
-          team via its detail page (coming with the agent-team-binding
-          editor).
+          Members create team agents from{" "}
+          <Link href={`/agents/new?team=${id}`} className="underline">
+            new agent
+          </Link>{" "}
+          by choosing this team.
         </p>
       </div>
     );
