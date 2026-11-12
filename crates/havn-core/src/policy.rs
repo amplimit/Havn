@@ -174,6 +174,20 @@ impl Default for ResourceLimits {
     }
 }
 
+/// Parent of every agent cgroup, directly below the cgroup v2 root. It has
+/// no unit suffix (`.slice`, `.service`, `.scope`), so systemd never takes
+/// it for one of its units.
+pub const AGENT_CGROUP_PARENT: &str = "havn";
+
+/// Name prefix of the per-agent cgroups inside [`AGENT_CGROUP_PARENT`].
+pub const AGENT_CGROUP_PREFIX: &str = "agent-";
+
+/// An agent's cgroup relative to the cgroup root, as `/proc/<pid>/cgroup`
+/// shows it: `/havn/agent-<id>`.
+pub fn agent_cgroup(agent_id: impl std::fmt::Display) -> String {
+    format!("/{AGENT_CGROUP_PARENT}/{AGENT_CGROUP_PREFIX}{agent_id}")
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BudgetPolicy {
@@ -893,5 +907,13 @@ mod tests {
         assert_eq!(fs.timeout_seconds, 60);
         assert!(fs.enabled);
         assert!(fs.env.is_empty());
+    }
+
+    #[test]
+    fn agent_cgroup_is_outside_any_systemd_unit_name() {
+        assert_eq!(agent_cgroup("abc"), "/havn/agent-abc");
+        for suffix in [".slice", ".service", ".scope"] {
+            assert!(!AGENT_CGROUP_PARENT.ends_with(suffix));
+        }
     }
 }

@@ -100,7 +100,9 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
     namespace)
         grep -q "agent spawner: NamespaceSpawner" "$GATEWAY_LOG" \
             || { tail -50 "$GATEWAY_LOG" >&2; die "gateway did not select NamespaceSpawner"; }
-        CGROUP="/sys/fs/cgroup/havn.slice/agent-$AGENT_ID"
+        CGROUP="/sys/fs/cgroup/havn/agent-$AGENT_ID"
+        [ ! -e "/sys/fs/cgroup/havn.slice/agent-$AGENT_ID" ] \
+            || die "agent cgroup also exists under the old /havn.slice parent"
         for f in memory.max cpu.max pids.max cgroup.procs; do
             log "$f: $(paste -sd' ' "$CGROUP/$f" 2>&1)"
         done
@@ -117,7 +119,7 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
         done)
         [ -n "$RUNTIME_PIDS" ] || die "no havn-runtime process for agent $AGENT_ID"
         for pid in $RUNTIME_PIDS; do
-            [ "$(cat "/proc/$pid/cgroup")" = "0::/havn.slice/agent-$AGENT_ID" ] \
+            [ "$(cat "/proc/$pid/cgroup")" = "0::/havn/agent-$AGENT_ID" ] \
                 || die "havn-runtime (pid $pid) is outside the agent cgroup: $(cat "/proc/$pid/cgroup")"
         done
         for pid in $RUNTIME_PIDS; do

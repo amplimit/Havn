@@ -263,12 +263,14 @@ fn peer_cgroup_is_agents(contents: Option<&str>, agent_id: AgentId) -> bool {
 
 /// Parse `/proc/<pid>/cgroup` (cgroup v2: a single `0::<path>` line, shown
 /// relative to the gateway's cgroup root, the same root the spawner
-/// creates `havn.slice` under) and require exactly the agent's cgroup.
+/// creates `havn` under) and require exactly the agent's cgroup.
 /// Comparing the whole path matters: a cgroup the agent creates below its
-/// own, even one named after another agent, does not match.
+/// own, even one named after another agent, does not match. So does
+/// `/havn.slice/agent-<id>`, where gateways before #66 put agents: those
+/// belong to a gateway that is gone.
 #[cfg(target_os = "linux")]
 fn cgroup_belongs_to_agent(contents: &str, agent_id: AgentId) -> bool {
-    let expected = format!("/{}/agent-{agent_id}", havn_spawner::cgroup::SLICE);
+    let expected = havn_core::agent_cgroup(agent_id);
     contents
         .lines()
         .filter_map(|line| line.strip_prefix("0::"))
@@ -2056,29 +2058,33 @@ mod tests {
     fn cgroup_path_must_name_the_agent() {
         let id = AgentId::new();
         let other = AgentId::new();
-        let own = format!("0::/havn.slice/agent-{id}\n");
+        let own = format!("0::/havn/agent-{id}\n");
         assert!(cgroup_belongs_to_agent(&own, id));
         assert!(!cgroup_belongs_to_agent(
-            &format!("0::/elsewhere/havn.slice/agent-{id}\n"),
+            &format!("0::/elsewhere/havn/agent-{id}\n"),
             id
         ));
         assert!(
-            !cgroup_belongs_to_agent(&format!("0::/havn.slice/agent-{other}/agent-{id}\n"), id),
+            !cgroup_belongs_to_agent(&format!("0::/havn/agent-{other}/agent-{id}\n"), id),
             "a cgroup created inside another agent's cgroup must not match"
         );
         assert!(!cgroup_belongs_to_agent(&own, other));
         assert!(!cgroup_belongs_to_agent(
-            &format!("0::/havn.slice/agent-{id}-x\n"),
+            &format!("0::/havn/agent-{id}-x\n"),
             id
         ));
         assert!(!cgroup_belongs_to_agent(
-            &format!("0::/havn.slice/agent-{id}/nested\n"),
+            &format!("0::/havn/agent-{id}/nested\n"),
             id
         ));
         assert!(!cgroup_belongs_to_agent(
-            &format!("1:name=systemd:/havn.slice/agent-{id}\n"),
+            &format!("1:name=systemd:/havn/agent-{id}\n"),
             id
         ));
+        assert!(
+            !cgroup_belongs_to_agent(&format!("0::/havn.slice/agent-{id}\n"), id),
+            "the cgroup of gateways before #66 must not match"
+        );
         assert!(!cgroup_belongs_to_agent("0::/user.slice\n", id));
         assert!(!cgroup_belongs_to_agent("", id));
     }

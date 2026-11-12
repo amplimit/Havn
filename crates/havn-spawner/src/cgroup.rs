@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! /sys/fs/cgroup/                          ← unified cgroup v2 mount
-//!   havn.slice/                            ← gateway's slice (created on init)
+//!   havn/                                  ← parent of all agents (created on init)
 //!     agent-<uuid>/                        ← per-agent leaf
 //!       memory.max
 //!       cpu.max
@@ -19,21 +19,21 @@
 //! controller takes the cgroup root as a parameter so unit tests can
 //! substitute a tempdir; production binds
 //! `/sys/fs/cgroup` via [`CgroupController::system`].
+//!
+//! Gateways before #66 used `havn.slice` as the parent, which is also the
+//! cgroup of a systemd slice unit of that name. [`RETIRED_PARENT`] is kept
+//! only so start-up can remove what such a gateway left behind.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use havn_core::ResourceLimits;
+use havn_core::{AGENT_CGROUP_PARENT, AGENT_CGROUP_PREFIX, ResourceLimits};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-/// Default systemd-friendly slice name. We don't manage the slice lifecycle —
-/// systemd or the operator does that — but we create the directory if it's
-/// missing and writable.
-pub const SLICE: &str = "havn.slice";
-
-const AGENT_PREFIX: &str = "agent-";
+/// Parent cgroup of agents under gateways before #66.
+pub const RETIRED_PARENT: &str = "havn.slice";
 
 const REQUIRED_CONTROLLERS: &[&str] = &["cpu", "memory", "pids"];
 
@@ -48,8 +48,8 @@ pub enum CgroupError {
     RootMissing(PathBuf),
     #[error("cgroup root {root} is not cgroup v2 (missing cgroup.controllers)")]
     NotV2 { root: PathBuf },
-    #[error("cannot create slice {0}")]
-    SliceCreate(PathBuf),
+    #[error("cannot create agent cgroup parent {0}")]
+    ParentCreate(PathBuf),
     #[error("cannot write {file}: {source}")]
     WriteFailed {
         file: PathBuf,
@@ -91,8 +91,28 @@ pub struct AgentResourceStats {
 pub struct CgroupController {
     /// cgroup v2 mount root, typically `/sys/fs/cgroup`.
     root: PathBuf,
-    /// Resolved slice path: `<root>/havn.slice`.
-    slice: PathBuf,
+    /// Parent of the agent cgroups: `<root>/havn`.
+    parent: PathBuf,
+}
+
+/// The state systemd reports for a `havn.slice` unit. While the unit is
+/// active systemd owns `/havn.slice`, and the gateway must leave it alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SliceUnit {
+    Inactive,
+    Active,
+    Unknown,
+}
+
+impl SliceUnit {
+    /// Map systemd's `ActiveState` property.
+    pub fn from_active_state(state: &str) -> Self {
+        match state.trim() {
+            "inactive" | "failed" => Self::Inactive,
+            "active" | "activating" | "deactivating" | "reloading" | "refreshing" => Self::Active,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 impl CgroupController {
@@ -114,24 +134,24 @@ impl CgroupController {
         if !root.join("cgroup.controllers").exists() {
             return Err(CgroupError::NotV2 { root });
         }
-        let slice = root.join(SLICE);
-        if !slice.exists()
-            && let Err(e) = fs::create_dir(&slice)
+        let parent = root.join(AGENT_CGROUP_PARENT);
+        if !parent.exists()
+            && let Err(e) = fs::create_dir(&parent)
         {
             warn!(
-                slice = %slice.display(),
+                parent = %parent.display(),
                 error = %e,
-                "cannot create havn.slice — run the gateway as root (contrib/systemd/havn.service)"
+                "cannot create the agent cgroup parent — run the gateway as root (contrib/systemd/havn.service)"
             );
-            return Err(CgroupError::SliceCreate(slice));
+            return Err(CgroupError::ParentCreate(parent));
         }
-        delegate_controllers(&root, &slice)?;
-        Ok(Self { root, slice })
+        delegate_controllers(&root, &parent)?;
+        Ok(Self { root, parent })
     }
 
-    /// Slice path that the controller is operating under. Useful for tests.
-    pub fn slice(&self) -> &Path {
-        &self.slice
+    /// Parent cgroup of every agent cgroup.
+    pub fn parent(&self) -> &Path {
+        &self.parent
     }
 
     /// Returns the cgroup root path supplied at construction time.
@@ -164,20 +184,77 @@ impl CgroupController {
     }
 
     pub fn agent_path(&self, agent_id: &str) -> PathBuf {
-        self.slice.join(format!("{AGENT_PREFIX}{agent_id}"))
+        self.parent.join(format!("{AGENT_CGROUP_PREFIX}{agent_id}"))
     }
 
-    /// Every per-agent cgroup currently under the slice.
+    /// Every per-agent cgroup currently under the parent.
     pub fn agent_cgroups(&self) -> Vec<PathBuf> {
-        let Ok(entries) = fs::read_dir(&self.slice) else {
-            return Vec::new();
+        agent_dirs(&self.parent)
+    }
+
+    /// `<root>/havn.slice`, if a gateway before #66 left it.
+    pub fn retired_parent(&self) -> Option<PathBuf> {
+        Some(self.root.join(RETIRED_PARENT)).filter(|p| p.is_dir())
+    }
+
+    /// Agent cgroups a gateway before #66 left under `<root>/havn.slice`.
+    pub fn retired_agent_cgroups(&self) -> Vec<PathBuf> {
+        agent_dirs(&self.root.join(RETIRED_PARENT))
+    }
+
+    /// Remove `<root>/havn.slice` once its agent cgroups are gone. It is
+    /// kept while systemd has, or may have, an active unit for it, and while
+    /// anything else lives in it. Returns whether it was removed.
+    pub fn remove_retired_parent(&self, unit: SliceUnit) -> bool {
+        let Some(parent) = self.retired_parent() else {
+            return false;
         };
-        entries
-            .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().starts_with(AGENT_PREFIX))
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect()
+        match unit {
+            SliceUnit::Inactive => {}
+            SliceUnit::Active => {
+                info!(
+                    parent = %parent.display(),
+                    "keeping the agent cgroup parent of older gateways: systemd manages it as havn.slice"
+                );
+                return false;
+            }
+            SliceUnit::Unknown => {
+                warn!(
+                    parent = %parent.display(),
+                    "keeping the agent cgroup parent of older gateways: cannot tell whether \
+                     systemd manages it as havn.slice; remove it by hand once it is empty"
+                );
+                return false;
+            }
+        }
+        let children = fs::read_dir(&parent).map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.path().is_dir())
+                .count()
+        });
+        if children > 0 {
+            warn!(
+                parent = %parent.display(),
+                children,
+                "keeping the agent cgroup parent of older gateways: it still holds other cgroups"
+            );
+            return false;
+        }
+        match self.cleanup(&parent) {
+            Ok(()) => {
+                info!(parent = %parent.display(), "removed the agent cgroup parent of older gateways");
+                true
+            }
+            Err(e) => {
+                warn!(
+                    parent = %parent.display(),
+                    error = %e,
+                    "cannot remove the agent cgroup parent of older gateways"
+                );
+                false
+            }
+        }
     }
 
     /// True while any process is left in the cgroup or below it. A cgroup
@@ -229,8 +306,9 @@ impl CgroupController {
 }
 
 /// Files we touch in [`CgroupController::create_agent`] / the spawner's pre-exec join /
-/// [`CgroupController::kill_all`]. Listed here so [`CgroupController::cleanup`] can
-/// pre-unlink them in test environments where they're real on-disk files.
+/// [`CgroupController::kill_all`] / controller delegation. Listed here so
+/// [`CgroupController::cleanup`] can pre-unlink them in test environments
+/// where they're real on-disk files.
 const CONTROL_FILES: &[&str] = &[
     "memory.max",
     "cpu.max",
@@ -238,7 +316,24 @@ const CONTROL_FILES: &[&str] = &[
     "cgroup.procs",
     "cgroup.kill",
     "cgroup.events",
+    "cgroup.subtree_control",
 ];
+
+fn agent_dirs(parent: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(AGENT_CGROUP_PREFIX)
+        })
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect()
+}
 
 fn format_memory_max(memory_mb: u64) -> String {
     if memory_mb == 0 {
@@ -270,7 +365,7 @@ fn format_pids_max(pids_max: u32) -> String {
     }
 }
 
-fn delegate_controllers(root: &Path, slice: &Path) -> Result<(), CgroupError> {
+fn delegate_controllers(root: &Path, parent: &Path) -> Result<(), CgroupError> {
     let root_available = root.join("cgroup.controllers");
     let unavailable = absent_from(&root_available, REQUIRED_CONTROLLERS)?;
     if !unavailable.is_empty() {
@@ -286,11 +381,11 @@ fn delegate_controllers(root: &Path, slice: &Path) -> Result<(), CgroupError> {
         info!(
             root = %root.display(),
             controllers = %missing.join(" "),
-            "enabled cgroup controllers on the cgroup root for havn.slice; this applies \
-             to every top-level cgroup on the host"
+            "enabled cgroup controllers on the cgroup root for the agent cgroups; this \
+             applies to every top-level cgroup on the host"
         );
     }
-    enable_controllers(&slice.join("cgroup.subtree_control"), REQUIRED_CONTROLLERS)
+    enable_controllers(&parent.join("cgroup.subtree_control"), REQUIRED_CONTROLLERS)
 }
 
 fn absent_from<'a>(list: &Path, controllers: &[&'a str]) -> Result<Vec<&'a str>, CgroupError> {
@@ -377,6 +472,25 @@ pub(crate) fn fake_root(available: &str, enabled: &str) -> PathBuf {
     root
 }
 
+/// `<root>/havn.slice` as a gateway before #66 left it, with one agent
+/// cgroup per id.
+#[cfg(test)]
+pub(crate) fn retired_parent_with(root: &Path, agents: &[&str]) -> Vec<PathBuf> {
+    let parent = root.join(RETIRED_PARENT);
+    fs::create_dir_all(&parent).expect("mkdir havn.slice");
+    fs::write(parent.join("cgroup.subtree_control"), "+cpu +memory +pids")
+        .expect("write subtree_control");
+    agents
+        .iter()
+        .map(|id| {
+            let agent = parent.join(format!("{AGENT_CGROUP_PREFIX}{id}"));
+            fs::create_dir(&agent).expect("mkdir agent");
+            fs::write(agent.join("memory.max"), "536870912").expect("write memory.max");
+            agent
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -394,55 +508,57 @@ mod tests {
     }
 
     #[test]
-    fn with_root_enables_required_controllers_on_slice() {
+    fn with_root_enables_required_controllers_on_parent() {
         let root = fake_v2_root();
         let ctl = CgroupController::with_root(root.clone()).expect("ctl");
         assert_eq!(
-            read(&ctl.slice().join("cgroup.subtree_control")),
+            read(&ctl.parent().join("cgroup.subtree_control")),
             "+cpu +memory +pids"
         );
         assert_eq!(read(&root.join("cgroup.subtree_control")), ALL_CONTROLLERS);
     }
 
     #[test]
-    fn with_root_enables_missing_controllers_on_root_then_slice() {
+    fn with_root_enables_missing_controllers_on_root_then_parent() {
         let root = fake_root(ALL_CONTROLLERS, "cpu io");
         let ctl = CgroupController::with_root(root.clone()).expect("ctl");
         assert_eq!(read(&root.join("cgroup.subtree_control")), "+memory +pids");
         assert_eq!(
-            read(&ctl.slice().join("cgroup.subtree_control")),
+            read(&ctl.parent().join("cgroup.subtree_control")),
             "+cpu +memory +pids"
         );
     }
 
     #[test]
-    fn with_root_writes_root_before_slice() {
+    fn with_root_writes_root_before_parent() {
         let root = fake_root(ALL_CONTROLLERS, "cpu io");
-        let slice_control = root.join(SLICE).join("cgroup.subtree_control");
-        std::fs::create_dir_all(&slice_control).expect("mkdir");
-        let err = CgroupController::with_root(root.clone()).expect_err("slice write must fail");
+        let parent_control = root
+            .join(AGENT_CGROUP_PARENT)
+            .join("cgroup.subtree_control");
+        std::fs::create_dir_all(&parent_control).expect("mkdir");
+        let err = CgroupController::with_root(root.clone()).expect_err("parent write must fail");
         let failed = match err {
             CgroupError::ControllerDelegation { file, .. } => file,
             other => panic!("expected ControllerDelegation, got {other:?}"),
         };
-        assert_eq!(failed, slice_control);
+        assert_eq!(failed, parent_control);
         assert_eq!(read(&root.join("cgroup.subtree_control")), "+memory +pids");
     }
 
     #[test]
-    fn with_root_is_idempotent_for_existing_slice() {
+    fn with_root_is_idempotent_for_existing_parent() {
         let root = fake_v2_root();
         let first = CgroupController::with_root(root.clone()).expect("first");
         first
             .create_agent("live", &ResourceLimits::default())
             .expect("agent");
         let second = CgroupController::with_root(root).expect("second");
-        assert_eq!(first.slice(), second.slice());
+        assert_eq!(first.parent(), second.parent());
         assert_eq!(
-            read(&second.slice().join("cgroup.subtree_control")),
+            read(&second.parent().join("cgroup.subtree_control")),
             "+cpu +memory +pids"
         );
-        assert!(second.slice().join("agent-live").is_dir());
+        assert!(second.parent().join("agent-live").is_dir());
     }
 
     #[test]
@@ -458,9 +574,11 @@ mod tests {
     }
 
     #[test]
-    fn with_root_rejects_slice_without_writable_subtree_control() {
+    fn with_root_rejects_parent_without_writable_subtree_control() {
         let root = fake_v2_root();
-        let control = root.join(SLICE).join("cgroup.subtree_control");
+        let control = root
+            .join(AGENT_CGROUP_PARENT)
+            .join("cgroup.subtree_control");
         std::fs::create_dir_all(&control).expect("mkdir");
         let err = CgroupController::with_root(root).expect_err("must fail");
         assert!(
@@ -500,13 +618,13 @@ mod tests {
     }
 
     #[test]
-    fn with_root_creates_slice_when_missing() {
+    fn with_root_creates_parent_when_missing() {
         let root = fake_v2_root();
         let ctl = CgroupController::with_root(root.clone()).expect("ctl");
-        assert!(ctl.slice().exists());
+        assert!(ctl.parent().exists());
         assert_eq!(
-            ctl.slice().file_name().and_then(|s| s.to_str()),
-            Some(SLICE)
+            ctl.parent().file_name().and_then(|s| s.to_str()),
+            Some(AGENT_CGROUP_PARENT)
         );
     }
 
@@ -645,10 +763,84 @@ mod tests {
         let ctl = CgroupController::with_root(root).expect("ctl");
         let a = ctl.create_agent("a", &ResourceLimits::default()).unwrap();
         let b = ctl.create_agent("b", &ResourceLimits::default()).unwrap();
-        std::fs::create_dir(ctl.slice().join("other")).unwrap();
+        std::fs::create_dir(ctl.parent().join("other")).unwrap();
         let mut found = ctl.agent_cgroups();
         found.sort();
         assert_eq!(found, vec![a, b]);
+    }
+
+    #[test]
+    fn agent_path_matches_the_peer_cgroup() {
+        let root = fake_v2_root();
+        let ctl = CgroupController::with_root(root.clone()).expect("ctl");
+        let relative = ctl
+            .agent_path("abc")
+            .strip_prefix(&root)
+            .expect("under root")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(format!("/{relative}"), havn_core::agent_cgroup("abc"));
+        assert_eq!(ctl.parent(), root.join("havn"));
+    }
+
+    #[test]
+    fn retired_agent_cgroups_are_found_apart_from_current_ones() {
+        let root = fake_v2_root();
+        let ctl = CgroupController::with_root(root.clone()).expect("ctl");
+        assert!(ctl.retired_parent().is_none());
+        assert!(ctl.retired_agent_cgroups().is_empty());
+        let current = ctl.create_agent("now", &ResourceLimits::default()).unwrap();
+        let mut old = retired_parent_with(&root, &["a", "b"]);
+        let mut found = ctl.retired_agent_cgroups();
+        found.sort();
+        old.sort();
+        assert_eq!(found, old);
+        assert_eq!(ctl.agent_cgroups(), vec![current]);
+        assert_eq!(ctl.retired_parent(), Some(root.join("havn.slice")));
+    }
+
+    #[test]
+    fn retired_parent_is_removed_only_when_empty_and_not_a_systemd_unit() {
+        let root = fake_v2_root();
+        let ctl = CgroupController::with_root(root.clone()).expect("ctl");
+        let parent = root.join(RETIRED_PARENT);
+        let agents = retired_parent_with(&root, &["a"]);
+
+        assert!(
+            !ctl.remove_retired_parent(SliceUnit::Inactive),
+            "agent cgroup left"
+        );
+        for agent in &agents {
+            ctl.cleanup(agent).unwrap();
+        }
+        assert!(!ctl.remove_retired_parent(SliceUnit::Active));
+        assert!(!ctl.remove_retired_parent(SliceUnit::Unknown));
+        assert!(parent.is_dir());
+        assert!(ctl.remove_retired_parent(SliceUnit::Inactive));
+        assert!(!parent.exists());
+        assert!(
+            !ctl.remove_retired_parent(SliceUnit::Inactive),
+            "already gone"
+        );
+    }
+
+    #[test]
+    fn slice_unit_follows_systemd_active_state() {
+        assert_eq!(
+            SliceUnit::from_active_state("inactive\n"),
+            SliceUnit::Inactive
+        );
+        assert_eq!(SliceUnit::from_active_state("failed"), SliceUnit::Inactive);
+        assert_eq!(SliceUnit::from_active_state("active"), SliceUnit::Active);
+        assert_eq!(
+            SliceUnit::from_active_state("deactivating"),
+            SliceUnit::Active
+        );
+        assert_eq!(SliceUnit::from_active_state(""), SliceUnit::Unknown);
+        assert_eq!(
+            SliceUnit::from_active_state("maintenance"),
+            SliceUnit::Unknown
+        );
     }
 
     #[test]

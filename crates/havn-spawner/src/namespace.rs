@@ -3,12 +3,13 @@
 //! Current isolation layers:
 //!
 //! - **cgroup v2** — per-agent cgroup under
-//!   `/sys/fs/cgroup/havn.slice/agent-<id>` with the policy's memory / CPU /
+//!   `/sys/fs/cgroup/havn/agent-<id>` with the policy's memory / CPU /
 //!   pids limits. `stop()` falls back to `cgroup.kill` for atomic
 //!   subtree termination (fork-bomb safe). Every spawn starts from an
 //!   empty cgroup: one left over from an earlier instance is killed and
 //!   removed first, and [`NamespaceSpawner::reap_orphans`] clears those a
-//!   previous gateway run left behind.
+//!   previous gateway run left behind, including the ones gateways before
+//!   #66 put under `/sys/fs/cgroup/havn.slice`.
 //! - **User + mount + network + PID namespaces** — `unshare(CLONE_NEWUSER
 //!   | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWPID)` in `pre_exec`, host UID
 //!   mapped to agent's in-namespace UID 0, mount propagation marked
@@ -28,7 +29,7 @@
 //!   ([`crate::ns_setup::pivot_root_into_minimal_rootfs`]).
 //!
 //! Compared to [`crate::subprocess::SubprocessSpawner`], this spawner
-//! requires root (it creates `havn.slice` at the cgroup root and moves
+//! requires root (it creates `havn` at the cgroup root and moves
 //! agents into it). [`NamespaceSpawner::try_init`]
 //! probes for that at startup and returns an error so the caller can fall
 //! back to the unprivileged subprocess spawner with a clear log.
@@ -47,7 +48,7 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::cgroup::{CgroupController, CgroupError};
+use crate::cgroup::{CgroupController, CgroupError, RETIRED_PARENT, SliceUnit};
 use crate::ns_setup;
 use crate::{
     AgentExit, AgentHandle, AgentSpawnConfig, AgentSpawner, ChildWatch, ResourceStats, Result,
@@ -59,6 +60,10 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// How long `cgroup.kill` may take to empty a cgroup before giving up.
 const CGROUP_DRAIN: Duration = Duration::from_secs(2);
 
+const SYSTEMD_RUNTIME: &str = "/run/systemd";
+
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug)]
 pub struct NamespaceSpawner {
     cgroup: CgroupController,
@@ -68,6 +73,9 @@ pub struct NamespaceSpawner {
     /// then agents get no network interface at all, even if their policy
     /// allows egress, rather than an unisolated one.
     network_ready: bool,
+    /// systemd's runtime directory, `/run/systemd`; tests point it
+    /// elsewhere so they never ask the host's systemd.
+    systemd_runtime: PathBuf,
 }
 
 #[derive(Debug)]
@@ -77,7 +85,7 @@ struct AgentState {
 }
 
 impl NamespaceSpawner {
-    /// Probe the host for cgroup v2 + havn.slice writability. Returns an
+    /// Probe the host for cgroup v2 and a writable agent cgroup parent. Returns an
     /// error if either is missing — the gateway should fall back to
     /// [`crate::subprocess::SubprocessSpawner`] with a warn log.
     pub fn try_init() -> Result<Self> {
@@ -91,7 +99,7 @@ impl NamespaceSpawner {
         let cgroup = CgroupController::system()
             .map_err(|e| SpawnerError::IsolationUnavailable(e.to_string()))?;
         info!(
-            slice = %cgroup.slice().display(),
+            parent = %cgroup.parent().display(),
             pool_cidr = %pool.cidr(),
             "NamespaceSpawner cgroup v2 ready"
         );
@@ -100,6 +108,7 @@ impl NamespaceSpawner {
             state: Arc::new(Mutex::new(HashMap::new())),
             pool,
             network_ready: false,
+            systemd_runtime: PathBuf::from(SYSTEMD_RUNTIME),
         })
     }
 
@@ -112,6 +121,49 @@ impl NamespaceSpawner {
             state: Arc::new(Mutex::new(HashMap::new())),
             pool: crate::network::AgentSubnetPool::default(),
             network_ready: false,
+            systemd_runtime: PathBuf::from(SYSTEMD_RUNTIME),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_systemd_runtime(mut self, dir: PathBuf) -> Self {
+        self.systemd_runtime = dir;
+        self
+    }
+
+    /// systemd's view of a `havn.slice` unit. Without systemd as init
+    /// (no `<runtime>/system`) nothing can own `/havn.slice`.
+    async fn slice_unit(&self) -> SliceUnit {
+        if !self.systemd_runtime.join("system").exists() {
+            return SliceUnit::Inactive;
+        }
+        let systemctl = match crate::network::resolve_tool("systemctl") {
+            Ok(path) => path,
+            Err(e) => {
+                warn!(error = %e, "cannot ask systemd about havn.slice");
+                return SliceUnit::Unknown;
+            }
+        };
+        let query = Command::new(systemctl)
+            .args(["show", "--property=ActiveState", "--value", RETIRED_PARENT])
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(SYSTEMCTL_TIMEOUT, query).await {
+            Ok(Ok(out)) if out.status.success() => {
+                SliceUnit::from_active_state(&String::from_utf8_lossy(&out.stdout))
+            }
+            Ok(Ok(out)) => {
+                warn!(status = %out.status, "systemctl show havn.slice failed");
+                SliceUnit::Unknown
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "cannot run systemctl");
+                SliceUnit::Unknown
+            }
+            Err(_) => {
+                warn!("systemctl show havn.slice timed out");
+                SliceUnit::Unknown
+            }
         }
     }
 
@@ -529,10 +581,15 @@ impl AgentSpawner for NamespaceSpawner {
             .map(|s| s.cgroup_path.clone())
             .collect();
         let mut reaped = 0;
-        for cgroup in self.cgroup.agent_cgroups() {
-            if tracked.contains(&cgroup) {
-                continue;
-            }
+        // Agents of a gateway before #66 belong to a gateway that is gone;
+        // the ones still meant to run are restarted under the current parent.
+        let retired = self.cgroup.retired_agent_cgroups();
+        let current = self
+            .cgroup
+            .agent_cgroups()
+            .into_iter()
+            .filter(|c| !tracked.contains(c));
+        for cgroup in retired.into_iter().chain(current) {
             let populated = self.cgroup.is_populated(&cgroup);
             match self.clear_cgroup(&cgroup).await {
                 Ok(()) => {
@@ -545,6 +602,10 @@ impl AgentSpawner for NamespaceSpawner {
                     "agent cgroup left by an earlier run cannot be removed"
                 ),
             }
+        }
+        if self.cgroup.retired_parent().is_some() {
+            let unit = self.slice_unit().await;
+            self.cgroup.remove_retired_parent(unit);
         }
         Ok(reaped)
     }
@@ -578,7 +639,7 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
-    use crate::cgroup::{ALL_CONTROLLERS, fake_root};
+    use crate::cgroup::{ALL_CONTROLLERS, fake_root, retired_parent_with};
     use std::path::PathBuf;
 
     fn fake_cgroup_root() -> PathBuf {
@@ -620,8 +681,8 @@ mod tests {
         assert!(matches!(err, SpawnerError::Spawn(_)), "{err:?}");
 
         // No `agent-*` directories should be left behind.
-        let slice = root.join("havn.slice");
-        let mut entries = std::fs::read_dir(&slice).expect("readdir");
+        let parent = root.join(havn_core::AGENT_CGROUP_PARENT);
+        let mut entries = std::fs::read_dir(&parent).expect("readdir");
         let leftover_count = entries
             .by_ref()
             .filter(|e| e.as_ref().map(|x| x.path().is_dir()).unwrap_or(false))
@@ -679,5 +740,45 @@ mod tests {
         assert_eq!(spawner.reap_orphans().await.expect("reap"), 2);
         assert!(!a.exists() && !b.exists());
         assert_eq!(spawner.reap_orphans().await.expect("reap"), 0);
+    }
+
+    fn without_systemd() -> PathBuf {
+        std::env::temp_dir().join(format!("havn-no-systemd-{}", uuid::Uuid::now_v7()))
+    }
+
+    #[tokio::test]
+    async fn reap_orphans_clears_agents_an_older_gateway_left_in_havn_slice() {
+        let root = fake_cgroup_root();
+        let ctl = CgroupController::with_root(root.clone()).expect("ctl");
+        let current = ctl
+            .create_agent("now", &Policy::default().resource_limits)
+            .expect("current");
+        let retired = retired_parent_with(&root, &["x", "y"]);
+        let spawner =
+            NamespaceSpawner::with_controller(ctl.clone()).with_systemd_runtime(without_systemd());
+
+        assert_eq!(spawner.reap_orphans().await.expect("reap"), 3);
+        for agent in &retired {
+            assert!(!agent.exists(), "{}", agent.display());
+        }
+        assert!(!current.exists());
+        assert!(!root.join(RETIRED_PARENT).exists());
+        assert!(ctl.parent().is_dir(), "the current parent stays");
+        assert_eq!(spawner.reap_orphans().await.expect("reap"), 0);
+    }
+
+    #[tokio::test]
+    async fn reap_orphans_keeps_havn_slice_holding_other_cgroups() {
+        let root = fake_cgroup_root();
+        let ctl = CgroupController::with_root(root.clone()).expect("ctl");
+        let retired = retired_parent_with(&root, &["x"]);
+        let other = root.join(RETIRED_PARENT).join("unrelated.service");
+        std::fs::create_dir(&other).expect("other");
+        let spawner =
+            NamespaceSpawner::with_controller(ctl).with_systemd_runtime(without_systemd());
+
+        assert_eq!(spawner.reap_orphans().await.expect("reap"), 1);
+        assert!(!retired[0].exists());
+        assert!(other.is_dir());
     }
 }
