@@ -107,7 +107,8 @@ The dashboard is not part of the release binaries. Run it on the gateway
 host with Node.js 22+, from your source checkout or a fresh clone:
 
 ```bash
-# Clone the tag of the release you installed (skip if you built from source):
+# Clone the tag matching the release you installed, e.g. v0.1.3
+# (`havn --version` shows it); skip if you built from source:
 git clone --branch v0.1.3 https://github.com/amplimit/havn
 cd havn/apps/dashboard
 npm install

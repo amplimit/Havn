@@ -136,7 +136,11 @@ async function fetchIdentityHeader() {
     signal: AbortSignal.timeout(5_000),
   });
   // Gateways up to v0.1.2 have no /auth/info and only ever read X-User-ID.
-  if (res.status === 404) return "x-user-id";
+  // With a different expected header a 404 is an error, not that gateway.
+  if (res.status === 404 && (EXPECTED_IDENTITY_HEADER ?? "x-user-id") === "x-user-id") {
+    await res.body?.cancel();
+    return "x-user-id";
+  }
   if (!res.ok) throw new Error(`GET /auth/info returned ${res.status}`);
   const body = await res.json();
   const name = typeof body?.identity_header === "string" ? body.identity_header.toLowerCase() : "";
