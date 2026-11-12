@@ -11,6 +11,7 @@
 
 mod agent;
 mod api;
+mod channel_access;
 mod credential;
 mod doctor;
 mod gateway;
@@ -97,6 +98,60 @@ enum Command {
     Role {
         #[command(subcommand)]
         action: RoleAction,
+    },
+    /// One-time invite codes that admit a sender to a channel account's
+    /// DMs (`dm_policy = "allowlist"`). Same direct-DB approach as `user`.
+    Invite {
+        #[command(subcommand)]
+        action: InviteAction,
+    },
+    /// Senders admitted to channel accounts, by config `allow_from` or invite.
+    Access {
+        #[command(subcommand)]
+        action: AccessAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum InviteAction {
+    /// Create an invite and print its code once.
+    Create {
+        /// Channel id, as in `[[channels.<channel>.accounts]]` (e.g. `telegram`).
+        #[arg(long)]
+        channel: String,
+        /// Account id within that channel.
+        #[arg(long)]
+        account: String,
+        /// Lifetime of the unused code: a number with s, m, h or d (max 30d).
+        #[arg(long, default_value = "24h", value_parser = channel_access::parse_ttl)]
+        expires: chrono::Duration,
+    },
+    /// List invites with their status. Codes are never shown again.
+    List,
+    /// Revoke an unused invite.
+    Revoke {
+        /// Invite id (UUID) from `invite list`.
+        id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AccessAction {
+    /// List allowed senders from config and from redeemed invites.
+    List {
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Remove a sender admitted by invite. Applies to their next message.
+    Revoke {
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        account: String,
+        /// Platform-prefixed sender id, as shown by `access list`.
+        sender: String,
     },
 }
 
@@ -322,6 +377,33 @@ fn main() -> anyhow::Result<()> {
         Command::User { action } => async_runtime()?.block_on(run_user(action)),
         Command::Team { action } => async_runtime()?.block_on(run_team(action)),
         Command::Role { action } => async_runtime()?.block_on(run_role(action)),
+        Command::Invite { action } => async_runtime()?.block_on(run_invite(action)),
+        Command::Access { action } => async_runtime()?.block_on(run_access(action)),
+    }
+}
+
+async fn run_invite(action: InviteAction) -> anyhow::Result<()> {
+    match action {
+        InviteAction::Create {
+            channel,
+            account,
+            expires,
+        } => channel_access::invite_create(&channel, &account, expires).await,
+        InviteAction::List => channel_access::invite_list().await,
+        InviteAction::Revoke { id } => channel_access::invite_revoke(&id).await,
+    }
+}
+
+async fn run_access(action: AccessAction) -> anyhow::Result<()> {
+    match action {
+        AccessAction::List { channel, account } => {
+            channel_access::access_list(channel.as_deref(), account.as_deref()).await
+        }
+        AccessAction::Revoke {
+            channel,
+            account,
+            sender,
+        } => channel_access::access_revoke(&channel, &account, &sender).await,
     }
 }
 
@@ -407,5 +489,73 @@ async fn run_credential(action: CredentialAction) -> anyhow::Result<()> {
             priority,
         } => credential::add(&provider, &api_key, priority, name.as_deref()).await,
         CredentialAction::Delete { credential_id } => credential::delete(&credential_id).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use clap::CommandFactory as _;
+
+    #[test]
+    fn cli_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn invite_create_defaults_to_a_day() {
+        let cli = Cli::try_parse_from([
+            "havn",
+            "invite",
+            "create",
+            "--channel",
+            "telegram",
+            "--account",
+            "bot",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Invite {
+                action: InviteAction::Create { expires, .. },
+            } => assert_eq!(expires, chrono::Duration::hours(24)),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "havn",
+                "invite",
+                "create",
+                "--channel",
+                "telegram",
+                "--account",
+                "bot",
+                "--expires",
+                "1w",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn access_revoke_takes_the_sender() {
+        let cli = Cli::try_parse_from([
+            "havn",
+            "access",
+            "revoke",
+            "--channel",
+            "telegram",
+            "--account",
+            "bot",
+            "tg:1",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::Access {
+                action: AccessAction::Revoke { ref sender, .. },
+            } if sender == "tg:1"
+        ));
     }
 }

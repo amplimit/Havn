@@ -340,7 +340,33 @@ Havn ships a stable HTTP + WebSocket protocol at `/api/v1/channel` for external 
 | Slack | — | Planned |
 | Discord | — | Planned |
 
-An agent can only send through the channel accounts that `[[bindings]]` binds to it. With an account's `dm_policy = "allowlist"` (the default) it can only message senders in `allow_from`; with `dm_policy = "open"` it can message anyone the bot can reach on that platform, so use `open` only for bots meant to be public.
+An agent can only send through the channel accounts that `[[bindings]]` binds to it. With an account's `dm_policy = "allowlist"` (the default) it can only message senders in `allow_from` or admitted with an invite code (below); with `dm_policy = "open"` it can message anyone the bot can reach on that platform, so use `open` only for bots meant to be public.
+
+### Invite codes
+
+Instead of adding every team member to `allow_from` and restarting the gateway, an operator can hand out one-time invite codes for an `allowlist` account:
+
+```sh
+havn invite create --channel telegram --account acme-bot           # expires in 24h
+havn invite create --channel telegram --account acme-bot --expires 2h
+```
+
+The command prints a code such as `7K3M-QX9P-2HWD-RT4B` once. Send it to the person over a channel you trust (the way you hand out the code is what vouches for them). They message the code to the bot in a private chat; case, dashes and spaces don't matter. The gateway then adds their sender id to the account's allowlist, marks the code used, records a `channel_access.granted` audit entry and replies with a short welcome. The code itself is not passed to the agent. Their later messages reach the agent like those of anyone in `allow_from`.
+
+- A code works once, only for the channel and account it was created for, and expires after `--expires` (default 24h, at most 30d). havn stores only its SHA-256 hash.
+- A wrong, used, expired or revoked code gets the same reply as any other message from an unknown sender, so a sender can't tell whether a code exists. Each sender gets 5 attempts per account every 15 minutes, and failed attempts are logged.
+- On `dm_policy = "open"` accounts everyone is already admitted, so codes are passed to the agent as ordinary messages.
+
+Manage invites and admitted senders with the same direct-database commands as `havn user` (no gateway restart needed):
+
+```sh
+havn invite list                                       # status of every invite; codes are never shown again
+havn invite revoke <invite-id>                         # an unused invite
+havn access list [--channel telegram] [--account acme-bot]   # allow_from entries and invited senders
+havn access revoke --channel telegram --account acme-bot tg:123456789
+```
+
+`access revoke` applies to the sender's next message, and the agent can no longer message them either. Entries in `allow_from` can only be removed from the config file.
 
 ## Capability Packs
 

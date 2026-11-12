@@ -70,7 +70,7 @@ pub struct AgentSocketCtx {
     /// `[[bindings]]` and `[[channels]]` startup snapshots (taken from the
     /// same config as `AppState`'s). Outbound channel messages are only delivered through
     /// accounts bound to the sending agent, to recipients its account's
-    /// `dm_policy` allows.
+    /// `dm_policy` allows (TOML `allow_from` or the invite allowlist in `db`).
     pub bindings: Arc<Vec<crate::config::ChannelBindingConfig>>,
     pub channels: Arc<std::collections::BTreeMap<String, crate::config::ChannelEntry>>,
     pub cron_scheduler: CronScheduler,
@@ -671,7 +671,8 @@ where
                 } else if let Some((channel, account_id, sender_id)) =
                     crate::channel_id_codec::decode(&msg.channel_id)
                 {
-                    if let Err(refusal) = crate::channel_router::outbound_permitted(
+                    use crate::channel_router::OutboundRefusal;
+                    let refusal = match crate::channel_router::outbound_permitted(
                         &ctx.bindings,
                         &ctx.channels,
                         agent_id,
@@ -679,6 +680,25 @@ where
                         account_id,
                         sender_id,
                     ) {
+                        Ok(()) => None,
+                        // Senders admitted by invite code live in the DB.
+                        Err(OutboundRefusal::RecipientNotAllowed) => {
+                            match havn_db::repo::channel_access::is_allowed(
+                                &ctx.db, channel, account_id, sender_id,
+                            )
+                            .await
+                            {
+                                Ok(true) => None,
+                                Ok(false) => Some(OutboundRefusal::RecipientNotAllowed),
+                                Err(e) => {
+                                    warn!(%agent_id, error = %e, "channel allowlist lookup failed");
+                                    Some(OutboundRefusal::RecipientNotAllowed)
+                                }
+                            }
+                        }
+                        Err(refusal) => Some(refusal),
+                    };
+                    if let Some(refusal) = refusal {
                         warn!(
                             %agent_id,
                             channel,
@@ -2163,5 +2183,92 @@ mod tests {
             matches!(reply, Some(GatewayToAgent::Welcome { .. })),
             "{reply:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn outbound_reaches_invited_recipients_until_revoked() {
+        use havn_db::repo::channel_access;
+        use havn_proto::channel::ChannelFrame;
+
+        let mut ctx = ctx_with(false, false).await;
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (agent, _rx) = connected_agent(&ctx, owner, "bot", serde_json::json!({})).await;
+        ctx.bindings = Arc::new(vec![crate::config::ChannelBindingConfig {
+            agent_id: agent.to_string(),
+            channel: "telegram".into(),
+            account_id: "bot".into(),
+        }]);
+        let mut channels = std::collections::BTreeMap::new();
+        channels.insert(
+            "telegram".to_string(),
+            crate::config::ChannelEntry {
+                accounts: vec![crate::config::ChannelAccount {
+                    id: "bot".into(),
+                    adapter_token_ref: "secret:channel:telegram:bot".into(),
+                    dm_policy: crate::config::DmPolicy::Allowlist,
+                    allow_from: Vec::new(),
+                }],
+            },
+        );
+        ctx.channels = Arc::new(channels);
+        let (adapter_tx, mut adapter) = mpsc::channel(8);
+        ctx.channel_router
+            .register(
+                crate::channel_router::AccountKey::new("telegram", "bot"),
+                adapter_tx,
+            )
+            .await;
+        let invite =
+            channel_access::create_invite(&ctx.db, "telegram", "bot", channel_access::DEFAULT_TTL)
+                .await
+                .expect("invite");
+        channel_access::redeem(
+            &ctx.db,
+            "telegram",
+            "bot",
+            "tg:1",
+            &invite.code,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("redeem")
+        .expect("valid");
+
+        let outbound_to = |sender: &str| {
+            AgentToGateway::OutboundMessage(havn_core::OutboundMessage {
+                channel_id: crate::channel_id_codec::encode("telegram", "bot", sender),
+                content: havn_core::MessageContent::Text { text: "hi".into() },
+                reply_to: None,
+            })
+        };
+        let mut bytes = Vec::new();
+        for sender in ["tg:1", "tg:2"] {
+            write_frame(&mut bytes, &outbound_to(sender))
+                .await
+                .expect("encode");
+        }
+        run_reader(&mut BufReader::new(bytes.as_slice()), agent, &ctx)
+            .await
+            .expect("reader");
+        let mut delivered = Vec::new();
+        while let Ok(ChannelFrame::Outbound(o)) = adapter.try_recv() {
+            delivered.push(o.to);
+        }
+        assert_eq!(delivered, vec!["tg:1".to_string()]);
+
+        channel_access::revoke_sender(&ctx.db, "telegram", "bot", "tg:1")
+            .await
+            .expect("revoke");
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &outbound_to("tg:1"))
+            .await
+            .expect("encode");
+        run_reader(&mut BufReader::new(bytes.as_slice()), agent, &ctx)
+            .await
+            .expect("reader");
+        assert!(adapter.try_recv().is_err());
     }
 }

@@ -146,12 +146,14 @@ pub struct ChannelAccount {
     /// resolvability, not naming convention.
     pub adapter_token_ref: String,
     /// DM access policy. Default `allowlist` — only senders listed in
-    /// `allow_from` may DM; empty list = deny all (safe default).
-    /// Operators with public bots set `open`.
+    /// `allow_from` or admitted with an invite code (`havn invite
+    /// create`) may DM; neither = deny all (safe default). Operators with
+    /// public bots set `open`.
     #[serde(default)]
     pub dm_policy: DmPolicy,
-    /// Platform-prefixed sender IDs allowed when `dm_policy = "allowlist"`.
-    /// Ignored under other policies.
+    /// Platform-prefixed sender IDs allowed when `dm_policy = "allowlist"`,
+    /// in addition to the invite allowlist in the DB. Ignored under other
+    /// policies.
     #[serde(default)]
     pub allow_from: Vec<String>,
 }
@@ -159,9 +161,9 @@ pub struct ChannelAccount {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DmPolicy {
-    /// Only senders listed in `allow_from` may DM. Empty list = deny
-    /// all. Safe failure direction: "nobody can use it" rather than
-    /// "everyone can use it".
+    /// Only senders listed in `allow_from` or admitted with an invite
+    /// code may DM. Neither = deny all. Safe failure direction: "nobody
+    /// can use it" rather than "everyone can use it".
     #[default]
     Allowlist,
     /// Any sender on the platform may DM. Use for public help bots or
