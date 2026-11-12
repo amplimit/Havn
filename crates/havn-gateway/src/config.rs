@@ -172,6 +172,25 @@ pub enum DmPolicy {
     Open,
 }
 
+/// Why senders admitted by invite to `(channel, account_id)` are not in
+/// effect, or `None` when they are. Grants stay in the DB and apply
+/// again if the account comes back as `allowlist`.
+#[must_use]
+pub fn inactive_grant_reason(
+    channels: &std::collections::BTreeMap<String, ChannelEntry>,
+    channel: &str,
+    account_id: &str,
+) -> Option<&'static str> {
+    match channels
+        .get(channel)
+        .and_then(|entry| entry.accounts.iter().find(|a| a.id == account_id))
+    {
+        None => Some("account is not configured"),
+        Some(acct) if acct.dm_policy != DmPolicy::Allowlist => Some("dm_policy is not allowlist"),
+        Some(_) => None,
+    }
+}
+
 /// One cross-channel binding (spec §3.5). The same agent can have
 /// multiple bindings — one per channel it should appear on.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -575,6 +594,30 @@ mod tests {
         )
         .expect("legacy dead config blocks should be ignored");
         assert_eq!(parsed.reload.debounce_ms, 500);
+    }
+
+    #[test]
+    fn inactive_grant_reason_flags_missing_and_open_accounts() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+            [[channels.telegram.accounts]]
+            id = "team-bot"
+            adapter_token_ref = "secret:channel:telegram:team-bot"
+
+            [[channels.telegram.accounts]]
+            id = "public-bot"
+            adapter_token_ref = "secret:channel:telegram:public-bot"
+            dm_policy = "open"
+        "#,
+        )
+        .expect("parse");
+        assert_eq!(
+            inactive_grant_reason(&cfg.channels, "telegram", "team-bot"),
+            None
+        );
+        assert!(inactive_grant_reason(&cfg.channels, "telegram", "public-bot").is_some());
+        assert!(inactive_grant_reason(&cfg.channels, "telegram", "gone-bot").is_some());
+        assert!(inactive_grant_reason(&cfg.channels, "slack", "team-bot").is_some());
     }
 
     #[test]

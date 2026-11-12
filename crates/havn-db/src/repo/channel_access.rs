@@ -104,14 +104,24 @@ pub fn generate_code() -> Result<String> {
     Ok(out)
 }
 
-/// Canonical form of something a user typed: dashes and whitespace
-/// dropped, upper-cased, and the Crockford look-alikes (O to 0, I and L
-/// to 1) folded. `None` unless the result is exactly one code.
+/// Canonical form of something a user typed: dashes (including the
+/// Unicode dashes and minus sign that editors and chat apps substitute),
+/// whitespace and zero-width characters dropped, upper-cased, and the
+/// Crockford look-alikes (O to 0, I and L to 1) folded. `None` unless
+/// the result is exactly one code.
 #[must_use]
 pub fn normalize_code(input: &str) -> Option<String> {
     let mut out = String::with_capacity(CODE_LEN);
     for c in input.chars() {
-        if c == '-' || c.is_whitespace() {
+        let separator = matches!(
+            c,
+            '-' | '\u{2010}'..='\u{2015}'
+                | '\u{2212}'
+                | '\u{200b}'..='\u{200d}'
+                | '\u{2060}'
+                | '\u{feff}'
+        );
+        if separator || c.is_whitespace() {
             continue;
         }
         if !c.is_ascii() || out.len() == CODE_LEN {
@@ -194,13 +204,26 @@ pub async fn find_invite(pool: &SqlitePool, id: Uuid) -> Result<Option<Invite>> 
     row.map(Invite::try_from).transpose()
 }
 
-/// Every invite, newest first.
-pub async fn list_invites(pool: &SqlitePool) -> Result<Vec<Invite>> {
-    let rows: Vec<InviteRow> = sqlx::query_as(&format!(
-        "SELECT {INVITE_COLUMNS} FROM channel_invites ORDER BY created_at DESC, id DESC"
-    ))
-    .fetch_all(pool)
-    .await?;
+/// Invites, newest first, optionally for one channel and/or account.
+/// A channel filter uses `idx_channel_invites_account`.
+pub async fn list_invites(
+    pool: &SqlitePool,
+    channel: Option<&str>,
+    account_id: Option<&str>,
+) -> Result<Vec<Invite>> {
+    let mut sql = format!("SELECT {INVITE_COLUMNS} FROM channel_invites WHERE 1 = 1");
+    if channel.is_some() {
+        sql.push_str(" AND channel = ?");
+    }
+    if account_id.is_some() {
+        sql.push_str(" AND account_id = ?");
+    }
+    sql.push_str(" ORDER BY created_at DESC, id DESC");
+    let mut q = sqlx::query_as::<_, InviteRow>(&sql);
+    for v in [channel, account_id].into_iter().flatten() {
+        q = q.bind(v);
+    }
+    let rows = q.fetch_all(pool).await?;
     rows.into_iter().map(Invite::try_from).collect()
 }
 
@@ -232,7 +255,8 @@ pub async fn revoke_invite(pool: &SqlitePool, id: Uuid) -> Result<()> {
 /// for another account, used, revoked or expired; those cases are not
 /// told apart so a caller cannot leak which one applied. The claim is a
 /// single conditional UPDATE, so two senders racing for one code cannot
-/// both win.
+/// both win. `None` too when `sender_id` is already admitted: the claim
+/// is rolled back and the code stays usable.
 pub async fn redeem(
     pool: &SqlitePool,
     channel: &str,
@@ -246,12 +270,12 @@ pub async fn redeem(
     };
     let now_ts = timestamp(now);
     let mut tx = pool.begin().await?;
-    let claimed: Option<(String,)> = sqlx::query_as(
+    let claimed: Option<InviteRow> = sqlx::query_as(&format!(
         "UPDATE channel_invites SET used_by_sender = ?1, used_at = ?2 \
          WHERE code_hash = ?3 AND channel = ?4 AND account_id = ?5 \
            AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?2 \
-         RETURNING id",
-    )
+         RETURNING {INVITE_COLUMNS}"
+    ))
     .bind(sender_id)
     .bind(&now_ts)
     .bind(hash_code(&canonical))
@@ -259,24 +283,28 @@ pub async fn redeem(
     .bind(account_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((id,)) = claimed else {
+    let Some(row) = claimed else {
         return Ok(None);
     };
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO channel_allowlist (channel, account_id, sender_id, registered_at, invite_id) \
          VALUES (?1, ?2, ?3, ?4, ?5) \
-         ON CONFLICT (channel, account_id, sender_id) \
-         DO UPDATE SET registered_at = excluded.registered_at, invite_id = excluded.invite_id",
+         ON CONFLICT (channel, account_id, sender_id) DO NOTHING",
     )
     .bind(channel)
     .bind(account_id)
     .bind(sender_id)
     .bind(&now_ts)
-    .bind(&id)
+    .bind(&row.id)
     .execute(&mut *tx)
     .await?;
+    if inserted.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let invite = Invite::try_from(row)?;
     tx.commit().await?;
-    find_invite(pool, parse_db_uuid(&id, "channel_invites.id")?).await
+    Ok(Some(invite))
 }
 
 pub async fn is_allowed(
@@ -317,6 +345,23 @@ pub async fn list_allowed(pool: &SqlitePool) -> Result<Vec<AllowedSender>> {
     .fetch_all(pool)
     .await?;
     rows.into_iter().map(AllowedSender::try_from).collect()
+}
+
+/// Remove every sender admitted to `account_id`, on `channel` or on any
+/// channel. Returns how many were removed.
+pub async fn revoke_account(
+    pool: &SqlitePool,
+    channel: Option<&str>,
+    account_id: &str,
+) -> Result<u64> {
+    let res = sqlx::query(
+        "DELETE FROM channel_allowlist WHERE account_id = ?1 AND (?2 IS NULL OR channel = ?2)",
+    )
+    .bind(account_id)
+    .bind(channel)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
 }
 
 /// Remove an admitted sender. The gateway reads the table on every
@@ -425,6 +470,18 @@ mod tests {
             normalize_code("OIL0-0000-0000-0000").as_deref(),
             Some("0110000000000000")
         );
+        for pasted in [
+            "7K3M\u{2010}QX9P\u{2013}2HWD\u{2014}RT4B",
+            "7K3M\u{2212}QX9P\u{2011}2HWD\u{2015}RT4B",
+            "\u{feff}7K3M-\u{200b}QX9P-2HWD\u{200d}-RT4B\u{2060}",
+            "\u{a0}7K3M QX9P\u{a0}2HWD RT4B\u{a0}",
+        ] {
+            assert_eq!(
+                normalize_code(pasted).as_deref(),
+                Some(canonical),
+                "{pasted:?}"
+            );
+        }
         assert_eq!(normalize_code("7K3M-QX9P-2HWD-RT4"), None);
         assert_eq!(normalize_code("7K3M-QX9P-2HWD-RT4BX"), None);
         assert_eq!(normalize_code("7K3M-QX9P-2HWD-RT4U"), None);
@@ -534,6 +591,106 @@ mod tests {
         assert_eq!(count_allowed(&pool, "telegram", "bot").await.unwrap(), 0);
     }
 
+    async fn file_pool(dir: &tempfile::TempDir) -> SqlitePool {
+        crate::connect(dir.path().join("havn.db"))
+            .await
+            .expect("db")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_redeems_of_one_code_admit_one_sender() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = file_pool(&dir).await;
+        for _ in 0..10 {
+            let created = create_invite(&pool, "telegram", "bot", DEFAULT_TTL)
+                .await
+                .expect("create");
+            let tasks: Vec<_> = (0..4)
+                .map(|i| {
+                    let pool = pool.clone();
+                    let code = created.code.clone();
+                    tokio::spawn(async move {
+                        redeem(
+                            &pool,
+                            "telegram",
+                            "bot",
+                            &format!("tg:{i}"),
+                            &code,
+                            Utc::now(),
+                        )
+                        .await
+                        .expect("redeem")
+                    })
+                })
+                .collect();
+            let mut winners = 0;
+            for t in tasks {
+                winners += usize::from(t.await.expect("join").is_some());
+            }
+            assert_eq!(winners, 1);
+            assert_eq!(count_allowed(&pool, "telegram", "bot").await.unwrap(), 1);
+            revoke_account(&pool, None, "bot").await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_sender_racing_two_codes_keeps_the_second_usable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = file_pool(&dir).await;
+        let a = create_invite(&pool, "telegram", "bot", DEFAULT_TTL)
+            .await
+            .unwrap();
+        let b = create_invite(&pool, "telegram", "bot", DEFAULT_TTL)
+            .await
+            .unwrap();
+        let (ra, rb) = tokio::join!(
+            redeem(&pool, "telegram", "bot", "tg:1", &a.code, Utc::now()),
+            redeem(&pool, "telegram", "bot", "tg:1", &b.code, Utc::now()),
+        );
+        let (ra, rb) = (ra.expect("redeem"), rb.expect("redeem"));
+        assert_eq!(usize::from(ra.is_some()) + usize::from(rb.is_some()), 1);
+        let unused = if ra.is_some() { &b } else { &a };
+        let row = find_invite(&pool, unused.invite.id).await.unwrap().unwrap();
+        assert_eq!(row.status(Utc::now()), InviteStatus::Active);
+        assert!(
+            redeem(&pool, "telegram", "bot", "tg:2", &unused.code, Utc::now())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_account_clears_one_account() {
+        let pool = connect_in_memory().await.expect("db");
+        for (channel, account, sender) in [
+            ("telegram", "bot", "tg:1"),
+            ("telegram", "bot", "tg:2"),
+            ("slack", "bot", "slack:1"),
+            ("telegram", "other-bot", "tg:3"),
+        ] {
+            let created = create_invite(&pool, channel, account, DEFAULT_TTL)
+                .await
+                .unwrap();
+            redeem(&pool, channel, account, sender, &created.code, Utc::now())
+                .await
+                .unwrap()
+                .expect("valid");
+        }
+        assert_eq!(
+            revoke_account(&pool, Some("telegram"), "bot")
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(count_allowed(&pool, "slack", "bot").await.unwrap(), 1);
+        assert_eq!(revoke_account(&pool, None, "bot").await.unwrap(), 1);
+        assert_eq!(
+            count_allowed(&pool, "telegram", "other-bot").await.unwrap(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn revoking_a_used_invite_is_a_conflict() {
         let pool = connect_in_memory().await.expect("db");
@@ -588,10 +745,25 @@ mod tests {
             .await
             .unwrap()
             .expect("valid");
-        let listed = list_invites(&pool).await.unwrap();
+        let c = create_invite(&pool, "slack", "bot", DEFAULT_TTL)
+            .await
+            .unwrap();
+        let listed = list_invites(&pool, Some("telegram"), None).await.unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, b.invite.id);
         assert_eq!(listed[0].status(Utc::now()), InviteStatus::Active);
         assert_eq!(listed[1].status(Utc::now()), InviteStatus::Used);
+        assert_eq!(list_invites(&pool, None, None).await.unwrap().len(), 3);
+        let by_account = list_invites(&pool, Some("slack"), Some("bot"))
+            .await
+            .unwrap();
+        assert_eq!(by_account.len(), 1);
+        assert_eq!(by_account[0].id, c.invite.id);
+        assert!(
+            list_invites(&pool, None, Some("other-bot"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

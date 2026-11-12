@@ -360,13 +360,16 @@ The command prints a code such as `7K3M-QX9P-2HWD-RT4B` once. Send it to the per
 Manage invites and admitted senders with the same direct-database commands as `havn user` (no gateway restart needed):
 
 ```sh
-havn invite list                                       # status of every invite; codes are never shown again
-havn invite revoke <invite-id>                         # an unused invite
+havn invite list [--channel telegram] [--account acme-bot]   # status of each invite; codes are never shown again
+havn invite revoke <invite-id>                               # an unused invite
 havn access list [--channel telegram] [--account acme-bot]   # allow_from entries and invited senders
 havn access revoke --channel telegram --account acme-bot tg:123456789
+havn access revoke --all --account acme-bot [--channel telegram]   # every invited sender of the account
 ```
 
-`access revoke` applies to the sender's next message, and the agent can no longer message them either. Entries in `allow_from` can only be removed from the config file.
+`access revoke` applies to the sender's next message, and the agent can no longer message them either. Entries in `allow_from` can only be removed from the config file; `access revoke` warns when a sender it removed is still listed there.
+
+Invited senders are stored per account and outlive config edits. If an account is removed or switched to `open`, its grants stop applying but are kept, and apply again if the account comes back as `allowlist`. The gateway warns about such grants at start-up and `access list` marks them; clear them with `havn access revoke --all`.
 
 ## Capability Packs
 

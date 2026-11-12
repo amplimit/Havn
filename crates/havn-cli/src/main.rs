@@ -127,7 +127,12 @@ enum InviteAction {
         expires: chrono::Duration,
     },
     /// List invites with their status. Codes are never shown again.
-    List,
+    List {
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        account: Option<String>,
+    },
     /// Revoke an unused invite.
     Revoke {
         /// Invite id (UUID) from `invite list`.
@@ -144,14 +149,20 @@ enum AccessAction {
         #[arg(long)]
         account: Option<String>,
     },
-    /// Remove a sender admitted by invite. Applies to their next message.
+    /// Remove a sender admitted by invite, or with `--all` every sender
+    /// admitted to the account. Applies to their next message.
     Revoke {
-        #[arg(long)]
-        channel: String,
+        /// Required for one sender; with `--all`, omit to cover every channel.
+        #[arg(long, required_unless_present = "all")]
+        channel: Option<String>,
         #[arg(long)]
         account: String,
         /// Platform-prefixed sender id, as shown by `access list`.
-        sender: String,
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        sender: Option<String>,
+        /// Remove every sender admitted by invite to the account.
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -389,7 +400,9 @@ async fn run_invite(action: InviteAction) -> anyhow::Result<()> {
             account,
             expires,
         } => channel_access::invite_create(&channel, &account, expires).await,
-        InviteAction::List => channel_access::invite_list().await,
+        InviteAction::List { channel, account } => {
+            channel_access::invite_list(channel.as_deref(), account.as_deref()).await
+        }
         InviteAction::Revoke { id } => channel_access::invite_revoke(&id).await,
     }
 }
@@ -403,7 +416,16 @@ async fn run_access(action: AccessAction) -> anyhow::Result<()> {
             channel,
             account,
             sender,
-        } => channel_access::access_revoke(&channel, &account, &sender).await,
+            all,
+        } => match (all, channel, sender) {
+            (true, channel, _) => {
+                channel_access::access_revoke_all(channel.as_deref(), &account).await
+            }
+            (false, Some(channel), Some(sender)) => {
+                channel_access::access_revoke(&channel, &account, &sender).await
+            }
+            (false, ..) => anyhow::bail!("pass --channel and a sender id, or --all"),
+        },
     }
 }
 
@@ -554,8 +576,44 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Access {
-                action: AccessAction::Revoke { ref sender, .. },
-            } if sender == "tg:1"
+                action: AccessAction::Revoke { ref sender, all: false, .. },
+            } if sender.as_deref() == Some("tg:1")
         ));
+        let all = Cli::try_parse_from(["havn", "access", "revoke", "--all", "--account", "bot"])
+            .expect("parse --all");
+        assert!(matches!(
+            all.command,
+            Command::Access {
+                action: AccessAction::Revoke {
+                    channel: None,
+                    sender: None,
+                    all: true,
+                    ..
+                },
+            }
+        ));
+        for bad in [
+            &["havn", "access", "revoke", "--account", "bot", "tg:1"][..],
+            &[
+                "havn",
+                "access",
+                "revoke",
+                "--channel",
+                "telegram",
+                "--account",
+                "bot",
+            ][..],
+            &[
+                "havn",
+                "access",
+                "revoke",
+                "--all",
+                "--account",
+                "bot",
+                "tg:1",
+            ][..],
+        ] {
+            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
+        }
     }
 }

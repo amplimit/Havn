@@ -123,9 +123,9 @@ fn invite_lines(invites: &[Invite], now: DateTime<Utc>) -> Vec<String> {
         .collect()
 }
 
-pub async fn invite_list() -> anyhow::Result<()> {
+pub async fn invite_list(channel: Option<&str>, account: Option<&str>) -> anyhow::Result<()> {
     let pool = open_db_pub().await?;
-    let invites = channel_access::list_invites(&pool)
+    let invites = channel_access::list_invites(&pool, channel, account)
         .await
         .context("listing invites")?;
     if invites.is_empty() {
@@ -157,8 +157,33 @@ pub async fn invite_revoke(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether config admits `sender` through `allow_from`.
+fn in_allow_from(cfg: &CliConfig, channel: &str, account: &str, sender: &str) -> bool {
+    cfg.account(channel, account)
+        .is_some_and(|a| a.is_allowlist() && a.allow_from.iter().any(|s| s == sender))
+}
+
+/// Why the gateway ignores invite grants for this account, mirroring its
+/// start-up warning. Nothing to say without a config file.
+fn grant_note(
+    cfg: &CliConfig,
+    config_found: bool,
+    channel: &str,
+    account: &str,
+) -> Option<&'static str> {
+    if !config_found {
+        return None;
+    }
+    match cfg.account(channel, account) {
+        None => Some("not in effect: account is not configured"),
+        Some(a) if !a.is_allowlist() => Some("not in effect: dm_policy is not allowlist"),
+        Some(_) => None,
+    }
+}
+
 fn access_lines(
     cfg: &CliConfig,
+    config_found: bool,
     allowed: &[AllowedSender],
     channel: Option<&str>,
     account: Option<&str>,
@@ -180,13 +205,17 @@ fn access_lines(
         let invite = a
             .invite_id
             .map_or_else(|| "-".to_string(), |id| id.to_string());
-        lines.push(format!(
+        let mut line = format!(
             "{}/{}  {}  source=invite  invite={invite}  registered={}",
             a.channel,
             a.account_id,
             a.sender_id,
             ts(a.registered_at)
-        ));
+        );
+        if let Some(note) = grant_note(cfg, config_found, &a.channel, &a.account_id) {
+            line.push_str(&format!("  note=\"{note}\""));
+        }
+        lines.push(line);
     }
     lines
 }
@@ -197,7 +226,13 @@ pub async fn access_list(channel: Option<&str>, account: Option<&str>) -> anyhow
     let allowed = channel_access::list_allowed(&pool)
         .await
         .context("listing allowed senders")?;
-    let lines = access_lines(&cfg, &allowed, channel, account);
+    let lines = access_lines(
+        &cfg,
+        paths::config_path().is_some(),
+        &allowed,
+        channel,
+        account,
+    );
     if lines.is_empty() {
         println!("(no allowed senders)");
     }
@@ -207,19 +242,23 @@ pub async fn access_list(channel: Option<&str>, account: Option<&str>) -> anyhow
     Ok(())
 }
 
+/// Returns a warning when the sender stays admitted through `allow_from`.
 async fn revoke_sender_with(
     pool: &sqlx::SqlitePool,
     cfg: &CliConfig,
     channel: &str,
     account: &str,
     sender: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
+    let in_config = in_allow_from(cfg, channel, account, sender);
     match channel_access::revoke_sender(pool, channel, account, sender).await {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(in_config.then(|| {
+            format!(
+                "{sender} is also listed in allow_from for {channel}/{account} in config and \
+                 can still message the bot; remove it there and restart the gateway"
+            )
+        })),
         Err(DbError::NotFound) => {
-            let in_config = cfg
-                .account(channel, account)
-                .is_some_and(|a| a.allow_from.iter().any(|s| s == sender));
             if in_config {
                 anyhow::bail!(
                     "{sender} is listed in allow_from for {channel}/{account} in config; \
@@ -235,8 +274,40 @@ async fn revoke_sender_with(
 pub async fn access_revoke(channel: &str, account: &str, sender: &str) -> anyhow::Result<()> {
     let cfg = paths::load_config()?;
     let pool = open_db_pub().await?;
-    revoke_sender_with(&pool, &cfg, channel, account, sender).await?;
-    println!("revoked {sender} on {channel}/{account}; applies to their next message");
+    let warning = revoke_sender_with(&pool, &cfg, channel, account, sender).await?;
+    println!(
+        "revoked {sender}'s invite access on {channel}/{account}; applies to their next message"
+    );
+    if let Some(w) = warning {
+        eprintln!("warning: {w}");
+    }
+    Ok(())
+}
+
+async fn revoke_all_with(
+    pool: &sqlx::SqlitePool,
+    channel: Option<&str>,
+    account: &str,
+) -> anyhow::Result<u64> {
+    if let Some(ch) = channel {
+        check_part("--channel", ch)?;
+    }
+    check_part("--account", account)?;
+    channel_access::revoke_account(pool, channel, account)
+        .await
+        .context("revoking access")
+}
+
+pub async fn access_revoke_all(channel: Option<&str>, account: &str) -> anyhow::Result<()> {
+    let pool = open_db_pub().await?;
+    let n = revoke_all_with(&pool, channel, account).await?;
+    let scope = channel.map_or_else(
+        || format!("{account} on every channel"),
+        |ch| format!("{ch}/{account}"),
+    );
+    println!(
+        "revoked invite access of {n} sender(s) on {scope}; allow_from entries in config are unchanged"
+    );
     Ok(())
 }
 
@@ -304,7 +375,9 @@ mod tests {
         let created = create_with(&pool, "telegram", "bot", Duration::hours(1))
             .await
             .expect("create");
-        let invites = channel_access::list_invites(&pool).await.unwrap();
+        let invites = channel_access::list_invites(&pool, None, None)
+            .await
+            .unwrap();
         let lines = invite_lines(&invites, Utc::now());
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("active"), "{}", lines[0]);
@@ -316,7 +389,9 @@ mod tests {
         revoke_invite_with(&pool, &created.invite.id.to_string())
             .await
             .expect("revoke");
-        let invites = channel_access::list_invites(&pool).await.unwrap();
+        let invites = channel_access::list_invites(&pool, Some("telegram"), Some("bot"))
+            .await
+            .unwrap();
         assert!(invite_lines(&invites, Utc::now())[0].contains("revoked"));
         assert!(revoke_invite_with(&pool, "not-a-uuid").await.is_err());
         assert!(
@@ -324,6 +399,84 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    async fn admit(pool: &sqlx::SqlitePool, channel: &str, account: &str, sender: &str) {
+        let created = create_with(pool, channel, account, Duration::hours(1))
+            .await
+            .unwrap();
+        channel_access::redeem(pool, channel, account, sender, &created.code, Utc::now())
+            .await
+            .unwrap()
+            .expect("valid");
+    }
+
+    #[tokio::test]
+    async fn revoking_a_sender_also_in_allow_from_warns() {
+        let cfg = config(CONFIG);
+        let pool = havn_db::connect_in_memory().await.expect("db");
+        admit(&pool, "telegram", "bot", "tg:toml").await;
+        let warning = revoke_sender_with(&pool, &cfg, "telegram", "bot", "tg:toml")
+            .await
+            .expect("the invite grant is removed");
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|w| w.contains("allow_from") && w.contains("still")),
+            "{warning:?}"
+        );
+        assert!(
+            !channel_access::is_allowed(&pool, "telegram", "bot", "tg:toml")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn access_list_flags_grants_the_gateway_ignores() {
+        let cfg = config(CONFIG);
+        let pool = havn_db::connect_in_memory().await.expect("db");
+        admit(&pool, "telegram", "public-bot", "tg:1").await;
+        admit(&pool, "telegram", "gone-bot", "tg:2").await;
+        let allowed = channel_access::list_allowed(&pool).await.unwrap();
+        let lines = access_lines(&cfg, true, &allowed, None, Some("public-bot"));
+        assert_eq!(
+            lines.len(),
+            1,
+            "allow_from of an open account is not listed"
+        );
+        assert!(
+            lines[0].contains("dm_policy is not allowlist"),
+            "{}",
+            lines[0]
+        );
+        let lines = access_lines(&cfg, true, &allowed, None, Some("gone-bot"));
+        assert!(
+            lines[0].contains("account is not configured"),
+            "{}",
+            lines[0]
+        );
+        let lines = access_lines(&CliConfig::default(), false, &allowed, None, None);
+        assert!(lines.iter().all(|l| !l.contains("note=")), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn revoke_all_clears_an_account() {
+        let pool = havn_db::connect_in_memory().await.expect("db");
+        admit(&pool, "telegram", "bot", "tg:1").await;
+        admit(&pool, "telegram", "bot", "tg:2").await;
+        admit(&pool, "slack", "bot", "slack:1").await;
+        admit(&pool, "telegram", "other-bot", "tg:3").await;
+        assert_eq!(
+            revoke_all_with(&pool, Some("telegram"), "bot")
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(revoke_all_with(&pool, None, "bot").await.unwrap(), 1);
+        assert_eq!(revoke_all_with(&pool, None, "bot").await.unwrap(), 0);
+        assert!(revoke_all_with(&pool, None, "").await.is_err());
+        assert_eq!(channel_access::list_allowed(&pool).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -338,20 +491,25 @@ mod tests {
             .unwrap()
             .expect("valid");
         let allowed = channel_access::list_allowed(&pool).await.unwrap();
-        let lines = access_lines(&cfg, &allowed, None, None);
+        let lines = access_lines(&cfg, true, &allowed, None, None);
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].contains("tg:toml") && lines[0].contains("source=config"));
         assert!(lines[1].contains("tg:1") && lines[1].contains("source=invite"));
-        assert!(access_lines(&cfg, &allowed, Some("slack"), None).is_empty());
-        assert_eq!(access_lines(&cfg, &allowed, None, Some("bot")).len(), 2);
+        assert!(!lines[1].contains("note="), "{}", lines[1]);
+        assert!(access_lines(&cfg, true, &allowed, Some("slack"), None).is_empty());
+        assert_eq!(
+            access_lines(&cfg, true, &allowed, None, Some("bot")).len(),
+            2
+        );
 
         let err = revoke_sender_with(&pool, &cfg, "telegram", "bot", "tg:toml")
             .await
             .expect_err("config entry");
         assert!(err.to_string().contains("allow_from"), "{err}");
-        revoke_sender_with(&pool, &cfg, "telegram", "bot", "tg:1")
+        let warning = revoke_sender_with(&pool, &cfg, "telegram", "bot", "tg:1")
             .await
             .expect("revoke");
+        assert_eq!(warning, None);
         assert!(
             !channel_access::is_allowed(&pool, "telegram", "bot", "tg:1")
                 .await
