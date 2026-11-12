@@ -118,24 +118,84 @@ pub async fn run_listener(socket_path: &Path, ctx: AgentSocketCtx) -> anyhow::Re
     }
 }
 
-/// Whether process `pid` is in the cgroup the spawner created for
-/// `agent_id`. Sandboxed processes cannot leave their cgroup (they cannot
-/// see or write the cgroup filesystem), so this ties the connection to
-/// the agent that was spawned.
-async fn peer_in_agent_cgroup(pid: Option<i32>, agent_id: AgentId) -> bool {
-    let Some(pid) = pid else {
-        return false;
+/// Read the cgroup of the process on the other end of `stream`, at accept
+/// time, before the peer has sent anything: the peer must not be able to
+/// choose when the check runs. The pid from SO_PEERCRED is a number that
+/// could be reused once the peer exits, so when the kernel supports
+/// SO_PEERPIDFD (Linux 6.5+) we pin the process with a pidfd and confirm,
+/// after reading its cgroup, that this same process is still alive.
+#[cfg(target_os = "linux")]
+async fn peer_cgroup(stream: &UnixStream) -> Option<String> {
+    let pid = stream.peer_cred().ok()?.pid()?;
+    let pidfd = peer_pidfd(stream);
+    let contents = tokio::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .await
+        .ok()?;
+    match &pidfd {
+        Some(fd) if !pidfd_alive(fd) => None,
+        _ => Some(contents),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn peer_cgroup(_stream: &UnixStream) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn peer_pidfd(stream: &UnixStream) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    // Not exported by every libc target; the value is the same on all
+    // Linux architectures.
+    const SO_PEERPIDFD: libc::c_int = 77;
+    let mut fd: libc::c_int = -1;
+    let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()).ok()?;
+    // SAFETY: `fd` and `len` are valid for writes of the sizes passed, and
+    // the socket fd is borrowed from a live stream for the whole call.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_PEERPIDFD,
+            (&raw mut fd).cast(),
+            &raw mut len,
+        )
     };
+    if rc != 0 || fd < 0 {
+        return None;
+    }
+    // SAFETY: on success getsockopt returned a new pidfd that nothing else
+    // owns, so taking ownership here closes it exactly once.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_alive(pidfd: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsRawFd as _;
+    // pidfd_send_signal has the same number on every architecture.
+    const SYS_PIDFD_SEND_SIGNAL: libc::c_long = 424;
+    // SAFETY: signal 0 performs only the existence and permission checks;
+    // a null siginfo and zero flags are the documented defaults.
+    let rc = unsafe {
+        libc::syscall(
+            SYS_PIDFD_SEND_SIGNAL,
+            pidfd.as_raw_fd(),
+            0,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    rc == 0
+}
+
+fn peer_cgroup_is_agents(contents: Option<&str>, agent_id: AgentId) -> bool {
     #[cfg(target_os = "linux")]
     {
-        match tokio::fs::read_to_string(format!("/proc/{pid}/cgroup")).await {
-            Ok(contents) => cgroup_belongs_to_agent(&contents, agent_id),
-            Err(_) => false,
-        }
+        contents.is_some_and(|c| cgroup_belongs_to_agent(c, agent_id))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (pid, agent_id);
+        let _ = (contents, agent_id);
         false
     }
 }
@@ -156,8 +216,13 @@ fn cgroup_belongs_to_agent(contents: &str, agent_id: AgentId) -> bool {
 
 async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::Result<()> {
     // Every sandbox sees the same socket, so the agent id in Hello is only
-    // a claim. The peer's pid comes from the kernel and cannot be forged.
-    let peer_pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
+    // a claim. The peer's process comes from the kernel and cannot be
+    // forged; look up its cgroup now, before reading anything from it.
+    let peer_cgroup = if ctx.verify_peer_cgroup {
+        peer_cgroup(&stream).await
+    } else {
+        None
+    };
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
 
@@ -178,10 +243,10 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
     let agent_id = AgentId::from_str(&agent_id_str)
         .with_context(|| format!("parsing agent_id {agent_id_str:?}"))?;
 
-    if ctx.verify_peer_cgroup && !peer_in_agent_cgroup(peer_pid, agent_id).await {
+    if ctx.verify_peer_cgroup && !peer_cgroup_is_agents(peer_cgroup.as_deref(), agent_id) {
         warn!(
             %agent_id,
-            ?peer_pid,
+            peer_cgroup = peer_cgroup.as_deref().map(str::trim_end),
             "refusing agent connection: the connecting process is not in that agent's cgroup"
         );
         anyhow::bail!("agent {agent_id}: connecting process is not in the agent's cgroup");
@@ -191,9 +256,9 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
     // that is already connected is refused before it learns anything.
     let (tx, mut rx) = mpsc::channel::<GatewayToAgent>(OUTBOUND_QUEUE_CAPACITY);
     ctx.registry
-        .attach(agent_id, tx)
+        .attach(agent_id, tx.clone())
         .await
-        .with_context(|| format!("attach: agent {agent_id}"))?;
+        .with_context(|| format!("refusing connection for agent {agent_id}"))?;
 
     // 2. Resolve policy + send Welcome.
     //
@@ -280,7 +345,7 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
     )
     .await;
     if let Err(e) = welcome {
-        ctx.registry.detach(agent_id).await;
+        ctx.registry.detach(agent_id, &tx).await;
         return Err(e).context("sending Welcome");
     }
 
@@ -300,7 +365,7 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
     let result = run_reader(&mut reader, agent_id, &ctx).await;
 
     // 6. Cleanup
-    ctx.registry.detach(agent_id).await;
+    ctx.registry.detach(agent_id, &tx).await;
     writer_task.abort();
     let _ = writer_task.await;
 
@@ -1193,6 +1258,20 @@ mod tests {
         ));
         assert!(!cgroup_belongs_to_agent("0::/user.slice\n", id));
         assert!(!cgroup_belongs_to_agent("", id));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn peer_cgroup_reads_the_connecting_process() {
+        let (ours, theirs) = UnixStream::pair().expect("socket pair");
+        let seen = peer_cgroup(&ours).await.expect("peer cgroup");
+        let own = std::fs::read_to_string("/proc/self/cgroup").expect("own cgroup");
+        assert_eq!(seen, own);
+        // SO_PEERPIDFD needs Linux 6.5+; older kernels fall back to the pid.
+        if let Some(pidfd) = peer_pidfd(&ours) {
+            assert!(pidfd_alive(&pidfd));
+        }
+        drop(theirs);
     }
 
     #[tokio::test]

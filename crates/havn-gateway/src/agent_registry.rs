@@ -98,8 +98,15 @@ impl AgentRegistry {
 
     /// Drop the outbound channel without removing the registry entry.
     /// Called on socket disconnect — the agent process may still be alive.
-    pub async fn detach(&self, agent_id: AgentId) {
-        if let Some(entry) = self.inner.lock().await.get_mut(&agent_id) {
+    pub async fn detach(&self, agent_id: AgentId, tx: &mpsc::Sender<GatewayToAgent>) {
+        // Only the connection that attached `tx` may clear it; a newer
+        // connection may already have taken its place.
+        if let Some(entry) = self.inner.lock().await.get_mut(&agent_id)
+            && entry
+                .tx
+                .as_ref()
+                .is_some_and(|current| current.same_channel(tx))
+        {
             entry.tx = None;
         }
     }
@@ -133,7 +140,7 @@ impl AgentRegistry {
             .map(|(id, e)| RegisteredAgent {
                 agent_id: *id,
                 pid: e.handle.pid,
-                connected: e.tx.is_some(),
+                connected: e.tx.as_ref().is_some_and(|tx| !tx.is_closed()),
             })
             .collect()
     }
@@ -143,7 +150,7 @@ impl AgentRegistry {
             .lock()
             .await
             .get(&agent_id)
-            .is_some_and(|e| e.tx.is_some())
+            .is_some_and(|e| e.tx.as_ref().is_some_and(|tx| !tx.is_closed()))
     }
 
     /// True if the agent has been spawned (handle present in the
@@ -269,11 +276,39 @@ mod tests {
         reg.register(handle).await;
 
         let (tx, _rx) = mpsc::channel(8);
-        reg.attach(id, tx).await.expect("attach");
-        reg.detach(id).await;
+        reg.attach(id, tx.clone()).await.expect("attach");
+        reg.detach(id, &tx).await;
 
         assert!(!reg.is_connected(id).await);
         // Handle still present.
         assert!(reg.remove(id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_detach_leaves_a_newer_connection_alone() {
+        let reg = AgentRegistry::new();
+        let handle = fake_handle();
+        let id = handle.agent_id;
+        reg.register(handle).await;
+
+        let (old, old_rx) = mpsc::channel::<GatewayToAgent>(8);
+        reg.attach(id, old.clone()).await.expect("first attach");
+        drop(old_rx);
+        let (new, mut new_rx) = mpsc::channel::<GatewayToAgent>(8);
+        reg.attach(id, new).await.expect("reconnect");
+
+        reg.detach(id, &old).await;
+
+        assert!(
+            reg.is_connected(id).await,
+            "the new connection must survive"
+        );
+        reg.send(id, GatewayToAgent::HeartbeatTick)
+            .await
+            .expect("send");
+        assert!(matches!(
+            new_rx.recv().await,
+            Some(GatewayToAgent::HeartbeatTick)
+        ));
     }
 }

@@ -265,12 +265,12 @@ mod tests {
             })
             .await;
         let (tx, _rx) = tokio::sync::mpsc::channel::<GatewayToAgent>(8);
-        registry.attach(agent.id, tx).await.expect("attach");
+        registry.attach(agent.id, tx.clone()).await.expect("attach");
 
         scheduler.tick_once(Instant::now()).await;
         assert_eq!(scheduler.state.lock().await.len(), 1);
 
-        registry.detach(agent.id).await;
+        registry.detach(agent.id, &tx).await;
         scheduler.tick_once(Instant::now()).await;
         assert!(scheduler.state.lock().await.is_empty());
     }
