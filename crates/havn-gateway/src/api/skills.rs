@@ -238,6 +238,7 @@ async fn set_pinned(
         .admin_rpc
         .call(
             &request_id,
+            agent_id,
             || async move {
                 registry
                     .send(agent_for_send, GatewayToAgent::SkillPinRequest(req))

@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use havn_core::AgentId;
 use havn_proto::AdminOutcome;
 use thiserror::Error;
 use tokio::sync::{Mutex, oneshot};
@@ -32,7 +33,8 @@ use tracing::warn;
 
 #[derive(Debug, Clone, Default)]
 pub struct AdminRpc {
-    pending: Arc<Mutex<HashMap<String, oneshot::Sender<AdminOutcome>>>>,
+    /// Pending requests with the only agent allowed to answer each.
+    pending: Arc<Mutex<HashMap<String, (AgentId, oneshot::Sender<AdminOutcome>)>>>,
 }
 
 #[derive(Debug, Error)]
@@ -53,9 +55,16 @@ impl AdminRpc {
     /// Reserve a slot for `request_id` and return the receiver. The
     /// caller sends the request frame down the agent socket and then
     /// awaits this receiver.
-    pub async fn register(&self, request_id: &str) -> oneshot::Receiver<AdminOutcome> {
+    pub async fn register(
+        &self,
+        request_id: &str,
+        target: AgentId,
+    ) -> oneshot::Receiver<AdminOutcome> {
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(request_id.into(), tx);
+        self.pending
+            .lock()
+            .await
+            .insert(request_id.into(), (target, tx));
         rx
     }
 
@@ -63,9 +72,26 @@ impl AdminRpc {
     /// the outcome. No-op (with a warn log) if the id has no pending
     /// entry — that means the caller already timed out, which is fine
     /// from the runtime's perspective.
-    pub async fn resolve(&self, request_id: &str, outcome: AdminOutcome) {
-        let sender = self.pending.lock().await.remove(request_id);
-        if let Some(tx) = sender {
+    /// Deliver `outcome` from `responder`. A reply from any agent other
+    /// than the one the request was sent to is dropped and leaves the
+    /// request pending.
+    pub async fn resolve(&self, responder: AgentId, request_id: &str, outcome: AdminOutcome) {
+        let sender = {
+            let mut map = self.pending.lock().await;
+            match map.get(request_id) {
+                Some((target, _)) if *target == responder => map.remove(request_id),
+                Some(_) => {
+                    warn!(
+                        request_id,
+                        %responder,
+                        "admin RPC response from an agent that was not asked; dropping"
+                    );
+                    return;
+                }
+                None => None,
+            }
+        };
+        if let Some((_, tx)) = sender {
             // Receiver may have dropped (caller cancelled / timed out).
             // That's fine — silently discard.
             let _ = tx.send(outcome);
@@ -88,6 +114,7 @@ impl AdminRpc {
     pub async fn call<F, Fut, E>(
         &self,
         request_id: &str,
+        target: AgentId,
         send: F,
         timeout_after: Duration,
     ) -> Result<AdminOutcome, AdminRpcCallError<E>>
@@ -95,7 +122,7 @@ impl AdminRpc {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<(), E>>,
     {
-        let rx = self.register(request_id).await;
+        let rx = self.register(request_id, target).await;
         if let Err(e) = send().await {
             // Roll back the pending entry — the request was never
             // dispatched; nobody will ever resolve it.
@@ -137,8 +164,10 @@ mod tests {
     #[tokio::test]
     async fn register_then_resolve_completes_receiver() {
         let rpc = AdminRpc::new();
-        let rx = rpc.register("req-1").await;
+        let target = AgentId::new();
+        let rx = rpc.register("req-1", target).await;
         rpc.resolve(
+            target,
             "req-1",
             AdminOutcome::Ok {
                 details: serde_json::json!({"k": "v"}),
@@ -152,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_unknown_id_is_a_warn_not_a_panic() {
         let rpc = AdminRpc::new();
-        rpc.resolve("never-registered", AdminOutcome::NotFound)
+        rpc.resolve(AgentId::new(), "never-registered", AdminOutcome::NotFound)
             .await;
         // No assertions — just verifying we don't panic.
     }
@@ -160,15 +189,19 @@ mod tests {
     #[tokio::test]
     async fn call_succeeds_when_response_arrives() {
         let rpc = AdminRpc::new();
+        let target = AgentId::new();
         let rpc_for_resolve = rpc.clone();
         // Spawn a "runtime" that resolves shortly after we send.
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            rpc_for_resolve.resolve("r", AdminOutcome::NotFound).await;
+            rpc_for_resolve
+                .resolve(target, "r", AdminOutcome::NotFound)
+                .await;
         });
         let result: Result<AdminOutcome, AdminRpcCallError<std::io::Error>> = rpc
             .call(
                 "r",
+                target,
                 || async { Ok::<_, std::io::Error>(()) },
                 Duration::from_millis(500),
             )
@@ -182,6 +215,7 @@ mod tests {
         let result: Result<AdminOutcome, AdminRpcCallError<std::io::Error>> = rpc
             .call(
                 "r",
+                AgentId::new(),
                 || async { Ok::<_, std::io::Error>(()) },
                 Duration::from_millis(50),
             )
@@ -200,11 +234,34 @@ mod tests {
         let result: Result<AdminOutcome, AdminRpcCallError<&'static str>> = rpc
             .call(
                 "r",
+                AgentId::new(),
                 || async { Err::<(), _>("send fail") },
                 Duration::from_secs(1),
             )
             .await;
         assert!(matches!(result, Err(AdminRpcCallError::Send(_))));
         assert!(rpc.pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_the_target_agent_can_reply() {
+        let rpc = AdminRpc::new();
+        let target = AgentId::new();
+        let mut rx = rpc.register("req-2", target).await;
+        rpc.resolve(AgentId::new(), "req-2", AdminOutcome::NotFound)
+            .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a reply from another agent must not arrive"
+        );
+        rpc.resolve(
+            target,
+            "req-2",
+            AdminOutcome::Ok {
+                details: serde_json::json!({}),
+            },
+        )
+        .await;
+        assert!(matches!(rx.await.expect("reply"), AdminOutcome::Ok { .. }));
     }
 }

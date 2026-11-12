@@ -181,6 +181,7 @@ pub async fn forget(
         .admin_rpc
         .call(
             &request_id,
+            agent_id,
             || async move {
                 registry
                     .send(agent_for_send, GatewayToAgent::MemoryForgetRequest(req))

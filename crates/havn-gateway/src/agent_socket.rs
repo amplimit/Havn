@@ -377,10 +377,14 @@ where
                 }
             }
             AgentToGateway::MemoryForgetResponse(resp) => {
-                ctx.admin_rpc.resolve(&resp.request_id, resp.outcome).await;
+                ctx.admin_rpc
+                    .resolve(agent_id, &resp.request_id, resp.outcome)
+                    .await;
             }
             AgentToGateway::SkillPinResponse(resp) => {
-                ctx.admin_rpc.resolve(&resp.request_id, resp.outcome).await;
+                ctx.admin_rpc
+                    .resolve(agent_id, &resp.request_id, resp.outcome)
+                    .await;
             }
             AgentToGateway::AgentQuery(query) => {
                 // Caller-side initiation. Spawn so a slow target doesn't
@@ -839,8 +843,9 @@ async fn handle_agent_query(caller_id: AgentId, query: AgentQuery, ctx: AgentSoc
         {
             Ok(Ok(resp)) => resp,
             Ok(Err(_)) => {
-                // Sender dropped without delivering — broker pending entry
-                // is already gone via Resolve, so we're clean.
+                // The broker drops a sender only by resolving or cancelling
+                // it, and dispatch ids are unique, so this is not expected;
+                // report it as an error rather than waiting.
                 send_query_error(
                     &ctx,
                     caller_id,
