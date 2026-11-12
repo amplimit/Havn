@@ -1111,7 +1111,7 @@ mod tests {
             state.channels = Arc::new(channels);
             state
                 .registry
-                .register(havn_spawner::AgentHandle { agent_id, pid: 1 })
+                .register(havn_spawner::AgentHandle::new(agent_id, 1))
                 .await;
             let (agent_tx, agent) = mpsc::channel(16);
             state

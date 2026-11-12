@@ -11,18 +11,21 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use havn_core::{AgentId, Policy};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::{AgentHandle, AgentSpawnConfig, AgentSpawner, ResourceStats, Result, SpawnerError};
+use crate::{
+    AgentExit, AgentHandle, AgentSpawnConfig, AgentSpawner, ChildWatch, ResourceStats, Result,
+    SpawnerError,
+};
 
 /// Grace period between SIGTERM and SIGKILL on `stop()`.
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct SubprocessSpawner {
-    children: Arc<Mutex<HashMap<AgentId, Child>>>,
+    children: Arc<Mutex<HashMap<AgentId, ChildWatch>>>,
 }
 
 impl Default for SubprocessSpawner {
@@ -70,6 +73,26 @@ impl AgentSpawner for SubprocessSpawner {
         // Inherit stdout/stderr so logs propagate; in production the namespace
         // spawner will redirect them to the agent's log file.
         cmd.kill_on_drop(true);
+        // The agent dies with the gateway instead of outliving it.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt as _;
+            let gateway_pid = std::process::id().cast_signed();
+            // SAFETY: runs between fork and exec and only makes the
+            // async-signal-safe prctl/getppid calls.
+            unsafe {
+                cmd.as_std_mut()
+                    .pre_exec(move || crate::ns_setup::kill_with_parent(Some(gateway_pid)));
+            }
+        }
+
+        // A previous instance the caller never stopped would otherwise be
+        // forgotten here while it keeps running.
+        let previous = self.children.lock().await.remove(&config.agent_id);
+        if let Some(previous) = previous {
+            warn!(agent_id = %config.agent_id, "stopping a previous instance before respawn");
+            terminate(config.agent_id, &previous).await;
+        }
 
         let child = cmd.spawn().map_err(|e| {
             SpawnerError::Spawn(format!("exec {}: {e}", config.runtime_binary.display()))
@@ -80,41 +103,41 @@ impl AgentSpawner for SubprocessSpawner {
 
         info!(agent_id = %config.agent_id, pid, "subprocess agent started");
 
-        self.children.lock().await.insert(config.agent_id, child);
-
-        Ok(AgentHandle {
-            agent_id: config.agent_id,
-            pid,
-        })
+        let handle = AgentHandle::new(config.agent_id, pid);
+        self.children
+            .lock()
+            .await
+            .insert(config.agent_id, ChildWatch::start(child, &handle));
+        Ok(handle)
     }
 
     async fn stop(&self, handle: &AgentHandle) -> Result<()> {
-        let mut child = {
+        let child = {
             let mut guard = self.children.lock().await;
+            if guard
+                .get(&handle.agent_id)
+                .is_none_or(|c| !c.belongs_to(handle))
+            {
+                return Err(SpawnerError::NotFound(handle.agent_id));
+            }
             guard
                 .remove(&handle.agent_id)
                 .ok_or(SpawnerError::NotFound(handle.agent_id))?
         };
+        terminate(handle.agent_id, &child).await;
+        Ok(())
+    }
 
-        // Try graceful SIGTERM first.
-        send_sigterm(handle.pid);
-
-        // Wait up to STOP_GRACE for the child to exit on its own.
-        let waited = tokio::time::timeout(STOP_GRACE, child.wait()).await;
-        match waited {
-            Ok(Ok(status)) => {
-                info!(agent_id = %handle.agent_id, ?status, "agent exited after SIGTERM");
-                Ok(())
-            }
-            Ok(Err(e)) => Err(SpawnerError::Io(e)),
-            Err(_) => {
-                warn!(agent_id = %handle.agent_id, "SIGTERM grace expired; sending SIGKILL");
-                child.start_kill().map_err(SpawnerError::Io)?;
-                let status = child.wait().await.map_err(SpawnerError::Io)?;
-                info!(agent_id = %handle.agent_id, ?status, "agent killed");
-                Ok(())
-            }
-        }
+    async fn wait(&self, handle: &AgentHandle) -> Result<AgentExit> {
+        let child = self
+            .children
+            .lock()
+            .await
+            .get(&handle.agent_id)
+            .filter(|c| c.belongs_to(handle))
+            .cloned()
+            .ok_or(SpawnerError::NotFound(handle.agent_id))?;
+        Ok(child.exited().await)
     }
 
     async fn stats(&self, _handle: &AgentHandle) -> Result<ResourceStats> {
@@ -124,22 +147,20 @@ impl AgentSpawner for SubprocessSpawner {
     }
 }
 
-#[cfg(unix)]
-fn send_sigterm(pid: u32) {
-    // SAFETY: passing a valid pid to libc::kill with a defined signal number.
-    // If the pid has already exited, kill returns ESRCH, which we treat as a
-    // benign race (the child is gone — that's what we wanted). We bit-cast u32
-    // to i32 because libc::pid_t is signed; pids fit comfortably below i32::MAX
-    // on every kernel we target.
-    unsafe {
-        let _ = libc::kill(pid.cast_signed(), libc::SIGTERM);
+/// SIGTERM, then SIGKILL once [`STOP_GRACE`] has passed. Returns at once
+/// for a child that has already exited. Off unix there is no SIGTERM, so
+/// the child is killed after the grace period.
+async fn terminate(agent_id: AgentId, child: &ChildWatch) {
+    child.terminate();
+    match tokio::time::timeout(STOP_GRACE, child.exited()).await {
+        Ok(exit) => info!(%agent_id, %exit, "agent exited"),
+        Err(_) => {
+            warn!(%agent_id, "SIGTERM grace expired; sending SIGKILL");
+            child.kill();
+            let exit = child.exited().await;
+            info!(%agent_id, %exit, "agent killed");
+        }
     }
-}
-
-#[cfg(not(unix))]
-fn send_sigterm(_pid: u32) {
-    // No SIGTERM equivalent on non-unix targets; stop() falls through to
-    // start_kill() (terminate) after the grace period.
 }
 
 #[cfg(test)]
@@ -147,7 +168,6 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
-    use havn_core::AgentId;
     use std::path::PathBuf;
 
     fn config_for(agent_id: AgentId, runtime: PathBuf) -> AgentSpawnConfig {
@@ -189,16 +209,93 @@ mod tests {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("exec sleep 60").kill_on_drop(true);
         let child = cmd.spawn().expect("spawn sh");
-        let pid = child.id().expect("pid");
-        spawner.children.lock().await.insert(agent_id, child);
+        let handle = AgentHandle::new(agent_id, child.id().expect("pid"));
+        spawner
+            .children
+            .lock()
+            .await
+            .insert(agent_id, ChildWatch::start(child, &handle));
         let _ = sleep; // keep the lookup result in scope
-
-        let handle = AgentHandle { agent_id, pid };
+        let waiter = {
+            let spawner = SubprocessSpawner {
+                children: Arc::clone(&spawner.children),
+            };
+            let handle = handle.clone();
+            tokio::spawn(async move { spawner.wait(&handle).await })
+        };
+        tokio::task::yield_now().await;
         spawner.stop(&handle).await.expect("stop");
+        let exit = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter resolves")
+            .expect("join");
+        // The waiter either got the exit or found the child already gone.
+        #[cfg(unix)]
+        if let Ok(exit) = exit {
+            assert_eq!(exit, AgentExit::Signal(libc::SIGTERM));
+        }
+        #[cfg(not(unix))]
+        let _ = exit;
 
         // Re-stop should fail with NotFound.
         let err = spawner.stop(&handle).await.expect_err("already stopped");
         assert!(matches!(err, SpawnerError::NotFound(_)));
+    }
+
+    async fn track(spawner: &SubprocessSpawner, script: &str) -> AgentHandle {
+        let agent_id = AgentId::new();
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sh");
+        let handle = AgentHandle::new(agent_id, child.id().expect("pid"));
+        spawner
+            .children
+            .lock()
+            .await
+            .insert(agent_id, ChildWatch::start(child, &handle));
+        handle
+    }
+
+    #[tokio::test]
+    async fn wait_reports_a_child_that_exits_on_its_own() {
+        let spawner = SubprocessSpawner::new();
+        let handle = track(&spawner, "exit 3").await;
+
+        let exit = tokio::time::timeout(Duration::from_secs(5), spawner.wait(&handle))
+            .await
+            .expect("exit observed without polling")
+            .expect("tracked");
+        assert_eq!(exit, AgentExit::Code(3));
+
+        // Cleanup of an exited child is immediate and forgets it.
+        tokio::time::timeout(Duration::from_secs(1), spawner.stop(&handle))
+            .await
+            .expect("no grace period for an exited child")
+            .expect("stop");
+        assert!(matches!(
+            spawner.wait(&handle).await,
+            Err(SpawnerError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stop_ignores_a_handle_from_an_earlier_spawn() {
+        let spawner = SubprocessSpawner::new();
+        let handle = track(&spawner, "exec sleep 60").await;
+
+        // Same pid, as after a pid is recycled, but an earlier spawn.
+        let stale = AgentHandle {
+            serial: handle.serial - 1,
+            ..handle.clone()
+        };
+        assert!(matches!(
+            spawner.stop(&stale).await,
+            Err(SpawnerError::NotFound(_))
+        ));
+        spawner.stop(&handle).await.expect("current instance stops");
     }
 
     #[tokio::test]

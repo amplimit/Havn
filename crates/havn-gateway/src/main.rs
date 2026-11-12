@@ -21,6 +21,7 @@ mod policy_resolver;
 mod query_broker;
 mod reload;
 mod secret_ref;
+mod supervisor;
 mod webchat;
 mod workspace;
 
@@ -160,6 +161,8 @@ struct AppState {
     /// key, so callers can assume `Some` whenever a credential read
     /// happens (the `Credential` row would not exist otherwise).
     pub keyring: Option<keyring::KeyRing>,
+    /// Restart bookkeeping for agents whose process exits or goes silent.
+    pub supervisor: supervisor::Supervisor,
     /// `[llm] max_tokens_ceiling`, applied to the LLM test endpoint as
     /// to agent calls.
     pub max_tokens_ceiling: u32,
@@ -464,6 +467,10 @@ async fn main() -> anyhow::Result<()> {
         embedding_config: embedding_config.clone(),
         agent_env_passthrough: Arc::new(api::agents::embedding_env_passthrough(&cfg.embedding)),
         keyring: keyring.clone(),
+        supervisor: supervisor::Supervisor::new(
+            supervisor::RestartPolicy::default(),
+            havn_proto::LIVENESS_PING_INTERVAL,
+        ),
         max_tokens_ceiling: cfg.llm.max_tokens_ceiling,
     };
 
@@ -501,6 +508,12 @@ async fn main() -> anyhow::Result<()> {
             error!(error = ?e, "agent socket listener crashed");
         }
     });
+
+    // Agents: clear what an earlier run left, bring back the ones that
+    // were running, and keep watching their liveness pings.
+    supervisor::reconcile(&state).await;
+    let liveness_task = tokio::spawn(supervisor::run_liveness_checks(state.clone()));
+    let shutdown_state = state.clone();
 
     // Background task: heartbeat scheduler (spec §9.6).
     let heartbeat = heartbeat::HeartbeatScheduler::new(registry.clone(), db.clone());
@@ -628,6 +641,9 @@ async fn main() -> anyhow::Result<()> {
     .await
     .context("serving HTTP")?;
 
+    liveness_task.abort();
+    let _ = liveness_task.await;
+    supervisor::shut_down(&shutdown_state).await;
     socket_task.abort();
     let _ = socket_task.await;
     heartbeat_task.abort();

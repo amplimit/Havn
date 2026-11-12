@@ -18,6 +18,11 @@ pub use codec::{FrameError, read_frame, write_frame};
 /// 0.2.0: `CronTick`/`CronResult` carry `run_id`.
 pub const PROTOCOL_VERSION: &str = "0.2.0";
 
+/// How often a runtime sends [`AgentToGateway::LivenessPing`] once it is
+/// up. The gateway restarts an agent that stays connected but silent for
+/// several intervals.
+pub const LIVENESS_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Frames sent from the agent runtime to the gateway.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -33,8 +38,8 @@ pub enum AgentToGateway {
     /// Cron job finished — gateway records a `CronRun` row, writes the output
     /// to disk, and optionally broadcasts via `deliver` (spec §8.5).
     CronResult(CronResult),
-    /// Periodic liveness ping. Gateway may consider the agent dead if
-    /// these stop arriving for a configurable timeout.
+    /// Sent every [`LIVENESS_PING_INTERVAL`] from its own task. The
+    /// gateway restarts an agent whose pings stop while it stays connected.
     LivenessPing,
     /// Reply to a [`GatewayToAgent::MemoryForgetRequest`]. Carries the
     /// matching `request_id` so the gateway can resolve the pending
