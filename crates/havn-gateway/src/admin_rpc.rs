@@ -68,13 +68,12 @@ impl AdminRpc {
         rx
     }
 
-    /// Match an incoming `*Response` to its pending sender and forward
-    /// the outcome. No-op (with a warn log) if the id has no pending
-    /// entry — that means the caller already timed out, which is fine
-    /// from the runtime's perspective.
-    /// Deliver `outcome` from `responder`. A reply from any agent other
-    /// than the one the request was sent to is dropped and leaves the
-    /// request pending.
+    /// Match an incoming `*Response` from `responder` to its pending sender
+    /// and forward the outcome. A reply from any agent other than the one
+    /// the request was sent to is dropped and leaves the request pending.
+    /// No-op (with a warn log) if the id has no pending entry — that means
+    /// the caller already timed out, which is fine from the runtime's
+    /// perspective.
     pub async fn resolve(&self, responder: AgentId, request_id: &str, outcome: AdminOutcome) {
         let sender = {
             let mut map = self.pending.lock().await;
