@@ -67,7 +67,7 @@ pub async fn handler(
 
     // Token check: the dashboard fetches its `ws_token` from /me (which
     // equals the user's id) and passes it on the upgrade query string.
-    // Combined with the X-User-ID extractor above, this double-binds
+    // Combined with the identity-header extractor above, this double-binds
     // the WS to the resolved subject — even if the upstream proxy
     // somehow leaked the cookie / SSO session, an attacker would also
     // need to know the user's id to upgrade. Symmetric to spec §11.

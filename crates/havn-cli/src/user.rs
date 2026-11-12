@@ -1,11 +1,11 @@
-//! `havn user {add,list,delete}` — operator-side user provisioning
-//! (spec §1.7).
+//! `havn user {add,set-external-id,list,delete}` — operator-side user
+//! provisioning (spec §1.7).
 //!
 //! The CLI talks **directly** to the gateway SQLite, not via HTTP.
 //! Reasoning: the operator who provisions users is on the same host as
 //! the gateway, has filesystem access, and runs before any reverse
 //! proxy is even configured. Going through HTTP would mean the CLI
-//! itself needs an X-User-ID, which there's no clean way to bootstrap.
+//! itself needs an identity header, which there's no clean way to bootstrap.
 //! Direct DB access avoids that chicken-and-egg.
 //!
 //! The gateway must NOT be running concurrently with destructive `user
@@ -18,7 +18,8 @@ use std::str::FromStr as _;
 
 use anyhow::Context as _;
 use havn_core::UserId;
-use havn_db::repo::users;
+use havn_db::DbError;
+use havn_db::repo::users::{self, User};
 
 /// Resolve the gateway DB path from `$HAVN_DB`, the config file at
 /// `$HAVN_CONFIG`, or the default location. Mirrors the gateway's own
@@ -74,40 +75,92 @@ async fn open_db() -> anyhow::Result<sqlx::SqlitePool> {
         .with_context(|| format!("opening havn DB at {}", path.display()))
 }
 
-pub async fn add(id: &str, display_name: &str) -> anyhow::Result<()> {
+fn parse_user_id(id: &str) -> anyhow::Result<UserId> {
+    UserId::from_str(id).map_err(|_| anyhow::anyhow!("user id must be a UUID v7 (got {id:?})"))
+}
+
+fn explain(err: DbError, external_id: Option<&str>) -> anyhow::Error {
+    match (err, external_id) {
+        (DbError::Conflict("users.external_id"), Some(ext)) => {
+            anyhow::anyhow!("external id {ext:?} is already assigned to another user")
+        }
+        (DbError::Conflict("users.id"), _) => anyhow::anyhow!("a user with this id already exists"),
+        (err, _) => err.into(),
+    }
+}
+
+async fn insert(
+    pool: &sqlx::SqlitePool,
+    id: Option<&str>,
+    external_id: Option<&str>,
+    display_name: &str,
+) -> anyhow::Result<User> {
     if display_name.trim().is_empty() {
         anyhow::bail!("--display-name must be non-empty");
     }
-    let user_id = UserId::from_str(id)
-        .map_err(|_| anyhow::anyhow!("user id must be a UUID v7 (got {id:?})"))?;
-    let pool = open_db().await?;
-    let user = users::create_with_id(&pool, user_id, display_name)
+    let user_id = match (id, external_id) {
+        (Some(id), _) => parse_user_id(id)?,
+        (None, Some(_)) => UserId::new(),
+        (None, None) => anyhow::bail!("pass a user id, --external-id, or both"),
+    };
+    users::create_with_id(pool, user_id, display_name, external_id)
         .await
-        .with_context(|| format!("inserting user {user_id}"))?;
-    println!("added user {} ({})", user.id, user.display_name);
+        .map_err(|e| explain(e, external_id))
+}
+
+pub async fn add(
+    id: Option<&str>,
+    external_id: Option<&str>,
+    display_name: &str,
+) -> anyhow::Result<()> {
+    let pool = open_db().await?;
+    let user = insert(&pool, id, external_id, display_name).await?;
+    match &user.external_id {
+        Some(ext) => println!(
+            "added user {} ({}), external id {ext}",
+            user.id, user.display_name
+        ),
+        None => println!("added user {} ({})", user.id, user.display_name),
+    }
+    Ok(())
+}
+
+pub async fn set_external_id(id: &str, external_id: Option<&str>) -> anyhow::Result<()> {
+    let user_id = parse_user_id(id)?;
+    let pool = open_db().await?;
+    let previous = match users::set_external_id(&pool, user_id, external_id).await {
+        Err(DbError::NotFound) => anyhow::bail!("no user with id {user_id}"),
+        other => other.map_err(|e| explain(e, external_id))?,
+    };
+    let previous = previous.as_deref().unwrap_or("none");
+    match external_id {
+        Some(ext) => println!("user {user_id}: external id {ext} (was {previous})"),
+        None => println!("user {user_id}: external id cleared (was {previous})"),
+    }
     Ok(())
 }
 
 pub async fn list() -> anyhow::Result<()> {
     let pool = open_db().await?;
-    let rows: Vec<(String, String, String)> =
-        sqlx::query_as("SELECT id, display_name, created_at FROM users ORDER BY created_at")
-            .fetch_all(&pool)
-            .await
-            .context("listing users")?;
+    let rows = users::list(&pool).await.context("listing users")?;
     if rows.is_empty() {
         println!("(no users)");
         return Ok(());
     }
-    for (id, display_name, created_at) in rows {
-        println!("{id}  {display_name:24}  {created_at}");
+    for user in rows {
+        println!(
+            "{}  {:24}  {:32}  {}",
+            user.id,
+            user.display_name,
+            user.external_id.as_deref().unwrap_or("-"),
+            user.created_at.to_rfc3339(),
+        );
     }
     Ok(())
 }
 
 pub async fn delete(id: &str) -> anyhow::Result<()> {
-    let user_id = UserId::from_str(id)
-        .map_err(|_| anyhow::anyhow!("user id must be a UUID v7 (got {id:?})"))?;
+    let user_id = parse_user_id(id)?;
     let pool = open_db().await?;
     // Hard-delete. FK cascades on agents.owner_id wipe the user's
     // agents, on credentials they take their credentials, on
@@ -126,4 +179,50 @@ pub async fn delete(id: &str) -> anyhow::Result<()> {
     }
     println!("deleted user {user_id} (and all owned agents / credentials)");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+
+    #[tokio::test]
+    async fn add_with_external_id_generates_internal_id() {
+        let pool = havn_db::connect_in_memory().await.expect("db");
+        let user = insert(&pool, None, Some("alice@example.com"), "Alice")
+            .await
+            .expect("add");
+        assert_eq!(user.external_id.as_deref(), Some("alice@example.com"));
+        let found = users::find_by_external_id(&pool, "alice@example.com")
+            .await
+            .expect("find")
+            .expect("some");
+        assert_eq!(found.id, user.id);
+    }
+
+    #[tokio::test]
+    async fn add_keeps_the_uuid_path() {
+        let pool = havn_db::connect_in_memory().await.expect("db");
+        let id = UserId::new();
+        let user = insert(&pool, Some(&id.to_string()), None, "Bob")
+            .await
+            .expect("add");
+        assert_eq!(user.id, id);
+        assert_eq!(user.external_id, None);
+        assert!(insert(&pool, Some("bob"), None, "Bob").await.is_err());
+        assert!(insert(&pool, None, None, "Bob").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn add_rejects_duplicate_external_id() {
+        let pool = havn_db::connect_in_memory().await.expect("db");
+        insert(&pool, None, Some("alice"), "Alice")
+            .await
+            .expect("first");
+        let err = insert(&pool, None, Some("alice"), "Other")
+            .await
+            .expect_err("duplicate");
+        assert!(err.to_string().contains("already assigned"), "{err}");
+    }
 }

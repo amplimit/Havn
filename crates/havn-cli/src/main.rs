@@ -78,8 +78,9 @@ enum Command {
         action: CredentialAction,
     },
     /// Provision havn users (spec §1.7). Operator pre-populates the
-    /// users table with the X-User-IDs the upstream proxy will emit;
-    /// any header value that doesn't match an existing user gets 403.
+    /// users table with the identities the upstream proxy will emit
+    /// (internal UUID or external id); any header value that doesn't
+    /// match an existing user gets 403.
     /// CLI talks directly to the gateway DB — does not require the
     /// gateway to be running, and bypasses the normal auth path.
     User {
@@ -122,21 +123,38 @@ enum GatewayAction {
 
 #[derive(Debug, Subcommand)]
 enum UserAction {
-    /// Add a user with the given X-User-ID.
+    /// Add a user identified by an internal UUID, an external id, or both.
     Add {
-        /// X-User-ID value (UUID v7) the upstream proxy will emit.
-        /// Generate one with `uuidgen`, your SSO subject mapping, etc.
-        id: String,
+        /// Internal user id (UUID v7) the upstream proxy will emit.
+        /// Generated when omitted together with `--external-id`.
+        #[arg(required_unless_present = "external_id")]
+        id: Option<String>,
+        /// Username or email the upstream proxy emits in the trusted
+        /// header (for example `alice@example.com`). Matched exactly,
+        /// case-sensitively.
+        #[arg(long)]
+        external_id: Option<String>,
         /// Friendly name shown in the dashboard sidebar.
         #[arg(long)]
         display_name: String,
+    },
+    /// Attach, replace or clear the external id of an existing user.
+    SetExternalId {
+        /// Internal user id (UUID v7).
+        id: String,
+        /// Username or email the upstream proxy emits.
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        external_id: Option<String>,
+        /// Remove the external id instead of setting one.
+        #[arg(long)]
+        clear: bool,
     },
     /// List all provisioned users.
     List,
     /// Hard-delete a user. Cascades through their agents, credentials,
     /// memberships. Unrecoverable — be sure.
     Delete {
-        /// X-User-ID value to remove.
+        /// Internal user id (UUID v7) to remove.
         id: String,
     },
 }
@@ -349,7 +367,14 @@ async fn run_role(action: RoleAction) -> anyhow::Result<()> {
 
 async fn run_user(action: UserAction) -> anyhow::Result<()> {
     match action {
-        UserAction::Add { id, display_name } => user::add(&id, &display_name).await,
+        UserAction::Add {
+            id,
+            external_id,
+            display_name,
+        } => user::add(id.as_deref(), external_id.as_deref(), &display_name).await,
+        UserAction::SetExternalId {
+            id, external_id, ..
+        } => user::set_external_id(&id, external_id.as_deref()).await,
         UserAction::List => user::list().await,
         UserAction::Delete { id } => user::delete(&id).await,
     }
