@@ -18,7 +18,7 @@
 //! `havn-init`), seccomp in the runtime. The
 //! controller takes the cgroup root as a parameter so unit tests can
 //! substitute a tempdir; production binds
-//! `/sys/fs/cgroup` via [`Self::system`].
+//! `/sys/fs/cgroup` via [`CgroupController::system`].
 
 use std::fs;
 use std::io;
@@ -119,7 +119,7 @@ impl CgroupController {
             warn!(
                 slice = %slice.display(),
                 error = %e,
-                "cannot create havn.slice — install systemd unit with Delegate=yes or run as root"
+                "cannot create havn.slice — run the gateway as root (contrib/systemd/havn.service)"
             );
             return Err(CgroupError::SliceCreate(slice));
         }
