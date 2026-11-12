@@ -305,6 +305,7 @@ mod tests {
         let cfg = CliConfig {
             listen: None,
             db_path: Some(std::path::PathBuf::from("/var/lib/havn/havn.db")),
+            ..CliConfig::default()
         };
         assert_eq!(
             paths::pid_file(&cfg),

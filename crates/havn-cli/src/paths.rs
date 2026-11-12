@@ -1,5 +1,6 @@
 //! Path resolution shared across the new ops subcommands
-//! (`gateway`, `status`, `logs`, `doctor`).
+//! (`gateway`, `status`, `logs`, `doctor`), plus the channel accounts
+//! `invite` and `access` check against.
 //!
 //! The CLI doesn't run as the gateway, so it can't ask the gateway in-process
 //! where its files live. Instead it reads the same `config.toml` the gateway
@@ -10,6 +11,7 @@
 //! 2. `${XDG_CONFIG_HOME:-$HOME/.config}/havn/config.toml`.
 //! 3. None — caller falls back to compiled defaults.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -25,6 +27,38 @@ const ENV_CONFIG: &str = "HAVN_CONFIG";
 pub struct CliConfig {
     pub listen: Option<String>,
     pub db_path: Option<PathBuf>,
+    pub channels: BTreeMap<String, CliChannel>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CliChannel {
+    pub accounts: Vec<CliChannelAccount>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CliChannelAccount {
+    pub id: String,
+    pub dm_policy: Option<String>,
+    pub allow_from: Vec<String>,
+}
+
+impl CliChannelAccount {
+    /// The gateway's default policy is `allowlist`.
+    #[must_use]
+    pub fn is_allowlist(&self) -> bool {
+        self.dm_policy.as_deref().is_none_or(|p| p == "allowlist")
+    }
+}
+
+impl CliConfig {
+    #[must_use]
+    pub fn account(&self, channel: &str, account: &str) -> Option<&CliChannelAccount> {
+        self.channels
+            .get(channel)
+            .and_then(|c| c.accounts.iter().find(|a| a.id == account))
+    }
 }
 
 /// Where `config.toml` is — None if it doesn't exist anywhere we look.
@@ -141,6 +175,7 @@ mod tests {
         let cfg = CliConfig {
             listen: None,
             db_path: Some(PathBuf::from("/var/lib/havn/havn.db")),
+            ..CliConfig::default()
         };
         assert_eq!(data_dir(&cfg), PathBuf::from("/var/lib/havn"));
     }

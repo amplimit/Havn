@@ -146,12 +146,14 @@ pub struct ChannelAccount {
     /// resolvability, not naming convention.
     pub adapter_token_ref: String,
     /// DM access policy. Default `allowlist` — only senders listed in
-    /// `allow_from` may DM; empty list = deny all (safe default).
-    /// Operators with public bots set `open`.
+    /// `allow_from` or admitted with an invite code (`havn invite
+    /// create`) may DM; neither = deny all (safe default). Operators with
+    /// public bots set `open`.
     #[serde(default)]
     pub dm_policy: DmPolicy,
-    /// Platform-prefixed sender IDs allowed when `dm_policy = "allowlist"`.
-    /// Ignored under other policies.
+    /// Platform-prefixed sender IDs allowed when `dm_policy = "allowlist"`,
+    /// in addition to the invite allowlist in the DB. Ignored under other
+    /// policies.
     #[serde(default)]
     pub allow_from: Vec<String>,
 }
@@ -159,15 +161,34 @@ pub struct ChannelAccount {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DmPolicy {
-    /// Only senders listed in `allow_from` may DM. Empty list = deny
-    /// all. Safe failure direction: "nobody can use it" rather than
-    /// "everyone can use it".
+    /// Only senders listed in `allow_from` or admitted with an invite
+    /// code may DM. Neither = deny all. Safe failure direction: "nobody
+    /// can use it" rather than "everyone can use it".
     #[default]
     Allowlist,
     /// Any sender on the platform may DM. Use for public help bots or
     /// personal bots where the operator controls visibility at the
     /// platform level (e.g. Telegram bot handle is private).
     Open,
+}
+
+/// Why senders admitted by invite to `(channel, account_id)` are not in
+/// effect, or `None` when they are. Grants stay in the DB and apply
+/// again if the account comes back as `allowlist`.
+#[must_use]
+pub fn inactive_grant_reason(
+    channels: &std::collections::BTreeMap<String, ChannelEntry>,
+    channel: &str,
+    account_id: &str,
+) -> Option<&'static str> {
+    match channels
+        .get(channel)
+        .and_then(|entry| entry.accounts.iter().find(|a| a.id == account_id))
+    {
+        None => Some("account is not configured"),
+        Some(acct) if acct.dm_policy != DmPolicy::Allowlist => Some("dm_policy is not allowlist"),
+        Some(_) => None,
+    }
 }
 
 /// One cross-channel binding (spec §3.5). The same agent can have
@@ -573,6 +594,30 @@ mod tests {
         )
         .expect("legacy dead config blocks should be ignored");
         assert_eq!(parsed.reload.debounce_ms, 500);
+    }
+
+    #[test]
+    fn inactive_grant_reason_flags_missing_and_open_accounts() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+            [[channels.telegram.accounts]]
+            id = "team-bot"
+            adapter_token_ref = "secret:channel:telegram:team-bot"
+
+            [[channels.telegram.accounts]]
+            id = "public-bot"
+            adapter_token_ref = "secret:channel:telegram:public-bot"
+            dm_policy = "open"
+        "#,
+        )
+        .expect("parse");
+        assert_eq!(
+            inactive_grant_reason(&cfg.channels, "telegram", "team-bot"),
+            None
+        );
+        assert!(inactive_grant_reason(&cfg.channels, "telegram", "public-bot").is_some());
+        assert!(inactive_grant_reason(&cfg.channels, "telegram", "gone-bot").is_some());
+        assert!(inactive_grant_reason(&cfg.channels, "slack", "team-bot").is_some());
     }
 
     #[test]
