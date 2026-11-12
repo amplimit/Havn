@@ -4,12 +4,10 @@
  * the gateway at runtime, so `HAVN_GATEWAY_URL` takes effect without
  * a rebuild and dev and production share one code path.
  *
- * This is the cleanest fit for spec §1.7: the gateway stays loopback-
- * only (no `trust_header` + no public bind), and the dashboard plays
- * the role of the "upstream proxy" — auth happens in the dashboard
- * (single-user mode here means bootstrap user is implicit; multi-user
- * deployments would put a real auth proxy between the browser and
- * this dashboard, then forward X-User-ID to gateway via fetch headers).
+ * The dashboard has no login of its own, so it listens on 127.0.0.1 by
+ * default. In multi-user mode an authenticating proxy in front of it
+ * sets X-User-ID; that header is forwarded to the gateway only from the
+ * peers listed in HAVN_DASHBOARD_TRUSTED_PROXIES and dropped otherwise.
  *
  * WS path: browser opens `ws://<dashboard-host>:3000/ws/chat/<id>?token=…`,
  * we open a raw TCP socket to the gateway (default `127.0.0.1:8080`),
@@ -24,7 +22,17 @@ import next from "next";
 
 const DEV = process.argv.includes("--dev");
 const PORT = Number(process.env.PORT ?? 3000);
-const HOSTNAME = process.env.HOSTNAME ?? "0.0.0.0";
+// Not HOSTNAME: shells and containers often export it as the machine
+// name, which would bind the dashboard to a network interface.
+// `||`, not `??`: an empty value (e.g. `Environment=HAVN_DASHBOARD_HOST=`)
+// would otherwise make Node listen on every interface.
+const HOST = process.env.HAVN_DASHBOARD_HOST || "127.0.0.1";
+const TRUSTED_PROXIES = (process.env.HAVN_DASHBOARD_TRUSTED_PROXIES ?? "")
+  .split(",")
+  .map((entry) => entry.trim())
+  .filter(Boolean);
+const IDENTITY_HEADER = "x-user-id";
+const MAX_UPGRADE_RESPONSE_HEAD = 16 * 1024;
 const GATEWAY = process.env.HAVN_GATEWAY_URL ?? "http://127.0.0.1:8080";
 const WS_PREFIX = "/ws/";
 const API_PREFIX = "/api/";
@@ -66,9 +74,20 @@ const gatewayUrl = parseGatewayUrl(GATEWAY);
 const GATEWAY_HOST = gatewayUrl.hostname.replace(/^\[|\]$/g, "");
 const GATEWAY_PORT = Number(gatewayUrl.port || 80);
 
-const app = next({ dev: DEV, hostname: HOSTNAME, port: PORT });
+const app = next({ dev: DEV, hostname: HOST, port: PORT });
 await app.prepare();
 const handle = app.getRequestHandler();
+
+function peerAddress(req) {
+  const addr = req.socket.remoteAddress ?? "";
+  return addr.startsWith("::ffff:") ? addr.slice("::ffff:".length) : addr;
+}
+
+// Only an authenticating proxy listed in HAVN_DASHBOARD_TRUSTED_PROXIES
+// may tell the gateway who the user is.
+function mayAssertIdentity(req) {
+  return TRUSTED_PROXIES.includes(peerAddress(req));
+}
 
 function endToEndHeaders(headers) {
   const out = {};
@@ -80,14 +99,33 @@ function endToEndHeaders(headers) {
   return out;
 }
 
+function forwardedHeaders(req) {
+  const headers = { ...endToEndHeaders(req.headers), host: gatewayUrl.host };
+  if (!mayAssertIdentity(req)) delete headers[IDENTITY_HEADER];
+  // A chunked request body must stay chunked upstream. Without framing,
+  // Node writes the decoded body of a GET/DELETE/OPTIONS as raw bytes on
+  // a keep-alive connection, and the gateway parses them as a second
+  // request (which would carry whatever X-User-ID the client chose).
+  if (req.headers["transfer-encoding"] !== undefined) {
+    headers["transfer-encoding"] = "chunked";
+  }
+  return headers;
+}
+
 function proxyApi(req, res) {
+  const te = req.headers["transfer-encoding"];
+  if (te !== undefined && te.trim().toLowerCase() !== "chunked") {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "unsupported transfer-encoding" }));
+    return;
+  }
   const upstream = httpRequest(
     {
       host: GATEWAY_HOST,
       port: GATEWAY_PORT,
       method: req.method,
       path: req.url.slice(API_PREFIX.length - 1),
-      headers: { ...endToEndHeaders(req.headers), host: gatewayUrl.host },
+      headers: forwardedHeaders(req),
     },
     (upstreamRes) => {
       res.writeHead(upstreamRes.statusCode ?? 502, endToEndHeaders(upstreamRes.headers));
@@ -136,27 +174,46 @@ server.on("upgrade", (req, clientSocket, head) => {
     return;
   }
   const upstream = netConnect({ host: GATEWAY_HOST, port: GATEWAY_PORT }, () => {
-    // Replay the original HTTP/1.1 Upgrade request bytes so the
-    // gateway sees the same Sec-WebSocket-* headers + path. We
-    // OVERWRITE the `Origin` header to a canonical loopback value
-    // — the gateway's allowlist (spec §3.2 ClawJacked defense) is
-    // configured for `http://127.0.0.1:<dashboard-port>` and we
-    // don't want to expand that allowlist every time the operator
-    // accesses the dashboard via a different hostname (SSH tunnel
-    // localhost / public IP / DNS / VPN). The dashboard IS the
-    // upstream auth boundary in havn's deploy model (spec §1.7);
-    // the gateway trusts whatever Origin the dashboard forwards.
+    // Replay the Upgrade request with Origin set to the dashboard's own
+    // loopback origin, which the gateway's allowed_origins lists by
+    // default; browsers reach the dashboard under many hostnames (SSH
+    // tunnel, proxy domain), so their Origin cannot be listed upfront.
     const canonicalOrigin = `http://127.0.0.1:${PORT}`;
+    const trusted = mayAssertIdentity(req);
     const headerLines = Object.entries(req.headers)
       .filter(([k, v]) => v !== undefined && k.toLowerCase() !== "origin")
+      .filter(([k]) => trusted || k.toLowerCase() !== IDENTITY_HEADER)
       .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(", ") : v}`);
     headerLines.push(`origin: ${canonicalOrigin}`);
     const requestLine = `${req.method} ${req.url} HTTP/${req.httpVersion}`;
     upstream.write(`${requestLine}\r\n${headerLines.join("\r\n")}\r\n\r\n`);
-    if (head?.length) upstream.write(head);
-    // Bidirectional byte pipe — the WS framing is opaque to us.
-    upstream.pipe(clientSocket);
-    clientSocket.pipe(upstream);
+
+    // Forward nothing else until the gateway has switched protocols.
+    // Bytes the client sent after its Upgrade request (`head`, or later)
+    // would otherwise reach the gateway as further HTTP requests on this
+    // loopback connection if it refused the upgrade.
+    let response = Buffer.alloc(0);
+    const onResponse = (chunk) => {
+      response = Buffer.concat([response, chunk]);
+      if (response.indexOf("\r\n\r\n") === -1) {
+        if (response.length > MAX_UPGRADE_RESPONSE_HEAD) tearDown();
+        return;
+      }
+      upstream.off("data", onResponse);
+      const statusLine = response.subarray(0, response.indexOf("\r\n")).toString("latin1");
+      if (!/^HTTP\/1\.1 101 /.test(statusLine)) {
+        // Relay the refusal and close; never forward further requests.
+        clientSocket.end(response);
+        upstream.destroy();
+        return;
+      }
+      clientSocket.write(response);
+      if (head?.length) upstream.write(head);
+      // The WebSocket framing is opaque to us from here on.
+      upstream.pipe(clientSocket);
+      clientSocket.pipe(upstream);
+    };
+    upstream.on("data", onResponse);
   });
   const tearDown = () => {
     upstream.destroy();
@@ -168,8 +225,11 @@ server.on("upgrade", (req, clientSocket, head) => {
   clientSocket.on("close", () => upstream.destroy());
 });
 
-server.listen(PORT, HOSTNAME, () => {
-  console.log(`havn dashboard listening on http://${HOSTNAME}:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`havn dashboard listening on http://${HOST}:${PORT}`);
+  console.log(
+    `  X-User-ID accepted from: ${TRUSTED_PROXIES.length ? TRUSTED_PROXIES.join(", ") : "nobody"}`,
+  );
   console.log(`  /api and /ws proxy → ${GATEWAY_HOST}:${GATEWAY_PORT}${DEV ? " (dev)" : ""}`);
 });
 
