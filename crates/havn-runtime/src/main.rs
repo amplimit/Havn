@@ -606,6 +606,23 @@ async fn main() -> anyhow::Result<()> {
             }
         })
     };
+    // 5'. Liveness pings (the gateway restarts an agent that goes silent).
+    //     A task of its own, so long LLM calls and tools do not delay them;
+    //     they stop when the whole process stalls (frozen, wedged runtime,
+    //     blocked writer).
+    let _liveness_task = {
+        let writer_tx = writer_tx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(havn_proto::LIVENESS_PING_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if writer_tx.send(AgentToGateway::LivenessPing).await.is_err() {
+                    break;
+                }
+            }
+        })
+    };
     let parent_messages = Arc::new(RwLock::new(Vec::<serde_json::Value>::new()));
 
     // 5b. Background memory aging pass (spec §9.4). Detached task; the

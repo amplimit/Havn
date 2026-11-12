@@ -8,10 +8,16 @@
 //!    successful Hello/Welcome handshake. Wires the outbound channel.
 //!
 //! Detach + remove run in reverse on disconnect / stop.
+//!
+//! Each registration gets a generation number. Whoever notices that an
+//! instance ended (its exit, or its liveness pings stopping) removes it by
+//! generation, so a stale observer can never remove a newer instance and
+//! the instance an operator stopped is not mistaken for a crash.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use havn_core::AgentId;
 use havn_proto::GatewayToAgent;
@@ -24,11 +30,16 @@ use tracing::warn;
 #[derive(Debug, Clone, Default)]
 pub struct AgentRegistry {
     inner: Arc<Mutex<HashMap<AgentId, Entry>>>,
+    generations: Arc<AtomicU64>,
+    /// Woken on every registration, for connections that arrive first.
+    registered: Arc<Notify>,
 }
 
 #[derive(Debug)]
 struct Entry {
     handle: AgentHandle,
+    generation: u64,
+    registered_at: Instant,
     /// Set after the agent's runtime process connects and exchanges Hello.
     tx: Option<mpsc::Sender<GatewayToAgent>>,
     /// In-flight caps, kept per agent so reconnecting does not reset them.
@@ -37,6 +48,67 @@ struct Entry {
     /// Tells the writer of the connection that attached `tx` to give up;
     /// set and cleared together with `tx`.
     disconnect: Option<Arc<Notify>>,
+    connected_at: Option<Instant>,
+    /// When the connection's reader last received or finished handling a
+    /// frame, and whether a `LivenessPing` has been among them.
+    last_frame: Option<Instant>,
+    pinging: bool,
+    /// Since when the reader has been handling a frame. Gateway-side work
+    /// (a slow delivery) keeps it from reading pings, which counts against
+    /// the agent only past [`LivenessLimits::busy`].
+    busy_since: Option<Instant>,
+}
+
+/// How long an instance may stay quiet before it counts as hung.
+#[derive(Debug, Clone, Copy)]
+pub struct LivenessLimits {
+    /// Between frames, once the runtime has started pinging.
+    pub silence: Duration,
+    /// From spawn to Hello: opening agent.db, migrations, skill indexing.
+    pub connect: Duration,
+    /// From Hello to the first ping: embedder and MCP server start-up.
+    pub first_ping: Duration,
+    /// Handling one frame; past this the connection counts as hung too.
+    pub busy: Duration,
+}
+
+impl Entry {
+    /// How long the instance has been quiet, if that exceeds the limit
+    /// for the phase it is in.
+    fn overdue(&self, now: Instant, limits: &LivenessLimits) -> Option<Duration> {
+        let (since, limit) = match (self.busy_since, self.pinging, self.last_frame) {
+            (Some(busy), _, _) => (busy, limits.busy),
+            (None, true, Some(frame)) => (frame, limits.silence),
+            (None, _, _) => match self.connected_at {
+                Some(connected) => (connected, limits.first_ping),
+                None => (self.registered_at, limits.connect),
+            },
+        };
+        let quiet = now.saturating_duration_since(since);
+        (quiet > limit).then_some(quiet)
+    }
+
+    fn is_connection(&self, tx: &mpsc::Sender<GatewayToAgent>) -> bool {
+        self.tx
+            .as_ref()
+            .is_some_and(|current| current.same_channel(tx))
+    }
+}
+
+/// An instance that was removed from the registry, with what is needed to
+/// clean it up and judge how long it ran.
+#[derive(Debug, Clone)]
+pub struct Instance {
+    pub handle: AgentHandle,
+    pub registered_at: Instant,
+}
+
+/// An instance that has been silent for longer than allowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Silent {
+    pub agent_id: AgentId,
+    pub generation: u64,
+    pub silent_for: Duration,
 }
 
 /// Caps on `LlmRequest` / `AgentQuery` frames one agent may have handled at
@@ -96,14 +168,22 @@ impl AgentRegistry {
         Self::default()
     }
 
-    /// Record the spawner-returned handle. Subsequent `attach` will wire the tx.
-    pub async fn register(&self, handle: AgentHandle) {
+    /// Record the spawner-returned handle. Subsequent `attach` will wire the
+    /// tx. Returns the generation that identifies this instance.
+    pub async fn register(&self, handle: AgentHandle) -> u64 {
         let id = handle.agent_id;
+        let generation = self.generations.fetch_add(1, Ordering::Relaxed) + 1;
         let replaced = self.inner.lock().await.insert(
             id,
             Entry {
                 handle,
+                generation,
+                registered_at: Instant::now(),
                 tx: None,
+                connected_at: None,
+                last_frame: None,
+                pinging: false,
+                busy_since: None,
                 llm_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_LLM_REQUESTS)),
                 query_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_AGENT_QUERIES)),
                 disconnect: None,
@@ -112,6 +192,26 @@ impl AgentRegistry {
         // Nothing can reach a connection of the replaced entry any more.
         if let Some(signal) = replaced.and_then(|e| e.disconnect) {
             signal.notify_waiters();
+        }
+        self.registered.notify_waiters();
+        generation
+    }
+
+    /// Wait up to `limit` for `agent_id` to be registered. The spawner
+    /// returns the handle only after the runtime has started, so under load
+    /// its Hello can arrive before the registration it belongs to.
+    pub async fn wait_registered(&self, agent_id: AgentId, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            let registered = self.registered.notified();
+            tokio::pin!(registered);
+            registered.as_mut().enable();
+            if self.is_registered(agent_id).await {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, registered).await.is_err() {
+                return self.is_registered(agent_id).await;
+            }
         }
     }
 
@@ -178,8 +278,63 @@ impl AgentRegistry {
             return Err(AttachError::AlreadyConnected(agent_id));
         }
         entry.tx = Some(tx);
+        entry.connected_at = Some(Instant::now());
         entry.disconnect = Some(Arc::new(Notify::new()));
         Ok(())
+    }
+
+    /// The reader of connection `tx` received a frame and starts handling
+    /// it. Any frame is a sign of life; a ping also arms the silence check.
+    pub async fn frame_received(
+        &self,
+        agent_id: AgentId,
+        tx: &mpsc::Sender<GatewayToAgent>,
+        ping: bool,
+    ) {
+        self.frame_received_at(agent_id, tx, ping, Instant::now())
+            .await;
+    }
+
+    async fn frame_received_at(
+        &self,
+        agent_id: AgentId,
+        tx: &mpsc::Sender<GatewayToAgent>,
+        ping: bool,
+        at: Instant,
+    ) {
+        if let Some(entry) = self.inner.lock().await.get_mut(&agent_id)
+            && entry.is_connection(tx)
+        {
+            entry.last_frame = Some(at);
+            entry.pinging |= ping;
+            entry.busy_since = Some(at);
+        }
+    }
+
+    /// The reader of connection `tx` is done with its frame and reads again.
+    pub async fn frame_handled(&self, agent_id: AgentId, tx: &mpsc::Sender<GatewayToAgent>) {
+        if let Some(entry) = self.inner.lock().await.get_mut(&agent_id)
+            && entry.is_connection(tx)
+        {
+            entry.last_frame = Some(Instant::now());
+            entry.busy_since = None;
+        }
+    }
+
+    /// Instances quiet for longer than `limits` allow (see [`Entry::overdue`]).
+    pub async fn silent(&self, now: Instant, limits: &LivenessLimits) -> Vec<Silent> {
+        self.inner
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(id, e)| {
+                e.overdue(now, limits).map(|silent_for| Silent {
+                    agent_id: *id,
+                    generation: e.generation,
+                    silent_for,
+                })
+            })
+            .collect()
     }
 
     /// Drop the outbound channel without removing the registry entry.
@@ -188,12 +343,10 @@ impl AgentRegistry {
         // Only the connection that attached `tx` may clear it; a newer
         // connection may already have taken its place.
         if let Some(entry) = self.inner.lock().await.get_mut(&agent_id)
-            && entry
-                .tx
-                .as_ref()
-                .is_some_and(|current| current.same_channel(tx))
+            && entry.is_connection(tx)
         {
             entry.tx = None;
+            entry.busy_since = None;
             entry.disconnect = None;
         }
     }
@@ -201,6 +354,28 @@ impl AgentRegistry {
     /// Remove the entry entirely; returns the spawner handle so callers can stop the process.
     pub async fn remove(&self, agent_id: AgentId) -> Option<AgentHandle> {
         self.inner.lock().await.remove(&agent_id).map(|e| e.handle)
+    }
+
+    /// Remove the entry only if it is still instance `generation`.
+    pub async fn remove_generation(&self, agent_id: AgentId, generation: u64) -> Option<Instance> {
+        let mut map = self.inner.lock().await;
+        if map.get(&agent_id)?.generation != generation {
+            return None;
+        }
+        map.remove(&agent_id).map(|e| Instance {
+            handle: e.handle,
+            registered_at: e.registered_at,
+        })
+    }
+
+    /// Remove every entry (gateway shutdown).
+    pub async fn drain(&self) -> Vec<AgentHandle> {
+        self.inner
+            .lock()
+            .await
+            .drain()
+            .map(|(_, e)| e.handle)
+            .collect()
     }
 
     async fn sender(&self, agent_id: AgentId) -> Result<mpsc::Sender<GatewayToAgent>, SendError> {
@@ -282,10 +457,7 @@ mod tests {
     use super::*;
 
     fn fake_handle() -> AgentHandle {
-        AgentHandle {
-            agent_id: AgentId::new(),
-            pid: 12345,
-        }
+        AgentHandle::new(AgentId::new(), 12345)
     }
 
     #[tokio::test]
@@ -485,6 +657,177 @@ mod tests {
         assert!(!reg.is_connected(id).await);
         // Handle still present.
         assert!(reg.remove(id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn wait_registered_returns_once_the_agent_is_registered() {
+        let reg = AgentRegistry::new();
+        let handle = fake_handle();
+        let id = handle.agent_id;
+        let waiter = {
+            let reg = reg.clone();
+            tokio::spawn(async move { reg.wait_registered(id, Duration::from_secs(5)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reg.register(handle).await;
+        let found = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("woken by the registration")
+            .expect("join");
+        assert!(found);
+
+        let missing = AgentId::new();
+        assert!(
+            !reg.wait_registered(missing, Duration::from_millis(50))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_generation_only_removes_that_instance() {
+        let reg = AgentRegistry::new();
+        let handle = fake_handle();
+        let id = handle.agent_id;
+        let first = reg.register(handle.clone()).await;
+        let second = reg.register(handle).await;
+        assert_ne!(first, second);
+
+        assert!(
+            reg.remove_generation(id, first).await.is_none(),
+            "an observer of the old instance must not remove the new one"
+        );
+        assert!(reg.is_registered(id).await);
+        let removed = reg.remove_generation(id, second).await.expect("current");
+        assert_eq!(removed.handle.agent_id, id);
+        assert!(!reg.is_registered(id).await);
+        assert!(reg.remove_generation(id, second).await.is_none());
+    }
+
+    const LIMITS: LivenessLimits = LivenessLimits {
+        silence: Duration::from_secs(60),
+        connect: Duration::from_secs(300),
+        first_ping: Duration::from_secs(600),
+        busy: Duration::from_secs(600),
+    };
+
+    #[tokio::test]
+    async fn silence_counts_from_the_last_frame_once_pinging() {
+        let reg = AgentRegistry::new();
+        let handle = fake_handle();
+        let id = handle.agent_id;
+        let generation = reg.register(handle).await;
+        let (tx, _rx) = mpsc::channel(8);
+        reg.attach(id, tx.clone()).await.expect("attach");
+        let start = Instant::now();
+
+        // Connected, never pinged: still starting up, judged only by the
+        // generous first-ping limit.
+        assert!(
+            reg.silent(start + LIMITS.silence * 5, &LIMITS)
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            reg.silent(start + LIMITS.first_ping * 2, &LIMITS)
+                .await
+                .len(),
+            1
+        );
+
+        reg.frame_received_at(id, &tx, true, start).await;
+        reg.frame_handled(id, &tx).await;
+        let handled = Instant::now();
+        assert!(
+            reg.silent(handled + LIMITS.silence / 2, &LIMITS)
+                .await
+                .is_empty()
+        );
+        let silent = reg.silent(handled + LIMITS.silence * 2, &LIMITS).await;
+        assert_eq!(silent.len(), 1);
+        assert_eq!(silent[0].generation, generation);
+        assert!(silent[0].silent_for >= LIMITS.silence * 2);
+
+        // Any frame counts as a sign of life, a ping or not.
+        let later = handled + LIMITS.silence * 2;
+        reg.frame_received_at(id, &tx, false, later).await;
+        assert!(reg.silent(later, &LIMITS).await.is_empty());
+        reg.frame_handled(id, &tx).await;
+        let handled = Instant::now();
+        assert!(
+            reg.silent(handled + LIMITS.silence / 2, &LIMITS)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_is_not_judged_while_its_reader_is_busy() {
+        let reg = AgentRegistry::new();
+        let handle = fake_handle();
+        let id = handle.agent_id;
+        reg.register(handle).await;
+        let (tx, _rx) = mpsc::channel(8);
+        reg.attach(id, tx.clone()).await.expect("attach");
+        let start = Instant::now();
+
+        // A frame whose delivery stalls on the gateway side: excused for a
+        // while, but not forever.
+        reg.frame_received_at(id, &tx, true, start).await;
+        assert!(
+            reg.silent(start + LIMITS.silence * 5, &LIMITS)
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            reg.silent(start + LIMITS.busy * 2, &LIMITS).await.len(),
+            1,
+            "a reader stuck on one frame for too long counts as hung"
+        );
+        reg.frame_handled(id, &tx).await;
+        assert_eq!(
+            reg.silent(Instant::now() + LIMITS.silence * 2, &LIMITS)
+                .await
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn frames_from_an_old_connection_do_not_count() {
+        let reg = AgentRegistry::new();
+        let handle = fake_handle();
+        let id = handle.agent_id;
+        reg.register(handle).await;
+        let (old, old_rx) = mpsc::channel(8);
+        reg.attach(id, old.clone()).await.expect("attach");
+        drop(old_rx);
+        let (new, _new_rx) = mpsc::channel(8);
+        reg.attach(id, new).await.expect("reconnect");
+
+        reg.frame_received_at(id, &old, true, Instant::now()).await;
+        assert!(
+            reg.silent(Instant::now() + LIMITS.silence * 2, &LIMITS)
+                .await
+                .is_empty(),
+            "a ping from the old connection must not arm the new one"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_instance_that_never_connects_counts_as_silent() {
+        let reg = AgentRegistry::new();
+        let handle = fake_handle();
+        let id = handle.agent_id;
+        reg.register(handle).await;
+        let now = Instant::now();
+        assert!(
+            reg.silent(now + LIMITS.silence * 2, &LIMITS)
+                .await
+                .is_empty()
+        );
+        let silent = reg.silent(now + LIMITS.connect * 2, &LIMITS).await;
+        assert_eq!(silent.len(), 1);
+        assert_eq!(silent[0].agent_id, id);
     }
 
     #[tokio::test]

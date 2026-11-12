@@ -9,7 +9,8 @@
 //! 5. Per-connection reader loop dispatches inbound frames:
 //!    - `LlmRequest` → spawn proxy task → reply with `LlmResponse`
 //!    - `OutboundMessage` → route via channel adapter (Phase 1: log only)
-//!    - `LivenessPing` → record (Phase 2: drives unhealthy-agent detection)
+//!    - every frame, `LivenessPing` included, is recorded in the registry;
+//!      the supervisor restarts agents that go quiet (`crate::supervisor`)
 
 use std::path::Path;
 use std::str::FromStr as _;
@@ -42,6 +43,9 @@ use havn_core::Policy;
 use havn_db::repo::agents as agents_repo;
 
 const OUTBOUND_QUEUE_CAPACITY: usize = 64;
+
+/// How long a Hello may wait for the registration of its agent.
+const REGISTRATION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Longest one frame write may take. A runtime that stops reading its socket
 /// is disconnected after this, which also releases every task waiting for
@@ -323,6 +327,31 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
         anyhow::bail!("agent {agent_id}: connecting process is not in the agent's cgroup");
     }
 
+    // A runtime can say Hello before the spawn that started it has
+    // registered its handle. Give the registration a moment, then check
+    // the peer again: it must still be a live process in the agent's
+    // cgroup, not one a clean-up killed while we waited.
+    if !ctx.registry.is_registered(agent_id).await {
+        if !ctx
+            .registry
+            .wait_registered(agent_id, REGISTRATION_WAIT)
+            .await
+        {
+            anyhow::bail!("refusing connection for agent {agent_id}: not registered");
+        }
+        if ctx.verify_peer_cgroup {
+            let now_in = self::peer_cgroup(reader.get_ref().as_ref()).await;
+            if !peer_cgroup_is_agents(now_in.as_deref(), agent_id) {
+                warn!(
+                    %agent_id,
+                    peer_cgroup = now_in.as_deref().map(str::trim_end),
+                    "refusing agent connection: the peer left the agent's cgroup while waiting"
+                );
+                anyhow::bail!("agent {agent_id}: connecting process is no longer in its cgroup");
+            }
+        }
+    }
+
     // Attach before sending Welcome, so a second connection for an agent
     // that is already connected is refused before it learns anything.
     let (tx, rx) = mpsc::channel::<GatewayToAgent>(OUTBOUND_QUEUE_CAPACITY);
@@ -432,7 +461,7 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
 
     // 5. Reader loop; the connection also ends when the writer gives up.
     let reader_result = tokio::select! {
-        result = run_reader(&mut reader, agent_id, &ctx) => Some(result),
+        result = run_reader(&mut reader, agent_id, &tx, &ctx) => Some(result),
         _ = &mut writer_task => None,
     };
 
@@ -646,228 +675,238 @@ async fn refuse(ctx: &AgentSocketCtx, agent_id: AgentId, refusal: GatewayToAgent
 async fn run_reader<R>(
     reader: &mut R,
     agent_id: AgentId,
+    tx: &mpsc::Sender<GatewayToAgent>,
     ctx: &AgentSocketCtx,
 ) -> Result<(), FrameError>
 where
     R: AsyncBufRead + Unpin,
 {
     while let Some(frame) = read_frame::<_, AgentToGateway>(reader).await? {
-        match frame {
-            AgentToGateway::Hello { .. } => {
-                warn!(%agent_id, "duplicate Hello after handshake — ignoring");
-            }
-            AgentToGateway::OutboundMessage(msg) => {
-                // Three dispatch cases by channel_id shape:
-                //  1. "broadcast" sentinel — fan out to all open WebChat
-                //     sessions for this agent (heartbeat/cron output).
-                //  2. `ch|<channel>|<account>|<sender>` — channel adapter
-                //     codec (spec §3, channel_id_codec). Decode +
-                //     deliver via channel_router to the right WS.
-                //  3. Anything else — assumed to be a WebChat session
-                //     UUID; route via webchat_router.
-                if msg.channel_id == "broadcast" {
-                    let n = ctx.webchat_router.broadcast(agent_id, msg).await;
-                    debug!(%agent_id, sessions = n, "broadcast outbound delivered");
-                } else if let Some((channel, account_id, sender_id)) =
-                    crate::channel_id_codec::decode(&msg.channel_id)
-                {
-                    if let Err(refusal) = crate::channel_router::outbound_permitted(
-                        &ctx.bindings,
-                        &ctx.channels,
-                        agent_id,
-                        channel,
-                        account_id,
-                        sender_id,
-                    ) {
-                        warn!(
-                            %agent_id,
-                            channel,
-                            account = account_id,
-                            reason = refusal.as_str(),
-                            "dropping channel-adapter outbound"
-                        );
-                        continue;
-                    }
-                    // Channel-adapter outbound. Translate havn-core's
-                    // MessageContent into havn-proto's
-                    // ChannelMessageContent and push via the router.
-                    use havn_core::MessageContent;
-                    use havn_proto::channel::ChannelMessageContent;
-                    let translated = match msg.content {
-                        MessageContent::Text { text } => Some(ChannelMessageContent::Text { text }),
-                        MessageContent::Image { url, caption } => {
-                            Some(ChannelMessageContent::Image { url, caption })
-                        }
-                        MessageContent::File { url, filename } => {
-                            Some(ChannelMessageContent::File { url, filename })
-                        }
-                        // Agents rarely emit Audio / Location / Contact
-                        // outbound — these are user-input shapes. When
-                        // they DO emit one (e.g., an agent skill that
-                        // shares a location), we flatten to Text so the
-                        // adapter doesn't need a per-platform "send
-                        // location" pathway. Future Layer when needed.
-                        MessageContent::Audio { transcript, .. } => {
-                            Some(ChannelMessageContent::Text { text: transcript })
-                        }
-                        MessageContent::Location {
-                            latitude,
-                            longitude,
-                            name,
-                            ..
-                        } => {
-                            let label = name.unwrap_or_default();
-                            let coords = format!("{latitude:.6},{longitude:.6}");
-                            let text = if label.is_empty() {
-                                format!("[location: {coords}]")
-                            } else {
-                                format!("[location: {coords} ({label})]")
-                            };
-                            Some(ChannelMessageContent::Text { text })
-                        }
-                        MessageContent::Contact {
-                            display_name,
-                            phone_number,
-                            ..
-                        } => {
-                            let text = match phone_number {
-                                Some(ph) => format!("[contact: {display_name} {ph}]"),
-                                None => format!("[contact: {display_name}]"),
-                            };
-                            Some(ChannelMessageContent::Text { text })
-                        }
-                        // MessageContent is non_exhaustive in havn-core;
-                        // future variants without a channel counterpart
-                        // are dropped with a warn (we can't surface them
-                        // through this path).
-                        _ => None,
-                    };
-                    match translated {
-                        Some(content) => {
-                            if let Err(e) = ctx
-                                .channel_router
-                                .deliver(channel, account_id, sender_id, msg.reply_to, content)
-                                .await
-                            {
-                                warn!(
-                                    %agent_id,
-                                    channel,
-                                    account = account_id,
-                                    error = %e,
-                                    "could not deliver outbound to channel adapter (offline?)"
-                                );
-                            }
-                        }
-                        None => {
-                            warn!(%agent_id, "dropping channel-adapter outbound: unsupported MessageContent variant")
-                        }
-                    }
-                } else if let Err(e) = ctx.webchat_router.deliver(agent_id, msg).await {
-                    warn!(%agent_id, error = %e, "could not deliver outbound to webchat");
-                }
-            }
-            AgentToGateway::LlmRequest(req) => {
-                if req.request_id.len() > MAX_REQUEST_ID_BYTES {
-                    warn!(%agent_id, len = req.request_id.len(), "dropping LlmRequest with an oversized request_id");
-                    continue;
-                }
-                let Some(permit) = ctx.registry.try_reserve(agent_id, Slot::Llm).await else {
-                    warn!(%agent_id, limit = MAX_INFLIGHT_LLM_REQUESTS, "too many LLM requests in flight; refusing one");
-                    let refusal = GatewayToAgent::LlmResponse(LlmResponse {
-                        request_id: req.request_id,
-                        outcome: LlmOutcome::Error {
-                            message: format!(
-                                "this agent already has {MAX_INFLIGHT_LLM_REQUESTS} LLM requests in flight; retry when one finishes"
-                            ),
-                        },
-                        provider_response: serde_json::Value::Null,
-                        usage: None,
-                    });
-                    refuse(ctx, agent_id, refusal).await;
-                    continue;
-                };
-                let ctx_cloned = ctx.clone();
-                tokio::spawn(async move {
-                    handle_llm_request(agent_id, req, ctx_cloned).await;
-                    drop(permit);
-                });
-            }
-            AgentToGateway::LivenessPing => {
-                debug!(%agent_id, "liveness ping");
-            }
-            AgentToGateway::CronResult(result) => {
-                let job_id = result.job_id.clone();
-                match ctx.cron_scheduler.record_result(agent_id, result).await {
-                    Ok(()) => {}
-                    Err(e @ crate::cron::CronError::NotPending(_)) => {
-                        warn!(%agent_id, %job_id, error = %e, "rejecting unsolicited CronResult");
-                    }
-                    Err(e @ crate::cron::CronError::ExpiredRun(_)) => {
-                        info!(%agent_id, %job_id, error = %e, "dropping CronResult: result for an expired run");
-                    }
-                    Err(e) => {
-                        warn!(%agent_id, %job_id, error = %e, "cron result recording failed");
-                    }
-                }
-            }
-            AgentToGateway::MemoryForgetResponse(resp) => {
-                ctx.admin_rpc
-                    .resolve(agent_id, &resp.request_id, resp.outcome)
-                    .await;
-            }
-            AgentToGateway::SkillPinResponse(resp) => {
-                ctx.admin_rpc
-                    .resolve(agent_id, &resp.request_id, resp.outcome)
-                    .await;
-            }
-            AgentToGateway::DataResponse(resp) => {
-                ctx.admin_rpc
-                    .resolve(agent_id, &resp.request_id, resp.outcome)
-                    .await;
-            }
-            AgentToGateway::AgentQuery(query) => {
-                // Caller-side initiation. Spawn so a slow target doesn't
-                // block the caller's reader loop; at most
-                // MAX_INFLIGHT_AGENT_QUERIES per caller, each bounded by
-                // the timeout enforced inside the handler.
-                if query.request_id.len() > MAX_REQUEST_ID_BYTES {
-                    warn!(%agent_id, len = query.request_id.len(), "dropping AgentQuery with an oversized request_id");
-                    continue;
-                }
-                let Some(permit) = ctx.registry.try_reserve(agent_id, Slot::Query).await else {
-                    warn!(%agent_id, limit = MAX_INFLIGHT_AGENT_QUERIES, "too many agent queries in flight; refusing one");
-                    let refusal = GatewayToAgent::AgentQueryResult(AgentQueryResult {
-                        request_id: query.request_id,
-                        outcome: AgentQueryOutcome::Error {
-                            message: format!(
-                                "this agent already has {MAX_INFLIGHT_AGENT_QUERIES} queries in flight; retry when one finishes"
-                            ),
-                        },
-                        text: String::new(),
-                        transcript: serde_json::Value::Null,
-                    });
-                    refuse(ctx, agent_id, refusal).await;
-                    continue;
-                };
-                let ctx_cloned = ctx.clone();
-                tokio::spawn(async move {
-                    handle_agent_query(agent_id, query, ctx_cloned).await;
-                    drop(permit);
-                });
-            }
-            AgentToGateway::AgentQueryResponse(resp) => {
-                // Callee-side reply — match against pending broker entry
-                // so the caller-side handler can wake.
-                ctx.query_broker.resolve(agent_id, resp).await;
-            }
-            // The protocol enum is `#[non_exhaustive]`; future variants land
-            // here so older gateways gracefully ignore frames they don't know.
-            other => {
-                warn!(%agent_id, ?other, "unknown frame variant — ignoring");
-            }
-        }
+        // Every frame is a sign of life. While a frame is being handled
+        // (a delivery can wait on a slow client) the agent is not judged
+        // for the pings this reader is not reading.
+        let ping = matches!(frame, AgentToGateway::LivenessPing);
+        ctx.registry.frame_received(agent_id, tx, ping).await;
+        dispatch(agent_id, frame, ctx).await;
+        ctx.registry.frame_handled(agent_id, tx).await;
     }
     Ok(())
+}
+
+async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx) {
+    match frame {
+        AgentToGateway::Hello { .. } => {
+            warn!(%agent_id, "duplicate Hello after handshake — ignoring");
+        }
+        AgentToGateway::OutboundMessage(msg) => {
+            // Three dispatch cases by channel_id shape:
+            //  1. "broadcast" sentinel — fan out to all open WebChat
+            //     sessions for this agent (heartbeat/cron output).
+            //  2. `ch|<channel>|<account>|<sender>` — channel adapter
+            //     codec (spec §3, channel_id_codec). Decode +
+            //     deliver via channel_router to the right WS.
+            //  3. Anything else — assumed to be a WebChat session
+            //     UUID; route via webchat_router.
+            if msg.channel_id == "broadcast" {
+                let n = ctx.webchat_router.broadcast(agent_id, msg).await;
+                debug!(%agent_id, sessions = n, "broadcast outbound delivered");
+            } else if let Some((channel, account_id, sender_id)) =
+                crate::channel_id_codec::decode(&msg.channel_id)
+            {
+                if let Err(refusal) = crate::channel_router::outbound_permitted(
+                    &ctx.bindings,
+                    &ctx.channels,
+                    agent_id,
+                    channel,
+                    account_id,
+                    sender_id,
+                ) {
+                    warn!(
+                        %agent_id,
+                        channel,
+                        account = account_id,
+                        reason = refusal.as_str(),
+                        "dropping channel-adapter outbound"
+                    );
+                    return;
+                }
+                // Channel-adapter outbound. Translate havn-core's
+                // MessageContent into havn-proto's
+                // ChannelMessageContent and push via the router.
+                use havn_core::MessageContent;
+                use havn_proto::channel::ChannelMessageContent;
+                let translated = match msg.content {
+                    MessageContent::Text { text } => Some(ChannelMessageContent::Text { text }),
+                    MessageContent::Image { url, caption } => {
+                        Some(ChannelMessageContent::Image { url, caption })
+                    }
+                    MessageContent::File { url, filename } => {
+                        Some(ChannelMessageContent::File { url, filename })
+                    }
+                    // Agents rarely emit Audio / Location / Contact
+                    // outbound — these are user-input shapes. When
+                    // they DO emit one (e.g., an agent skill that
+                    // shares a location), we flatten to Text so the
+                    // adapter doesn't need a per-platform "send
+                    // location" pathway. Future Layer when needed.
+                    MessageContent::Audio { transcript, .. } => {
+                        Some(ChannelMessageContent::Text { text: transcript })
+                    }
+                    MessageContent::Location {
+                        latitude,
+                        longitude,
+                        name,
+                        ..
+                    } => {
+                        let label = name.unwrap_or_default();
+                        let coords = format!("{latitude:.6},{longitude:.6}");
+                        let text = if label.is_empty() {
+                            format!("[location: {coords}]")
+                        } else {
+                            format!("[location: {coords} ({label})]")
+                        };
+                        Some(ChannelMessageContent::Text { text })
+                    }
+                    MessageContent::Contact {
+                        display_name,
+                        phone_number,
+                        ..
+                    } => {
+                        let text = match phone_number {
+                            Some(ph) => format!("[contact: {display_name} {ph}]"),
+                            None => format!("[contact: {display_name}]"),
+                        };
+                        Some(ChannelMessageContent::Text { text })
+                    }
+                    // MessageContent is non_exhaustive in havn-core;
+                    // future variants without a channel counterpart
+                    // are dropped with a warn (we can't surface them
+                    // through this path).
+                    _ => None,
+                };
+                match translated {
+                    Some(content) => {
+                        if let Err(e) = ctx
+                            .channel_router
+                            .deliver(channel, account_id, sender_id, msg.reply_to, content)
+                            .await
+                        {
+                            warn!(
+                                %agent_id,
+                                channel,
+                                account = account_id,
+                                error = %e,
+                                "could not deliver outbound to channel adapter (offline?)"
+                            );
+                        }
+                    }
+                    None => {
+                        warn!(%agent_id, "dropping channel-adapter outbound: unsupported MessageContent variant")
+                    }
+                }
+            } else if let Err(e) = ctx.webchat_router.deliver(agent_id, msg).await {
+                warn!(%agent_id, error = %e, "could not deliver outbound to webchat");
+            }
+        }
+        AgentToGateway::LlmRequest(req) => {
+            if req.request_id.len() > MAX_REQUEST_ID_BYTES {
+                warn!(%agent_id, len = req.request_id.len(), "dropping LlmRequest with an oversized request_id");
+                return;
+            }
+            let Some(permit) = ctx.registry.try_reserve(agent_id, Slot::Llm).await else {
+                warn!(%agent_id, limit = MAX_INFLIGHT_LLM_REQUESTS, "too many LLM requests in flight; refusing one");
+                let refusal = GatewayToAgent::LlmResponse(LlmResponse {
+                    request_id: req.request_id,
+                    outcome: LlmOutcome::Error {
+                        message: format!(
+                            "this agent already has {MAX_INFLIGHT_LLM_REQUESTS} LLM requests in flight; retry when one finishes"
+                        ),
+                    },
+                    provider_response: serde_json::Value::Null,
+                    usage: None,
+                });
+                refuse(ctx, agent_id, refusal).await;
+                return;
+            };
+            let ctx_cloned = ctx.clone();
+            tokio::spawn(async move {
+                handle_llm_request(agent_id, req, ctx_cloned).await;
+                drop(permit);
+            });
+        }
+        // Recorded by the reader loop, like every frame.
+        AgentToGateway::LivenessPing => {}
+        AgentToGateway::CronResult(result) => {
+            let job_id = result.job_id.clone();
+            match ctx.cron_scheduler.record_result(agent_id, result).await {
+                Ok(()) => {}
+                Err(e @ crate::cron::CronError::NotPending(_)) => {
+                    warn!(%agent_id, %job_id, error = %e, "rejecting unsolicited CronResult");
+                }
+                Err(e @ crate::cron::CronError::ExpiredRun(_)) => {
+                    info!(%agent_id, %job_id, error = %e, "dropping CronResult: result for an expired run");
+                }
+                Err(e) => {
+                    warn!(%agent_id, %job_id, error = %e, "cron result recording failed");
+                }
+            }
+        }
+        AgentToGateway::MemoryForgetResponse(resp) => {
+            ctx.admin_rpc
+                .resolve(agent_id, &resp.request_id, resp.outcome)
+                .await;
+        }
+        AgentToGateway::SkillPinResponse(resp) => {
+            ctx.admin_rpc
+                .resolve(agent_id, &resp.request_id, resp.outcome)
+                .await;
+        }
+        AgentToGateway::DataResponse(resp) => {
+            ctx.admin_rpc
+                .resolve(agent_id, &resp.request_id, resp.outcome)
+                .await;
+        }
+        AgentToGateway::AgentQuery(query) => {
+            // Caller-side initiation. Spawn so a slow target doesn't
+            // block the caller's reader loop; at most
+            // MAX_INFLIGHT_AGENT_QUERIES per caller, each bounded by
+            // the timeout enforced inside the handler.
+            if query.request_id.len() > MAX_REQUEST_ID_BYTES {
+                warn!(%agent_id, len = query.request_id.len(), "dropping AgentQuery with an oversized request_id");
+                return;
+            }
+            let Some(permit) = ctx.registry.try_reserve(agent_id, Slot::Query).await else {
+                warn!(%agent_id, limit = MAX_INFLIGHT_AGENT_QUERIES, "too many agent queries in flight; refusing one");
+                let refusal = GatewayToAgent::AgentQueryResult(AgentQueryResult {
+                    request_id: query.request_id,
+                    outcome: AgentQueryOutcome::Error {
+                        message: format!(
+                            "this agent already has {MAX_INFLIGHT_AGENT_QUERIES} queries in flight; retry when one finishes"
+                        ),
+                    },
+                    text: String::new(),
+                    transcript: serde_json::Value::Null,
+                });
+                refuse(ctx, agent_id, refusal).await;
+                return;
+            };
+            let ctx_cloned = ctx.clone();
+            tokio::spawn(async move {
+                handle_agent_query(agent_id, query, ctx_cloned).await;
+                drop(permit);
+            });
+        }
+        AgentToGateway::AgentQueryResponse(resp) => {
+            // Callee-side reply — match against pending broker entry
+            // so the caller-side handler can wake.
+            ctx.query_broker.resolve(agent_id, resp).await;
+        }
+        // The protocol enum is `#[non_exhaustive]`; future variants land
+        // here so older gateways gracefully ignore frames they don't know.
+        other => {
+            warn!(%agent_id, ?other, "unknown frame variant — ignoring");
+        }
+    }
 }
 
 async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocketCtx) {
@@ -1633,12 +1672,7 @@ mod tests {
         )
         .await
         .expect("create agent");
-        ctx.registry
-            .register(AgentHandle {
-                agent_id: agent.id,
-                pid: 1,
-            })
-            .await;
+        ctx.registry.register(AgentHandle::new(agent.id, 1)).await;
         let (tx, rx) = mpsc::channel(8);
         ctx.registry.attach(agent.id, tx).await.expect("attach");
         (agent.id, rx)
@@ -1749,7 +1783,8 @@ mod tests {
         // Hold the pool's only connection: every accepted request then
         // blocks on its database lookup and stays in flight.
         let held = ctx.db.acquire().await.expect("connection");
-        run_reader(&mut BufReader::new(bytes.as_slice()), agent, &ctx)
+        let (conn, _conn_rx) = mpsc::channel(1);
+        run_reader(&mut BufReader::new(bytes.as_slice()), agent, &conn, &ctx)
             .await
             .expect("reader");
 
@@ -1971,9 +2006,7 @@ mod tests {
 
     async fn registered_agent(ctx: &AgentSocketCtx) -> AgentId {
         let agent_id = AgentId::new();
-        ctx.registry
-            .register(AgentHandle { agent_id, pid: 1 })
-            .await;
+        ctx.registry.register(AgentHandle::new(agent_id, 1)).await;
         agent_id
     }
 
@@ -2133,6 +2166,26 @@ mod tests {
             live_rx.recv().await,
             Some(GatewayToAgent::HeartbeatTick)
         ));
+    }
+
+    #[tokio::test]
+    async fn hello_before_registration_waits_for_it() {
+        let ctx = ctx_with(false, false).await;
+        let agent_id = AgentId::new();
+        // The runtime connects before the spawn that started it returns.
+        let registry = ctx.registry.clone();
+        let late = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            registry.register(AgentHandle::new(agent_id, 1)).await;
+        });
+
+        let (_, reply) = hello(&ctx, agent_id).await;
+
+        late.await.expect("join");
+        assert!(
+            matches!(reply, Some(GatewayToAgent::Welcome { .. })),
+            "{reply:?}"
+        );
     }
 
     #[tokio::test]

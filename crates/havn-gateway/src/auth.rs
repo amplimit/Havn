@@ -424,6 +424,10 @@ pub(crate) mod tests {
             )),
             agent_env_passthrough: Arc::new(Vec::new()),
             keyring: None,
+            supervisor: crate::supervisor::Supervisor::new(
+                crate::supervisor::RestartPolicy::default(),
+                havn_proto::LIVENESS_PING_INTERVAL,
+            ),
             max_tokens_ceiling: crate::config::DEFAULT_MAX_TOKENS_CEILING,
         };
         (app, bootstrap)
