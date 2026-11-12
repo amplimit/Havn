@@ -166,10 +166,40 @@ struct AppState {
     reason = "main wires every subsystem; extracting helpers obscures the startup path"
 )]
 async fn main() -> anyhow::Result<()> {
+    // The gateway takes no arguments (config comes from the file and env);
+    // only `--version` and `--help` are answered, matching the other binaries.
+    {
+        use std::io::Write as _;
+        match std::env::args().nth(1).as_deref() {
+            Some("--version" | "-V") => {
+                writeln!(
+                    std::io::stdout(),
+                    "havn-gateway {}",
+                    env!("CARGO_PKG_VERSION")
+                )?;
+                return Ok(());
+            }
+            Some("--help" | "-h") => {
+                writeln!(
+                    std::io::stdout(),
+                    "Usage: havn-gateway [--version | --help]\n\nRuns the havn gateway. It \
+                     takes no other arguments: config comes from $HAVN_CONFIG or \
+                     ~/.config/havn/config.toml, credentials need HAVN_AGE_KEY."
+                )?;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     init_tracing();
 
     let cfg = GatewayConfig::load().context("loading gateway config")?;
-    info!(listen = %cfg.listen, db = %cfg.db_path.display(), "starting havn gateway");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        listen = %cfg.listen,
+        db = %cfg.db_path.display(),
+        "starting havn gateway"
+    );
 
     enforce_listen_safety(&cfg.listen, cfg.trust_header.enabled)
         .context("listen-address safety check (spec §1.7)")?;
@@ -597,6 +627,20 @@ fn isolation_exceptions(
     Ok((dns, reachable))
 }
 
+#[cfg(target_os = "linux")]
+fn nat_failure_hint(e: &havn_spawner::network::NetworkError) -> &'static str {
+    use havn_spawner::network::NetworkError;
+    match e {
+        NetworkError::Unavailable(_) => {
+            "install iptables (nft or legacy backend), iproute2 (`ip`) and util-linux \
+             (`nsenter`), e.g. `apt-get install iptables iproute2 util-linux`; `havn doctor` \
+             checks for them"
+        }
+        NetworkError::PermissionDenied(_) => "run the gateway as root (CAP_NET_ADMIN)",
+        _ => "see the error; the gateway needs working `iptables` and `ip` as root",
+    }
+}
+
 fn select_spawner(
     network: &config::NetworkConfig,
 ) -> anyhow::Result<(Arc<dyn AgentSpawner>, Option<String>)> {
@@ -668,11 +712,13 @@ fn select_spawner(
                         info!(primary_iface = %primary, pool_cidr = %pool.cidr(), "per-agent NAT ready");
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        tracing::error!(
                             error = %e,
-                            "global NAT setup failed; agents will spawn without outbound network. \
-                             Tools needing the internet (web_fetch, browser pack, network MCP) will \
-                             surface their own errors at use time."
+                            fix = nat_failure_hint(&e),
+                            "global NAT setup failed; EVERY agent will spawn WITHOUT outbound \
+                             network until the gateway restarts with this fixed. Tools needing \
+                             the internet (web_fetch, browser pack, network MCP) will surface \
+                             their own errors at use time."
                         );
                     }
                 }
@@ -692,8 +738,8 @@ fn select_spawner(
                 Ok((Arc::new(s), Some(pool.cidr())))
             }
             Err(e) => Err(anyhow::anyhow!(
-                "agent isolation is unavailable: {e}. Run the gateway as root (or in a cgroup \
-                 delegated with Delegate=yes) on a cgroup v2 host, or set HAVN_SPAWNER=subprocess \
+                "agent isolation is unavailable: {e}. Run the gateway as root (directly or via \
+                 contrib/systemd/havn.service) on a cgroup v2 host, or set HAVN_SPAWNER=subprocess \
                  to run agents WITHOUT isolation (dev only)"
             )),
         }

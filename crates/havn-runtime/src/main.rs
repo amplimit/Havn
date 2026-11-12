@@ -566,30 +566,33 @@ async fn main() -> anyhow::Result<()> {
     // timeout. `recv()` is cancellation-safe, so selecting it against the
     // notify never drops a frame.
     let writer_shutdown = Arc::new(Notify::new());
+    let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+    // Pending oneshots for outbound `agent_query` calls (spec §4.4 v0.7),
+    // shared with the `agent_query` tool registered below.
+    let agent_query_pending: tools::agent_query::PendingQueries =
+        Arc::new(Mutex::new(HashMap::new()));
     let writer_task = {
         let writer_shutdown = Arc::clone(&writer_shutdown);
+        let pending = Arc::clone(&pending);
+        let queries = Arc::clone(&agent_query_pending);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     maybe = writer_rx.recv() => match maybe {
-                        Some(frame) => match write_frame(&mut write, &frame).await {
-                            Ok(()) => {}
-                            // Rejected before anything was written: the
-                            // stream is intact, only this frame is lost.
-                            Err(havn_proto::FrameError::FrameTooLarge(size)) => {
-                                error!(size, "dropping an outbound frame over the size limit");
-                            }
-                            Err(e) => {
+                        // An oversized frame fails its waiter inside
+                        // `write_outbound` and leaves the stream intact.
+                        Some(frame) => {
+                            if let Err(e) = tool_loop::write_outbound(&mut write, frame, &pending, &queries).await {
                                 error!(error = %e, "agent writer failed");
                                 break;
                             }
-                        },
+                        }
                         None => break,
                     },
                     () = writer_shutdown.notified() => {
                         // Flush whatever is already queued, best-effort, then stop.
                         while let Ok(frame) = writer_rx.try_recv() {
-                            if write_frame(&mut write, &frame).await.is_err() {
+                            if tool_loop::write_outbound(&mut write, frame, &pending, &queries).await.is_err() {
                                 break;
                             }
                         }
@@ -599,7 +602,6 @@ async fn main() -> anyhow::Result<()> {
             }
         })
     };
-    let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
     let parent_messages = Arc::new(RwLock::new(Vec::<serde_json::Value>::new()));
 
     // 5b. Background memory aging pass (spec §9.4). Detached task; the
@@ -687,14 +689,11 @@ async fn main() -> anyhow::Result<()> {
         semaphore: Arc::new(Semaphore::new(subagent_tool::SUBAGENT_MAX_CONCURRENT)),
     });
 
-    // Cross-agent query plumbing (spec §4.4 v0.7). The pending map is
-    // shared with the `agent_query` tool registered below.
+    // Cross-agent query plumbing (spec §4.4 v0.7).
     // `incoming_query_registry` is the BASE registry — no
     // subagent_spawn, no agent_query — handed to the temp loop that
     // answers IncomingQuery frames. Combined with the gateway's
     // same-owner + caller-self check, that makes the call graph depth-1.
-    let agent_query_pending: tools::agent_query::PendingQueries =
-        Arc::new(Mutex::new(HashMap::new()));
     let incoming_query_registry = base_registry.clone();
 
     let parent_registry = base_registry
