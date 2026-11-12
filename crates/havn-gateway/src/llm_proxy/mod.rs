@@ -334,3 +334,96 @@ async fn try_one(
         Err(e) => classify(e),
     }
 }
+
+/// Why a request would make the LLM provider fetch something from the
+/// network on the agent's behalf: content blocks whose `source` is a URL
+/// (images, documents), or server-side tools, which carry a `type` that the
+/// runtime's own tool definitions never set. Used to refuse such requests
+/// for agents whose policy denies egress.
+#[must_use]
+pub fn provider_side_fetch(request: &AnthropicRequest) -> Option<&'static str> {
+    fn has_url_source(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(map) => {
+                let url_source = map
+                    .get("source")
+                    .and_then(|source| source.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("url");
+                url_source || map.values().any(has_url_source)
+            }
+            serde_json::Value::Array(items) => items.iter().any(has_url_source),
+            _ => false,
+        }
+    }
+    if request.messages.iter().any(|m| has_url_source(&m.content)) {
+        return Some("message content refers to a URL the provider would fetch");
+    }
+    let server_tool = request
+        .tools
+        .as_ref()
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool.get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| kind != "custom")
+            })
+        });
+    if server_tool {
+        return Some("request uses a provider-side tool");
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn request(content: serde_json::Value, tools: Option<serde_json::Value>) -> AnthropicRequest {
+        AnthropicRequest {
+            model: "claude-sonnet-4-6".into(),
+            max_tokens: 64,
+            messages: vec![AnthropicMessage {
+                role: "user".into(),
+                content,
+            }],
+            system: None,
+            temperature: None,
+            tools,
+        }
+    }
+
+    #[test]
+    fn plain_requests_fetch_nothing() {
+        let tools = json!([{"name": "shell", "description": "run", "input_schema": {}}]);
+        assert_eq!(
+            provider_side_fetch(&request(json!("hello"), Some(tools))),
+            None
+        );
+        let base64_image = json!([{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}]);
+        assert_eq!(provider_side_fetch(&request(base64_image, None)), None);
+    }
+
+    #[test]
+    fn url_sources_are_detected_anywhere_in_the_content() {
+        let direct = json!([{"type": "image", "source": {"type": "url", "url": "https://example.test/?d=x"}}]);
+        assert!(provider_side_fetch(&request(direct, None)).is_some());
+        let nested = json!([{"type": "tool_result", "tool_use_id": "t1", "content": [
+            {"type": "document", "source": {"type": "url", "url": "https://example.test/doc.pdf"}}
+        ]}]);
+        assert!(provider_side_fetch(&request(nested, None)).is_some());
+    }
+
+    #[test]
+    fn server_side_tools_are_detected() {
+        let tools = json!([{"type": "web_search_20250305", "name": "web_search"}]);
+        assert!(provider_side_fetch(&request(json!("hi"), Some(tools))).is_some());
+        let custom = json!([{"type": "custom", "name": "shell", "input_schema": {}}]);
+        assert_eq!(
+            provider_side_fetch(&request(json!("hi"), Some(custom))),
+            None
+        );
+    }
+}

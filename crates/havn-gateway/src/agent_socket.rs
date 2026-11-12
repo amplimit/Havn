@@ -435,8 +435,8 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
     // X-User-ID middleware decides who's allowed to TALK to the agent
     // via the dashboard, but mid-conversation LLM proxy calls always
     // attribute to the agent's owner.
-    let owner_id = match havn_db::repo::agents::find_by_id(&ctx.db, agent_id).await {
-        Ok(Some(agent)) => agent.owner_id,
+    let agent = match havn_db::repo::agents::find_by_id(&ctx.db, agent_id).await {
+        Ok(Some(agent)) => agent,
         Ok(None) => {
             warn!(%agent_id, "LLM request for unknown agent — cannot resolve owner");
             let response = LlmResponse {
@@ -471,8 +471,36 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
         }
     };
 
+    let owner_id = agent.owner_id;
+    let egress_allowed = policy_resolver::for_session(&ctx.db, &agent, ctx.multi_user)
+        .await
+        .network_policy
+        .egress_allowed;
+
     let response = match build_anthropic_request(&req) {
         Ok(ar) => {
+            // An agent without egress must not get the provider to fetch
+            // URLs for it (a way to send data out through the query string).
+            if !egress_allowed && let Some(reason) = llm_proxy::provider_side_fetch(&ar) {
+                warn!(%agent_id, reason, "refusing LLM request from an agent without egress");
+                let _ = ctx
+                    .registry
+                    .send(
+                        agent_id,
+                        GatewayToAgent::LlmResponse(LlmResponse {
+                            request_id,
+                            outcome: LlmOutcome::Error {
+                                message: format!(
+                                    "{reason}; this agent's policy does not allow network egress"
+                                ),
+                            },
+                            provider_response: serde_json::Value::Null,
+                            usage: None,
+                        }),
+                    )
+                    .await;
+                return;
+            }
             let Some(ring) = ctx.keyring.as_ref() else {
                 let _ = ctx
                     .registry
