@@ -2,14 +2,18 @@
 #
 # install.sh copies it to /usr/local/lib/systemd/system/havn.service; it is
 # not enabled. Put local changes in a drop-in (`systemctl edit havn`) so a
-# re-install does not overwrite them. To use it:
+# re-install does not overwrite them. To use it, as root:
 #
-#   install -d -m 700 /etc/havn
-#   install -m 600 /dev/null /etc/havn/havn.env
-#   echo 'HAVN_AGE_KEY=<your passphrase>' > /etc/havn/havn.env
-#   havn setup --non-interactive        # as root, once
+#   install -d -m 700 -o root -g root /etc/havn
+#   install -m 600 -o root -g root /dev/null /etc/havn/havn.env
+#   $EDITOR /etc/havn/havn.env          # add: HAVN_AGE_KEY='<passphrase>'
+#   HOME=/root havn setup --non-interactive   # once; install.sh does this
 #   systemctl enable --now havn
 #   journalctl -u havn -f
+#
+# Write the key with an editor rather than `echo`, which leaves it in the
+# shell history. systemd reads the value inside the single quotes literally;
+# it must not contain `'` or `\`.
 
 [Unit]
 Description=havn gateway
@@ -26,19 +30,25 @@ Type=simple
 # Runs as root: agent namespaces, the per-agent cgroups and the NAT rules
 # need it.
 ExecStart=/usr/local/bin/havn-gateway
-# Same config and data paths as `havn setup` run by root
-# (~/.config/havn/config.toml, ~/.local/share/havn). Set HAVN_CONFIG in the
-# environment file to use another config file.
+# Same config and data paths as `havn setup` run by root with HOME=/root
+# (/root/.config/havn/config.toml, /root/.local/share/havn). Set HAVN_CONFIG
+# in the environment file to use another config file.
 Environment=HOME=/root
-# HAVN_AGE_KEY=... (and any other HAVN_* settings), one per line. Keep the
-# file mode 600.
+# HAVN_AGE_KEY='...' (and any other HAVN_* settings), one per line. Mode
+# 0600, owned by root.
 EnvironmentFile=/etc/havn/havn.env
-# The gateway creates each agent's cgroup under /sys/fs/cgroup/havn.slice,
-# a top-level cgroup it manages itself, outside this unit's cgroup.
-# Delegate=yes makes systemd keep the cpu, memory and pids controllers
-# enabled on the path from the root and leave cgroups below the unit to the
-# gateway. Do not set Slice=havn.slice: systemd would then own the
-# havn.slice cgroup that the gateway writes agent cgroups into.
+# Agent cgroups are /sys/fs/cgroup/havn.slice/agent-<id>: the gateway, as
+# root, creates that top-level cgroup and moves agents into it, outside
+# this unit's subtree. That is not what systemd delegation covers (a
+# delegated service only manages the cgroups below its own); here
+# Delegate=yes only makes systemd keep the cpu, memory and pids controllers
+# enabled on the path from the root cgroup.
+#
+# /sys/fs/cgroup/havn.slice is also where systemd would put a slice unit
+# named havn.slice. Never create such a unit, set Slice=havn.slice, or run
+# anything with `--slice=havn`: systemd would adopt that cgroup, rewrite its
+# cgroup.subtree_control (which can drop the agents' memory.max limits) and
+# may remove it.
 Delegate=yes
 # Stopping the unit does not signal the agents (they are outside its
 # cgroup); each agent exits when its connection to the gateway closes.

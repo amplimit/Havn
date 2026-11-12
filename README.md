@@ -77,19 +77,21 @@ For a dev box without isolation, `HAVN_SPAWNER=subprocess havn start` runs agent
 
 ### Run under systemd
 
-On hosts running systemd, `install.sh` installs a reference unit at `/usr/local/lib/systemd/system/havn.service` (source: [contrib/systemd/havn.service](contrib/systemd/havn.service), also in the release tarball). It is not enabled. It runs the gateway as root with `HOME=/root`, so it uses the config and data that `havn setup` created as root, reads `HAVN_AGE_KEY` from `/etc/havn/havn.env`, and restarts on failure:
+On hosts running systemd, `install.sh` installs a reference unit at `/usr/local/lib/systemd/system/havn.service` (source: [contrib/systemd/havn.service](contrib/systemd/havn.service), also in the release tarball). It is not enabled. It runs the gateway as root with `HOME=/root`, so it uses the config and data under `/root` (install.sh runs `havn setup` for root when it installs the unit), reads `HAVN_AGE_KEY` from `/etc/havn/havn.env`, and restarts on failure:
 
 ```bash
 sudo -i
-havn setup --non-interactive                    # once, as root
-install -d -m 700 /etc/havn
-install -m 600 /dev/null /etc/havn/havn.env
-echo 'HAVN_AGE_KEY=your-secret-passphrase' > /etc/havn/havn.env
+HOME=/root havn setup --non-interactive         # once; install.sh already did this
+install -d -m 700 -o root -g root /etc/havn
+install -m 600 -o root -g root /dev/null /etc/havn/havn.env
+$EDITOR /etc/havn/havn.env                      # add: HAVN_AGE_KEY='your-secret-passphrase'
 systemctl enable --now havn
 journalctl -u havn -f
 ```
 
-Agents get their cgroups under `/sys/fs/cgroup/havn.slice`, which the gateway manages itself; the unit sets `Delegate=yes` and stays in the default slice. Put local changes in a drop-in (`systemctl edit havn`) rather than editing the installed file, which a re-install overwrites.
+Keep `/etc/havn/havn.env` mode 0600 and owned by root, and write the key with an editor rather than `echo`, which leaves it in the shell history. systemd takes the value inside single quotes literally; it must not contain `'` or `\`.
+
+Agent cgroups are `/sys/fs/cgroup/havn.slice/agent-<id>`. The gateway creates that top-level cgroup itself and moves agents into it, outside the unit's own cgroup, so this is not systemd delegation; `Delegate=yes` only keeps the cpu, memory and pids controllers enabled from the root cgroup down. `/sys/fs/cgroup/havn.slice` is also where systemd would put a slice unit called `havn.slice`: never create such a unit, set `Slice=havn.slice`, or run anything with `--slice=havn`, or systemd adopts the cgroup, rewrites its controllers (which can drop the agents' memory limits) and may remove it. Put local changes in a drop-in (`systemctl edit havn`) rather than editing the installed file, which a re-install overwrites.
 
 ### Build from source
 

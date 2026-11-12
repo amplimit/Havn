@@ -50,10 +50,45 @@
 
 #![cfg(target_os = "linux")]
 
+use std::ffi::OsStr;
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::process::Command;
 
 use havn_core::AgentId;
+
+/// Searched after `PATH`, where `ip` and `iptables` live on Debian /
+/// Ubuntu: a gateway started from a root shell that kept a user's `PATH`
+/// (`su` without `-`) would otherwise not find them. `havn doctor`
+/// searches the same way.
+const SBIN_DIRS: &[&str] = &["/usr/local/sbin", "/usr/sbin", "/sbin"];
+
+/// Absolute path of a network tool from the absolute `PATH` entries, then
+/// `SBIN_DIRS`; the bare name when neither has it, so the exec error
+/// names the tool.
+pub fn resolve_tool(name: &str) -> PathBuf {
+    resolve_tool_in(name, std::env::var_os("PATH").as_deref())
+}
+
+fn resolve_tool_in(name: &str, path_var: Option<&OsStr>) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    path_var
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .filter(|dir| dir.is_absolute())
+        .chain(SBIN_DIRS.iter().map(PathBuf::from))
+        .map(|dir| dir.join(name))
+        .find(|p| {
+            p.metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+fn tool(name: &str) -> Command {
+    Command::new(resolve_tool(name))
+}
 
 /// Default first / second octet for the per-agent /30 pool.
 /// Operators with a 10.x VPN, Docker bridge collision, or k8s pod
@@ -139,7 +174,7 @@ impl AgentSubnetPool {
     /// land in someone else's network. Caller logs + bails.
     pub fn refuse_on_route_conflict(&self) -> std::result::Result<(), String> {
         let pool_prefix = format!("{}.{}.", self.first_octet, self.second_octet);
-        let out = Command::new("ip")
+        let out = tool("ip")
             .args(["-o", "-4", "route", "show"])
             .output()
             .map_err(|e| format!("ip route show: {e}"))?;
@@ -399,7 +434,7 @@ const HOOK_CHAINS: &[&str] = &["PREROUTING", "INPUT", "FORWARD"];
 /// `iptables -w`: wait for the xtables lock instead of failing when
 /// another tool (Docker, fail2ban) holds it.
 fn iptables() -> Command {
-    let mut cmd = Command::new("iptables");
+    let mut cmd = tool("iptables");
     cmd.arg("-w");
     cmd
 }
@@ -631,7 +666,7 @@ pub fn teardown_agent_network(agent_id: AgentId, pool: &AgentSubnetPool) {
 /// delete. Returns the number of interfaces removed for the operator
 /// to log.
 pub fn gc_orphaned_veth() -> Result<usize> {
-    let out = Command::new("ip")
+    let out = tool("ip")
         .args(["-o", "link", "show", "type", "veth"])
         .output()
         .map_err(|e| NetworkError::Unavailable(format!("ip link show: {e}")))?;
@@ -695,7 +730,7 @@ fn probe_tooling() -> Result<()> {
         ("iptables", "--version"),
         ("nsenter", "--version"),
     ] {
-        let r = Command::new(bin).arg(flag).output();
+        let r = tool(bin).arg(flag).output();
         match r {
             Ok(out) if out.status.success() => {}
             Ok(out) => {
@@ -720,7 +755,7 @@ fn probe_tooling() -> Result<()> {
 /// hard-coding `eth0` / `enp0s3` / etc.
 fn detect_primary_iface() -> Result<String> {
     // `ip -o route get 1.1.1.1` → "1.1.1.1 via 192.168.1.1 dev eth0 src ..."
-    let out = Command::new("ip")
+    let out = tool("ip")
         .args(["-o", "route", "get", "1.1.1.1"])
         .output()?;
     if !out.status.success() {
@@ -772,7 +807,7 @@ fn add_iptables_rule_idempotent(rule: &[&str]) -> Result<()> {
 }
 
 fn run_ip(args: &[&str]) -> Result<()> {
-    let out = Command::new("ip").args(args).output()?;
+    let out = tool("ip").args(args).output()?;
     if out.status.success() {
         return Ok(());
     }
@@ -788,21 +823,25 @@ fn run_ip(args: &[&str]) -> Result<()> {
 }
 
 fn run_ip_silent(args: &[&str]) -> Result<()> {
-    let _ = Command::new("ip").args(args).output()?;
+    let _ = tool("ip").args(args).output()?;
     Ok(())
 }
 
 fn run_nsenter(pid: &str, ip_args: &[&str]) -> Result<()> {
-    let mut full = vec!["-t", pid, "-n", "ip"];
-    full.extend(ip_args);
-    let out = Command::new("nsenter").args(&full).output()?;
+    let ip = resolve_tool("ip");
+    let out = tool("nsenter")
+        .args(["-t", pid, "-n"])
+        .arg(&ip)
+        .args(ip_args)
+        .output()?;
     if out.status.success() {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
     Err(NetworkError::CommandFailed(format!(
-        "nsenter {}: {}",
-        full.join(" "),
+        "nsenter -t {pid} -n {} {}: {}",
+        ip.display(),
+        ip_args.join(" "),
         stderr
     )))
 }
@@ -814,6 +853,34 @@ mod tests {
 
     fn default_pool() -> AgentSubnetPool {
         AgentSubnetPool::default()
+    }
+
+    #[test]
+    fn resolve_tool_uses_absolute_path_entries_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("havn-resolve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("havn-resolve-tool");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = std::env::join_paths(["relative/dir", dir.to_str().unwrap()]).unwrap();
+        assert_eq!(resolve_tool_in("havn-resolve-tool", Some(&path)), bin);
+        assert_eq!(
+            resolve_tool_in("havn-missing-tool", Some(&path)),
+            PathBuf::from("havn-missing-tool")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_tool_falls_back_to_sbin() {
+        if std::path::Path::new("/usr/sbin/iptables").is_file() {
+            assert_eq!(
+                resolve_tool_in("iptables", Some(OsStr::new("/nonexistent"))),
+                PathBuf::from("/usr/sbin/iptables")
+            );
+        }
     }
 
     #[test]

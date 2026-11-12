@@ -263,7 +263,15 @@ if [ "${HAVN_SKIP_SYSTEMD:-0}" != "1" ] && [ -d /run/systemd/system ]; then
     else
         unit_src="$STAGE/havn.service"
     fi
-    if [ -f "$unit_src" ]; then
+    # The prefix goes verbatim into ExecStart= and the sed replacement.
+    case "$INSTALL_PREFIX" in
+        *[[:space:]]* | *'&'* | *'|'* | *'\'*) prefix_ok=false ;;
+        /*) prefix_ok=true ;;
+        *) prefix_ok=false ;;
+    esac
+    if ! $prefix_ok; then
+        warn "HAVN_PREFIX '$INSTALL_PREFIX' must be an absolute path without whitespace, '&', '|' or '\\'; skipping the systemd unit"
+    elif [ -f "$unit_src" ]; then
         sed "s|^ExecStart=/usr/local/bin/|ExecStart=${INSTALL_PREFIX%/}/|" "$unit_src" >"$STAGE/unit"
         $SUDO install -d -m 755 "$UNIT_DIR"
         $SUDO install -m 644 "$STAGE/unit" "$UNIT_DIR/havn.service"
@@ -276,9 +284,23 @@ if [ "${HAVN_SKIP_SYSTEMD:-0}" != "1" ] && [ -d /run/systemd/system ]; then
 fi
 
 # 10. Run `havn setup --non-interactive` so the data dir + config exist on first run.
+# The systemd unit runs the gateway with HOME=/root, so when it is installed
+# setup also runs for root with that HOME (unless this run already is that);
+# otherwise the unit's gateway would start on an empty config and database.
+# The invoking user's setup still runs for `havn start` from their shell.
+root_setup=false
+if $unit_installed && { [ "$(id -u)" -ne 0 ] || [ "${HOME:-}" != /root ] \
+        || [ -n "${XDG_CONFIG_HOME:-}" ] || [ -n "${HAVN_CONFIG:-}" ]; }; then
+    root_setup=true
+fi
 if [ "${HAVN_SKIP_SETUP:-0}" != "1" ]; then
     log "running havn setup --non-interactive"
     "$INSTALL_PREFIX/havn" setup --non-interactive
+    if $root_setup; then
+        log "running havn setup --non-interactive for root (HOME=/root, as the systemd unit uses)"
+        $SUDO env -u XDG_CONFIG_HOME -u HAVN_CONFIG HOME=/root \
+            "$INSTALL_PREFIX/havn" setup --non-interactive
+    fi
 fi
 
 ok "install complete"
@@ -292,11 +314,17 @@ next:
   havn doctor                                   # check isolation and network prerequisites
 EOF
 if $unit_installed; then
+    root_setup_hint=""
+    if [ "${HAVN_SKIP_SETUP:-0}" = "1" ]; then
+        root_setup_hint="  sudo env HOME=/root havn setup --non-interactive   # config + data under /root, as the unit uses
+"
+    fi
     cat <<EOF >&2
 
-or run the gateway under systemd:
-  sudo install -d -m 700 /etc/havn
-  sudo install -m 600 /dev/null /etc/havn/havn.env   # then add HAVN_AGE_KEY=<passphrase>
+or run the gateway under systemd (it uses root's config under /root):
+${root_setup_hint}  sudo install -d -m 700 -o root -g root /etc/havn
+  sudo install -m 600 -o root -g root /dev/null /etc/havn/havn.env
+  sudoedit /etc/havn/havn.env                        # add: HAVN_AGE_KEY='<passphrase>' (no ' or \\ inside)
   sudo systemctl enable --now havn
 EOF
 fi

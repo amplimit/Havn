@@ -293,6 +293,13 @@ struct SliceProbe {
     writable: io::Result<()>,
     /// The cgroup root's `cgroup.controllers`.
     controllers: io::Result<String>,
+    /// The cgroup root's `cgroup.subtree_control` (empty when unreadable).
+    subtree_control: String,
+    /// The cgroup root is not the host's root cgroup (it has
+    /// `cgroup.type`, e.g. a container's cgroup namespace) and has member
+    /// processes. cgroup v2 then refuses to enable controllers for its
+    /// children (EBUSY); the host's root cgroup is exempt from that rule.
+    root_busy: bool,
     root_user: bool,
 }
 
@@ -300,14 +307,28 @@ fn probe_slice(root: &Path) -> SliceProbe {
     let slice = root.join(CGROUP_SLICE);
     let slice_exists = slice.is_dir();
     let writable = writable(if slice_exists { &slice } else { root });
+    let root_busy = root.join("cgroup.type").exists()
+        && std::fs::read_to_string(root.join("cgroup.procs"))
+            .is_ok_and(|procs| !procs.trim().is_empty());
     SliceProbe {
         slice,
         slice_exists,
         writable,
         controllers: std::fs::read_to_string(root.join("cgroup.controllers")),
+        subtree_control: std::fs::read_to_string(root.join("cgroup.subtree_control"))
+            .unwrap_or_default(),
+        root_busy,
         // SAFETY: geteuid has no preconditions and cannot fail.
         root_user: unsafe { libc::geteuid() } == 0,
     }
+}
+
+fn absent<'a>(list: &str, wanted: &[&'a str]) -> Vec<&'a str> {
+    wanted
+        .iter()
+        .copied()
+        .filter(|c| !list.split_whitespace().any(|t| t == *c))
+        .collect()
 }
 
 fn writable(path: &Path) -> io::Result<()> {
@@ -327,6 +348,16 @@ const SLICE_HINT: &str = "run the gateway as root (see contrib/systemd/havn.serv
 fn slice_verdict(p: &SliceProbe) -> (Verdict, String) {
     let slice = p.slice.display();
     if let Err(e) = &p.writable {
+        let denied = matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM));
+        if denied && !p.root_user {
+            return (
+                Verdict::Warn,
+                format!(
+                    "cannot check {slice} as non-root ({e}); the gateway runs as root, so run \
+                     `sudo havn doctor`"
+                ),
+            );
+        }
         let what = if p.slice_exists {
             format!("{slice} is not writable")
         } else {
@@ -346,11 +377,7 @@ fn slice_verdict(p: &SliceProbe) -> (Verdict, String) {
             );
         }
     };
-    let missing: Vec<&str> = REQUIRED_CONTROLLERS
-        .iter()
-        .copied()
-        .filter(|c| !raw.split_whitespace().any(|t| t == *c))
-        .collect();
+    let missing = absent(raw, REQUIRED_CONTROLLERS);
     if !missing.is_empty() {
         return (
             Verdict::Warn,
@@ -358,6 +385,19 @@ fn slice_verdict(p: &SliceProbe) -> (Verdict, String) {
                 "cgroup controllers `{}` are not offered at the cgroup root — the gateway \
                  refuses to start",
                 missing.join(" ")
+            ),
+        );
+    }
+    let undelegated = absent(&p.subtree_control, REQUIRED_CONTROLLERS);
+    if p.root_busy && !undelegated.is_empty() {
+        return (
+            Verdict::Warn,
+            format!(
+                "the cgroup root has member processes and does not enable `{}` for its \
+                 children, which cgroup v2 then refuses to change (EBUSY) — the gateway \
+                 refuses to start; inside a container, move its processes into a leaf cgroup \
+                 or give it a delegated cgroup",
+                undelegated.join(" ")
             ),
         );
     }
@@ -396,14 +436,19 @@ const NETWORK_TOOLS: &[(&str, &str)] = &[
     ("nsenter", "util-linux"),
 ];
 
-/// An unprivileged shell often lacks the sbin directories on `PATH`, while
-/// the root gateway has them.
+/// Same lookup as `havn_spawner::network::resolve_tool` (absolute `PATH`
+/// entries, then these), so doctor and the gateway agree; the CLI does not
+/// link the spawner.
 const SBIN_DIRS: &[&str] = &["/usr/local/sbin", "/usr/sbin", "/sbin"];
 
 fn find_tool(name: &str, path_var: Option<&OsString>) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt as _;
     let mut dirs: Vec<PathBuf> = path_var
-        .map(|p| std::env::split_paths(p).collect())
+        .map(|p| {
+            std::env::split_paths(p)
+                .filter(|d| d.is_absolute())
+                .collect()
+        })
         .unwrap_or_default();
     dirs.extend(SBIN_DIRS.iter().map(PathBuf::from));
     dirs.into_iter().map(|d| d.join(name)).find(|p| {
@@ -557,6 +602,8 @@ mod tests {
             slice_exists,
             writable,
             controllers: Ok("cpuset cpu io memory hugetlb pids rdma misc\n".into()),
+            subtree_control: "cpu memory pids\n".into(),
+            root_busy: false,
             root_user,
         }
     }
@@ -566,14 +613,36 @@ mod tests {
     }
 
     #[test]
-    fn uncreatable_slice_warns_with_fix_hint() {
-        let (v, msg) = slice_verdict(&probe(false, denied(), false));
+    fn uncreatable_slice_as_root_warns_with_fix_hint() {
+        let (v, msg) = slice_verdict(&probe(false, denied(), true));
         assert!(matches!(v, Verdict::Warn));
         assert!(
             msg.contains("cannot create /sys/fs/cgroup/havn.slice"),
             "{msg}"
         );
         assert!(msg.contains("run the gateway as root"), "{msg}");
+    }
+
+    #[test]
+    fn denied_as_non_root_asks_for_sudo() {
+        let (v, msg) = slice_verdict(&probe(false, denied(), false));
+        assert!(matches!(v, Verdict::Warn));
+        assert!(msg.contains("sudo havn doctor"), "{msg}");
+        assert!(!msg.contains("refuses to start"), "{msg}");
+    }
+
+    #[test]
+    fn busy_namespace_root_without_controllers_warns() {
+        let mut p = probe(true, Ok(()), true);
+        p.subtree_control = "cpu pids\n".into();
+        p.root_busy = true;
+        let (v, msg) = slice_verdict(&p);
+        assert!(matches!(v, Verdict::Warn));
+        assert!(msg.contains("`memory`") && msg.contains("EBUSY"), "{msg}");
+
+        p.root_busy = false;
+        let (v, _) = slice_verdict(&p);
+        assert!(matches!(v, Verdict::Ok));
     }
 
     #[test]

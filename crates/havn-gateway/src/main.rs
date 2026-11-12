@@ -163,6 +163,17 @@ struct AppState {
     reason = "main wires every subsystem; extracting helpers obscures the startup path"
 )]
 async fn main() -> anyhow::Result<()> {
+    // The gateway takes no arguments (config comes from the file and env);
+    // `--version` is the one exception, matching the other binaries.
+    if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
+        use std::io::Write as _;
+        writeln!(
+            std::io::stdout(),
+            "havn-gateway {}",
+            env!("CARGO_PKG_VERSION")
+        )?;
+        return Ok(());
+    }
     init_tracing();
 
     let cfg = GatewayConfig::load().context("loading gateway config")?;
