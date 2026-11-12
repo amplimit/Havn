@@ -418,6 +418,26 @@ fn apply_isolation(pool_cidr: &str, dns: &[String], reachable: &[String]) -> Res
         run_iptables(&args)?;
     }
     let hook = ["-i", HOST_IFACE_MATCH, "-j", EGRESS_CHAIN];
+    // Strict reverse-path check for agent links, independent of the
+    // rp_filter sysctls (which other tools and `conf.all` override). It is
+    // only valid in PREROUTING, so it sits next to the jump, not in the
+    // chain the INPUT and FORWARD hooks share.
+    let rpfilter = [
+        "-i",
+        HOST_IFACE_MATCH,
+        "-m",
+        "rpfilter",
+        "--invert",
+        "-j",
+        "DROP",
+    ];
+    loop {
+        let mut del = vec!["-t", "mangle", "-D", "PREROUTING"];
+        del.extend(rpfilter);
+        if !iptables().args(&del).output()?.status.success() {
+            break;
+        }
+    }
     for chain in HOOK_CHAINS {
         // Remove any existing jump (possibly no longer first), then
         // insert it at the top.
@@ -432,13 +452,35 @@ fn apply_isolation(pool_cidr: &str, dns: &[String], reachable: &[String]) -> Res
         ins.extend(hook);
         run_iptables(&ins)?;
     }
-    Ok(())
+    let mut ins = vec!["-t", "mangle", "-I", "PREROUTING", "1"];
+    ins.extend(rpfilter);
+    run_iptables(&ins)
 }
 
 /// Whether every isolation hook is still installed. A firewall reload
 /// (firewalld, netfilter-persistent) can remove them while the gateway
 /// runs; agents are then started without network access.
 fn isolation_in_place() -> Result<bool> {
+    // A flushed chain leaves the jumps in place; check a rule inside it.
+    let sentinel = iptables()
+        .args([
+            "-t",
+            "mangle",
+            "-C",
+            EGRESS_CHAIN,
+            "-m",
+            "addrtype",
+            "--dst-type",
+            "LOCAL",
+            "-j",
+            "DROP",
+        ])
+        .output()?
+        .status
+        .success();
+    if !sentinel {
+        return Ok(false);
+    }
     for chain in HOOK_CHAINS {
         let present = iptables()
             .args([

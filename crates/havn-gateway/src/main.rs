@@ -574,7 +574,11 @@ fn isolation_exceptions(
     let mut reachable = Vec::new();
     for entry in &network.agent_private_access {
         match havn_spawner::network::parse_ipv4_net(entry) {
-            Some((_, prefix)) if prefix > 0 => reachable.push(entry.clone()),
+            // Multicast and reserved space (224.0.0.0 and up) is never a
+            // useful destination for agents.
+            Some((addr, prefix)) if prefix > 0 && addr.octets()[0] < 224 => {
+                reachable.push(entry.clone());
+            }
             _ => anyhow::bail!(
                 "network.agent_private_access entry {entry:?} must be an IPv4 address or \
                  a.b.c.d/n CIDR with n > 0"
