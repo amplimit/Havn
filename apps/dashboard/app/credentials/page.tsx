@@ -12,7 +12,7 @@ export default function CredentialsPage() {
   const [provider, setProvider] = useState("anthropic");
   const [apiKey, setApiKey] = useState("");
   const [priority, setPriority] = useState(10);
-  const [maxUsdPerDay, setMaxUsdPerDay] = useState<string>(""); // empty = unlimited
+  const [maxTokensPerDay, setMaxTokensPerDay] = useState<string>(""); // empty = unlimited
 
   async function reload() {
     try {
@@ -33,13 +33,13 @@ export default function CredentialsPage() {
     setError(null);
     try {
       const limits: Record<string, unknown> = {};
-      if (maxUsdPerDay.trim()) {
-        const n = Number(maxUsdPerDay);
-        if (Number.isFinite(n) && n > 0) limits.max_usd_per_day = n;
+      if (maxTokensPerDay.trim()) {
+        const n = Number(maxTokensPerDay);
+        if (Number.isInteger(n) && n > 0) limits.max_tokens_per_day = n;
       }
       await api.credentials.create(provider.trim(), apiKey.trim(), priority, limits);
       setApiKey("");
-      setMaxUsdPerDay("");
+      setMaxTokensPerDay("");
       await reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -63,7 +63,7 @@ export default function CredentialsPage() {
       <header className="mb-8">
         <h1 className="display-h1">credentials</h1>
         <p className="mt-2" style={{ color: "var(--color-body)", fontSize: 18 }}>
-          LLM provider keys, with optional daily-USD caps. The gateway proxies
+          LLM provider keys, with optional daily token caps. The gateway proxies
           every model call through these — agent processes never see the raw
           keys (spec §7).
         </p>
@@ -132,15 +132,15 @@ export default function CredentialsPage() {
             />
           </div>
           <div className="md:col-span-2">
-            <label className="label" htmlFor="cap">max USD / day (blank = unlimited)</label>
+            <label className="label" htmlFor="cap">max tokens / day (blank = unlimited)</label>
             <input
               id="cap"
               type="number"
-              min={0}
-              step="0.01"
-              placeholder="5.00"
-              value={maxUsdPerDay}
-              onChange={(e) => setMaxUsdPerDay(e.target.value)}
+              min={1}
+              step={1}
+              placeholder="1000000"
+              value={maxTokensPerDay}
+              onChange={(e) => setMaxTokensPerDay(e.target.value)}
               className="input tabular"
             />
             <p className="mt-1.5 text-xs" style={{ color: "var(--color-body)" }}>
@@ -178,8 +178,10 @@ export default function CredentialsPage() {
 
       <ul className="grid gap-3">
         {creds?.map((c) => {
-          const cap =
-            (c.limits?.max_usd_per_day as number | undefined) ?? null;
+          // Only `max_tokens_per_day` is enforced; a `max_usd_per_day` left
+          // by older dashboards is ignored by the gateway and not shown.
+          const raw = c.limits?.max_tokens_per_day;
+          const cap = typeof raw === "number" && raw > 0 ? raw : null;
           return (
             <li key={c.id} className="card flex items-center justify-between px-5 py-4">
               <div className="min-w-0 flex-1">
@@ -187,7 +189,9 @@ export default function CredentialsPage() {
                   <span className="display-h3">{c.provider}</span>
                   <span className="pill pill-stopped tabular">priority {c.priority}</span>
                   {cap ? (
-                    <span className="pill pill-running tabular">cap ${cap.toFixed(2)}/day</span>
+                    <span className="pill pill-running tabular">
+                      cap {cap.toLocaleString()} tokens/day
+                    </span>
                   ) : (
                     <span className="pill pill-stopped">unlimited</span>
                   )}

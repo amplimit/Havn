@@ -317,6 +317,7 @@ pub(crate) mod tests {
             )),
             agent_env_passthrough: Arc::new(Vec::new()),
             keyring: None,
+            max_tokens_ceiling: None,
         };
         (app, bootstrap)
     }

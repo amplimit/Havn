@@ -73,6 +73,9 @@ pub struct AgentSocketCtx {
     /// without a side-channel.
     pub embedding_config: Arc<arc_swap::ArcSwap<serde_json::Value>>,
     pub multi_user: bool,
+    /// `[llm] max_tokens_ceiling`: upper bound on `max_tokens` for every
+    /// proxied LLM call, whatever the agent's config asks for.
+    pub max_tokens_ceiling: Option<u32>,
     /// True when agents run under `NamespaceSpawner`, each in its own
     /// `agent-<id>` cgroup. The gateway then accepts a connection for an
     /// agent only from a process in that cgroup. With the unisolated
@@ -770,13 +773,19 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                 }
                 None => owner_id,
             };
+            let billing = llm_proxy::Billing {
+                user_id: billing_user,
+                agent_id: Some(agent_id),
+                budget: policy.budget.clone(),
+            };
             match llm_proxy::complete_with_provider(
                 &ctx.db,
                 &ctx.http,
                 ring,
-                billing_user,
+                &billing,
                 &provider,
                 &ar,
+                ctx.max_tokens_ceiling,
             )
             .await
             {
@@ -1322,6 +1331,7 @@ mod tests {
                 serde_json::json!({"provider": "disabled"}),
             )),
             multi_user,
+            max_tokens_ceiling: None,
             verify_peer_cgroup,
             extra_mounts: Vec::new(),
             tmpfs_mounts: Vec::new(),
