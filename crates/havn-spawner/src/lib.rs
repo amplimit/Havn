@@ -54,9 +54,12 @@ pub struct AgentSpawnConfig {
     pub init_binary: Option<PathBuf>,
     /// Path to the gateway's listening socket. The runtime dials this on startup.
     pub gateway_socket: PathBuf,
-    /// True when this is a subagent. Subagents inherit parent cgroup, are killed
-    /// with parent (`PR_SET_PDEATHSIG` + `cgroup.kill` backstop), and have no
-    /// `subagent_spawn` tool. See spec §4.5.
+    /// Passes `--is-subagent` to the runtime. The gateway spawns no subagent
+    /// processes today: subagents run as tasks inside the parent runtime
+    /// (spec §4.5). Every process a spawner starts is SIGKILLed by the kernel
+    /// when the gateway dies (`PR_SET_PDEATHSIG`, set in the child before
+    /// exec; under the namespace spawner `havn-init` sets it again for the
+    /// runtime), and the gateway reaps leftover agent cgroups at startup.
     #[serde(default)]
     pub is_subagent: bool,
     /// Operator-declared extra host paths to mirror-bind into the agent
@@ -322,15 +325,140 @@ pub struct ResourceStats {
     pub pids: u32,
 }
 
+/// How an agent's top-level process ended. Under the namespace spawner that
+/// process is `havn-init`, which exits with the runtime's code, or with
+/// `128 + signal` when the runtime was killed by a signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentExit {
+    Code(i32),
+    Signal(i32),
+    Unknown,
+}
+
+impl From<std::io::Result<std::process::ExitStatus>> for AgentExit {
+    fn from(status: std::io::Result<std::process::ExitStatus>) -> Self {
+        let Ok(status) = status else {
+            return Self::Unknown;
+        };
+        if let Some(code) = status.code() {
+            return Self::Code(code);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            if let Some(signal) = status.signal() {
+                return Self::Signal(signal);
+            }
+        }
+        Self::Unknown
+    }
+}
+
+impl std::fmt::Display for AgentExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Code(code) => write!(f, "exit code {code}"),
+            Self::Signal(signal) => write!(f, "signal {signal}"),
+            Self::Unknown => f.write_str("unknown exit status"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StopSignal {
+    Terminate,
+    Kill,
+}
+
+/// Owns a spawned child in a task that reaps it as soon as it exits, so
+/// exits are observed without anyone polling. Signals go through the same
+/// task: it only signals a child it has not reaped yet, so a recycled pid
+/// is never hit.
+#[derive(Debug, Clone)]
+pub(crate) struct ChildWatch {
+    pid: u32,
+    exit: tokio::sync::watch::Receiver<Option<AgentExit>>,
+    signals: tokio::sync::mpsc::UnboundedSender<StopSignal>,
+}
+
+impl ChildWatch {
+    pub(crate) fn start(mut child: tokio::process::Child, pid: u32) -> Self {
+        let (exit_tx, exit) = tokio::sync::watch::channel(None);
+        let (signals, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let status = loop {
+                tokio::select! {
+                    status = child.wait() => break status,
+                    Some(signal) = requests.recv() => deliver(&mut child, signal),
+                }
+            };
+            exit_tx.send_replace(Some(AgentExit::from(status)));
+        });
+        Self { pid, exit, signals }
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub(crate) fn terminate(&self) {
+        let _ = self.signals.send(StopSignal::Terminate);
+    }
+
+    pub(crate) fn kill(&self) {
+        let _ = self.signals.send(StopSignal::Kill);
+    }
+
+    pub(crate) async fn exited(&self) -> AgentExit {
+        let mut exit = self.exit.clone();
+        match exit.wait_for(Option::is_some).await {
+            Ok(status) => status.unwrap_or(AgentExit::Unknown),
+            Err(_) => AgentExit::Unknown,
+        }
+    }
+}
+
+fn deliver(child: &mut tokio::process::Child, signal: StopSignal) {
+    match signal {
+        StopSignal::Terminate => {
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                // SAFETY: `pid` belongs to a child this task has not reaped,
+                // so it cannot have been reused; SIGTERM is a defined signal.
+                unsafe {
+                    let _ = libc::kill(pid.cast_signed(), libc::SIGTERM);
+                }
+            }
+        }
+        StopSignal::Kill => {
+            let _ = child.start_kill();
+        }
+    }
+}
+
 #[async_trait]
 pub trait AgentSpawner: Send + Sync + std::fmt::Debug {
     /// Spawn an agent process; returns a handle for later lifecycle calls.
     async fn spawn(&self, config: &AgentSpawnConfig, policy: &Policy) -> Result<AgentHandle>;
 
-    /// Stop a running agent. SIGTERM, then SIGKILL after a grace period
-    /// (5 seconds for the subprocess spawner; the namespace spawner adds a
-    /// `cgroup.kill` backstop for the whole subtree).
+    /// Stop an agent and release what the spawner holds for it. SIGTERM,
+    /// then SIGKILL after a grace period (5 seconds for the subprocess
+    /// spawner; the namespace spawner adds a `cgroup.kill` backstop for the
+    /// whole subtree). Also the cleanup step for an agent that has already
+    /// exited on its own.
     async fn stop(&self, handle: &AgentHandle) -> Result<()>;
+
+    /// Resolve once the agent's process has exited. `NotFound` when the
+    /// spawner no longer tracks this process (stopped, or replaced by a
+    /// later spawn).
+    async fn wait(&self, handle: &AgentHandle) -> Result<AgentExit>;
+
+    /// Kill agent processes left behind by a previous gateway run; returns
+    /// how many agents were found. Called once at gateway startup.
+    async fn reap_orphans(&self) -> Result<usize> {
+        Ok(0)
+    }
 
     /// Read current resource usage. Returns zeroes for backends that don't track it.
     async fn stats(&self, handle: &AgentHandle) -> Result<ResourceStats>;

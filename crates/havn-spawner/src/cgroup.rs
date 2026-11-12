@@ -33,6 +33,8 @@ use tracing::{debug, info, warn};
 /// missing and writable.
 pub const SLICE: &str = "havn.slice";
 
+const AGENT_PREFIX: &str = "agent-";
+
 const REQUIRED_CONTROLLERS: &[&str] = &["cpu", "memory", "pids"];
 
 /// cgroup v2 cpu.max period — the standard 100 ms scheduler window. Quota is
@@ -144,7 +146,7 @@ impl CgroupController {
         agent_id: &str,
         limits: &ResourceLimits,
     ) -> Result<PathBuf, CgroupError> {
-        let path = self.slice.join(format!("agent-{agent_id}"));
+        let path = self.agent_path(agent_id);
         if !path.exists() {
             fs::create_dir(&path).map_err(|e| CgroupError::WriteFailed {
                 file: path.clone(),
@@ -159,6 +161,30 @@ impl CgroupController {
         write_file(&path.join("pids.max"), &format_pids_max(limits.pids_max))?;
         debug!(agent_id, path = %path.display(), "agent cgroup created");
         Ok(path)
+    }
+
+    pub fn agent_path(&self, agent_id: &str) -> PathBuf {
+        self.slice.join(format!("{AGENT_PREFIX}{agent_id}"))
+    }
+
+    /// Every per-agent cgroup currently under the slice.
+    pub fn agent_cgroups(&self) -> Vec<PathBuf> {
+        let Ok(entries) = fs::read_dir(&self.slice) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(AGENT_PREFIX))
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect()
+    }
+
+    /// True while any process is left in the cgroup or below it. A cgroup
+    /// without `cgroup.events` (already removed) counts as empty.
+    pub fn is_populated(&self, cgroup: &Path) -> bool {
+        fs::read_to_string(cgroup.join("cgroup.events"))
+            .is_ok_and(|events| events.lines().any(|l| l.trim() == "populated 1"))
     }
 
     /// Read current resource usage. Missing files yield zeroes — this happens
@@ -211,6 +237,7 @@ const CONTROL_FILES: &[&str] = &[
     "pids.max",
     "cgroup.procs",
     "cgroup.kill",
+    "cgroup.events",
 ];
 
 fn format_memory_max(memory_mb: u64) -> String {
@@ -597,6 +624,31 @@ mod tests {
         // the kernel cleans up the virtual files when rmdir lands.
         ctl.cleanup(&path).expect("cleanup");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn populated_follows_cgroup_events() {
+        let root = fake_v2_root();
+        let ctl = CgroupController::with_root(root).expect("ctl");
+        let path = ctl.create_agent("ev", &ResourceLimits::default()).unwrap();
+        assert!(!ctl.is_populated(&path), "no cgroup.events: nothing left");
+        std::fs::write(path.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        assert!(ctl.is_populated(&path));
+        std::fs::write(path.join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        assert!(!ctl.is_populated(&path));
+        ctl.cleanup(&path).expect("cleanup");
+    }
+
+    #[test]
+    fn agent_cgroups_lists_only_agent_directories() {
+        let root = fake_v2_root();
+        let ctl = CgroupController::with_root(root).expect("ctl");
+        let a = ctl.create_agent("a", &ResourceLimits::default()).unwrap();
+        let b = ctl.create_agent("b", &ResourceLimits::default()).unwrap();
+        std::fs::create_dir(ctl.slice().join("other")).unwrap();
+        let mut found = ctl.agent_cgroups();
+        found.sort();
+        assert_eq!(found, vec![a, b]);
     }
 
     #[test]

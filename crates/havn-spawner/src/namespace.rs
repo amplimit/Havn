@@ -5,7 +5,10 @@
 //! - **cgroup v2** — per-agent cgroup under
 //!   `/sys/fs/cgroup/havn.slice/agent-<id>` with the policy's memory / CPU /
 //!   pids limits. `stop()` falls back to `cgroup.kill` for atomic
-//!   subtree termination (fork-bomb safe).
+//!   subtree termination (fork-bomb safe). Every spawn starts from an
+//!   empty cgroup: one left over from an earlier instance is killed and
+//!   removed first, and [`NamespaceSpawner::reap_orphans`] clears those a
+//!   previous gateway run left behind.
 //! - **User + mount + network + PID namespaces** — `unshare(CLONE_NEWUSER
 //!   | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWPID)` in `pre_exec`, host UID
 //!   mapped to agent's in-namespace UID 0, mount propagation marked
@@ -34,21 +37,27 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::process::CommandExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use havn_core::{AgentId, Policy};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::cgroup::{CgroupController, CgroupError};
 use crate::ns_setup;
-use crate::{AgentHandle, AgentSpawnConfig, AgentSpawner, ResourceStats, Result, SpawnerError};
+use crate::{
+    AgentExit, AgentHandle, AgentSpawnConfig, AgentSpawner, ChildWatch, ResourceStats, Result,
+    SpawnerError,
+};
 
 const STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// How long `cgroup.kill` may take to empty a cgroup before giving up.
+const CGROUP_DRAIN: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub struct NamespaceSpawner {
@@ -63,7 +72,7 @@ pub struct NamespaceSpawner {
 
 #[derive(Debug)]
 struct AgentState {
-    child: Child,
+    child: ChildWatch,
     cgroup_path: PathBuf,
 }
 
@@ -111,6 +120,76 @@ impl NamespaceSpawner {
     pub fn set_network_ready(&mut self) {
         self.network_ready = true;
     }
+
+    /// SIGKILL whatever is left in `cgroup`, wait for it to empty, and
+    /// remove it.
+    async fn clear_cgroup(&self, cgroup: &Path) -> Result<(), CgroupError> {
+        if let Err(e) = self.cgroup.kill_all(cgroup) {
+            warn!(cgroup = %cgroup.display(), error = %e, "cgroup.kill failed");
+        }
+        let deadline = tokio::time::Instant::now() + CGROUP_DRAIN;
+        while self.cgroup.is_populated(cgroup) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        self.cgroup.cleanup(cgroup)
+    }
+
+    /// Stop one instance: SIGTERM through the reaper, `cgroup.kill` for
+    /// whatever the reaper cannot see, then remove its cgroup and network.
+    async fn terminate(&self, agent_id: AgentId, state: AgentState) {
+        let AgentState { child, cgroup_path } = state;
+
+        // 1. Graceful SIGTERM first. The child is the OUTER reaper (in the
+        //    host PID ns); its signal handler forwards SIGTERM to the inner
+        //    runtime (PID 1 in the new ns) — see
+        //    `ns_setup::install_signal_forwarder`. The inner runs its
+        //    graceful shutdown, exits, and the outer waitpid's then
+        //    `_exit`s with the same status. For a child that has already
+        //    exited this is a no-op and the wait below returns at once.
+        child.terminate();
+
+        // 2. Wait STOP_GRACE for the OUTER to exit on its own. A timeout
+        //    means either the inner is stuck or the signal forwarder did
+        //    not deliver — either way we fall through to cgroup.kill.
+        let timed_out = match tokio::time::timeout(STOP_GRACE, child.exited()).await {
+            Ok(exit) => {
+                info!(%agent_id, %exit, "outer reaper exited");
+                false
+            }
+            Err(_) => {
+                warn!(%agent_id, "SIGTERM grace expired; will hammer cgroup subtree");
+                true
+            }
+        };
+
+        // 3. Backstop: ALWAYS cgroup.kill the whole subtree, then remove the
+        //    cgroup. Even when the outer reaper exited cleanly above, the
+        //    inner runtime (and any grandchild of its shell tool) may live
+        //    on in the same cgroup, invisible to the reaper wait — for
+        //    instance when the reaper itself was killed. Without this
+        //    hammer they would survive `stop()`, leak resources, and keep
+        //    the cgroup busy.
+        if let Err(e) = self.clear_cgroup(&cgroup_path).await {
+            warn!(
+                cgroup = %cgroup_path.display(),
+                error = %e,
+                "cgroup cleanup failed; the next spawn or gateway start retries it"
+            );
+        }
+        if timed_out {
+            // The cgroup kill took the reaper with it; make sure it is
+            // reaped even if the kill could not be written.
+            child.kill();
+            let _ = child.exited().await;
+        }
+
+        // 4. Best-effort veth teardown. The kernel reaps the pair when
+        //    the agent's netns is destroyed (after the last process in
+        //    it exits, which the cgroup.kill above ensures); this `ip
+        //    link del` is the belt-and-braces path for the rare case
+        //    where the host-side end lingers.
+        crate::network::teardown_agent_network(agent_id, &self.pool);
+    }
 }
 
 #[async_trait]
@@ -125,14 +204,33 @@ impl AgentSpawner for NamespaceSpawner {
         //    in it on startup.
         tokio::fs::create_dir_all(&config.workspace_dir).await?;
 
-        // 2. Create the cgroup with policy limits BEFORE spawning so we
+        // 2. Start from an empty cgroup. A previous instance still tracked
+        //    here is stopped; a cgroup left from anything else is cleared.
+        //    Processes left in it could otherwise pass the gateway's peer
+        //    check as this agent.
+        let previous = self.state.lock().await.remove(&config.agent_id);
+        if let Some(previous) = previous {
+            warn!(agent_id = %config.agent_id, "stopping a previous instance before respawn");
+            self.terminate(config.agent_id, previous).await;
+        }
+        let stale = self.cgroup.agent_path(&config.agent_id.to_string());
+        if stale.exists() {
+            self.clear_cgroup(&stale).await.map_err(|e| {
+                SpawnerError::Spawn(format!(
+                    "agent cgroup {} from an earlier run cannot be cleared: {e}",
+                    stale.display()
+                ))
+            })?;
+        }
+
+        // 3. Create the cgroup with policy limits BEFORE spawning so we
         //    never have an unconstrained PID in flight.
         let cgroup_path = self
             .cgroup
             .create_agent(&config.agent_id.to_string(), &policy.resource_limits)
             .map_err(|e| map_cgroup_err(&e))?;
 
-        // 3. Build the spawn command. Two-stage launch:
+        // 4. Build the spawn command. Two-stage launch:
         //    a. exec `havn-init <runtime> <runtime-args>`. The pre_exec
         //       hook below runs in this process; it puts everything from
         //       here on into fresh user/mount/net/pid namespaces.
@@ -272,6 +370,8 @@ impl AgentSpawner for NamespaceSpawner {
         // SAFETY: `getuid` / `getgid` are async-signal-safe and infallible.
         let host_uid = unsafe { libc::getuid() };
         let host_gid = unsafe { libc::getgid() };
+        // havn-init dies with the gateway (and takes the runtime along).
+        let gateway_pid = std::process::id().cast_signed();
         // The child joins its cgroup itself, before exec, so havn-init and
         // everything it forks (the runtime, tools, subagents) inherit the
         // limits. Joining from the parent after spawn() races with
@@ -290,6 +390,8 @@ impl AgentSpawner for NamespaceSpawner {
                 ns_setup::unshare_namespaces()?;
                 ns_setup::write_user_namespace_maps(host_uid, host_gid)?;
                 ns_setup::mark_mounts_private()?;
+                // Last, after every credential change, which could clear it.
+                ns_setup::kill_with_parent(Some(gateway_pid))?;
                 Ok(())
             });
         }
@@ -303,7 +405,7 @@ impl AgentSpawner for NamespaceSpawner {
             .id()
             .ok_or_else(|| SpawnerError::Spawn("child has no pid".into()))?;
 
-        // 4. Per-agent veth + NAT setup (spec §4.1, §6.3 v0.7).
+        // 5. Per-agent veth + NAT setup (spec §4.1, §6.3 v0.7).
         //
         //    **Gated on `policy.network_policy.egress_allowed`** (default
         //    false). The pre_exec hook above already unshared
@@ -378,10 +480,13 @@ impl AgentSpawner for NamespaceSpawner {
             "agent started in cgroup"
         );
 
-        self.state
-            .lock()
-            .await
-            .insert(config.agent_id, AgentState { child, cgroup_path });
+        self.state.lock().await.insert(
+            config.agent_id,
+            AgentState {
+                child: ChildWatch::start(child, pid),
+                cgroup_path,
+            },
+        );
 
         Ok(AgentHandle {
             agent_id: config.agent_id,
@@ -390,82 +495,61 @@ impl AgentSpawner for NamespaceSpawner {
     }
 
     async fn stop(&self, handle: &AgentHandle) -> Result<()> {
-        let AgentState {
-            mut child,
-            cgroup_path,
-        } = {
+        let state = {
             let mut guard = self.state.lock().await;
+            if guard
+                .get(&handle.agent_id)
+                .is_none_or(|s| s.child.pid() != handle.pid)
+            {
+                return Err(SpawnerError::NotFound(handle.agent_id));
+            }
             guard
                 .remove(&handle.agent_id)
                 .ok_or(SpawnerError::NotFound(handle.agent_id))?
         };
-
-        // 1. Try graceful SIGTERM first. libc::kill is the same call the
-        //    SubprocessSpawner uses; we need a separate file because tokio's
-        //    Child only exposes start_kill (= SIGKILL).
-        //
-        //    `handle.pid` is the OUTER reaper (in the host PID ns); its
-        //    signal handler forwards SIGTERM to the inner runtime (PID 1
-        //    in the new ns) — see `ns_setup::install_signal_forwarder`.
-        //    The inner runs its graceful shutdown, exits, and the outer
-        //    waitpid's then `_exit`s with the same status.
-        send_sigterm(handle.pid);
-
-        // 2. Wait STOP_GRACE for the OUTER to exit on its own. A clean exit
-        //    here means the inner already shut down gracefully and the
-        //    outer reaper finished. A timeout means either the inner is
-        //    stuck or the signal forwarder did not deliver — either way
-        //    we fall through to cgroup.kill.
-        let timed_out = match tokio::time::timeout(STOP_GRACE, child.wait()).await {
-            Ok(Ok(status)) => {
-                info!(agent_id = %handle.agent_id, ?status, "outer reaper exited after SIGTERM");
-                false
-            }
-            Ok(Err(e)) => {
-                warn!(agent_id = %handle.agent_id, error = %e, "wait failed; proceeding to cgroup.kill");
-                false
-            }
-            Err(_) => {
-                warn!(
-                    agent_id = %handle.agent_id,
-                    "SIGTERM grace expired; will hammer cgroup subtree"
-                );
-                true
-            }
-        };
-
-        // 3. Backstop: ALWAYS cgroup.kill the whole subtree. Even when the
-        //    outer reaper exited cleanly above, the inner runtime (and any
-        //    grandchild of its shell tool) lives in the same cgroup but is
-        //    invisible to `child.wait()` — the gateway only ever held a
-        //    handle on the outer. Without this hammer the inner would
-        //    survive `stop()`, leak resources, and the subsequent
-        //    `cleanup()` would fail with EBUSY because the cgroup still
-        //    has live tasks.
-        if let Err(e) = self.cgroup.kill_all(&cgroup_path) {
-            warn!(error = %e, "cgroup.kill backstop failed");
-        }
-        if timed_out {
-            // Drain the wait future so we don't leave a zombie on our side.
-            let _ = child.wait().await;
-        }
-
-        // 4. cgroup is now empty — rmdir.
-        if let Err(e) = self.cgroup.cleanup(&cgroup_path) {
-            warn!(
-                cgroup = %cgroup_path.display(),
-                error = %e,
-                "cgroup cleanup failed; will retry on next gateway restart"
-            );
-        }
-
-        // 5. Best-effort veth teardown. The kernel reaps the pair when
-        //    the agent's netns is destroyed (after the last process in
-        //    it exits, which the cgroup.kill above ensures); this `ip
-        //    link del` is the belt-and-braces path for the rare case
-        //    where the host-side end lingers.
-        crate::network::teardown_agent_network(handle.agent_id, &self.pool);
+        self.terminate(handle.agent_id, state).await;
         Ok(())
+    }
+
+    async fn wait(&self, handle: &AgentHandle) -> Result<AgentExit> {
+        let child = self
+            .state
+            .lock()
+            .await
+            .get(&handle.agent_id)
+            .filter(|s| s.child.pid() == handle.pid)
+            .map(|s| s.child.clone())
+            .ok_or(SpawnerError::NotFound(handle.agent_id))?;
+        Ok(child.exited().await)
+    }
+
+    async fn reap_orphans(&self) -> Result<usize> {
+        let tracked: Vec<PathBuf> = self
+            .state
+            .lock()
+            .await
+            .values()
+            .map(|s| s.cgroup_path.clone())
+            .collect();
+        let mut reaped = 0;
+        for cgroup in self.cgroup.agent_cgroups() {
+            if tracked.contains(&cgroup) {
+                continue;
+            }
+            let populated = self.cgroup.is_populated(&cgroup);
+            match self.clear_cgroup(&cgroup).await {
+                Ok(()) => {
+                    info!(cgroup = %cgroup.display(), populated, "removed agent cgroup left by an earlier run");
+                    reaped += 1;
+                }
+                Err(e) => warn!(
+                    cgroup = %cgroup.display(),
+                    error = %e,
+                    "agent cgroup left by an earlier run cannot be removed"
+                ),
+            }
+        }
+        Ok(reaped)
     }
 
     async fn stats(&self, handle: &AgentHandle) -> Result<ResourceStats> {
@@ -490,15 +574,6 @@ impl AgentSpawner for NamespaceSpawner {
 
 fn map_cgroup_err(e: &CgroupError) -> SpawnerError {
     SpawnerError::IsolationUnavailable(e.to_string())
-}
-
-#[cfg(unix)]
-fn send_sigterm(pid: u32) {
-    // SAFETY: same invariants as in the SubprocessSpawner — well-known
-    // signal number, ESRCH is benign (child already exited).
-    unsafe {
-        let _ = libc::kill(pid.cast_signed(), libc::SIGTERM);
-    }
 }
 
 #[cfg(test)]
@@ -558,5 +633,54 @@ mod tests {
             leftover_count, 0,
             "expected no leftover cgroup dirs after failed spawn"
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_refuses_a_cgroup_left_by_an_earlier_run_it_cannot_clear() {
+        let root = fake_cgroup_root();
+        let ctl = CgroupController::with_root(root).expect("ctl");
+        let spawner = NamespaceSpawner::with_controller(ctl.clone());
+        let agent_id = AgentId::new();
+        let stale = ctl
+            .create_agent(&agent_id.to_string(), &Policy::default().resource_limits)
+            .expect("stale cgroup");
+        // A nested cgroup keeps the directory from being removed.
+        std::fs::create_dir(stale.join("nested")).expect("nested");
+
+        let cfg = AgentSpawnConfig {
+            agent_id,
+            workspace_dir: std::env::temp_dir().join(format!("havn-ws-{}", uuid::Uuid::now_v7())),
+            runtime_binary: PathBuf::from("/bin/this-binary-does-not-exist"),
+            init_binary: Some(PathBuf::from("/bin/this-binary-does-not-exist")),
+            gateway_socket: std::env::temp_dir().join("havn-fake.sock"),
+            is_subagent: false,
+            extra_mounts: Vec::new(),
+            tmpfs_mounts: Vec::new(),
+            seccomp_allow_extra: Vec::new(),
+            agent_dns: Vec::new(),
+            env_passthrough: Vec::new(),
+        };
+        let err = spawner
+            .spawn(&cfg, &Policy::default())
+            .await
+            .expect_err("must not join a cgroup that may hold old processes");
+        assert!(
+            matches!(&err, SpawnerError::Spawn(m) if m.contains("cannot be cleared")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_orphans_clears_every_untracked_agent_cgroup() {
+        let root = fake_cgroup_root();
+        let ctl = CgroupController::with_root(root).expect("ctl");
+        let limits = Policy::default().resource_limits;
+        let a = ctl.create_agent("a", &limits).expect("a");
+        let b = ctl.create_agent("b", &limits).expect("b");
+        let spawner = NamespaceSpawner::with_controller(ctl);
+
+        assert_eq!(spawner.reap_orphans().await.expect("reap"), 2);
+        assert!(!a.exists() && !b.exists());
+        assert_eq!(spawner.reap_orphans().await.expect("reap"), 0);
     }
 }

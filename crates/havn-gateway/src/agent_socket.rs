@@ -9,7 +9,8 @@
 //! 5. Per-connection reader loop dispatches inbound frames:
 //!    - `LlmRequest` → spawn proxy task → reply with `LlmResponse`
 //!    - `OutboundMessage` → route via channel adapter (Phase 1: log only)
-//!    - `LivenessPing` → record (Phase 2: drives unhealthy-agent detection)
+//!    - `LivenessPing` → record in the registry; the supervisor restarts
+//!      agents whose pings stop (`crate::supervisor`)
 
 use std::path::Path;
 use std::str::FromStr as _;
@@ -544,7 +545,7 @@ where
                 });
             }
             AgentToGateway::LivenessPing => {
-                debug!(%agent_id, "liveness ping");
+                ctx.registry.record_ping(agent_id).await;
             }
             AgentToGateway::CronResult(result) => {
                 let job_id = result.job_id.clone();

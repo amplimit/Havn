@@ -27,6 +27,8 @@
 //!    own namespace, which is the host's unprivileged UID.
 //! 3. Mark mount propagation `MS_PRIVATE` so any future mount/unmount the
 //!    agent does inside its mount namespace doesn't escape to the host.
+//! 4. `PR_SET_PDEATHSIG` ([`kill_with_parent`]) so the agent is SIGKILLed
+//!    when the gateway dies instead of outliving it.
 //!
 //! ## PID namespace fork dance
 //!
@@ -157,6 +159,36 @@ pub unsafe fn join_cgroup(cgroup_procs: &CStr) -> io::Result<()> {
     // SAFETY: same contract as `write_proc_file`; writing "0" moves the
     // calling process into the cgroup that owns `cgroup.procs`.
     unsafe { write_proc_file(cgroup_procs, b"0") }
+}
+
+/// Have the kernel SIGKILL the calling process when its parent dies.
+/// Strictly the kernel watches the parent *thread* that forked us; the
+/// gateway spawns from tokio worker threads, which live as long as the
+/// gateway (nothing in it calls `block_in_place`, which can retire one).
+/// `expected_parent` closes the race where the parent died before this
+/// call; pass `None` inside a new PID namespace, where the parent is not
+/// visible. Async-signal-safe, so callable between fork and exec, and
+/// preserved across exec of a binary without set-id bits or file caps.
+pub fn kill_with_parent(expected_parent: Option<libc::pid_t>) -> io::Result<()> {
+    // SAFETY: PR_SET_PDEATHSIG takes one signal number; the trailing
+    // arguments are ignored and passed as zero.
+    let rc = unsafe {
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0_u64,
+            0_u64,
+            0_u64,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: getppid has no preconditions.
+    if expected_parent.is_some_and(|parent| unsafe { libc::getppid() } != parent) {
+        return Err(io::Error::from_raw_os_error(libc::ESRCH));
+    }
+    Ok(())
 }
 
 /// Mark the entire mount tree under `/` as `MS_PRIVATE` so the agent's
@@ -914,6 +946,37 @@ unsafe fn write_proc_file(path: &CStr, data: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_is_killed_when_the_thread_that_spawned_it_exits() {
+        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+        let parent = std::process::id().cast_signed();
+        let mut child = std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("30");
+            // SAFETY: the hook only makes async-signal-safe calls.
+            unsafe {
+                cmd.pre_exec(move || kill_with_parent(Some(parent)));
+            }
+            cmd.spawn().expect("spawn sleep")
+        })
+        .join()
+        .expect("spawning thread");
+        let status = child.wait().expect("wait");
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+    }
+
+    #[test]
+    fn spawn_fails_when_the_parent_is_not_the_expected_one() {
+        use std::os::unix::process::CommandExt as _;
+        let mut cmd = std::process::Command::new("true");
+        // SAFETY: the hook only makes async-signal-safe calls.
+        unsafe {
+            cmd.pre_exec(|| kill_with_parent(Some(i32::MAX)));
+        }
+        let err = cmd.spawn().expect_err("parent check must fail");
+        assert_eq!(err.raw_os_error(), Some(libc::ESRCH));
+    }
 
     #[test]
     fn uid_map_line_format() {

@@ -27,6 +27,10 @@
 //!   reaches it, blocks in `waitpid`, and `_exit`s with the runtime's exit
 //!   code. Never returns.
 //!
+//! Both sides die with their parent: the spawner sets `PR_SET_PDEATHSIG`
+//! (SIGKILL) for this process before exec, and the child sets it again
+//! towards the parent, so a dead gateway takes the whole agent with it.
+//!
 //! Why a separate binary instead of doing the fork in `pre_exec`:
 //! `std::process::Command::spawn` uses a cloexec pipe to detect exec
 //! success — if `pre_exec` forks and the post-fork parent never exec's,
@@ -224,6 +228,14 @@ unsafe fn fork_and_exec_runtime(
             1
         }
         0 => {
+            // The runtime must not outlive this reaper: if the reaper is
+            // killed (with the gateway, or by hand), so is the runtime and,
+            // with it as PID 1, everything in its namespace.
+            if let Err(e) = ns_setup::kill_with_parent(None) {
+                eprintln!("havn-init: PR_SET_PDEATHSIG failed: {e}");
+                // SAFETY: `_exit` is async-signal-safe.
+                unsafe { libc::_exit(1) };
+            }
             // Child: PID 1 in the new PID ns. Build the minimal rootfs
             // (mounts /proc inside it as part of the operation), pivot
             // into it, then exec the runtime.

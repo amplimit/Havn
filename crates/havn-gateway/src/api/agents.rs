@@ -7,6 +7,12 @@
 //! - `POST /agents/{id}/stop` — request graceful shutdown via socket frame,
 //!   then SIGTERM/SIGKILL via spawner.
 //! - `DELETE /agents/{id}` — stop if running, remove workspace, delete DB row.
+//!
+//! Status `running` doubles as "meant to be running": while it is set,
+//! [`crate::supervisor`] restarts the agent when its process ends or goes
+//! silent, and brings it back after a gateway restart. Starting and
+//! stopping an agent's process is serialized per agent by
+//! [`start_lock`].
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -227,7 +233,10 @@ pub async fn start(
     // Idempotent — explicit POST /start is now mostly redundant since
     // the WS handler auto-starts on chat connect (spec §4.3 lifecycle
     // is preserved as data-model state, but most users never see it).
-    // Operators who want to pre-warm an agent can still POST here.
+    // Operators who want to pre-warm an agent can still POST here. An
+    // explicit start also gives an agent the supervisor gave up on a
+    // fresh restart budget.
+    state.supervisor.forget(id).await;
     ensure_running(&state, user.id, id).await?;
 
     let agent = repo::find_by_id(&state.db, id)
@@ -237,46 +246,85 @@ pub async fn start(
     Ok(Json(AgentView::from_agent(agent, connected)))
 }
 
+/// Per-agent lock held while an agent's process is started or stopped.
+/// The map-of-mutexes pattern keeps each agent independent — slow agent A
+/// doesn't block agent B.
+pub(crate) async fn start_lock(state: &AppState, id: AgentId) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = state.start_locks.lock().await;
+    map.entry(id)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Who asks for an agent to run.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StartBy {
+    User(havn_core::UserId),
+    /// The supervisor bringing back an agent meant to be running; audited
+    /// as its owner. Does nothing once the agent is no longer `running`.
+    Supervisor(havn_core::UserId),
+}
+
+#[derive(Debug)]
+pub(crate) struct StartError {
+    /// A process was spawned for this attempt (or one was already starting);
+    /// its exit or silence is handled by the supervisor like any other.
+    pub(crate) spawned: bool,
+    pub(crate) error: ApiError,
+}
+
+impl From<StartError> for ApiError {
+    fn from(e: StartError) -> Self {
+        e.error
+    }
+}
+
 /// Make `agent_id` runnable and connected. Idempotent and concurrency-
 /// safe via per-agent start lock — multiple WS connects to the same
 /// offline agent serialize through the lock; only the first spawns,
 /// the rest wait for the existing handshake to complete.
 ///
-/// Steps:
-/// 1. Fast path — if already connected, return.
-/// 2. Acquire per-agent lock so we don't race a sibling start.
-/// 3. Re-check connected (someone else may have raced ahead while we
-///    were waiting on the lock).
-/// 4. Ensure workspace exists, resolve policy via for_session, spawn
-///    runtime, register handle, set DB status, write audit.
-/// 5. Poll `is_connected` for up to [`HANDSHAKE_TIMEOUT`] so the
-///    caller (typically the WS handler) can proceed knowing the
-///    agent socket is live.
-///
 /// Returns Ok when the agent finished its Hello/Welcome handshake.
-/// Returns ApiError::Internal on spawn failure or handshake timeout
-/// (caller surfaces a friendlier message at the boundary).
+/// Returns ApiError::Internal on spawn failure, handshake timeout, or
+/// when the process exits before its handshake (caller surfaces a
+/// friendlier message at the boundary).
 pub async fn ensure_running(
     state: &AppState,
     by_user: havn_core::UserId,
     id: AgentId,
 ) -> Result<(), ApiError> {
+    Ok(start_agent(state, id, StartBy::User(by_user)).await?)
+}
+
+/// Steps:
+/// 1. Fast path — if already connected, return.
+/// 2. Acquire per-agent lock so we don't race a sibling start or a stop.
+/// 3. Re-check connected (someone else may have raced ahead while we
+///    were waiting on the lock); a supervisor start also re-checks that
+///    the agent is still meant to run.
+/// 4. Ensure workspace exists, resolve policy via for_session, spawn
+///    runtime, set DB status, register handle, start watching for its
+///    exit, write audit.
+/// 5. Poll `is_connected` for up to [`HANDSHAKE_TIMEOUT`] so the
+///    caller (typically the WS handler) can proceed knowing the
+///    agent socket is live.
+pub(crate) async fn start_agent(
+    state: &AppState,
+    id: AgentId,
+    by: StartBy,
+) -> Result<(), StartError> {
     use std::time::Duration;
+
+    let not_spawned = |error: ApiError| StartError {
+        spawned: false,
+        error,
+    };
 
     if state.registry.is_connected(id).await {
         return Ok(());
     }
 
-    // Per-agent serialization. The map-of-mutexes pattern keeps each
-    // agent's start independent — slow agent A doesn't block agent B
-    // from starting. Lock is held across spawn + initial registration
-    // (a few hundred ms in practice).
-    let agent_lock = {
-        let mut map = state.start_locks.lock().await;
-        map.entry(id)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    };
+    let agent_lock = start_lock(state, id).await;
     let _guard = agent_lock.lock().await;
 
     // Re-check after acquiring — a sibling start may have completed
@@ -284,15 +332,31 @@ pub async fn ensure_running(
     if state.registry.is_connected(id).await {
         return Ok(());
     }
+    if state.supervisor.shutting_down() {
+        return Err(not_spawned(ApiError::Conflict(
+            "the gateway is shutting down".into(),
+        )));
+    }
+    if let StartBy::Supervisor(_) = by {
+        match repo::find_by_id(&state.db, id).await {
+            Ok(Some(agent)) if agent.status == AgentStatus::Running => {}
+            // Stopped or deleted while a restart was pending.
+            Ok(_) => return Ok(()),
+            Err(e) => return Err(not_spawned(e.into())),
+        }
+    }
 
     // If a handle is registered but the socket hasn't completed
     // handshake yet (a previous attempt is mid-flight), DON'T spawn
-    // again — just fall through to the polling loop and wait.
-    if !state.registry.is_registered(id).await {
+    // again — just fall through to the polling loop and wait. A dead
+    // instance does not linger here: the supervisor deregisters it as
+    // soon as its process exits.
+    let mut spawned = state.registry.is_registered(id).await;
+    if !spawned {
         let workspace = workspace_for(state, id);
         workspace::ensure(&workspace)
             .await
-            .map_err(|e| ApiError::Internal(format!("workspace: {e}")))?;
+            .map_err(|e| not_spawned(ApiError::Internal(format!("workspace: {e}"))))?;
 
         let cfg = AgentSpawnConfig {
             agent_id: id,
@@ -308,28 +372,35 @@ pub async fn ensure_running(
             env_passthrough: state.agent_env_passthrough.as_ref().clone(),
         };
         let agent_row = repo::find_by_id(&state.db, id)
-            .await?
-            .ok_or(ApiError::NotFound)?;
+            .await
+            .map_err(|e| not_spawned(e.into()))?
+            .ok_or_else(|| not_spawned(ApiError::NotFound))?;
         let policy =
             policy_resolver::for_session(&state.db, &agent_row, state.trusted_proxies.is_some())
                 .await;
 
         let handle = state.spawner.spawn(&cfg, &policy).await.map_err(|e| {
             tracing::error!(agent_id = %id, error = %e, "spawner.spawn failed");
-            ApiError::Internal(format!("spawn: {e}"))
+            not_spawned(ApiError::Internal(format!("spawn: {e}")))
         })?;
-        info!(agent_id = %id, pid = handle.pid, "agent spawned (lazy)");
+        info!(agent_id = %id, pid = handle.pid, "agent spawned");
 
-        state.registry.register(handle).await;
-        repo::set_status(&state.db, id, AgentStatus::Running).await?;
-        audit::record_agent_action(
-            &state.db,
-            by_user,
-            id,
-            "agent.started",
-            serde_json::json!({}),
-        )
-        .await;
+        // Status before the exit watch starts, so an instant crash is
+        // judged against `running`.
+        if let Err(e) = repo::set_status(&state.db, id, AgentStatus::Running).await {
+            if let Err(stop) = state.spawner.stop(&handle).await {
+                warn!(agent_id = %id, error = %stop, "spawner.stop failed");
+            }
+            return Err(not_spawned(e.into()));
+        }
+        spawned = true;
+        let generation = state.registry.register(handle.clone()).await;
+        crate::supervisor::watch(state, handle, generation);
+        let (actor, action) = match by {
+            StartBy::User(user) => (user, "agent.started"),
+            StartBy::Supervisor(owner) => (owner, "agent.restarted"),
+        };
+        audit::record_agent_action(&state.db, actor, id, action, serde_json::json!({})).await;
     }
 
     // Poll for handshake. 200ms × 50 = 10s upper bound; subprocess
@@ -342,12 +413,23 @@ pub async fn ensure_running(
         if state.registry.is_connected(id).await {
             return Ok(());
         }
+        if !state.registry.is_registered(id).await {
+            return Err(StartError {
+                spawned,
+                error: ApiError::Internal(format!(
+                    "agent {id} exited before completing its handshake"
+                )),
+            });
+        }
         tokio::time::sleep(POLL).await;
     }
-    Err(ApiError::Internal(format!(
-        "agent {id} did not complete its handshake within {}s",
-        HANDSHAKE_TIMEOUT.as_secs()
-    )))
+    Err(StartError {
+        spawned,
+        error: ApiError::Internal(format!(
+            "agent {id} did not complete its handshake within {}s",
+            HANDSHAKE_TIMEOUT.as_secs()
+        )),
+    })
 }
 
 pub async fn stop(
@@ -358,20 +440,28 @@ pub async fn stop(
     let agent = resolve_agent(&id, &user, &state).await?;
     let id = agent.id;
 
-    // Best-effort graceful shutdown via socket; ignore if not connected.
-    if state.registry.is_connected(id).await
-        && let Err(e) = state.registry.send(id, GatewayToAgent::Shutdown).await
     {
-        warn!(agent_id = %id, error = ?e, "shutdown frame send failed");
+        let agent_lock = start_lock(&state, id).await;
+        let _guard = agent_lock.lock().await;
+        // Stopped first: from here on the supervisor leaves the agent
+        // down, including a restart that is already pending.
+        repo::set_status(&state.db, id, AgentStatus::Stopped).await?;
+        state.supervisor.forget(id).await;
+
+        // Best-effort graceful shutdown via socket; ignore if not connected.
+        if state.registry.is_connected(id).await
+            && let Err(e) = state.registry.send(id, GatewayToAgent::Shutdown).await
+        {
+            warn!(agent_id = %id, error = ?e, "shutdown frame send failed");
+        }
+
+        if let Some(handle) = state.registry.remove(id).await
+            && let Err(e) = state.spawner.stop(&handle).await
+        {
+            warn!(agent_id = %id, error = %e, "spawner.stop failed; continuing");
+        }
     }
 
-    if let Some(handle) = state.registry.remove(id).await
-        && let Err(e) = state.spawner.stop(&handle).await
-    {
-        warn!(agent_id = %id, error = %e, "spawner.stop failed; continuing");
-    }
-
-    repo::set_status(&state.db, id, AgentStatus::Stopped).await?;
     audit::record_agent_action(
         &state.db,
         user.id,
@@ -397,14 +487,19 @@ pub async fn delete(
     let agent = resolve_agent(&id, &user, &state).await?;
     let id = agent.id;
 
-    // Stop first if running.
-    if let Some(handle) = state.registry.remove(id).await {
-        if state.registry.is_connected(id).await {
-            let _ = state.registry.send(id, GatewayToAgent::Shutdown).await;
-        }
-        if let Err(e) = state.spawner.stop(&handle).await {
-            warn!(agent_id = %id, error = %e, "spawner.stop during delete failed");
-        }
+    // Stop first if running. Under the start lock, so no start or restart
+    // spawns it again while it is being removed.
+    let agent_lock = start_lock(&state, id).await;
+    let _guard = agent_lock.lock().await;
+    state.supervisor.forget(id).await;
+    repo::set_status(&state.db, id, AgentStatus::Stopped).await?;
+    if state.registry.is_connected(id).await {
+        let _ = state.registry.send(id, GatewayToAgent::Shutdown).await;
+    }
+    if let Some(handle) = state.registry.remove(id).await
+        && let Err(e) = state.spawner.stop(&handle).await
+    {
+        warn!(agent_id = %id, error = %e, "spawner.stop during delete failed");
     }
 
     // Audit BEFORE delete so the FK SET NULL on agent_id doesn't lose
