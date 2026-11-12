@@ -1,7 +1,7 @@
 //! PID-1-aware init hooks for the agent runtime (spec §4.1).
 //!
 //! When the runtime is launched inside a fresh PID namespace by the
-//! [`havn_spawner::namespace::NamespaceSpawner`], the kernel makes it PID 1
+//! `havn_spawner::namespace::NamespaceSpawner`, the kernel makes it PID 1
 //! of that namespace. PID 1 has two pieces of special semantics that bite
 //! a non-aware process:
 //!

@@ -43,7 +43,7 @@ use crate::secret_ref;
 
 /// Header carrying the operator-generated adapter authentication
 /// token (spec §3.3). The matching credential row is keyed by
-/// (provider = "channel:<channel>", name = <account_id>); the gateway
+/// `(provider = "channel:<channel>", name = <account_id>)`; the gateway
 /// finds it by handle and constant-time-compares the decrypted bytes
 /// against this header.
 const ADAPTER_TOKEN_HEADER: &str = "x-adapter-token";

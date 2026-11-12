@@ -1059,7 +1059,7 @@ const SILENT_MARKER: &str = "[SILENT]";
 /// Match the `[SILENT]` sentinel loosely — case-insensitive, anywhere in
 /// trimmed output. Mirrors Hermes's behaviour and tolerates the model
 /// emitting `**[SILENT]**`, leading newlines, lowercase variants, or
-/// wrapping it in a sentence ("respond with [silent] to skip"). Strict
+/// wrapping it in a sentence ("respond with \[silent\] to skip"). Strict
 /// `starts_with` matching missed too many real-world variations.
 fn is_silent_output(text: &str) -> bool {
     text.trim().to_uppercase().contains(SILENT_MARKER)
@@ -1313,7 +1313,7 @@ async fn run_tool_loop(
 /// 1. **Recent events (last 7 days)** — auto-loaded from typed memory
 ///    (kind = event), so the agent knows what just happened without
 ///    spending a `memory_search` tool call. Capped at
-///    [`RECENT_EVENTS_LIMIT`] entries.
+///    [`DEFAULT_RECENT_EVENTS_LIMIT`] entries.
 /// 2. **Skills relevant to this turn** — FTS5-retrieved from the skill
 ///    index based on `user_text`.
 ///

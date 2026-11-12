@@ -361,7 +361,7 @@ pub async fn ensure_running(
 /// 4. Ensure workspace exists, resolve policy via for_session, spawn
 ///    runtime, set DB status, register handle, start watching for its
 ///    exit, write audit.
-/// 5. Poll `is_connected` for up to [`HANDSHAKE_TIMEOUT`] so the
+/// 5. Poll `is_connected` for up to `HANDSHAKE_TIMEOUT` so the
 ///    caller (typically the WS handler) can proceed knowing the
 ///    agent socket is live.
 pub(crate) async fn start_agent(

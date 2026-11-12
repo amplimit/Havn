@@ -3,7 +3,7 @@
 //! `async-openai` SDK dependency to keep the dependency surface
 //! small and version-pinning predictable.
 //!
-//! API spec: https://platform.openai.com/docs/api-reference/embeddings/create
+//! API spec: <https://platform.openai.com/docs/api-reference/embeddings/create>
 //!
 //! Usage notes baked in:
 //! - Batches up to 2048 inputs per call (OpenAI limit). Caller can

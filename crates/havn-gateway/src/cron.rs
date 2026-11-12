@@ -4,7 +4,7 @@
 //! has elapsed, optionally runs each job's `wake_check` script
 //! gateway-side (NOT in the agent — fail-open with concurrency cap), then
 //! sends a `CronTick` frame to the corresponding agent. Output capture and
-//! `[SILENT]` suppression happen on the way back via [`record_result`],
+//! `[SILENT]` suppression happen on the way back via [`CronScheduler::record_result`],
 //! invoked by the agent socket handler when an `AgentToGateway::CronResult`
 //! frame arrives. Each tick carries a gateway-assigned `run_id`; a result is
 //! accepted only for a run that is still pending, once.

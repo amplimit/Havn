@@ -31,7 +31,7 @@ impl Gateway {
         format!("{}{}", self.base.trim_end_matches('/'), path)
     }
 
-    /// GET <base><path>, parse JSON response. Returns Err with the body text
+    /// GET `<base><path>`, parse JSON response. Returns Err with the body text
     /// when status is non-2xx — those messages are operator-readable.
     pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
         let resp = self

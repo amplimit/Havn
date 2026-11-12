@@ -37,7 +37,7 @@ pub struct NewQuery<'a> {
     pub caller_agent_id: AgentId,
     pub target_agent_id: AgentId,
     pub caller_user_id: UserId,
-    /// Caller-supplied prompt. Truncated to [`PROMPT_EXCERPT_MAX`] before
+    /// Caller-supplied prompt. Truncated to `PROMPT_EXCERPT_MAX` before
     /// the INSERT so we never persist arbitrary-size payloads.
     pub prompt: &'a str,
     pub outcome: Outcome,

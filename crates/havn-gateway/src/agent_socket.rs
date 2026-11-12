@@ -1,7 +1,9 @@
 //! Unix-socket listener for connecting agent runtime processes.
 //!
 //! Each connected agent gets one accepted socket. The handshake is:
-//! 1. Agent sends `Hello { agent_id, version }`.
+//! 1. Agent sends `Hello { agent_id, version }` within `HELLO_TIMEOUT`.
+//!    At most `MAX_PENDING_HANDSHAKES` connections may be between accept
+//!    and Welcome at once; further ones are closed straight away.
 //! 2. Gateway validates protocol version and that the agent was registered
 //!    via the lifecycle endpoint (`POST /agents/:id/start`).
 //! 3. Gateway replies `Welcome { session_token }`.
@@ -28,7 +30,7 @@ use havn_proto::{
 use sqlx::SqlitePool;
 use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -46,6 +48,16 @@ const OUTBOUND_QUEUE_CAPACITY: usize = 64;
 
 /// How long a Hello may wait for the registration of its agent.
 const REGISTRATION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a connected peer has to send Hello.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connections allowed between accept and Welcome at once, the
+/// registration wait included. The rest are closed as soon as accepted.
+const MAX_PENDING_HANDSHAKES: usize = 64;
+
+/// Least time between two warnings about connections refused for that cap.
+const REFUSAL_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Longest one frame write may take. A runtime that stops reading its socket
 /// is disconnected after this, which also releases every task waiting for
@@ -137,11 +149,41 @@ pub async fn run_listener(socket_path: &Path, ctx: AgentSocketCtx) -> anyhow::Re
         .with_context(|| format!("binding agent socket {}", socket_path.display()))?;
     info!(path = %socket_path.display(), "agent socket listening");
 
+    serve(
+        listener,
+        ctx,
+        Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES)),
+    )
+    .await
+}
+
+/// Accept connections, each holding one of `handshakes` until its Welcome
+/// is sent or it is refused.
+async fn serve(
+    listener: UnixListener,
+    ctx: AgentSocketCtx,
+    handshakes: Arc<Semaphore>,
+) -> anyhow::Result<()> {
+    let mut refused: u64 = 0;
+    let mut last_warning: Option<tokio::time::Instant> = None;
     loop {
         let (stream, _addr) = listener.accept().await.context("accept")?;
+        let Ok(handshake) = Arc::clone(&handshakes).try_acquire_owned() else {
+            drop(stream);
+            refused += 1;
+            if last_warning.is_none_or(|at| at.elapsed() >= REFUSAL_WARN_INTERVAL) {
+                warn!(
+                    refused,
+                    "refusing agent connections: too many handshakes in progress"
+                );
+                refused = 0;
+                last_warning = Some(tokio::time::Instant::now());
+            }
+            continue;
+        };
         let ctx = ctx.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, ctx).await {
+            if let Err(e) = handle_connection(stream, ctx, handshake).await {
                 warn!(error = ?e, "agent connection ended with error");
             }
         });
@@ -280,7 +322,11 @@ fn clip(s: &str) -> &str {
     s.char_indices().nth(64).map_or(s, |(end, _)| &s[..end])
 }
 
-async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::Result<()> {
+async fn handle_connection(
+    stream: UnixStream,
+    ctx: AgentSocketCtx,
+    handshake: OwnedSemaphorePermit,
+) -> anyhow::Result<()> {
     // Every sandbox sees the same socket, so the agent id in Hello is only
     // a claim. The peer's process comes from the kernel and cannot be
     // forged; look up its cgroup now, before reading anything from it.
@@ -293,8 +339,9 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
     let mut reader = BufReader::new(read);
 
     // 1. Handshake: read Hello
-    let hello = read_frame::<_, AgentToGateway>(&mut reader)
+    let hello = tokio::time::timeout(HELLO_TIMEOUT, read_frame::<_, AgentToGateway>(&mut reader))
         .await
+        .map_err(|_| anyhow::anyhow!("no Hello within {}s", HELLO_TIMEOUT.as_secs()))?
         .context("reading Hello")?;
     let (agent_id_str, version) = match hello {
         Some(AgentToGateway::Hello { agent_id, version }) => (agent_id, version),
@@ -448,6 +495,7 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
         ctx.registry.detach(agent_id, &tx).await;
         return Err(e).context("sending Welcome");
     }
+    drop(handshake);
 
     info!(%agent_id, "agent connected");
 
@@ -2025,10 +2073,28 @@ mod tests {
         version: &str,
     ) -> (anyhow::Result<()>, Option<GatewayToAgent>) {
         let (client, server) = UnixStream::pair().expect("socket pair");
-        let gateway = tokio::spawn(handle_connection(server, ctx.clone()));
+        let slots = Arc::new(Semaphore::new(1));
+        let gateway = tokio::spawn(handle_connection(server, ctx.clone(), take_slot(&slots)));
         let (client_read, mut client_write) = client.into_split();
+        send_hello(&mut client_write, agent_id, version).await;
+        let mut reader = BufReader::new(client_read);
+        let reply = read_reply(&mut reader).await;
+        drop(client_write);
+        drop(reader);
+        let verdict = gateway.await.expect("join");
+        (verdict, reply)
+    }
+
+    fn take_slot(slots: &Arc<Semaphore>) -> OwnedSemaphorePermit {
+        Arc::clone(slots).try_acquire_owned().expect("free slot")
+    }
+
+    async fn send_hello<W>(write: &mut W, agent_id: AgentId, version: &str)
+    where
+        W: AsyncWrite + Unpin,
+    {
         write_frame(
-            &mut client_write,
+            write,
             &AgentToGateway::Hello {
                 agent_id: agent_id.to_string(),
                 version: version.into(),
@@ -2036,19 +2102,122 @@ mod tests {
         )
         .await
         .expect("send hello");
-        let mut reader = BufReader::new(client_read);
-        let reply = tokio::time::timeout(
+    }
+
+    async fn read_reply<R>(reader: &mut R) -> Option<GatewayToAgent>
+    where
+        R: AsyncBufRead + Unpin,
+    {
+        tokio::time::timeout(
             Duration::from_secs(5),
-            read_frame::<_, GatewayToAgent>(&mut reader),
+            read_frame::<_, GatewayToAgent>(reader),
         )
         .await
         .expect("gateway answers or closes")
         .ok()
-        .flatten();
+        .flatten()
+    }
+
+    async fn wait_for_free_slots(slots: &Semaphore, free: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while slots.available_permits() != free {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("slot count settles");
+    }
+
+    #[tokio::test]
+    async fn silent_peer_is_dropped_after_the_hello_timeout() {
+        let ctx = ctx_with(false, false).await;
+        tokio::time::pause();
+        let slots = Arc::new(Semaphore::new(1));
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let started = tokio::time::Instant::now();
+
+        let verdict = handle_connection(server, ctx, take_slot(&slots)).await;
+
+        let err = verdict.expect_err("a peer that never says Hello is dropped");
+        assert!(err.to_string().contains("no Hello"), "{err:#}");
+        assert!(started.elapsed() >= HELLO_TIMEOUT);
+        assert_eq!(slots.available_permits(), 1);
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn connections_over_the_handshake_cap_are_refused() {
+        let ctx = ctx_with(false, false).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let slots = Arc::new(Semaphore::new(1));
+        let server = tokio::spawn(serve(listener, ctx.clone(), Arc::clone(&slots)));
+
+        // One connection that has not said Hello takes the only slot.
+        let pending = UnixStream::connect(&path).await.expect("connect");
+        wait_for_free_slots(&slots, 0).await;
+
+        // Closed at once, not left waiting for a Hello it never sends.
+        let extra = UnixStream::connect(&path).await.expect("connect");
+        let reply = read_reply(&mut BufReader::new(extra)).await;
+        assert!(
+            reply.is_none(),
+            "an extra connection must be closed: {reply:?}"
+        );
+        assert_eq!(slots.available_permits(), 0);
+
+        // Once the pending connection is welcomed, its slot is free again.
+        let (pending_read, mut pending_write) = pending.into_split();
+        let agent = registered_agent(&ctx).await;
+        send_hello(&mut pending_write, agent, PROTOCOL_VERSION).await;
+        let mut pending_read = BufReader::new(pending_read);
+        let reply = read_reply(&mut pending_read).await;
+        assert!(
+            matches!(reply, Some(GatewayToAgent::Welcome { .. })),
+            "{reply:?}"
+        );
+        wait_for_free_slots(&slots, 1).await;
+
+        let next = UnixStream::connect(&path).await.expect("connect");
+        let (next_read, mut next_write) = next.into_split();
+        let agent = registered_agent(&ctx).await;
+        send_hello(&mut next_write, agent, PROTOCOL_VERSION).await;
+        let reply = read_reply(&mut BufReader::new(next_read)).await;
+        assert!(
+            matches!(reply, Some(GatewayToAgent::Welcome { .. })),
+            "{reply:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn handshake_slot_is_held_through_the_registration_wait() {
+        let ctx = ctx_with(false, false).await;
+        let slots = Arc::new(Semaphore::new(1));
+        let agent_id = AgentId::new();
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let gateway = tokio::spawn(handle_connection(server, ctx.clone(), take_slot(&slots)));
+        let (client_read, mut client_write) = client.into_split();
+        send_hello(&mut client_write, agent_id, PROTOCOL_VERSION).await;
+
+        // The Hello came before the registration, so the gateway waits.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(slots.available_permits(), 0);
+        ctx.registry.register(AgentHandle::new(agent_id, 1)).await;
+
+        let mut reader = BufReader::new(client_read);
+        let reply = read_reply(&mut reader).await;
+        assert!(
+            matches!(reply, Some(GatewayToAgent::Welcome { .. })),
+            "{reply:?}"
+        );
+        wait_for_free_slots(&slots, 1).await;
+        assert!(!gateway.is_finished(), "the connection itself stays open");
+
         drop(client_write);
         drop(reader);
-        let verdict = gateway.await.expect("join");
-        (verdict, reply)
+        let _ = gateway.await.expect("join");
     }
 
     #[cfg(target_os = "linux")]

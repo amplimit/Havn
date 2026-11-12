@@ -361,7 +361,7 @@ impl GatewayConfig {
     }
 
     /// Resolve the `havn-init` shim path. Same convention as
-    /// [`resolved_runtime_binary`]: explicit config wins, otherwise look
+    /// [`Self::resolved_runtime_binary`]: explicit config wins, otherwise look
     /// next to the gateway binary.
     pub fn resolved_init_binary(&self) -> anyhow::Result<PathBuf> {
         Self::resolve_sibling_binary(self.init_binary.as_ref(), "havn-init")

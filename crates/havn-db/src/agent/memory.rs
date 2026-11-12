@@ -115,7 +115,7 @@ pub struct Entry {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// Number of times this row has been returned by `search` since it
-    /// was last written. Bumped by [`bump_recall`]. The aging pass uses
+    /// was last written. Bumped by `bump_recall`. The aging pass uses
     /// `last_recalled_at` as the freshness anchor when present, so a
     /// recall-fresh row stays alive past its calendar TTL.
     pub recall_count: i64,
@@ -549,8 +549,8 @@ const RECALL_BUMP_TOP_K: usize = 3;
 /// FTS5 search over keys + values, restricted to active (non-archived)
 /// rows. `kinds` filters by [`Kind`] when non-empty.
 ///
-/// Bumps `recall_count` + `last_recalled_at` only on rows whose BM25
-/// rank is below [`RECALL_BUMP_RANK_THRESHOLD`] (i.e. the actually-good
+/// Bumps `recall_count` + `last_recalled_at` only on the top
+/// `RECALL_BUMP_TOP_K` rows by BM25 rank (i.e. the actually-good
 /// hits). Pollution by generic queries is the audit-found failure mode
 /// this guards against.
 pub async fn search(
