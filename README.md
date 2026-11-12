@@ -137,6 +137,7 @@ havn is **infrastructure, not SaaS**. The test: does it require kernel primitive
 - Agents run in isolated Linux namespaces (PID, mount, network, user) with Landlock LSM and seccomp-bpf syscall filtering
 - API keys encrypted at rest with [age](https://age-encryption.org/) — agent processes never see them
 - Per-credential token-per-day and requests-per-minute caps enforced gateway-side
+- A policy's `allowed_models` is enforced by the gateway. For agents without network egress, the gateway also refuses LLM requests that would make the provider fetch a URL (URL-sourced images and documents, provider-side tools, models with built-in web search under common names); restrict `allowed_models` to be sure an agent cannot pick a model with its own web access
 - WebChat WebSocket connections are checked against an Origin allowlist (`allowed_origins`) and must present the caller's `ws_token` from `GET /me`; the token identifies the user rather than being a secret, so the Origin check is what blocks cross-site connections
 - No marketplace — skills are local files; sharing via git
 

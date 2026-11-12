@@ -336,20 +336,29 @@ async fn try_one(
 }
 
 /// Why a request would make the LLM provider fetch something from the
-/// network on the agent's behalf: content blocks whose `source` is a URL
-/// (images, documents), or server-side tools, which carry a `type` that the
-/// runtime's own tool definitions never set. Used to refuse such requests
-/// for agents whose policy denies egress.
+/// network on the agent's behalf: image or document blocks whose `source`
+/// is a URL, server-side tools (they carry a `type` that the runtime's own
+/// tool definitions never set), or a model with built-in web search. Used
+/// to refuse such requests for agents whose policy denies egress. The model
+/// check only catches well-known naming patterns; `allowed_models` is the
+/// operator's actual control over which models an agent can use.
 #[must_use]
 pub fn provider_side_fetch(request: &AnthropicRequest) -> Option<&'static str> {
     fn has_url_source(value: &serde_json::Value) -> bool {
         match value {
             serde_json::Value::Object(map) => {
-                let url_source = map
-                    .get("source")
-                    .and_then(|source| source.get("type"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("url");
+                let kind = map.get("type").and_then(serde_json::Value::as_str);
+                // Tool inputs are data the model wrote, not content the
+                // provider would act on.
+                if kind == Some("tool_use") {
+                    return false;
+                }
+                let url_source = matches!(kind, Some("image" | "document"))
+                    && map
+                        .get("source")
+                        .and_then(|source| source.get("type"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("url");
                 url_source || map.values().any(has_url_source)
             }
             serde_json::Value::Array(items) => items.iter().any(has_url_source),
@@ -373,7 +382,23 @@ pub fn provider_side_fetch(request: &AnthropicRequest) -> Option<&'static str> {
     if server_tool {
         return Some("request uses a provider-side tool");
     }
+    let model = request.model.to_ascii_lowercase();
+    if model.ends_with(":online")
+        || model.contains("search")
+        || model.starts_with("perplexity/")
+        || model.contains("sonar")
+    {
+        return Some("model has built-in web access");
+    }
     None
+}
+
+/// Whether `model` is permitted by a policy's `allowed_models`: `"*"`
+/// allows any model, otherwise the name must be listed exactly (the same
+/// semantics the policy uses when narrowing lists).
+#[must_use]
+pub fn model_allowed(allowed_models: &[String], model: &str) -> bool {
+    allowed_models.iter().any(|m| m == "*" || m == model)
 }
 
 #[cfg(test)]
@@ -414,6 +439,35 @@ mod tests {
             {"type": "document", "source": {"type": "url", "url": "https://example.test/doc.pdf"}}
         ]}]);
         assert!(provider_side_fetch(&request(nested, None)).is_some());
+    }
+
+    #[test]
+    fn tool_inputs_and_other_blocks_are_not_flagged() {
+        let tool_use = json!([{"type": "tool_use", "id": "t1", "name": "mcp_fetch",
+            "input": {"source": {"type": "url", "url": "https://example.test/"}}}]);
+        assert_eq!(provider_side_fetch(&request(tool_use, None)), None);
+    }
+
+    #[test]
+    fn web_search_models_are_detected() {
+        for model in [
+            "openai/gpt-4o:online",
+            "gpt-4o-search-preview",
+            "perplexity/sonar-pro",
+        ] {
+            let mut req = request(json!("hi"), None);
+            req.model = model.into();
+            assert!(provider_side_fetch(&req).is_some(), "{model}");
+        }
+    }
+
+    #[test]
+    fn allowed_models_are_matched_exactly_or_by_star() {
+        assert!(model_allowed(&["*".into()], "anything"));
+        let list = vec!["deepseek/deepseek-v4.1-flash-1017".to_string()];
+        assert!(model_allowed(&list, "deepseek/deepseek-v4.1-flash-1017"));
+        assert!(!model_allowed(&list, "openai/gpt-4o:online"));
+        assert!(!model_allowed(&[], "anything"));
     }
 
     #[test]

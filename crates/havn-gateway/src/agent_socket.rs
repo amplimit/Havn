@@ -472,13 +472,32 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
     };
 
     let owner_id = agent.owner_id;
-    let egress_allowed = policy_resolver::for_session(&ctx.db, &agent, ctx.multi_user)
-        .await
-        .network_policy
-        .egress_allowed;
+    let policy = policy_resolver::for_session(&ctx.db, &agent, ctx.multi_user).await;
+    let egress_allowed = policy.network_policy.egress_allowed;
 
     let response = match build_anthropic_request(&req) {
         Ok(ar) => {
+            if !llm_proxy::model_allowed(&policy.allowed_models, &ar.model) {
+                warn!(%agent_id, model = %ar.model, "refusing LLM request for a model the policy does not allow");
+                let _ = ctx
+                    .registry
+                    .send(
+                        agent_id,
+                        GatewayToAgent::LlmResponse(LlmResponse {
+                            request_id,
+                            outcome: LlmOutcome::Error {
+                                message: format!(
+                                    "model {:?} is not allowed by this agent's policy",
+                                    ar.model
+                                ),
+                            },
+                            provider_response: serde_json::Value::Null,
+                            usage: None,
+                        }),
+                    )
+                    .await;
+                return;
+            }
             // An agent without egress must not get the provider to fetch
             // URLs for it (a way to send data out through the query string).
             if !egress_allowed && let Some(reason) = llm_proxy::provider_side_fetch(&ar) {
