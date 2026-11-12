@@ -334,22 +334,19 @@ fn gemini_to_anthropic(raw: &Value, model: &str) -> Result<AnthropicResponse, St
         stop_reason
     };
 
-    let usage = raw.get("usageMetadata").map_or(
-        AnthropicUsage {
-            input_tokens: 0,
-            output_tokens: 0,
-        },
-        |u| AnthropicUsage {
-            input_tokens: u
-                .get("promptTokenCount")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            output_tokens: u
-                .get("candidatesTokenCount")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        },
-    );
+    // Thinking tokens are billed as output but reported apart from the
+    // candidates.
+    let usage = raw
+        .get("usageMetadata")
+        .filter(|u| u.is_object())
+        .map_or_else(AnthropicUsage::unreported, |u| {
+            let count = |key: &str| u.get(key).and_then(Value::as_u64).unwrap_or(0);
+            AnthropicUsage {
+                input_tokens: count("promptTokenCount"),
+                output_tokens: count("candidatesTokenCount") + count("thoughtsTokenCount"),
+                ..AnthropicUsage::default()
+            }
+        });
 
     Ok(AnthropicResponse {
         id: raw
@@ -514,6 +511,20 @@ mod tests {
         assert_eq!(blocks[0]["text"], "hello!");
         assert_eq!(canon.usage.input_tokens, 5);
         assert_eq!(canon.usage.output_tokens, 2);
+    }
+
+    #[test]
+    fn thinking_tokens_count_as_output() {
+        let raw = json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "hi"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 2, "thoughtsTokenCount": 40}
+        });
+        let canon = gemini_to_anthropic(&raw, "gemini-2.5-pro").expect("parse");
+        assert_eq!(canon.usage.output_tokens, 42);
+        assert!(!canon.usage.unreported);
     }
 
     #[test]

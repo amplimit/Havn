@@ -28,6 +28,15 @@ pub async fn anthropic(
     if req.max_tokens == 0 {
         return Err(ApiError::BadRequest("max_tokens must be > 0".into()));
     }
+    // No agent here, so no agent budget; the caller's own policy still
+    // decides which models they may use.
+    let policy = crate::policy_resolver::for_user(&state.db, user.id).await;
+    if !llm_proxy::model_allowed(&policy.allowed_models, &req.model) {
+        return Err(ApiError::Forbidden(format!(
+            "model {:?} is not allowed by your policy",
+            req.model
+        )));
+    }
 
     let ring = state.keyring.as_ref().ok_or_else(|| {
         // No HAVN_AGE_KEY: boot guard only allowed this state when the

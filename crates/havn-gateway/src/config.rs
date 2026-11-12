@@ -264,14 +264,30 @@ pub struct NetworkConfig {
     pub agent_private_access: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct LlmConfig {
     /// Upper bound on `max_tokens` for every LLM call the gateway proxies,
     /// whatever the agent's config or the runtime asks for. The proxy also
-    /// clamps to the model's own output limit where it knows it. Unset
-    /// means no operator ceiling; 0 is rejected.
-    pub max_tokens_ceiling: Option<u32>,
+    /// clamps to the model's own output limit where it knows it. Default
+    /// [`DEFAULT_MAX_TOKENS_CEILING`], the largest output limit of a known
+    /// model; 0 is rejected.
+    ///
+    /// While a call runs it holds a reservation of up to this many output
+    /// tokens against the token caps it is billed to. On shared credentials
+    /// with small caps, a lower value keeps one user's large `max_tokens`
+    /// from tying up the remaining budget of everyone else.
+    pub max_tokens_ceiling: u32,
+}
+
+pub const DEFAULT_MAX_TOKENS_CEILING: u32 = 128_000;
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens_ceiling: DEFAULT_MAX_TOKENS_CEILING,
+        }
+    }
 }
 
 impl Default for NetworkConfig {
@@ -405,8 +421,8 @@ impl GatewayConfig {
     }
 
     fn validate_llm(&self) -> anyhow::Result<()> {
-        if self.llm.max_tokens_ceiling == Some(0) {
-            anyhow::bail!("[llm] max_tokens_ceiling must be at least 1 (omit it for no ceiling)");
+        if self.llm.max_tokens_ceiling == 0 {
+            anyhow::bail!("[llm] max_tokens_ceiling must be at least 1");
         }
         Ok(())
     }
@@ -753,11 +769,14 @@ mod tests {
     }
 
     #[test]
-    fn llm_max_tokens_ceiling_is_optional_and_positive() {
-        assert_eq!(GatewayConfig::default().llm.max_tokens_ceiling, None);
+    fn llm_max_tokens_ceiling_defaults_and_must_be_positive() {
+        assert_eq!(
+            GatewayConfig::default().llm.max_tokens_ceiling,
+            DEFAULT_MAX_TOKENS_CEILING
+        );
         let p = write_tmp_config("[llm]\nmax_tokens_ceiling = 16000\n");
         let cfg = GatewayConfig::load_from(&p).expect("load");
-        assert_eq!(cfg.llm.max_tokens_ceiling, Some(16_000));
+        assert_eq!(cfg.llm.max_tokens_ceiling, 16_000);
         let _ = std::fs::remove_file(&p);
         let p = write_tmp_config("[llm]\nmax_tokens_ceiling = 0\n");
         let msg = format!(

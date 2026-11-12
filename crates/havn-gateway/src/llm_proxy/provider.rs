@@ -169,6 +169,7 @@ const OUTPUT_LIMITS: &[(&str, u32)] = &[
     ("gemini-1-5-pro", 8_192),
     ("gemini-2-0-flash", 8_192),
     ("gemini-2-5-flash", 65_536),
+    ("gemini-2-5-flash-image", 32_768),
     ("gemini-2-5-pro", 65_536),
 ];
 
@@ -194,11 +195,10 @@ pub fn model_output_limit(model: &str) -> Option<u32> {
 /// `requested` clamped to the model's known output limit and to the
 /// operator's ceiling, whichever is lower.
 #[must_use]
-pub fn clamp_max_tokens(model: &str, requested: u32, ceiling: Option<u32>) -> u32 {
-    [model_output_limit(model), ceiling]
-        .into_iter()
-        .flatten()
-        .fold(requested, u32::min)
+pub fn clamp_max_tokens(model: &str, requested: u32, ceiling: u32) -> u32 {
+    model_output_limit(model)
+        .map_or(requested, |limit| requested.min(limit))
+        .min(ceiling)
 }
 
 /// Map [`ProviderError`] onto the orchestrator's [`super::Attempt`] verdict.
@@ -290,28 +290,24 @@ mod tests {
 
     #[test]
     fn max_tokens_is_clamped_to_model_limit_and_ceiling() {
+        const NONE: u32 = u32::MAX;
         assert_eq!(
-            clamp_max_tokens("claude-3-haiku-20240307", 8_192, None),
+            clamp_max_tokens("claude-3-haiku-20240307", 8_192, NONE),
             4_096
         );
-        assert_eq!(clamp_max_tokens("claude-opus-5-5", 8_192, None), 8_192);
-        assert_eq!(clamp_max_tokens("claude-opus-5-5", 200_000, None), 128_000);
+        assert_eq!(clamp_max_tokens("claude-opus-5-5", 8_192, NONE), 8_192);
+        assert_eq!(clamp_max_tokens("claude-opus-5-5", 200_000, NONE), 128_000);
+        assert_eq!(clamp_max_tokens("claude-opus-5-5", 8_192, 2_000), 2_000);
+        assert_eq!(clamp_max_tokens("claude-3-haiku", 8_192, 6_000), 4_096);
         assert_eq!(
-            clamp_max_tokens("claude-opus-5-5", 8_192, Some(2_000)),
-            2_000
-        );
-        assert_eq!(
-            clamp_max_tokens("claude-3-haiku", 8_192, Some(6_000)),
-            4_096
-        );
-        assert_eq!(
-            clamp_max_tokens("mystery-model", 1_000_000, None),
+            clamp_max_tokens("mystery-model", 1_000_000, NONE),
             1_000_000
         );
         assert_eq!(
-            clamp_max_tokens("mystery-model", 1_000_000, Some(16_000)),
-            16_000
+            clamp_max_tokens("mystery-model", 1_000_000, 128_000),
+            128_000
         );
+        assert_eq!(model_output_limit("gemini-2.5-flash-image"), Some(32_768));
     }
 
     #[test]

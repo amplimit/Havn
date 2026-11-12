@@ -157,7 +157,7 @@ struct AppState {
     pub keyring: Option<keyring::KeyRing>,
     /// `[llm] max_tokens_ceiling`, applied to the LLM test endpoint as
     /// to agent calls.
-    pub max_tokens_ceiling: Option<u32>,
+    pub max_tokens_ceiling: u32,
 }
 
 #[tokio::main]

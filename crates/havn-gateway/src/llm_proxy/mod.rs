@@ -51,15 +51,15 @@ use provider::{LlmProvider, classify};
 /// counts as exhausted.
 const MIN_OUTPUT_TOKENS: u32 = 256;
 
-/// Bytes of request text counted as one input token when reserving. Real
-/// tokenizers average about 4 bytes per token for English and 2 to 3 for
-/// CJK text, so this over-reserves; the reservation is settled to the
-/// provider's reported usage once the call returns.
-const INPUT_BYTES_PER_TOKEN: u64 = 2;
+/// ASCII bytes of request text counted as one input token when reserving
+/// (tokenizers average about 4 for English); every other byte counts as a
+/// token of its own. This over-reserves; the reservation is settled to
+/// the provider's reported usage once the call returns.
+const ASCII_BYTES_PER_TOKEN: u64 = 2;
 
-/// Tokens reserved per base64 image, in place of its encoded size. Claude
-/// bills at most about 1,600 tokens for an image at standard resolution
-/// and about 4,800 at high resolution.
+/// Least tokens reserved per image or document block, whatever its source.
+/// Claude bills at most about 1,600 tokens for an image at standard
+/// resolution and about 4,800 at high resolution.
 const IMAGE_TOKENS: u64 = 5_000;
 
 /// Who an LLM call is billed to and the agent budget it must fit in.
@@ -139,10 +139,37 @@ pub struct AnthropicResponse {
     pub usage: AnthropicUsage,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct AnthropicUsage {
+    /// Excludes prompt-cache writes and reads, reported apart below.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    /// The provider's response carried no usage. The proxy then keeps the
+    /// request's reservation as its recorded usage.
+    #[serde(skip)]
+    pub unreported: bool,
+}
+
+impl AnthropicUsage {
+    #[must_use]
+    pub fn unreported() -> Self {
+        Self {
+            unreported: true,
+            ..Self::default()
+        }
+    }
+
+    /// Every input token the call consumed, cache writes and reads included.
+    #[must_use]
+    pub fn total_input_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_creation_input_tokens.unwrap_or(0))
+            .saturating_add(self.cache_read_input_tokens.unwrap_or(0))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -200,7 +227,7 @@ pub async fn complete(
     keyring: &KeyRing,
     billing: &Billing,
     request: &AnthropicRequest,
-    max_tokens_ceiling: Option<u32>,
+    max_tokens_ceiling: u32,
 ) -> Result<AnthropicResponse, ProxyError> {
     let provider_name = provider::provider_for_model(&request.model);
     complete_with_provider(
@@ -217,8 +244,6 @@ pub async fn complete(
 
 /// Like [`complete`], but the caller has already decided which provider to
 /// use (e.g. the runtime read it out of `LlmRequest.options.provider`).
-/// `max_tokens` is first clamped to the model's known output limit and to
-/// the operator's `[llm] max_tokens_ceiling`.
 pub async fn complete_with_provider(
     db: &SqlitePool,
     http: &reqwest::Client,
@@ -226,22 +251,30 @@ pub async fn complete_with_provider(
     billing: &Billing,
     provider_name: &str,
     request: &AnthropicRequest,
-    max_tokens_ceiling: Option<u32>,
+    max_tokens_ceiling: u32,
 ) -> Result<AnthropicResponse, ProxyError> {
-    let provider = dispatch_provider(provider_name)?;
-    let max_tokens =
-        provider::clamp_max_tokens(&request.model, request.max_tokens, max_tokens_ceiling);
-    let request = with_max_tokens(request, max_tokens);
+    let route = Route {
+        provider: dispatch_provider(provider_name)?,
+        name: provider_name,
+    };
     complete_through(
         db,
         http,
         keyring,
-        provider,
-        provider_name,
+        route,
         billing,
-        &request,
+        request,
+        max_tokens_ceiling,
     )
     .await
+}
+
+/// The provider implementation a call goes through and the provider name
+/// its credentials are stored under.
+#[derive(Clone, Copy)]
+struct Route<'a> {
+    provider: &'a dyn LlmProvider,
+    name: &'a str,
 }
 
 fn with_max_tokens(request: &AnthropicRequest, max_tokens: u32) -> Cow<'_, AnthropicRequest> {
@@ -255,18 +288,25 @@ fn with_max_tokens(request: &AnthropicRequest, max_tokens: u32) -> Cow<'_, Anthr
     }
 }
 
+/// `max_tokens` is clamped to the model's known output limit and to
+/// `max_tokens_ceiling` before anything is reserved or sent.
 async fn complete_through(
     db: &SqlitePool,
     http: &reqwest::Client,
     keyring: &KeyRing,
-    provider: &dyn LlmProvider,
-    provider_name: &str,
+    route: Route<'_>,
     billing: &Billing,
     request: &AnthropicRequest,
+    max_tokens_ceiling: u32,
 ) -> Result<AnthropicResponse, ProxyError> {
-    let chain = resolve_for_user(db, billing.user_id, provider_name).await?;
+    let max_tokens =
+        provider::clamp_max_tokens(&request.model, request.max_tokens, max_tokens_ceiling);
+    let request = with_max_tokens(request, max_tokens);
+    let request = request.as_ref();
+
+    let chain = resolve_for_user(db, billing.user_id, route.name).await?;
     if chain.is_empty() {
-        return Err(ProxyError::NoCredential(provider_name.to_string()));
+        return Err(ProxyError::NoCredential(route.name.to_string()));
     }
 
     // Each attempt first reserves the request's worst case (estimated
@@ -278,6 +318,7 @@ async fn complete_through(
     let agent_tokens = billing.enforced_agent_tokens();
     let min_tokens_out = i64::from(request.max_tokens.min(MIN_OUTPUT_TOKENS));
     let mut exhausted: Option<String> = None;
+    let mut db_failure: Option<havn_db::DbError> = None;
     for cred in chain {
         let caps = Caps {
             agent_tokens,
@@ -289,7 +330,7 @@ async fn complete_through(
             credential_id: cred.id,
             user_id: billing.user_id,
             agent_id: billing.agent_id,
-            provider: provider_name,
+            provider: route.name,
             model: &request.model,
             tokens_in,
             max_tokens_out: i64::from(request.max_tokens),
@@ -301,6 +342,7 @@ async fn complete_through(
         let reserved = match credential_usage::reserve(db, reservation).await {
             Ok(Some(reserved)) => reserved,
             Ok(None) => {
+                db_failure = None;
                 let refusal = refusal(
                     db,
                     &cred,
@@ -329,27 +371,32 @@ async fn complete_through(
                     error = %e,
                     "token reservation failed; skipping credential"
                 );
+                db_failure = Some(e);
                 continue;
             }
         };
+        db_failure = None;
+        let guard = ReservationGuard::new(db, reserved.id);
         let granted = u32::try_from(reserved.tokens_out).unwrap_or(request.max_tokens);
         let attempt_request = with_max_tokens(request, granted.min(request.max_tokens));
 
-        match try_one(http, keyring, provider, &cred, &attempt_request).await {
+        match try_one(http, keyring, route.provider, &cred, &attempt_request).await {
             Attempt::Ok(resp) => {
-                let tokens_in = i64::try_from(resp.usage.input_tokens).unwrap_or(i64::MAX);
-                let tokens_out = i64::try_from(resp.usage.output_tokens).unwrap_or(i64::MAX);
-                // A failed write leaves the reservation in place, which
-                // over-counts rather than under-counts.
-                let _ =
-                    credential_usage::settle(db, &reserved.id, &resp.model, tokens_in, tokens_out)
-                        .await
-                        .map_err(|e| warn!(error = %e, "usage settlement failed (non-fatal)"));
+                if resp.usage.unreported {
+                    warn!(
+                        credential_id = %cred.id,
+                        model = %resp.model,
+                        "provider reported no token usage; keeping the reservation as usage"
+                    );
+                    guard.keep();
+                } else {
+                    guard.settle(&resp).await;
+                }
                 info!(
                     credential_id = %cred.id,
-                    provider = provider_name,
+                    provider = route.name,
                     model = %resp.model,
-                    in = resp.usage.input_tokens,
+                    in = resp.usage.total_input_tokens(),
                     out = resp.usage.output_tokens,
                     "llm proxy ok"
                 );
@@ -357,27 +404,84 @@ async fn complete_through(
                 return Ok(resp);
             }
             Attempt::Disable { reason } => {
-                release(db, &reserved.id).await;
+                guard.release().await;
                 warn!(credential_id = %cred.id, %reason, "disabling credential");
                 let _ = havn_db::repo::credentials::set_enabled(db, cred.id, false)
                     .await
                     .map_err(|e| warn!(error = %e, "failed to disable credential"));
             }
             Attempt::TryNext { reason } => {
-                release(db, &reserved.id).await;
+                guard.release().await;
                 warn!(credential_id = %cred.id, %reason, "skipping credential, trying next");
             }
             Attempt::Fatal(e) => {
-                release(db, &reserved.id).await;
+                guard.release().await;
                 return Err(e);
             }
         }
     }
 
+    if let Some(e) = db_failure {
+        return Err(ProxyError::Db(e));
+    }
     Err(exhausted.map_or_else(
-        || ProxyError::NoCredential(provider_name.to_string()),
+        || ProxyError::NoCredential(route.name.to_string()),
         ProxyError::BudgetExhausted,
     ))
+}
+
+/// Owns a reservation row until it is settled, released or kept. Dropped
+/// while armed (the caller's future was cancelled mid-call, e.g. an HTTP
+/// client disconnected), it releases the row from a spawned task.
+struct ReservationGuard {
+    db: SqlitePool,
+    id: Option<String>,
+}
+
+impl ReservationGuard {
+    fn new(db: &SqlitePool, id: String) -> Self {
+        Self {
+            db: db.clone(),
+            id: Some(id),
+        }
+    }
+
+    async fn settle(mut self, resp: &AnthropicResponse) {
+        let Some(id) = self.id.take() else { return };
+        let tokens_in = i64::try_from(resp.usage.total_input_tokens()).unwrap_or(i64::MAX);
+        let tokens_out = i64::try_from(resp.usage.output_tokens).unwrap_or(i64::MAX);
+        // A failed write leaves the reservation in place, which
+        // over-counts rather than under-counts.
+        if let Err(e) =
+            credential_usage::settle(&self.db, &id, &resp.model, tokens_in, tokens_out).await
+        {
+            warn!(error = %e, "usage settlement failed (non-fatal)");
+        }
+    }
+
+    async fn release(mut self) {
+        if let Some(id) = self.id.take() {
+            release(&self.db, &id).await;
+        }
+    }
+
+    /// Leave the reservation as the recorded usage.
+    fn keep(mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        let Some(id) = self.id.take() else { return };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                let db = self.db.clone();
+                runtime.spawn(async move { release(&db, &id).await });
+            }
+            Err(_) => warn!(reservation_id = %id, "no runtime to release a token reservation"),
+        }
+    }
 }
 
 async fn release(db: &SqlitePool, reservation_id: &str) {
@@ -486,37 +590,88 @@ async fn warn_over_agent_budget(
     }
 }
 
-/// Upper estimate of a request's input tokens: the bytes of its text
-/// (system prompt, messages, tool definitions) at
-/// [`INPUT_BYTES_PER_TOKEN`], with each base64 image counted as
-/// [`IMAGE_TOKENS`] instead of its encoded size.
+/// Upper estimate of a request's input tokens (system prompt, messages,
+/// tool definitions): ASCII text at [`ASCII_BYTES_PER_TOKEN`], every
+/// other byte as a token of its own. An image block counts as at least
+/// [`IMAGE_TOKENS`] whatever its source, without its base64 data; a
+/// document block as at least [`IMAGE_TOKENS`], its data included. Tool
+/// inputs are plain data the model wrote and are counted as text.
 fn input_token_estimate(request: &AnthropicRequest) -> i64 {
-    fn bytes(value: &serde_json::Value) -> u64 {
-        match value {
-            serde_json::Value::String(s) => s.len() as u64,
-            serde_json::Value::Array(items) => items.iter().map(bytes).sum(),
-            serde_json::Value::Object(map) => {
-                let image = map.get("type").and_then(serde_json::Value::as_str) == Some("base64")
-                    && map
-                        .get("media_type")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|m| m.starts_with("image/"));
-                if image {
-                    return IMAGE_TOKENS * INPUT_BYTES_PER_TOKEN;
+    #[derive(Default)]
+    struct Count {
+        ascii: u64,
+        other: u64,
+        fixed: u64,
+    }
+
+    impl Count {
+        fn text(&mut self, s: &str) {
+            let ascii = s.bytes().filter(u8::is_ascii).count() as u64;
+            self.ascii += ascii;
+            self.other += s.len() as u64 - ascii;
+        }
+
+        fn tokens(&self) -> u64 {
+            self.ascii.div_ceil(ASCII_BYTES_PER_TOKEN) + self.other + self.fixed
+        }
+
+        fn walk(&mut self, value: &serde_json::Value, blocks: bool) {
+            match value {
+                serde_json::Value::String(s) => self.text(s),
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        self.walk(item, blocks);
+                    }
                 }
-                map.iter().map(|(k, v)| k.len() as u64 + bytes(v)).sum()
+                serde_json::Value::Object(map) => {
+                    let kind = map.get("type").and_then(serde_json::Value::as_str);
+                    let (blocks, floor) = match kind {
+                        _ if !blocks => (false, None),
+                        Some("tool_use") => (false, None),
+                        Some("image" | "document") => (true, Some(IMAGE_TOKENS)),
+                        _ => (true, None),
+                    };
+                    let mut inner = Self::default();
+                    for (key, item) in map {
+                        inner.text(key);
+                        match (kind, key.as_str(), item) {
+                            (Some("image"), "source", serde_json::Value::Object(source))
+                                if floor.is_some() =>
+                            {
+                                for (k, v) in source.iter().filter(|(k, _)| *k != "data") {
+                                    inner.text(k);
+                                    inner.walk(v, false);
+                                }
+                            }
+                            _ => inner.walk(item, blocks),
+                        }
+                    }
+                    match floor {
+                        Some(floor) => self.fixed += inner.tokens().max(floor),
+                        None => {
+                            self.ascii += inner.ascii;
+                            self.other += inner.other;
+                            self.fixed += inner.fixed;
+                        }
+                    }
+                }
+                _ => self.ascii += 4,
             }
-            _ => 4,
         }
     }
-    let system = request.system.as_ref().map_or(0, |s| s.len() as u64);
-    let messages: u64 = request
-        .messages
-        .iter()
-        .map(|m| m.role.len() as u64 + bytes(&m.content))
-        .sum();
-    let tools = request.tools.as_ref().map_or(0, bytes);
-    i64::try_from((system + messages + tools).div_ceil(INPUT_BYTES_PER_TOKEN)).unwrap_or(i64::MAX)
+
+    let mut count = Count::default();
+    if let Some(system) = &request.system {
+        count.text(system);
+    }
+    for message in &request.messages {
+        count.text(&message.role);
+        count.walk(&message.content, true);
+    }
+    if let Some(tools) = &request.tools {
+        count.walk(tools, false);
+    }
+    i64::try_from(count.tokens()).unwrap_or(i64::MAX)
 }
 
 /// Back-compat wrapper. Phase 1 callers used `anthropic_complete`; we keep
@@ -528,7 +683,7 @@ pub async fn anthropic_complete(
     keyring: &KeyRing,
     billing: &Billing,
     request: &AnthropicRequest,
-    max_tokens_ceiling: Option<u32>,
+    max_tokens_ceiling: u32,
 ) -> Result<AnthropicResponse, ProxyError> {
     complete_with_provider(
         db,
@@ -756,6 +911,7 @@ mod tests {
         use super::super::*;
 
         const PASSPHRASE: &str = "budget-tests";
+        const CEILING: u32 = 128_000;
 
         /// Encrypting calibrates scrypt to about a second; do it once.
         fn ciphertext() -> &'static [u8] {
@@ -767,21 +923,36 @@ mod tests {
             })
         }
 
-        /// Records the `max_tokens` of each call and answers with
-        /// `output_tokens = max_tokens`, or fails with a 500.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Reply {
+            /// `output_tokens = max_tokens`, one input token.
+            Ok,
+            /// As `Ok`, plus 100 prompt-cache reads.
+            Cached,
+            /// As `Ok`, without usage.
+            Unreported,
+            /// HTTP 500.
+            Fail,
+        }
+
+        /// Records the `max_tokens` of each call and answers per `reply`.
         struct FakeProvider {
-            fail: bool,
+            reply: Reply,
             delay: Duration,
             seen: Mutex<Vec<u32>>,
         }
 
         impl FakeProvider {
-            fn new(fail: bool, delay: Duration) -> Arc<Self> {
+            fn new(reply: Reply, delay: Duration) -> Arc<Self> {
                 Arc::new(Self {
-                    fail,
+                    reply,
                     delay,
                     seen: Mutex::new(Vec::new()),
                 })
+            }
+
+            fn seen(&self) -> Vec<u32> {
+                self.seen.lock().unwrap().clone()
             }
         }
 
@@ -800,22 +971,28 @@ mod tests {
                 assert_eq!(api_key, "sk-test");
                 self.seen.lock().unwrap().push(request.max_tokens);
                 tokio::time::sleep(self.delay).await;
-                if self.fail {
-                    return Err(ProviderError::Upstream {
-                        status: 500,
-                        body: "down".into(),
-                    });
-                }
+                let usage = match self.reply {
+                    Reply::Fail => {
+                        return Err(ProviderError::Upstream {
+                            status: 500,
+                            body: "down".into(),
+                        });
+                    }
+                    Reply::Unreported => AnthropicUsage::unreported(),
+                    Reply::Ok | Reply::Cached => AnthropicUsage {
+                        input_tokens: 1,
+                        output_tokens: u64::from(request.max_tokens),
+                        cache_read_input_tokens: (self.reply == Reply::Cached).then_some(100),
+                        ..AnthropicUsage::default()
+                    },
+                };
                 Ok(AnthropicResponse {
                     id: "msg_1".into(),
                     model: format!("{}-20260101", request.model),
                     role: "assistant".into(),
                     content: json!([{"type": "text", "text": "ok"}]),
                     stop_reason: Some("end_turn".into()),
-                    usage: AnthropicUsage {
-                        input_tokens: 1,
-                        output_tokens: u64::from(request.max_tokens),
-                    },
+                    usage,
                 })
             }
         }
@@ -880,22 +1057,34 @@ mod tests {
             }
         }
 
-        async fn call(
+        async fn call_with(
             f: &Fixture,
             provider: &FakeProvider,
             billing: &Billing,
             request: &AnthropicRequest,
+            ceiling: u32,
         ) -> Result<AnthropicResponse, ProxyError> {
             complete_through(
                 &f.db,
                 &reqwest::Client::new(),
                 &KeyRing::from_passphrase(PASSPHRASE),
-                provider,
-                "anthropic",
+                Route {
+                    provider,
+                    name: "anthropic",
+                },
                 billing,
                 request,
+                ceiling,
             )
             .await
+        }
+
+        async fn call(
+            f: &Fixture,
+            provider: &FakeProvider,
+            request: &AnthropicRequest,
+        ) -> Result<AnthropicResponse, ProxyError> {
+            call_with(f, provider, &f.billing, request, CEILING).await
         }
 
         async fn rows(db: &SqlitePool) -> Vec<(Option<String>, String, i64, i64)> {
@@ -909,82 +1098,151 @@ mod tests {
         async fn settlement_records_actual_usage_and_agent() {
             let db = havn_db::connect_in_memory().await.expect("db");
             let f = fixture(db, json!({})).await;
-            let provider = FakeProvider::new(false, Duration::ZERO);
-            call(&f, &provider, &f.billing, &ask(300))
-                .await
-                .expect("ok");
+            let provider = FakeProvider::new(Reply::Cached, Duration::ZERO);
+            call(&f, &provider, &ask(300)).await.expect("ok");
             let agent = f.billing.agent_id.map(|a| a.to_string());
+            // One fresh input token plus 100 read from the prompt cache.
             assert_eq!(
                 rows(&f.db).await,
-                vec![(agent, "claude-sonnet-4-6-20260101".into(), 1, 300)]
+                vec![(agent, "claude-sonnet-4-6-20260101".into(), 101, 300)]
             );
+        }
+
+        #[tokio::test]
+        async fn missing_usage_keeps_the_reservation() {
+            let db = havn_db::connect_in_memory().await.expect("db");
+            let f = fixture(db, json!({})).await;
+            let provider = FakeProvider::new(Reply::Unreported, Duration::ZERO);
+            let request = ask(300);
+            call(&f, &provider, &request).await.expect("ok");
+            let row = rows(&f.db).await.pop().expect("row");
+            assert_eq!((row.2, row.3), (input_token_estimate(&request), 300));
         }
 
         #[tokio::test]
         async fn reservation_is_released_on_upstream_error() {
             let db = havn_db::connect_in_memory().await.expect("db");
             let f = fixture(db, json!({"max_tokens_per_day": 10_000})).await;
-            let provider = FakeProvider::new(true, Duration::ZERO);
-            let err = call(&f, &provider, &f.billing, &ask(300))
+            let provider = FakeProvider::new(Reply::Fail, Duration::ZERO);
+            let err = call(&f, &provider, &ask(300))
                 .await
                 .expect_err("upstream down");
             assert!(matches!(err, ProxyError::NoCredential(_)), "{err}");
-            assert_eq!(provider.seen.lock().unwrap().len(), 1);
+            assert_eq!(provider.seen().len(), 1);
             assert!(rows(&f.db).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn reservation_is_released_when_the_call_is_dropped() {
+            let db = havn_db::connect_in_memory().await.expect("db");
+            let f = Arc::new(fixture(db, json!({})).await);
+            let provider = FakeProvider::new(Reply::Ok, Duration::from_secs(60));
+            let task = {
+                let (f, provider) = (Arc::clone(&f), Arc::clone(&provider));
+                tokio::spawn(async move { call(&f, &provider, &ask(300)).await })
+            };
+            while provider.seen().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(rows(&f.db).await.len(), 1);
+            task.abort();
+            let _ = task.await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !rows(&f.db).await.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("reservation released");
+        }
+
+        #[tokio::test]
+        async fn database_failures_are_reported_as_such() {
+            let db = havn_db::connect_in_memory().await.expect("db");
+            let f = fixture(db, json!({})).await;
+            sqlx::query("DROP TABLE credential_usages")
+                .execute(&f.db)
+                .await
+                .expect("drop");
+            let provider = FakeProvider::new(Reply::Ok, Duration::ZERO);
+            let err = call(&f, &provider, &ask(300)).await.expect_err("no table");
+            assert!(matches!(err, ProxyError::Db(_)), "{err}");
+            assert!(provider.seen().is_empty());
+        }
+
+        #[tokio::test]
+        async fn max_tokens_is_clamped_before_reserving() {
+            let db = havn_db::connect_in_memory().await.expect("db");
+            let f = fixture(db, json!({"max_tokens_per_day": 5_000})).await;
+            // Without usage in the reply the reservation stays as the row.
+            let provider = FakeProvider::new(Reply::Unreported, Duration::ZERO);
+            let mut request = ask(8_192);
+            // Output limit 4,096. Unclamped, the reservation would grant the
+            // 4,997 tokens the cap leaves.
+            request.model = "claude-3-haiku-20240307".into();
+            call(&f, &provider, &request).await.expect("ok");
+            assert_eq!(provider.seen(), vec![4_096]);
+            assert_eq!(rows(&f.db).await.pop().expect("row").3, 4_096);
+
+            let f = fixture(havn_db::connect_in_memory().await.expect("db"), json!({})).await;
+            let provider = FakeProvider::new(Reply::Unreported, Duration::ZERO);
+            call_with(&f, &provider, &f.billing, &ask(8_192), 500)
+                .await
+                .expect("ok");
+            assert_eq!(provider.seen(), vec![500]);
+            assert_eq!(rows(&f.db).await.pop().expect("row").3, 500);
         }
 
         #[tokio::test]
         async fn max_tokens_shrinks_to_what_the_cap_leaves() {
             let db = havn_db::connect_in_memory().await.expect("db");
             let f = fixture(db, json!({"max_tokens_per_day": 2_000})).await;
-            let provider = FakeProvider::new(false, Duration::ZERO);
+            let provider = FakeProvider::new(Reply::Ok, Duration::ZERO);
             let request = ask(8_192);
-            call(&f, &provider, &f.billing, &request).await.expect("ok");
+            call(&f, &provider, &request).await.expect("ok");
             let granted = 2_000 - u32::try_from(input_token_estimate(&request)).unwrap();
-            assert_eq!(*provider.seen.lock().unwrap(), vec![granted]);
+            assert_eq!(provider.seen(), vec![granted]);
             // The cap is now used up: the next call never reaches upstream.
-            let err = call(&f, &provider, &f.billing, &request)
-                .await
-                .expect_err("exhausted");
+            let err = call(&f, &provider, &request).await.expect_err("exhausted");
             assert!(matches!(err, ProxyError::BudgetExhausted(_)), "{err}");
-            assert_eq!(provider.seen.lock().unwrap().len(), 1);
+            assert_eq!(provider.seen().len(), 1);
         }
 
         #[tokio::test]
         async fn agent_budget_is_enforced_unless_warn_only() {
             let db = havn_db::connect_in_memory().await.expect("db");
             let f = fixture(db, json!({})).await;
-            let provider = FakeProvider::new(false, Duration::ZERO);
+            let provider = FakeProvider::new(Reply::Ok, Duration::ZERO);
             let mut billing = f.billing.clone();
             billing.budget.max_tokens_per_day = 100;
             billing.budget.on_exhaust = BudgetExhaustAction::Fail;
-            let err = call(&f, &provider, &billing, &ask(1_000))
+            let err = call_with(&f, &provider, &billing, &ask(1_000), CEILING)
                 .await
                 .expect_err("over budget");
             assert!(
                 matches!(&err, ProxyError::BudgetExhausted(r) if r.starts_with("agent")),
                 "{err}"
             );
-            assert!(provider.seen.lock().unwrap().is_empty());
+            assert!(provider.seen().is_empty());
 
             billing.budget.on_exhaust = BudgetExhaustAction::WarnOnly;
-            call(&f, &provider, &billing, &ask(1_000))
+            call_with(&f, &provider, &billing, &ask(1_000), CEILING)
                 .await
                 .expect("warn_only does not block");
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn parallel_requests_cannot_overspend_the_cap() {
-            let path =
-                std::env::temp_dir().join(format!("havn-proxy-budget-{}.db", uuid::Uuid::now_v7()));
-            let db = havn_db::connect(&path).await.expect("db");
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = havn_db::connect(dir.path().join("havn.db"))
+                .await
+                .expect("db");
             let f = Arc::new(fixture(db, json!({"max_tokens_per_day": 3_000})).await);
-            let provider = FakeProvider::new(false, Duration::from_millis(200));
+            let provider = FakeProvider::new(Reply::Ok, Duration::from_millis(200));
             let mut tasks = tokio::task::JoinSet::new();
             for _ in 0..8 {
-                let f = Arc::clone(&f);
-                let provider = Arc::clone(&provider);
-                tasks.spawn(async move { call(&f, &provider, &f.billing, &ask(1_000)).await });
+                let (f, provider) = (Arc::clone(&f), Arc::clone(&provider));
+                tasks.spawn(async move { call(&f, &provider, &ask(1_000)).await });
             }
             let mut ok = 0;
             while let Some(result) = tasks.join_next().await {
@@ -1001,26 +1259,45 @@ mod tests {
             let used: i64 = rows(&f.db).await.iter().map(|r| r.2 + r.3).sum();
             assert!(used <= 3_000, "used {used}");
             f.db.close().await;
-            for suffix in ["", "-wal", "-shm"] {
-                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-            }
+        }
+
+        fn estimate(content: serde_json::Value) -> i64 {
+            let mut request = ask(1);
+            request.messages[0].content = content;
+            input_token_estimate(&request)
         }
 
         #[test]
-        fn input_estimate_counts_text_and_images() {
-            let mut request = ask(1);
-            request.system = Some("x".repeat(100));
-            request.messages[0].content = json!([
-                {"type": "text", "text": "y".repeat(200)},
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png",
-                    "data": "A".repeat(1_000_000)}}
-            ]);
-            let estimate = input_token_estimate(&request);
+        fn input_estimate_counts_text_images_and_documents() {
             let image = i64::try_from(IMAGE_TOKENS).unwrap();
-            assert!(
-                estimate > 150 + image && estimate < 200 + image,
-                "{estimate}"
+            // "user" + "text" keys and value + 200 ASCII bytes, 2 bytes a token.
+            assert_eq!(
+                estimate(json!([{"type": "text", "text": "y".repeat(200)}])),
+                108
             );
+            let base64 = json!([{"type": "image", "source": {"type": "base64",
+                "media_type": "image/png", "data": "A".repeat(1_000_000)}}]);
+            assert_eq!(estimate(base64), 2 + image);
+            let url = json!([{"type": "image", "source": {"type": "url",
+                "url": "https://example.test/a.png"}}]);
+            assert_eq!(estimate(url), 2 + image);
+            let nested = json!([{"type": "tool_result", "tool_use_id": "t", "content": [
+                {"type": "image", "source": {"type": "url", "url": "https://example.test/a.png"}}
+            ]}]);
+            assert!(estimate(nested) > image);
+            let pdf = json!([{"type": "document", "source": {"type": "base64",
+                "media_type": "application/pdf", "data": "A".repeat(100_000)}}]);
+            assert!(estimate(pdf) > 50_000);
+        }
+
+        #[test]
+        fn input_estimate_counts_non_ascii_bytes_and_tool_inputs() {
+            // 100 three-byte characters are 300 tokens.
+            assert_eq!(estimate(json!("\u{4e2d}".repeat(100))), 302);
+            // An "image" inside tool input is data, counted in full.
+            let tool_use = json!([{"type": "tool_use", "id": "t", "name": "n", "input":
+                {"type": "image", "source": {"data": "A".repeat(100_000)}}}]);
+            assert!(estimate(tool_use) > 50_000);
         }
     }
 }

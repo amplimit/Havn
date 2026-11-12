@@ -29,14 +29,18 @@ export default function CredentialsPage() {
 
   async function onAdd(e: React.FormEvent) {
     e.preventDefault();
+    const limits: Record<string, unknown> = {};
+    if (maxTokensPerDay.trim()) {
+      const n = Number(maxTokensPerDay);
+      if (!Number.isInteger(n) || n <= 0) {
+        setError("max tokens / day must be a whole number above 0, or blank for unlimited");
+        return;
+      }
+      limits.max_tokens_per_day = n;
+    }
     setBusy(true);
     setError(null);
     try {
-      const limits: Record<string, unknown> = {};
-      if (maxTokensPerDay.trim()) {
-        const n = Number(maxTokensPerDay);
-        if (Number.isInteger(n) && n > 0) limits.max_tokens_per_day = n;
-      }
       await api.credentials.create(provider.trim(), apiKey.trim(), priority, limits);
       setApiKey("");
       setMaxTokensPerDay("");
@@ -179,9 +183,10 @@ export default function CredentialsPage() {
       <ul className="grid gap-3">
         {creds?.map((c) => {
           // Only `max_tokens_per_day` is enforced; a `max_usd_per_day` left
-          // by older dashboards is ignored by the gateway and not shown.
+          // by older dashboards is ignored by the gateway.
           const raw = c.limits?.max_tokens_per_day;
           const cap = typeof raw === "number" && raw > 0 ? raw : null;
+          const usdCap = c.limits?.max_usd_per_day !== undefined;
           return (
             <li key={c.id} className="card flex items-center justify-between px-5 py-4">
               <div className="min-w-0 flex-1">
@@ -203,6 +208,11 @@ export default function CredentialsPage() {
                 >
                   {c.id}
                 </p>
+                {usdCap && (
+                  <p className="mt-1 text-xs" style={{ color: "var(--color-ruby)" }}>
+                    this key has a USD/day cap, which the gateway does not enforce; delete and re-add it with a token cap
+                  </p>
+                )}
               </div>
               <button
                 type="button"

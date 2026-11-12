@@ -75,7 +75,7 @@ pub struct AgentSocketCtx {
     pub multi_user: bool,
     /// `[llm] max_tokens_ceiling`: upper bound on `max_tokens` for every
     /// proxied LLM call, whatever the agent's config asks for.
-    pub max_tokens_ceiling: Option<u32>,
+    pub max_tokens_ceiling: u32,
     /// True when agents run under `NamespaceSpawner`, each in its own
     /// `agent-<id>` cgroup. The gateway then accepts a connection for an
     /// agent only from a process in that cgroup. With the unisolated
@@ -1331,7 +1331,7 @@ mod tests {
                 serde_json::json!({"provider": "disabled"}),
             )),
             multi_user,
-            max_tokens_ceiling: None,
+            max_tokens_ceiling: crate::config::DEFAULT_MAX_TOKENS_CEILING,
             verify_peer_cgroup,
             extra_mounts: Vec::new(),
             tmpfs_mounts: Vec::new(),

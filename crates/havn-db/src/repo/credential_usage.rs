@@ -16,37 +16,6 @@ use uuid::Uuid;
 
 use crate::Result;
 
-#[derive(Debug, Clone)]
-pub struct NewUsage<'a> {
-    pub credential_id: CredentialId,
-    pub user_id: UserId,
-    /// `None` for gateway-direct LLM calls (e.g. the test endpoint).
-    pub agent_id: Option<AgentId>,
-    pub provider: &'a str,
-    pub model: &'a str,
-    pub tokens_in: i64,
-    pub tokens_out: i64,
-}
-
-pub async fn record(pool: &SqlitePool, usage: NewUsage<'_>) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO credential_usages \
-         (id, credential_id, user_id, agent_id, provider, model, tokens_in, tokens_out) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-    )
-    .bind(Uuid::now_v7().to_string())
-    .bind(usage.credential_id.to_string())
-    .bind(usage.user_id.to_string())
-    .bind(usage.agent_id.map(|a| a.to_string()))
-    .bind(usage.provider)
-    .bind(usage.model)
-    .bind(usage.tokens_in)
-    .bind(usage.tokens_out)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 /// Daily token and per-minute request caps one LLM call must fit in.
 /// `0` disables a cap.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -413,6 +382,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_an_agent_keeps_its_usage() {
+        let pool = connect_in_memory().await.expect("connect");
+        let f = fixture(&pool).await;
+        let r = reserve(&pool, reservation(&f, 10, 100, Caps::default()))
+            .await
+            .expect("reserve")
+            .expect("granted");
+        settle(&pool, &r.id, "m", 40, 60).await.expect("settle");
+        crate::repo::agents::delete(&pool, f.agent_id)
+            .await
+            .expect("delete agent");
+        let t = total(&pool, &f).await;
+        assert_eq!((t.credential_tokens, t.user_tokens), (100, 100));
+        let agent: Option<String> =
+            sqlx::query_scalar("SELECT agent_id FROM credential_usages WHERE id = ?1")
+                .bind(&r.id)
+                .fetch_one(&pool)
+                .await
+                .expect("row");
+        assert_eq!(agent, None);
+    }
+
+    #[tokio::test]
     async fn each_cap_limits_the_grant() {
         let pool = connect_in_memory().await.expect("connect");
         let f = fixture(&pool).await;
@@ -472,8 +464,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_reservations_cannot_overspend() {
-        let path = std::env::temp_dir().join(format!("havn-reserve-{}.db", Uuid::now_v7()));
-        let pool = crate::connect(&path).await.expect("connect");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = crate::connect(dir.path().join("havn.db"))
+            .await
+            .expect("connect");
         let f = fixture(&pool).await;
         let caps = Caps {
             credential_tokens: 1_000,
@@ -497,8 +491,5 @@ mod tests {
         assert_eq!(granted, vec![50, 100, 100, 100, 100, 100, 100]);
         assert_eq!(total(&pool, &f).await.credential_tokens, 1_000);
         pool.close().await;
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
     }
 }
