@@ -86,8 +86,10 @@ const OUTBOUND_QUEUE_CAPACITY: usize = 64;
 const SHUTDOWN_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Pauses before each new handshake attempt. The gateway closes a
 /// connection before Welcome when its handshake slots are full, so the
-/// runtime tries again a few times; the total stays well under the
-/// gateway's 10 s wait for a started agent to connect.
+/// runtime tries again a few times. A refused attempt is usually quick,
+/// but one for a not-yet-registered agent can wait the gateway's 10 s
+/// `REGISTRATION_WAIT`, so all four attempts can take about 42 s, still
+/// inside the supervisor's `CONNECT_LIMIT` for a started agent.
 const HANDSHAKE_RETRY_DELAYS: [std::time::Duration; 3] = [
     std::time::Duration::from_millis(250),
     std::time::Duration::from_millis(500),

@@ -183,6 +183,7 @@ struct Admission {
     per_agent_limit: usize,
     busy: AtomicU64,
     foreign: AtomicU64,
+    lookup_failed: AtomicU64,
 }
 
 /// One connection's place in the handshake limits, given back on drop.
@@ -200,6 +201,7 @@ impl Admission {
             per_agent_limit,
             busy: AtomicU64::new(0),
             foreign: AtomicU64::new(0),
+            lookup_failed: AtomicU64::new(0),
         }
     }
 
@@ -268,14 +270,15 @@ async fn accept_connections(
         let admission = Arc::clone(&admission);
         tokio::spawn(async move {
             let peer_cgroup = if ctx.verify_peer_cgroup {
-                tokio::time::timeout(PEER_LOOKUP_TIMEOUT, peer_cgroup(&stream))
-                    .await
-                    .ok()
-                    .flatten()
+                peer_cgroup(&stream, Some(lookup)).await
             } else {
+                drop(lookup);
                 None
             };
-            drop(lookup);
+            if ctx.verify_peer_cgroup && peer_cgroup.is_none() {
+                admission.lookup_failed.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             let peer_agent = peer_cgroup.as_deref().and_then(peer_agent);
             if ctx.verify_peer_cgroup && peer_agent.is_none() {
                 debug!(
@@ -319,6 +322,14 @@ async fn report_refusals(admission: &Admission) {
                 "refused agent socket connections from processes outside every agent cgroup"
             );
         }
+        let failed = admission.lookup_failed.swap(0, Ordering::Relaxed);
+        if failed > 0 {
+            warn!(
+                refused = failed,
+                interval_s = REFUSAL_WARN_INTERVAL.as_secs(),
+                "refused agent socket connections whose peer cgroup could not be read"
+            );
+        }
     }
 }
 
@@ -331,15 +342,25 @@ async fn report_refusals(admission: &Admission) {
 /// produce a pidfd for the peer (for example because it already exited),
 /// the connection is refused. Only kernels without SO_PEERPIDFD fall back
 /// to the bare pid, leaving the short window between connect and this read.
+///
+/// The file is read on a blocking thread that keeps `lookup` (a permit of
+/// `MAX_PEER_LOOKUPS`) until the read returns, so a stuck read is given up
+/// on after `PEER_LOOKUP_TIMEOUT` but still counts against that cap.
 #[cfg(target_os = "linux")]
-async fn peer_cgroup(stream: &UnixStream) -> Option<String> {
+async fn peer_cgroup(stream: &UnixStream, lookup: Option<OwnedSemaphorePermit>) -> Option<String> {
     let pid = stream.peer_cred().ok()?.pid()?;
     let pin = peer_pidfd(stream);
     if matches!(pin, PeerPidfd::Failed) {
         return None;
     }
-    let contents = tokio::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+    let read = tokio::task::spawn_blocking(move || {
+        let _lookup = lookup;
+        std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+    });
+    let contents = tokio::time::timeout(PEER_LOOKUP_TIMEOUT, read)
         .await
+        .ok()?
+        .ok()?
         .ok()?;
     match &pin {
         PeerPidfd::Pinned(fd) if !pidfd_alive(fd) => None,
@@ -348,7 +369,10 @@ async fn peer_cgroup(stream: &UnixStream) -> Option<String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn peer_cgroup(_stream: &UnixStream) -> Option<String> {
+async fn peer_cgroup(
+    _stream: &UnixStream,
+    _lookup: Option<OwnedSemaphorePermit>,
+) -> Option<String> {
     None
 }
 
@@ -528,7 +552,7 @@ async fn handle_connection(
             anyhow::bail!("refusing connection for agent {agent_id}: not registered");
         }
         if ctx.verify_peer_cgroup {
-            let now_in = self::peer_cgroup(reader.get_ref().as_ref()).await;
+            let now_in = self::peer_cgroup(reader.get_ref().as_ref(), None).await;
             if !peer_cgroup_is_agents(now_in.as_deref(), agent_id) {
                 warn!(
                     %agent_id,
@@ -2236,7 +2260,7 @@ mod tests {
     ) -> (anyhow::Result<()>, Option<GatewayToAgent>) {
         let (client, server) = UnixStream::pair().expect("socket pair");
         let cgroup = if ctx.verify_peer_cgroup {
-            peer_cgroup(&server).await
+            peer_cgroup(&server, None).await
         } else {
             None
         };
@@ -2411,6 +2435,7 @@ mod tests {
 
         assert!(reply.is_none(), "the peer must be closed: {reply:?}");
         assert_eq!(admission.foreign.load(Ordering::Relaxed), 1);
+        assert_eq!(admission.lookup_failed.load(Ordering::Relaxed), 0);
         assert_eq!(admission.busy.load(Ordering::Relaxed), 0);
         assert_eq!(admission.handshakes.available_permits(), 1);
         server.abort();
@@ -2488,7 +2513,7 @@ mod tests {
     #[tokio::test]
     async fn peer_cgroup_reads_the_connecting_process() {
         let (ours, theirs) = UnixStream::pair().expect("socket pair");
-        let seen = peer_cgroup(&ours).await.expect("peer cgroup");
+        let seen = peer_cgroup(&ours, None).await.expect("peer cgroup");
         let own = std::fs::read_to_string("/proc/self/cgroup").expect("own cgroup");
         assert_eq!(seen, own);
         // SO_PEERPIDFD needs Linux 6.5+; older kernels fall back to the pid.
@@ -2530,7 +2555,7 @@ mod tests {
             .expect("runtime");
         let seen = rt.block_on(async {
             let stream = UnixStream::from_std(accepted).expect("tokio stream");
-            peer_cgroup(&stream).await
+            peer_cgroup(&stream, None).await
         });
         let _ = std::fs::remove_dir_all(&dir);
         assert!(seen.is_none(), "an exited peer must be refused: {seen:?}");
