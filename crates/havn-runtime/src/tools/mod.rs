@@ -254,6 +254,11 @@ impl ToolRegistry {
         self
     }
 
+    /// Names of every registered tool, regardless of context.
+    pub fn names(&self) -> Vec<&str> {
+        self.tools.iter().map(|t| t.name()).collect()
+    }
+
     /// True iff the named tool is disabled in this execution context by
     /// `policy.context_toolsets[context].disabled`.
     fn disabled_in(&self, context: &str, tool_name: &str) -> bool {

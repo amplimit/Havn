@@ -543,18 +543,6 @@ async fn main() -> anyhow::Result<()> {
                 .collect()
         })
         .unwrap_or_default();
-    {
-        let mut known: Vec<&str> = tool_names.iter().map(String::as_str).collect();
-        known.extend(["subagent_spawn", "agent_query"]);
-        let snapshot = hooks.load();
-        let unknown = snapshot.unknown_tools(&known);
-        if !unknown.is_empty() {
-            warn!(
-                tools = ?unknown,
-                "PreToolUse hook rules name tools this agent does not have; they never fire"
-            );
-        }
-    }
     let display_name = agent_name.as_deref().unwrap_or(&args.agent_id);
     let plat_ctx = system_prompt::platform_context(display_name, &args.agent_id, &tool_names);
     let system_prompt = Arc::new(bootstrap.system_prompt(Some(&plat_ctx)));
@@ -716,6 +704,16 @@ async fn main() -> anyhow::Result<()> {
         can_query_other_agents = policy.permissions.can_query_other_agents,
         "parent tool registry built"
     );
+    {
+        let snapshot = hooks.load();
+        let unknown = snapshot.unknown_tools(&parent_registry.names());
+        if !unknown.is_empty() {
+            warn!(
+                tools = ?unknown,
+                "PreToolUse hook rules name tools this agent does not have; they never fire"
+            );
+        }
+    }
 
     // 7. Reader loop dispatches gateway → agent frames.
     let ctx = Ctx {

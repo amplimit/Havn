@@ -71,14 +71,16 @@ pub struct ToolHookRule {
 pub const MAX_HOOK_RULES: usize = 64;
 pub const MAX_HOOK_PATTERNS: usize = 256;
 pub const MAX_HOOK_PATTERN_LEN: usize = 1024;
-const HOOK_REGEX_SIZE_LIMIT: usize = 256 * 1024;
+/// Compiled-program and DFA-cache limit [`HookPolicy::validate`] applies
+/// to each pattern.
+pub const HOOK_REGEX_SIZE_LIMIT: usize = 256 * 1024;
 
-/// Compile one deny pattern with small compiled-program and DFA-cache
-/// limits, so a single pattern cannot claim much CPU or memory.
-pub fn compile_hook_pattern(pattern: &str) -> crate::Result<regex::Regex> {
+/// Compile one deny pattern with a small compiled-program and DFA-cache
+/// limit, so a single pattern cannot claim much CPU or memory.
+pub fn compile_hook_pattern(pattern: &str, size_limit: usize) -> crate::Result<regex::Regex> {
     regex::RegexBuilder::new(pattern)
-        .size_limit(HOOK_REGEX_SIZE_LIMIT)
-        .dfa_size_limit(HOOK_REGEX_SIZE_LIMIT)
+        .size_limit(size_limit)
+        .dfa_size_limit(size_limit)
         .build()
         .map_err(|e| crate::Error::InvalidPolicy(format!("hook regex {pattern:?}: {e}")))
 }
@@ -119,7 +121,7 @@ impl HookPolicy {
                         rule.tool
                     ));
                 }
-                compile_hook_pattern(pattern)?;
+                compile_hook_pattern(pattern, HOOK_REGEX_SIZE_LIMIT)?;
             }
         }
         Ok(())

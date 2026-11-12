@@ -42,18 +42,22 @@
 //!   the v1 surface to in-process regex match. External-command hooks
 //!   add an exec/seccomp surface that's not worth the complexity until
 //!   real users ask for it.
-//! - Deny-only: a malformed workspace file is ignored (the policy rules
-//!   still apply). The gateway validates policy hooks where a policy is
-//!   written (`Policy::validate`), so an invalid one is not expected here.
-//! - Patterns compile once per session start, with the size limits of
-//!   [`havn_core::compile_hook_pattern`].
+//! - Deny-only. The gateway validates policy hooks strictly where a
+//!   policy is written (`Policy::validate`). The workspace file is read
+//!   leniently: unknown keys are ignored, and invalid patterns and rules
+//!   past the caps are dropped with a warning. A file that is not valid
+//!   YAML drops the workspace layer; the policy rules always apply.
+//! - Patterns compile once per session start, with twice the size limit
+//!   the gateway validates against, so a regex crate upgrade that grows
+//!   compiled programs does not stop agents from starting.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use havn_core::HookPolicy;
+use havn_core::{HookPolicy, MAX_HOOK_PATTERN_LEN, MAX_HOOK_PATTERNS, MAX_HOOK_RULES};
 use regex::Regex;
+use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 /// One per-tool veto rule. `tool` matches against [`crate::tools::Tool::name`];
@@ -78,11 +82,10 @@ pub type Hooks = Arc<ArcSwap<HookSet>>;
 
 /// Build the session's hook set: the policy's rules plus any rules in
 /// `<workspace>/.havn/hooks.yaml`. The workspace file can only add rules.
-/// An invalid policy pattern is an error; a missing, malformed or
-/// over-limit workspace file only drops the workspace layer. The rule
-/// and pattern caps apply to the workspace file, not to the policy: a
-/// resolved policy can hold the union of several validated ones. A
-/// reload must also go through here so it keeps the policy rules.
+/// An invalid policy pattern is an error. The rule and pattern caps
+/// apply to the workspace file, not to the policy: a resolved policy can
+/// hold the union of several validated ones. A reload must also go
+/// through here so it keeps the policy rules.
 pub async fn load(policy: &HookPolicy, workspace: &Path) -> Result<HookSet, String> {
     let mut set = compile(policy).map_err(|e| format!("policy hooks: {e}"))?;
     let workspace_rules = load_from_workspace(workspace).await.rules;
@@ -121,10 +124,66 @@ async fn load_from_workspace(workspace: &Path) -> HookSet {
     }
 }
 
+const COMPILE_SIZE_LIMIT: usize = 2 * havn_core::HOOK_REGEX_SIZE_LIMIT;
+
+/// Lenient parse of the workspace file; only YAML that does not parse at
+/// all is an error.
 fn parse(yaml: &str) -> Result<HookSet, String> {
-    let raw: HookPolicy = serde_norway::from_str(yaml).map_err(|e| format!("yaml: {e}"))?;
-    raw.validate().map_err(|e| e.to_string())?;
-    compile(&raw)
+    #[derive(Deserialize)]
+    struct File {
+        #[serde(default)]
+        pre_tool_use: Vec<Rule>,
+    }
+    #[derive(Deserialize)]
+    struct Rule {
+        tool: String,
+        #[serde(default)]
+        deny: Vec<String>,
+    }
+    let file: File = serde_norway::from_str(yaml).map_err(|e| format!("yaml: {e}"))?;
+    if file.pre_tool_use.len() > MAX_HOOK_RULES {
+        warn!(
+            ignored = file.pre_tool_use.len() - MAX_HOOK_RULES,
+            "hooks.yaml has more than {MAX_HOOK_RULES} rules; ignoring the rest"
+        );
+    }
+    let mut patterns_left = MAX_HOOK_PATTERNS;
+    let mut rules = Vec::new();
+    'rules: for rule in file.pre_tool_use.into_iter().take(MAX_HOOK_RULES) {
+        if rule.tool.trim().is_empty() {
+            warn!("hooks.yaml rule with an empty tool ignored");
+            continue;
+        }
+        let mut deny = Vec::with_capacity(rule.deny.len());
+        for pattern in &rule.deny {
+            if patterns_left == 0 {
+                warn!(
+                    "hooks.yaml has more than {MAX_HOOK_PATTERNS} deny patterns; ignoring the rest"
+                );
+                rules.push(ToolHook {
+                    tool: rule.tool,
+                    deny,
+                });
+                break 'rules;
+            }
+            if pattern.len() > MAX_HOOK_PATTERN_LEN {
+                warn!(tool = %rule.tool, "hooks.yaml pattern longer than {MAX_HOOK_PATTERN_LEN} bytes ignored");
+                continue;
+            }
+            match havn_core::compile_hook_pattern(pattern, COMPILE_SIZE_LIMIT) {
+                Ok(re) => {
+                    deny.push(re);
+                    patterns_left -= 1;
+                }
+                Err(e) => warn!(tool = %rule.tool, error = %e, "hooks.yaml pattern ignored"),
+            }
+        }
+        rules.push(ToolHook {
+            tool: rule.tool,
+            deny,
+        });
+    }
+    Ok(HookSet { rules })
 }
 
 fn compile(hooks: &HookPolicy) -> Result<HookSet, String> {
@@ -132,7 +191,7 @@ fn compile(hooks: &HookPolicy) -> Result<HookSet, String> {
     for h in &hooks.pre_tool_use {
         let mut compiled = Vec::with_capacity(h.deny.len());
         for pat in &h.deny {
-            let re = havn_core::compile_hook_pattern(pat)
+            let re = havn_core::compile_hook_pattern(pat, COMPILE_SIZE_LIMIT)
                 .map_err(|e| format!("tool {:?}: {e}", h.tool))?;
             compiled.push(re);
         }
@@ -225,9 +284,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_invalid_regex() {
-        let yaml = "pre_tool_use:\n  - tool: shell\n    deny: [\"[unclosed\"]\n";
-        assert!(parse(yaml).is_err());
+    fn parse_skips_invalid_regex_only() {
+        let set =
+            set_with("pre_tool_use:\n  - tool: shell\n    deny: [\"[unclosed\", \"^sudo \"]\n");
+        assert!(matches!(set.veto("shell", "sudo ls"), Veto::Deny { .. }));
+        assert_eq!(set.rules[0].deny.len(), 1);
     }
 
     #[test]
@@ -294,12 +355,42 @@ mod tests {
     }
 
     #[test]
-    fn workspace_file_over_limits_is_rejected() {
-        let rules: String = (0..=havn_core::MAX_HOOK_RULES)
-            .map(|i| format!("  - tool: shell\n    deny: [\"^p{i}\"]\n"))
+    fn workspace_file_keeps_rules_up_to_the_caps() {
+        let rules: String = (0..=MAX_HOOK_RULES)
+            .map(|i| format!("  - tool: shell\n    deny: [\"^p{i}$\"]\n"))
             .collect();
-        assert!(parse(&format!("pre_tool_use:\n{rules}")).is_err());
-        assert!(parse("pre_tool_use:\n  - tool: shell\n    denny: [\"x\"]\n").is_err());
+        let set = set_with(&format!("pre_tool_use:\n{rules}"));
+        assert_eq!(set.rules.len(), MAX_HOOK_RULES);
+        assert!(matches!(set.veto("shell", "p0"), Veto::Deny { .. }));
+        let last = MAX_HOOK_RULES - 1;
+        assert!(matches!(
+            set.veto("shell", &format!("p{last}")),
+            Veto::Deny { .. }
+        ));
+        assert!(matches!(
+            set.veto("shell", &format!("p{MAX_HOOK_RULES}")),
+            Veto::Allow
+        ));
+
+        let patterns = (0..=MAX_HOOK_PATTERNS)
+            .map(|i| format!("\"^q{i}$\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let set = set_with(&format!(
+            "pre_tool_use:\n  - tool: shell\n    deny: [{patterns}]\n  - tool: file_read\n    deny: [\"x\"]\n"
+        ));
+        let kept: usize = set.rules.iter().map(|r| r.deny.len()).sum();
+        assert_eq!(kept, MAX_HOOK_PATTERNS);
+        assert!(matches!(set.veto("shell", "q0"), Veto::Deny { .. }));
+        assert!(matches!(set.veto("file_read", "x"), Veto::Allow));
+    }
+
+    #[test]
+    fn workspace_file_ignores_unknown_keys() {
+        let set = set_with(
+            "version: 1\npre_tool_use:\n  - tool: shell\n    note: legacy\n    deny: [\"^sudo \"]\n",
+        );
+        assert!(matches!(set.veto("shell", "sudo ls"), Veto::Deny { .. }));
     }
 
     #[test]
