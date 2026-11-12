@@ -113,6 +113,12 @@ function forwardedHeaders(req) {
 }
 
 function proxyApi(req, res) {
+  const te = req.headers["transfer-encoding"];
+  if (te !== undefined && te.trim().toLowerCase() !== "chunked") {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "unsupported transfer-encoding" }));
+    return;
+  }
   const upstream = httpRequest(
     {
       host: GATEWAY_HOST,
@@ -194,12 +200,14 @@ server.on("upgrade", (req, clientSocket, head) => {
         return;
       }
       upstream.off("data", onResponse);
-      clientSocket.write(response);
       const statusLine = response.subarray(0, response.indexOf("\r\n")).toString("latin1");
       if (!/^HTTP\/1\.1 101 /.test(statusLine)) {
-        tearDown();
+        // Relay the refusal and close; never forward further requests.
+        clientSocket.end(response);
+        upstream.destroy();
         return;
       }
+      clientSocket.write(response);
       if (head?.length) upstream.write(head);
       // The WebSocket framing is opaque to us from here on.
       upstream.pipe(clientSocket);
