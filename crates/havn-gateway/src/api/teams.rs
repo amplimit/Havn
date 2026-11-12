@@ -646,7 +646,7 @@ mod tests {
     async fn team_usage_counts_only_team_resources_and_is_admin_only() {
         use havn_core::UserId;
         use havn_db::repo::agents::{NewAgent, create as create_agent_row};
-        use havn_db::repo::credential_usage::{NewUsage, record};
+        use havn_db::repo::credential_usage::{Caps, Reservation, reserve, settle};
         use havn_db::repo::credentials::{CredentialScope, NewCredential, create as create_cred};
         let f = team_fixture().await;
         let db = &f.state.db;
@@ -685,21 +685,30 @@ mod tests {
         };
         let team_agent = agent(Some(f.team), "team-agent").await;
         let own_agent = agent(None, "own-agent").await;
+        // Recorded the way the LLM proxy does: reserve, then settle.
         let spend = |user: UserId, credential, agent_id, tokens: i64| async move {
-            record(
+            let reserved = reserve(
                 db,
-                NewUsage {
+                Reservation {
                     credential_id: credential,
                     user_id: user,
                     agent_id,
                     provider: "anthropic",
                     model: "m",
                     tokens_in: tokens,
-                    tokens_out: 0,
+                    max_tokens_out: 1,
+                    min_tokens_out: 1,
+                    caps: Caps::default(),
+                    day_start: "1970-01-01T00:00:00.000Z",
+                    minute_start: "1970-01-01T00:00:00.000Z",
                 },
             )
             .await
-            .expect("usage");
+            .expect("reserve")
+            .expect("no caps");
+            settle(db, &reserved.id, "m", tokens, 0)
+                .await
+                .expect("settle");
         };
         // Counted: team credential, and team agent on a personal credential.
         spend(f.member.id, team_cred, Some(own_agent), 10).await;

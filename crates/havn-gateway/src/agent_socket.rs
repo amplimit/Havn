@@ -291,9 +291,7 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
             "refusing agent: runtime protocol version differs from the gateway's; \
              install the havn-runtime that ships with this gateway"
         );
-        anyhow::bail!(
-            "protocol version mismatch (agent {version:?}, gateway {PROTOCOL_VERSION})"
-        );
+        anyhow::bail!("protocol version mismatch (agent {version:?}, gateway {PROTOCOL_VERSION})");
     }
 
     let agent_id = AgentId::from_str(&agent_id_str)
