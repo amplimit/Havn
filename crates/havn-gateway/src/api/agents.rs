@@ -490,6 +490,7 @@ pub(crate) async fn agent_data<T: serde::de::DeserializeOwned>(
         .admin_rpc
         .call(
             &request_id,
+            id,
             || async move {
                 registry
                     .send(id, GatewayToAgent::DataRequest(req))
