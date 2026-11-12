@@ -164,12 +164,7 @@ mod tests {
         .await
         .expect("agent");
 
-        registry
-            .register(AgentHandle {
-                agent_id: agent.id,
-                pid: 1,
-            })
-            .await;
+        registry.register(AgentHandle::new(agent.id, 1)).await;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<GatewayToAgent>(8);
         registry.attach(agent.id, tx).await.expect("attach");
 
@@ -193,12 +188,7 @@ mod tests {
         .await
         .expect("agent");
 
-        registry
-            .register(AgentHandle {
-                agent_id: agent.id,
-                pid: 1,
-            })
-            .await;
+        registry.register(AgentHandle::new(agent.id, 1)).await;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<GatewayToAgent>(8);
         registry.attach(agent.id, tx).await.expect("attach");
 
@@ -229,12 +219,7 @@ mod tests {
             )
             .await
             .expect("agent");
-            registry
-                .register(AgentHandle {
-                    agent_id: agent.id,
-                    pid: 1,
-                })
-                .await;
+            registry.register(AgentHandle::new(agent.id, 1)).await;
             let (tx, rx) = tokio::sync::mpsc::channel::<GatewayToAgent>(1);
             registry.attach(agent.id, tx).await.expect("attach");
             queues.push((agent.id, rx));
@@ -312,12 +297,7 @@ mod tests {
         .await
         .expect("agent");
 
-        registry
-            .register(AgentHandle {
-                agent_id: agent.id,
-                pid: 1,
-            })
-            .await;
+        registry.register(AgentHandle::new(agent.id, 1)).await;
         let (tx, _rx) = tokio::sync::mpsc::channel::<GatewayToAgent>(8);
         registry.attach(agent.id, tx.clone()).await.expect("attach");
 

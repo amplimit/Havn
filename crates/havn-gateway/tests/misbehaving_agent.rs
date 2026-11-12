@@ -31,6 +31,9 @@ use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest as _};
 
 const STEP: Duration = Duration::from_secs(10);
 const QUIET: Duration = Duration::from_secs(1);
+/// The gateway holds a Hello for an unregistered agent for up to ten
+/// seconds, in case the spawn that started it has not registered it yet.
+const HELLO: Duration = Duration::from_secs(20);
 
 /// Stands in for havn-runtime: keeps the agent's process alive without
 /// connecting, and exits with the gateway (or after ten minutes).
@@ -384,7 +387,7 @@ impl Link {
             version: PROTOCOL_VERSION.to_string(),
         };
         write_frame(&mut self.writer, &hello).await.ok()?;
-        let reply = tokio::time::timeout(STEP, read_frame::<_, GatewayToAgent>(&mut self.reader))
+        let reply = tokio::time::timeout(HELLO, read_frame::<_, GatewayToAgent>(&mut self.reader))
             .await
             .expect("the gateway answers Hello or closes the connection");
         match reply {
@@ -899,8 +902,23 @@ async fn requests_with_oversized_ids_get_no_reply() {
     assert!(gw.connected(agent_id).await);
 }
 
-fn agent_cgroup(id: AgentId) -> PathBuf {
-    PathBuf::from(format!("/sys/fs/cgroup/havn.slice/agent-{id}"))
+/// The cgroup the spawner put agent `id`'s process in, found from that
+/// process rather than from the spawner's naming scheme.
+fn agent_cgroup(id: AgentId) -> Option<PathBuf> {
+    let marker = format!("--agent-id\0{id}\0");
+    std::fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .find_map(|entry| {
+            let cmdline = std::fs::read(entry.path().join("cmdline")).ok()?;
+            if !String::from_utf8_lossy(&cmdline).contains(&marker) {
+                return None;
+            }
+            let cgroup = std::fs::read_to_string(entry.path().join("cgroup")).ok()?;
+            let path = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+            path.contains(&id.to_string())
+                .then(|| PathBuf::from(format!("/sys/fs/cgroup{path}")))
+        })
 }
 
 #[tokio::test]
@@ -919,26 +937,25 @@ async fn under_isolation_only_the_agents_cgroup_may_connect_as_it() {
     let starts = [gw.start_agent(a), gw.start_agent(b)];
     for id in [a, b] {
         gw.wait_until("the agent's process runs in its cgroup", STEP, async || {
-            gw.agent_view(id).await["status"] == json!("running")
-                && std::fs::read_to_string(agent_cgroup(id).join("cgroup.procs"))
-                    .is_ok_and(|procs| !procs.trim().is_empty())
+            gw.agent_view(id).await["status"] == json!("running") && agent_cgroup(id).is_some()
         })
         .await;
     }
+    let cgroup = |id| agent_cgroup(id).expect("agent cgroup");
 
     let outside = Link::socket(&gw.socket()).await.hello(&a.to_string()).await;
     assert!(
         outside.is_none(),
         "a process outside the agent's cgroup connected as it"
     );
-    let other = Link::from_cgroup(&agent_cgroup(a), &gw.socket())
+    let other = Link::from_cgroup(&cgroup(a), &gw.socket())
         .await
         .hello(&b.to_string())
         .await;
     assert!(other.is_none(), "agent {a}'s cgroup connected as agent {b}");
     let mut sessions = Vec::new();
     for id in [a, b] {
-        let own = Link::from_cgroup(&agent_cgroup(id), &gw.socket())
+        let own = Link::from_cgroup(&cgroup(id), &gw.socket())
             .await
             .hello(&id.to_string())
             .await

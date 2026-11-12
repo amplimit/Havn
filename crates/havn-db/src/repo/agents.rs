@@ -206,6 +206,19 @@ pub async fn list_for_owner(pool: &SqlitePool, owner_id: UserId) -> Result<Vec<A
     rows.into_iter().map(Agent::try_from).collect()
 }
 
+/// Every agent, of any owner, currently in `status`.
+pub async fn list_with_status(pool: &SqlitePool, status: AgentStatus) -> Result<Vec<Agent>> {
+    let rows: Vec<AgentRow> = sqlx::query_as::<_, AgentRow>(
+        "SELECT id, owner_id, team_id, name, status, host, pid, config, created_at, updated_at \
+         FROM agents WHERE status = ?1 ORDER BY created_at",
+    )
+    .bind(status.as_str())
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(Agent::try_from).collect()
+}
+
 pub async fn set_status(pool: &SqlitePool, id: AgentId, status: AgentStatus) -> Result<()> {
     let result = sqlx::query(
         "UPDATE agents SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
@@ -338,6 +351,45 @@ mod tests {
         .await
         .expect("create user")
         .id
+    }
+
+    #[tokio::test]
+    async fn list_with_status_spans_owners() {
+        let pool = connect_in_memory().await.expect("connect");
+        let mut running = Vec::new();
+        for (i, status) in [
+            AgentStatus::Running,
+            AgentStatus::Stopped,
+            AgentStatus::Running,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let owner = make_user(&pool, "").await;
+            let agent = create(
+                &pool,
+                NewAgent {
+                    owner_id: owner,
+                    team_id: None,
+                    name: &format!("a{i}"),
+                    config: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("create agent");
+            set_status(&pool, agent.id, status).await.expect("status");
+            if status == AgentStatus::Running {
+                running.push(agent.id);
+            }
+        }
+        let listed: Vec<AgentId> = list_with_status(&pool, AgentStatus::Running)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(listed.len(), running.len());
+        assert!(running.iter().all(|id| listed.contains(id)));
     }
 
     #[tokio::test]
