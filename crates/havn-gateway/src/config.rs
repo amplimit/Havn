@@ -248,6 +248,11 @@ pub struct NetworkConfig {
     /// refuses to start the gateway if this collides with an existing
     /// host route.
     pub agent_pool_cidr: String,
+    /// IPv4 addresses or CIDRs that agents with egress may reach even
+    /// though they lie in private, link-local or CGNAT ranges, which are
+    /// otherwise blocked (an internal API, a LAN service). The `agent_dns`
+    /// servers are always reachable. Default empty.
+    pub agent_private_access: Vec<String>,
 }
 
 impl Default for NetworkConfig {
@@ -255,6 +260,7 @@ impl Default for NetworkConfig {
         Self {
             agent_dns: vec!["1.1.1.1".into(), "8.8.8.8".into(), "9.9.9.9".into()],
             agent_pool_cidr: "10.42.0.0/16".into(),
+            agent_private_access: Vec::new(),
         }
     }
 }
