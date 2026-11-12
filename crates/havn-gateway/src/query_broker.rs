@@ -15,13 +15,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use havn_core::AgentId;
 use havn_proto::AgentQueryResponse;
 use tokio::sync::{Mutex, oneshot};
 use tracing::warn;
 
+#[derive(Debug)]
+struct Pending {
+    /// The only agent allowed to answer.
+    target: AgentId,
+    tx: oneshot::Sender<AgentQueryResponse>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct QueryBroker {
-    pending: Arc<Mutex<HashMap<String, oneshot::Sender<AgentQueryResponse>>>>,
+    pending: Arc<Mutex<HashMap<String, Pending>>>,
 }
 
 impl QueryBroker {
@@ -30,26 +38,50 @@ impl QueryBroker {
         Self::default()
     }
 
-    /// Reserve a slot for `request_id`. Caller sends the
-    /// `IncomingQuery` frame down the target's agent socket, then
-    /// awaits the returned receiver under a wall-clock timeout.
-    pub async fn register(&self, request_id: &str) -> oneshot::Receiver<AgentQueryResponse> {
+    /// Reserve a slot for a query dispatched to `target` and return the id
+    /// to put in its `IncomingQuery`. The broker chooses the id, so a
+    /// calling agent cannot pick or collide with it, and only `target` can
+    /// answer. The caller awaits the receiver under a wall-clock timeout.
+    pub async fn register(
+        &self,
+        target: AgentId,
+    ) -> (String, oneshot::Receiver<AgentQueryResponse>) {
+        let request_id = uuid::Uuid::now_v7().to_string();
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(request_id.into(), tx);
-        rx
+        self.pending
+            .lock()
+            .await
+            .insert(request_id.clone(), Pending { target, tx });
+        (request_id, rx)
     }
 
-    /// Demultiplex an incoming [`AgentQueryResponse`] from the target
-    /// agent. No-op (with a warn) if the id has no pending entry — the
-    /// caller most likely timed out and tore down its receiver.
-    pub async fn resolve(&self, response: AgentQueryResponse) {
+    /// Demultiplex an [`AgentQueryResponse`] sent by `responder`. A
+    /// response from any agent other than the query's target is dropped and
+    /// leaves the pending query untouched. No-op (with a warn) if the id has
+    /// no pending entry — the caller most likely timed out and tore down its
+    /// receiver.
+    pub async fn resolve(&self, responder: AgentId, response: AgentQueryResponse) {
         let request_id = response.request_id.clone();
-        let sender = self.pending.lock().await.remove(&request_id);
-        if let Some(tx) = sender {
+        let pending = {
+            let mut map = self.pending.lock().await;
+            match map.get(&request_id) {
+                Some(p) if p.target == responder => map.remove(&request_id),
+                Some(_) => {
+                    warn!(
+                        request_id,
+                        %responder,
+                        "AgentQueryResponse from an agent that was not asked; dropping"
+                    );
+                    return;
+                }
+                None => None,
+            }
+        };
+        if let Some(p) = pending {
             // Receiver may have dropped (caller cancelled / timed out).
             // Silently discard — the receiver-side error path already
             // surfaces the timeout to the LLM as a tool_result.
-            let _ = tx.send(response);
+            let _ = p.tx.send(response);
         } else {
             warn!(
                 request_id,
@@ -72,52 +104,63 @@ mod tests {
     use super::*;
     use havn_proto::AgentQueryOutcome;
 
+    fn response(request_id: &str, text: &str) -> AgentQueryResponse {
+        AgentQueryResponse {
+            request_id: request_id.into(),
+            outcome: AgentQueryOutcome::Ok,
+            text: text.into(),
+            transcript: serde_json::Value::Null,
+        }
+    }
+
     #[tokio::test]
     async fn register_resolve_round_trip() {
         let broker = QueryBroker::new();
-        let rx = broker.register("rid-1").await;
+        let target = AgentId::new();
+        let (id, rx) = broker.register(target).await;
+        broker.resolve(target, response(&id, "hi")).await;
+        assert_eq!(rx.await.expect("recv").text, "hi");
+    }
+
+    #[tokio::test]
+    async fn only_the_target_can_answer() {
+        let broker = QueryBroker::new();
+        let target = AgentId::new();
+        let (id, mut rx) = broker.register(target).await;
 
         broker
-            .resolve(AgentQueryResponse {
-                request_id: "rid-1".into(),
-                outcome: AgentQueryOutcome::Ok,
-                text: "hi".into(),
-                transcript: serde_json::Value::Null,
-            })
+            .resolve(AgentId::new(), response(&id, "forged"))
             .await;
+        assert!(rx.try_recv().is_err(), "a forged answer must not arrive");
 
-        let r = rx.await.expect("recv");
-        assert_eq!(r.text, "hi");
+        broker.resolve(target, response(&id, "real")).await;
+        assert_eq!(rx.await.expect("recv").text, "real");
+    }
+
+    #[tokio::test]
+    async fn ids_are_chosen_by_the_broker() {
+        let broker = QueryBroker::new();
+        let target = AgentId::new();
+        let (first, _rx1) = broker.register(target).await;
+        let (second, _rx2) = broker.register(target).await;
+        assert_ne!(first, second);
     }
 
     #[tokio::test]
     async fn cancel_removes_pending_entry() {
         let broker = QueryBroker::new();
-        let _rx = broker.register("rid-2").await;
-        broker.cancel("rid-2").await;
-        // resolving after cancel hits the "no pending" warn path,
-        // exercised by the absence of a panic.
-        broker
-            .resolve(AgentQueryResponse {
-                request_id: "rid-2".into(),
-                outcome: AgentQueryOutcome::Ok,
-                text: String::new(),
-                transcript: serde_json::Value::Null,
-            })
-            .await;
+        let target = AgentId::new();
+        let (id, mut rx) = broker.register(target).await;
+        broker.cancel(&id).await;
+        broker.resolve(target, response(&id, "late")).await;
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn unknown_request_id_is_ignored() {
         let broker = QueryBroker::new();
-        // No register call. Resolve must not panic.
         broker
-            .resolve(AgentQueryResponse {
-                request_id: "rid-orphan".into(),
-                outcome: AgentQueryOutcome::Ok,
-                text: String::new(),
-                transcript: serde_json::Value::Null,
-            })
+            .resolve(AgentId::new(), response("rid-orphan", ""))
             .await;
     }
 }
