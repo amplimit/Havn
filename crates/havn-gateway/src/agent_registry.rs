@@ -31,6 +31,8 @@ use tracing::warn;
 pub struct AgentRegistry {
     inner: Arc<Mutex<HashMap<AgentId, Entry>>>,
     generations: Arc<AtomicU64>,
+    /// Woken on every registration, for connections that arrive first.
+    registered: Arc<Notify>,
 }
 
 #[derive(Debug)]
@@ -191,7 +193,26 @@ impl AgentRegistry {
         if let Some(signal) = replaced.and_then(|e| e.disconnect) {
             signal.notify_waiters();
         }
+        self.registered.notify_waiters();
         generation
+    }
+
+    /// Wait up to `limit` for `agent_id` to be registered. The spawner
+    /// returns the handle only after the runtime has started, so under load
+    /// its Hello can arrive before the registration it belongs to.
+    pub async fn wait_registered(&self, agent_id: AgentId, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            let registered = self.registered.notified();
+            tokio::pin!(registered);
+            registered.as_mut().enable();
+            if self.is_registered(agent_id).await {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, registered).await.is_err() {
+                return self.is_registered(agent_id).await;
+            }
+        }
     }
 
     /// Take one in-flight slot for `agent_id`, or `None` when its cap is
@@ -636,6 +657,30 @@ mod tests {
         assert!(!reg.is_connected(id).await);
         // Handle still present.
         assert!(reg.remove(id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn wait_registered_returns_once_the_agent_is_registered() {
+        let reg = AgentRegistry::new();
+        let handle = fake_handle();
+        let id = handle.agent_id;
+        let waiter = {
+            let reg = reg.clone();
+            tokio::spawn(async move { reg.wait_registered(id, Duration::from_secs(5)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reg.register(handle).await;
+        let found = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("woken by the registration")
+            .expect("join");
+        assert!(found);
+
+        let missing = AgentId::new();
+        assert!(
+            !reg.wait_registered(missing, Duration::from_millis(50))
+                .await
+        );
     }
 
     #[tokio::test]

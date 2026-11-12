@@ -44,6 +44,9 @@ use havn_db::repo::agents as agents_repo;
 
 const OUTBOUND_QUEUE_CAPACITY: usize = 64;
 
+/// How long a Hello may wait for the registration of its agent.
+const REGISTRATION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Longest one frame write may take. A runtime that stops reading its socket
 /// is disconnected after this, which also releases every task waiting for
 /// room in its outbound queue.
@@ -308,6 +311,31 @@ async fn handle_connection(stream: UnixStream, ctx: AgentSocketCtx) -> anyhow::R
             "refusing agent connection: the connecting process is not in that agent's cgroup"
         );
         anyhow::bail!("agent {agent_id}: connecting process is not in the agent's cgroup");
+    }
+
+    // A runtime can say Hello before the spawn that started it has
+    // registered its handle. Give the registration a moment, then check
+    // the peer again: it must still be a live process in the agent's
+    // cgroup, not one a clean-up killed while we waited.
+    if !ctx.registry.is_registered(agent_id).await {
+        if !ctx
+            .registry
+            .wait_registered(agent_id, REGISTRATION_WAIT)
+            .await
+        {
+            anyhow::bail!("refusing connection for agent {agent_id}: not registered");
+        }
+        if ctx.verify_peer_cgroup {
+            let now_in = self::peer_cgroup(reader.get_ref().as_ref()).await;
+            if !peer_cgroup_is_agents(now_in.as_deref(), agent_id) {
+                warn!(
+                    %agent_id,
+                    peer_cgroup = now_in.as_deref().map(str::trim_end),
+                    "refusing agent connection: the peer left the agent's cgroup while waiting"
+                );
+                anyhow::bail!("agent {agent_id}: connecting process is no longer in its cgroup");
+            }
+        }
     }
 
     // Attach before sending Welcome, so a second connection for an agent
@@ -2106,6 +2134,26 @@ mod tests {
             live_rx.recv().await,
             Some(GatewayToAgent::HeartbeatTick)
         ));
+    }
+
+    #[tokio::test]
+    async fn hello_before_registration_waits_for_it() {
+        let ctx = ctx_with(false, false).await;
+        let agent_id = AgentId::new();
+        // The runtime connects before the spawn that started it returns.
+        let registry = ctx.registry.clone();
+        let late = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            registry.register(AgentHandle::new(agent_id, 1)).await;
+        });
+
+        let (_, reply) = hello(&ctx, agent_id).await;
+
+        late.await.expect("join");
+        assert!(
+            matches!(reply, Some(GatewayToAgent::Welcome { .. })),
+            "{reply:?}"
+        );
     }
 
     #[tokio::test]

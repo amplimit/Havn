@@ -56,6 +56,10 @@ use crate::audit;
 /// Missed liveness pings after which a connected agent counts as hung.
 pub const LIVENESS_MISSED_PINGS: u32 = 4;
 
+/// Agents [`reconcile`] starts at once, so a host with many agents is
+/// not hit by all their start-ups together.
+const RESTORE_CONCURRENCY: usize = 4;
+
 /// From spawn to Hello. Covers opening agent.db, migrations and skill
 /// indexing on a loaded host.
 const CONNECT_LIMIT: Duration = Duration::from_secs(5 * 60);
@@ -413,10 +417,15 @@ pub(crate) async fn reconcile(state: &AppState) {
             return;
         }
     };
+    let slots = Arc::new(tokio::sync::Semaphore::new(RESTORE_CONCURRENCY));
     for agent in agents {
         info!(agent_id = %agent.id, name = %agent.name, "restoring agent that was running");
         let state = state.clone();
+        let slots = Arc::clone(&slots);
         tokio::spawn(async move {
+            let Ok(_slot) = slots.acquire().await else {
+                return;
+            };
             match start_agent(&state, agent.id, StartBy::Supervisor(agent.owner_id)).await {
                 Ok(()) => {}
                 Err(e) if e.spawned => {}
