@@ -34,7 +34,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, mpsc};
 use tracing::warn;
 
-use crate::config::ChannelBindingConfig;
+use crate::config::{ChannelBindingConfig, ChannelEntry, DmPolicy};
 
 /// Sliding window for the per-account replay buffer (spec §3.2).
 const REPLAY_WINDOW: Duration = Duration::from_secs(300);
@@ -277,6 +277,52 @@ pub fn agent_for_account<'a>(
         .map(|b| b.agent_id.as_str())
 }
 
+/// Why an agent may not send a channel message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundRefusal {
+    NotBound,
+    UnknownAccount,
+    RecipientNotAllowed,
+}
+
+impl OutboundRefusal {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotBound => "agent is not bound to this channel account",
+            Self::UnknownAccount => "channel account is not configured",
+            Self::RecipientNotAllowed => "recipient is not in the account's allow_from",
+        }
+    }
+}
+
+/// Decide whether `agent_id` may send through `(channel, account_id)` to
+/// `recipient`. The agent must be the one `[[bindings]]` binds to the
+/// account. Under `dm_policy = "allowlist"` the recipient must be in
+/// `allow_from`; under `open` anyone on the platform can already talk to
+/// the agent, so any recipient is allowed.
+pub fn outbound_permitted(
+    bindings: &[ChannelBindingConfig],
+    channels: &std::collections::BTreeMap<String, ChannelEntry>,
+    agent_id: &str,
+    channel: &str,
+    account_id: &str,
+    recipient: &str,
+) -> Result<(), OutboundRefusal> {
+    if agent_for_account(bindings, channel, account_id) != Some(agent_id) {
+        return Err(OutboundRefusal::NotBound);
+    }
+    let account = channels
+        .get(channel)
+        .and_then(|entry| entry.accounts.iter().find(|a| a.id == account_id))
+        .ok_or(OutboundRefusal::UnknownAccount)?;
+    match account.dm_policy {
+        DmPolicy::Open => Ok(()),
+        DmPolicy::Allowlist if account.allow_from.iter().any(|id| id == recipient) => Ok(()),
+        DmPolicy::Allowlist => Err(OutboundRefusal::RecipientNotAllowed),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
@@ -499,5 +545,67 @@ mod tests {
             .replay_since(&AccountKey::new("telegram", "ghost"), 42)
             .await;
         assert!(got.is_empty());
+    }
+
+    fn channels_with(
+        account: &str,
+        dm_policy: DmPolicy,
+        allow_from: &[&str],
+    ) -> std::collections::BTreeMap<String, ChannelEntry> {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            "telegram".to_string(),
+            ChannelEntry {
+                accounts: vec![crate::config::ChannelAccount {
+                    id: account.into(),
+                    adapter_token_ref: "secret:channel:telegram:bot".into(),
+                    dm_policy,
+                    allow_from: allow_from.iter().map(|s| (*s).to_string()).collect(),
+                }],
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn outbound_requires_binding_to_the_account() {
+        let bs = vec![binding("a1", "telegram", "bot")];
+        let chs = channels_with("bot", DmPolicy::Open, &[]);
+        assert_eq!(
+            outbound_permitted(&bs, &chs, "a2", "telegram", "bot", "123"),
+            Err(OutboundRefusal::NotBound)
+        );
+        assert_eq!(
+            outbound_permitted(&bs, &chs, "a1", "telegram", "other-bot", "123"),
+            Err(OutboundRefusal::NotBound)
+        );
+        assert_eq!(
+            outbound_permitted(&bs, &chs, "a1", "telegram", "bot", "123"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn outbound_under_allowlist_only_reaches_allowed_senders() {
+        let bs = vec![binding("a1", "telegram", "bot")];
+        let chs = channels_with("bot", DmPolicy::Allowlist, &["111"]);
+        assert_eq!(
+            outbound_permitted(&bs, &chs, "a1", "telegram", "bot", "111"),
+            Ok(())
+        );
+        assert_eq!(
+            outbound_permitted(&bs, &chs, "a1", "telegram", "bot", "999"),
+            Err(OutboundRefusal::RecipientNotAllowed)
+        );
+    }
+
+    #[test]
+    fn outbound_to_unconfigured_account_is_refused() {
+        let bs = vec![binding("a1", "telegram", "bot")];
+        let chs = std::collections::BTreeMap::new();
+        assert_eq!(
+            outbound_permitted(&bs, &chs, "a1", "telegram", "bot", "111"),
+            Err(OutboundRefusal::UnknownAccount)
+        );
     }
 }

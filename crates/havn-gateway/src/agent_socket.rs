@@ -50,6 +50,12 @@ pub struct AgentSocketCtx {
     /// ChannelRouter::deliver`] when an agent's `OutboundMessage` carries
     /// a channel-adapter `channel_id` (decoded via `channel_id_codec`).
     pub channel_router: crate::channel_router::ChannelRouter,
+    /// `[[bindings]]` and `[[channels]]` startup snapshots (shared with
+    /// `AppState`). Outbound channel messages are only delivered through
+    /// accounts bound to the sending agent, to recipients its account's
+    /// `dm_policy` allows.
+    pub bindings: Arc<Vec<crate::config::ChannelBindingConfig>>,
+    pub channels: Arc<std::collections::BTreeMap<String, crate::config::ChannelEntry>>,
     pub cron_scheduler: CronScheduler,
     /// Pending admin RPC senders (`MemoryForget`, `SkillPin`). The
     /// reader matches `*Response` variants and resolves the matching
@@ -283,6 +289,23 @@ where
                 } else if let Some((channel, account_id, sender_id)) =
                     crate::channel_id_codec::decode(&msg.channel_id)
                 {
+                    if let Err(refusal) = crate::channel_router::outbound_permitted(
+                        &ctx.bindings,
+                        &ctx.channels,
+                        &agent_id.to_string(),
+                        channel,
+                        account_id,
+                        sender_id,
+                    ) {
+                        warn!(
+                            %agent_id,
+                            channel,
+                            account = account_id,
+                            reason = refusal.as_str(),
+                            "dropping channel-adapter outbound"
+                        );
+                        continue;
+                    }
                     // Channel-adapter outbound. Translate havn-core's
                     // MessageContent into havn-proto's
                     // ChannelMessageContent and push via the router.
@@ -357,7 +380,7 @@ where
                             warn!(%agent_id, "dropping channel-adapter outbound: unsupported MessageContent variant")
                         }
                     }
-                } else if let Err(e) = ctx.webchat_router.deliver(msg).await {
+                } else if let Err(e) = ctx.webchat_router.deliver(agent_id, msg).await {
                     warn!(%agent_id, error = %e, "could not deliver outbound to webchat");
                 }
             }
