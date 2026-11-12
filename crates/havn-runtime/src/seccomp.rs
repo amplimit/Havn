@@ -191,6 +191,14 @@ const DANGEROUS_SYSCALLS: &[i64] = &[
     libc::SYS_umount2,
     libc::SYS_pivot_root,
     libc::SYS_chroot,
+    // The Linux 5.2+ mount API reaches the same ground as mount(2).
+    libc::SYS_fsopen,
+    libc::SYS_fsconfig,
+    libc::SYS_fsmount,
+    libc::SYS_fspick,
+    libc::SYS_move_mount,
+    libc::SYS_open_tree,
+    libc::SYS_mount_setattr,
     // ── kernel modules ──────────────────────────────────────────────
     libc::SYS_init_module,
     libc::SYS_finit_module,
@@ -235,6 +243,10 @@ mod tests {
         for required in &[
             libc::SYS_mount,
             libc::SYS_umount2,
+            libc::SYS_fsopen,
+            libc::SYS_fsmount,
+            libc::SYS_move_mount,
+            libc::SYS_open_tree,
             libc::SYS_reboot,
             libc::SYS_kexec_load,
             libc::SYS_ptrace,
@@ -271,6 +283,8 @@ mod tests {
         // table is intentionally narrow — operators cannot let a pack
         // call `mount` even if they paste it in config.
         assert!(blocked.contains(&libc::SYS_mount));
+        assert!(blocked.contains(&libc::SYS_fsmount));
+        assert!(blocked.contains(&libc::SYS_open_tree));
         assert!(blocked.contains(&libc::SYS_ptrace));
         assert!(blocked.contains(&libc::SYS_bpf));
         assert!(blocked.contains(&libc::SYS_init_module));
@@ -330,5 +344,26 @@ mod tests {
         )
         .expect("filter");
         let _: BpfProgram = filter.try_into().expect("compile to BPF");
+    }
+
+    /// Applies the real filter in a separate copy of this test binary and
+    /// checks that the kernel kills it on the new mount API.
+    #[test]
+    fn new_mount_api_kills_the_agent() {
+        const PROBE: &str = "HAVN_SECCOMP_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            restrict_syscalls(&[]).expect("install filter");
+            // SAFETY: fsopen with a valid NUL-terminated name and no flags;
+            // the filter is expected to kill the process before it returns.
+            unsafe { libc::syscall(libc::SYS_fsopen, c"tmpfs".as_ptr(), 0) };
+            std::process::exit(0);
+        }
+        use std::os::unix::process::ExitStatusExt as _;
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "seccomp::tests::new_mount_api_kills_the_agent"])
+            .env(PROBE, "1")
+            .status()
+            .expect("run probe");
+        assert_eq!(status.signal(), Some(libc::SIGSYS), "{status:?}");
     }
 }
