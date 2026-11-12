@@ -76,7 +76,8 @@ pub fn allowlist(
 }
 
 /// Newline-separated, the transport format for [`RW_ENV`] / [`RO_ENV`].
-/// Paths containing a newline are dropped (they cannot be represented).
+/// Paths that are not UTF-8 or contain a newline are dropped (they cannot
+/// be represented); a dropped path is denied, never widened.
 #[must_use]
 pub fn encode(paths: &[PathBuf]) -> String {
     paths

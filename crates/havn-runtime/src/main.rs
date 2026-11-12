@@ -310,17 +310,31 @@ async fn main() -> anyhow::Result<()> {
                 None
             } else {
                 match serde_json::from_value::<embedding::EmbeddingConfig>(emb_value.clone()) {
-                    Ok(cfg) => match cfg.instantiate() {
-                        Ok(eh) => eh,
-                        Err(e) => {
-                            warn!(
-                                provider = cfg.provider_name(),
-                                error = %e,
-                                "embedding provider failed to initialise; hybrid retrieval disabled"
+                    Ok(mut cfg) => {
+                        // Landlock is already in force here, so the
+                        // model cache defaults to a workspace directory.
+                        if let embedding::EmbeddingConfig::Local(local) = &mut cfg
+                            && local.cache_dir.is_none()
+                        {
+                            local.cache_dir = Some(
+                                args.workspace
+                                    .join(".havn/models")
+                                    .to_string_lossy()
+                                    .into_owned(),
                             );
-                            None
                         }
-                    },
+                        match cfg.instantiate() {
+                            Ok(eh) => eh,
+                            Err(e) => {
+                                warn!(
+                                    provider = cfg.provider_name(),
+                                    error = %e,
+                                    "embedding provider failed to initialise; hybrid retrieval disabled"
+                                );
+                                None
+                            }
+                        }
+                    }
                     Err(e) => {
                         warn!(
                             raw = %emb_value,
@@ -333,13 +347,10 @@ async fn main() -> anyhow::Result<()> {
             };
             let provider_label = embedder.as_ref().map_or("disabled", |e| e.name());
             // Translate the Welcome's `extra_mounts` wire vec into
-            // (path, ro?) pairs for the Landlock step below. The
-            // *bind-mounts themselves* are already in place — havn-
-            // init applied them before pivot_root. We only extend
-            // the LSM allowlist here so the agent can actually
-            // touch the bound paths; without a Landlock entry the
-            // kernel denies access even though the file exists in
-            // the namespace.
+            // (path, ro?) pairs for the Landlock step below, which
+            // only runs without havn-init (subprocess spawner); under
+            // the namespace spawner havn-init already added these
+            // paths to the rules it applied before exec.
             let extra_mount_pairs: Vec<(std::path::PathBuf, bool)> = extra_mounts_wire
                 .into_iter()
                 .map(|m| {
@@ -348,8 +359,8 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .collect();
             // Tmpfs mounts get rw access in Landlock — they exist
-            // precisely so the workload can write to them. The
-            // tmpfs *itself* is mounted by havn-init pre-pivot.
+            // precisely so the workload can write to them (same
+            // split as above for who applies the rule).
             let tmpfs_paths: Vec<std::path::PathBuf> = tmpfs_mounts_wire
                 .into_iter()
                 .map(|m| std::path::PathBuf::from(m.path))
@@ -390,9 +401,9 @@ async fn main() -> anyhow::Result<()> {
     //     between Welcome and now is acceptable — no user-controlled
     //     code runs in that window (only fastembed init from a
     //     gateway-supplied config string).
-    //     Under the namespace spawner the rules are already in place:
-    //     havn-init applies them before exec so that every thread is
-    //     covered (a `local-embed` cache_dir must then be in the workspace).
+    //     Under the namespace spawner the Landlock rules are already in
+    //     place: havn-init applies them before exec so that every thread
+    //     is covered (hence the `local-embed` cache default above).
     #[cfg(target_os = "linux")]
     {
         // Union the MCP-server extra paths from policy (spec §13
@@ -443,6 +454,14 @@ async fn main() -> anyhow::Result<()> {
             // havn-init applied the rules before exec, covering every
             // thread of this process.
             info!("landlock applied before exec by havn-init");
+        } else if init::is_pid_one() {
+            // PID 1 means the namespace spawner started us through
+            // havn-init, which should have applied the rules; applying
+            // them here would leave the worker threads unconfined.
+            return Err(anyhow!(
+                "running as PID 1 but havn-init did not apply the Landlock rules \
+                 (mismatched havn-init?); refusing to start"
+            ));
         } else {
             // Without havn-init (subprocess spawner) this only confines
             // the calling thread; that mode is not isolated anyway.

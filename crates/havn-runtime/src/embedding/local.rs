@@ -39,8 +39,9 @@ pub struct LocalConfig {
     /// `nomic-ai/nomic-embed-text-v1.5` (768d),
     /// `intfloat/multilingual-e5-small` (384d).
     pub model: String,
-    /// Where the ONNX file is cached. Defaults to
-    /// `$XDG_CACHE_HOME/havn/models` or `~/.cache/havn/models`.
+    /// Where the ONNX file is cached. Defaults to `<workspace>/.havn/models`
+    /// (the agent can write nowhere else); a custom path must be writable
+    /// under the agent's Landlock rules, e.g. a tmpfs or rw extra mount.
     pub cache_dir: Option<String>,
     /// Output dimension. Must match the model's native dim.
     pub dimensions: usize,

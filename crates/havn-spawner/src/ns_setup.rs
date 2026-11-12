@@ -255,8 +255,8 @@ const NEW_ROOT_PATH: &str = "/tmp/.havn-newroot";
 /// **What the agent can no longer see** (vs. plain mount-ns +
 /// `MS_PRIVATE`): `/etc/{shadow,passwd,group,...}`, `/root`, `/home`,
 /// `/var/lib/havn/agents/<other-id>/...`, `/opt`, `/srv`, `/sys`, the
-/// host's `/tmp`, the host's `/proc`. Landlock (applied later by the
-/// runtime) is the primary access control; `pivot_root` removes the
+/// host's `/tmp`, the host's `/proc`. Landlock (applied by `havn-init`
+/// after this, before exec) is the primary access control; `pivot_root` removes the
 /// paths from view entirely so even a Landlock bypass would hit ENOENT.
 ///
 /// # Safety

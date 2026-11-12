@@ -4,7 +4,7 @@
 //!
 //! [`namespace::NamespaceSpawner`] is the Linux-native isolation backend
 //! (user/mount/net/pid namespaces, minimal-rootfs pivot, cgroup v2 limits;
-//! the runtime adds Landlock and seccomp; spec §4.1). The gateway refuses to
+//! Landlock applied by `havn-init`, seccomp by the runtime; spec §4.1). The gateway refuses to
 //! start when it cannot initialise.
 //!
 //! [`subprocess::SubprocessSpawner`] is plain `tokio::process::Command` exec

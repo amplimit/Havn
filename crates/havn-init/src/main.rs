@@ -17,7 +17,10 @@
 //!   inside the new ns, mirror-binds the agent's workspace at the same
 //!   absolute path the runtime was told, optionally surfaces
 //!   `/etc/resolv.conf` when network is allowed), `pivot_root`s into it,
-//!   then exec's the runtime. The runtime IS PID 1 — it installs its own
+//!   applies the agent's Landlock rules (passed by the spawner in
+//!   `HAVN_LANDLOCK_RW` / `HAVN_LANDLOCK_RO`) so that every thread of the
+//!   runtime and every process its tools start inherits them, then exec's
+//!   the runtime. The runtime IS PID 1 — it installs its own
 //!   SIGCHLD reaper / shutdown handlers (see `havn-runtime/src/init.rs`).
 //! - **parent** (still in host PID ns): forwards `SIGTERM` / `SIGINT` /
 //!   `SIGHUP` to the inner runtime so the spawner's graceful-stop path
@@ -136,17 +139,25 @@ fn main() {
             Err(_) => Vec::new(),
         };
 
-        // Landlock lists from the spawner (absent when an older spawner
-        // launched us; the runtime then applies its own rules).
+        // Landlock lists from the spawner. Without them the agent would
+        // only get the runtime's own, single-thread rules, so refuse.
         let landlock_rules = match (
             std::env::var(havn_spawner::filesystem_rules::RW_ENV),
             std::env::var(havn_spawner::filesystem_rules::RO_ENV),
         ) {
-            (Ok(rw), Ok(ro)) => Some((
+            (Ok(rw), Ok(ro)) => (
                 havn_spawner::filesystem_rules::decode(&rw),
                 havn_spawner::filesystem_rules::decode(&ro),
-            )),
-            _ => None,
+            ),
+            _ => {
+                eprintln!(
+                    "havn-init: {} / {} not set (havn-init and the gateway are from different \
+                     releases?); refusing to start the agent",
+                    havn_spawner::filesystem_rules::RW_ENV,
+                    havn_spawner::filesystem_rules::RO_ENV,
+                );
+                std::process::exit(1);
+            }
         };
 
         // SAFETY: caller (NamespaceSpawner) has already done
@@ -165,7 +176,7 @@ fn main() {
                 &extra_mounts,
                 &tmpfs_mounts,
                 &agent_dns,
-                landlock_rules.as_ref(),
+                &landlock_rules,
             )
         };
         // SAFETY: `_exit` is async-signal-safe and never returns.
@@ -201,7 +212,7 @@ unsafe fn fork_and_exec_runtime(
     extra_mounts: &[havn_spawner::ExtraMount],
     tmpfs_mounts: &[havn_spawner::TmpfsMount],
     agent_dns: &[String],
-    landlock_rules: Option<&(Vec<PathBuf>, Vec<PathBuf>)>,
+    landlock_rules: &(Vec<PathBuf>, Vec<PathBuf>),
 ) -> i32 {
     // SAFETY: `fork` is async-signal-safe; we branch immediately on the
     // documented return values without touching any inherited mutex.
@@ -240,12 +251,14 @@ unsafe fn fork_and_exec_runtime(
             // every thread the runtime starts and every process its tools
             // run, which a call from inside the multi-threaded runtime
             // would not achieve.
+            let (rw, ro) = landlock_rules;
+            apply_landlock_or_exit(rw, ro);
             let mut command = std::process::Command::new(runtime_binary);
-            command.args(runtime_args);
-            if let Some((rw, ro)) = landlock_rules {
-                apply_landlock_or_exit(rw, ro);
-                command.env(havn_spawner::filesystem_rules::APPLIED_ENV, "1");
-            }
+            command
+                .args(runtime_args)
+                .env_remove(havn_spawner::filesystem_rules::RW_ENV)
+                .env_remove(havn_spawner::filesystem_rules::RO_ENV)
+                .env(havn_spawner::filesystem_rules::APPLIED_ENV, "1");
 
             // exec the runtime. We use `std::process::Command` here for
             // ergonomics — we're past pre_exec land and a normal exec is
@@ -274,7 +287,13 @@ fn apply_landlock_or_exit(rw: &[PathBuf], ro: &[PathBuf]) {
     use havn_spawner::filesystem_rules::{Enforcement, apply};
     let allow_without = std::env::var("HAVN_ALLOW_NO_LANDLOCK").as_deref() == Ok("1");
     match apply(rw, ro) {
-        Ok(Enforcement::Full | Enforcement::Partial) => {}
+        Ok(Enforcement::Full) => {}
+        Ok(Enforcement::Partial) => {
+            eprintln!(
+                "havn-init: Landlock only partially enforced (the kernel supports a subset of \
+                 the requested access rights)"
+            );
+        }
         Ok(Enforcement::None) if allow_without => {
             eprintln!(
                 "havn-init: Landlock not enforced; HAVN_ALLOW_NO_LANDLOCK=1, starting the agent \

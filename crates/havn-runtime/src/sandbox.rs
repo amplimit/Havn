@@ -1,5 +1,10 @@
 //! Landlock-LSM filesystem restriction for the runtime process.
 //!
+//! Used only without `havn-init` (the subprocess spawner, which is not an
+//! isolation boundary): a ruleset applied from here confines the calling
+//! thread only. Under the namespace spawner `havn-init` applies the rules
+//! (`havn_spawner::filesystem_rules`) before exec, covering every thread.
+//!
 //! Applied late in startup — by the time we call [`restrict_filesystem`]:
 //!
 //! - The per-agent `agent.db` is already open (the file descriptor survives

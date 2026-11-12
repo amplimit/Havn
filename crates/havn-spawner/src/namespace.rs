@@ -16,14 +16,13 @@
 //!   `proc`, and exec's the runtime. Combined with the user ns this means
 //!   the agent's `ps -ef` / `ls /proc` shows nothing from the host or
 //!   other agents (spec §4.1).
-//! - **Landlock + seccomp** — applied inside the runtime itself
-//!   (`havn-runtime/src/{sandbox,seccomp}.rs`) right before the LLM loop
-//!   starts, so the syscall + filesystem surfaces are restricted in
-//!   addition to the namespace boundary.
-//!
-//! Still deferred (spec §4.1): `pivot_root` to a minimal rootfs. Landlock
-//! covers the same threat model in practice; `pivot_root` is defence in
-//! depth on top of it.
+//! - **Landlock** — rules computed here ([`crate::filesystem_rules`]) and
+//!   applied by `havn-init` right before it execs the runtime, so every
+//!   runtime thread and tool process inherits them.
+//! - **seccomp** — installed by the runtime on all of its threads (TSYNC)
+//!   before the LLM loop starts (`havn-runtime/src/seccomp.rs`).
+//! - **Minimal rootfs** — `havn-init` `pivot_root`s into it before exec
+//!   ([`crate::ns_setup::pivot_root_into_minimal_rootfs`]).
 //!
 //! Compared to [`crate::subprocess::SubprocessSpawner`], this spawner
 //! requires either root or systemd cgroup delegation
