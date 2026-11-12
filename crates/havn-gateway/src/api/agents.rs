@@ -497,7 +497,10 @@ pub(crate) async fn agent_data<T: serde::de::DeserializeOwned>(
                     .await
                     .map_err(|e| format!("send: {e}"))
             },
-            std::time::Duration::from_secs(10),
+            // A freshly started runtime reads its first frame only after
+            // loading embeddings and starting MCP servers; the request
+            // waits in the socket until then.
+            std::time::Duration::from_secs(60),
         )
         .await
         .map_err(|e| ApiError::Internal(format!("agent did not answer: {e}")))?;

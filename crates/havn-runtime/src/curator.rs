@@ -100,8 +100,7 @@ pub struct Bridge {
     pub workspace_dir: Arc<PathBuf>,
     pub writer_tx: mpsc::Sender<AgentToGateway>,
     pub pending: Pending,
-    /// Model the curator's LLM call uses. Pulled from runtime config so
-    /// the operator can pin curator to a cheap model.
+    /// Model the curator's LLM call uses: the agent's own session model.
     pub model: String,
 }
 

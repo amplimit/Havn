@@ -143,6 +143,8 @@ pub async fn curator_reports(
 /// total size.
 const MAX_REPORT_BYTES: u64 = 1024 * 1024;
 const MAX_REPORTS: usize = 200;
+/// How many report files are looked at to find the newest ones.
+const MAX_REPORTS_SCANNED: usize = 5000;
 const MAX_REPORTS_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 
 /// `None` when the workspace or its `.curator` directory does not exist.
@@ -150,9 +152,10 @@ fn read_curator_reports(workspace: &std::path::Path) -> Option<Vec<CuratorReport
     let ws = crate::agent_files::WorkspaceDir::open(workspace).ok()?;
     let dir = ws.subdir(".curator").ok().flatten()?;
     let mut files = dir
-        .regular_files(|name| name.ends_with(".md"), MAX_REPORTS)
+        .regular_files(|name| name.ends_with(".md"), MAX_REPORTS_SCANNED)
         .unwrap_or_default();
     files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.truncate(MAX_REPORTS);
     let mut total = 0usize;
     let reports = files
         .into_iter()

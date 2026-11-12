@@ -57,7 +57,7 @@ pub struct AgentSocketCtx {
     pub bindings: Arc<Vec<crate::config::ChannelBindingConfig>>,
     pub channels: Arc<std::collections::BTreeMap<String, crate::config::ChannelEntry>>,
     pub cron_scheduler: CronScheduler,
-    /// Pending admin RPC senders (`MemoryForget`, `SkillPin`). The
+    /// Pending admin RPC senders (`MemoryForget`, `SkillPin`, `Data`). The
     /// reader matches `*Response` variants and resolves the matching
     /// pending future.
     pub admin_rpc: crate::admin_rpc::AdminRpc,

@@ -225,13 +225,12 @@ fn check_landlock() -> Verdict {
         }
         Ok(_) => {
             line(
-                Verdict::Fail,
+                Verdict::Warn,
                 "landlock",
                 "not enabled in this kernel (needs 5.13+ with landlock in the lsm= list); \
-                 agents will refuse to start unless the gateway runs with \
-                 HAVN_ALLOW_NO_LANDLOCK=1",
+                 the gateway refuses to start unless it runs with HAVN_ALLOW_NO_LANDLOCK=1",
             );
-            Verdict::Fail
+            Verdict::Warn
         }
         Err(e) => {
             line(

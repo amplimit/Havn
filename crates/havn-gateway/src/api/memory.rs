@@ -78,9 +78,8 @@ impl From<memory::Entry> for MemoryEntryView {
 pub struct ListResponse {
     pub agent_id: String,
     pub entries: Vec<MemoryEntryView>,
-    /// True when the dashboard should render "agent isn't running OR
-    /// has no memory yet" rather than "0 of N". The agent.db file
-    /// hasn't been opened by the agent runtime even once.
+    /// Kept for API compatibility; always false now that the running agent
+    /// answers (a stopped agent gets 409 instead).
     pub uninitialised: bool,
 }
 

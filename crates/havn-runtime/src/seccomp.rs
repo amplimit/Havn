@@ -109,6 +109,8 @@ pub fn restrict_syscalls(allow_extra: &[String]) -> Result<(), SeccompError> {
         .map_err(|e| SeccompError::Compile(format!("{e:?}")))?;
 
     seccompiler::apply_filter(&program).map_err(|e| SeccompError::Apply(e.to_string()))?;
+    #[cfg(target_arch = "x86_64")]
+    seccompiler::apply_filter(&x32_guard()).map_err(|e| SeccompError::Apply(e.to_string()))?;
 
     info!(
         blocked = blocked.len(),
@@ -116,6 +118,36 @@ pub fn restrict_syscalls(allow_extra: &[String]) -> Result<(), SeccompError> {
         "seccomp filter installed"
     );
     Ok(())
+}
+
+/// x32 system calls report the x86_64 audit architecture with bit 30 set
+/// in the number, so the blocklist above (which matches exact numbers)
+/// would not see them. This filter kills any such call. It runs before
+/// the kernel looks the number up, so it applies whether or not the
+/// kernel has x32 support.
+#[cfg(target_arch = "x86_64")]
+fn x32_guard() -> BpfProgram {
+    use seccompiler::sock_filter;
+    const LD_W_ABS: u16 = 0x20;
+    const JEQ_K: u16 = 0x15;
+    const JGE_K: u16 = 0x35;
+    const RET_K: u16 = 0x06;
+    const ARCH_OFFSET: u32 = 4;
+    const NR_OFFSET: u32 = 0;
+    const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+    const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+    const RET_ALLOW: u32 = 0x7fff_0000;
+    const RET_KILL_PROCESS: u32 = 0x8000_0000;
+    let insn = |code, jt, jf, k| sock_filter { code, jt, jf, k };
+    vec![
+        insn(LD_W_ABS, 0, 0, ARCH_OFFSET),
+        // Not x86_64 (the main filter kills those): allow.
+        insn(JEQ_K, 0, 2, AUDIT_ARCH_X86_64),
+        insn(LD_W_ABS, 0, 0, NR_OFFSET),
+        insn(JGE_K, 1, 0, X32_SYSCALL_BIT),
+        insn(RET_K, 0, 0, RET_ALLOW),
+        insn(RET_K, 0, 0, RET_KILL_PROCESS),
+    ]
 }
 
 /// Build the blocklist with operator-declared relaxations applied.
@@ -424,5 +456,29 @@ mod tests {
             matches!(status.signal(), Some(libc::SIGSYS | libc::SIGSEGV)),
             "{status:?}"
         );
+    }
+
+    /// x32 system calls (number | 0x4000_0000) must be killed even though
+    /// the blocklist matches exact numbers.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x32_syscalls_are_refused() {
+        const PROBE: &str = "HAVN_SECCOMP_X32_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            no_core_dump();
+            restrict_syscalls(&[]).expect("install filter");
+            // SAFETY: getpid takes no arguments; with the x32 bit set it is
+            // either killed by the filter or rejected with ENOSYS.
+            let rc = unsafe { libc::syscall(0x4000_0000 | libc::SYS_getpid) };
+            // Reaching this line means the call was allowed.
+            std::process::exit(i32::from(rc < 0));
+        }
+        use std::os::unix::process::ExitStatusExt as _;
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "seccomp::tests::x32_syscalls_are_refused"])
+            .env(PROBE, "1")
+            .status()
+            .expect("run probe");
+        assert_eq!(status.signal(), Some(libc::SIGSYS), "{status:?}");
     }
 }

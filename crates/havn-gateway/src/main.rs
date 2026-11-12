@@ -606,6 +606,24 @@ fn select_spawner(
     #[cfg(target_os = "linux")]
     {
         use havn_spawner::namespace::NamespaceSpawner;
+        // Agents refuse to start without Landlock; refuse here instead, so
+        // the operator sees one clear error rather than agents that exit
+        // right after starting.
+        let allow_no_landlock = std::env::var("HAVN_ALLOW_NO_LANDLOCK").as_deref() == Ok("1");
+        match std::fs::read_to_string("/sys/kernel/security/lsm") {
+            Ok(lsms) if !lsms.split(',').any(|m| m.trim() == "landlock") && !allow_no_landlock => {
+                anyhow::bail!(
+                    "Landlock is not enabled in this kernel (needs 5.13+ with landlock in the \
+                     lsm= list), so agents would run without filesystem restriction; enable it, \
+                     or set HAVN_ALLOW_NO_LANDLOCK=1 to run them anyway"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => warn!(
+                error = %e,
+                "could not read /sys/kernel/security/lsm; each agent checks Landlock itself"
+            ),
+        }
         use havn_spawner::network::AgentSubnetPool;
         // Parse the operator's pool CIDR. Bad config = warn + default.
         let pool = match AgentSubnetPool::parse(&network.agent_pool_cidr) {
