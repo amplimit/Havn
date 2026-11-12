@@ -122,6 +122,85 @@ pub fn provider_for_model(model: &str) -> &'static str {
     }
 }
 
+/// Maximum output tokens of known models, keyed by model-name prefix in
+/// the normalized form [`model_output_limit`] matches against. The longest
+/// matching prefix wins; models not listed are not clamped.
+const OUTPUT_LIMITS: &[(&str, u32)] = &[
+    // Anthropic
+    ("claude-3-haiku", 4_096),
+    ("claude-3-sonnet", 4_096),
+    ("claude-3-opus", 4_096),
+    ("claude-3-5-haiku", 8_192),
+    ("claude-3-5-sonnet", 8_192),
+    ("claude-3-7-sonnet", 64_000),
+    ("claude-sonnet-4-0", 64_000),
+    ("claude-sonnet-4-20250514", 64_000),
+    ("claude-opus-4-0", 32_000),
+    ("claude-opus-4-20250514", 32_000),
+    ("claude-opus-4-1", 32_000),
+    ("claude-sonnet-4-5", 64_000),
+    ("claude-haiku-4-5", 64_000),
+    ("claude-opus-4-5", 64_000),
+    ("claude-opus-4-6", 128_000),
+    ("claude-sonnet-4-6", 128_000),
+    ("claude-opus-4-7", 128_000),
+    ("claude-opus-4-8", 128_000),
+    ("claude-opus-5", 128_000),
+    ("claude-sonnet-5", 128_000),
+    ("claude-haiku-5", 128_000),
+    ("claude-fable-5", 128_000),
+    ("claude-mythos-5", 128_000),
+    // OpenAI
+    ("gpt-3-5-turbo", 4_096),
+    ("gpt-4-turbo", 4_096),
+    ("gpt-4o", 16_384),
+    ("gpt-4o-2024-05-13", 4_096),
+    ("gpt-4-1", 32_768),
+    ("gpt-5", 128_000),
+    ("gpt-5-chat", 16_384),
+    ("o1", 100_000),
+    ("o1-mini", 65_536),
+    ("o1-preview", 32_768),
+    ("o3", 100_000),
+    ("o3-mini", 100_000),
+    ("o4-mini", 100_000),
+    // Google
+    ("gemini-1-5-flash", 8_192),
+    ("gemini-1-5-pro", 8_192),
+    ("gemini-2-0-flash", 8_192),
+    ("gemini-2-5-flash", 65_536),
+    ("gemini-2-5-flash-image", 32_768),
+    ("gemini-2-5-pro", 65_536),
+];
+
+/// Known output-token limit of `model`, or `None` for an unknown model.
+/// An OpenRouter-style vendor prefix (`anthropic/`) is dropped and dots
+/// become dashes (`claude-3.5-sonnet` is `claude-3-5-sonnet`). A prefix
+/// matches only up to a `-`, `:` or `@` boundary, so `o1` does not match
+/// `o10`.
+#[must_use]
+pub fn model_output_limit(model: &str) -> Option<u32> {
+    let bare = model.rsplit('/').next().unwrap_or(model);
+    let name = bare.to_ascii_lowercase().replace('.', "-");
+    OUTPUT_LIMITS
+        .iter()
+        .filter(|(prefix, _)| {
+            name.strip_prefix(prefix)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', ':', '@']))
+        })
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map(|&(_, limit)| limit)
+}
+
+/// `requested` clamped to the model's known output limit and to the
+/// operator's ceiling, whichever is lower.
+#[must_use]
+pub fn clamp_max_tokens(model: &str, requested: u32, ceiling: u32) -> u32 {
+    model_output_limit(model)
+        .map_or(requested, |limit| requested.min(limit))
+        .min(ceiling)
+}
+
 /// Map [`ProviderError`] onto the orchestrator's [`super::Attempt`] verdict.
 /// Lives here because the rules are part of the provider contract — every
 /// provider's HTTP semantics fold to the same fallback decisions.
@@ -171,6 +250,64 @@ mod tests {
             "openrouter"
         );
         assert_eq!(provider_for_model("meta-llama/llama-3.1-70b"), "openrouter");
+    }
+
+    #[test]
+    fn output_limits_match_by_longest_prefix() {
+        assert_eq!(model_output_limit("claude-3-haiku-20240307"), Some(4_096));
+        assert_eq!(
+            model_output_limit("claude-3-5-sonnet-20241022"),
+            Some(8_192)
+        );
+        assert_eq!(
+            model_output_limit("anthropic/claude-3.5-sonnet"),
+            Some(8_192)
+        );
+        assert_eq!(model_output_limit("claude-opus-4-20250514"), Some(32_000));
+        assert_eq!(model_output_limit("claude-opus-4-5-20251101"), Some(64_000));
+        assert_eq!(model_output_limit("claude-opus-5-5"), Some(128_000));
+        assert_eq!(model_output_limit("gpt-4o-mini"), Some(16_384));
+        assert_eq!(model_output_limit("gpt-4o-2024-05-13"), Some(4_096));
+        assert_eq!(model_output_limit("openai/gpt-4.1-mini"), Some(32_768));
+        assert_eq!(model_output_limit("o1-mini"), Some(65_536));
+        assert_eq!(model_output_limit("gemini-2.5-pro"), Some(65_536));
+        assert_eq!(
+            model_output_limit("google/gemini-2.0-flash-001"),
+            Some(8_192)
+        );
+    }
+
+    #[test]
+    fn unknown_models_are_not_limited() {
+        assert_eq!(
+            model_output_limit("deepseek/deepseek-v4.1-flash-1017"),
+            None
+        );
+        assert_eq!(model_output_limit("o10"), None);
+        assert_eq!(model_output_limit("claude-opus-4-9"), None);
+        assert_eq!(model_output_limit("mystery-model-9000"), None);
+    }
+
+    #[test]
+    fn max_tokens_is_clamped_to_model_limit_and_ceiling() {
+        const NONE: u32 = u32::MAX;
+        assert_eq!(
+            clamp_max_tokens("claude-3-haiku-20240307", 8_192, NONE),
+            4_096
+        );
+        assert_eq!(clamp_max_tokens("claude-opus-5-5", 8_192, NONE), 8_192);
+        assert_eq!(clamp_max_tokens("claude-opus-5-5", 200_000, NONE), 128_000);
+        assert_eq!(clamp_max_tokens("claude-opus-5-5", 8_192, 2_000), 2_000);
+        assert_eq!(clamp_max_tokens("claude-3-haiku", 8_192, 6_000), 4_096);
+        assert_eq!(
+            clamp_max_tokens("mystery-model", 1_000_000, NONE),
+            1_000_000
+        );
+        assert_eq!(
+            clamp_max_tokens("mystery-model", 1_000_000, 128_000),
+            128_000
+        );
+        assert_eq!(model_output_limit("gemini-2.5-flash-image"), Some(32_768));
     }
 
     #[test]

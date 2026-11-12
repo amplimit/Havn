@@ -8,7 +8,7 @@
 //!
 //! Per-user caps live in `limits.per_user.{max_tokens_per_day,
 //! max_requests_per_minute}`. The credential resolver consults these
-//! at LLM-proxy time (see `crate::credential_resolver::per_user_ceilings_remaining`).
+//! at LLM-proxy time (see `crate::credential_resolver::credential_caps`).
 //!
 //! Spec §1.5: "team-level credentials with per-user token / RPM caps".
 //! This module is the consume-side; the dashboard is the UI.

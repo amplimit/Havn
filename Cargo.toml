@@ -53,9 +53,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 uuid = { version = "1.23", features = ["v5", "v7", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
 
-# Test scratch directories
-tempfile = "3"
-
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
@@ -106,6 +103,7 @@ seccompiler = "0.5"
 
 # Testing
 tokio-test = "0.4"
+tempfile = "3"
 
 # Unix syscalls (signal delivery for graceful agent stop).
 libc = "0.2"

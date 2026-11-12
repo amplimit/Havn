@@ -79,24 +79,30 @@ impl HeartbeatScheduler {
             .map(|a| a.agent_id)
             .collect();
 
-        let mut state = self.state.lock().await;
-
+        let mut intervals = Vec::with_capacity(connected.len());
         for agent_id in &connected {
-            let interval = self.interval_for(*agent_id).await;
+            intervals.push((*agent_id, self.interval_for(*agent_id).await));
+        }
+
+        // One pass serves every agent, so it never waits on one agent's
+        // queue: an agent whose queue is full misses this tick and is
+        // retried on the next pass.
+        let mut state = self.state.lock().await;
+        for (agent_id, interval) in intervals {
             // First observation: record `now` and skip — the first heartbeat
             // fires `interval` after the agent first connects, not immediately.
-            let last = *state.entry(*agent_id).or_insert(now);
+            let last = *state.entry(agent_id).or_insert(now);
             if now.saturating_duration_since(last) < interval {
                 continue;
             }
             match self
                 .registry
-                .send(*agent_id, GatewayToAgent::HeartbeatTick)
+                .try_send(agent_id, GatewayToAgent::HeartbeatTick)
                 .await
             {
                 Ok(()) => {
                     debug!(%agent_id, "heartbeat tick sent");
-                    state.insert(*agent_id, now);
+                    state.insert(agent_id, now);
                 }
                 Err(e) => {
                     warn!(%agent_id, error = %e, "could not deliver HeartbeatTick");
@@ -205,6 +211,54 @@ mod tests {
         scheduler.tick_once(t1).await;
         let frame = rx.recv().await.expect("tick");
         assert!(matches!(frame, GatewayToAgent::HeartbeatTick));
+    }
+
+    #[tokio::test]
+    async fn agent_with_a_full_queue_does_not_block_other_heartbeats() {
+        let (scheduler, registry, db, owner) = fixture().await;
+        let mut queues = Vec::new();
+        for name in ["stalled", "healthy"] {
+            let agent = havn_db::repo::agents::create(
+                &db,
+                NewAgent {
+                    owner_id: owner,
+                    team_id: None,
+                    name,
+                    config: serde_json::json!({"heartbeat": {"interval_seconds": 60}}),
+                },
+            )
+            .await
+            .expect("agent");
+            registry
+                .register(AgentHandle {
+                    agent_id: agent.id,
+                    pid: 1,
+                })
+                .await;
+            let (tx, rx) = tokio::sync::mpsc::channel::<GatewayToAgent>(1);
+            registry.attach(agent.id, tx).await.expect("attach");
+            queues.push((agent.id, rx));
+        }
+        let (stalled, _stalled_rx) = &queues[0];
+        registry
+            .send(*stalled, GatewayToAgent::Shutdown)
+            .await
+            .expect("fill the stalled agent's queue");
+
+        let t0 = Instant::now();
+        scheduler.tick_once(t0).await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            scheduler.tick_once(t0 + Duration::from_secs(61)),
+        )
+        .await
+        .expect("a full queue must not stall the pass");
+
+        let (_, healthy_rx) = &mut queues[1];
+        assert!(matches!(
+            healthy_rx.try_recv(),
+            Ok(GatewayToAgent::HeartbeatTick)
+        ));
     }
 
     #[tokio::test]

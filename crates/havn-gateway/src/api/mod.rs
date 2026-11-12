@@ -10,6 +10,11 @@ use axum::response::{IntoResponse, Response};
 use havn_db::DbError;
 use serde_json::json;
 
+/// Longest one WebSocket send to a browser or channel adapter may take. A peer
+/// that stops reading is disconnected after this instead of holding its
+/// session open.
+pub(crate) const WS_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub mod agents;
 pub mod audit;
 pub mod bootstrap;
