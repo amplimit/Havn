@@ -5,7 +5,7 @@ Next.js dashboard for the havn gateway (spec §10). Includes:
 - **agent list** (`/`) — start / stop / delete with live status pills
 - **agent creation** (`/agents/new`) — name + model picker
 - **chat view** (`/agents/[id]`) — WebSocket connection to `/ws/chat/:agent_id`
-- **credentials** (`/credentials`) — provider keys with optional `max_usd_per_day` cap
+- **credentials** (`/credentials`) — provider keys with optional `max_tokens_per_day` cap
 
 ## Design
 
