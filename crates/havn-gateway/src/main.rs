@@ -598,7 +598,13 @@ fn select_spawner(
                 // ip_forward sysctl, all targeting the operator-
                 // configured pool. Failure is non-fatal — agents that
                 // don't need outbound still work.
-                match havn_spawner::network::ensure_global_nat(&pool) {
+                let reachable: Vec<String> = network
+                    .agent_dns
+                    .iter()
+                    .chain(&network.agent_private_access)
+                    .cloned()
+                    .collect();
+                match havn_spawner::network::ensure_global_nat(&pool, &reachable) {
                     Ok(primary) => {
                         info!(primary_iface = %primary, pool_cidr = %pool.cidr(), "per-agent NAT ready");
                     }

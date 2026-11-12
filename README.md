@@ -135,6 +135,7 @@ havn is **infrastructure, not SaaS**. The test: does it require kernel primitive
 ## Security Model
 
 - Agents run in isolated Linux namespaces (PID, mount, network, user) with Landlock LSM and seccomp-bpf syscall filtering
+- Agents with network egress reach the public internet only: traffic to the gateway host, other agents, private, link-local (including cloud metadata), CGNAT and multicast addresses is dropped, and the agent link has no IPv6. The configured `agent_dns` servers stay reachable; list other internal addresses agents may use under `[network] agent_private_access = ["10.0.5.20", "192.168.1.0/24"]`
 - API keys encrypted at rest with [age](https://age-encryption.org/) — agent processes never see them
 - Per-credential token-per-day and requests-per-minute caps enforced gateway-side
 - WebChat WebSocket connections are checked against an Origin allowlist (`allowed_origins`) and must present the caller's `ws_token` from `GET /me`; the token identifies the user rather than being a secret, so the Origin check is what blocks cross-site connections

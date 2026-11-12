@@ -30,7 +30,10 @@
 //!
 //! Global ops happen once at gateway startup ([`ensure_global_nat`]):
 //! - `iptables -t nat ... POSTROUTING ... MASQUERADE` for 10.42.0.0/16.
-//! - `iptables FORWARD ... ACCEPT` both directions for 10.42.0.0/16.
+//! - `iptables FORWARD ... ACCEPT` both directions for 10.42.0.0/16, after
+//!   the `HAVN-AGENT-EGRESS` chain drops traffic to private, link-local,
+//!   CGNAT and multicast ranges, and an `INPUT` rule drops everything the
+//!   pool sends to the host itself.
 //! - `/proc/sys/net/ipv4/ip_forward = 1` (typically already so on a host
 //!   that runs containers; we set it idempotently anyway).
 //!
@@ -238,10 +241,15 @@ pub type Result<T> = std::result::Result<T, NetworkError>;
 /// where to look. On any failure returns the typed error and the
 /// spawner falls through to "agent has no outbound network", which is
 /// the v0.6 baseline.
-pub fn ensure_global_nat(pool: &AgentSubnetPool) -> Result<String> {
+pub fn ensure_global_nat(pool: &AgentSubnetPool, reachable: &[String]) -> Result<String> {
     probe_tooling()?;
     let primary = detect_primary_iface()?;
     let pool_cidr = pool.cidr();
+
+    // Isolation first: if it cannot be applied, return the error before
+    // NAT exists, so agents get no outbound network rather than
+    // unrestricted outbound network.
+    apply_isolation(&pool_cidr, reachable)?;
 
     // /proc/sys/net/ipv4/ip_forward — idempotent write.
     if let Err(e) = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1\n") {
@@ -270,6 +278,77 @@ pub fn ensure_global_nat(pool: &AgentSubnetPool) -> Result<String> {
     add_iptables_rule_idempotent(&["-A", "FORWARD", "-s", &pool_cidr, "-j", "ACCEPT"])?;
     add_iptables_rule_idempotent(&["-A", "FORWARD", "-d", &pool_cidr, "-j", "ACCEPT"])?;
     Ok(primary)
+}
+
+/// Destinations an agent with egress must not reach: the gateway host's
+/// own networks, other agents, cloud metadata (169.254.169.254) and
+/// anything else that is not the public internet.
+const BLOCKED_DESTINATIONS: &[&str] = &[
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+];
+
+/// Chain holding the per-destination rules for traffic leaving the pool.
+const EGRESS_CHAIN: &str = "HAVN-AGENT-EGRESS";
+
+/// iptables invocations that isolate the agent pool. `reachable` lists
+/// IPv4 addresses or CIDRs agents may still reach inside the blocked
+/// ranges (the configured DNS resolvers, operator exceptions); entries
+/// that are not IPv4 are ignored.
+fn isolation_rules(reachable: &[String]) -> Vec<Vec<String>> {
+    let mut rules: Vec<Vec<String>> = Vec::new();
+    let rule = |parts: &[&str]| parts.iter().map(|p| (*p).to_string()).collect::<Vec<_>>();
+    for dest in reachable.iter().filter(|d| !d.contains(':')) {
+        rules.push(rule(&["-A", EGRESS_CHAIN, "-d", dest, "-j", "ACCEPT"]));
+    }
+    for dest in BLOCKED_DESTINATIONS {
+        rules.push(rule(&["-A", EGRESS_CHAIN, "-d", dest, "-j", "DROP"]));
+    }
+    rules
+}
+
+/// Drop everything agents send to the gateway host itself (they reach the
+/// gateway over its Unix socket only) and route their forwarded traffic
+/// through [`EGRESS_CHAIN`], rebuilt from scratch so config changes apply
+/// on the next start.
+fn apply_isolation(pool_cidr: &str, reachable: &[String]) -> Result<()> {
+    add_iptables_rule_idempotent(&["-I", "INPUT", "-s", pool_cidr, "-j", "DROP"])?;
+    // -N fails if the chain exists; -F then empties it either way.
+    let _ = Command::new("iptables")
+        .args(["-N", EGRESS_CHAIN])
+        .output()?;
+    run_iptables(&["-F", EGRESS_CHAIN])?;
+    for rule in isolation_rules(reachable) {
+        let args: Vec<&str> = rule.iter().map(String::as_str).collect();
+        run_iptables(&args)?;
+    }
+    add_iptables_rule_idempotent(&["-I", "FORWARD", "-s", pool_cidr, "-j", EGRESS_CHAIN])?;
+    Ok(())
+}
+
+fn run_iptables(args: &[&str]) -> Result<()> {
+    let out = Command::new("iptables").args(args).output()?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if stderr.to_lowercase().contains("permission")
+        || stderr.to_lowercase().contains("operation not permitted")
+    {
+        return Err(NetworkError::PermissionDenied(stderr));
+    }
+    Err(NetworkError::CommandFailed(format!(
+        "iptables {}: {}",
+        args.join(" "),
+        stderr
+    )))
 }
 
 /// Lay down the per-agent veth pair, addressing, default route, and `lo`.
@@ -306,6 +385,11 @@ pub fn configure_agent_network(
         "dev",
         &net.host_iface,
     ])?;
+    // The isolation rules are IPv4 iptables rules. Give neither end an
+    // IPv6 address (not even link-local), so agents cannot reach host
+    // services listening on IPv6 over the veth.
+    run_ip(&["link", "set", &net.host_iface, "addrgenmode", "none"])?;
+    run_ip(&["link", "set", &net.ns_iface, "addrgenmode", "none"])?;
     run_ip(&["link", "set", &net.host_iface, "up"])?;
     run_ip(&["link", "set", &net.ns_iface, "netns", &pid])?;
 
@@ -320,6 +404,8 @@ pub fn configure_agent_network(
             &net.ns_iface,
         ],
     )?;
+    // Moving the interface between namespaces can reset its IPv6 settings.
+    run_nsenter(&pid, &["link", "set", &net.ns_iface, "addrgenmode", "none"])?;
     run_nsenter(&pid, &["link", "set", &net.ns_iface, "up"])?;
     run_nsenter(&pid, &["link", "set", "lo", "up"])?;
     run_nsenter(
@@ -534,6 +620,37 @@ mod tests {
 
     fn default_pool() -> AgentSubnetPool {
         AgentSubnetPool::default()
+    }
+
+    #[test]
+    fn isolation_blocks_private_ranges_after_exceptions() {
+        let rules = isolation_rules(&["192.168.1.53".into(), "1.1.1.1".into(), "fd00::1".into()]);
+        let flat: Vec<String> = rules.iter().map(|r| r.join(" ")).collect();
+        assert_eq!(
+            flat[0],
+            format!("-A {EGRESS_CHAIN} -d 192.168.1.53 -j ACCEPT")
+        );
+        assert_eq!(flat[1], format!("-A {EGRESS_CHAIN} -d 1.1.1.1 -j ACCEPT"));
+        assert!(
+            !flat.iter().any(|r| r.contains("fd00")),
+            "IPv6 entries are not passed to iptables"
+        );
+        for dest in [
+            "10.0.0.0/8",
+            "169.254.0.0/16",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+        ] {
+            assert!(
+                flat.contains(&format!("-A {EGRESS_CHAIN} -d {dest} -j DROP")),
+                "{dest}"
+            );
+        }
+        let first_drop = flat
+            .iter()
+            .position(|r| r.ends_with("DROP"))
+            .expect("drops");
+        assert!(flat[..first_drop].iter().all(|r| r.ends_with("ACCEPT")));
     }
 
     #[test]
