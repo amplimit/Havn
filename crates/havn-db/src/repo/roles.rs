@@ -219,6 +219,10 @@ mod tests {
             .expect("team");
         let mut policy = Policy::default();
         policy.permissions.can_spawn_subagents = true;
+        policy.hooks.pre_tool_use.push(havn_core::ToolHookRule {
+            tool: "shell".into(),
+            deny: vec!["^echo".into()],
+        });
         let r = create(
             &pool,
             NewRole {
@@ -233,6 +237,7 @@ mod tests {
         assert_eq!(found.name, "lead");
         assert_eq!(found.team_id, Some(team.id));
         assert!(found.policy.permissions.can_spawn_subagents);
+        assert_eq!(found.policy.hooks, policy.hooks);
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@ import { ApiError, api, type RoleView } from "@/lib/api";
 const POLICY_HINT = `Edit the JSON below. Required top-level keys (see havn-core::Policy):
   max_agents, allowed_models, resource_limits, budget, permissions,
   network_policy, context_toolsets, admin_visibility.
+Optional: mcp_servers, hooks ({"pre_tool_use": [{"tool": "shell", "deny": ["^rm -rf"]}]}).
 Save validates by deserialising — broken JSON yields a 400 with the parse error.`;
 
 export default function RolesPage({

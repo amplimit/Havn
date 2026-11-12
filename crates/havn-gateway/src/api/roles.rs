@@ -85,6 +85,7 @@ pub async fn create(
     // Default to a *narrow* policy — admins explicitly broaden as needed.
     // Less surprising than copying the `admin` baseline.
     let policy = req.policy.unwrap_or_default();
+    policy.validate()?;
 
     let role = repo::create(
         &state.db,
@@ -130,6 +131,7 @@ pub async fn patch(
         )));
     }
 
+    req.policy.validate()?;
     let updated = repo::set_policy(&state.db, role_id, &req.policy).await?;
     audit::record(
         &state.db,

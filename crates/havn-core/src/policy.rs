@@ -26,6 +26,10 @@ pub struct Policy {
     /// operator hasn't pre-installed. The runtime registers each
     /// server's tools as `mcp__<server>__<tool>`.
     pub mcp_servers: HashMap<String, McpServerConfig>,
+    /// Operator PreToolUse deny rules, same shape as a workspace
+    /// `.havn/hooks.yaml`. The runtime applies them together with the
+    /// workspace file, which can add rules but not remove these.
+    pub hooks: HookPolicy,
 }
 
 impl Default for Policy {
@@ -40,7 +44,115 @@ impl Default for Policy {
             context_toolsets: ContextToolsets::default(),
             admin_visibility: AdminVisibility::default(),
             mcp_servers: HashMap::new(),
+            hooks: HookPolicy::default(),
         }
+    }
+}
+
+/// PreToolUse hooks: guardrails against model mistakes, matched as
+/// regexes on a tool's flattened input. They are not a security
+/// boundary; `permissions`, `network_policy` and the sandbox are.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HookPolicy {
+    pub pre_tool_use: Vec<ToolHookRule>,
+}
+
+/// Deny rule for one tool: the call is refused when any `deny` regex
+/// matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolHookRule {
+    pub tool: String,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+pub const MAX_HOOK_RULES: usize = 64;
+pub const MAX_HOOK_PATTERNS: usize = 256;
+pub const MAX_HOOK_PATTERN_LEN: usize = 1024;
+/// Compiled-program and DFA-cache limit [`HookPolicy::validate`] applies
+/// to each pattern.
+pub const HOOK_REGEX_SIZE_LIMIT: usize = 256 * 1024;
+
+/// Compile one deny pattern with a small compiled-program and DFA-cache
+/// limit, so a single pattern cannot claim much CPU or memory.
+pub fn compile_hook_pattern(pattern: &str, size_limit: usize) -> crate::Result<regex::Regex> {
+    regex::RegexBuilder::new(pattern)
+        .size_limit(size_limit)
+        .dfa_size_limit(size_limit)
+        .build()
+        .map_err(|e| crate::Error::InvalidPolicy(format!("hook regex {pattern:?}: {e}")))
+}
+
+impl Policy {
+    /// Checks that deserialisation cannot express. Deserialising stays
+    /// cheap because the gateway resolves policies on every request;
+    /// call this where a policy is written.
+    pub fn validate(&self) -> crate::Result<()> {
+        self.hooks.validate()
+    }
+}
+
+impl HookPolicy {
+    /// Enforces the rule, pattern and length caps and compiles every
+    /// pattern.
+    pub fn validate(&self) -> crate::Result<()> {
+        let invalid = |m: String| Err(crate::Error::InvalidPolicy(m));
+        if self.pre_tool_use.len() > MAX_HOOK_RULES {
+            return invalid(format!(
+                "hooks: more than {MAX_HOOK_RULES} pre_tool_use rules"
+            ));
+        }
+        let patterns: usize = self.pre_tool_use.iter().map(|r| r.deny.len()).sum();
+        if patterns > MAX_HOOK_PATTERNS {
+            return invalid(format!(
+                "hooks: more than {MAX_HOOK_PATTERNS} deny patterns"
+            ));
+        }
+        for rule in &self.pre_tool_use {
+            if rule.tool.trim().is_empty() {
+                return invalid("hooks: a pre_tool_use rule has an empty tool".into());
+            }
+            for pattern in &rule.deny {
+                if pattern.len() > MAX_HOOK_PATTERN_LEN {
+                    return invalid(format!(
+                        "hooks: a {} deny pattern is longer than {MAX_HOOK_PATTERN_LEN} bytes",
+                        rule.tool
+                    ));
+                }
+                compile_hook_pattern(pattern, HOOK_REGEX_SIZE_LIMIT)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every rule of `self` and `other`; a pattern already present for
+    /// the same tool is not repeated.
+    #[must_use]
+    pub fn union(&self, other: &HookPolicy) -> HookPolicy {
+        let mut merged = self.clone();
+        for rule in &other.pre_tool_use {
+            let missing: Vec<String> = rule
+                .deny
+                .iter()
+                .filter(|p| !merged.denies(&rule.tool, p))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                merged.pre_tool_use.push(ToolHookRule {
+                    tool: rule.tool.clone(),
+                    deny: missing,
+                });
+            }
+        }
+        merged
+    }
+
+    fn denies(&self, tool: &str, pattern: &str) -> bool {
+        self.pre_tool_use
+            .iter()
+            .any(|r| r.tool == tool && r.deny.iter().any(|p| p == pattern))
     }
 }
 
@@ -306,6 +418,7 @@ impl Policy {
                     Some((name.clone(), server))
                 })
                 .collect(),
+            hooks: self.hooks.union(&ceiling.hooks),
         }
     }
 
@@ -385,6 +498,10 @@ impl Policy {
                 }
                 merged
             },
+            // Deny rules are guardrails an operator wrote for a role, so
+            // combining roles keeps all of them rather than only the
+            // rules every role shares.
+            hooks: self.hooks.union(&other.hooks),
         }
     }
 }
@@ -644,6 +761,115 @@ mod tests {
         assert!(!parsed.admin_visibility.can_view_conversations);
         assert!(!parsed.permissions.can_use_mcp);
         assert!(parsed.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn policy_without_hooks_deserialises() {
+        let raw = serde_json::json!({
+            "max_agents": 3,
+            "permissions": { "can_use_shell": false },
+        });
+        let p: Policy = serde_json::from_value(raw).expect("parse");
+        assert_eq!(p.max_agents, 3);
+        assert!(p.hooks.pre_tool_use.is_empty());
+    }
+
+    #[test]
+    fn policy_hooks_round_trip_and_reject_invalid_regex() {
+        let raw = serde_json::json!({
+            "hooks": { "pre_tool_use": [
+                { "tool": "shell", "deny": ["^rm -rf", "^sudo "] },
+                { "tool": "web_fetch" },
+            ]},
+        });
+        let p: Policy = serde_json::from_value(raw).expect("parse");
+        assert_eq!(p.hooks.pre_tool_use.len(), 2);
+        assert!(p.hooks.pre_tool_use[1].deny.is_empty());
+        let back: Policy =
+            serde_json::from_str(&serde_json::to_string(&p).expect("serialize")).expect("parse");
+        assert_eq!(back.hooks, p.hooks);
+
+        p.validate().expect("valid");
+
+        let bad = serde_json::json!({
+            "hooks": { "pre_tool_use": [{ "tool": "shell", "deny": ["[unclosed"] }] },
+        });
+        let parsed: Policy = serde_json::from_value(bad).expect("deserialise stays cheap");
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn hook_typos_are_rejected() {
+        for raw in [
+            serde_json::json!({ "hooks": { "pre_tool_uses": [] } }),
+            serde_json::json!({ "hooks": { "pre_tool_use": [{ "tool": "shell", "denny": ["x"] }] } }),
+        ] {
+            assert!(serde_json::from_value::<Policy>(raw).is_err());
+        }
+        assert!(hooks_with(" ", &["x"]).validate().is_err());
+    }
+
+    #[test]
+    fn hook_validation_enforces_limits() {
+        let rule = |n: usize| ToolHookRule {
+            tool: "shell".into(),
+            deny: (0..n).map(|i| format!("^p{i}")).collect(),
+        };
+        let too_many_rules = HookPolicy {
+            pre_tool_use: (0..=MAX_HOOK_RULES).map(|_| rule(1)).collect(),
+        };
+        assert!(too_many_rules.validate().is_err());
+        let too_many_patterns = HookPolicy {
+            pre_tool_use: vec![rule(MAX_HOOK_PATTERNS + 1)],
+        };
+        assert!(too_many_patterns.validate().is_err());
+        let at_limit = HookPolicy {
+            pre_tool_use: vec![rule(MAX_HOOK_PATTERNS)],
+        };
+        at_limit.validate().expect("at the limit");
+
+        let long = "a".repeat(MAX_HOOK_PATTERN_LEN + 1);
+        assert!(hooks_with("shell", &[&long]).validate().is_err());
+        // Short, but compiles to a program far over the size limit.
+        assert!(
+            hooks_with("shell", &["(\\w{100}){100}"])
+                .validate()
+                .is_err()
+        );
+    }
+
+    fn hooks_with(tool: &str, deny: &[&str]) -> HookPolicy {
+        HookPolicy {
+            pre_tool_use: vec![ToolHookRule {
+                tool: tool.into(),
+                deny: deny.iter().map(|p| (*p).to_string()).collect(),
+            }],
+        }
+    }
+
+    #[test]
+    fn clamp_and_widen_keep_every_hook_rule() {
+        let mut cap = Policy::default();
+        cap.hooks = hooks_with("shell", &["^rm -rf", "^sudo "]);
+        let mut own = Policy::default();
+        own.hooks = hooks_with("shell", &["^sudo ", "kubectl delete"]);
+
+        for p in [own.clamp_to(&cap), own.widen_with(&cap)] {
+            let patterns: Vec<&str> = p
+                .hooks
+                .pre_tool_use
+                .iter()
+                .filter(|r| r.tool == "shell")
+                .flat_map(|r| r.deny.iter().map(String::as_str))
+                .collect();
+            assert_eq!(patterns, vec!["^sudo ", "kubectl delete", "^rm -rf"]);
+        }
+        assert!(
+            Policy::default()
+                .clamp_to(&cap)
+                .hooks
+                .denies("shell", "^rm -rf")
+        );
     }
 
     #[test]
