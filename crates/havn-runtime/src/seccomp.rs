@@ -17,11 +17,12 @@
 //!
 //! ## When it applies
 //!
-//! Called once in [`super::main`] after Landlock has been installed. Runs
-//! late enough that startup syscalls (file I/O for bootstrap files, cgroup
-//! attach, socket connect) have completed. Inherited across `execve` and
-//! `fork` so subprocesses spawned by the `shell` tool get the same
-//! restrictions.
+//! Called once in [`super::main`] after Landlock is in place. Runs late
+//! enough that startup syscalls (file I/O for bootstrap files, cgroup
+//! attach, socket connect) have completed. Installed on every thread of
+//! the process at once (TSYNC), since the tokio workers that run tools
+//! already exist, and inherited across `execve` and `fork` so subprocesses
+//! spawned by the `shell` tool get the same restrictions.
 //!
 //! ## What's in the list
 //!
