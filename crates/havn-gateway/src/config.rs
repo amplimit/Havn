@@ -312,6 +312,23 @@ pub struct LlmConfig {
 
 pub const DEFAULT_MAX_TOKENS_CEILING: u32 = 128_000;
 
+/// True for a plain-`http` URL to a host other than this one: whatever is
+/// sent there, API keys included, crosses the network unencrypted.
+#[must_use]
+pub fn is_plaintext_to_another_host(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default();
+    let local = host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    url.scheme() == "http" && !local
+}
+
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
@@ -445,21 +462,23 @@ impl GatewayConfig {
     /// the last known good snapshot.
     pub fn load_from(path: &std::path::Path) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)?;
-        let parsed: Self = toml::from_str(&raw)?;
+        let mut parsed: Self = toml::from_str(&raw)?;
         parsed.validate_channel_ids()?;
         parsed.validate_llm()?;
         Ok(parsed)
     }
 
-    fn validate_llm(&self) -> anyhow::Result<()> {
+    /// Also stores each `[llm.base_url]` in normalized form, without a
+    /// trailing slash.
+    fn validate_llm(&mut self) -> anyhow::Result<()> {
         if self.llm.max_tokens_ceiling == 0 {
             anyhow::bail!("[llm] max_tokens_ceiling must be at least 1");
         }
-        for (provider, url) in &self.llm.base_url {
+        for (provider, url) in &mut self.llm.base_url {
             if !crate::llm_proxy::is_provider(provider) {
                 anyhow::bail!("[llm.base_url] names an unknown provider {provider:?}");
             }
-            let plain = reqwest::Url::parse(url).is_ok_and(|u| {
+            let parsed = reqwest::Url::parse(url).ok().filter(|u| {
                 matches!(u.scheme(), "http" | "https")
                     && u.has_host()
                     && u.username().is_empty()
@@ -467,12 +486,13 @@ impl GatewayConfig {
                     && u.query().is_none()
                     && u.fragment().is_none()
             });
-            if !plain {
+            let Some(parsed) = parsed else {
                 anyhow::bail!(
                     "[llm.base_url] {provider} = {url:?} must be an http(s) URL without \
                      credentials, query or fragment"
                 );
-            }
+            };
+            *url = parsed.as_str().trim_end_matches('/').to_string();
         }
         Ok(())
     }
@@ -914,6 +934,35 @@ mod tests {
             let msg = format!("{:#}", GatewayConfig::load_from(&p).expect_err(bad));
             assert!(msg.contains("[llm.base_url]"), "{msg}");
             let _ = std::fs::remove_file(&p);
+        }
+        let p = write_tmp_config("[llm.base_url]\nopenai = \"https://llm.example/v1/\"\n");
+        let cfg = GatewayConfig::load_from(&p).expect("load");
+        assert_eq!(
+            cfg.llm.base_url.get("openai").map(String::as_str),
+            Some("https://llm.example/v1"),
+            "stored without the trailing slash"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn plaintext_base_urls_to_other_hosts_are_flagged() {
+        for remote in [
+            "http://llm.example",
+            "http://10.0.0.5:8000/v1",
+            "http://[2001:db8::1]",
+        ] {
+            assert!(is_plaintext_to_another_host(remote), "{remote}");
+        }
+        for local in [
+            "https://llm.example",
+            "http://127.0.0.1:9000",
+            "http://127.1.2.3",
+            "http://[::1]:9000",
+            "http://localhost:9000",
+            "http://LOCALHOST",
+        ] {
+            assert!(!is_plaintext_to_another_host(local), "{local}");
         }
     }
 }

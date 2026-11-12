@@ -708,6 +708,17 @@ pub async fn anthropic_complete(
     complete_with_provider(db, http, keyring, billing, "anthropic", request, llm).await
 }
 
+/// HTTP client for provider calls. Redirects are not followed: requests
+/// carry the provider's API key, which must not reach whatever host a
+/// redirect names.
+pub fn http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .pool_idle_timeout(std::time::Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 /// Whether `name` is a provider the proxy can call.
 #[must_use]
 pub fn is_provider(name: &str) -> bool {

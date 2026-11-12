@@ -1,4 +1,4 @@
-// scripts/dashboard-chat.mjs — open a chat through the dashboard's own
+// scripts/dashboard-chat.mjs - open a chat through the dashboard's own
 // server in a headless browser and wait for the agent's reply.
 //
 // For the length of the run it also serves a mock of the Anthropic

@@ -12,6 +12,7 @@
 
 use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt as _, StreamExt as _};
 use havn_core::{AgentId, MessageContent, OutboundMessage, Policy};
 use havn_proto::channel::{ChannelFrame, ChannelMessageContent};
+use havn_proto::codec::MAX_FRAME_BYTES;
 use havn_proto::{
     AdminOutcome, AgentQuery, AgentQueryOutcome, AgentQueryResponse, AgentToGateway, CronOutcome,
     CronResult, GatewayToAgent, LlmRequest, MemoryForgetResponse, PROTOCOL_VERSION, read_frame,
@@ -157,6 +159,18 @@ impl Gateway {
             .stderr(log);
         if !self.isolated {
             cmd.env("HAVN_SPAWNER", "subprocess");
+        }
+        // Drop stops the gateway; this also stops it if the test process
+        // dies without unwinding.
+        // SAFETY: prctl is async-signal-safe and touches no shared state.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
         }
         self.process = Some(cmd.spawn().expect("spawn gateway"));
         self.url = format!("http://127.0.0.1:{port}");
@@ -695,6 +709,12 @@ async fn outbound_through_unbound_channels_is_dropped() {
     let (mut adapter, _) = tokio_tungstenite::connect_async(request)
         .await
         .expect("adapter connects");
+    // The gateway registers the adapter only after the upgrade; until then
+    // a permitted message would be dropped too.
+    gw.wait_until("the adapter session is registered", STEP, async || {
+        gw.log().contains("channel WS opened")
+    })
+    .await;
     let mut bound = gw.connect(bound_id).await;
     let mut intruder = gw.connect(intruder_id).await;
 
@@ -795,21 +815,21 @@ async fn agent_that_never_reads_is_disconnected_and_others_keep_working() {
 async fn oversized_frames_close_the_connection() {
     let gw = Gateway::start("").await;
     let mut steady = gw.running_agent("steady", json!({})).await;
-    let five_mib = 5 * 1024 * 1024;
+    let too_large = MAX_FRAME_BYTES + 1;
 
     // No newline at all.
     let endless_id = gw.create_agent("endless", json!({})).await;
     let mut endless = gw.connect(endless_id).await;
-    let _ = endless.writer.write_all(&vec![b'x'; five_mib]).await;
+    let _ = endless.writer.write_all(&vec![b'x'; too_large]).await;
     assert!(matches!(endless.next(STEP).await, Next::Closed));
 
-    // A well-formed request that is too large.
+    // A well-formed request over the limit.
     let large_id = gw.create_agent("large", json!({})).await;
     let mut large = gw.connect(large_id).await;
     let mut frame = serde_json::to_vec(&AgentToGateway::LlmRequest(LlmRequest {
         request_id: "big".into(),
         model: "claude-sonnet-4-6".into(),
-        messages: json!([{ "role": "user", "content": "x".repeat(five_mib) }]),
+        messages: json!([{ "role": "user", "content": "x".repeat(too_large) }]),
         options: json!({}),
         billing_user_id: None,
     }))

@@ -28,7 +28,6 @@ mod workspace;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
@@ -371,11 +370,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .pool_idle_timeout(Duration::from_secs(60))
-        .build()
-        .context("building HTTP client")?;
+    let http = llm_proxy::http_client().context("building HTTP client")?;
 
     let registry = AgentRegistry::new();
     let webchat_router = WebChatRouter::new();
@@ -441,6 +436,13 @@ async fn main() -> anyhow::Result<()> {
     let embedding_config = Arc::new(ArcSwap::from_pointee(cfg.embedding.clone()));
     for (provider, url) in &cfg.llm.base_url {
         info!(provider = %provider, url = %url, "provider calls go to [llm.base_url]");
+        if config::is_plaintext_to_another_host(url) {
+            warn!(
+                provider = %provider,
+                url = %url,
+                "[llm.base_url] is plain http to another host: API keys cross the network unencrypted"
+            );
+        }
     }
     let llm = Arc::new(cfg.llm.clone());
     let state = AppState {

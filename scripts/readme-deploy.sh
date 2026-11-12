@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# scripts/readme-deploy.sh — deploy havn the way README.md's Quick Start
+# scripts/readme-deploy.sh - deploy havn the way README.md's Quick Start
 # says, from this checkout, then chat with an agent through the
 # dashboard's own server in a headless browser.
 #
-# Steps, as in the README: install.sh (which builds this checkout instead
-# of downloading a release), `havn setup`, `havn start` as root,
-# `havn credential add anthropic ...`, and the dashboard's
-# `npm ci && npm run build && npm start`. CI has no LLM key, so the
-# credential is a dummy and `[llm.base_url]` points anthropic calls at a
-# mock provider that scripts/dashboard-chat.mjs runs for the chat.
+# Steps, as in the README: install.sh, `havn setup`, `havn start` as root,
+# `havn credential add anthropic ...`, and the dashboard's install, build
+# and start. CI has no LLM key, so the credential is a dummy and
+# `[llm.base_url]` points anthropic calls at a mock provider that
+# scripts/dashboard-chat.mjs runs for the chat.
+#
+# Not covered: the release path. README's `curl ... | bash` downloads a
+# prebuilt release; here install.sh runs from the checkout and builds it.
 #
 # Usage:
 #   PLAYWRIGHT_DIR=<dir with node_modules/playwright> ./scripts/readme-deploy.sh
@@ -32,9 +34,9 @@ readonly MOCK_KEY="sk-ant-readme-deploy-mock"
 readonly AGE_KEY="readme-deploy-passphrase"
 read -r -a AS_ROOT <<<"${HAVN_DEPLOY_SUDO-sudo -H}"
 
-log() { printf '\033[1;36m▶\033[0m %s\n' "$*" >&2; }
-ok()  { printf '\033[1;32m✓\033[0m %s\n' "$*" >&2; }
-die() { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 2; }
+log() { printf '>> %s\n' "$*" >&2; }
+ok()  { printf 'ok %s\n' "$*" >&2; }
+die() { printf 'FAIL %s\n' "$*" >&2; exit 2; }
 
 [ -n "${PLAYWRIGHT_DIR:-}" ] || die "PLAYWRIGHT_DIR must name a directory with node_modules/playwright"
 command -v node >/dev/null 2>&1 || die "node is required"
@@ -47,6 +49,24 @@ DASHBOARD_LOG="$LOG_DIR/readme-dashboard.log"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
+# The README commands this script follows. If the README changes them,
+# fail here so the script is updated with it rather than testing a path
+# the README no longer describes.
+for line in \
+    "curl -fsSL https://raw.githubusercontent.com/amplimit/havn/main/install.sh | bash" \
+    "sudo -i" \
+    "havn setup --non-interactive" \
+    "export HAVN_AGE_KEY=" \
+    "havn start" \
+    "havn credential add anthropic " \
+    "cd havn/apps/dashboard" \
+    "npm install" \
+    "npm run build" \
+    "npm start"; do
+    awk -v p="$line" 'index($0, p) == 1 { found = 1 } END { exit !found }' README.md \
+        || die "README.md no longer has a line starting with '$line'; update $0 to match it"
+done
+
 wait_for() {
     local what=$1 url=$2 tries=$3
     for _ in $(seq 1 "$tries"); do
@@ -56,7 +76,8 @@ wait_for() {
     return 1
 }
 
-# Install: `curl ... | bash` runs install.sh, which in a checkout builds it.
+# Install: README's `curl ... | bash` runs install.sh, which in a checkout
+# builds the checkout.
 if [ "${HAVN_SKIP_INSTALL:-0}" != "1" ]; then
     log "install.sh (HAVN_PROFILE=${HAVN_PROFILE:-debug})"
     HAVN_PROFILE="${HAVN_PROFILE:-debug}" bash ./install.sh
@@ -66,10 +87,21 @@ fi
 log "havn setup --non-interactive"
 "${AS_ROOT[@]}" havn setup --non-interactive >/dev/null
 CONFIG="$("${AS_ROOT[@]}" sh -c 'printf %s "$HOME/.config/havn/config.toml"')"
+
 # The one deviation from the README: send anthropic calls to the mock.
-if ! "${AS_ROOT[@]}" grep -q '^\[llm\.base_url\]' "$CONFIG"; then
-    printf '\n[llm.base_url]\nanthropic = "http://127.0.0.1:%s"\n' "$MOCK_PORT" \
-        | "${AS_ROOT[@]}" tee -a "$CONFIG" >/dev/null
+# Re-runs replace the entry instead of adding a second table.
+MOCK_ENTRY="anthropic = \"http://127.0.0.1:$MOCK_PORT\""
+if "${AS_ROOT[@]}" awk '
+        /^[[:space:]]*\[/ { section = $0; gsub(/[[:space:]]/, "", section) }
+        section == "[llm]" && /^[[:space:]]*base_url[[:space:]]*=/ { found = 1 }
+        END { exit !found }' "$CONFIG"; then
+    die "$CONFIG sets [llm] base_url inline; give it as an [llm.base_url] table instead"
+elif "${AS_ROOT[@]}" grep -q '^\[llm\.base_url\]' "$CONFIG"; then
+    "${AS_ROOT[@]}" sed -i \
+        -e '/^\[llm\.base_url\]/,/^\[/{/^[[:space:]]*anthropic[[:space:]]*=/d}' \
+        -e "/^\[llm\.base_url\]/a $MOCK_ENTRY" "$CONFIG"
+else
+    printf '\n[llm.base_url]\n%s\n' "$MOCK_ENTRY" | "${AS_ROOT[@]}" tee -a "$CONFIG" >/dev/null
 fi
 
 # README: `export HAVN_AGE_KEY=...`, `havn start`.
