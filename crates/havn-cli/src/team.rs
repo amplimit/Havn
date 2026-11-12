@@ -147,6 +147,21 @@ pub async fn remove_member(team: &str, user: &str) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("removing {user_id} from {team_id}"))?;
     println!("removed user {user_id} from team {team_id}");
+    let running: Vec<_> = havn_db::repo::agents::list_for_team(&pool, team_id)
+        .await
+        .with_context(|| format!("listing agents of {team_id}"))?
+        .into_iter()
+        .filter(|a| {
+            a.owner_id == user_id && a.status == havn_db::repo::agents::AgentStatus::Running
+        })
+        .collect();
+    for agent in running {
+        println!(
+            "agent {} ({}) is still running in this team; stop it from the dashboard or the API \
+             (it cannot be started again while its owner is outside the team)",
+            agent.name, agent.id
+        );
+    }
     Ok(())
 }
 

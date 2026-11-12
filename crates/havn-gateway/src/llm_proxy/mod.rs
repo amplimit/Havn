@@ -30,7 +30,7 @@ pub mod gemini;
 pub mod openai;
 pub mod provider;
 
-use havn_core::UserId;
+use havn_core::{TeamId, UserId};
 use havn_db::repo::credential_usage::{self, NewUsage};
 use havn_db::repo::credentials::Credential;
 use serde::{Deserialize, Serialize};
@@ -150,21 +150,24 @@ pub async fn complete(
     request: &AnthropicRequest,
 ) -> Result<AnthropicResponse, ProxyError> {
     let provider_name = provider::provider_for_model(&request.model);
-    complete_with_provider(db, http, keyring, user_id, provider_name, request).await
+    complete_with_provider(db, http, keyring, user_id, None, provider_name, request).await
 }
 
 /// Like [`complete`], but the caller has already decided which provider to
 /// use (e.g. the runtime read it out of `LlmRequest.options.provider`).
+/// `agent_team` is the calling agent's team; it limits the team
+/// credentials tried (see [`resolve_for_user`]).
 pub async fn complete_with_provider(
     db: &SqlitePool,
     http: &reqwest::Client,
     keyring: &KeyRing,
     user_id: UserId,
+    agent_team: Option<TeamId>,
     provider_name: &str,
     request: &AnthropicRequest,
 ) -> Result<AnthropicResponse, ProxyError> {
     let provider = dispatch_provider(provider_name)?;
-    let chain = resolve_for_user(db, user_id, provider_name).await?;
+    let chain = resolve_for_user(db, user_id, agent_team, provider_name).await?;
     if chain.is_empty() {
         return Err(ProxyError::NoCredential(provider_name.to_string()));
     }
@@ -280,7 +283,7 @@ pub async fn anthropic_complete(
     user_id: UserId,
     request: &AnthropicRequest,
 ) -> Result<AnthropicResponse, ProxyError> {
-    complete_with_provider(db, http, keyring, user_id, "anthropic", request).await
+    complete_with_provider(db, http, keyring, user_id, None, "anthropic", request).await
 }
 
 fn dispatch_provider(name: &str) -> Result<&'static dyn LlmProvider, ProxyError> {

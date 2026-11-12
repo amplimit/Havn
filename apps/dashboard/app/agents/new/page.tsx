@@ -21,7 +21,8 @@ export default function NewAgentPage() {
         const t = await api.teams.list();
         if (cancelled) return;
         setTeams(t);
-        if (wanted && t.some((team) => team.id === wanted)) setTeamId(wanted);
+        if (wanted && t.some((team) => team.id === wanted && team.can_create_agents))
+          setTeamId(wanted);
       } catch {
         // Without the team list the agent is created as a personal agent.
       }
@@ -94,8 +95,8 @@ export default function NewAgentPage() {
             >
               <option value="">none (personal agent)</option>
               {teams.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.name}
+                <option key={t.id} value={t.id} disabled={!t.can_create_agents}>
+                  {t.can_create_agents ? t.name : `${t.name} (agent limit reached)`}
                 </option>
               ))}
             </select>

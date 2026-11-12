@@ -19,7 +19,7 @@
 //! cap (still relevant for team creds — the team-level ceiling sits
 //! ABOVE any per-user ceiling).
 
-use havn_core::UserId;
+use havn_core::{TeamId, UserId};
 use havn_db::DbError;
 use havn_db::repo::credential_usage;
 use havn_db::repo::credentials::{self as repo, Credential, CredentialScope};
@@ -32,12 +32,18 @@ use tracing::debug;
 /// precedence), then team-scoped (admins drop a fallback for the
 /// whole team).
 ///
+/// `agent_team` is the team of the agent making the call. A team agent
+/// may use only that team's credentials (and only while `user_id` is a
+/// member), so it cannot bill another team; a personal agent (`None`)
+/// falls back to every team the user belongs to.
+///
 /// Within each scope, `priority DESC` sorts; across scopes, the chain
 /// concatenates. Disabled credentials are filtered at the SQL layer
 /// by [`repo::list_active_for_provider`].
 pub async fn resolve_for_user(
     db: &SqlitePool,
     user_id: UserId,
+    agent_team: Option<TeamId>,
     provider: &str,
 ) -> Result<Vec<Credential>, DbError> {
     // v0.2 namespace bridge: callers pass a bare provider name like
@@ -61,16 +67,20 @@ pub async fn resolve_for_user(
     // Step 2: team scope, both forms. One DB hit to enumerate the
     // user's teams, then 2× per team. Bounded — most users belong
     // to ≤2 teams in practice.
-    let teams = team_memberships::list_for_user(db, user_id).await?;
+    let teams: Vec<TeamId> = match agent_team {
+        Some(team) if team_memberships::is_member(db, user_id, team).await? => vec![team],
+        Some(_) => Vec::new(),
+        None => team_memberships::list_for_user(db, user_id)
+            .await?
+            .into_iter()
+            .map(|m| m.team_id)
+            .collect(),
+    };
     for team in teams {
         for p in &candidates {
-            let team_chain = repo::list_active_for_provider(
-                db,
-                CredentialScope::Team,
-                &team.team_id.to_string(),
-                p,
-            )
-            .await?;
+            let team_chain =
+                repo::list_active_for_provider(db, CredentialScope::Team, &team.to_string(), p)
+                    .await?;
             chain.extend(team_chain);
         }
     }
@@ -231,7 +241,7 @@ mod tests {
             .expect("user")
             .id;
 
-        let chain = resolve_for_user(&pool, owner, "anthropic")
+        let chain = resolve_for_user(&pool, owner, None, "anthropic")
             .await
             .expect("resolve");
         assert!(chain.is_empty());
@@ -262,7 +272,7 @@ mod tests {
             .expect("create cred");
         }
 
-        let chain = resolve_for_user(&pool, owner, "anthropic")
+        let chain = resolve_for_user(&pool, owner, None, "anthropic")
             .await
             .expect("resolve");
         let priorities: Vec<_> = chain.iter().map(|c| c.priority).collect();
@@ -326,12 +336,94 @@ mod tests {
         .await
         .expect("team cred");
 
-        let chain = resolve_for_user(&pool, user.id, "anthropic")
+        let chain = resolve_for_user(&pool, user.id, None, "anthropic")
             .await
             .expect("resolve");
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[0].api_key_ciphertext, b"user-key");
         assert_eq!(chain[1].api_key_ciphertext, b"team-key");
+    }
+
+    #[tokio::test]
+    async fn team_agent_uses_only_its_own_teams_credentials() {
+        let pool = connect_in_memory().await.expect("connect");
+        let user = create_user(&pool, NewUser { display_name: "u" })
+            .await
+            .expect("user");
+        let mut teams = Vec::new();
+        for name in ["a", "b", "left"] {
+            let team = create_team(&pool, NewTeam { name }).await.expect("team");
+            let role = create_role(
+                &pool,
+                NewRole {
+                    team_id: Some(team.id),
+                    name: "member",
+                    policy: &Policy::default(),
+                },
+            )
+            .await
+            .expect("role");
+            team_memberships::add(&pool, user.id, team.id, role.id)
+                .await
+                .expect("add");
+            havn_db::repo::credentials::create(
+                &pool,
+                NewCredential {
+                    scope: CredentialScope::Team,
+                    scope_id: &team.id.to_string(),
+                    provider: "anthropic",
+                    name: None,
+                    api_key_ciphertext: name.as_bytes(),
+                    priority: 0,
+                    limits: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("team cred");
+            teams.push(team.id);
+        }
+        havn_db::repo::credentials::create(
+            &pool,
+            NewCredential {
+                scope: CredentialScope::User,
+                scope_id: &user.id.to_string(),
+                provider: "anthropic",
+                name: None,
+                api_key_ciphertext: b"own",
+                priority: 0,
+                limits: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("user cred");
+        team_memberships::remove(&pool, user.id, teams[2])
+            .await
+            .expect("remove");
+
+        let keys = |chain: Vec<Credential>| {
+            chain
+                .into_iter()
+                .map(|c| String::from_utf8(c.api_key_ciphertext).expect("utf8"))
+                .collect::<Vec<_>>()
+        };
+        let team_a = resolve_for_user(&pool, user.id, Some(teams[0]), "anthropic")
+            .await
+            .expect("resolve");
+        assert_eq!(keys(team_a), ["own", "a"]);
+        let former = resolve_for_user(&pool, user.id, Some(teams[2]), "anthropic")
+            .await
+            .expect("resolve");
+        assert_eq!(
+            keys(former),
+            ["own"],
+            "no credentials of a team the user left"
+        );
+        let personal = resolve_for_user(&pool, user.id, None, "anthropic")
+            .await
+            .expect("resolve");
+        let mut personal = keys(personal);
+        personal.sort();
+        assert_eq!(personal, ["a", "b", "own"]);
     }
 
     /// Helper: create one credential with the given limits JSON and return it.

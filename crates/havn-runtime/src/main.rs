@@ -389,7 +389,12 @@ async fn main() -> anyhow::Result<()> {
             )
         }
         Some(other) => return Err(anyhow!("expected Welcome, got {other:?}")),
-        None => return Err(anyhow!("connection closed before Welcome")),
+        None => {
+            return Err(anyhow!(
+                "connection closed before Welcome (the gateway refuses a runtime whose \
+                 protocol version {PROTOCOL_VERSION} differs from its own; see the gateway log)"
+            ));
+        }
     };
 
     // 3b. Sandbox application — moved from pre-Welcome to here so the

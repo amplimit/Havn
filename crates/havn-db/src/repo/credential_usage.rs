@@ -125,10 +125,12 @@ pub struct TeamUserUsage {
 }
 
 /// Rollup query: the team's usage since `since_rfc3339`, per user. Counts
-/// only calls billed to one of the team's credentials or made by one of the
-/// team's agents (`agents.team_id`, through `credential_usages.agent_id`);
-/// a member's usage of their own credentials on their own agents is not
-/// included. Every current member gets a row (zero when unused); a
+/// only calls made by one of the team's agents (`agents.team_id`, through
+/// `credential_usages.agent_id`) or billed to one of the team's credentials
+/// by a caller outside any other team (a personal agent or no agent), so a
+/// call is counted for at most one team. A member's usage of their own
+/// credentials on their own agents is not included. Every current member
+/// gets a row (zero when unused); a
 /// non-member appears when they used the team's resources (a former
 /// member, or a cross-agent caller billed for a team agent's work).
 ///
@@ -145,8 +147,10 @@ pub async fn list_team_usage(
              FROM credential_usages cu \
              WHERE cu.created_at >= ?2 \
                AND (cu.agent_id IN (SELECT id FROM agents WHERE team_id = ?1) \
-                    OR cu.credential_id IN \
-                       (SELECT id FROM credentials WHERE scope = 'team' AND scope_id = ?1)) \
+                    OR (cu.credential_id IN \
+                           (SELECT id FROM credentials WHERE scope = 'team' AND scope_id = ?1) \
+                        AND COALESCE((SELECT team_id FROM agents WHERE id = cu.agent_id), ?1) \
+                            = ?1)) \
          ), people AS ( \
              SELECT user_id FROM team_memberships WHERE team_id = ?1 \
              UNION SELECT user_id FROM scoped \

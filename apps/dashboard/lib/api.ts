@@ -112,6 +112,8 @@ export type TeamView = {
   created_at: string;
   /** True when the calling user holds this team's admin role. */
   is_admin: boolean;
+  /** True when the caller's role in the team allows another agent there. */
+  can_create_agents: boolean;
 };
 
 export type TeamAgentView = {

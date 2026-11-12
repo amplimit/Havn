@@ -8,7 +8,8 @@
 //! - `POST /agents/{id}/start` — spawn runtime process via the spawner,
 //!   register the handle. Status `running` once the agent connects.
 //! - `POST /agents/{id}/stop` — request graceful shutdown via socket frame,
-//!   then SIGTERM/SIGKILL via spawner.
+//!   then SIGTERM/SIGKILL via spawner. The owner, or an admin of the
+//!   agent's team, may stop it.
 //! - `DELETE /agents/{id}` — stop if running, remove workspace, delete DB row.
 
 use axum::Json;
@@ -130,8 +131,8 @@ pub async fn create(
         )));
     }
 
-    let team_id = match req.team_id.as_deref() {
-        None => None,
+    let (team_id, max_in_team) = match req.team_id.as_deref() {
+        None => (None, 0),
         Some(raw) => {
             let team_id = TeamId::from_str(raw)
                 .map_err(|_| ApiError::BadRequest("invalid team id".into()))?;
@@ -144,11 +145,13 @@ pub async fn create(
                     role_policy.max_agents
                 )));
             }
-            Some(team_id)
+            (Some(team_id), role_policy.max_agents)
         }
     };
 
-    let agent = repo::create(
+    // The checks above give the specific message; this insert re-checks
+    // both quotas atomically, so concurrent creates cannot exceed them.
+    let agent = repo::create_within_quota(
         &state.db,
         NewAgent {
             owner_id: user.id,
@@ -156,8 +159,13 @@ pub async fn create(
             name: req.name.trim(),
             config: req.config.unwrap_or_else(|| serde_json::json!({})),
         },
+        user_policy.max_agents,
+        max_in_team,
     )
-    .await?;
+    .await?
+    .ok_or_else(|| {
+        ApiError::Forbidden("agent quota exhausted: a concurrent request used the last slot".into())
+    })?;
 
     let workspace = workspace_for(&state, agent.id);
     workspace::ensure(&workspace)
@@ -318,6 +326,17 @@ pub async fn ensure_running(
     // handshake yet (a previous attempt is mid-flight), DON'T spawn
     // again — just fall through to the polling loop and wait.
     if !state.registry.is_registered(id).await {
+        let agent_row = repo::find_by_id(&state.db, id)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        if let Some(team_id) = agent_row.team_id
+            && !havn_db::repo::team_memberships::is_member(&state.db, agent_row.owner_id, team_id)
+                .await?
+        {
+            return Err(ApiError::Forbidden(format!(
+                "agent {id} belongs to team {team_id}, which its owner is no longer a member of"
+            )));
+        }
         let workspace = workspace_for(state, id);
         workspace::ensure(&workspace)
             .await
@@ -336,9 +355,6 @@ pub async fn ensure_running(
             agent_dns: state.agent_dns.clone(),
             env_passthrough: state.agent_env_passthrough.as_ref().clone(),
         };
-        let agent_row = repo::find_by_id(&state.db, id)
-            .await?
-            .ok_or(ApiError::NotFound)?;
         let policy =
             policy_resolver::for_session(&state.db, &agent_row, state.trusted_proxies.is_some())
                 .await;
@@ -384,9 +400,46 @@ pub async fn stop(
     user: AuthedUser,
     Path(id): Path<String>,
 ) -> Result<Json<AgentView>, ApiError> {
-    let agent = resolve_agent(&id, &user, &state).await?;
+    let agent = match resolve_agent(&id, &user, &state).await {
+        Err(ApiError::NotFound) => team_agent_for_admin(&id, &user, &state).await?,
+        other => other?,
+    };
     let id = agent.id;
+    stop_agent(&state, id, user.id, serde_json::json!({})).await?;
 
+    let agent = repo::find_by_id(&state.db, id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let connected = state.registry.is_connected(id).await;
+    Ok(Json(AgentView::from_agent(agent, connected)))
+}
+
+/// An agent `user` does not own but may manage as an admin of the agent's
+/// team. `NotFound` otherwise, so existence does not leak.
+async fn team_agent_for_admin(
+    s: &str,
+    user: &AuthedUser,
+    state: &AppState,
+) -> Result<Agent, ApiError> {
+    let id = AgentId::from_str(s.trim()).map_err(|_| ApiError::NotFound)?;
+    let agent = repo::find_by_id(&state.db, id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    match agent.team_id {
+        Some(team_id) if perm::is_admin(&state.db, user.id, team_id).await? => Ok(agent),
+        _ => Err(ApiError::NotFound),
+    }
+}
+
+/// Stop `id` (graceful shutdown frame, then the spawner), mark it
+/// `stopped` and audit `agent.stopped` by `by_user` with `details`.
+/// Stopping an agent that is not running only updates its status.
+pub(crate) async fn stop_agent(
+    state: &AppState,
+    id: AgentId,
+    by_user: havn_core::UserId,
+    details: serde_json::Value,
+) -> Result<(), ApiError> {
     // Best-effort graceful shutdown via socket; ignore if not connected.
     if state.registry.is_connected(id).await
         && let Err(e) = state.registry.send(id, GatewayToAgent::Shutdown).await
@@ -401,21 +454,40 @@ pub async fn stop(
     }
 
     repo::set_status(&state.db, id, AgentStatus::Stopped).await?;
-    audit::record_agent_action(
-        &state.db,
-        user.id,
-        id,
-        "agent.stopped",
-        serde_json::json!({}),
-    )
-    .await;
+    audit::record_agent_action(&state.db, by_user, id, "agent.stopped", details).await;
+    info!(agent_id = %id, by = %by_user, "agent stopped");
+    Ok(())
+}
 
-    let agent = repo::find_by_id(&state.db, id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    info!(agent_id = %id, "agent stopped");
-    let connected = state.registry.is_connected(id).await;
-    Ok(Json(AgentView::from_agent(agent, connected)))
+/// Stop every agent `owner` (or, with `None`, anyone) has in `team_id`.
+/// The agents are kept. Used when a member leaves a team and before a team
+/// is deleted.
+pub(crate) async fn stop_team_agents(
+    state: &AppState,
+    team_id: TeamId,
+    owner: Option<havn_core::UserId>,
+    by_user: havn_core::UserId,
+    reason: &str,
+) -> Result<usize, ApiError> {
+    let agents = repo::list_for_team(&state.db, team_id).await?;
+    let mut stopped = 0;
+    for agent in agents
+        .into_iter()
+        .filter(|a| owner.is_none_or(|o| a.owner_id == o))
+    {
+        if agent.status != AgentStatus::Running && !state.registry.is_registered(agent.id).await {
+            continue;
+        }
+        stop_agent(
+            state,
+            agent.id,
+            by_user,
+            serde_json::json!({"reason": reason, "team_id": team_id.to_string()}),
+        )
+        .await?;
+        stopped += 1;
+    }
+    Ok(stopped)
 }
 
 pub async fn delete(

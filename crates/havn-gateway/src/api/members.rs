@@ -232,16 +232,27 @@ pub async fn remove(
     }
 
     team_memberships::remove(&state.db, member, team).await?;
+    // Their agents in this team keep running under a role they no longer
+    // hold otherwise; stop them (they are kept, and cannot be started
+    // again while the owner is outside the team).
+    let stopped = crate::api::agents::stop_team_agents(
+        &state,
+        team,
+        Some(member),
+        user.id,
+        "owner removed from team",
+    )
+    .await?;
     audit::record(
         &state.db,
         user.id,
         Some(team),
         None,
         "member.removed",
-        serde_json::json!({"user_id": member.to_string()}),
+        serde_json::json!({"user_id": member.to_string(), "agents_stopped": stopped}),
     )
     .await;
-    info!(team = %team, %member, "member removed");
+    info!(team = %team, %member, agents_stopped = stopped, "member removed");
     Ok(StatusCode::NO_CONTENT)
 }
 

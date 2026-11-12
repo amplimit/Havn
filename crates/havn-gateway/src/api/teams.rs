@@ -44,6 +44,9 @@ pub struct TeamView {
     /// `admin` role. Lets the dashboard render mgmt buttons without
     /// a second request per row.
     pub is_admin: bool,
+    /// True when the caller's role in the team allows another agent of
+    /// theirs there (`max_agents`), for the new-agent form.
+    pub can_create_agents: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +76,7 @@ pub async fn list(
             name: team.name,
             created_at: team.created_at,
             is_admin: m.role_name == "admin",
+            can_create_agents: can_create_agents(&state, user.id, m.team_id).await?,
         });
     }
     Ok(Json(views))
@@ -153,6 +157,7 @@ pub async fn create(
             name: team.name,
             created_at: team.created_at,
             is_admin: true,
+            can_create_agents: can_create_agents(&state, user.id, team.id).await?,
         }),
     ))
 }
@@ -174,6 +179,7 @@ pub async fn get(
         name: team.name,
         created_at: team.created_at,
         is_admin,
+        can_create_agents: can_create_agents(&state, user.id, id).await?,
     }))
 }
 
@@ -206,6 +212,7 @@ pub async fn patch(
             name: renamed.name,
             created_at: renamed.created_at,
             is_admin,
+            can_create_agents: can_create_agents(&state, user.id, id).await?,
         }));
     }
     // No-op patch — return current state.
@@ -218,12 +225,15 @@ pub async fn patch(
         name: team.name,
         created_at: team.created_at,
         is_admin,
+        can_create_agents: can_create_agents(&state, user.id, id).await?,
     }))
 }
 
 /// `DELETE /teams/{id}` — admin-only. Cascades through roles and
-/// memberships; agents owned by team members keep their team_id set
-/// to NULL via the FK rule (not deleted — operators preserve work).
+/// memberships. The team's running agents are stopped first; the FK rule
+/// then sets their team_id to NULL, so they are kept (operators preserve
+/// work) as their owners' personal agents, governed by the owner's own
+/// policy from the next start on.
 ///
 /// Audit shape: the deletion is recorded as a USER action (team_id
 /// `None`), with the team's name + id snapshotted into details. The
@@ -245,6 +255,8 @@ pub async fn delete(
         .await?
         .map_or_else(|| "(unknown)".into(), |t| t.name);
 
+    let stopped =
+        crate::api::agents::stop_team_agents(&state, id, None, user.id, "team deleted").await?;
     repo::delete(&state.db, id).await?;
     audit::record(
         &state.db,
@@ -255,6 +267,7 @@ pub async fn delete(
         serde_json::json!({
             "team_id": id.to_string(),
             "team_name": snapshot_name,
+            "agents_stopped": stopped,
         }),
     )
     .await;
@@ -381,6 +394,16 @@ fn into_usage_entry(u: TeamUserUsage) -> TeamUsageEntry {
 
 // ---- helpers --------------------------------------------------------------
 
+async fn can_create_agents(
+    state: &AppState,
+    user_id: havn_core::UserId,
+    team_id: TeamId,
+) -> Result<bool, ApiError> {
+    let role = crate::policy_resolver::for_team_member(&state.db, user_id, team_id).await;
+    let owned = havn_db::repo::agents::count_for_owner_in_team(&state.db, user_id, team_id).await?;
+    Ok(owned < role.max_agents)
+}
+
 fn parse_id(s: &str) -> Result<TeamId, ApiError> {
     TeamId::from_str(s).map_err(|_| ApiError::BadRequest("invalid team id".into()))
 }
@@ -416,6 +439,8 @@ mod tests {
 
     use super::*;
     use crate::auth::tests::state_with;
+    use havn_core::AgentId;
+    use havn_db::repo::agents::AgentStatus;
 
     fn request() -> Json<CreateTeamRequest> {
         Json(CreateTeamRequest {
@@ -682,6 +707,27 @@ mod tests {
         // Not counted: a member's own credential on their own agent.
         spend(f.member.id, own_cred, Some(own_agent), 1000).await;
         spend(f.member.id, own_cred, None, 10_000).await;
+        // A call by this team's agent on another team's credential (the
+        // resolver no longer allows it; older rows may exist) counts for
+        // the agent's team only.
+        let other = repo::create(db, NewTeam { name: "other" })
+            .await
+            .expect("team");
+        let other_admin = create_role(
+            db,
+            NewRole {
+                team_id: Some(other.id),
+                name: "admin",
+                policy: &admin_default_policy(),
+            },
+        )
+        .await
+        .expect("role");
+        team_memberships::add(db, f.admin.id, other.id, other_admin.id)
+            .await
+            .expect("membership");
+        let other_cred = cred(CredentialScope::Team, other.id.to_string()).await;
+        spend(f.member.id, other_cred, Some(team_agent), 5).await;
 
         let read = |user: AuthedUser| {
             usage(
@@ -697,8 +743,8 @@ mod tests {
             .iter()
             .find(|e| e.user_id == f.member.id.to_string())
             .expect("member row");
-        assert_eq!(member.tokens_in, 110);
-        assert_eq!(member.call_count, 2);
+        assert_eq!(member.tokens_in, 115);
+        assert_eq!(member.call_count, 3);
         let admin = resp
             .entries
             .iter()
@@ -718,5 +764,137 @@ mod tests {
             let denied = read(user).await;
             assert!(matches!(denied, Err(ApiError::Forbidden(_))), "{denied:?}");
         }
+
+        let Json(other_usage) = usage(
+            State(f.state.clone()),
+            f.admin.clone(),
+            Path(other.id.to_string()),
+            Query(UsageQuery { days: None }),
+        )
+        .await
+        .expect("admin of the other team");
+        assert!(
+            other_usage.entries.iter().all(|e| e.tokens_in == 0),
+            "another team's agent is not counted again: {:?}",
+            other_usage.entries
+        );
+    }
+
+    async fn running_team_agent(f: &TeamFixture, owner: &AuthedUser) -> AgentId {
+        use crate::api::agents::create as create_agent;
+        let (_, Json(agent)) = create_agent(
+            State(f.state.clone()),
+            owner.clone(),
+            agent_request("worker", Some(f.team)),
+        )
+        .await
+        .expect("team agent");
+        let id = AgentId::from_str(&agent.id).expect("id");
+        havn_db::repo::agents::set_status(&f.state.db, id, AgentStatus::Running)
+            .await
+            .expect("status");
+        id
+    }
+
+    async fn status_of(f: &TeamFixture, id: AgentId) -> AgentStatus {
+        havn_db::repo::agents::find_by_id(&f.state.db, id)
+            .await
+            .expect("lookup")
+            .expect("agent kept")
+            .status
+    }
+
+    #[tokio::test]
+    async fn removing_a_member_stops_their_team_agents() {
+        let f = team_fixture().await;
+        let id = running_team_agent(&f, &f.member).await;
+
+        crate::api::members::remove(
+            State(f.state.clone()),
+            f.admin.clone(),
+            Path((f.team.to_string(), f.member.id.to_string())),
+        )
+        .await
+        .expect("remove member");
+        assert_eq!(status_of(&f, id).await, AgentStatus::Stopped);
+
+        let start = crate::api::agents::ensure_running(&f.state, f.member.id, id).await;
+        assert!(matches!(start, Err(ApiError::Forbidden(_))), "{start:?}");
+
+        let cron = crate::api::cron::create(
+            State(f.state.clone()),
+            f.member.clone(),
+            Path(id.to_string()),
+            Json(crate::api::cron::CreateCronRequest {
+                name: "nightly".into(),
+                prompt: "p".into(),
+                schedule: crate::api::cron::ScheduleInput::Interval {
+                    interval_seconds: 3600,
+                },
+                next_run_at: None,
+                wake_check: None,
+                deliver: "local".into(),
+                enabled_toolsets: Vec::new(),
+            }),
+        )
+        .await;
+        assert!(matches!(cron, Err(ApiError::Forbidden(_))), "{cron:?}");
+    }
+
+    #[tokio::test]
+    async fn team_admins_may_stop_team_agents_and_others_may_not() {
+        let f = team_fixture().await;
+        let id = running_team_agent(&f, &f.member).await;
+        let stop = |user: &AuthedUser| {
+            crate::api::agents::stop(State(f.state.clone()), user.clone(), Path(id.to_string()))
+        };
+
+        for user in [&f.viewer, &f.outsider] {
+            let denied = stop(user).await;
+            assert!(matches!(denied, Err(ApiError::NotFound)), "{denied:?}");
+        }
+        assert_eq!(status_of(&f, id).await, AgentStatus::Running);
+
+        let Json(stopped) = stop(&f.admin).await.expect("team admin stops it");
+        assert_eq!(stopped.status, "stopped");
+        assert_eq!(status_of(&f, id).await, AgentStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_team_stops_and_keeps_its_agents() {
+        let f = team_fixture().await;
+        let id = running_team_agent(&f, &f.member).await;
+        delete(
+            State(f.state.clone()),
+            f.admin.clone(),
+            Path(f.team.to_string()),
+        )
+        .await
+        .expect("delete team");
+        let agent = havn_db::repo::agents::find_by_id(&f.state.db, id)
+            .await
+            .expect("lookup")
+            .expect("agent kept");
+        assert_eq!(agent.status, AgentStatus::Stopped);
+        assert_eq!(agent.team_id, None);
+    }
+
+    #[tokio::test]
+    async fn team_view_reports_whether_another_agent_fits() {
+        let f = team_fixture().await;
+        let view = |user: &AuthedUser| {
+            get(
+                State(f.state.clone()),
+                user.clone(),
+                Path(f.team.to_string()),
+            )
+        };
+        let Json(before) = view(&f.member).await.expect("view");
+        assert!(before.can_create_agents);
+        running_team_agent(&f, &f.member).await;
+        let Json(after) = view(&f.member).await.expect("view");
+        assert!(!after.can_create_agents, "member role allows one agent");
+        let Json(viewer) = view(&f.viewer).await.expect("view");
+        assert!(!viewer.can_create_agents);
     }
 }

@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 pub use codec::{FrameError, read_frame, write_frame};
 
 /// Current wire-protocol version. Mismatch on `Hello` is a hard error.
-pub const PROTOCOL_VERSION: &str = "0.1.0";
+/// 0.2.0: `CronTick`/`CronResult` carry `run_id`.
+pub const PROTOCOL_VERSION: &str = "0.2.0";
 
 /// Frames sent from the agent runtime to the gateway.
 #[derive(Debug, Clone, Serialize, Deserialize)]
