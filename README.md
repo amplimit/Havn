@@ -135,6 +135,7 @@ havn is **infrastructure, not SaaS**. The test: does it require kernel primitive
 ## Security Model
 
 - Agents run in isolated Linux namespaces (PID, mount, network, user) with Landlock LSM and seccomp-bpf syscall filtering
+- Agents do not start if Landlock is not available (kernel 5.13+ with `landlock` in the `lsm=` list; `havn doctor` checks it). To run agents without filesystem restriction on such a kernel anyway, start the gateway with `HAVN_ALLOW_NO_LANDLOCK=1`
 - API keys encrypted at rest with [age](https://age-encryption.org/) — agent processes never see them
 - Per-credential token-per-day and requests-per-minute caps enforced gateway-side
 - WebChat WebSocket connections are checked against an Origin allowlist (`allowed_origins`) and must present the caller's `ws_token` from `GET /me`; the token identifies the user rather than being a secret, so the Origin check is what blocks cross-site connections
