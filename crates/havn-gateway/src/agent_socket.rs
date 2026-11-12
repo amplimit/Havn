@@ -553,10 +553,14 @@ where
                 }
             }
             AgentToGateway::MemoryForgetResponse(resp) => {
-                ctx.admin_rpc.resolve(&resp.request_id, resp.outcome).await;
+                ctx.admin_rpc
+                    .resolve(agent_id, &resp.request_id, resp.outcome)
+                    .await;
             }
             AgentToGateway::SkillPinResponse(resp) => {
-                ctx.admin_rpc.resolve(&resp.request_id, resp.outcome).await;
+                ctx.admin_rpc
+                    .resolve(agent_id, &resp.request_id, resp.outcome)
+                    .await;
             }
             AgentToGateway::AgentQuery(query) => {
                 // Caller-side initiation. Spawn so a slow target doesn't
@@ -571,7 +575,7 @@ where
             AgentToGateway::AgentQueryResponse(resp) => {
                 // Callee-side reply — match against pending broker entry
                 // so the caller-side handler can wake.
-                ctx.query_broker.resolve(resp).await;
+                ctx.query_broker.resolve(agent_id, resp).await;
             }
             // The protocol enum is `#[non_exhaustive]`; future variants land
             // here so older gateways gracefully ignore frames they don't know.
@@ -996,20 +1000,22 @@ async fn handle_agent_query(caller_id: AgentId, query: AgentQuery, ctx: AgentSoc
 
     // Dispatch IncomingQuery to the target.
     let timeout_secs = query.timeout_seconds.min(AGENT_QUERY_MAX_TIMEOUT_SECS);
+    // The target sees a gateway-chosen id, not the caller's, and only the
+    // target may answer it.
+    let (dispatch_id, rx) = ctx.query_broker.register(target_id).await;
     let incoming = IncomingQuery {
-        request_id: request_id.clone(),
+        request_id: dispatch_id.clone(),
         caller_agent_id: caller_id.to_string(),
         billing_user_id: caller_owner.to_string(),
         prompt: query.prompt.clone(),
         include_transcript: query.include_transcript,
     };
-    let rx = ctx.query_broker.register(&request_id).await;
     if let Err(e) = ctx
         .registry
         .send(target_id, GatewayToAgent::IncomingQuery(incoming))
         .await
     {
-        ctx.query_broker.cancel(&request_id).await;
+        ctx.query_broker.cancel(&dispatch_id).await;
         send_query_error(
             &ctx,
             caller_id,
@@ -1038,8 +1044,9 @@ async fn handle_agent_query(caller_id: AgentId, query: AgentQuery, ctx: AgentSoc
         {
             Ok(Ok(resp)) => resp,
             Ok(Err(_)) => {
-                // Sender dropped without delivering — broker pending entry
-                // is already gone via Resolve, so we're clean.
+                // The broker drops a sender only by resolving or cancelling
+                // it, and dispatch ids are unique, so this is not expected;
+                // report it as an error rather than waiting.
                 send_query_error(
                     &ctx,
                     caller_id,
@@ -1061,7 +1068,7 @@ async fn handle_agent_query(caller_id: AgentId, query: AgentQuery, ctx: AgentSoc
                 return;
             }
             Err(_) => {
-                ctx.query_broker.cancel(&request_id).await;
+                ctx.query_broker.cancel(&dispatch_id).await;
                 send_query_timeout(&ctx, caller_id, request_id.clone()).await;
                 record_audit(
                     &ctx,
@@ -1102,7 +1109,7 @@ async fn handle_agent_query(caller_id: AgentId, query: AgentQuery, ctx: AgentSoc
     .await;
 
     let result = AgentQueryResult {
-        request_id: response.request_id,
+        request_id,
         outcome: response.outcome,
         text: response.text,
         transcript: response.transcript,
