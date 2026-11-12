@@ -37,9 +37,29 @@ talks to the dashboard's origin. Settings, read at startup:
 | Variable | Default | Meaning |
 |---|---|---|
 | `PORT` | `3000` | Dashboard port |
+| `HAVN_DASHBOARD_HOST` | `127.0.0.1` | Listen address |
 | `HAVN_GATEWAY_URL` | `http://127.0.0.1:8080` | Gateway address (http only) |
+| `HAVN_DASHBOARD_TRUSTED_PROXIES` | empty | Comma-separated peer addresses allowed to set `X-User-ID` |
 
 The proxy presents WebSocket upgrades to the gateway with
 `Origin: http://127.0.0.1:<PORT>`. The default port is in the gateway's
 default `allowed_origins`; if you change `PORT`, add
 `http://127.0.0.1:<PORT>` to `allowed_origins` in the gateway config.
+
+## Access from another machine
+
+The dashboard has no login of its own: anyone who can reach it acts as
+the single-user operator, or as whatever `X-User-ID` they are allowed to
+send. Keep it on `127.0.0.1` and reach it through one of:
+
+- **An SSH tunnel** (single user): `ssh -L 3000:127.0.0.1:3000 <server>`,
+  then open `http://localhost:3000`.
+- **An authenticating reverse proxy** on the same host (multi-user). The
+  proxy logs the user in and sets `X-User-ID` itself, replacing any value
+  the client sent. Set `HAVN_DASHBOARD_TRUSTED_PROXIES` to the address
+  the proxy connects from (for example `127.0.0.1`); from any other peer
+  the dashboard drops `X-User-ID`.
+
+Setting `HAVN_DASHBOARD_HOST=0.0.0.0` exposes the dashboard without
+authentication; do that only behind a firewall that admits nothing but
+the proxy.

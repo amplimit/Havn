@@ -95,9 +95,13 @@ npm run build
 npm start                    # http://localhost:3000
 ```
 
-Then open `http://localhost:3000`, create an agent, and start chatting. For
-development, `npm run dev` serves the same app with hot reload. See
-[apps/dashboard/README.md](apps/dashboard/README.md) for settings.
+Then open `http://localhost:3000`, create an agent, and start chatting. The
+dashboard listens on 127.0.0.1 only and has no login of its own; from
+another machine use an SSH tunnel (`ssh -L 3000:127.0.0.1:3000 <server>`) or
+an authenticating reverse proxy. For development, `npm run dev` serves the
+same app with hot reload. See
+[apps/dashboard/README.md](apps/dashboard/README.md) for settings and
+multi-user setup.
 
 ## Project Structure
 

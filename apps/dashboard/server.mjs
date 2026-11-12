@@ -4,12 +4,10 @@
  * the gateway at runtime, so `HAVN_GATEWAY_URL` takes effect without
  * a rebuild and dev and production share one code path.
  *
- * This is the cleanest fit for spec §1.7: the gateway stays loopback-
- * only (no `trust_header` + no public bind), and the dashboard plays
- * the role of the "upstream proxy" — auth happens in the dashboard
- * (single-user mode here means bootstrap user is implicit; multi-user
- * deployments would put a real auth proxy between the browser and
- * this dashboard, then forward X-User-ID to gateway via fetch headers).
+ * The dashboard has no login of its own, so it listens on 127.0.0.1 by
+ * default. In multi-user mode an authenticating proxy in front of it
+ * sets X-User-ID; that header is forwarded to the gateway only from the
+ * peers listed in HAVN_DASHBOARD_TRUSTED_PROXIES and dropped otherwise.
  *
  * WS path: browser opens `ws://<dashboard-host>:3000/ws/chat/<id>?token=…`,
  * we open a raw TCP socket to the gateway (default `127.0.0.1:8080`),
@@ -24,7 +22,14 @@ import next from "next";
 
 const DEV = process.argv.includes("--dev");
 const PORT = Number(process.env.PORT ?? 3000);
-const HOSTNAME = process.env.HOSTNAME ?? "0.0.0.0";
+// Not HOSTNAME: shells and containers often export it as the machine
+// name, which would bind the dashboard to a network interface.
+const HOST = process.env.HAVN_DASHBOARD_HOST ?? "127.0.0.1";
+const TRUSTED_PROXIES = (process.env.HAVN_DASHBOARD_TRUSTED_PROXIES ?? "")
+  .split(",")
+  .map((entry) => entry.trim())
+  .filter(Boolean);
+const IDENTITY_HEADER = "x-user-id";
 const GATEWAY = process.env.HAVN_GATEWAY_URL ?? "http://127.0.0.1:8080";
 const WS_PREFIX = "/ws/";
 const API_PREFIX = "/api/";
@@ -66,9 +71,20 @@ const gatewayUrl = parseGatewayUrl(GATEWAY);
 const GATEWAY_HOST = gatewayUrl.hostname.replace(/^\[|\]$/g, "");
 const GATEWAY_PORT = Number(gatewayUrl.port || 80);
 
-const app = next({ dev: DEV, hostname: HOSTNAME, port: PORT });
+const app = next({ dev: DEV, hostname: HOST, port: PORT });
 await app.prepare();
 const handle = app.getRequestHandler();
+
+function peerAddress(req) {
+  const addr = req.socket.remoteAddress ?? "";
+  return addr.startsWith("::ffff:") ? addr.slice("::ffff:".length) : addr;
+}
+
+// Only an authenticating proxy listed in HAVN_DASHBOARD_TRUSTED_PROXIES
+// may tell the gateway who the user is.
+function mayAssertIdentity(req) {
+  return TRUSTED_PROXIES.includes(peerAddress(req));
+}
 
 function endToEndHeaders(headers) {
   const out = {};
@@ -80,6 +96,12 @@ function endToEndHeaders(headers) {
   return out;
 }
 
+function forwardedHeaders(req) {
+  const headers = { ...endToEndHeaders(req.headers), host: gatewayUrl.host };
+  if (!mayAssertIdentity(req)) delete headers[IDENTITY_HEADER];
+  return headers;
+}
+
 function proxyApi(req, res) {
   const upstream = httpRequest(
     {
@@ -87,7 +109,7 @@ function proxyApi(req, res) {
       port: GATEWAY_PORT,
       method: req.method,
       path: req.url.slice(API_PREFIX.length - 1),
-      headers: { ...endToEndHeaders(req.headers), host: gatewayUrl.host },
+      headers: forwardedHeaders(req),
     },
     (upstreamRes) => {
       res.writeHead(upstreamRes.statusCode ?? 502, endToEndHeaders(upstreamRes.headers));
@@ -147,8 +169,10 @@ server.on("upgrade", (req, clientSocket, head) => {
     // upstream auth boundary in havn's deploy model (spec §1.7);
     // the gateway trusts whatever Origin the dashboard forwards.
     const canonicalOrigin = `http://127.0.0.1:${PORT}`;
+    const trusted = mayAssertIdentity(req);
     const headerLines = Object.entries(req.headers)
       .filter(([k, v]) => v !== undefined && k.toLowerCase() !== "origin")
+      .filter(([k]) => trusted || k.toLowerCase() !== IDENTITY_HEADER)
       .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(", ") : v}`);
     headerLines.push(`origin: ${canonicalOrigin}`);
     const requestLine = `${req.method} ${req.url} HTTP/${req.httpVersion}`;
@@ -168,8 +192,8 @@ server.on("upgrade", (req, clientSocket, head) => {
   clientSocket.on("close", () => upstream.destroy());
 });
 
-server.listen(PORT, HOSTNAME, () => {
-  console.log(`havn dashboard listening on http://${HOSTNAME}:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`havn dashboard listening on http://${HOST}:${PORT}`);
   console.log(`  /api and /ws proxy → ${GATEWAY_HOST}:${GATEWAY_PORT}${DEV ? " (dev)" : ""}`);
 });
 
