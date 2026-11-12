@@ -39,5 +39,8 @@ age.workspace = true
 secrecy.workspace = true
 async-trait.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

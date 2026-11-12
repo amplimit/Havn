@@ -41,6 +41,10 @@ pub struct OpenAiProvider {
     #[allow(dead_code)]
     name: &'static str,
     base_url: &'static str,
+    /// Body field carrying `max_tokens`. OpenAI deprecated `max_tokens`
+    /// in favour of `max_completion_tokens`, and its reasoning models
+    /// (o-series, gpt-5) reject the old name; OpenRouter takes `max_tokens`.
+    max_tokens_field: &'static str,
     /// HTTP-Referer / X-Title — OpenRouter wants these for traffic
     /// attribution. Empty for plain OpenAI.
     extra_headers: &'static [(&'static str, &'static str)],
@@ -53,12 +57,14 @@ impl OpenAiProvider {
     pub const OPENAI: Self = Self {
         name: Self::OPENAI_NAME,
         base_url: OPENAI_URL,
+        max_tokens_field: "max_completion_tokens",
         extra_headers: &[],
     };
 
     pub const OPENROUTER: Self = Self {
         name: Self::OPENROUTER_NAME,
         base_url: OPENROUTER_URL,
+        max_tokens_field: "max_tokens",
         extra_headers: &[("HTTP-Referer", "https://havn.dev"), ("X-Title", "havn")],
     };
 }
@@ -75,7 +81,7 @@ impl LlmProvider for OpenAiProvider {
         api_key: &str,
         request: &AnthropicRequest,
     ) -> Result<AnthropicResponse, ProviderError> {
-        let body = anthropic_to_openai(request)
+        let body = anthropic_to_openai(request, self.max_tokens_field)
             .map_err(|e| ProviderError::Translation(format!("request build: {e}")))?;
 
         let mut builder = http.post(self.base_url).bearer_auth(api_key).json(&body);
@@ -121,7 +127,7 @@ impl LlmProvider for OpenAiProvider {
 /// body. Tool uses / results inside content blocks are unwrapped into
 /// OpenAI's split `tool_calls` (assistant) / `role: "tool"` (response)
 /// shape.
-fn anthropic_to_openai(req: &AnthropicRequest) -> Result<Value, String> {
+fn anthropic_to_openai(req: &AnthropicRequest, max_tokens_field: &str) -> Result<Value, String> {
     let mut messages: Vec<Value> = Vec::with_capacity(req.messages.len() + 1);
 
     if let Some(sys) = req.system.as_ref().filter(|s| !s.is_empty()) {
@@ -135,8 +141,8 @@ fn anthropic_to_openai(req: &AnthropicRequest) -> Result<Value, String> {
     let mut body = json!({
         "model": req.model,
         "messages": messages,
-        "max_tokens": req.max_tokens,
     });
+    body[max_tokens_field] = json!(req.max_tokens);
     if let Some(t) = req.temperature {
         body["temperature"] = json!(t);
     }
@@ -346,19 +352,18 @@ fn openai_to_anthropic(raw: &Value) -> Result<AnthropicResponse, String> {
         None => None,
     };
 
-    let usage = raw.get("usage").map_or(
-        AnthropicUsage {
-            input_tokens: 0,
-            output_tokens: 0,
-        },
-        |u| AnthropicUsage {
-            input_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
-            output_tokens: u
-                .get("completion_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        },
-    );
+    // `completion_tokens` includes reasoning tokens and `prompt_tokens`
+    // includes cached ones.
+    let usage = raw
+        .get("usage")
+        .and_then(|u| {
+            Some(AnthropicUsage {
+                input_tokens: u.get("prompt_tokens")?.as_u64()?,
+                output_tokens: u.get("completion_tokens")?.as_u64()?,
+                ..AnthropicUsage::default()
+            })
+        })
+        .unwrap_or_else(AnthropicUsage::unreported);
 
     Ok(AnthropicResponse {
         id,
@@ -395,7 +400,7 @@ mod tests {
             }],
             Some("you are a calc"),
         );
-        let body = anthropic_to_openai(&r).expect("translate");
+        let body = anthropic_to_openai(&r, "max_tokens").expect("translate");
         let messages = body["messages"].as_array().expect("messages array");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "system");
@@ -421,7 +426,7 @@ mod tests {
             }],
             None,
         );
-        let body = anthropic_to_openai(&r).expect("translate");
+        let body = anthropic_to_openai(&r, "max_tokens").expect("translate");
         let messages = body["messages"].as_array().expect("messages");
         assert_eq!(messages.len(), 1);
         let m = &messages[0];
@@ -451,7 +456,7 @@ mod tests {
             }],
             None,
         );
-        let body = anthropic_to_openai(&r).expect("translate");
+        let body = anthropic_to_openai(&r, "max_tokens").expect("translate");
         let messages = body["messages"].as_array().expect("messages");
         // No primary user message (no text), just the tool message.
         assert_eq!(messages.len(), 1);
@@ -476,7 +481,7 @@ mod tests {
                 "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}
             }
         ]));
-        let body = anthropic_to_openai(&r).expect("translate");
+        let body = anthropic_to_openai(&r, "max_tokens").expect("translate");
         let tools = body["tools"].as_array().expect("tools");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");
@@ -505,6 +510,37 @@ mod tests {
         assert_eq!(blocks[0]["text"], "hello!");
         assert_eq!(canon.usage.input_tokens, 12);
         assert_eq!(canon.usage.output_tokens, 4);
+        assert!(!canon.usage.unreported);
+    }
+
+    #[test]
+    fn missing_usage_is_flagged_unreported() {
+        let raw = json!({
+            "id": "gen-1",
+            "model": "vendor/model",
+            "choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}]
+        });
+        assert!(openai_to_anthropic(&raw).expect("parse").usage.unreported);
+        let mut partial = raw.clone();
+        partial["usage"] = json!({"prompt_tokens": 12});
+        assert!(
+            openai_to_anthropic(&partial)
+                .expect("parse")
+                .usage
+                .unreported
+        );
+    }
+
+    #[test]
+    fn max_tokens_field_follows_the_provider() {
+        let r = req(vec![], None);
+        let openai =
+            anthropic_to_openai(&r, OpenAiProvider::OPENAI.max_tokens_field).expect("body");
+        assert_eq!(openai["max_completion_tokens"], 256);
+        assert!(openai.get("max_tokens").is_none());
+        let openrouter =
+            anthropic_to_openai(&r, OpenAiProvider::OPENROUTER.max_tokens_field).expect("body");
+        assert_eq!(openrouter["max_tokens"], 256);
     }
 
     #[test]
