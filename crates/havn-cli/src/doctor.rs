@@ -70,6 +70,8 @@ pub async fn run() -> anyhow::Result<()> {
     mark!(v);
     let v = check_binaries();
     mark!(v);
+    let v = check_landlock();
+    mark!(v);
     let v = check_cgroup_v2();
     mark!(v);
     let v = check_db(&cfg).await;
@@ -200,6 +202,46 @@ fn check_binaries() -> Verdict {
         }
     }
     worst
+}
+
+fn check_landlock() -> Verdict {
+    if !cfg!(target_os = "linux") {
+        return Verdict::Ok;
+    }
+    let allowed = std::env::var("HAVN_ALLOW_NO_LANDLOCK").as_deref() == Ok("1");
+    match std::fs::read_to_string("/sys/kernel/security/lsm") {
+        Ok(lsms) if lsms.split(',').any(|m| m.trim() == "landlock") => {
+            line(Verdict::Ok, "landlock", "enabled");
+            Verdict::Ok
+        }
+        Ok(_) if allowed => {
+            line(
+                Verdict::Warn,
+                "landlock",
+                "not enabled; HAVN_ALLOW_NO_LANDLOCK=1, so agents run without filesystem \
+                 restriction",
+            );
+            Verdict::Warn
+        }
+        Ok(_) => {
+            line(
+                Verdict::Fail,
+                "landlock",
+                "not enabled in this kernel (needs 5.13+ with landlock in the lsm= list); \
+                 agents will refuse to start unless the gateway runs with \
+                 HAVN_ALLOW_NO_LANDLOCK=1",
+            );
+            Verdict::Fail
+        }
+        Err(e) => {
+            line(
+                Verdict::Warn,
+                "landlock",
+                &format!("could not read /sys/kernel/security/lsm: {e}"),
+            );
+            Verdict::Warn
+        }
+    }
 }
 
 fn check_cgroup_v2() -> Verdict {

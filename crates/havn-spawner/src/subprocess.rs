@@ -51,6 +51,13 @@ impl AgentSpawner for SubprocessSpawner {
             .envs(crate::agent_environment(&config.env_passthrough, |name| {
                 std::env::var_os(name)
             }));
+        // Operator opt-out for kernels without Landlock; the runtime
+        // refuses to start without Landlock otherwise. Forwarded on its
+        // own because HAVN_* variables are never passed through.
+        if std::env::var_os("HAVN_ALLOW_NO_LANDLOCK").as_deref() == Some(std::ffi::OsStr::new("1"))
+        {
+            cmd.env("HAVN_ALLOW_NO_LANDLOCK", "1");
+        }
         cmd.arg("--agent-id")
             .arg(config.agent_id.to_string())
             .arg("--gateway-socket")

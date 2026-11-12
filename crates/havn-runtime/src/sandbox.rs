@@ -38,6 +38,10 @@ use tracing::{info, warn};
 /// `/home`, `/root`, `/var`, and `/opt` stay denied.
 const SYSTEM_READ_PATHS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"];
 
+/// Operator opt-out, forwarded by the spawner from the gateway's
+/// environment, for running agents on kernels without Landlock.
+pub const ALLOW_NO_LANDLOCK: &str = "HAVN_ALLOW_NO_LANDLOCK";
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SandboxError {
@@ -135,10 +139,19 @@ pub fn restrict_filesystem(
         RulesetStatus::PartiallyEnforced => {
             warn!("landlock partially enforced (kernel supports a subset of requested ABI)");
         }
-        RulesetStatus::NotEnforced => warn!(
-            "landlock NOT enforced — kernel < 5.13 or LSM disabled. Agent has unrestricted \
-             filesystem access. Recommended: enable Landlock in kernel config or upgrade."
-        ),
+        RulesetStatus::NotEnforced => {
+            if std::env::var_os(ALLOW_NO_LANDLOCK).as_deref() != Some(std::ffi::OsStr::new("1")) {
+                return Err(SandboxError::Landlock(format!(
+                    "Landlock is not enforced (kernel < 5.13 or LSM disabled), so the agent \
+                     would have unrestricted filesystem access; enable Landlock, or set \
+                     {ALLOW_NO_LANDLOCK}=1 for the gateway to run agents without it"
+                )));
+            }
+            warn!(
+                "landlock NOT enforced and {ALLOW_NO_LANDLOCK}=1: the agent has unrestricted \
+                 filesystem access"
+            );
+        }
     }
     Ok(())
 }

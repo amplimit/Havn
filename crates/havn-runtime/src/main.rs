@@ -432,11 +432,24 @@ async fn main() -> anyhow::Result<()> {
         for path in &tmpfs_mounts {
             allow_rw.push(path.as_path());
         }
-        if let Err(e) = sandbox::restrict_filesystem(&args.workspace, &allow_rw, &allow_ro) {
-            warn!(error = %e, "Landlock restriction failed; continuing without LSM enforcement");
-        }
-        if let Err(e) = seccomp::restrict_syscalls(&seccomp_allow_extra) {
-            warn!(error = %e, "seccomp restriction failed; continuing without syscall filtering");
+        // A sandbox layer that cannot be installed is an error, not a
+        // reason to run the agent without it. (A kernel without Landlock
+        // is reported by restrict_filesystem as "not enforced", not here.)
+        sandbox::restrict_filesystem(&args.workspace, &allow_rw, &allow_ro)
+            .map_err(|e| anyhow!("Landlock restriction failed: {e}"))?;
+        match seccomp::restrict_syscalls(&seccomp_allow_extra) {
+            Ok(()) => {}
+            // An operator typo in seccomp.allow_extra must not leave the
+            // agent unfiltered: apply the full blocklist instead.
+            Err(seccomp::SeccompError::UnknownSyscall(name)) => {
+                warn!(
+                    name,
+                    "unknown or unrelaxable seccomp.allow_extra entry; applying the full blocklist"
+                );
+                seccomp::restrict_syscalls(&[])
+                    .map_err(|e| anyhow!("seccomp restriction failed: {e}"))?;
+            }
+            Err(e) => return Err(anyhow!("seccomp restriction failed: {e}")),
         }
     }
 
