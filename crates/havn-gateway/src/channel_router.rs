@@ -304,12 +304,16 @@ impl OutboundRefusal {
 pub fn outbound_permitted(
     bindings: &[ChannelBindingConfig],
     channels: &std::collections::BTreeMap<String, ChannelEntry>,
-    agent_id: &str,
+    agent_id: havn_core::AgentId,
     channel: &str,
     account_id: &str,
     recipient: &str,
 ) -> Result<(), OutboundRefusal> {
-    if agent_for_account(bindings, channel, account_id) != Some(agent_id) {
+    // Parse the configured id the same way inbound routing does, so
+    // uppercase or otherwise non-canonical UUIDs in config still match.
+    let bound = agent_for_account(bindings, channel, account_id)
+        .and_then(|id| <havn_core::AgentId as std::str::FromStr>::from_str(id).ok());
+    if bound != Some(agent_id) {
         return Err(OutboundRefusal::NotBound);
     }
     let account = channels
@@ -569,42 +573,56 @@ mod tests {
 
     #[test]
     fn outbound_requires_binding_to_the_account() {
-        let bs = vec![binding("a1", "telegram", "bot")];
+        let (a1, a2) = (havn_core::AgentId::new(), havn_core::AgentId::new());
+        let bs = vec![binding(&a1.to_string(), "telegram", "bot")];
         let chs = channels_with("bot", DmPolicy::Open, &[]);
         assert_eq!(
-            outbound_permitted(&bs, &chs, "a2", "telegram", "bot", "123"),
+            outbound_permitted(&bs, &chs, a2, "telegram", "bot", "123"),
             Err(OutboundRefusal::NotBound)
         );
         assert_eq!(
-            outbound_permitted(&bs, &chs, "a1", "telegram", "other-bot", "123"),
+            outbound_permitted(&bs, &chs, a1, "telegram", "other-bot", "123"),
             Err(OutboundRefusal::NotBound)
         );
         assert_eq!(
-            outbound_permitted(&bs, &chs, "a1", "telegram", "bot", "123"),
+            outbound_permitted(&bs, &chs, a1, "telegram", "bot", "123"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn outbound_matches_non_canonical_binding_ids() {
+        let a1 = havn_core::AgentId::new();
+        let bs = vec![binding(&a1.to_string().to_uppercase(), "telegram", "bot")];
+        let chs = channels_with("bot", DmPolicy::Open, &[]);
+        assert_eq!(
+            outbound_permitted(&bs, &chs, a1, "telegram", "bot", "123"),
             Ok(())
         );
     }
 
     #[test]
     fn outbound_under_allowlist_only_reaches_allowed_senders() {
-        let bs = vec![binding("a1", "telegram", "bot")];
+        let a1 = havn_core::AgentId::new();
+        let bs = vec![binding(&a1.to_string(), "telegram", "bot")];
         let chs = channels_with("bot", DmPolicy::Allowlist, &["111"]);
         assert_eq!(
-            outbound_permitted(&bs, &chs, "a1", "telegram", "bot", "111"),
+            outbound_permitted(&bs, &chs, a1, "telegram", "bot", "111"),
             Ok(())
         );
         assert_eq!(
-            outbound_permitted(&bs, &chs, "a1", "telegram", "bot", "999"),
+            outbound_permitted(&bs, &chs, a1, "telegram", "bot", "999"),
             Err(OutboundRefusal::RecipientNotAllowed)
         );
     }
 
     #[test]
     fn outbound_to_unconfigured_account_is_refused() {
-        let bs = vec![binding("a1", "telegram", "bot")];
+        let a1 = havn_core::AgentId::new();
+        let bs = vec![binding(&a1.to_string(), "telegram", "bot")];
         let chs = std::collections::BTreeMap::new();
         assert_eq!(
-            outbound_permitted(&bs, &chs, "a1", "telegram", "bot", "111"),
+            outbound_permitted(&bs, &chs, a1, "telegram", "bot", "111"),
             Err(OutboundRefusal::UnknownAccount)
         );
     }

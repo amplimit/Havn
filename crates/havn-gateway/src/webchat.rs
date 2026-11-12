@@ -28,9 +28,8 @@ pub struct WebChatRouter {
 
 #[derive(Debug)]
 struct Session {
-    /// Agent the session is bound to. Used by `agent_for_session` for the
-    /// dashboard's agent-status surface; no other code currently reads it.
-    #[allow(dead_code, reason = "consumed by upcoming dashboard endpoints")]
+    /// Agent the session is bound to. Only that agent's messages are
+    /// delivered to it.
     agent_id: AgentId,
     tx: mpsc::Sender<ServerMessage>,
 }

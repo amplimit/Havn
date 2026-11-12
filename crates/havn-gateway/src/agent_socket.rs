@@ -50,8 +50,8 @@ pub struct AgentSocketCtx {
     /// ChannelRouter::deliver`] when an agent's `OutboundMessage` carries
     /// a channel-adapter `channel_id` (decoded via `channel_id_codec`).
     pub channel_router: crate::channel_router::ChannelRouter,
-    /// `[[bindings]]` and `[[channels]]` startup snapshots (shared with
-    /// `AppState`). Outbound channel messages are only delivered through
+    /// `[[bindings]]` and `[[channels]]` startup snapshots (taken from the
+    /// same config as `AppState`'s). Outbound channel messages are only delivered through
     /// accounts bound to the sending agent, to recipients its account's
     /// `dm_policy` allows.
     pub bindings: Arc<Vec<crate::config::ChannelBindingConfig>>,
@@ -292,7 +292,7 @@ where
                     if let Err(refusal) = crate::channel_router::outbound_permitted(
                         &ctx.bindings,
                         &ctx.channels,
-                        &agent_id.to_string(),
+                        agent_id,
                         channel,
                         account_id,
                         sender_id,

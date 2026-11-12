@@ -177,6 +177,8 @@ Havn ships a stable HTTP + WebSocket protocol at `/api/v1/channel` for external 
 | Slack | — | Planned |
 | Discord | — | Planned |
 
+An agent can only send through the channel accounts that `[[bindings]]` binds to it. With an account's `dm_policy = "allowlist"` (the default) it can only message senders in `allow_from`; with `dm_policy = "open"` it can message anyone the bot can reach on that platform, so use `open` only for bots meant to be public.
+
 ## Capability Packs
 
 Some agent workloads need capabilities havn doesn't build into core (browser, code interpreter, vendor CLI). Havn provides generic primitives — bind mounts, tmpfs mounts, seccomp allowances — and external capability packs wire them together. Packs live in separate repositories and install under `/opt/havn/<pack>/`.
