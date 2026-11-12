@@ -398,8 +398,17 @@ mod tests {
             restrict_syscalls(&[]).expect("install filter");
             let mut nr: i64 = 20; // getpid in the i386 table
             // SAFETY: int 0x80 with eax=20 is the i386 getpid syscall; it takes
-            // no arguments and only clobbers eax.
-            unsafe { std::arch::asm!("int 0x80", inout("rax") nr) };
+            // no arguments. Kernels before 4.17 also zeroed r8-r11.
+            unsafe {
+                std::arch::asm!(
+                    "int 0x80",
+                    inout("rax") nr,
+                    lateout("r8") _,
+                    lateout("r9") _,
+                    lateout("r10") _,
+                    lateout("r11") _,
+                );
+            }
             // Reaching this line means the call was allowed.
             std::process::exit(i32::from(nr < 0));
         }
@@ -409,6 +418,11 @@ mod tests {
             .env(PROBE, "1")
             .status()
             .expect("run probe");
-        assert_eq!(status.signal(), Some(libc::SIGSYS), "{status:?}");
+        // SIGSYS: the filter killed it. SIGSEGV: the kernel has no 32-bit
+        // syscall entry at all (ia32 emulation off), which also refuses it.
+        assert!(
+            matches!(status.signal(), Some(libc::SIGSYS | libc::SIGSEGV)),
+            "{status:?}"
+        );
     }
 }
