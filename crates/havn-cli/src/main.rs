@@ -138,12 +138,16 @@ enum UserAction {
         #[arg(long)]
         display_name: String,
     },
-    /// Attach or replace the external id of an existing user.
+    /// Attach, replace or clear the external id of an existing user.
     SetExternalId {
         /// Internal user id (UUID v7).
         id: String,
         /// Username or email the upstream proxy emits.
-        external_id: String,
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        external_id: Option<String>,
+        /// Remove the external id instead of setting one.
+        #[arg(long)]
+        clear: bool,
     },
     /// List all provisioned users.
     List,
@@ -368,9 +372,9 @@ async fn run_user(action: UserAction) -> anyhow::Result<()> {
             external_id,
             display_name,
         } => user::add(id.as_deref(), external_id.as_deref(), &display_name).await,
-        UserAction::SetExternalId { id, external_id } => {
-            user::set_external_id(&id, &external_id).await
-        }
+        UserAction::SetExternalId {
+            id, external_id, ..
+        } => user::set_external_id(&id, external_id.as_deref()).await,
         UserAction::List => user::list().await,
         UserAction::Delete { id } => user::delete(&id).await,
     }

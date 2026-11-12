@@ -125,14 +125,18 @@ pub async fn add(
     Ok(())
 }
 
-pub async fn set_external_id(id: &str, external_id: &str) -> anyhow::Result<()> {
+pub async fn set_external_id(id: &str, external_id: Option<&str>) -> anyhow::Result<()> {
     let user_id = parse_user_id(id)?;
     let pool = open_db().await?;
-    let user = match users::set_external_id(&pool, user_id, external_id).await {
+    let previous = match users::set_external_id(&pool, user_id, external_id).await {
         Err(DbError::NotFound) => anyhow::bail!("no user with id {user_id}"),
-        other => other.map_err(|e| explain(e, Some(external_id)))?,
+        other => other.map_err(|e| explain(e, external_id))?,
     };
-    println!("user {} now has external id {external_id}", user.id);
+    let previous = previous.as_deref().unwrap_or("none");
+    match external_id {
+        Some(ext) => println!("user {user_id}: external id {ext} (was {previous})"),
+        None => println!("user {user_id}: external id cleared (was {previous})"),
+    }
     Ok(())
 }
 

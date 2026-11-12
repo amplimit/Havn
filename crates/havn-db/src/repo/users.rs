@@ -8,6 +8,8 @@
 //! hash, no email-verification state, no recovery token. Email and
 //! auth_provider columns were dropped in migration 0003.
 
+use std::str::FromStr as _;
+
 use chrono::{DateTime, Utc};
 use havn_core::UserId;
 use sqlx::SqlitePool;
@@ -62,9 +64,15 @@ pub async fn create_with_id(
     find_by_id(pool, id).await?.ok_or(DbError::NotFound)
 }
 
-/// Attach (or replace) the external identity of an existing user.
-pub async fn set_external_id(pool: &SqlitePool, id: UserId, external_id: &str) -> Result<User> {
-    check_external_id(Some(external_id))?;
+/// Attach, replace or (with `None`) clear the external identity of an
+/// existing user. Returns the previous value.
+pub async fn set_external_id(
+    pool: &SqlitePool,
+    id: UserId,
+    external_id: Option<&str>,
+) -> Result<Option<String>> {
+    check_external_id(external_id)?;
+    let previous = find_by_id(pool, id).await?.ok_or(DbError::NotFound)?;
     let res = sqlx::query("UPDATE users SET external_id = ?2 WHERE id = ?1")
         .bind(id.to_string())
         .bind(external_id)
@@ -74,22 +82,33 @@ pub async fn set_external_id(pool: &SqlitePool, id: UserId, external_id: &str) -
     if res.rows_affected() == 0 {
         return Err(DbError::NotFound);
     }
-    find_by_id(pool, id).await?.ok_or(DbError::NotFound)
+    Ok(previous.external_id)
 }
 
-// The gateway trims header values, and header values cannot carry control
-// characters, so such an identity could never be matched.
+// The gateway sees a trimmed header value of visible ASCII; Node joins a
+// repeated header with ", "; and any UUID form could be confused with an
+// internal user id. Values outside these rules could never match safely.
 fn check_external_id(external_id: Option<&str>) -> Result<()> {
-    match external_id {
-        Some(v) if v.is_empty() || v.trim() != v || v.chars().any(char::is_control) => {
-            Err(DbError::InvalidValue {
-                column: "users.external_id",
-                message: format!(
-                    "{v:?} must be non-empty, without surrounding whitespace or control characters"
-                ),
-            })
-        }
-        _ => Ok(()),
+    let Some(v) = external_id else {
+        return Ok(());
+    };
+    let problem = if v.is_empty() || v.trim() != v {
+        Some("must be non-empty, without surrounding whitespace")
+    } else if !v.bytes().all(|b| b == b' ' || b.is_ascii_graphic()) {
+        Some("may only contain visible ASCII characters and inner spaces")
+    } else if v.contains(',') {
+        Some("may not contain a comma")
+    } else if UserId::from_str(v).is_ok() {
+        Some("may not be a UUID, which would be confused with an internal user id")
+    } else {
+        None
+    };
+    match problem {
+        Some(problem) => Err(DbError::InvalidValue {
+            column: "users.external_id",
+            message: format!("{v:?} {problem}"),
+        }),
+        None => Ok(()),
     }
 }
 
@@ -280,7 +299,7 @@ mod tests {
         let other = create_with_id(&pool, UserId::new(), "c", None)
             .await
             .expect("no external id");
-        let taken = set_external_id(&pool, other.id, "alice").await;
+        let taken = set_external_id(&pool, other.id, Some("alice")).await;
         assert!(
             matches!(taken, Err(DbError::Conflict("users.external_id"))),
             "got {taken:?}"
@@ -294,28 +313,62 @@ mod tests {
     async fn set_external_id_links_existing_user() {
         let pool = connect_in_memory().await.expect("connect");
         let user = ensure_default(&pool).await.expect("bootstrap");
-        set_external_id(&pool, user.id, "ops@example.com")
+        let previous = set_external_id(&pool, user.id, Some("ops@example.com"))
             .await
             .expect("set");
+        assert_eq!(previous, None);
         let found = find_by_external_id(&pool, "ops@example.com")
             .await
             .expect("find")
             .expect("some");
         assert_eq!(found.id, user.id);
-        let missing = set_external_id(&pool, UserId::new(), "x").await;
+        let previous = set_external_id(&pool, user.id, Some("ops"))
+            .await
+            .expect("replace");
+        assert_eq!(previous.as_deref(), Some("ops@example.com"));
+        let previous = set_external_id(&pool, user.id, None).await.expect("clear");
+        assert_eq!(previous.as_deref(), Some("ops"));
+        assert!(
+            find_by_external_id(&pool, "ops")
+                .await
+                .expect("find")
+                .is_none()
+        );
+        let missing = set_external_id(&pool, UserId::new(), Some("x")).await;
         assert!(matches!(missing, Err(DbError::NotFound)), "got {missing:?}");
     }
 
     #[tokio::test]
     async fn unusable_external_ids_are_refused() {
         let pool = connect_in_memory().await.expect("connect");
-        for bad in ["", " alice", "alice ", "al\tice"] {
+        let existing = ensure_default(&pool)
+            .await
+            .expect("bootstrap")
+            .id
+            .to_string();
+        let urn = format!("urn:uuid:{existing}");
+        let upper = existing.to_uppercase();
+        for bad in [
+            "",
+            " alice",
+            "alice ",
+            "al\tice",
+            "j\u{f6}rg@example.com",
+            "alice, bob",
+            existing.as_str(),
+            upper.as_str(),
+            urn.as_str(),
+            "4a1f0c528f3e4b8e9d550c6a2b1e7f10",
+        ] {
             let res = create_with_id(&pool, UserId::new(), "x", Some(bad)).await;
             assert!(
                 matches!(res, Err(DbError::InvalidValue { .. })),
                 "{bad:?}: {res:?}"
             );
         }
+        create_with_id(&pool, UserId::new(), "x", Some("Alice Smith"))
+            .await
+            .expect("inner space is fine");
     }
 
     #[tokio::test]
@@ -355,7 +408,7 @@ mod tests {
         let user = find_by_id(&pool, id).await.expect("find").expect("some");
         assert_eq!(user.display_name, "old");
         assert_eq!(user.external_id, None);
-        set_external_id(&pool, id, "old@example.com")
+        set_external_id(&pool, id, Some("old@example.com"))
             .await
             .expect("set on migrated row");
     }

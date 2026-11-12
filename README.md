@@ -172,13 +172,11 @@ listen = "0.0.0.0:8080"
 
 [trust_header]
 enabled = true
-# Peers allowed to set the identity header; everyone else gets 403.
-# Empty means loopback only (a proxy on the same host).
-allowed_proxies = ["127.0.0.1/32"]
+# Peers allowed to set the identity header (the address your proxy
+# connects from); everyone else gets 403. Empty means loopback only.
+allowed_proxies = ["192.0.2.10/32"]
 # Header carrying the user's identity (default "X-User-ID").
 header = "X-Forwarded-Email"
-# Match header values against external ids only (see below).
-match_user_id = false
 ```
 
 In trust-header (multi-user) mode:
@@ -194,10 +192,10 @@ Cron jobs may carry a `wake_check` script. It runs on the host as the dedicated 
 
 The gateway reads the user's identity from one header, `trust_header.header` (default `X-User-ID`), and only on connections from an `allowed_proxies` peer. It resolves the value to a havn user in this order:
 
-1. When `match_user_id = true` (the default) and the value is a UUID: the user with that internal id.
-2. The user whose external id equals the value. Matching is exact and case-sensitive: `Alice@example.com` and `alice@example.com` are different identities, so provision the value exactly as your proxy emits it.
+1. When `match_user_id` is on and the value is an internal user id in canonical form (lowercase, hyphenated): that user. `match_user_id` defaults to on for `X-User-ID` and off for any other header. Turn it on for another header only if users cannot choose their own names at the identity provider, otherwise a user could take another user's internal id as their name.
+2. The user whose external id equals the value. Matching is exact and case-sensitive: `Alice@example.com` and `alice@example.com` are different identities, so provision the value exactly as your proxy emits it. External ids are visible ASCII (inner spaces allowed), without commas, and cannot be UUIDs.
 
-Anything else gets 403; users are never created on the fly. A request carrying the header more than once is refused. Set `match_user_id = false` whenever users can choose their own username at the identity provider, otherwise a user could pick another user's internal id as their name.
+Anything else gets 403; users are never created on the fly. A request carrying the header more than once is refused. The header name cannot be one HTTP already uses (`Host`, `Cookie`, `Authorization`, `Connection`, ...).
 
 Provision users with the value the proxy will send:
 
@@ -206,17 +204,18 @@ havn user add --external-id alice@example.com --display-name "Alice"   # generat
 havn user add 0190a3c4-... --display-name "Bob"                         # internal id only (X-User-ID setups)
 havn user list                                                          # id, name, external id
 havn user set-external-id <existing-id> ops@example.com                 # e.g. the single-user bootstrap user
+havn user set-external-id <existing-id> --clear
 ```
 
-The dashboard forwards the same header to the gateway. Give it the same name in `HAVN_DASHBOARD_IDENTITY_HEADER`, and list the address the SSO proxy connects from in `HAVN_DASHBOARD_TRUSTED_PROXIES`; it drops the header, and other common identity headers such as `Remote-User` and `X-Forwarded-Email`, from every other peer, and drops `X-User-ID` from every peer when another header is configured. When the dashboard runs on the gateway host, the gateway sees the dashboard as a loopback peer, so `allowed_proxies = ["127.0.0.1/32"]` covers it. Route both the UI and `/api` and `/ws` through the SSO proxy, without unauthenticated paths: a path the proxy skips would pass through whatever header the client sent.
+The dashboard asks the gateway for the header name at startup (`GET /auth/info`) and forwards that header only from the addresses in `HAVN_DASHBOARD_TRUSTED_PROXIES`. It drops other common identity headers such as `X-User-ID`, `Remote-User` and `X-Forwarded-Email` from every peer, and refuses `/api` and `/ws` requests while it does not know the name. `HAVN_DASHBOARD_IDENTITY_HEADER` is optional; when set, the dashboard refuses to start if the gateway reads another header. When the dashboard runs on the gateway host, the gateway sees the dashboard as a loopback peer, so `allowed_proxies = ["127.0.0.1/32"]` and `listen = "127.0.0.1:8080"` cover it. Route both the UI and `/api` and `/ws` through the SSO proxy, without unauthenticated paths: a path the proxy skips would pass through whatever header the client sent.
 
 #### oauth2-proxy
 
-oauth2-proxy in front of the dashboard, all on one host. `--pass-user-headers` (on by default) makes oauth2-proxy replace `X-Forwarded-User` and `X-Forwarded-Email` on every request it forwards upstream, WebSocket upgrades included:
+oauth2-proxy (a current v7 release) in front of the dashboard, all on one host, with a TLS-terminating proxy in front of oauth2-proxy. `--pass-user-headers` (on by default) makes oauth2-proxy replace `X-Forwarded-User` and `X-Forwarded-Email` on every request it forwards upstream, WebSocket upgrades included:
 
 ```sh
 oauth2-proxy \
-  --http-address=0.0.0.0:4180 \
+  --http-address=127.0.0.1:4180 \
   --upstream=http://127.0.0.1:3000/ \
   --provider=oidc --oidc-issuer-url=https://sso.example.com \
   --client-id=havn --client-secret-file=/etc/oauth2-proxy/client-secret \
@@ -230,18 +229,19 @@ npm start   # in apps/dashboard
 ```
 
 ```toml
+listen = "127.0.0.1:8080"
+
 [trust_header]
 enabled = true
 allowed_proxies = ["127.0.0.1/32"]
 header = "X-Forwarded-Email"
-match_user_id = false
 ```
 
 ```sh
 havn user add --external-id alice@example.com --display-name "Alice"
 ```
 
-To key users on the provider's user id instead of the email, use `X-Forwarded-User` in both places and provision the value oauth2-proxy logs for each user. When oauth2-proxy runs as an nginx `auth_request` endpoint instead of in front of the dashboard, start it with `--set-xauthrequest` and copy its `X-Auth-Request-Email` response header into the forwarded request as in the next recipe.
+`X-Forwarded-User` carries the OIDC `sub` claim. Many providers (Keycloak, Authentik) use a UUID there, which cannot be an external id, so key users on the email. When oauth2-proxy runs as an nginx `auth_request` endpoint instead of in front of the dashboard, start it with `--set-xauthrequest` and copy its `X-Auth-Request-Email` response header into the forwarded request as in the next recipe.
 
 #### nginx `auth_request` with Authelia
 
@@ -265,7 +265,6 @@ location / {
     error_page 401 =302 $redirection_url;
 
     proxy_set_header Remote-User $user;
-    proxy_set_header X-User-ID "";
     proxy_set_header Host $host;
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
@@ -279,18 +278,19 @@ HAVN_DASHBOARD_TRUSTED_PROXIES=127.0.0.1 HAVN_DASHBOARD_IDENTITY_HEADER=Remote-U
 ```
 
 ```toml
+listen = "127.0.0.1:8080"
+
 [trust_header]
 enabled = true
 allowed_proxies = ["127.0.0.1/32"]
 header = "Remote-User"
-match_user_id = false
 ```
 
 ```sh
 havn user add --external-id alice --display-name "Alice"   # the Authelia username
 ```
 
-The same pattern works for Cloudflare Access (`header = "Cf-Access-Authenticated-User-Email"`, with `allowed_proxies` set to the address `cloudflared` connects from) and any other proxy that replaces a header with the authenticated user's name.
+The same pattern works for any other proxy that replaces a header with the authenticated user's name. With Cloudflare Access, use `header = "Cf-Access-Authenticated-User-Email"` and set `allowed_proxies` to the address `cloudflared` connects from. havn does not check the `Cf-Access-Jwt-Assertion` token, so the origin must be reachable only through `cloudflared`, and an Access bypass policy forwards requests nobody has authenticated.
 
 ## Channel Adapters
 

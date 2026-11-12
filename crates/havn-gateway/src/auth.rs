@@ -7,8 +7,9 @@
 //!    — when `gateway.trust_header.enabled` is true (configured for
 //!    deployments behind a reverse proxy that handles login). The header
 //!    value is looked up in the `users` table, as an internal user id
-//!    (when `match_user_id`) and then as an `external_id`; unknown
-//!    subjects get `403` and are never provisioned on the fly.
+//!    (when `match_user_id`, canonical form only) and then as an
+//!    `external_id`; unknown subjects get `403` and are never
+//!    provisioned on the fly.
 //! 2. **Single-user loopback fallback** — when `trust_header` is off,
 //!    the gateway is bound to loopback only and every request is
 //!    attributed to the bootstrap user (`users::ensure_default`). This
@@ -24,7 +25,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 
-use axum::extract::{ConnectInfo, FromRef as _, FromRequestParts};
+use axum::Json;
+use axum::extract::{ConnectInfo, FromRef as _, FromRequestParts, State};
 use axum::http::HeaderName;
 use axum::http::request::Parts;
 use havn_core::UserId;
@@ -34,6 +36,23 @@ use tracing::{debug, warn};
 use crate::AppState;
 use crate::api::ApiError;
 use crate::config::TrustHeaderConfig;
+
+pub const DEFAULT_HEADER: &str = "x-user-id";
+
+// Names a proxy or HTTP itself gives another meaning; carrying identity in
+// one of them would break requests or let the client's value through.
+const RESERVED_HEADERS: &[&str] = &[
+    "authorization",
+    "connection",
+    "content-length",
+    "cookie",
+    "host",
+    "origin",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
 
 #[derive(Debug, Clone)]
 pub struct IdentityHeader {
@@ -49,11 +68,29 @@ impl IdentityHeader {
                 cfg.header
             )
         })?;
+        if RESERVED_HEADERS.contains(&name.as_str()) {
+            return Err(format!(
+                "trust_header.header {:?} has its own meaning in HTTP; pick a dedicated header",
+                cfg.header
+            ));
+        }
+        // Internal ids are matched only on the default header unless the
+        // operator opts in: SSO usernames may be chosen by the users.
+        let match_user_id = cfg.match_user_id.unwrap_or(name.as_str() == DEFAULT_HEADER);
         Ok(Self {
             name,
-            match_user_id: cfg.match_user_id,
+            match_user_id,
         })
     }
+}
+
+/// `GET /auth/info`: the identity header name, so the dashboard proxy can
+/// forward exactly that header. Not a secret, served without identity.
+pub async fn info(State(app): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "identity_header": app.identity.name.as_str(),
+        "trust_header": app.trusted_proxies.is_some(),
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,18 +262,23 @@ pub async fn resolve(parts: &Parts, app: &AppState) -> Result<AuthedUser, ApiErr
                 "{header} header sent more than once; the upstream proxy must replace it"
             )));
         }
-        let raw = first
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
+        let raw = match first.map(|v| v.to_str().map(str::trim)) {
+            Some(Ok(raw)) if !raw.is_empty() => Some(raw),
+            Some(Err(_)) => {
+                return Err(ApiError::Forbidden(format!(
+                    "invalid {header} header value: only visible ASCII is accepted"
+                )));
+            }
+            _ => None,
+        };
         if let Some(raw) = raw {
             // Unknown and malformed values get the same Forbidden so a
             // probing client can't tell them apart.
             let user = lookup(app, raw).await?.ok_or_else(|| {
                 ApiError::Forbidden(format!(
-                    "no user provisioned for {header} {raw:?}; operator must run \
+                    "no user provisioned for this {header} value; operator must run \
                      `havn user add --external-id <value> --display-name \"...\"` \
-                     before this header is accepted"
+                     before it is accepted"
                 ))
             })?;
             return Ok(user.into());
@@ -281,8 +323,11 @@ pub async fn resolve(parts: &Parts, app: &AppState) -> Result<AuthedUser, ApiErr
 }
 
 async fn lookup(app: &AppState, raw: &str) -> Result<Option<User>, ApiError> {
+    // Only the canonical lowercase hyphenated form matches an internal id;
+    // the parser also accepts braces, `urn:uuid:`, uppercase and bare hex.
     if app.identity.match_user_id
         && let Ok(id) = UserId::from_str(raw)
+        && id.to_string() == raw
         && let Some(user) = users::find_by_id(&app.db, id).await?
     {
         return Ok(Some(user));
@@ -445,7 +490,7 @@ pub(crate) mod tests {
             .id
     }
 
-    fn with_header(app: &mut AppState, name: &str, match_user_id: bool) {
+    fn with_header(app: &mut AppState, name: &str, match_user_id: Option<bool>) {
         app.identity = IdentityHeader::from_config(&TrustHeaderConfig {
             header: name.into(),
             match_user_id,
@@ -468,18 +513,67 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn uuid_shaped_external_id_resolves() {
+    async fn non_canonical_user_id_is_refused() {
+        let (app, bs) = state_with(true).await;
+        let canonical = bs.to_string();
+        let simple = canonical.replace('-', "");
+        for raw in [
+            canonical.to_uppercase(),
+            format!("{{{canonical}}}"),
+            format!("urn:uuid:{canonical}"),
+            simple,
+        ] {
+            let parts = parts_with_header(HEADER_NAME, &raw);
+            let err = resolve(&parts, &app).await.expect_err(&raw);
+            assert!(matches!(err, ApiError::Forbidden(_)), "{raw}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn non_ascii_header_value_is_invalid_not_missing() {
         let (app, _bs) = state_with(true).await;
-        let sub = "4a1f0c52-8f3e-4b8e-9d55-0c6a2b1e7f10";
-        let user = add_external(&app, sub).await;
-        let parts = parts_with_header(HEADER_NAME, sub);
-        assert_eq!(resolve(&parts, &app).await.expect("ok").id, user);
+        let mut parts = parts_no_header();
+        parts.headers.insert(
+            HEADER_NAME,
+            axum::http::HeaderValue::from_bytes("j\u{f6}rg".as_bytes()).expect("value"),
+        );
+        let err = resolve(&parts, &app).await.expect_err("non-ascii");
+        assert!(
+            matches!(&err, ApiError::Forbidden(m) if m.contains("invalid")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_header_does_not_match_user_ids_by_default() {
+        let (mut app, bs) = state_with(true).await;
+        app.identity = IdentityHeader::from_config(&TrustHeaderConfig {
+            header: "X-Forwarded-User".into(),
+            ..TrustHeaderConfig::default()
+        })
+        .expect("header");
+        assert!(!app.identity.match_user_id);
+        let parts = parts_with_header("X-Forwarded-User", &bs.to_string());
+        let err = resolve(&parts, &app).await.expect_err("internal id");
+        assert!(matches!(err, ApiError::Forbidden(_)), "{err:?}");
+        with_header(&mut app, "X-Forwarded-User", Some(true));
+        let parts = parts_with_header("X-Forwarded-User", &bs.to_string());
+        assert_eq!(resolve(&parts, &app).await.expect("opted in").id, bs);
+    }
+
+    #[tokio::test]
+    async fn info_reports_the_identity_header() {
+        let (mut app, _bs) = state_with(true).await;
+        with_header(&mut app, "Remote-User", None);
+        let Json(body) = info(State(app)).await;
+        assert_eq!(body["identity_header"], "remote-user");
+        assert_eq!(body["trust_header"], true);
     }
 
     #[tokio::test]
     async fn custom_header_name_is_used() {
         let (mut app, _bs) = state_with(true).await;
-        with_header(&mut app, "X-Forwarded-User", true);
+        with_header(&mut app, "X-Forwarded-User", None);
         let alice = add_external(&app, "alice").await;
         let parts = parts_with_header("X-Forwarded-User", "alice");
         assert_eq!(resolve(&parts, &app).await.expect("ok").id, alice);
@@ -494,7 +588,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn custom_header_from_untrusted_peer_is_ignored() {
         let (mut app, _bs) = state_with(true).await;
-        with_header(&mut app, "Remote-User", true);
+        with_header(&mut app, "Remote-User", None);
         add_external(&app, "alice").await;
         let parts = from_peer(
             parts_with_header("Remote-User", "alice"),
@@ -507,13 +601,13 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn match_user_id_false_only_matches_external_ids() {
         let (mut app, bs) = state_with(true).await;
-        with_header(&mut app, "X-Forwarded-User", false);
+        with_header(&mut app, "X-Forwarded-User", Some(false));
         let parts = parts_with_header("X-Forwarded-User", &bs.to_string());
         let err = resolve(&parts, &app)
             .await
             .expect_err("internal id refused");
         assert!(matches!(err, ApiError::Forbidden(_)), "{err:?}");
-        havn_db::repo::users::set_external_id(&app.db, bs, "ops")
+        havn_db::repo::users::set_external_id(&app.db, bs, Some("ops"))
             .await
             .expect("link");
         let parts = parts_with_header("X-Forwarded-User", "ops");
@@ -536,11 +630,15 @@ pub(crate) mod tests {
 
     #[test]
     fn invalid_header_name_is_rejected() {
-        let cfg = TrustHeaderConfig {
-            header: "X User".into(),
-            ..TrustHeaderConfig::default()
-        };
-        assert!(IdentityHeader::from_config(&cfg).is_err());
+        for name in ["X User", "Host", "cookie", "Authorization", "Connection"] {
+            let cfg = TrustHeaderConfig {
+                header: name.into(),
+                ..TrustHeaderConfig::default()
+            };
+            assert!(IdentityHeader::from_config(&cfg).is_err(), "{name}");
+        }
+        let default = IdentityHeader::from_config(&TrustHeaderConfig::default()).expect("default");
+        assert!(default.match_user_id);
     }
 
     #[tokio::test]

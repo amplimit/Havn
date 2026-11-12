@@ -509,11 +509,11 @@ pub struct TrustHeaderConfig {
     /// `X-Forwarded-User`, `Remote-User` or
     /// `Cf-Access-Authenticated-User-Email`.
     pub header: String,
-    /// `true` lets a header value that is a UUID match an internal user id
-    /// before external ids are tried. Set `false` when the proxy emits
-    /// usernames or emails that users can choose themselves, so nobody can
-    /// pick another user's internal id as their name.
-    pub match_user_id: bool,
+    /// `true` lets a header value that is a canonical UUID match an internal
+    /// user id before external ids are tried. Unset means `true` for the
+    /// default `X-User-ID` header and `false` for any other: usernames an
+    /// SSO lets users choose must never resolve to another user's id.
+    pub match_user_id: Option<bool>,
 }
 
 impl Default for TrustHeaderConfig {
@@ -522,7 +522,7 @@ impl Default for TrustHeaderConfig {
             enabled: false,
             allowed_proxies: Vec::new(),
             header: "X-User-ID".into(),
-            match_user_id: true,
+            match_user_id: None,
         }
     }
 }
@@ -549,7 +549,7 @@ mod tests {
         assert!(parsed.channels.is_empty());
         assert!(parsed.bindings.is_empty());
         assert_eq!(parsed.trust_header.header, "X-User-ID");
-        assert!(parsed.trust_header.match_user_id);
+        assert_eq!(parsed.trust_header.match_user_id, None);
     }
 
     #[test]
@@ -559,7 +559,7 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(parsed.trust_header.header, "X-Forwarded-User");
-        assert!(!parsed.trust_header.match_user_id);
+        assert_eq!(parsed.trust_header.match_user_id, Some(false));
         assert!(parsed.trust_header.allowed_proxies.is_empty());
     }
 

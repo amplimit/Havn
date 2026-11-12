@@ -68,11 +68,12 @@ enabled = false
 allowed_proxies = []
 # Header carrying the identity, e.g. "X-Forwarded-User", "Remote-User",
 # "Cf-Access-Authenticated-User-Email". Values are matched exactly
-# (case-sensitive) against user ids and `--external-id` values.
+# (case-sensitive) against `--external-id` values.
 header = "X-User-ID"
-# Set false when the proxy emits usernames users can choose themselves,
-# so a value is only ever matched against external ids.
-match_user_id = true
+# Whether a value may also match an internal user id (canonical UUID).
+# Unset: true for X-User-ID, false for any other header. Only enable it
+# for another header if users cannot choose their own names at the SSO.
+# match_user_id = true
 "#,
             listen = self.listen,
             db = db.display().to_string(),

@@ -450,6 +450,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/auth/info", get(auth::info))
         .route("/me", get(api::me::get))
         .route("/me/audit-log", get(api::audit::list_for_self))
         .route(
