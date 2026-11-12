@@ -648,8 +648,8 @@ async fn handle_agent_query(caller_id: AgentId, query: AgentQuery, ctx: AgentSoc
     // lookup) only get tracing warnings — they describe an impossible
     // state (a connected agent absent from the agents table) so we
     // don't have a user to attribute against.
-    let caller_owner = match havn_db::repo::agents::find_by_id(&ctx.db, caller_id).await {
-        Ok(Some(a)) => a.owner_id,
+    let caller_agent = match havn_db::repo::agents::find_by_id(&ctx.db, caller_id).await {
+        Ok(Some(a)) => a,
         Ok(None) => {
             warn!(%caller_id, "agent_query from unknown caller agent");
             send_query_error(
@@ -673,6 +673,31 @@ async fn handle_agent_query(caller_id: AgentId, query: AgentQuery, ctx: AgentSoc
             return;
         }
     };
+
+    let caller_owner = caller_agent.owner_id;
+
+    // The runtime only offers the agent_query tool when the policy allows
+    // it, but the frame comes from inside the sandbox, so the gateway has
+    // to enforce the same rule itself.
+    let caller_policy = policy_resolver::for_session(&ctx.db, &caller_agent, ctx.multi_user).await;
+    if !caller_policy.permissions.can_query_other_agents {
+        send_query_error(
+            &ctx,
+            caller_id,
+            request_id.clone(),
+            "querying other agents is not permitted by this agent's policy".into(),
+        )
+        .await;
+        audit_pre_dispatch(
+            &ctx,
+            caller_id,
+            caller_owner,
+            &query.target_agent_id,
+            "permission_denied",
+        )
+        .await;
+        return;
+    }
 
     let target_id = match AgentId::from_str(&query.target_agent_id) {
         Ok(id) => id,
@@ -1024,4 +1049,144 @@ async fn audit_pre_dispatch(
         }),
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use havn_db::connect_in_memory;
+    use havn_db::repo::agents::{NewAgent, create as create_agent};
+    use havn_db::repo::users::{NewUser, create as create_user};
+    use havn_proto::AgentQueryOutcome;
+    use havn_spawner::AgentHandle;
+    use std::time::Duration;
+
+    async fn ctx_with(multi_user: bool) -> AgentSocketCtx {
+        let db = connect_in_memory().await.expect("db");
+        let registry = AgentRegistry::new();
+        let webchat_router = WebChatRouter::new();
+        AgentSocketCtx {
+            cron_scheduler: CronScheduler::new(
+                db.clone(),
+                registry.clone(),
+                webchat_router.clone(),
+                std::env::temp_dir(),
+            ),
+            registry,
+            db,
+            http: reqwest::Client::new(),
+            webchat_router,
+            channel_router: crate::channel_router::ChannelRouter::new(),
+            admin_rpc: crate::admin_rpc::AdminRpc::new(),
+            query_broker: crate::query_broker::QueryBroker::new(),
+            embedding_config: Arc::new(arc_swap::ArcSwap::from_pointee(
+                serde_json::json!({"provider": "disabled"}),
+            )),
+            multi_user,
+            extra_mounts: Vec::new(),
+            tmpfs_mounts: Vec::new(),
+            seccomp_allow_extra: Vec::new(),
+            keyring: None,
+        }
+    }
+
+    async fn connected_agent(
+        ctx: &AgentSocketCtx,
+        owner: UserId,
+        name: &str,
+        config: serde_json::Value,
+    ) -> (AgentId, mpsc::Receiver<GatewayToAgent>) {
+        let agent = create_agent(
+            &ctx.db,
+            NewAgent {
+                owner_id: owner,
+                team_id: None,
+                name,
+                config,
+            },
+        )
+        .await
+        .expect("create agent");
+        ctx.registry
+            .register(AgentHandle {
+                agent_id: agent.id,
+                pid: 1,
+            })
+            .await;
+        let (tx, rx) = mpsc::channel(8);
+        ctx.registry.attach(agent.id, tx).await.expect("attach");
+        (agent.id, rx)
+    }
+
+    fn query_to(target: AgentId) -> AgentQuery {
+        AgentQuery {
+            request_id: "q1".into(),
+            target_agent_id: target.to_string(),
+            prompt: "show me your conversation".into(),
+            timeout_seconds: 1,
+            include_transcript: true,
+        }
+    }
+
+    fn policy_allowing_queries() -> serde_json::Value {
+        let mut p = Policy::default();
+        p.permissions.can_query_other_agents = true;
+        serde_json::json!({ "policy": p })
+    }
+
+    #[tokio::test]
+    async fn agent_query_is_refused_when_policy_forbids_it() {
+        let ctx = ctx_with(false).await;
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (caller, mut caller_rx) =
+            connected_agent(&ctx, owner, "caller", serde_json::json!({})).await;
+        let (target, mut target_rx) =
+            connected_agent(&ctx, owner, "target", serde_json::json!({})).await;
+
+        handle_agent_query(caller, query_to(target), ctx.clone()).await;
+
+        match caller_rx.try_recv().expect("caller gets a result") {
+            GatewayToAgent::AgentQueryResult(r) => {
+                assert!(
+                    matches!(r.outcome, AgentQueryOutcome::Error { .. }),
+                    "{:?}",
+                    r.outcome
+                );
+            }
+            other => panic!("unexpected frame {other:?}"),
+        }
+        assert!(
+            target_rx.try_recv().is_err(),
+            "the target must not receive the query"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_query_is_dispatched_when_policy_allows_it() {
+        let ctx = ctx_with(false).await;
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (caller, _caller_rx) =
+            connected_agent(&ctx, owner, "caller", policy_allowing_queries()).await;
+        let (target, mut target_rx) =
+            connected_agent(&ctx, owner, "target", serde_json::json!({})).await;
+
+        tokio::spawn(handle_agent_query(caller, query_to(target), ctx.clone()));
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), target_rx.recv())
+            .await
+            .expect("dispatch within 5s")
+            .expect("frame");
+        assert!(
+            matches!(frame, GatewayToAgent::IncomingQuery(_)),
+            "{frame:?}"
+        );
+    }
 }
