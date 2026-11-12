@@ -1788,6 +1788,7 @@ dependencies = [
  "serde_json",
  "serde_norway",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

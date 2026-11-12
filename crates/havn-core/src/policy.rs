@@ -53,35 +53,78 @@ impl Default for Policy {
 /// regexes on a tool's flattened input. They are not a security
 /// boundary; `permissions`, `network_policy` and the sandbox are.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct HookPolicy {
     pub pre_tool_use: Vec<ToolHookRule>,
 }
 
 /// Deny rule for one tool: the call is refused when any `deny` regex
-/// matches. Patterns are validated on deserialize, so a policy with an
-/// invalid regex is rejected rather than shipped to the runtime.
+/// matches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolHookRule {
     pub tool: String,
-    #[serde(default, deserialize_with = "deserialize_patterns")]
+    #[serde(default)]
     pub deny: Vec<String>,
 }
 
-fn deserialize_patterns<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let patterns = Vec::<String>::deserialize(deserializer)?;
-    for pattern in &patterns {
-        regex::Regex::new(pattern).map_err(|e| {
-            serde::de::Error::custom(format!("invalid hook regex {pattern:?}: {e}"))
-        })?;
+pub const MAX_HOOK_RULES: usize = 64;
+pub const MAX_HOOK_PATTERNS: usize = 256;
+pub const MAX_HOOK_PATTERN_LEN: usize = 1024;
+const HOOK_REGEX_SIZE_LIMIT: usize = 256 * 1024;
+
+/// Compile one deny pattern with small compiled-program and DFA-cache
+/// limits, so a single pattern cannot claim much CPU or memory.
+pub fn compile_hook_pattern(pattern: &str) -> crate::Result<regex::Regex> {
+    regex::RegexBuilder::new(pattern)
+        .size_limit(HOOK_REGEX_SIZE_LIMIT)
+        .dfa_size_limit(HOOK_REGEX_SIZE_LIMIT)
+        .build()
+        .map_err(|e| crate::Error::InvalidPolicy(format!("hook regex {pattern:?}: {e}")))
+}
+
+impl Policy {
+    /// Checks that deserialisation cannot express. Deserialising stays
+    /// cheap because the gateway resolves policies on every request;
+    /// call this where a policy is written.
+    pub fn validate(&self) -> crate::Result<()> {
+        self.hooks.validate()
     }
-    Ok(patterns)
 }
 
 impl HookPolicy {
+    /// Enforces the rule, pattern and length caps and compiles every
+    /// pattern.
+    pub fn validate(&self) -> crate::Result<()> {
+        let invalid = |m: String| Err(crate::Error::InvalidPolicy(m));
+        if self.pre_tool_use.len() > MAX_HOOK_RULES {
+            return invalid(format!(
+                "hooks: more than {MAX_HOOK_RULES} pre_tool_use rules"
+            ));
+        }
+        let patterns: usize = self.pre_tool_use.iter().map(|r| r.deny.len()).sum();
+        if patterns > MAX_HOOK_PATTERNS {
+            return invalid(format!(
+                "hooks: more than {MAX_HOOK_PATTERNS} deny patterns"
+            ));
+        }
+        for rule in &self.pre_tool_use {
+            if rule.tool.trim().is_empty() {
+                return invalid("hooks: a pre_tool_use rule has an empty tool".into());
+            }
+            for pattern in &rule.deny {
+                if pattern.len() > MAX_HOOK_PATTERN_LEN {
+                    return invalid(format!(
+                        "hooks: a {} deny pattern is longer than {MAX_HOOK_PATTERN_LEN} bytes",
+                        rule.tool
+                    ));
+                }
+                compile_hook_pattern(pattern)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Every rule of `self` and `other`; a pattern already present for
     /// the same tool is not repeated.
     #[must_use]
@@ -744,10 +787,53 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&p).expect("serialize")).expect("parse");
         assert_eq!(back.hooks, p.hooks);
 
+        p.validate().expect("valid");
+
         let bad = serde_json::json!({
             "hooks": { "pre_tool_use": [{ "tool": "shell", "deny": ["[unclosed"] }] },
         });
-        assert!(serde_json::from_value::<Policy>(bad).is_err());
+        let parsed: Policy = serde_json::from_value(bad).expect("deserialise stays cheap");
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn hook_typos_are_rejected() {
+        for raw in [
+            serde_json::json!({ "hooks": { "pre_tool_uses": [] } }),
+            serde_json::json!({ "hooks": { "pre_tool_use": [{ "tool": "shell", "denny": ["x"] }] } }),
+        ] {
+            assert!(serde_json::from_value::<Policy>(raw).is_err());
+        }
+        assert!(hooks_with(" ", &["x"]).validate().is_err());
+    }
+
+    #[test]
+    fn hook_validation_enforces_limits() {
+        let rule = |n: usize| ToolHookRule {
+            tool: "shell".into(),
+            deny: (0..n).map(|i| format!("^p{i}")).collect(),
+        };
+        let too_many_rules = HookPolicy {
+            pre_tool_use: (0..=MAX_HOOK_RULES).map(|_| rule(1)).collect(),
+        };
+        assert!(too_many_rules.validate().is_err());
+        let too_many_patterns = HookPolicy {
+            pre_tool_use: vec![rule(MAX_HOOK_PATTERNS + 1)],
+        };
+        assert!(too_many_patterns.validate().is_err());
+        let at_limit = HookPolicy {
+            pre_tool_use: vec![rule(MAX_HOOK_PATTERNS)],
+        };
+        at_limit.validate().expect("at the limit");
+
+        let long = "a".repeat(MAX_HOOK_PATTERN_LEN + 1);
+        assert!(hooks_with("shell", &[&long]).validate().is_err());
+        // Short, but compiles to a program far over the size limit.
+        assert!(
+            hooks_with("shell", &["(\\w{100}){100}"])
+                .validate()
+                .is_err()
+        );
     }
 
     fn hooks_with(tool: &str, deny: &[&str]) -> HookPolicy {

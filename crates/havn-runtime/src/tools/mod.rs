@@ -529,6 +529,38 @@ mod tests {
         assert!(res.text().contains("disabled"), "{}", res.text());
     }
 
+    #[tokio::test]
+    async fn execute_for_applies_policy_hook_to_mcp_tool() {
+        let mut policy = Policy::default();
+        policy.hooks.pre_tool_use.push(havn_core::ToolHookRule {
+            tool: "mcp__fs__write_file".into(),
+            deny: vec!["/etc/".into()],
+        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        let set = crate::hooks::load(&policy.hooks, dir.path())
+            .await
+            .expect("hooks");
+        let reg = registry(policy).with_hooks(crate::hooks::handle(set));
+        let env = ToolCtx {
+            workspace_dir: dir.path().to_path_buf(),
+            agent_db: dummy_pool().await,
+            http: reqwest::Client::new(),
+            policy: Arc::clone(&reg.policy),
+            embedder: None,
+        };
+
+        let res = reg
+            .execute_for(
+                context::WEBCHAT,
+                "mcp__fs__write_file",
+                serde_json::json!({"path": "/etc/passwd", "content": "x"}),
+                &env,
+            )
+            .await;
+        assert!(res.is_error(), "{res:?}");
+        assert!(res.text().contains("denied by hook"), "{}", res.text());
+    }
+
     #[test]
     fn unknown_context_applies_no_filtering() {
         // Future-proofing: a context name nobody configured falls through

@@ -76,6 +76,12 @@ impl From<DbError> for ApiError {
     }
 }
 
+impl From<havn_core::Error> for ApiError {
+    fn from(e: havn_core::Error) -> Self {
+        Self::BadRequest(e.to_string())
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match &self {
