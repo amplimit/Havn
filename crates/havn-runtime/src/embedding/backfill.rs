@@ -6,7 +6,7 @@
 //! Triggers:
 //! - The runtime has an embedder configured (otherwise no-op).
 //! - Some rows exist with `embedding IS NULL` (or with the wrong
-//!   dim — operator switched providers; fixed via [`bump_dim`]).
+//!   dim — operator switched providers; re-embedded by the same scan).
 //!
 //! Cadence: one shot at startup. If the operator switches providers
 //! mid-flight (config edit + reload) the next agent restart picks

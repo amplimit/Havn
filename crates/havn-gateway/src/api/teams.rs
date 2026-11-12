@@ -9,9 +9,9 @@
 //! Sub-resources live in sibling modules:
 //! - `/teams/{id}/members` → [`super::members`]
 //! - `/teams/{id}/roles`   → [`super::roles`]
-//! - `/teams/{id}/agents`  → [`Self::list_agents`] below
+//! - `/teams/{id}/agents`  → [`list_agents`] below
 //! - `/teams/{id}/audit-log`   → [`super::audit`]
-//! - `/teams/{id}/usage`       → [`Self::usage`] below
+//! - `/teams/{id}/usage`       → [`usage`] below
 //! - `/teams/{id}/credentials` → [`super::team_credentials`]
 //!
 //! All admin-mutating endpoints write a `team.*` audit entry (best-effort).

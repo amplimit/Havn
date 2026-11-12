@@ -84,6 +84,17 @@ const OUTBOUND_QUEUE_CAPACITY: usize = 64;
 /// wedged. Kept comfortably under the spawner's 5s SIGTERM→SIGKILL grace
 /// (`STOP_GRACE`).
 const SHUTDOWN_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Pauses before each new handshake attempt. The gateway closes a
+/// connection before Welcome when its handshake slots are full, so the
+/// runtime tries again a few times. A refused attempt is usually quick,
+/// but one for a not-yet-registered agent can wait the gateway's 10 s
+/// `REGISTRATION_WAIT`, so all four attempts can take about 42 s, still
+/// inside the supervisor's `CONNECT_LIMIT` for a started agent.
+const HANDSHAKE_RETRY_DELAYS: [std::time::Duration; 3] = [
+    std::time::Duration::from_millis(250),
+    std::time::Duration::from_millis(500),
+    std::time::Duration::from_secs(1),
+];
 /// Number of recent turns retrieved per channel for context build.
 const HISTORY_WINDOW: u32 = 40;
 /// Hard cap on the number of LLM ↔ tool round trips per inbound message.
@@ -245,26 +256,8 @@ async fn main() -> anyhow::Result<()> {
     //    building the tool registry. The Welcome frame carries the policy
     //    snapshot the gateway resolved for this agent (spec §6); we need
     //    it in hand before deciding which tools to register.
-    let stream = UnixStream::connect(&args.gateway_socket)
-        .await
-        .with_context(|| {
-            format!(
-                "connecting to gateway socket {}",
-                args.gateway_socket.display()
-            )
-        })?;
-    let (read, mut write) = stream.into_split();
-    let mut reader = BufReader::new(read);
-
-    write_frame(
-        &mut write,
-        &AgentToGateway::Hello {
-            agent_id: args.agent_id.clone(),
-            version: PROTOCOL_VERSION.into(),
-        },
-    )
-    .await
-    .context("sending Hello")?;
+    let (mut reader, mut write, first_frame) =
+        handshake(&args.gateway_socket, &args.agent_id).await?;
 
     #[allow(clippy::type_complexity)]
     let (
@@ -285,10 +278,7 @@ async fn main() -> anyhow::Result<()> {
         Vec<(std::path::PathBuf, bool)>,
         Vec<std::path::PathBuf>,
         Vec<String>,
-    ) = match read_frame::<_, GatewayToAgent>(&mut reader)
-        .await
-        .context("reading Welcome")?
-    {
+    ) = match first_frame {
         Some(GatewayToAgent::Welcome {
             session_token: _,
             policy,
@@ -776,6 +766,53 @@ async fn main() -> anyhow::Result<()> {
     dispatch
 }
 
+type GatewayConnection = (
+    BufReader<tokio::net::unix::OwnedReadHalf>,
+    tokio::net::unix::OwnedWriteHalf,
+    Option<GatewayToAgent>,
+);
+
+/// Connect to the gateway, say Hello and read its first frame, retrying
+/// after each `HANDSHAKE_RETRY_DELAYS` pause while the connection fails or
+/// is closed before a reply. A final `None` frame means every attempt was
+/// closed before Welcome.
+async fn handshake(socket: &Path, agent_id: &str) -> anyhow::Result<GatewayConnection> {
+    let mut delays = HANDSHAKE_RETRY_DELAYS.iter();
+    loop {
+        let attempt = handshake_once(socket, agent_id).await;
+        let Some(delay) = delays.next() else {
+            return attempt;
+        };
+        match &attempt {
+            Ok((_, _, Some(_))) => return attempt,
+            Ok((_, _, None)) => warn!("gateway closed the connection before Welcome; retrying"),
+            Err(e) => warn!(error = %e, "handshake with the gateway failed; retrying"),
+        }
+        tokio::time::sleep(*delay).await;
+    }
+}
+
+async fn handshake_once(socket: &Path, agent_id: &str) -> anyhow::Result<GatewayConnection> {
+    let stream = UnixStream::connect(socket)
+        .await
+        .with_context(|| format!("connecting to gateway socket {}", socket.display()))?;
+    let (read, mut write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    write_frame(
+        &mut write,
+        &AgentToGateway::Hello {
+            agent_id: agent_id.to_owned(),
+            version: PROTOCOL_VERSION.into(),
+        },
+    )
+    .await
+    .context("sending Hello")?;
+    let first = read_frame::<_, GatewayToAgent>(&mut reader)
+        .await
+        .context("reading Welcome")?;
+    Ok((reader, write, first))
+}
+
 /// Resolves once a termination signal has flipped `init::SHUTDOWN_REQUESTED`
 /// (the PID-1 handler sets it on SIGTERM/SIGINT/SIGHUP), polled on a 250ms
 /// interval. Off Linux there is no PID-1 handler — `SubprocessSpawner` relies
@@ -1059,7 +1096,7 @@ const SILENT_MARKER: &str = "[SILENT]";
 /// Match the `[SILENT]` sentinel loosely — case-insensitive, anywhere in
 /// trimmed output. Mirrors Hermes's behaviour and tolerates the model
 /// emitting `**[SILENT]**`, leading newlines, lowercase variants, or
-/// wrapping it in a sentence ("respond with [silent] to skip"). Strict
+/// wrapping it in a sentence ("respond with \[silent\] to skip"). Strict
 /// `starts_with` matching missed too many real-world variations.
 fn is_silent_output(text: &str) -> bool {
     text.trim().to_uppercase().contains(SILENT_MARKER)
@@ -1313,7 +1350,7 @@ async fn run_tool_loop(
 /// 1. **Recent events (last 7 days)** — auto-loaded from typed memory
 ///    (kind = event), so the agent knows what just happened without
 ///    spending a `memory_search` tool call. Capped at
-///    [`RECENT_EVENTS_LIMIT`] entries.
+///    [`DEFAULT_RECENT_EVENTS_LIMIT`] entries.
 /// 2. **Skills relevant to this turn** — FTS5-retrieved from the skill
 ///    index based on `user_text`.
 ///
@@ -1705,6 +1742,37 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn handshake_retries_a_connection_closed_before_welcome() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gateway.sock");
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+        let gateway = tokio::spawn(async move {
+            // The first connection is refused the way a full gateway does.
+            let (refused, _) = listener.accept().await.expect("accept");
+            drop(refused);
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let hello = read_frame::<_, AgentToGateway>(&mut reader)
+                .await
+                .expect("read");
+            assert!(matches!(hello, Some(AgentToGateway::Hello { .. })));
+            write_frame(&mut write, &GatewayToAgent::HeartbeatTick)
+                .await
+                .expect("write");
+            (reader, write)
+        });
+
+        let (_reader, _write, first) = handshake(&path, "agent").await.expect("handshake");
+
+        assert!(
+            matches!(first, Some(GatewayToAgent::HeartbeatTick)),
+            "{first:?}"
+        );
+        let _ = gateway.await.expect("join");
+    }
 
     #[test]
     fn silent_marker_starts_with() {

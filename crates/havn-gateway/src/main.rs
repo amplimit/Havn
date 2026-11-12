@@ -837,7 +837,7 @@ fn select_spawner(
 /// in the database. This guard is the loudest no havn can give.
 ///
 /// Returns Ok in two cases:
-/// - listen address is loopback (127/8 or [::1]) — any config goes
+/// - listen address is loopback (127/8 or `[::1]`) — any config goes
 /// - trust_header.enabled is true (or `HAVN_TRUST_HEADER=1` was set,
 ///   which the config loader already merged in)
 ///
