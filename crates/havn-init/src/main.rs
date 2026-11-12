@@ -136,6 +136,19 @@ fn main() {
             Err(_) => Vec::new(),
         };
 
+        // Landlock lists from the spawner (absent when an older spawner
+        // launched us; the runtime then applies its own rules).
+        let landlock_rules = match (
+            std::env::var(havn_spawner::filesystem_rules::RW_ENV),
+            std::env::var(havn_spawner::filesystem_rules::RO_ENV),
+        ) {
+            (Ok(rw), Ok(ro)) => Some((
+                havn_spawner::filesystem_rules::decode(&rw),
+                havn_spawner::filesystem_rules::decode(&ro),
+            )),
+            _ => None,
+        };
+
         // SAFETY: caller (NamespaceSpawner) has already done
         //   unshare(CLONE_NEWUSER|NEWNS|NEWNET|NEWPID),
         //   write_user_namespace_maps, and mark_mounts_private. The next
@@ -152,6 +165,7 @@ fn main() {
                 &extra_mounts,
                 &tmpfs_mounts,
                 &agent_dns,
+                landlock_rules.as_ref(),
             )
         };
         // SAFETY: `_exit` is async-signal-safe and never returns.
@@ -187,6 +201,7 @@ unsafe fn fork_and_exec_runtime(
     extra_mounts: &[havn_spawner::ExtraMount],
     tmpfs_mounts: &[havn_spawner::TmpfsMount],
     agent_dns: &[String],
+    landlock_rules: Option<&(Vec<PathBuf>, Vec<PathBuf>)>,
 ) -> i32 {
     // SAFETY: `fork` is async-signal-safe; we branch immediately on the
     // documented return values without touching any inherited mutex.
@@ -221,12 +236,21 @@ unsafe fn fork_and_exec_runtime(
                 unsafe { libc::_exit(1) };
             }
 
+            // Confine this process before exec: Landlock is inherited by
+            // every thread the runtime starts and every process its tools
+            // run, which a call from inside the multi-threaded runtime
+            // would not achieve.
+            let mut command = std::process::Command::new(runtime_binary);
+            command.args(runtime_args);
+            if let Some((rw, ro)) = landlock_rules {
+                apply_landlock_or_exit(rw, ro);
+                command.env(havn_spawner::filesystem_rules::APPLIED_ENV, "1");
+            }
+
             // exec the runtime. We use `std::process::Command` here for
             // ergonomics — we're past pre_exec land and a normal exec is
             // fine in this context (no parent thread state to worry about).
-            let err = std::process::Command::new(runtime_binary)
-                .args(runtime_args)
-                .exec_replace();
+            let err = command.exec_replace();
             let display = runtime_binary.to_string_lossy();
             eprintln!("havn-init: exec runtime {display} failed: {err}");
             // SAFETY: `_exit` is async-signal-safe.
@@ -239,6 +263,36 @@ unsafe fn fork_and_exec_runtime(
             // atomic and calls sigaction; both async-signal-safe.
             unsafe { ns_setup::install_signal_forwarder_for(child_pid) };
             ns_setup::wait_for_child_exit_code(child_pid)
+        }
+    }
+}
+
+/// Apply the agent's Landlock rules, or exit: an agent never runs without
+/// them unless the operator set HAVN_ALLOW_NO_LANDLOCK=1.
+#[cfg(target_os = "linux")]
+fn apply_landlock_or_exit(rw: &[PathBuf], ro: &[PathBuf]) {
+    use havn_spawner::filesystem_rules::{Enforcement, apply};
+    let allow_without = std::env::var("HAVN_ALLOW_NO_LANDLOCK").as_deref() == Ok("1");
+    match apply(rw, ro) {
+        Ok(Enforcement::Full | Enforcement::Partial) => {}
+        Ok(Enforcement::None) if allow_without => {
+            eprintln!(
+                "havn-init: Landlock not enforced; HAVN_ALLOW_NO_LANDLOCK=1, starting the agent \
+                 without filesystem restriction"
+            );
+        }
+        Ok(Enforcement::None) => {
+            eprintln!(
+                "havn-init: Landlock is not enforced on this kernel; refusing to start the agent \
+                 (set HAVN_ALLOW_NO_LANDLOCK=1 to run it without filesystem restriction)"
+            );
+            // SAFETY: `_exit` is async-signal-safe.
+            unsafe { libc::_exit(1) };
+        }
+        Err(e) => {
+            eprintln!("havn-init: applying Landlock failed: {e}");
+            // SAFETY: `_exit` is async-signal-safe.
+            unsafe { libc::_exit(1) };
         }
     }
 }

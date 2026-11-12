@@ -167,6 +167,23 @@ impl AgentSpawner for NamespaceSpawner {
         {
             cmd.env("HAVN_ALLOW_NO_LANDLOCK", "1");
         }
+        // Landlock rules havn-init applies right before exec'ing the runtime,
+        // so every runtime thread and every tool process is confined.
+        let (landlock_rw, landlock_ro) = crate::filesystem_rules::allowlist(
+            &config.workspace_dir,
+            &config.extra_mounts,
+            &config.tmpfs_mounts,
+            policy,
+            &config.runtime_binary,
+        );
+        cmd.env(
+            crate::filesystem_rules::RW_ENV,
+            crate::filesystem_rules::encode(&landlock_rw),
+        )
+        .env(
+            crate::filesystem_rules::RO_ENV,
+            crate::filesystem_rules::encode(&landlock_ro),
+        );
         cmd.arg(&config.runtime_binary)
             .arg("--agent-id")
             .arg(config.agent_id.to_string())

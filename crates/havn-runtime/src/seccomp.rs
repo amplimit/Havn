@@ -108,9 +108,14 @@ pub fn restrict_syscalls(allow_extra: &[String]) -> Result<(), SeccompError> {
         .try_into()
         .map_err(|e| SeccompError::Compile(format!("{e:?}")))?;
 
-    seccompiler::apply_filter(&program).map_err(|e| SeccompError::Apply(e.to_string()))?;
+    // TSYNC: install on every thread of the process (the tokio workers
+    // already exist), not only the calling one; it also sets
+    // no_new_privs on all of them.
+    seccompiler::apply_filter_all_threads(&program)
+        .map_err(|e| SeccompError::Apply(e.to_string()))?;
     #[cfg(target_arch = "x86_64")]
-    seccompiler::apply_filter(&x32_guard()).map_err(|e| SeccompError::Apply(e.to_string()))?;
+    seccompiler::apply_filter_all_threads(&x32_guard())
+        .map_err(|e| SeccompError::Apply(e.to_string()))?;
 
     info!(
         blocked = blocked.len(),

@@ -390,6 +390,9 @@ async fn main() -> anyhow::Result<()> {
     //     between Welcome and now is acceptable — no user-controlled
     //     code runs in that window (only fastembed init from a
     //     gateway-supplied config string).
+    //     Under the namespace spawner the rules are already in place:
+    //     havn-init applies them before exec so that every thread is
+    //     covered (a `local-embed` cache_dir must then be in the workspace).
     #[cfg(target_os = "linux")]
     {
         // Union the MCP-server extra paths from policy (spec §13
@@ -436,8 +439,16 @@ async fn main() -> anyhow::Result<()> {
         // A sandbox layer that cannot be installed is an error, not a
         // reason to run the agent without it. (A kernel without Landlock
         // is reported by restrict_filesystem as "not enforced", not here.)
-        sandbox::restrict_filesystem(&args.workspace, &allow_rw, &allow_ro)
-            .map_err(|e| anyhow!("Landlock restriction failed: {e}"))?;
+        if std::env::var("HAVN_LANDLOCK_APPLIED").as_deref() == Ok("1") {
+            // havn-init applied the rules before exec, covering every
+            // thread of this process.
+            info!("landlock applied before exec by havn-init");
+        } else {
+            // Without havn-init (subprocess spawner) this only confines
+            // the calling thread; that mode is not isolated anyway.
+            sandbox::restrict_filesystem(&args.workspace, &allow_rw, &allow_ro)
+                .map_err(|e| anyhow!("Landlock restriction failed: {e}"))?;
+        }
         match seccomp::restrict_syscalls(&seccomp_allow_extra) {
             Ok(()) => {}
             // An operator typo in seccomp.allow_extra must not leave the

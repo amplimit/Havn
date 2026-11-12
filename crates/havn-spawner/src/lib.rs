@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 pub mod cgroup;
 #[cfg(target_os = "linux")]
+pub mod filesystem_rules;
+#[cfg(target_os = "linux")]
 pub mod namespace;
 #[cfg(target_os = "linux")]
 pub mod network;
