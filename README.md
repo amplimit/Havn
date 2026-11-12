@@ -147,6 +147,25 @@ havn is **infrastructure, not SaaS**. The test: does it require kernel primitive
 - WebChat WebSocket connections are checked against an Origin allowlist (`allowed_origins`) and must present the caller's `ws_token` from `GET /me`; the token identifies the user rather than being a secret, so the Origin check is what blocks cross-site connections
 - No marketplace — skills are local files; sharing via git
 
+## Tool Hooks
+
+PreToolUse hooks refuse a tool call before it runs when one of its regex patterns matches the call's main input (the shell command, the file path, the URL). The agent sees the refusal as the tool result and can adjust its plan.
+
+Operators put hooks in the policy (a role's policy, or a per-agent override), under `hooks`:
+
+```json
+"hooks": {
+  "pre_tool_use": [
+    { "tool": "shell", "deny": ["^rm -rf", "^sudo "] },
+    { "tool": "web_fetch", "deny": ["://internal\\.corp\\.net"] }
+  ]
+}
+```
+
+An agent workspace can also contain `.havn/hooks.yaml` with the same `pre_tool_use` list, so an existing file can be pasted into the policy as is. The agent can edit its own workspace, so this file can only add rules: the runtime applies the policy's rules and the file's rules together, and changing or deleting the file never removes a policy rule. Both are read when the agent starts. When roles are combined or an override is clamped to a role, every hook rule of each is kept.
+
+Hooks are guardrails against model mistakes, not a security boundary. A pattern matches text, and an agent that wants to can run the same action in a form no pattern matches (`rm  -rf`, `cd / && rm -rf`, a script file). To actually prevent an action, use the policy permissions (`can_use_shell`, `can_access_network`), `network_policy`, the mounts an agent gets, and the sandbox described above.
+
 ## Configuration
 
 Gateway config lives at `~/.config/havn/config.toml`:

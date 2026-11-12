@@ -484,11 +484,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // 4. Load PreToolUse hooks from `<workspace>/.havn/hooks.yaml`.
-    //    Empty / missing file → no-op handle. Both the parent and
-    //    subagent registries share the SAME handle so a hot-reload
-    //    (future) flips both atomically.
-    let hooks = hooks::handle(hooks::load_from_workspace(&args.workspace).await);
+    // 4. Load PreToolUse hooks: the policy's rules plus any rules the
+    //    workspace `.havn/hooks.yaml` adds (it cannot remove policy
+    //    rules). Both the parent and subagent registries share the SAME
+    //    handle so a hot-reload (future) flips both atomically.
+    let hooks = hooks::handle(
+        hooks::load(&policy.hooks, &args.workspace)
+            .await
+            .map_err(|e| anyhow!("loading PreToolUse hooks failed: {e}"))?,
+    );
 
     // 4a. MCP servers (spec §13 Phase 3). Spawned AFTER Landlock +
     //     seccomp so each MCP child process inherits both: Landlock
