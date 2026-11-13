@@ -124,7 +124,7 @@ export default function TeamOverviewPage({
                   type="text"
                   value={renaming}
                   onChange={(e) => setRenaming(e.target.value)}
-                  className="flex-1 bg-transparent text-base outline-none"
+                  className="flex-1 bg-transparent text-base"
                   style={{
                     borderBottom: "1px solid var(--color-border-default)",
                   }}

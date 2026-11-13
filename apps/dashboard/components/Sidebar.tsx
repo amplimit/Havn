@@ -11,13 +11,16 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
-import { Bot, Boxes, KeyRound, Plus, Users, type LucideIcon } from "lucide-react";
-import { api, type AgentView, type TeamView } from "@/lib/api";
+import { Bot, Boxes, KeyRound, Plus, TriangleAlert, Users, type LucideIcon } from "lucide-react";
+import { ApiError, api, type AgentView, type TeamView } from "@/lib/api";
 
 const POLL_MS = 5000;
 const DASHBOARD_VERSION = process.env.NEXT_PUBLIC_DASHBOARD_VERSION ?? "unknown";
 
 const ACTIVE_BG = "rgba(83, 58, 253, 0.07)";
+// Darker than --color-ruby: readable at 11px (4.5:1 on white).
+const WARNING_TEXT = "#c0164f";
+const NO_VERSION = "version not reported";
 
 export function Sidebar() {
   const pathname = usePathname();
@@ -39,25 +42,23 @@ export function Sidebar() {
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
       }
+      // Polled with the rest, so a gateway restarted on another release
+      // shows up without a reload.
+      try {
+        const info = await api.authInfo();
+        if (!cancelled) setGatewayVersion(info.version ?? NO_VERSION);
+      } catch (e) {
+        // Gateways before /auth/info answer 404.
+        if (!cancelled && e instanceof ApiError && e.status === 404) {
+          setGatewayVersion(NO_VERSION);
+        }
+      }
     }
     tick();
     const id = setInterval(tick, POLL_MS);
     return () => {
       cancelled = true;
       clearInterval(id);
-    };
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .authInfo()
-      .then((info) => {
-        if (!cancelled) setGatewayVersion(info.version ?? "before 0.1.5");
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
     };
   }, []);
 
@@ -108,7 +109,7 @@ export function Sidebar() {
               <Link
                 key={a.id}
                 href={href}
-                aria-current={active ? "page" : undefined}
+                aria-current={pathname === href ? "page" : active ? "true" : undefined}
                 className="flex items-center justify-between gap-2 rounded px-2 py-1.5 text-sm transition-colors hover:bg-[rgba(83,58,253,0.05)]"
                 style={{
                   backgroundColor: active ? ACTIVE_BG : undefined,
@@ -147,7 +148,7 @@ export function Sidebar() {
                 <Link
                   key={t.id}
                   href={href}
-                  aria-current={active ? "page" : undefined}
+                  aria-current={pathname === href ? "page" : active ? "true" : undefined}
                   className="flex items-center justify-between gap-2 rounded px-2 py-1.5 text-sm transition-colors hover:bg-[rgba(83,58,253,0.05)]"
                   style={{
                     backgroundColor: active ? ACTIVE_BG : undefined,
@@ -234,18 +235,21 @@ function SidebarLink({
 function VersionLine({ gateway }: { gateway: string | null }) {
   const mismatch = gateway !== null && gateway !== DASHBOARD_VERSION;
   return (
-    <p
-      className="mt-3 px-2 text-[11px] tabular"
-      style={{ color: mismatch ? "var(--color-ruby)" : "var(--color-body)" }}
-      title={
-        mismatch
-          ? "The dashboard and the gateway come from different releases. Build the dashboard from the tag that matches the gateway (havn --version)."
-          : undefined
-      }
-    >
-      dashboard {DASHBOARD_VERSION}
-      {gateway !== null && <> · gateway {gateway}</>}
-    </p>
+    <div className="mt-3 px-2 text-[11px] tabular" style={{ color: "var(--color-body)" }}>
+      <p>
+        dashboard {DASHBOARD_VERSION}
+        {gateway !== null && <> · gateway {gateway}</>}
+      </p>
+      {mismatch && (
+        <p role="status" className="mt-1 flex items-start gap-1" style={{ color: WARNING_TEXT }}>
+          <TriangleAlert size={12} className="mt-px shrink-0" aria-hidden="true" />
+          <span>
+            Different releases: build the dashboard from the tag that matches{" "}
+            <code className="font-mono">havn --version</code>.
+          </span>
+        </p>
+      )}
+    </div>
   );
 }
 

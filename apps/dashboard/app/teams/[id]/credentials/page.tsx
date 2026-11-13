@@ -136,7 +136,7 @@ export default function TeamCredentialsPage({
         title="Stored as age-encrypted ciphertext (spec §13). The gateway needs HAVN_AGE_KEY in its environment to decrypt at use time."
       >
         <Lock size={14} className="shrink-0" aria-hidden="true" />
-          keys are encrypted at rest with age (HAVN_AGE_KEY)
+        keys are encrypted at rest with age (HAVN_AGE_KEY)
       </div>
 
       {team?.is_admin && (
@@ -316,7 +316,7 @@ function FormField({
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
-        className="bg-transparent text-sm outline-none"
+        className="bg-transparent text-sm"
         style={{ borderBottom: "1px solid var(--color-border-default)" }}
       />
     </label>

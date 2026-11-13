@@ -75,19 +75,26 @@ const VIEWPORTS = [
 
 // Screenshots only document the pages; a failure here does not fail the run.
 async function screenshots(browser, pages) {
-  mkdirSync(SCREENS, { recursive: true });
-  for (const viewport of VIEWPORTS) {
-    const context = await browser.newContext({ viewport, deviceScaleFactor: 1 });
-    const page = await context.newPage();
-    for (const [name, path] of pages) {
+  try {
+    mkdirSync(SCREENS, { recursive: true });
+    for (const viewport of VIEWPORTS) {
+      const context = await browser.newContext({ viewport, deviceScaleFactor: 1 });
       try {
-        await page.goto(`${DASHBOARD}${path}`, { waitUntil: "networkidle" });
-        await page.screenshot({ path: `${SCREENS}/${name}-${viewport.name}.png`, fullPage: true });
-      } catch (e) {
-        console.error(`screenshot ${name} (${viewport.name}): ${e}`);
+        const page = await context.newPage();
+        for (const [name, path] of pages) {
+          try {
+            await page.goto(`${DASHBOARD}${path}`, { waitUntil: "networkidle" });
+            await page.screenshot({ path: `${SCREENS}/${name}-${viewport.name}.png`, fullPage: true });
+          } catch (e) {
+            console.error(`screenshot ${name} (${viewport.name}): ${e}`);
+          }
+        }
+      } finally {
+        await context.close().catch(() => {});
       }
     }
-    await context.close();
+  } catch (e) {
+    console.error(`screenshots: ${e}`);
   }
 }
 

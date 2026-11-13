@@ -238,43 +238,54 @@ export type AuditListResponse = {
 
 // The gateway answers errors with `{"error": "<kind>: <message>"}`; the
 // kind repeats the status, so only the message is shown.
-const ERROR_KINDS =
-  /^(bad request|forbidden|conflict|not found|unauthorized|internal|upstream provider error): /i;
+const ERROR_KINDS = /^(bad request|forbidden|conflict): /i;
+const MAX_ERROR_LENGTH = 300;
 
-export function readableError(status: number, body: string): string {
-  let text = body.trim();
-  try {
-    const parsed: unknown = JSON.parse(text);
-    if (parsed && typeof parsed === "object" && "error" in parsed) {
-      const { error } = parsed as { error: unknown };
-      if (typeof error === "string") text = error;
+function statusMessage(status: number): string {
+  if (status === 401 || status === 403) return "you are not allowed to do this";
+  if (status === 502 || status === 503 || status === 504) return "the gateway is not reachable";
+  return `request failed (${status})`;
+}
+
+// The gateway's `{"error": ...}` message, or a short plain-text body (the
+// dashboard server's own errors, request extractor errors). An HTML page
+// from a reverse proxy or SSO login falls back to the status.
+export function readableError(status: number, body: string, contentType = ""): string {
+  const text = body.trim();
+  let message = "";
+  if (contentType.includes("json") || text.startsWith("{")) {
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (parsed && typeof parsed === "object" && "error" in parsed) {
+        const { error } = parsed as { error: unknown };
+        if (typeof error === "string") message = error.replace(ERROR_KINDS, "");
+      }
+    } catch {
+      // Not the gateway's JSON; fall through to the status.
     }
-  } catch {
-    // Not JSON: a proxy or the dashboard server answered; keep the text.
+  } else if (!contentType.includes("html") && !text.startsWith("<")) {
+    message = text;
   }
-  text = text.replace(ERROR_KINDS, "");
-  if (status === 401 || status === 403) {
-    return text || "you are not allowed to do this";
-  }
-  if (status === 502 || status === 503 || status === 504) {
-    return text || "the gateway is not reachable";
-  }
-  return text || `request failed (${status})`;
+  if (!message) return statusMessage(status);
+  return message.length > MAX_ERROR_LENGTH
+    ? `${message.slice(0, MAX_ERROR_LENGTH)}…`
+    : message;
 }
 
 export class ApiError extends Error {
   constructor(
     public status: number,
     public body: string,
+    contentType = "",
   ) {
-    super(readableError(status, body));
+    super(readableError(status, body, contentType));
   }
 }
 
 export type AuthInfo = {
   identity_header: string;
   trust_header: boolean;
-  /** Absent on gateways before 0.1.5. */
+  /** Absent on gateways that do not report their version. */
   version?: string;
 };
 
@@ -291,10 +302,18 @@ async function request<T>(
     cache: "no-store",
   });
   if (!res.ok) {
-    throw new ApiError(res.status, await res.text());
+    throw new ApiError(res.status, await res.text(), res.headers.get("content-type") ?? "");
   }
   // 204 No Content has no body.
   if (res.status === 204) return undefined as T;
+  // A sign-in page from an SSO proxy whose session expired arrives as 200.
+  if (!(res.headers.get("content-type") ?? "").includes("json")) {
+    throw new ApiError(
+      res.status,
+      "{\"error\":\"the response was not from the gateway; your sign-in may have expired, reload the page\"}",
+      "application/json",
+    );
+  }
   return (await res.json()) as T;
 }
 

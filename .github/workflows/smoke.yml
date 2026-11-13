@@ -158,6 +158,7 @@ jobs:
           name: dashboard-screens
           path: ${{ runner.temp }}/dashboard-screens
           if-no-files-found: ignore
+          retention-days: 14
       - name: upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4

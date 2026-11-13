@@ -10,7 +10,7 @@ import {
 } from "@/lib/api";
 import { openChat, type ChatHandle } from "@/lib/websocket";
 import { Markdown } from "@/components/Markdown";
-import { BookOpen, Brain, Check, Copy, Layers, Search, Settings } from "lucide-react";
+import { BookOpen, Brain, Check, Copy, Layers, RotateCcw, Search, Settings } from "lucide-react";
 
 type Bubble = {
   id: number;
@@ -204,9 +204,10 @@ export default function ChatPage({
   // Auto-scroll to bottom on new bubbles or when the typing
   // indicator appears.
   useEffect(() => {
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     scrollRef.current?.scrollTo({
       top: scrollRef.current.scrollHeight,
-      behavior: "smooth",
+      behavior: reduce ? "auto" : "smooth",
     });
   }, [bubbles.length, pending]);
 
@@ -463,7 +464,7 @@ function ActionRow({
         type="button"
         onClick={onCopy}
         title="copy markdown source"
-        aria-label="copy message"
+        aria-label={copied ? "copied" : "copy message"}
         className="rounded px-1.5 py-0.5 transition-colors"
         style={{ background: "transparent" }}
         onMouseEnter={(e) =>
@@ -493,7 +494,10 @@ function ActionRow({
             (e.currentTarget.style.background = "transparent")
           }
         >
-          ↻ retry
+          <span className="inline-flex items-center gap-1">
+            <RotateCcw size={12} className="shrink-0" aria-hidden="true" />
+            retry
+          </span>
         </button>
       )}
     </div>

@@ -139,7 +139,7 @@ export default function RolesPage({
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
             placeholder="e.g. auditor, ops-readonly"
-            className="flex-1 bg-transparent text-base outline-none"
+            className="flex-1 bg-transparent text-base"
             style={{ borderBottom: "1px solid var(--color-border-default)" }}
           />
           <button type="submit" className="btn-primary" disabled={creating}>
