@@ -64,11 +64,26 @@ impl Schedule {
         })
     }
 
-    /// Compute the run-after-this `next_run_at`. Returns `None` for one-shot
-    /// schedules — the job is finished and should be disabled.
-    pub fn advance_from(&self, last_fire: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    /// The `next_run_at` after a run that was due at `scheduled` and fired at
+    /// `now`: the first slot of the interval grid through `scheduled` that is
+    /// later than `now`. Advancing from the slot rather than the firing time
+    /// keeps the job on its interval however late the scheduler noticed it,
+    /// and slots missed while the gateway was down are skipped, not replayed.
+    /// Returns `None` for one-shot schedules, and for an interval whose next
+    /// slot is past the range of a timestamp — the job is finished and should
+    /// be disabled.
+    pub fn advance_from(
+        &self,
+        scheduled: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
         match self {
-            Self::Interval { seconds } => Some(last_fire + ChronoDuration::seconds(*seconds)),
+            Self::Interval { seconds } => {
+                let behind = (now - scheduled).num_seconds().max(0);
+                let slots = behind / seconds + 1;
+                let step = ChronoDuration::try_seconds(slots.checked_mul(*seconds)?)?;
+                scheduled.checked_add_signed(step)
+            }
             Self::At { .. } => None,
         }
     }
@@ -169,22 +184,18 @@ pub async fn list_due(pool: &SqlitePool, now: DateTime<Utc>, limit: u32) -> Resu
 }
 
 /// Apply the post-run state transition: advance `next_run_at` for recurring
-/// schedules, or set `enabled = 0` for completed one-shot jobs.
-pub async fn advance_after_run(
-    pool: &SqlitePool,
-    id: CronJobId,
-    schedule: &Schedule,
-    last_fire: DateTime<Utc>,
-) -> Result<()> {
-    if let Some(next) = schedule.advance_from(last_fire) {
+/// schedules (see [`Schedule::advance_from`]), or set `enabled = 0` for
+/// completed one-shot jobs.
+pub async fn advance_after_run(pool: &SqlitePool, job: &CronJob, now: DateTime<Utc>) -> Result<()> {
+    if let Some(next) = job.schedule.advance_from(job.next_run_at, now) {
         sqlx::query("UPDATE cron_jobs SET next_run_at = ?1 WHERE id = ?2")
             .bind(next.to_rfc3339())
-            .bind(id.to_string())
+            .bind(job.id.to_string())
             .execute(pool)
             .await?;
     } else {
         sqlx::query("UPDATE cron_jobs SET enabled = 0 WHERE id = ?1")
-            .bind(id.to_string())
+            .bind(job.id.to_string())
             .execute(pool)
             .await?;
     }
@@ -405,27 +416,87 @@ mod tests {
         assert!(Schedule::parse("at:not-a-date").is_err());
     }
 
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
     #[test]
     fn advance_interval_adds_seconds() {
         let s = Schedule::Interval { seconds: 90 };
-        let now = DateTime::parse_from_rfc3339("2026-05-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let next = s.advance_from(now).unwrap();
-        let expected = DateTime::parse_from_rfc3339("2026-05-01T12:01:30Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(next, expected);
+        let slot = at("2026-05-01T12:00:00Z");
+        assert_eq!(s.advance_from(slot, slot), Some(at("2026-05-01T12:01:30Z")));
+    }
+
+    #[test]
+    fn a_late_run_keeps_the_job_on_its_interval() {
+        // A 60 s job noticed by a tick 59.9 s after its slot must be due at
+        // the next tick, not a minute after it.
+        let s = Schedule::Interval { seconds: 60 };
+        let slot = at("2026-05-01T12:00:00Z");
+        let fired = at("2026-05-01T12:00:59.900Z");
+        assert_eq!(
+            s.advance_from(slot, fired),
+            Some(at("2026-05-01T12:01:00Z"))
+        );
+    }
+
+    #[test]
+    fn a_slot_that_came_due_after_the_run_is_skipped() {
+        // Only the scheduler's tick time keeps this from happening to a
+        // delayed dispatch (see the gateway's `dispatch`).
+        let s = Schedule::Interval { seconds: 60 };
+        let slot = at("2026-05-01T12:00:00Z");
+        let fired = at("2026-05-01T12:01:00.200Z");
+        assert_eq!(
+            s.advance_from(slot, fired),
+            Some(at("2026-05-01T12:02:00Z"))
+        );
+    }
+
+    #[test]
+    fn an_interval_past_the_timestamp_range_ends_the_job() {
+        let s = Schedule::Interval {
+            seconds: i64::MAX / 2,
+        };
+        let slot = at("2026-05-01T12:00:00Z");
+        assert_eq!(s.advance_from(slot, slot), None);
+    }
+
+    #[test]
+    fn slots_missed_while_down_are_skipped() {
+        let s = Schedule::Interval { seconds: 3600 };
+        let slot = at("2026-05-01T12:00:00Z");
+        let fired = at("2026-05-01T15:30:00Z");
+        assert_eq!(
+            s.advance_from(slot, fired),
+            Some(at("2026-05-01T16:00:00Z"))
+        );
+        // Exactly on a later slot: that slot has run, the next one follows.
+        let fired = at("2026-05-01T15:00:00Z");
+        assert_eq!(
+            s.advance_from(slot, fired),
+            Some(at("2026-05-01T16:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn a_slot_in_the_future_still_advances_one_interval() {
+        // The run is never earlier than its slot, but the clock can step back.
+        let s = Schedule::Interval { seconds: 60 };
+        let slot = at("2026-05-01T12:00:00Z");
+        let fired = at("2026-05-01T11:59:00Z");
+        assert_eq!(
+            s.advance_from(slot, fired),
+            Some(at("2026-05-01T12:01:00Z"))
+        );
     }
 
     #[test]
     fn advance_at_returns_none() {
         let s = Schedule::At {
-            instant: DateTime::parse_from_rfc3339("2026-05-01T12:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            instant: at("2026-05-01T12:00:00Z"),
         };
-        assert!(s.advance_from(Utc::now()).is_none());
+        assert!(s.advance_from(Utc::now(), Utc::now()).is_none());
     }
 
     #[tokio::test]
@@ -517,12 +588,16 @@ mod tests {
         )
         .await
         .unwrap();
-        advance_after_run(&pool, recurring.id, &recurring.schedule, now)
+        advance_after_run(&pool, &recurring, now + ChronoDuration::seconds(30))
             .await
             .unwrap();
         let after = find_by_id(&pool, recurring.id).await.unwrap().unwrap();
         assert!(after.enabled);
-        assert!(after.next_run_at > now);
+        assert_eq!(
+            after.next_run_at.timestamp_millis(),
+            (recurring.next_run_at + ChronoDuration::seconds(60)).timestamp_millis(),
+            "advanced from the slot, not from the run"
+        );
 
         let one_shot = create(
             &pool,
@@ -539,9 +614,7 @@ mod tests {
         )
         .await
         .unwrap();
-        advance_after_run(&pool, one_shot.id, &one_shot.schedule, now)
-            .await
-            .unwrap();
+        advance_after_run(&pool, &one_shot, now).await.unwrap();
         let after = find_by_id(&pool, one_shot.id).await.unwrap().unwrap();
         assert!(!after.enabled, "one-shot should be disabled after firing");
     }

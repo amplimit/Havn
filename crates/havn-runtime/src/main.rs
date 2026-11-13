@@ -1143,36 +1143,43 @@ async fn handle_cron(tick: CronTick, ctx: Ctx) {
     let mut messages = vec![serde_json::json!({ "role": "user", "content": tick.prompt.clone() })];
 
     let augmented = augment_with_skills(&ctx, &ctx.cron_prompt, &tick.prompt).await;
-    let result =
-        match run_tool_loop(&ctx, crate::tools::context::CRON, &mut messages, &augmented).await {
-            Ok(text) => {
-                let silent = is_silent_output(&text);
-                if let Err(e) =
-                    conversations::record(&ctx.pool, &channel_id, Role::Assistant, &text).await
-                {
-                    warn!(%job_id, error = %e, "could not persist cron assistant turn");
-                }
-                CronResult {
-                    job_id: job_id.clone(),
-                    run_id: tick.run_id.clone(),
-                    outcome: CronOutcome::Success,
-                    output: text,
-                    silent,
-                }
-            }
-            Err(e) => {
-                error!(%job_id, error = %e, "cron tool-use loop failed");
-                CronResult {
-                    job_id: job_id.clone(),
-                    run_id: tick.run_id.clone(),
-                    outcome: CronOutcome::Error {
-                        message: e.to_string(),
-                    },
-                    output: String::new(),
-                    silent: false,
-                }
-            }
-        };
+    let handle = ctx.parent_handle();
+    let run = tool_loop::run_typed(
+        &handle,
+        crate::tools::context::CRON,
+        &mut messages,
+        &augmented,
+    )
+    .await;
+    // An LLM error or the iteration cap is a failed run: the gateway records
+    // the message in `cron_runs.error` and delivers nothing.
+    let (outcome, output) = match run {
+        Ok(text) => (CronOutcome::Success, text),
+        Err(e) => {
+            error!(%job_id, error = %e, "cron run failed");
+            let message = e.to_string();
+            let partial = match e {
+                tool_loop::RunError::IterationCap { partial_text, .. } => partial_text,
+                _ => String::new(),
+            };
+            (CronOutcome::Error { message }, partial)
+        }
+    };
+    let turn = match &outcome {
+        CronOutcome::Success => output.clone(),
+        CronOutcome::Error { message } if output.is_empty() => format!("({message})"),
+        CronOutcome::Error { message } => format!("{output}\n\n({message})"),
+    };
+    if let Err(e) = conversations::record(&ctx.pool, &channel_id, Role::Assistant, &turn).await {
+        warn!(%job_id, error = %e, "could not persist cron assistant turn");
+    }
+    let result = CronResult {
+        job_id: job_id.clone(),
+        run_id: tick.run_id.clone(),
+        silent: matches!(outcome, CronOutcome::Success) && is_silent_output(&output),
+        outcome,
+        output,
+    };
 
     if let Err(e) = ctx.writer_tx.send(AgentToGateway::CronResult(result)).await {
         error!(%job_id, error = ?e, "failed to enqueue CronResult");

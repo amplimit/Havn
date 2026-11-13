@@ -207,11 +207,15 @@ impl CronScheduler {
         debug!(count = due.len(), "dispatching due cron jobs");
         for job in due {
             let scheduler = self.clone();
-            tokio::spawn(async move { scheduler.dispatch(job).await });
+            tokio::spawn(async move { scheduler.dispatch(job, now).await });
         }
     }
 
-    async fn dispatch(&self, job: CronJob) {
+    /// Fire one due job. `tick_at` is when the tick that found it due
+    /// started: the schedule advances to the first slot after it, so a
+    /// dispatch delayed by a wake check or a full agent queue does not
+    /// skip a slot that the next tick would have run.
+    async fn dispatch(&self, job: CronJob, tick_at: DateTime<Utc>) {
         let agent_id = job.agent_id;
         let job_id = job.id;
 
@@ -233,7 +237,7 @@ impl CronScheduler {
                     },
                 )
                 .await;
-                let _ = advance_after_run(&self.db, job_id, &job.schedule, now).await;
+                let _ = advance_after_run(&self.db, &job, tick_at).await;
                 return;
             }
         }
@@ -258,8 +262,7 @@ impl CronScheduler {
             self.pending_runs().remove(&run_id);
             return;
         }
-        let now = Utc::now();
-        if let Err(e) = advance_after_run(&self.db, job_id, &job.schedule, now).await {
+        if let Err(e) = advance_after_run(&self.db, &job, tick_at).await {
             warn!(%job_id, error = %e, "advance_after_run failed");
         }
         debug!(%job_id, %agent_id, "cron tick dispatched");
