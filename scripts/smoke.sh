@@ -134,8 +134,14 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
             if tr '\0' '\n' < "/proc/$pid/environ" | grep -q '^HAVN_LANDLOCK_R[WO]='; then
                 die "havn-runtime (pid $pid) still carries the Landlock rule lists"
             fi
+            # Agent uid 0 is host uid 0: it must hold no capabilities.
+            for set in CapInh CapPrm CapEff CapBnd CapAmb; do
+                grep -q "^$set:[[:space:]]*0000000000000000$" "/proc/$pid/status" \
+                    || die "havn-runtime (pid $pid) has capabilities: $(grep "^$set:" "/proc/$pid/status")"
+            done
         done
         ok "every runtime thread is under seccomp with no_new_privs"
+        ok "the agent runtime holds no capabilities"
         ok "NamespaceSpawner isolation: memory.max=$(cat "$CGROUP/memory.max") pids.max=$(cat "$CGROUP/pids.max")"
         ;;
     subprocess)

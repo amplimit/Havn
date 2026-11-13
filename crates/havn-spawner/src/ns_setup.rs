@@ -901,6 +901,92 @@ extern "C" fn forward_signal_to_inner(sig: libc::c_int) {
     }
 }
 
+/// Securebits that stop uid 0 from meaning anything to capabilities, each
+/// locked so no descendant can unset it: exec as uid 0 grants nothing
+/// (`NOROOT`), uid changes leave capabilities alone (`NO_SETUID_FIXUP`),
+/// nothing keeps capabilities across a uid change (`KEEP_CAPS` locked
+/// off), and ambient capabilities cannot be raised.
+const LOCKED_NO_ROOT_SECUREBITS: libc::c_ulong = (1 << 0) // SECBIT_NOROOT
+    | (1 << 1) // SECBIT_NOROOT_LOCKED
+    | (1 << 2) // SECBIT_NO_SETUID_FIXUP
+    | (1 << 3) // SECBIT_NO_SETUID_FIXUP_LOCKED
+    | (1 << 5) // SECBIT_KEEP_CAPS_LOCKED
+    | (1 << 6) // SECBIT_NO_CAP_AMBIENT_RAISE
+    | (1 << 7); // SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED
+
+/// `_LINUX_CAPABILITY_VERSION_3`: 64-bit sets, as two 32-bit words.
+const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+#[repr(C)]
+struct CapabilityHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapabilityWords {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+/// Give up every capability for good, so the agent's uid 0 — which is the
+/// gateway's host uid — is an ordinary user to the kernel: no
+/// `CAP_DAC_OVERRIDE` on files it can see, no `CAP_SYS_PTRACE`, nothing
+/// regained by exec'ing a root-owned or file-capability binary. Called by
+/// `havn-init` last before it execs the runtime, after the mounts that
+/// need the namespace's capabilities.
+///
+/// Locks the securebits first (needs `CAP_SETPCAP`), then empties the
+/// bounding set (also needs it), the ambient set, and finally the
+/// effective, permitted and inheritable sets.
+pub fn drop_all_capabilities() -> io::Result<()> {
+    // SAFETY: prctl with integer arguments only.
+    if unsafe { libc::prctl(libc::PR_SET_SECUREBITS, LOCKED_NO_ROOT_SECUREBITS, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for cap in 0..=63 {
+        // SAFETY: prctl with integer arguments only.
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) } != 0 {
+            let err = io::Error::last_os_error();
+            // EINVAL: past the kernel's last capability.
+            if err.raw_os_error() == Some(libc::EINVAL) && cap > 0 {
+                break;
+            }
+            return Err(err);
+        }
+    }
+    // SAFETY: prctl with integer arguments only.
+    if unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut header = CapabilityHeader {
+        version: CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let empty = [CapabilityWords {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: capset reads one header and two capability words, both live
+    // for the call; pid 0 is the calling thread.
+    if unsafe { libc::syscall(libc::SYS_capset, &raw mut header, empty.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Public entry used by `havn-init` (the PID-1 shim). Same contract as the
 /// internal helper — installs `SIGTERM` / `SIGINT` / `SIGHUP` forwarders
 /// from the calling process to `child_pid`.
