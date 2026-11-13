@@ -50,7 +50,7 @@
 //! root from the host's `/` to a freshly-built tmpfs that exposes only:
 //! `/usr` (ro bind), `/lib`/`/lib64`/`/bin`/`/sbin` (symlinks → `/usr/*`),
 //! `/proc` (PID-ns view), `/tmp` (tmpfs), `/dev/{null,urandom,zero,random}`,
-//! `/etc/{resolv.conf,ssl}` (when network allowed), and the agent's
+//! `/etc/ssl/certs` (ro), `/etc/resolv.conf` (when network allowed), and the agent's
 //! workspace mirror-bound at its host path. Everything else (`/var`,
 //! `/home`, `/root`, `/srv`, `/sys`, `/etc/{shadow,passwd,...}`) is
 //! invisible to the agent — Landlock no longer the only thing keeping
@@ -521,27 +521,23 @@ pub unsafe fn pivot_root_into_minimal_rootfs(
         // The runtime unconditionally builds a reqwest HTTP client at
         // startup (used by tools, MCP, embedding providers), and reqwest
         // refuses to construct without a CA bundle ("No CA certificates
-        // were loaded from the system"). Mounting the bundle into the
-        // agent ns is a no-op for security: it's read-only public data
-        // that grants nothing on its own. The egress gate is the netns
+        // were loaded from the system"). The egress gate is the netns
         // (no veth = no packets out), not the absence of CA certs.
-        mkdir_under_newroot("etc/ssl", 0o755)?;
-        let ssl_target = cstr_under_newroot("etc/ssl");
-        libc::mount(
-            c"/etc/ssl".as_ptr(),
-            ssl_target.as_ptr(),
-            std::ptr::null(),
-            libc::MS_BIND | libc::MS_REC,
-            std::ptr::null(),
-        );
-        // Best-effort RO remount.
-        libc::mount(
-            std::ptr::null(),
-            ssl_target.as_ptr(),
-            std::ptr::null(),
-            libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
-            std::ptr::null(),
-        );
+        //
+        // Only `/etc/ssl/certs`, read-only: the rest of `/etc/ssl` holds
+        // `private/`, where hosts keep TLS keys, and the agent's uid 0 is
+        // the host's, so it could read them. The certificates there link
+        // into `/usr/share/ca-certificates`, already under the /usr bind.
+        // A read-only remount that fails stops the agent from starting.
+        let ca_certificates = Path::new("/etc/ssl/certs");
+        if ca_certificates.is_dir() {
+            mirror_bind_into_newroot(ca_certificates, true)?;
+        } else {
+            eprintln!(
+                "havn-init: no {}; HTTPS will fail in the agent",
+                ca_certificates.display()
+            );
+        }
 
         // 9. Mirror-bind workspace (rw) at its host path so the
         //    runtime's `--workspace <abs-path>` argument resolves
@@ -899,6 +895,113 @@ extern "C" fn forward_signal_to_inner(sig: libc::c_int) {
             let _ = libc::kill(pid, sig);
         }
     }
+}
+
+/// Securebits that stop uid 0 from meaning anything to capabilities, each
+/// locked so no descendant can unset it: exec as uid 0 grants nothing
+/// (`NOROOT`), uid changes leave capabilities alone (`NO_SETUID_FIXUP`),
+/// nothing keeps capabilities across a uid change (`KEEP_CAPS` locked
+/// off), and ambient capabilities cannot be raised.
+const LOCKED_NO_ROOT_SECUREBITS: libc::c_ulong = (1 << 0) // SECBIT_NOROOT
+    | (1 << 1) // SECBIT_NOROOT_LOCKED
+    | (1 << 2) // SECBIT_NO_SETUID_FIXUP
+    | (1 << 3) // SECBIT_NO_SETUID_FIXUP_LOCKED
+    | (1 << 5) // SECBIT_KEEP_CAPS_LOCKED
+    | (1 << 6) // SECBIT_NO_CAP_AMBIENT_RAISE
+    | (1 << 7); // SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED
+
+/// `_LINUX_CAPABILITY_VERSION_3`: 64-bit sets, as two 32-bit words.
+const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+#[repr(C)]
+struct CapabilityHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapabilityWords {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+/// Give up every capability in the agent's user namespace for good: no
+/// `CAP_DAC_OVERRIDE` on files it can see, no `CAP_SYS_PTRACE`, nothing
+/// regained by exec'ing a root-owned or file-capability binary. The
+/// agent's uid 0 is still the gateway's host uid, so it keeps the owner's
+/// permissions on host-root files it can reach. A user namespace the
+/// agent creates starts with its own full set, confined to that namespace.
+/// Called by `havn-init` last before it execs the runtime, after the
+/// mounts that need the namespace's capabilities.
+///
+/// Locks the securebits first (needs `CAP_SETPCAP`), then empties the
+/// bounding set (also needs it), the ambient set, and finally the
+/// effective, permitted and inheritable sets, and checks the bounding set
+/// is empty.
+///
+/// # Safety
+///
+/// Each step affects the calling thread only, so the process must be
+/// single-threaded (havn-init's child after `fork` is).
+pub unsafe fn drop_all_capabilities() -> io::Result<()> {
+    // SAFETY: prctl with integer arguments only.
+    if unsafe { libc::prctl(libc::PR_SET_SECUREBITS, LOCKED_NO_ROOT_SECUREBITS, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for cap in 0..=63_u32 {
+        // SAFETY: prctl with integer arguments only; the kernel reads the
+        // capability as an unsigned long.
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, libc::c_ulong::from(cap), 0, 0, 0) } != 0 {
+            let err = io::Error::last_os_error();
+            // EINVAL: past the kernel's last capability.
+            if err.raw_os_error() == Some(libc::EINVAL) && cap > 0 {
+                break;
+            }
+            return Err(err);
+        }
+    }
+    for cap in 0..=63_u32 {
+        // SAFETY: prctl with integer arguments only.
+        match unsafe { libc::prctl(libc::PR_CAPBSET_READ, libc::c_ulong::from(cap), 0, 0, 0) } {
+            0 => {}
+            1 => {
+                return Err(io::Error::other(format!(
+                    "capability {cap} is still in the bounding set"
+                )));
+            }
+            _ => break,
+        }
+    }
+    // SAFETY: prctl with integer arguments only.
+    if unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut header = CapabilityHeader {
+        version: CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let empty = [CapabilityWords {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: capset reads one header and two capability words, both live
+    // for the call; pid 0 is the calling thread.
+    if unsafe { libc::syscall(libc::SYS_capset, &raw mut header, empty.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Public entry used by `havn-init` (the PID-1 shim). Same contract as the
