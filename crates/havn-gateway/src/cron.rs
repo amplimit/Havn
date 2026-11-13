@@ -233,7 +233,7 @@ impl CronScheduler {
                     },
                 )
                 .await;
-                let _ = advance_after_run(&self.db, job_id, &job.schedule, now).await;
+                let _ = advance_after_run(&self.db, &job, now).await;
                 return;
             }
         }
@@ -258,8 +258,7 @@ impl CronScheduler {
             self.pending_runs().remove(&run_id);
             return;
         }
-        let now = Utc::now();
-        if let Err(e) = advance_after_run(&self.db, job_id, &job.schedule, now).await {
+        if let Err(e) = advance_after_run(&self.db, &job, Utc::now()).await {
             warn!(%job_id, error = %e, "advance_after_run failed");
         }
         debug!(%job_id, %agent_id, "cron tick dispatched");
