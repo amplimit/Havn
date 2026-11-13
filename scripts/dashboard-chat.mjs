@@ -8,9 +8,13 @@
 // answers through the dashboard, and that the gateway called the mock with
 // the credential that was added.
 //
+// Along the way it saves full-page screenshots of the main pages at a
+// desktop and a phone width to $RUNNER_TEMP/dashboard-screens, for review.
+//
 // Env: PLAYWRIGHT_DIR (a directory with node_modules/playwright),
 // HAVN_DASHBOARD_URL, HAVN_MOCK_LLM_PORT, HAVN_MOCK_LLM_KEY.
 
+import { mkdirSync } from "node:fs";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 
@@ -63,6 +67,37 @@ function check(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+const SCREENS = `${process.env.RUNNER_TEMP ?? "/tmp"}/dashboard-screens`;
+const VIEWPORTS = [
+  { name: "desktop", width: 1440, height: 900 },
+  { name: "phone", width: 390, height: 844 },
+];
+
+// Screenshots only document the pages; a failure here does not fail the run.
+async function screenshots(browser, pages) {
+  try {
+    mkdirSync(SCREENS, { recursive: true });
+    for (const viewport of VIEWPORTS) {
+      const context = await browser.newContext({ viewport, deviceScaleFactor: 1 });
+      try {
+        const page = await context.newPage();
+        for (const [name, path] of pages) {
+          try {
+            await page.goto(`${DASHBOARD}${path}`, { waitUntil: "networkidle" });
+            await page.screenshot({ path: `${SCREENS}/${name}-${viewport.name}.png`, fullPage: true });
+          } catch (e) {
+            console.error(`screenshot ${name} (${viewport.name}): ${e}`);
+          }
+        }
+      } finally {
+        await context.close().catch(() => {});
+      }
+    }
+  } catch (e) {
+    console.error(`screenshots: ${e}`);
+  }
+}
+
 const browser = await chromium.launch();
 let failure = null;
 try {
@@ -78,6 +113,8 @@ try {
     if (msg.type() === "error") console.error(`[browser] ${msg.text()}`);
   });
 
+  await screenshots(browser, [["home-empty", "/"]]);
+
   await page.goto(`${DASHBOARD}/agents/new`);
   await page.fill("#name", "readme-agent");
   const created = page.waitForResponse(
@@ -87,6 +124,7 @@ try {
   const createdStatus = (await created).status();
   check(createdStatus === 200 || createdStatus === 201, `POST /api/agents returned ${createdStatus}`);
   await page.waitForURL(/\/agents\/[0-9a-f-]{36}$/);
+  const agentPath = new URL(page.url()).pathname;
 
   const composer = page.locator("textarea:not([disabled])");
   await composer.waitFor();
@@ -117,6 +155,16 @@ try {
     "the gateway called the mock without the credential that was added",
   );
   console.log(`chat reply received; mock provider served ${calls.length} call(s) for ${calls[0].model}`);
+
+  await screenshots(browser, [
+    ["home", "/"],
+    ["new-agent", "/agents/new"],
+    ["models", "/models"],
+    ["credentials", "/credentials"],
+    ["teams", "/teams"],
+    ["chat", agentPath],
+    ["settings", `${agentPath}/settings`],
+  ]);
 } catch (e) {
   failure = e;
   const dir = process.env.RUNNER_TEMP ?? "/tmp";

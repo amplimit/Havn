@@ -104,7 +104,7 @@ export default function TeamAuditPage({
         <select
           value={actionFilter}
           onChange={(e) => setActionFilter(e.target.value)}
-          className="bg-transparent text-sm outline-none"
+          className="bg-transparent text-sm"
           style={{ borderBottom: "1px solid var(--color-border-default)" }}
         >
           {ACTION_PREFIXES.map((p) => (

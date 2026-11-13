@@ -10,6 +10,7 @@ import {
 } from "@/lib/api";
 import { openChat, type ChatHandle } from "@/lib/websocket";
 import { Markdown } from "@/components/Markdown";
+import { BookOpen, Brain, Check, Copy, Layers, RotateCcw, Search, Settings } from "lucide-react";
 
 type Bubble = {
   id: number;
@@ -203,9 +204,10 @@ export default function ChatPage({
   // Auto-scroll to bottom on new bubbles or when the typing
   // indicator appears.
   useEffect(() => {
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     scrollRef.current?.scrollTo({
       top: scrollRef.current.scrollHeight,
-      behavior: "smooth",
+      behavior: reduce ? "auto" : "smooth",
     });
   }, [bubbles.length, pending]);
 
@@ -272,24 +274,27 @@ export default function ChatPage({
         <div className="flex items-center gap-3">
           <Link
             href={`/agents/${agent.id}/memory`}
-            className="btn-ghost"
+            className="btn-ghost inline-flex items-center gap-1.5"
             title="See what the agent remembers about you"
           >
-            🧠 memory
+            <Brain size={16} className="shrink-0" aria-hidden="true" />
+            memory
           </Link>
           <Link
             href={`/agents/${agent.id}/skills`}
-            className="btn-ghost"
+            className="btn-ghost inline-flex items-center gap-1.5"
             title="Installed skills + curator log"
           >
-            📚 skills
+            <BookOpen size={16} className="shrink-0" aria-hidden="true" />
+            skills
           </Link>
           <Link
             href={`/agents/${agent.id}/settings`}
-            className="btn-ghost"
+            className="btn-ghost inline-flex items-center gap-1.5"
             title="Rename, change model, edit policy"
           >
-            ⚙ settings
+            <Settings size={16} className="shrink-0" aria-hidden="true" />
+            settings
           </Link>
           <MemoryPill embedding={embedding} />
           <ConnectionPill state={wsState} agent={agent} />
@@ -459,7 +464,7 @@ function ActionRow({
         type="button"
         onClick={onCopy}
         title="copy markdown source"
-        aria-label="copy message"
+        aria-label={copied ? "copied" : "copy message"}
         className="rounded px-1.5 py-0.5 transition-colors"
         style={{ background: "transparent" }}
         onMouseEnter={(e) =>
@@ -469,7 +474,10 @@ function ActionRow({
           (e.currentTarget.style.background = "transparent")
         }
       >
-        {copied ? "✓ copied" : "⧉ copy"}
+        <span className="inline-flex items-center gap-1">
+          {copied ? <Check size={12} className="shrink-0" aria-hidden="true" /> : <Copy size={12} className="shrink-0" aria-hidden="true" />}
+          {copied ? "copied" : "copy"}
+        </span>
       </button>
       {onRetry && (
         <button
@@ -486,7 +494,10 @@ function ActionRow({
             (e.currentTarget.style.background = "transparent")
           }
         >
-          ↻ retry
+          <span className="inline-flex items-center gap-1">
+            <RotateCcw size={12} className="shrink-0" aria-hidden="true" />
+            retry
+          </span>
         </button>
       )}
     </div>
@@ -738,7 +749,8 @@ function MemoryPill({ embedding }: { embedding: EmbeddingStatus | null }) {
   if (!embedding) return null;
   const hybrid = embedding.hybrid_enabled;
   const provider = embedding.provider;
-  const label = hybrid ? `🧬 ${provider}` : "🔍 keyword-only";
+  const label = hybrid ? provider : "keyword-only";
+  const LabelIcon = hybrid ? Layers : Search;
   const tip = hybrid
     ? `Hybrid retrieval (memory + skills): vector (${provider}) + BM25 keyword. Semantic-near queries work even with no shared words.`
     : "FTS5 keyword-only (memory + skills). Set [embedding] in config.toml to enable hybrid retrieval (spec §9.4 / §13).";
@@ -755,6 +767,7 @@ function MemoryPill({ embedding }: { embedding: EmbeddingStatus | null }) {
           : "var(--color-body)",
       }}
     >
+      <LabelIcon size={12} className="shrink-0" aria-hidden="true" />
       {label}
     </span>
   );

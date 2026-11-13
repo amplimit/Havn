@@ -151,6 +151,14 @@ jobs:
           HAVN_PROFILE: debug
           HAVN_SKIP_RUSTUP: '1'
           PLAYWRIGHT_DIR: ${{ runner.temp }}/playwright
+      - name: upload dashboard screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-screens
+          path: ${{ runner.temp }}/dashboard-screens
+          if-no-files-found: ignore
+          retention-days: 14
       - name: upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4

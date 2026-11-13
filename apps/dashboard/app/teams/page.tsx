@@ -91,7 +91,7 @@ export default function TeamsPage() {
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
             placeholder="e.g. engineering"
-            className="mt-1 w-full bg-transparent text-base outline-none"
+            className="mt-1 w-full bg-transparent text-base"
             style={{ borderBottom: "1px solid var(--color-border-default)" }}
           />
         </div>

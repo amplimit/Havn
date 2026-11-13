@@ -94,11 +94,13 @@ impl IdentityHeader {
 }
 
 /// `GET /auth/info`: the identity header name, so the dashboard proxy can
-/// forward exactly that header. Not a secret, served without identity.
+/// forward exactly that header, and the gateway version, so the dashboard
+/// can show a mismatch. Not a secret, served without identity.
 pub async fn info(State(app): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "identity_header": app.identity.name.as_str(),
         "trust_header": app.trusted_proxies.is_some(),
+        "version": env!("CARGO_PKG_VERSION"),
     }))
 }
 
@@ -601,6 +603,7 @@ pub(crate) mod tests {
         let Json(body) = info(State(app)).await;
         assert_eq!(body["identity_header"], "remote-user");
         assert_eq!(body["trust_header"], true);
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[tokio::test]

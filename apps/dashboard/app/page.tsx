@@ -35,7 +35,7 @@ export default function HomePage() {
       await api.agents.delete(id);
       await reload();
     } catch (e) {
-      alert(e instanceof Error ? e.message : String(e));
+      setError(`could not delete the agent: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setBusy(null);
     }
@@ -61,6 +61,7 @@ export default function HomePage() {
 
       {error && (
         <div
+          role="alert"
           className="card mb-6 px-4 py-3 text-sm"
           style={{ color: "var(--color-ruby)", borderColor: "rgba(234, 34, 97, 0.3)" }}
         >

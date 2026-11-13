@@ -125,13 +125,13 @@ export default function MembersPage({
             value={newUserId}
             onChange={(e) => setNewUserId(e.target.value)}
             placeholder="user X-User-ID (UUID v7)"
-            className="bg-transparent text-base outline-none"
+            className="bg-transparent text-base"
             style={{ borderBottom: "1px solid var(--color-border-default)" }}
           />
           <select
             value={newRoleId}
             onChange={(e) => setNewRoleId(e.target.value)}
-            className="bg-transparent text-sm outline-none"
+            className="bg-transparent text-sm"
             style={{ borderBottom: "1px solid var(--color-border-default)" }}
           >
             {roles.map((r) => (
@@ -172,7 +172,7 @@ export default function MembersPage({
                   <select
                     value={m.role_id}
                     onChange={(e) => onRoleChange(m.user_id, e.target.value)}
-                    className="bg-transparent text-sm outline-none"
+                    className="bg-transparent text-sm"
                     style={{
                       borderBottom: "1px solid var(--color-border-default)",
                     }}

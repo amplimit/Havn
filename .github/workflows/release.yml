@@ -26,8 +26,9 @@ env:
 jobs:
   version:
     # Binaries report the workspace version (`havn --version`), so the tag
-    # must match it: before tagging vX.Y.Z, set `[workspace.package] version`
-    # and the internal crates in `[workspace.dependencies]` to X.Y.Z.
+    # must match it: before tagging vX.Y.Z, set `[workspace.package] version`,
+    # the internal crates in `[workspace.dependencies]` and the dashboard's
+    # package.json version to X.Y.Z.
     name: tag matches workspace version
     runs-on: ubuntu-24.04
     steps:
@@ -47,6 +48,12 @@ jobs:
           if [ -n "$stale" ]; then
             echo "::error::internal crate versions in [workspace.dependencies] differ from $version:"
             echo "$stale"
+            exit 1
+          fi
+          # The dashboard shows its version next to the gateway's.
+          dashboard="$(node -p 'require("./apps/dashboard/package.json").version')"
+          if [ "$dashboard" != "$version" ]; then
+            echo "::error::apps/dashboard/package.json version $dashboard differs from $version"
             exit 1
           fi
       - name: Cargo.lock matches the version bump

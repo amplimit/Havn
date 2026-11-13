@@ -114,7 +114,7 @@ export default function SettingsPage({
       setAgent(updated);
       setSavedAt(Date.now());
     } catch (e) {
-      if (e instanceof ApiError) setError(`${e.status}: ${e.body}`);
+      if (e instanceof ApiError) setError(e.message);
       else setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
@@ -266,7 +266,7 @@ export default function SettingsPage({
               className="text-xs"
               style={{ color: "var(--color-success-text)" }}
             >
-              ✓ saved · changes apply on next spawn
+              saved · changes apply on next spawn
             </span>
           )}
         </div>
@@ -487,9 +487,9 @@ function BootstrapFileEditor({
         {justSaved && (
           <span
             className="text-xs"
-            style={{ color: "var(--color-stripe-green)" }}
+            style={{ color: "var(--color-success-text)" }}
           >
-            ✓ saved
+            saved
           </span>
         )}
         {dirty && !saving && !justSaved && (
@@ -858,9 +858,9 @@ function McpEditor({ agentId }: { agentId: string }) {
                 {justSaved && (
                   <span
                     className="ml-2 text-xs"
-                    style={{ color: "var(--color-stripe-green)" }}
+                    style={{ color: "var(--color-success-text)" }}
                   >
-                    ✓ saved
+                    saved
                   </span>
                 )}
               </div>
@@ -1144,9 +1144,9 @@ function RetrievalEditor({
               {justSaved && (
                 <span
                   className="text-xs"
-                  style={{ color: "var(--color-stripe-green)" }}
+                  style={{ color: "var(--color-success-text)" }}
                 >
-                  ✓ swapped — affects next agent spawn
+                  swapped — affects next agent spawn
                 </span>
               )}
               {embedding.hybrid_enabled ? (
