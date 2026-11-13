@@ -129,9 +129,9 @@ The dashboard is not part of the release binaries. Run it on the gateway
 host with Node.js 22.13+, from your source checkout or a fresh clone:
 
 ```bash
-# Clone the tag matching the release you installed, e.g. v0.1.5
+# Clone the tag matching the release you installed, e.g. v0.1.6
 # (`havn --version` shows it); skip if you built from source:
-git clone --branch v0.1.5 https://github.com/amplimit/havn
+git clone --branch v0.1.6 https://github.com/amplimit/havn
 cd havn/apps/dashboard
 npm install
 npm run build
@@ -183,6 +183,8 @@ havn is **infrastructure, not SaaS**. The test: does it require kernel primitive
 ## Security Model
 
 - Agents run in isolated Linux namespaces (PID, mount, network, user) with Landlock LSM and seccomp-bpf syscall filtering
+- The agent runtime, its tools and MCP servers hold no capabilities, and cannot regain them by exec. Inside the agent, `ping` and binding ports below 1024 therefore fail, and a read-write `extra_mounts` directory not owned by the gateway's user is read-only. The agent's root is still the gateway's host uid, so files it creates in its workspace belong to root on the host
+- Of the host's `/etc`, agents see only `/etc/ssl/certs` (read-only) and, with network egress, a generated `/etc/resolv.conf`
 - Agents do not start if Landlock is not available (kernel 5.13+ with `landlock` in the `lsm=` list; `havn doctor` checks it). To run agents without filesystem restriction on such a kernel anyway, start the gateway with `HAVN_ALLOW_NO_LANDLOCK=1`
 - Agents with network egress reach the public internet only: traffic to the gateway host (including Docker-published ports), other agents, private, link-local (including cloud metadata), CGNAT and reserved addresses is dropped in `mangle PREROUTING` before any other firewall rule, and the host end of the agent link has no IPv6. The configured `agent_dns` servers stay reachable on port 53, also when they run on the gateway host; list other internal addresses agents may use under `[network] agent_private_access = ["10.0.5.20", "192.168.1.0/24"]`. If these rules cannot be installed (no `iptables`), agents get no network access at all. A `firewall-cmd --reload` or similar flush removes them; agents started afterwards get no network until the gateway restarts. A host-wide rule that redirects port 53 to a local resolver also breaks agent DNS, since the redirected destination is no longer an `agent_dns` server
 - API keys encrypted at rest with [age](https://age-encryption.org/) — agent processes never see them
