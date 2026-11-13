@@ -175,9 +175,9 @@ export default function SettingsPage({
           className="mt-2 text-sm"
           style={{ color: "var(--color-body)" }}
         >
-          Changes apply on the agent's next start. The currently-running
+          Changes apply on the agent&apos;s next start. The currently-running
           runtime keeps its frozen system prompt + Welcome-snapshot
-          policy until it's restarted (spec §9.4).
+          policy until it&apos;s restarted (spec §9.4).
         </p>
       </header>
 
@@ -374,7 +374,7 @@ function BootstrapEditor({ agentId }: { agentId: string }) {
     <section className="mt-10 card px-4 py-4">
       <h2 className="display-h3 mb-2">bootstrap files</h2>
       <p className="mb-4 text-sm" style={{ color: "var(--color-body)" }}>
-        Three plain-text files in the agent's workspace that drive
+        Three plain-text files in the agent&apos;s workspace that drive
         persona, durable user-facing facts, and heartbeat behaviour
         (spec §5.3, §9.4 layer 2). Each saves independently. Empty
         body deletes the file.
@@ -640,8 +640,8 @@ function McpEditor({ agentId }: { agentId: string }) {
         <code className="font-mono"> mcp__&lt;server&gt;__&lt;tool&gt;</code>.
         Only binaries placed under{" "}
         <code className="font-mono">/usr/share/havn/mcp-servers/</code>{" "}
-        on the host are reachable; "no marketplace" means agents can't
-        install new ones. Changes apply on the agent's next start.
+        on the host are reachable; &quot;no marketplace&quot; means agents can&apos;t
+        install new ones. Changes apply on the agent&apos;s next start.
       </p>
       {error && (
         <div

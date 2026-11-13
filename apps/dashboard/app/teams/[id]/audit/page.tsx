@@ -10,7 +10,7 @@
  */
 
 import { use, useEffect, useState } from "react";
-import { ApiError, api, type AuditEntryView } from "@/lib/api";
+import { ApiError, type AuditEntryView } from "@/lib/api";
 
 const ACTION_PREFIXES = [
   "(all)",

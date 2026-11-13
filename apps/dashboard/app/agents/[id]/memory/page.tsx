@@ -164,7 +164,7 @@ export default function MemoryPage({
         <div className="card-elevated px-8 py-12 text-center">
           <p className="display-h3 mb-2">no memory yet</p>
           <p style={{ color: "var(--color-body)" }}>
-            The agent hasn't been started yet, so its database hasn't been
+            The agent hasn&apos;t been started yet, so its database hasn&apos;t been
             initialised. Start the agent and have a conversation; come back
             here to see what it remembered.
           </p>
@@ -175,9 +175,9 @@ export default function MemoryPage({
         <div className="card-elevated px-8 py-12 text-center">
           <p className="display-h3 mb-2">no memory yet</p>
           <p style={{ color: "var(--color-body)" }}>
-            The agent has been running but hasn't written any memory yet.
-            Tell it something to remember, or have a conversation — it'll
-            infer what's worth keeping during the next heartbeat.
+            The agent has been running but hasn&apos;t written any memory yet.
+            Tell it something to remember, or have a conversation — it&apos;ll
+            infer what&apos;s worth keeping during the next heartbeat.
           </p>
         </div>
       )}
