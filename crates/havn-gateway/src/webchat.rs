@@ -125,7 +125,33 @@ impl WebChatRouter {
             .channel_id
             .parse()
             .map_err(|_| DeliverError::InvalidChannelId(msg.channel_id.clone()))?;
+        let server_msg = match msg.content {
+            MessageContent::Text { text } => ServerMessage::AgentMessage { content: text },
+            // Phase 1 webchat is text-only. Stub other variants with a placeholder.
+            other => ServerMessage::AgentMessage {
+                content: format!("(unsupported content variant: {other:?})"),
+            },
+        };
+        self.send_to_session(agent_id, session_id, server_msg).await
+    }
 
+    /// Show `message` as an error in every open tab of `session_id`.
+    pub async fn error(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        message: String,
+    ) -> Result<(), DeliverError> {
+        self.send_to_session(agent_id, session_id, ServerMessage::Error { message })
+            .await
+    }
+
+    async fn send_to_session(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        server_msg: ServerMessage,
+    ) -> Result<(), DeliverError> {
         let targets: Vec<_> = {
             let map = self.inner.lock().await;
             map.iter()
@@ -137,13 +163,6 @@ impl WebChatRouter {
             return Err(DeliverError::NoSession(session_id));
         }
 
-        let server_msg = match msg.content {
-            MessageContent::Text { text } => ServerMessage::AgentMessage { content: text },
-            // Phase 1 webchat is text-only. Stub other variants with a placeholder.
-            other => ServerMessage::AgentMessage {
-                content: format!("(unsupported content variant: {other:?})"),
-            },
-        };
         let mut result = Err(DeliverError::WriterClosed);
         for (tab, tx) in targets {
             match self.offer(session_id, tab, &tx, server_msg.clone()).await {
@@ -210,6 +229,18 @@ impl WebChatRouter {
                 content: format!("(unsupported content variant: {other:?})"),
             },
         };
+        self.fan_out(agent_id, server_msg).await
+    }
+
+    /// Show `message` as an error in every open tab of `agent_id`.
+    pub async fn notice(&self, agent_id: AgentId, message: &str) -> usize {
+        let server_msg = ServerMessage::Error {
+            message: message.to_owned(),
+        };
+        self.fan_out(agent_id, server_msg).await
+    }
+
+    async fn fan_out(&self, agent_id: AgentId, server_msg: ServerMessage) -> usize {
         let targets: Vec<_> = {
             let map = self.inner.lock().await;
             map.iter()

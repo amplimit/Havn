@@ -22,8 +22,9 @@ use crate::start::resolve_gateway_bin;
 /// before we declare the launch failed.
 const DETACH_BIND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Graceful-stop budget. SIGTERM, then SIGKILL when this elapses.
-const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Graceful-stop budget. SIGTERM, then SIGKILL when this elapses. The
+/// gateway gives agents up to 30 s to finish their turns before it stops.
+const STOP_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub fn start(detach: bool) -> anyhow::Result<()> {
     if detach {

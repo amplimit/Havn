@@ -99,6 +99,20 @@ Keep `/etc/havn/havn.env` mode 0600 and owned by root, and write the key with an
 
 Agent cgroups are `/sys/fs/cgroup/havn/agent-<id>`. The gateway creates that top-level cgroup itself and moves agents into it, outside the unit's own cgroup, so this is not systemd delegation; `Delegate=yes` only keeps the cpu, memory and pids controllers enabled from the root cgroup down. `havn` is not a unit name, so systemd leaves the cgroup alone. Older gateways used `/sys/fs/cgroup/havn.slice`: at start-up the gateway kills the agents still running there, removes their cgroups, and removes `havn.slice` itself unless systemd has an active `havn.slice` unit or something else lives in it. Put local changes in a drop-in (`systemctl edit havn`) rather than editing the installed file, which a re-install overwrites.
 
+### Upgrading
+
+```bash
+sudo -i
+# Replace the binaries; the running gateway is not touched yet
+curl -fsSL https://raw.githubusercontent.com/amplimit/havn/main/install.sh | HAVN_VERSION=v0.1.5 bash
+systemctl stop havn
+# Back up the database while the gateway is stopped (its path is db_path in config.toml)
+mkdir -p ~/havn-backup && cp -a ~/.local/share/havn/havn.db* ~/havn-backup/
+systemctl start havn
+```
+
+A stopping gateway takes no new messages and gives the agents up to 30 seconds to finish what they are doing. Open chats still get those replies, and are told when one was cut off. Agents that were running start again with the gateway, and the dashboard reconnects on its own. The new gateway migrates the database when it starts, and there is no way back, so keep the copy until the new version works. Upgrade the dashboard separately: check out the new tag in its directory, then run `npm install` and `npm run build`, and restart it.
+
 ### Build from source
 
 ```bash

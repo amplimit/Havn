@@ -37,6 +37,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::AppState;
+use crate::agent_registry::SendError;
 use crate::api::{ApiError, WS_SEND_TIMEOUT};
 use crate::channel_id_codec;
 use crate::channel_router::{self, AccountKey};
@@ -62,6 +63,10 @@ const DM_REJECT_MESSAGE: &str =
 /// Sent back when an inbound message could not be handed to the agent.
 const AGENT_UNREACHABLE_MESSAGE: &str =
     "The agent could not receive your message right now. Please try again later.";
+
+/// Sent back when the gateway is restarting and takes no new messages.
+const GATEWAY_RESTARTING_MESSAGE: &str =
+    "The service is restarting and did not take your message. Please send it again in a minute.";
 
 const INVITE_WELCOME_MESSAGE: &str = "Your invite code was accepted. You can now message this bot.";
 
@@ -851,9 +856,11 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
             error = ?e,
             "channel inbound: failed to forward to agent (offline?)"
         );
-        let notice = ChannelMessageContent::Text {
-            text: AGENT_UNREACHABLE_MESSAGE.into(),
+        let text = match e {
+            SendError::Draining => GATEWAY_RESTARTING_MESSAGE,
+            _ => AGENT_UNREACHABLE_MESSAGE,
         };
+        let notice = ChannelMessageContent::Text { text: text.into() };
         if let Err(e) = state
             .channel_router
             .deliver(

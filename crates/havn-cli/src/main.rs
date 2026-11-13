@@ -183,7 +183,7 @@ enum GatewayAction {
         #[arg(long)]
         detach: bool,
     },
-    /// Send SIGTERM to the detached gateway via its PID file; SIGKILL after 10s.
+    /// Send SIGTERM to the detached gateway via its PID file; SIGKILL after 45s.
     Stop,
     /// Stop (if running) then start. `--detach` controls the new instance.
     Restart {
