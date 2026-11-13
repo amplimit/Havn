@@ -89,6 +89,8 @@ pub async fn run() -> anyhow::Result<()> {
     mark!(v);
     let v = check_gateway_reachable(&cfg).await;
     mark!(v);
+    let v = check_models().await;
+    mark!(v);
 
     println!();
     if fails == 0 && warns == 0 {
@@ -649,11 +651,113 @@ async fn check_gateway_reachable(cfg: &CliConfig) -> Verdict {
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct CredentialProvider {
+    provider: String,
+    enabled: bool,
+}
+
+// Needs the running gateway; `gateway api` above reports when it is not.
+async fn check_models() -> Verdict {
+    let Ok(gw) = Gateway::from_env() else {
+        return Verdict::Ok;
+    };
+    let Ok(view) = gw.get_json::<crate::model::ModelsView>("/llm/models").await else {
+        return Verdict::Ok;
+    };
+    let creds: Vec<CredentialProvider> = gw.get_json("/credentials").await.unwrap_or_default();
+    let (verdict, msg) = models_verdict(&view, &creds);
+    line(verdict, "models", &msg);
+    verdict
+}
+
+fn models_verdict(
+    view: &crate::model::ModelsView,
+    creds: &[CredentialProvider],
+) -> (Verdict, String) {
+    let Some(default) = view.effective_default.as_deref() else {
+        return (
+            Verdict::Warn,
+            "no model in [[llm.models]]: agents cannot chat until one is added, e.g.              `havn model add anthropic:claude-sonnet-4-6`"
+                .into(),
+        );
+    };
+    let mut missing: Vec<&str> = Vec::new();
+    for m in &view.models {
+        let provider = m.id.split_once(':').map_or("", |(p, _)| p);
+        let covered = creds.iter().any(|c| {
+            c.enabled && c.provider.strip_prefix("llm:").unwrap_or(&c.provider) == provider
+        });
+        if !covered && !missing.contains(&provider) {
+            missing.push(provider);
+        }
+    }
+    if missing.is_empty() {
+        (
+            Verdict::Ok,
+            format!("{} listed, default {default}", view.models.len()),
+        )
+    } else {
+        (
+            Verdict::Warn,
+            format!(
+                "no enabled credential of yours for {}: calls to those models fail until one                  is added with `havn credential add <provider> <key>`",
+                missing.join(", ")
+            ),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    fn view(ids: &[&str]) -> crate::model::ModelsView {
+        crate::model::ModelsView {
+            default_model: None,
+            effective_default: ids.first().map(|s| (*s).to_string()),
+            models: ids
+                .iter()
+                .map(|id| crate::model::ModelEntry {
+                    id: (*id).into(),
+                    label: None,
+                    max_output_tokens: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn cred(provider: &str, enabled: bool) -> CredentialProvider {
+        CredentialProvider {
+            provider: provider.into(),
+            enabled,
+        }
+    }
+
+    #[test]
+    fn models_need_a_list_and_a_credential_per_provider() {
+        let (v, msg) = models_verdict(&view(&[]), &[]);
+        assert!(
+            matches!(v, Verdict::Warn) && msg.contains("havn model add"),
+            "{msg}"
+        );
+        let (v, msg) = models_verdict(
+            &view(&["openrouter:deepseek/deepseek-r1:free", "anthropic:claude-x"]),
+            &[cred("llm:openrouter", true), cred("anthropic", false)],
+        );
+        assert!(matches!(v, Verdict::Warn), "{msg}");
+        assert!(
+            msg.contains("anthropic") && !msg.contains("openrouter"),
+            "{msg}"
+        );
+        let (v, msg) = models_verdict(
+            &view(&["openrouter:deepseek/deepseek-r1:free"]),
+            &[cred("openrouter", true)],
+        );
+        assert!(matches!(v, Verdict::Ok), "{msg}");
+    }
 
     fn probe(parent_exists: bool, writable: io::Result<()>, root_user: bool) -> ParentProbe {
         ParentProbe {

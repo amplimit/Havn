@@ -16,6 +16,7 @@ mod credential;
 mod doctor;
 mod gateway;
 mod logs;
+mod model;
 #[cfg(target_os = "linux")]
 mod nested_ns;
 mod paths;
@@ -77,6 +78,12 @@ enum Command {
     Credential {
         #[command(subcommand)]
         action: CredentialAction,
+    },
+    /// The models agents may use (`[[llm.models]]` in the gateway's
+    /// config.toml, which the gateway rewrites).
+    Model {
+        #[command(subcommand)]
+        action: ModelAction,
     },
     /// Provision havn users (spec §1.7). Operator pre-populates the
     /// users table with the identities the upstream proxy will emit
@@ -339,6 +346,30 @@ enum AgentAction {
 }
 
 #[derive(Debug, Subcommand)]
+enum ModelAction {
+    /// List the models agents may use; the default is marked.
+    List,
+    /// Add a model as provider:model, e.g. `anthropic:claude-sonnet-4-6`
+    /// or `openrouter:deepseek/deepseek-v4.1-flash-1017`.
+    Add {
+        id: String,
+        /// Name shown in the dashboard.
+        #[arg(long)]
+        label: Option<String>,
+        /// Upper bound on the output tokens of one call.
+        #[arg(long)]
+        max_output_tokens: Option<u32>,
+        /// Make it the model of agents that do not set one.
+        #[arg(long)]
+        default: bool,
+    },
+    /// Remove a model from the list.
+    Remove { id: String },
+    /// Make a listed model the model of agents that do not set one.
+    Default { id: String },
+}
+
+#[derive(Debug, Subcommand)]
 enum CredentialAction {
     /// List configured credentials.
     List,
@@ -385,6 +416,7 @@ fn main() -> anyhow::Result<()> {
         Command::Doctor => async_runtime()?.block_on(doctor::run()),
         Command::Agent { action } => async_runtime()?.block_on(run_agent(action)),
         Command::Credential { action } => async_runtime()?.block_on(run_credential(action)),
+        Command::Model { action } => async_runtime()?.block_on(run_model(action)),
         Command::User { action } => async_runtime()?.block_on(run_user(action)),
         Command::Team { action } => async_runtime()?.block_on(run_team(action)),
         Command::Role { action } => async_runtime()?.block_on(run_role(action)),
@@ -498,6 +530,20 @@ async fn run_agent(action: AgentAction) -> anyhow::Result<()> {
         AgentAction::Start { agent_id } => agent::start(&agent_id).await,
         AgentAction::Stop { agent_id } => agent::stop(&agent_id).await,
         AgentAction::Delete { agent_id } => agent::delete(&agent_id).await,
+    }
+}
+
+async fn run_model(action: ModelAction) -> anyhow::Result<()> {
+    match action {
+        ModelAction::List => model::list().await,
+        ModelAction::Add {
+            id,
+            label,
+            max_output_tokens,
+            default,
+        } => model::add(&id, label.as_deref(), max_output_tokens, default).await,
+        ModelAction::Remove { id } => model::remove(&id).await,
+        ModelAction::Default { id } => model::set_default(&id).await,
     }
 }
 

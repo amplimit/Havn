@@ -16,6 +16,7 @@ mod cron;
 mod heartbeat;
 mod keyring;
 mod llm_proxy;
+mod model_catalog;
 mod perm;
 mod policy_resolver;
 mod query_broker;
@@ -165,6 +166,9 @@ struct AppState {
     /// `[llm]` settings, applied to the LLM test endpoint as to agent
     /// calls.
     pub llm: Arc<config::LlmConfig>,
+    pub models: Arc<ArcSwap<model_catalog::ModelCatalog>>,
+    pub config_path: PathBuf,
+    pub models_write: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[tokio::main]
@@ -200,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
     }
     init_tracing();
 
-    let cfg = GatewayConfig::load().context("loading gateway config")?;
+    let mut cfg = GatewayConfig::load().context("loading gateway config")?;
     info!(
         version = env!("CARGO_PKG_VERSION"),
         listen = %cfg.listen,
@@ -370,6 +374,23 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let config_path = GatewayConfig::resolved_path();
+    let catalog = model_catalog::upgrade(&db, &config_path, cfg.llm.catalog())
+        .await
+        .context("upgrading model names to provider:model")?;
+    match catalog.default_entry() {
+        Some(default) => info!(
+            models = catalog.models.len(),
+            default = %default.id,
+            "model list"
+        ),
+        None => warn!(
+            "[[llm.models]] lists no model: agents cannot call an LLM until one is added in              config.toml, with `havn model add`, or on the dashboard"
+        ),
+    }
+    cfg.llm.default_model = catalog.default_model;
+    cfg.llm.models = catalog.models;
+
     let http = llm_proxy::http_client().context("building HTTP client")?;
 
     let registry = AgentRegistry::new();
@@ -422,6 +443,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let reload_handles = ReloadHandles::from_config(&cfg);
     let allowed_origins = reload_handles.allowed_origins.clone();
+    let models = reload_handles.models.clone();
     info!(
         allowed_origins = ?allowed_origins.load(),
         "webchat origin allowlist"
@@ -478,6 +500,9 @@ async fn main() -> anyhow::Result<()> {
             havn_proto::LIVENESS_PING_INTERVAL,
         ),
         llm: Arc::clone(&llm),
+        models: models.clone(),
+        config_path: config_path.clone(),
+        models_write: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     // Background task: agent socket listener.
@@ -502,6 +527,7 @@ async fn main() -> anyhow::Result<()> {
         embedding_config: embedding_config.clone(),
         multi_user: cfg.trust_header.enabled,
         llm,
+        models,
         verify_peer_cgroup: isolated_agent_pool.is_some(),
         extra_mounts: cfg.extra_mounts.clone(),
         tmpfs_mounts: cfg.tmpfs_mounts.clone(),
@@ -534,11 +560,7 @@ async fn main() -> anyhow::Result<()> {
     drop(db);
 
     // Background task: config watcher (spec §8.4).
-    let reload_task = reload::spawn_watcher(
-        config::GatewayConfig::resolved_path(),
-        cfg.clone(),
-        reload_handles,
-    );
+    let reload_task = reload::spawn_watcher(config_path, cfg.clone(), reload_handles);
 
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -548,6 +570,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/embedding",
             get(api::embedding::status).patch(api::embedding::patch),
+        )
+        .route(
+            "/llm/models",
+            get(api::models::get).put(api::models::put),
         )
         .route(
             "/credentials",

@@ -430,6 +430,12 @@ pub(crate) mod tests {
                 havn_proto::LIVENESS_PING_INTERVAL,
             ),
             llm: Arc::new(crate::config::LlmConfig::default()),
+            models: Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::model_catalog::ModelCatalog::default(),
+            )),
+            config_path: std::env::temp_dir()
+                .join(format!("havn-test-config-{}.toml", uuid::Uuid::now_v7())),
+            models_write: Arc::new(tokio::sync::Mutex::new(())),
         };
         (app, bootstrap)
     }

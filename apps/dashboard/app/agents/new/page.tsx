@@ -1,13 +1,16 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { api, type TeamView } from "@/lib/api";
+import { api, type ModelsView, type TeamView } from "@/lib/api";
 
 export default function NewAgentPage() {
   const router = useRouter();
   const [name, setName] = useState("");
-  const [model, setModel] = useState("claude-opus-4-7");
+  // Empty: the agent follows the gateway's default model.
+  const [model, setModel] = useState("");
+  const [models, setModels] = useState<ModelsView | null>(null);
   const [teams, setTeams] = useState<TeamView[]>([]);
   const [teamId, setTeamId] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -16,6 +19,14 @@ export default function NewAgentPage() {
   useEffect(() => {
     let cancelled = false;
     const wanted = new URLSearchParams(window.location.search).get("team");
+    api.models
+      .get()
+      .then((m) => {
+        if (!cancelled) setModels(m);
+      })
+      .catch(() => {
+        // Without the list the agent follows the gateway's default model.
+      });
     (async () => {
       try {
         const t = await api.teams.list();
@@ -39,7 +50,7 @@ export default function NewAgentPage() {
     try {
       const agent = await api.agents.create(
         name.trim(),
-        { model },
+        model ? { model } : {},
         teamId || null,
       );
       router.push(`/agents/${agent.id}`);
@@ -120,10 +131,26 @@ export default function NewAgentPage() {
             onChange={(e) => setModel(e.target.value)}
             className="input"
           >
-            <option value="claude-opus-4-7">claude-opus-4-7 — most capable</option>
-            <option value="claude-sonnet-4-6">claude-sonnet-4-6 — balanced</option>
-            <option value="claude-haiku-4-5">claude-haiku-4-5 — fastest</option>
+            <option value="">
+              {models?.effective_default
+                ? `gateway default (${models.effective_default})`
+                : "gateway default"}
+            </option>
+            {(models?.models ?? []).map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.label ? `${m.label} (${m.id})` : m.id}
+              </option>
+            ))}
           </select>
+          {models && models.models.length === 0 && (
+            <p className="mt-1.5 text-xs" style={{ color: "var(--color-ruby)" }}>
+              The gateway lists no models yet, so the agent cannot chat.{" "}
+              <Link href="/models" className="underline">
+                Add one
+              </Link>{" "}
+              first.
+            </p>
+          )}
         </div>
 
         {error && (

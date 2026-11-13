@@ -124,6 +124,7 @@ pub struct AgentSocketCtx {
     /// `[llm]` settings: the `max_tokens` ceiling for every proxied LLM
     /// call, whatever the agent's config asks for, and provider base URLs.
     pub llm: Arc<crate::config::LlmConfig>,
+    pub models: Arc<arc_swap::ArcSwap<crate::model_catalog::ModelCatalog>>,
     /// True when agents run under `NamespaceSpawner`, each in its own
     /// `agent-<id>` cgroup. The gateway then accepts a connection for an
     /// agent only from a process in that cgroup. With the unisolated
@@ -1212,9 +1213,29 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
     let egress_allowed = policy.network_policy.egress_allowed;
 
     let response = match build_anthropic_request(&req) {
-        Ok(ar) => {
-            if !llm_proxy::model_allowed(&policy.allowed_models, &ar.model) {
-                warn!(%agent_id, model = ?ar.model, "refusing LLM request for a model the policy does not allow");
+        Ok(mut ar) => {
+            let resolved = ctx.models.load().resolve(&req.model).cloned();
+            let entry = match resolved {
+                Ok(entry) => entry,
+                Err(message) => {
+                    warn!(%agent_id, model = ?req.model, "refusing LLM request for a model the gateway does not list");
+                    let _ = ctx
+                        .registry
+                        .send(
+                            agent_id,
+                            GatewayToAgent::LlmResponse(LlmResponse {
+                                request_id,
+                                outcome: LlmOutcome::Error { message },
+                                provider_response: serde_json::Value::Null,
+                                usage: None,
+                            }),
+                        )
+                        .await;
+                    return;
+                }
+            };
+            if !llm_proxy::model_allowed(&policy.allowed_models, &entry.id) {
+                warn!(%agent_id, model = ?entry.id, "refusing LLM request for a model the policy does not allow");
                 let _ = ctx
                     .registry
                     .send(
@@ -1224,7 +1245,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                             outcome: LlmOutcome::Error {
                                 message: format!(
                                     "model {:?} is not allowed by this agent's policy",
-                                    ar.model
+                                    entry.id
                                 ),
                             },
                             provider_response: serde_json::Value::Null,
@@ -1234,6 +1255,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                     .await;
                 return;
             }
+            ar.model = entry.model().to_string();
             // An agent without egress must not get the provider to fetch
             // URLs for it (a way to send data out through the query string).
             if !egress_allowed && let Some(reason) = llm_proxy::provider_side_fetch(&ar) {
@@ -1275,19 +1297,6 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                     .await;
                 return;
             };
-            // Provider resolution: explicit `options.provider` hint wins,
-            // otherwise infer from the model name (claude-* → anthropic,
-            // gpt-*/o1*/o3* → openai, gemini-* → gemini, vendor/model →
-            // openrouter). Unknown bare names fall back to anthropic so
-            // legacy configs keep working.
-            let provider = req
-                .options
-                .get("provider")
-                .and_then(serde_json::Value::as_str)
-                .map_or_else(
-                    || llm_proxy::provider::provider_for_model(&ar.model).to_string(),
-                    str::to_string,
-                );
             // Billing user. Spec §4.4 v0.7 lets a runtime stamp a
             // `billing_user_id` override on `LlmRequest` so an
             // IncomingQuery's LLM spend hits the caller's credentials,
@@ -1328,7 +1337,14 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                 budget: policy.budget.clone(),
             };
             match llm_proxy::complete_with_provider(
-                &ctx.db, &ctx.http, ring, &billing, &provider, &ar, &ctx.llm,
+                &ctx.db,
+                &ctx.http,
+                ring,
+                &billing,
+                entry.provider(),
+                entry.max_output_tokens,
+                &ar,
+                &ctx.llm,
             )
             .await
             {
@@ -1875,6 +1891,9 @@ mod tests {
             )),
             multi_user,
             llm: Arc::new(crate::config::LlmConfig::default()),
+            models: Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::model_catalog::ModelCatalog::default(),
+            )),
             verify_peer_cgroup,
             extra_mounts: Vec::new(),
             tmpfs_mounts: Vec::new(),
@@ -1973,6 +1992,92 @@ mod tests {
         assert!(
             matches!(frame, GatewayToAgent::IncomingQuery(_)),
             "{frame:?}"
+        );
+    }
+
+    async fn llm_error_for(
+        catalog: &[&str],
+        agent_config: serde_json::Value,
+        model: &str,
+    ) -> String {
+        let ctx = ctx_with(false, false).await;
+        ctx.models
+            .store(Arc::new(crate::model_catalog::ModelCatalog {
+                default_model: None,
+                models: catalog
+                    .iter()
+                    .map(|id| crate::model_catalog::ModelEntry {
+                        id: (*id).into(),
+                        label: None,
+                        max_output_tokens: None,
+                    })
+                    .collect(),
+            }));
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (agent, mut rx) = connected_agent(&ctx, owner, "a", agent_config).await;
+        let mut req = llm_request("r1");
+        req.model = model.into();
+        handle_llm_request(agent, req, ctx.clone()).await;
+        match rx.try_recv().expect("a reply") {
+            GatewayToAgent::LlmResponse(LlmResponse {
+                outcome: LlmOutcome::Error { message },
+                ..
+            }) => message,
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_requests_need_a_listed_model() {
+        let none = llm_error_for(&[], serde_json::json!({}), "").await;
+        assert!(none.contains("no model is configured"), "{none}");
+        let unlisted =
+            llm_error_for(&["openai:gpt-5"], serde_json::json!({}), "openai:gpt-4o").await;
+        assert!(
+            unlisted.contains("not in the gateway's model list"),
+            "{unlisted}"
+        );
+        let bare = llm_error_for(&["openai:gpt-5"], serde_json::json!({}), "gpt-5").await;
+        assert!(bare.contains("not in the gateway's model list"), "{bare}");
+    }
+
+    #[tokio::test]
+    async fn the_policy_narrows_the_model_list() {
+        let config = serde_json::json!({"policy": {"allowed_models": ["anthropic:claude-x"]}});
+        let refused = llm_error_for(
+            &["openai:gpt-5", "anthropic:claude-x"],
+            config.clone(),
+            "openai:gpt-5",
+        )
+        .await;
+        assert!(
+            refused.contains("not allowed by this agent's policy"),
+            "{refused}"
+        );
+        // A listed, allowed model gets past both checks to the credential
+        // lookup, which fails here only because the test has no keyring.
+        let passed = llm_error_for(
+            &["openai:gpt-5", "anthropic:claude-x"],
+            config,
+            "anthropic:claude-x",
+        )
+        .await;
+        assert!(passed.contains("credential encryption"), "{passed}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_model_takes_the_current_default() {
+        let config = serde_json::json!({"policy": {"allowed_models": ["anthropic:claude-x"]}});
+        let first =
+            llm_error_for(&["anthropic:claude-x", "openai:gpt-5"], config.clone(), "").await;
+        assert!(first.contains("credential encryption"), "{first}");
+        let other = llm_error_for(&["openai:gpt-5", "anthropic:claude-x"], config, "").await;
+        assert!(
+            other.contains("not allowed by this agent's policy"),
+            "{other}"
         );
     }
 

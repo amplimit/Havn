@@ -126,6 +126,7 @@ pub async fn create(
     if let Some(raw) = req.config.as_ref().and_then(|c| c.get("policy")) {
         check_policy_override(raw)?;
     }
+    check_model(&state, req.config.as_ref().and_then(|c| c.get("model")))?;
 
     // Spec §6.3 enforcement: max_agents is checked here, before INSERT.
     // policy_resolver::for_user is the single source of truth for "what
@@ -228,6 +229,7 @@ pub async fn patch(
     if let Some(raw) = req.config.as_ref().and_then(|c| c.get("policy")) {
         check_policy_override(raw)?;
     }
+    check_model(&state, req.config.as_ref().and_then(|c| c.get("model")))?;
 
     // Shallow-merge config patch on top of existing config.
     let merged_config = req.config.as_ref().map(|patch| {
@@ -264,6 +266,19 @@ pub async fn patch(
     info!(agent_id = %id, by = %user.id, "agent patched");
     let connected = state.registry.is_connected(id).await;
     Ok(Json(AgentView::from_agent(updated, connected)))
+}
+
+fn check_model(state: &AppState, raw: Option<&serde_json::Value>) -> Result<(), ApiError> {
+    match raw {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(serde_json::Value::String(id)) if state.models.load().get(id).is_some() => Ok(()),
+        Some(serde_json::Value::String(id)) => Err(ApiError::BadRequest(format!(
+            "config.model {id:?} is not in the gateway's model list ([[llm.models]])"
+        ))),
+        Some(_) => Err(ApiError::BadRequest(
+            "config.model must be a provider:model string".into(),
+        )),
+    }
 }
 
 /// Rejects a `config.policy` override that the policy resolver would
@@ -773,8 +788,29 @@ pub(crate) fn embedding_env_passthrough(embedding: &serde_json::Value) -> Vec<St
 
 #[cfg(test)]
 mod tests {
-    use super::{check_policy_override, embedding_env_passthrough};
+    use super::{check_model, check_policy_override, embedding_env_passthrough};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn the_model_must_be_listed() {
+        let (state, _) = crate::auth::tests::state_with(false).await;
+        state
+            .models
+            .store(std::sync::Arc::new(crate::model_catalog::ModelCatalog {
+                default_model: None,
+                models: vec![crate::model_catalog::ModelEntry {
+                    id: "openai:gpt-5".into(),
+                    label: None,
+                    max_output_tokens: None,
+                }],
+            }));
+        assert!(check_model(&state, None).is_ok());
+        assert!(check_model(&state, Some(&json!(null))).is_ok());
+        assert!(check_model(&state, Some(&json!("openai:gpt-5"))).is_ok());
+        assert!(check_model(&state, Some(&json!("gpt-5"))).is_err());
+        assert!(check_model(&state, Some(&json!("openai:gpt-4o"))).is_err());
+        assert!(check_model(&state, Some(&json!(5))).is_err());
+    }
 
     #[test]
     fn policy_override_must_parse_and_validate() {

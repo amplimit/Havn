@@ -58,6 +58,21 @@ impl Gateway {
         Self::parse(resp).await
     }
 
+    pub async fn put_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<T> {
+        let resp = self
+            .http
+            .put(self.url(path))
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("PUT {path}"))?;
+        Self::parse(resp).await
+    }
+
     #[allow(
         dead_code,
         reason = "exposed for upcoming stop/start convenience helpers"

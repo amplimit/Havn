@@ -90,6 +90,16 @@ impl Policy {
     /// cheap because the gateway resolves policies on every request;
     /// call this where a policy is written.
     pub fn validate(&self) -> crate::Result<()> {
+        for model in &self.allowed_models {
+            let named = model
+                .split_once(':')
+                .is_some_and(|(provider, name)| !provider.is_empty() && !name.is_empty());
+            if model != "*" && !named {
+                return Err(crate::Error::InvalidPolicy(format!(
+                    "allowed_models entry {model:?} must be \"*\" or provider:model"
+                )));
+            }
+        }
         self.hooks.validate()
     }
 }
@@ -914,6 +924,17 @@ mod tests {
         assert_eq!(agent_cgroup("abc"), "/havn/agent-abc");
         for suffix in [".slice", ".service", ".scope"] {
             assert!(!AGENT_CGROUP_PARENT.ends_with(suffix));
+        }
+    }
+
+    #[test]
+    fn allowed_models_need_a_provider() {
+        let mut p = Policy::default();
+        p.allowed_models = vec!["*".into(), "openrouter:deepseek/deepseek-r1:free".into()];
+        assert!(p.validate().is_ok());
+        for bad in ["claude-opus-4-7", ":claude", "anthropic:"] {
+            p.allowed_models = vec![bad.into()];
+            assert!(p.validate().is_err(), "{bad}");
         }
     }
 }
