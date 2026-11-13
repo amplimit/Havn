@@ -679,15 +679,16 @@ async fn main() -> anyhow::Result<()> {
     .await
     .context("serving HTTP")?;
 
-    liveness_task.abort();
-    let _ = liveness_task.await;
+    // No new ticks, and no liveness verdicts on agents that are leaving.
+    for task in [liveness_task, heartbeat_task, cron_task] {
+        task.abort();
+        let _ = task.await;
+    }
+    // The agent socket stays up while agents finish their turns.
+    supervisor::drain(&shutdown_state, supervisor::DRAIN_LIMIT).await;
     supervisor::shut_down(&shutdown_state).await;
     socket_task.abort();
     let _ = socket_task.await;
-    heartbeat_task.abort();
-    let _ = heartbeat_task.await;
-    cron_task.abort();
-    let _ = cron_task.await;
     reload_task.abort();
     let _ = reload_task.await;
     Ok(())

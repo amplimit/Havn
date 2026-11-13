@@ -49,6 +49,7 @@ use sqlx::SqlitePool;
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore, mpsc};
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -839,6 +840,10 @@ where
     // fires, where we break and exit so a half-read frame is moot.
     let shutdown = wait_for_shutdown();
     tokio::pin!(shutdown);
+    // Work the gateway handed over (turns, ticks, requests). On `Drain` the
+    // loop keeps routing replies to it and ends once it is all done.
+    let work = TaskTracker::new();
+    let mut draining = false;
 
     loop {
         let frame = tokio::select! {
@@ -850,7 +855,15 @@ where
                 info!("termination signal received — exiting agent runtime cleanly");
                 break;
             }
+            () = work.wait(), if draining => {
+                info!("drained: no work left in flight");
+                break;
+            }
         };
+        if draining && takes_new_work(&frame) {
+            warn!("draining; dropping a frame that would start new work");
+            continue;
+        }
         match frame {
             GatewayToAgent::Welcome { .. } => {
                 warn!("unexpected duplicate Welcome");
@@ -861,7 +874,7 @@ where
                 // now even if 7 days have elapsed".
                 curator_scheduler::record_inbound(&ctx.last_inbound).await;
                 let ctx = ctx.clone();
-                tokio::spawn(async move {
+                work.spawn(async move {
                     handle_inbound(msg, ctx).await;
                 });
             }
@@ -875,37 +888,37 @@ where
             }
             GatewayToAgent::HeartbeatTick => {
                 let ctx = ctx.clone();
-                tokio::spawn(async move {
+                work.spawn(async move {
                     handle_heartbeat(ctx).await;
                 });
             }
             GatewayToAgent::CronTick(tick) => {
                 let ctx = ctx.clone();
-                tokio::spawn(async move {
+                work.spawn(async move {
                     handle_cron(tick, ctx).await;
                 });
             }
             GatewayToAgent::MemoryForgetRequest(req) => {
                 let ctx = ctx.clone();
-                tokio::spawn(async move {
+                work.spawn(async move {
                     handle_memory_forget(req, ctx).await;
                 });
             }
             GatewayToAgent::SkillPinRequest(req) => {
                 let ctx = ctx.clone();
-                tokio::spawn(async move {
+                work.spawn(async move {
                     handle_skill_pin(req, ctx).await;
                 });
             }
             GatewayToAgent::DataRequest(req) => {
                 let ctx = ctx.clone();
-                tokio::spawn(async move {
+                work.spawn(async move {
                     handle_data_request(req, ctx).await;
                 });
             }
             GatewayToAgent::IncomingQuery(query) => {
                 let ctx = ctx.clone();
-                tokio::spawn(async move {
+                work.spawn(async move {
                     handle_incoming_query(query, ctx).await;
                 });
             }
@@ -924,12 +937,31 @@ where
                 info!("shutdown frame received");
                 break;
             }
+            GatewayToAgent::Drain => {
+                info!(
+                    in_flight = work.len(),
+                    "drain requested; finishing work in flight"
+                );
+                draining = true;
+                work.close();
+            }
             other => {
                 warn!(?other, "unknown gateway frame — ignoring");
             }
         }
     }
     Ok(())
+}
+
+/// Frames that start work of the agent's own. A draining agent drops
+/// them; replies and requests that serve work in flight still go through.
+fn takes_new_work(frame: &GatewayToAgent) -> bool {
+    matches!(
+        frame,
+        GatewayToAgent::InboundMessage(_)
+            | GatewayToAgent::HeartbeatTick
+            | GatewayToAgent::CronTick(_)
+    )
 }
 
 /// Sentinel string the agent may return when its heartbeat tick decides nothing

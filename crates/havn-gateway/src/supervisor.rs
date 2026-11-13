@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 
 use havn_core::{AgentId, UserId};
 use havn_db::repo::agents::{self as repo, AgentStatus};
+use havn_proto::GatewayToAgent;
 use havn_spawner::{AgentExit, AgentHandle};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -182,6 +183,11 @@ pub(crate) fn watch(state: &AppState, handle: AgentHandle, generation: u64) {
                 return;
             }
         };
+        if state.supervisor.shutting_down() {
+            // Left during a drain. It stays registered so `shut_down`
+            // releases what the spawner holds before the gateway exits.
+            return;
+        }
         // Gone from the registry: stopped on purpose, or already handled.
         let Some(instance) = state
             .registry
@@ -252,6 +258,15 @@ async fn recover(state: &AppState, instance: Instance, ended: Ended) {
     let ran_for = instance.registered_at.elapsed();
     let ran_for_s = ran_for.as_secs();
 
+    if state.supervisor.shutting_down() {
+        // Ended as the gateway stops (the flag was set after `watch` took
+        // it out of the registry): release it, but no audit or restart.
+        debug!(agent_id = %id, "agent left while the gateway is stopping");
+        if let Err(e) = state.spawner.stop(&instance.handle).await {
+            debug!(agent_id = %id, error = %e, "spawner had nothing left to stop");
+        }
+        return;
+    }
     match (ended, meant_to_run(state, id).await) {
         // Stopped or deleted meanwhile: its Shutdown frame can make it
         // exit before the stop deregisters it.
@@ -438,6 +453,80 @@ pub(crate) async fn reconcile(state: &AppState) {
     }
 }
 
+/// How long a stopping gateway waits for agents to finish their work.
+pub const DRAIN_LIMIT: Duration = Duration::from_secs(30);
+
+/// Shown in the open chats of agents that were still busy at the end of a
+/// drain.
+const CUT_OFF_NOTICE: &str = "The gateway restarted before the agent finished. Send your last message again once the chat is back.";
+
+/// First half of a clean gateway shutdown: take no new work, ask every
+/// connected agent to finish what it is doing and exit, and wait up to
+/// `limit` for them. The agent socket and LLM proxy must keep running
+/// meanwhile. Agents still busy at the end are left to [`shut_down`];
+/// their open chats are told the reply was cut off.
+pub(crate) async fn drain(state: &AppState, limit: Duration) {
+    state.supervisor.shutting_down.store(true, Ordering::SeqCst);
+    state.registry.start_draining();
+    let connected: Vec<AgentId> = state
+        .registry
+        .list()
+        .await
+        .into_iter()
+        .filter(|agent| agent.connected)
+        .map(|agent| agent.agent_id)
+        .collect();
+    if connected.is_empty() {
+        return;
+    }
+    info!(
+        agents = connected.len(),
+        limit_s = limit.as_secs(),
+        "letting agents finish their work"
+    );
+    let deadline = tokio::time::Instant::now() + limit;
+    // Agents not asked yet: a full queue refuses the frame, so it is
+    // offered again on every poll until the agent takes it or the limit.
+    let mut unasked = connected.clone();
+    let mut busy = connected;
+    loop {
+        let mut refused = Vec::new();
+        for id in unasked {
+            if let Err(e) = state.registry.try_send(id, GatewayToAgent::Drain).await {
+                debug!(agent_id = %id, error = %e, "could not ask agent to drain yet");
+                refused.push(id);
+            }
+        }
+        unasked = refused;
+        let mut still = Vec::with_capacity(busy.len());
+        for id in busy {
+            if state.registry.is_connected(id).await {
+                still.push(id);
+            }
+        }
+        busy = still;
+        unasked.retain(|id| busy.contains(id));
+        if busy.is_empty() || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(DRAIN_POLL).await;
+    }
+    if busy.is_empty() {
+        info!("agents finished their work");
+        return;
+    }
+    warn!(
+        agents = busy.len(),
+        "agents still busy after the drain limit; stopping them"
+    );
+    for id in busy {
+        state.webchat_router.notice(id, CUT_OFF_NOTICE).await;
+    }
+}
+
+/// How often [`drain`] checks whether the agents have left.
+const DRAIN_POLL: Duration = Duration::from_millis(100);
+
 /// Clean gateway shutdown: stop every agent process. Their status stays
 /// `running`, so the next gateway start brings them back. A start that is
 /// in progress sees the flag after registering and stops its own instance.
@@ -580,6 +669,24 @@ mod tests {
             let proc = procs.get_mut(&id).expect("running");
             proc.socket = None;
             proc.exit.send_replace(Some(AgentExit::Signal(9)));
+        }
+
+        /// The process exits by itself after its work (a drain): the
+        /// socket closes and exit 0 is reported.
+        fn finish(&self, id: AgentId) {
+            let mut procs = self.procs.lock().unwrap();
+            let proc = procs.get_mut(&id).expect("running");
+            proc.socket = None;
+            proc.exit.send_replace(Some(AgentExit::Code(0)));
+        }
+
+        /// Frames the gateway has sent the agent so far, oldest first.
+        fn received(&self, id: AgentId) -> Vec<GatewayToAgent> {
+            let mut procs = self.procs.lock().unwrap();
+            let Some((_, rx)) = procs.get_mut(&id).and_then(|p| p.socket.as_mut()) else {
+                return Vec::new();
+            };
+            std::iter::from_fn(|| rx.try_recv().ok()).collect()
         }
 
         /// The gateway side of the agent's current connection.
@@ -1146,5 +1253,81 @@ mod tests {
         assert_eq!(spawner.spawns(), 1);
         assert!(!state.registry.is_registered(id).await);
         assert!(spawner.procs.lock().unwrap().is_empty(), "instance stopped");
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_agents_to_finish_their_work() {
+        let (state, spawner, user) = fixture(quick_policy(), true, false).await;
+        let id = running_agent(&state, user).await;
+        eventually("connected", || async {
+            state.registry.is_connected(id).await
+        })
+        .await;
+
+        let drain = {
+            let state = state.clone();
+            tokio::spawn(async move { drain(&state, Duration::from_secs(30)).await })
+        };
+        let mut seen = Vec::new();
+        eventually("asked to drain", || {
+            seen.extend(spawner.received(id));
+            let asked = seen.iter().any(|f| matches!(f, GatewayToAgent::Drain));
+            async move { asked }
+        })
+        .await;
+        assert!(
+            matches!(
+                state.registry.send(id, GatewayToAgent::HeartbeatTick).await,
+                Err(crate::agent_registry::SendError::Draining)
+            ),
+            "no new work while draining"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!drain.is_finished(), "waits while the agent is busy");
+
+        spawner.finish(id);
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("drain ends once the agent has left")
+            .expect("join");
+        assert!(
+            state.registry.is_registered(id).await,
+            "left for shut_down to release"
+        );
+        shut_down(&state).await;
+        assert!(spawner.procs.lock().unwrap().is_empty(), "released");
+
+        tokio::time::sleep(quick_policy().max_delay * 4).await;
+        assert_eq!(spawner.spawns(), 1, "not restarted");
+        assert_eq!(status(&state, id).await, AgentStatus::Running);
+        let actions = audit_actions(&state).await;
+        assert_eq!(count(&actions, "agent.exited"), 0, "{actions:?}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_busy_past_the_drain_limit_is_stopped_and_its_chat_told() {
+        let (state, spawner, user) = fixture(quick_policy(), true, false).await;
+        let id = running_agent(&state, user).await;
+        eventually("connected", || async {
+            state.registry.is_connected(id).await
+        })
+        .await;
+        let (tab_tx, mut tab) = mpsc::channel(8);
+        let _registration = state
+            .webchat_router
+            .register(uuid::Uuid::now_v7(), id, tab_tx)
+            .await;
+
+        drain(&state, Duration::from_millis(100)).await;
+
+        match tab.try_recv() {
+            Ok(crate::webchat::ServerMessage::Error { message }) => {
+                assert!(message.contains("restarted"), "{message}");
+            }
+            other => panic!("expected a notice, got {other:?}"),
+        }
+        assert!(state.registry.is_connected(id).await, "left to shut_down");
+        shut_down(&state).await;
+        assert!(spawner.procs.lock().unwrap().is_empty(), "stopped");
     }
 }

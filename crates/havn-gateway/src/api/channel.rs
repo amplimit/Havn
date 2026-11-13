@@ -37,6 +37,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::AppState;
+use crate::agent_registry::SendError;
 use crate::api::{ApiError, WS_SEND_TIMEOUT};
 use crate::channel_id_codec;
 use crate::channel_router::{self, AccountKey};
@@ -62,6 +63,10 @@ const DM_REJECT_MESSAGE: &str =
 /// Sent back when an inbound message could not be handed to the agent.
 const AGENT_UNREACHABLE_MESSAGE: &str =
     "The agent could not receive your message right now. Please try again later.";
+
+/// Sent back when the gateway is restarting and takes no new messages.
+const GATEWAY_RESTARTING_MESSAGE: &str =
+    "The service is restarting and did not take your message. Please send it again in a minute.";
 
 const INVITE_WELCOME_MESSAGE: &str = "Your invite code was accepted. You can now message this bot.";
 
@@ -801,6 +806,20 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
     // N is forwarded). Do NOT move this to a detached task without restoring an
     // ordering guarantee. The hot path (already connected) skips it via
     // is_connected.
+    if state.supervisor.shutting_down() {
+        // An agent that has already drained is no longer connected and
+        // cannot be started now; tell the sender instead of dropping it.
+        tell_sender(
+            state,
+            channel,
+            &inb.account_id,
+            &inb.sender_id,
+            &inb.channel_message_id,
+            GATEWAY_RESTARTING_MESSAGE,
+        )
+        .await;
+        return;
+    }
     if !state.registry.is_connected(agent_id).await {
         match agent_repo::find_by_id(&state.db, agent_id).await {
             Ok(Some(agent_row)) => {
@@ -851,22 +870,19 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
             error = ?e,
             "channel inbound: failed to forward to agent (offline?)"
         );
-        let notice = ChannelMessageContent::Text {
-            text: AGENT_UNREACHABLE_MESSAGE.into(),
+        let text = match e {
+            SendError::Draining => GATEWAY_RESTARTING_MESSAGE,
+            _ => AGENT_UNREACHABLE_MESSAGE,
         };
-        if let Err(e) = state
-            .channel_router
-            .deliver(
-                channel,
-                &inb.account_id,
-                &inb.sender_id,
-                Some(inb.channel_message_id.clone()),
-                notice,
-            )
-            .await
-        {
-            warn!(error = %e, "channel inbound: failed to tell the sender the agent is unreachable");
-        }
+        tell_sender(
+            state,
+            channel,
+            &inb.account_id,
+            &inb.sender_id,
+            &inb.channel_message_id,
+            text,
+        )
+        .await;
     }
 }
 
@@ -878,6 +894,31 @@ enum SenderAccess {
     Admitted,
     /// Reject as an unauthorized sender.
     Denied,
+}
+
+/// Reply to the sender's message `message_id` with `text`.
+async fn tell_sender(
+    state: &AppState,
+    channel: &str,
+    account_id: &str,
+    sender_id: &str,
+    message_id: &str,
+    text: &str,
+) {
+    let notice = ChannelMessageContent::Text { text: text.into() };
+    if let Err(e) = state
+        .channel_router
+        .deliver(
+            channel,
+            account_id,
+            sender_id,
+            Some(message_id.to_owned()),
+            notice,
+        )
+        .await
+    {
+        warn!(error = %e, "channel inbound: failed to tell the sender why the message was not delivered");
+    }
 }
 
 /// `dm_policy = "open"` admits everyone. `allowlist` admits TOML
@@ -1222,6 +1263,18 @@ mod tests {
                     .await
                     .unwrap()
             }
+        }
+
+        #[tokio::test]
+        async fn a_stopping_gateway_tells_the_sender_instead_of_forwarding() {
+            let mut f = fixture(DmPolicy::Open, &[]).await;
+            crate::supervisor::drain(&f.state, std::time::Duration::ZERO).await;
+            f.send("tg:1", "hello").await;
+            assert!(f.forwarded().is_empty());
+            assert_eq!(
+                f.replies(),
+                vec![("tg:1".to_string(), GATEWAY_RESTARTING_MESSAGE.to_string())]
+            );
         }
 
         #[tokio::test]

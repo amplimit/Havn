@@ -173,6 +173,12 @@ pub enum GatewayToAgent {
     /// Graceful shutdown request — agent should close cleanly within 5s,
     /// after which the spawner sends SIGKILL.
     Shutdown,
+    /// The gateway is stopping: take no new work, finish what is in
+    /// flight, then exit. The gateway keeps answering `LlmRequest` and
+    /// query frames until then, and stops the agent if it takes too long.
+    /// A runtime that predates this frame cannot parse it and exits at
+    /// once, as on `Shutdown`, so it needs no protocol bump.
+    Drain,
     /// Inbound cross-agent query addressed to this agent (spec §4.4
     /// v0.7). Caller is identified by `caller_agent_id`. Token costs of
     /// any LLM calls during processing must be billed against

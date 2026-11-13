@@ -225,15 +225,10 @@ async fn serve_session<Si, St, E>(
             warn!(%agent_id, error = ?e, "failed to forward InboundMessage");
             // Inform the user; the socket stays open in case the agent comes back.
             let _ = router
-                .deliver(
+                .error(
                     agent_id,
-                    havn_core::OutboundMessage {
-                        channel_id: session_id.to_string(),
-                        content: MessageContent::Text {
-                            text: format!("Couldn't reach the agent: {e}"),
-                        },
-                        reply_to: None,
-                    },
+                    session_id,
+                    format!("Couldn't reach the agent: {e}"),
                 )
                 .await;
         }

@@ -99,6 +99,22 @@ Keep `/etc/havn/havn.env` mode 0600 and owned by root, and write the key with an
 
 Agent cgroups are `/sys/fs/cgroup/havn/agent-<id>`. The gateway creates that top-level cgroup itself and moves agents into it, outside the unit's own cgroup, so this is not systemd delegation; `Delegate=yes` only keeps the cpu, memory and pids controllers enabled from the root cgroup down. `havn` is not a unit name, so systemd leaves the cgroup alone. Older gateways used `/sys/fs/cgroup/havn.slice`: at start-up the gateway kills the agents still running there, removes their cgroups, and removes `havn.slice` itself unless systemd has an active `havn.slice` unit or something else lives in it. Put local changes in a drop-in (`systemctl edit havn`) rather than editing the installed file, which a re-install overwrites.
 
+### Upgrading
+
+```bash
+sudo -i
+# Replace the binaries with the release you move to; the running gateway is not touched yet
+curl -fsSL https://raw.githubusercontent.com/amplimit/havn/main/install.sh | HAVN_VERSION=<version> bash
+systemctl stop havn
+# While it is stopped, back up the data: havn.db and every agent's agent.db
+cp -a ~/.local/share/havn ~/havn-backup-$(date +%Y%m%d-%H%M%S)
+systemctl start havn
+```
+
+A stopping gateway takes no new messages and gives the agents up to 30 seconds to finish what they are doing. Open chats still get those replies, and are told when one was cut off. Gateways up to v0.1.4 stop their agents at once, so the stop before leaving one of them drops work in progress; choose a quiet moment for it. Agents that were running start again with the gateway, and the dashboard reconnects on its own.
+
+The new gateway and agents migrate their databases when they start, and there is no way back, so keep the backup until the new version works. With a `db_path` or `workspace_root` other than the default, back up those too. Upgrade the dashboard separately: check out the new tag in its directory, then run `npm install` and `npm run build`, and restart it.
+
 ### Build from source
 
 ```bash

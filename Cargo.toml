@@ -44,6 +44,7 @@ axum = { version = "0.8", features = ["ws", "macros"] }
 # WebSocket client for the gateway's integration tests; axum's `ws`
 # feature already builds it.
 tokio-tungstenite = "0.29"
+tokio-util = { version = "0.7", features = ["rt"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 

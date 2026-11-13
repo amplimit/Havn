@@ -5,6 +5,7 @@ import Link from "next/link";
 import {
   api,
   type AgentView,
+  type ConversationTurn,
   type EmbeddingStatus,
   type MeView,
 } from "@/lib/api";
@@ -20,6 +21,35 @@ type Bubble = {
 };
 
 const AGENT_POLL_MS = 5000;
+const HISTORY_LIMIT = 100;
+const RECONNECT_MS = 1500;
+
+function turnBubbles(turns: ConversationTurn[], nextId: () => number): Bubble[] {
+  return turns
+    .filter((t) => t.role === "user" || t.role === "assistant")
+    .map((t) => ({
+      id: nextId(),
+      role: t.role === "user" ? "you" : "agent",
+      content: t.content,
+      ts: new Date(t.created_at).getTime(),
+    }));
+}
+
+// Allowance for the gap between the gateway's clock and this browser's.
+const CLOCK_SKEW_MS = 60_000;
+
+// The stored conversation, fetched from `since` on, replaces what is on
+// screen, except notices (they exist only in this tab) and live bubbles
+// newer than the fetch that it does not have yet.
+function mergeStored(prev: Bubble[], stored: Bubble[], since: number): Bubble[] {
+  const recent = stored.filter((s) => s.ts >= since - CLOCK_SKEW_MS);
+  const kept = prev.filter(
+    (b) =>
+      b.role === "system" ||
+      (b.ts >= since && !recent.some((s) => s.role === b.role && s.content === b.content)),
+  );
+  return [...stored, ...kept].sort((a, b) => a.ts - b.ts);
+}
 
 export default function ChatPage({
   params,
@@ -95,17 +125,11 @@ export default function ChatPage({
     let cancelled = false;
     (async () => {
       try {
-        const r = await api.conversation.list(id, 100);
+        const since = Date.now();
+        const r = await api.conversation.list(id, HISTORY_LIMIT);
         if (cancelled || r.turns.length === 0) return;
-        const seeded: Bubble[] = r.turns
-          .filter((t) => t.role === "user" || t.role === "assistant")
-          .map((t) => ({
-            id: bubbleIdRef.current++,
-            role: t.role === "user" ? "you" : "agent",
-            content: t.content,
-            ts: new Date(t.created_at).getTime(),
-          }));
-        setBubbles(seeded);
+        const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
+        setBubbles((prev) => mergeStored(prev, stored, since));
       } catch (e) {
         // Not fatal — chat works fine without history (just won't show
         // past turns). Surface the error so we know if it's persistent.
@@ -123,15 +147,19 @@ export default function ChatPage({
   // that on connect), so a slower cadence is fine.
   useEffect(() => {
     let cancelled = false;
+    // Once the agent has loaded, a failed poll (the gateway restarting)
+    // keeps the chat on screen; the next poll catches up.
+    let loaded = false;
     async function tick() {
       try {
         const a = await api.agents.get(id);
         if (!cancelled) {
+          loaded = true;
           setAgent(a);
           setError(null);
         }
       } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+        if (!cancelled && !loaded) setError(e instanceof Error ? e.message : String(e));
       }
     }
     tick();
@@ -143,9 +171,10 @@ export default function ChatPage({
   }, [id]);
 
   // WebSocket lifecycle — open ONCE per (page, token) pair. The
-  // gateway lazy-spawns the runtime if needed; auto-reconnect on
-  // unintentional close is handled inside this effect (re-run a
-  // single time after a backoff).
+  // gateway lazy-spawns the runtime if needed. After an unintentional
+  // close it keeps reconnecting, and each open reloads the stored
+  // conversation, which has the replies sent while the chat was away
+  // (and the history, if the gateway was down when the page loaded).
   useEffect(() => {
     if (!me) return;
     if (chatRef.current) return;
@@ -153,11 +182,26 @@ export default function ChatPage({
     let cancelled = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
+    async function catchUp() {
+      try {
+        const since = Date.now();
+        const r = await api.conversation.list(id, HISTORY_LIMIT);
+        if (cancelled) return;
+        const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
+        setBubbles((prev) => mergeStored(prev, stored, since));
+      } catch (e) {
+        console.warn("[chat] history reload failed", e);
+      }
+    }
+
     function connect() {
       if (cancelled) return;
       setWsState("connecting");
       const handle = openChat(id, me!.ws_token, {
-        onOpen: () => setWsState("open"),
+        onOpen: () => {
+          setWsState("open");
+          void catchUp();
+        },
         onMessage: (msg) => {
           // Either a real reply or a soft error closes the "replying…"
           // state — the user gets feedback either way.
@@ -176,13 +220,11 @@ export default function ChatPage({
           chatRef.current = null;
           if (cancelled) return;
           setWsState("closed");
-          // Auto-reconnect once after a small backoff. If the agent
-          // was explicitly stopped (status flips away from running),
-          // the next message will trigger lazy-spawn anyway, so a
-          // quiet retry is the right default.
+          // A reply still due arrives through the reload on reconnect.
+          setPending(false);
           reconnectTimer = setTimeout(() => {
             if (!cancelled && !chatRef.current) connect();
-          }, 1500);
+          }, RECONNECT_MS);
         },
       });
       chatRef.current = handle;
@@ -316,7 +358,7 @@ export default function ChatPage({
               {wsState === "connecting"
                 ? "starting agent…"
                 : wsState === "error" || wsState === "closed"
-                  ? "trouble connecting — try sending a message anyway"
+                  ? "reconnecting…"
                   : "send a message to start the conversation"}
             </div>
           )}
@@ -787,6 +829,6 @@ function ConnectionPill({
   if (state === "connecting")
     return <span className="pill pill-stopped">starting…</span>;
   if (state === "error" || state === "closed")
-    return <span className="pill pill-stopped">disconnected</span>;
+    return <span className="pill pill-stopped">reconnecting…</span>;
   return <span className="pill pill-stopped">{agent.status}</span>;
 }

@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use havn_core::AgentId;
@@ -33,6 +33,8 @@ pub struct AgentRegistry {
     generations: Arc<AtomicU64>,
     /// Woken on every registration, for connections that arrive first.
     registered: Arc<Notify>,
+    /// Set while the gateway stops: agents get no new work.
+    draining: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -124,10 +126,6 @@ pub enum Slot {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[allow(
-    dead_code,
-    reason = "consumed by the agent-status dashboard endpoint in the next vertical"
-)]
 pub struct RegisteredAgent {
     pub agent_id: AgentId,
     pub pid: u32,
@@ -154,6 +152,8 @@ pub enum SendError {
     ChannelClosed,
     #[error("agent {0} is not draining its outbound queue")]
     Stalled(AgentId),
+    #[error("the gateway is restarting; send it again once it is back")]
+    Draining,
 }
 
 /// Longest a sender waits for room in an agent's outbound queue. An agent
@@ -378,6 +378,23 @@ impl AgentRegistry {
             .collect()
     }
 
+    /// Stop handing agents new work: from now on [`Self::send`] and
+    /// [`Self::try_send`] refuse frames that start it. Frames serving work
+    /// already in flight still go through.
+    pub fn start_draining(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    fn refuses(&self, frame: &GatewayToAgent) -> bool {
+        self.draining.load(Ordering::SeqCst)
+            && matches!(
+                frame,
+                GatewayToAgent::InboundMessage(_)
+                    | GatewayToAgent::HeartbeatTick
+                    | GatewayToAgent::CronTick(_)
+            )
+    }
+
     async fn sender(&self, agent_id: AgentId) -> Result<mpsc::Sender<GatewayToAgent>, SendError> {
         let map = self.inner.lock().await;
         let entry = map
@@ -390,6 +407,9 @@ impl AgentRegistry {
     /// for queue space; on timeout the agent is disconnected. Errors if not
     /// registered, not connected or stalled.
     pub async fn send(&self, agent_id: AgentId, frame: GatewayToAgent) -> Result<(), SendError> {
+        if self.refuses(&frame) {
+            return Err(SendError::Draining);
+        }
         let tx = self.sender(agent_id).await?;
         match tx.send_timeout(frame, SEND_TIMEOUT).await {
             Ok(()) => Ok(()),
@@ -409,6 +429,9 @@ impl AgentRegistry {
         agent_id: AgentId,
         frame: GatewayToAgent,
     ) -> Result<(), SendError> {
+        if self.refuses(&frame) {
+            return Err(SendError::Draining);
+        }
         let tx = self.sender(agent_id).await?;
         tx.try_send(frame).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => SendError::Stalled(agent_id),
@@ -416,10 +439,6 @@ impl AgentRegistry {
         })
     }
 
-    #[allow(
-        dead_code,
-        reason = "consumed by the agent-status dashboard endpoint in the next vertical"
-    )]
     pub async fn list(&self) -> Vec<RegisteredAgent> {
         self.inner
             .lock()
