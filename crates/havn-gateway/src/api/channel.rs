@@ -1268,7 +1268,8 @@ mod tests {
         #[tokio::test]
         async fn a_stopping_gateway_tells_the_sender_instead_of_forwarding() {
             let mut f = fixture(DmPolicy::Open, &[]).await;
-            crate::supervisor::drain(&f.state, std::time::Duration::ZERO).await;
+            crate::supervisor::drain(&f.state, std::time::Duration::ZERO, std::future::pending())
+                .await;
             f.send("tg:1", "hello").await;
             assert!(f.forwarded().is_empty());
             assert_eq!(

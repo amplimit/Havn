@@ -191,6 +191,20 @@ pub fn kill_with_parent(expected_parent: Option<libc::pid_t>) -> io::Result<()> 
     Ok(())
 }
 
+/// Start a new session, so the calling process leaves the gateway's
+/// process group and controlling terminal. A Ctrl-C in the terminal that
+/// runs the gateway then reaches the gateway alone, which lets its agents
+/// finish their work before stopping them, instead of the agents too.
+/// Async-signal-safe, so callable between fork and exec, where the child
+/// is never a process group leader and `setsid` cannot fail with EPERM.
+pub fn leave_terminal_session() -> io::Result<()> {
+    // SAFETY: setsid has no preconditions.
+    if unsafe { libc::setsid() } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Tells a forked child whether its parent is still alive where `getppid`
 /// cannot (the parent is outside the child's PID namespace): the parent
 /// keeps the write end open for as long as it lives.

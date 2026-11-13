@@ -73,16 +73,21 @@ impl AgentSpawner for SubprocessSpawner {
         // Inherit stdout/stderr so logs propagate; in production the namespace
         // spawner will redirect them to the agent's log file.
         cmd.kill_on_drop(true);
-        // The agent dies with the gateway instead of outliving it.
+        // The agent never reads the terminal the gateway runs in.
+        cmd.stdin(std::process::Stdio::null());
+        // The agent dies with the gateway instead of outliving it, and is
+        // out of reach of the gateway terminal's Ctrl-C.
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::process::CommandExt as _;
             let gateway_pid = std::process::id().cast_signed();
             // SAFETY: runs between fork and exec and only makes the
-            // async-signal-safe prctl/getppid calls.
+            // async-signal-safe setsid/prctl/getppid calls.
             unsafe {
-                cmd.as_std_mut()
-                    .pre_exec(move || crate::ns_setup::kill_with_parent(Some(gateway_pid)));
+                cmd.as_std_mut().pre_exec(move || {
+                    crate::ns_setup::leave_terminal_session()?;
+                    crate::ns_setup::kill_with_parent(Some(gateway_pid))
+                });
             }
         }
 
@@ -308,6 +313,78 @@ mod tests {
         let policy = Policy::default();
         let err = spawner.spawn(&cfg, &policy).await.expect_err("should fail");
         assert!(matches!(err, SpawnerError::Spawn(_)), "{err:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_agent_has_its_own_session_and_its_tools_stop_with_it() {
+        // The "runtime" starts a "tool" in the background, records its
+        // session id, stdin and the tool's pid, then waits to be stopped.
+        // Arguments: --agent-id <id> --gateway-socket <p> --workspace <w>.
+        let dir = std::env::temp_dir().join(format!("havn-test-session-{}", AgentId::new()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let runtime = dir.join("runtime.sh");
+        std::fs::write(
+            &runtime,
+            "#!/bin/sh\n\
+             sleep 300 &\n\
+             cut -d' ' -f6 /proc/$$/stat > \"$6/sid.tmp\"\n\
+             readlink /proc/$$/fd/0 >> \"$6/sid.tmp\"\n\
+             echo $! >> \"$6/sid.tmp\"\n\
+             mv \"$6/sid.tmp\" \"$6/sid\"\n\
+             exec sleep 60\n",
+        )
+        .expect("write runtime");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let spawner = SubprocessSpawner::new();
+        let cfg = config_for(AgentId::new(), runtime);
+        // Another test thread forking while the script was open for
+        // writing can make the exec fail with ETXTBSY for a moment.
+        let mut attempt = 0;
+        let handle = loop {
+            match spawner.spawn(&cfg, &Policy::default()).await {
+                Ok(handle) => break handle,
+                Err(SpawnerError::Spawn(m)) if m.contains("busy") && attempt < 20 => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("spawn: {e:?}"),
+            }
+        };
+
+        let report = cfg.workspace_dir.join("sid");
+        let mut seen = None;
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(&report) {
+                seen = Some(text);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        spawner.stop(&handle).await.expect("stop");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cfg.workspace_dir);
+
+        let seen = seen.expect("the runtime reported");
+        let mut lines = seen.lines();
+        let sid: u32 = lines.next().expect("sid").trim().parse().expect("number");
+        assert_eq!(sid, handle.pid, "the agent leads a session of its own");
+        assert_eq!(lines.next(), Some("/dev/null"), "stdin");
+        let tool = lines.next().expect("tool pid").trim().to_owned();
+        let mut alive = true;
+        for _ in 0..100 {
+            alive = std::fs::read_to_string(format!("/proc/{tool}/stat"))
+                .is_ok_and(|stat| !stat.contains(") Z "));
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!alive, "the agent's tool process {tool} outlived it");
     }
 
     fn which(name: &str) -> Option<PathBuf> {
