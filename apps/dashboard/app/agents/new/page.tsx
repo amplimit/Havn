@@ -79,7 +79,7 @@ export default function NewAgentPage() {
   }
 
   return (
-    <div className="mx-auto max-w-xl px-8 py-12">
+    <div className="mx-auto max-w-xl px-4 py-8 sm:px-8 sm:py-12">
       <h1 className="display-h2 mb-2">new agent</h1>
       <p style={{ color: "var(--color-body)" }} className="mb-8">
         Pick a name and model. The agent gets its own workspace, three bootstrap
@@ -172,24 +172,24 @@ export default function NewAgentPage() {
             </p>
           )}
           <div role="status">
-          {uncovered && (
-            <p
-              className="mt-2 flex items-start gap-1.5 text-xs"
-              style={{ color: "var(--color-warning-text)" }}
-            >
-              <TriangleAlert size={14} className="mt-px shrink-0" aria-hidden="true" />
-              <span>
-                No key for <strong className="font-normal">{provider}</strong> reaches
-                this agent, so it cannot chat yet.{" "}
-                <Link href="/credentials" className="underline">
-                  Add your own
-                </Link>
-                {teamId
-                  ? ", or ask a team admin to add one to the team's credentials."
-                  : ", or ask a team admin to add one to a team you are in."}
-              </span>
-            </p>
-          )}
+            {uncovered && (
+              <p
+                className="mt-2 flex items-start gap-1.5 text-xs"
+                style={{ color: "var(--color-warning-text)" }}
+              >
+                <TriangleAlert size={14} className="mt-px shrink-0" aria-hidden="true" />
+                <span>
+                  No key for <strong className="font-normal">{provider}</strong> reaches
+                  this agent, so it cannot chat yet.{" "}
+                  <Link href="/credentials" className="underline">
+                    Add your own
+                  </Link>
+                  {teamId
+                    ? ", or ask a team admin to add one to the team's credentials."
+                    : ", or ask a team admin to add one to a team you are in."}
+                </span>
+              </p>
+            )}
           </div>
         </div>
 

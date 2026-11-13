@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { ApiError, LLM_PROVIDERS as PROVIDERS, api, type ModelEntry, type ModelsView } from "@/lib/api";
+import { SkeletonList } from "@/components/SkeletonList";
 
 export default function ModelsPage() {
   const [view, setView] = useState<ModelsView | null>(null);
@@ -91,7 +92,7 @@ export default function ModelsPage() {
   const editable = view?.editable ?? false;
 
   return (
-    <div className="mx-auto max-w-4xl px-8 py-12">
+    <div className="mx-auto max-w-4xl px-4 py-8 sm:px-8 sm:py-12">
       <header className="mb-8">
         <h1 className="display-h1">models</h1>
         <p className="mt-2" style={{ color: "var(--color-body)", fontSize: 18 }}>
@@ -214,9 +215,7 @@ export default function ModelsPage() {
       <h2 className="display-h2 mb-4">listed ({view?.models.length ?? "…"})</h2>
 
       {view === null && !error && (
-        <div className="card px-4 py-6 text-sm" style={{ color: "var(--color-body)" }}>
-          loading…
-        </div>
+        <SkeletonList />
       )}
 
       {view?.models.length === 0 && (
@@ -227,10 +226,10 @@ export default function ModelsPage() {
 
       <ul className="grid gap-3">
         {view?.models.map((m, i) => (
-          <li key={m.id} className="card flex items-center justify-between px-5 py-4">
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-3">
-                <span className="display-h3">{m.label ?? m.id}</span>
+          <li key={m.id} className="card flex flex-wrap items-center justify-between gap-3 px-5 py-4">
+            <div className="min-w-[14rem] flex-1">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                <span className="display-h3 wrap-anywhere">{m.label ?? m.id}</span>
                 {view.effective_default === m.id && (
                   <span className="pill pill-running">default</span>
                 )}
@@ -241,13 +240,13 @@ export default function ModelsPage() {
                 )}
               </div>
               {m.label && (
-                <p className="mt-1 font-mono text-xs" style={{ color: "var(--color-body)" }}>
+                <p className="mt-1 font-mono text-xs wrap-anywhere" style={{ color: "var(--color-body)" }}>
                   {m.id}
                 </p>
               )}
             </div>
             {editable && (
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
                 <button
                   type="button"
                   className="btn-ghost"

@@ -19,6 +19,7 @@ export function SetupChecklist({
   onVisibleChange?: (visible: boolean) => void;
 }) {
   const [setup, setSetup] = useState<Setup | null>(null);
+  const [failed, setFailed] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -29,6 +30,7 @@ export function SetupChecklist({
       })
       .catch(() => {
         // Without the data there is nothing reliable to show.
+        if (!cancelled) setFailed(true);
       });
     return () => {
       cancelled = true;
@@ -42,11 +44,12 @@ export function SetupChecklist({
   const hasAgent = (agentCount ?? 0) > 0;
   const defaultProvider = modelProvider(models?.effective_default);
   const keyDone = hasModel && defaultProvider ? providers?.has(defaultProvider) === true : anyKey;
+  const decided = agentCount !== null && (setup !== null || failed);
   const visible = setup !== null && agentCount !== null && !(anyKey && hasModel && hasAgent);
 
   useEffect(() => {
-    onVisibleChange?.(visible);
-  }, [visible, onVisibleChange]);
+    if (decided) onVisibleChange?.(visible);
+  }, [decided, visible, onVisibleChange]);
 
   if (!visible || !models) return null;
 
@@ -74,8 +77,9 @@ export function SetupChecklist({
             >
               <TriangleAlert size={14} className="mt-0.5 shrink-0" aria-hidden="true" />
               <span>
-                None of your keys is for <strong className="font-normal">{defaultProvider}</strong>,
-                the provider of the default model {models.effective_default}.
+                No key your agents can use is for{" "}
+                <strong className="font-normal">{defaultProvider}</strong>, the provider of the
+                default model {models.effective_default}.
               </span>
             </span>
           )}

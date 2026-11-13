@@ -1,6 +1,6 @@
 "use client";
 
-import { use, useEffect, useState } from "react";
+import { use, useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { Pin } from "lucide-react";
 import {
@@ -36,7 +36,7 @@ export default function SkillsPage({
   const [pendingPin, setPendingPin] = useState<string | null>(null);
   const [pinError, setPinError] = useState<string | null>(null);
 
-  async function load() {
+  const load = useCallback(async () => {
     // Curator reports are files and stay readable while the agent is
     // stopped; the skill list needs the running agent (409 otherwise).
     const [s, r] = await Promise.allSettled([
@@ -49,7 +49,7 @@ export default function SkillsPage({
     setArchived(s.value.archived);
     setUninitialised(s.value.uninitialised);
     setError(null);
-  }
+  }, [id]);
 
   useEffect(() => {
     let cancelled = false;
@@ -64,7 +64,7 @@ export default function SkillsPage({
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [load]);
 
   async function togglePin(name: string, currentlyPinned: boolean) {
     setPendingPin(name);
@@ -90,7 +90,7 @@ export default function SkillsPage({
   }
 
   return (
-    <div className="mx-auto max-w-5xl px-8 py-12">
+    <div className="mx-auto max-w-5xl px-4 py-8 sm:px-8 sm:py-12">
       <header className="mb-8">
         <Link
           href={`/agents/${id}`}
@@ -143,7 +143,7 @@ export default function SkillsPage({
       )}
 
       {active !== null && uninitialised && (
-        <div className="card-elevated px-8 py-12 text-center">
+        <div className="card-elevated px-6 py-12 text-center sm:px-8">
           <p className="display-h3 mb-2">agent never started</p>
           <p style={{ color: "var(--color-body)" }}>
             Skills are indexed when the agent first runs. Start the agent and

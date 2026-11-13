@@ -31,28 +31,40 @@ export default function MembersPage({
   const [newUserId, setNewUserId] = useState("");
   const [newRoleId, setNewRoleId] = useState("");
 
+  function show(m: MemberView[], r: RoleView[]) {
+    setMembers(m);
+    setRoles(r);
+    // Default to the seeded `member` role on the add form.
+    const seed = r.find((x) => x.name === "member") ?? r[0];
+    if (seed) setNewRoleId((current) => current || seed.id);
+    setError(null);
+  }
+
   async function load() {
     try {
       const [m, r] = await Promise.all([
         api.teams.members.list(id),
         api.teams.roles.list(id),
       ]);
-      setMembers(m);
-      setRoles(r);
-      // Default to the seeded `member` role on the add form.
-      if (!newRoleId) {
-        const seed = r.find((x) => x.name === "member") ?? r[0];
-        if (seed) setNewRoleId(seed.id);
-      }
-      setError(null);
+      show(m, r);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
   }
 
   useEffect(() => {
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    let cancelled = false;
+    Promise.all([api.teams.members.list(id), api.teams.roles.list(id)]).then(
+      ([m, r]) => {
+        if (!cancelled) show(m, r);
+      },
+      (e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
   }, [id]);
 
   async function onAdd(e: React.FormEvent) {

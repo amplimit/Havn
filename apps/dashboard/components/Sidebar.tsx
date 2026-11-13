@@ -10,8 +10,18 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useState } from "react";
-import { Bot, Boxes, KeyRound, Plus, TriangleAlert, Users, type LucideIcon } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import {
+  Bot,
+  Boxes,
+  KeyRound,
+  Menu,
+  Plus,
+  TriangleAlert,
+  Users,
+  X,
+  type LucideIcon,
+} from "lucide-react";
 import { ApiError, api, type AgentView, type TeamView } from "@/lib/api";
 
 const POLL_MS = 5000;
@@ -26,6 +36,43 @@ export function Sidebar() {
   const [teams, setTeams] = useState<TeamView[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [gatewayVersion, setGatewayVersion] = useState<string | null>(null);
+  // Below the md breakpoint the sidebar is a drawer behind a menu button.
+  const [open, setOpen] = useState(false);
+  const menuButton = useRef<HTMLButtonElement>(null);
+  const closeButton = useRef<HTMLButtonElement>(null);
+  const wasOpen = useRef(false);
+
+  useEffect(() => {
+    if (open) {
+      const behind = [document.getElementById("main"), document.querySelector(".skip-link")];
+      for (const el of behind) if (el instanceof HTMLElement) el.inert = true;
+      const html = document.documentElement;
+      const overflow = html.style.overflow;
+      html.style.overflow = "hidden";
+      closeButton.current?.focus();
+      const onKey = (e: KeyboardEvent) => {
+        if (e.key === "Escape") setOpen(false);
+      };
+      document.addEventListener("keydown", onKey);
+      // At md and up the drawer is the regular sidebar; a window widened
+      // (or a tablet rotated) while it is open must not stay modal.
+      const wide = window.matchMedia("(min-width: 48rem)");
+      const onWide = (e: MediaQueryListEvent) => {
+        if (e.matches) setOpen(false);
+      };
+      wide.addEventListener("change", onWide);
+      return () => {
+        wide.removeEventListener("change", onWide);
+        document.removeEventListener("keydown", onKey);
+        for (const el of behind) if (el instanceof HTMLElement) el.inert = false;
+        html.style.overflow = overflow;
+      };
+    }
+    if (wasOpen.current) menuButton.current?.focus();
+  }, [open]);
+  useEffect(() => {
+    wasOpen.current = open;
+  }, [open]);
 
   useEffect(() => {
     let cancelled = false;
@@ -61,26 +108,73 @@ export function Sidebar() {
   }, []);
 
   return (
-    <aside
-      className="flex w-64 shrink-0 flex-col border-r"
-      style={{
-        borderColor: "var(--color-border-default)",
-        backgroundColor: "var(--color-surface)",
-      }}
-    >
-      <Link
-        href="/"
-        className="px-5 py-5"
+    <>
+      <header
+        inert={open}
+        className="sticky top-0 z-30 flex h-15 items-center justify-between border-b px-4 md:hidden"
         style={{
-          color: "var(--color-deep-navy)",
-          fontWeight: 300,
-          fontSize: 22,
-          letterSpacing: "-0.4px",
-          lineHeight: 1,
+          borderColor: "var(--color-border-default)",
+          backgroundColor: "var(--color-surface)",
         }}
       >
-        havn
-      </Link>
+        <Link href="/" style={LOGO_STYLE}>
+          havn
+        </Link>
+        <button
+          ref={menuButton}
+          type="button"
+          onClick={() => setOpen(true)}
+          aria-label="Open navigation"
+          aria-expanded={open}
+          aria-controls="sidebar"
+          className="-mr-2 flex h-11 w-11 items-center justify-center rounded"
+          style={{ color: "var(--color-deep-navy)" }}
+        >
+          <Menu size={22} aria-hidden="true" />
+        </button>
+      </header>
+      {open && (
+        <div
+          className="fixed inset-0 z-40 md:hidden"
+          style={{ backgroundColor: "rgba(6, 27, 49, 0.35)" }}
+          onClick={() => setOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+      <aside
+        id="sidebar"
+        aria-label="Navigation"
+        role={open ? "dialog" : undefined}
+        aria-modal={open ? true : undefined}
+        className={`fixed inset-y-0 left-0 z-50 flex w-72 max-w-[85vw] flex-col overflow-y-auto overscroll-contain border-r transition-[translate] duration-200 md:sticky md:top-0 md:z-auto md:h-screen md:w-64 md:max-w-none md:shrink-0 md:translate-x-0 ${
+          open
+            ? "translate-x-0"
+            : "max-md:invisible max-md:-translate-x-full max-md:transition-[translate,visibility]"
+        }`}
+        style={{
+          borderColor: "var(--color-border-default)",
+          backgroundColor: "var(--color-surface)",
+        }}
+        onClick={(e) => {
+          // Following a link closes the drawer.
+          if ((e.target as HTMLElement).closest("a")) setOpen(false);
+        }}
+      >
+      <div className="flex items-center justify-between">
+        <Link href="/" className="px-5 py-5" style={LOGO_STYLE}>
+          havn
+        </Link>
+        <button
+          ref={closeButton}
+          type="button"
+          onClick={() => setOpen(false)}
+          aria-label="Close navigation"
+          className="mr-2 flex h-11 w-11 items-center justify-center rounded md:hidden"
+          style={{ color: "var(--color-deep-navy)" }}
+        >
+          <X size={20} aria-hidden="true" />
+        </button>
+      </div>
 
       <div className="px-3">
         <SectionTitle>Agents</SectionTitle>
@@ -184,9 +278,18 @@ export function Sidebar() {
         </nav>
         <VersionLine gateway={gatewayVersion} />
       </div>
-    </aside>
+      </aside>
+    </>
   );
 }
+
+const LOGO_STYLE: React.CSSProperties = {
+  color: "var(--color-deep-navy)",
+  fontWeight: 300,
+  fontSize: 22,
+  letterSpacing: "-0.4px",
+  lineHeight: 1,
+};
 
 function SectionTitle({ children }: { children: React.ReactNode }) {
   return (

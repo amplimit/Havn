@@ -36,6 +36,14 @@ export default function TeamCredentialsPage({
   const [perUserTokens, setPerUserTokens] = useState<string>("");
   const [perUserRpm, setPerUserRpm] = useState<string>("");
 
+  function fail(e: unknown) {
+    if (e instanceof ApiError && e.status === 403) {
+      setError("Members only — you're not in this team.");
+    } else {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   async function load() {
     try {
       const [t, c] = await Promise.all([
@@ -46,17 +54,26 @@ export default function TeamCredentialsPage({
       setCreds(c);
       setError(null);
     } catch (e) {
-      if (e instanceof ApiError && e.status === 403) {
-        setError("Members only — you're not in this team.");
-      } else {
-        setError(e instanceof Error ? e.message : String(e));
-      }
+      fail(e);
     }
   }
 
   useEffect(() => {
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    let cancelled = false;
+    Promise.all([api.teams.get(id), api.teams.credentials.list(id)]).then(
+      ([t, c]) => {
+        if (cancelled) return;
+        setTeam(t);
+        setCreds(c);
+        setError(null);
+      },
+      (e) => {
+        if (!cancelled) fail(e);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
   }, [id]);
 
   async function onCreate(e: React.FormEvent) {

@@ -13,6 +13,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { api, type TeamView } from "@/lib/api";
+import { SkeletonList } from "@/components/SkeletonList";
 
 export default function TeamsPage() {
   const [teams, setTeams] = useState<TeamView[] | null>(null);
@@ -30,7 +31,18 @@ export default function TeamsPage() {
   }
 
   useEffect(() => {
-    load();
+    let cancelled = false;
+    api.teams
+      .list()
+      .then((t) => {
+        if (!cancelled) setTeams(t);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   async function onCreate(e: React.FormEvent) {
@@ -49,7 +61,7 @@ export default function TeamsPage() {
   }
 
   return (
-    <div className="mx-auto max-w-4xl px-8 py-12">
+    <div className="mx-auto max-w-4xl px-4 py-8 sm:px-8 sm:py-12">
       <header className="mb-8">
         <h1 className="display-h1">teams</h1>
         <p
@@ -101,16 +113,11 @@ export default function TeamsPage() {
       </form>
 
       {teams === null && !error && (
-        <div
-          className="card px-4 py-6 text-sm"
-          style={{ color: "var(--color-body)" }}
-        >
-          loading…
-        </div>
+        <SkeletonList />
       )}
 
       {teams !== null && teams.length === 0 && (
-        <div className="card-elevated px-8 py-12 text-center">
+        <div className="card-elevated px-6 py-12 text-center sm:px-8">
           <p className="display-h3 mb-2">no teams yet</p>
           <p style={{ color: "var(--color-body)" }}>
             Ask your operator to add you to a team, or keep your agents

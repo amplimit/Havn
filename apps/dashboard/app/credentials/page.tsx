@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Lock } from "lucide-react";
 import { api, type CredentialView } from "@/lib/api";
+import { SkeletonList } from "@/components/SkeletonList";
 
 export default function CredentialsPage() {
   const [creds, setCreds] = useState<CredentialView[] | null>(null);
@@ -26,7 +27,20 @@ export default function CredentialsPage() {
   }
 
   useEffect(() => {
-    reload();
+    let cancelled = false;
+    api.credentials.list().then(
+      (c) => {
+        if (cancelled) return;
+        setCreds(c);
+        setError(null);
+      },
+      (e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   async function onAdd(e: React.FormEvent) {
@@ -65,7 +79,7 @@ export default function CredentialsPage() {
   }
 
   return (
-    <div className="mx-auto max-w-4xl px-8 py-12">
+    <div className="mx-auto max-w-4xl px-4 py-8 sm:px-8 sm:py-12">
       <header className="mb-8">
         <h1 className="display-h1">credentials</h1>
         <p className="mt-2" style={{ color: "var(--color-body)", fontSize: 18 }}>
@@ -178,9 +192,7 @@ export default function CredentialsPage() {
       <h2 className="display-h2 mb-4">configured ({creds?.length ?? "…"})</h2>
 
       {creds === null && !error && (
-        <div className="card px-4 py-6 text-sm" style={{ color: "var(--color-body)" }}>
-          loading…
-        </div>
+        <SkeletonList />
       )}
 
       {creds?.length === 0 && (
@@ -200,8 +212,8 @@ export default function CredentialsPage() {
           const cap = typeof raw === "number" && raw > 0 ? raw : null;
           const usdCap = c.limits?.max_usd_per_day !== undefined;
           return (
-            <li key={c.id} className="card flex items-center justify-between px-5 py-4">
-              <div className="min-w-0 flex-1">
+            <li key={c.id} className="card flex flex-wrap items-center justify-between gap-3 px-5 py-4">
+              <div className="min-w-[12rem] flex-1">
                 <div className="flex items-center gap-3">
                   <span className="display-h3">{c.provider}</span>
                   <span className="pill pill-stopped tabular">priority {c.priority}</span>

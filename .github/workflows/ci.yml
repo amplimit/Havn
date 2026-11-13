@@ -61,8 +61,7 @@ jobs:
           cache: npm
           cache-dependency-path: apps/dashboard/package-lock.json
       - run: npm ci --no-audit --no-fund
-      # The 12 React Compiler warnings left for #87; no new ones.
-      - run: npm run lint -- --max-warnings 12
+      - run: npm run lint -- --max-warnings 0
       - run: npm run type-check
       - run: npm run build
 

@@ -4,12 +4,13 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { api, type AgentView } from "@/lib/api";
 import { SetupChecklist } from "@/components/SetupChecklist";
+import { SkeletonList } from "@/components/SkeletonList";
 
 export default function HomePage() {
   const [agents, setAgents] = useState<AgentView[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const [checklistShown, setChecklistShown] = useState(false);
+  const [checklistShown, setChecklistShown] = useState<boolean | null>(null);
 
   async function reload() {
     try {
@@ -21,7 +22,20 @@ export default function HomePage() {
   }
 
   useEffect(() => {
-    reload();
+    let cancelled = false;
+    api.agents.list().then(
+      (a) => {
+        if (cancelled) return;
+        setAgents(a);
+        setError(null);
+      },
+      (e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   async function deleteAgent(id: string) {
@@ -44,8 +58,8 @@ export default function HomePage() {
   }
 
   return (
-    <div className="mx-auto max-w-5xl px-8 py-12">
-      <header className="mb-8 flex items-end justify-between">
+    <div className="mx-auto max-w-5xl px-4 py-8 sm:px-8 sm:py-12">
+      <header className="mb-8 flex flex-wrap items-end justify-between gap-4">
         <div>
           <h1 className="display-h1">your agents</h1>
           <p
@@ -71,15 +85,13 @@ export default function HomePage() {
         </div>
       )}
 
-      <SetupChecklist agentCount={agents?.length ?? null} onVisibleChange={setChecklistShown} />
-
+      <div className="flex flex-col">
+      <div>
       {agents === null && !error && (
-        <div className="card px-4 py-6 text-sm" style={{ color: "var(--color-body)" }}>
-          loading…
-        </div>
+        <SkeletonList />
       )}
 
-      {agents?.length === 0 && !checklistShown && (
+      {agents?.length === 0 && checklistShown === false && (
         <div className="card px-5 py-10 text-center" style={{ color: "var(--color-body)" }}>
           no agents yet
         </div>
@@ -88,8 +100,8 @@ export default function HomePage() {
       <ul className="grid gap-3">
         {agents?.map((a) => (
           <li key={a.id} className="card px-5 py-4">
-            <div className="flex items-center justify-between gap-4">
-              <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div className="min-w-[12rem] flex-1">
                 <div className="flex items-center gap-3">
                   <Link
                     href={`/agents/${a.id}`}
@@ -123,6 +135,16 @@ export default function HomePage() {
           </li>
         ))}
       </ul>
+      </div>
+
+      {/* After the list in reading order; drawn first only when there is
+          no list to push down. */}
+      <div
+        className={`empty:hidden ${agents && agents.length > 0 ? "mt-8" : "order-first"}`}
+      >
+        <SetupChecklist agentCount={agents?.length ?? null} onVisibleChange={setChecklistShown} />
+      </div>
+      </div>
     </div>
   );
 }

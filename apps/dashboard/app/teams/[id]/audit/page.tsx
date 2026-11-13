@@ -9,8 +9,9 @@
  * we render JSON inline.
  */
 
-import { use, useEffect, useState } from "react";
+import { use, useEffect, useRef, useState } from "react";
 import { ApiError, type AuditEntryView } from "@/lib/api";
+import { SkeletonList } from "@/components/SkeletonList";
 
 const ACTION_PREFIXES = [
   "(all)",
@@ -32,7 +33,8 @@ export default function TeamAuditPage({
   const { id } = use(params);
   const [entries, setEntries] = useState<AuditEntryView[]>([]);
   const [nextBefore, setNextBefore] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  // True while the first page for the current filter loads.
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [actionFilter, setActionFilter] = useState<string>("(all)");
   // Note: the gateway's filter builder takes optional `action_prefix`,
@@ -41,46 +43,55 @@ export default function TeamAuditPage({
   // the prefix changes (the lib client only exposes `(before,limit)`).
   // Promote to `lib/api.ts` when a third caller appears.
 
-  async function loadFirst() {
-    setLoading(true);
-    try {
-      const res = await fetchPage(id, { actionPrefix: prefixOrEmpty(actionFilter) });
-      setEntries(res.entries);
-      setNextBefore(res.next_before);
-      setError(null);
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 403) {
-        setError(
-          "You don't have admin permission on this team — audit log is admin-only.",
-        );
-      } else {
-        setError(e instanceof Error ? e.message : String(e));
-      }
-    } finally {
-      setLoading(false);
-    }
-  }
+
+  // Bumped on every filter change, so an older page requested under the
+  // previous filter is dropped when it arrives.
+  const generation = useRef(0);
 
   async function loadMore() {
     if (!nextBefore || loading) return;
+    const started = generation.current;
     setLoading(true);
     try {
       const res = await fetchPage(id, {
         actionPrefix: prefixOrEmpty(actionFilter),
         before: nextBefore,
       });
+      if (started !== generation.current) return;
       setEntries((prev) => [...prev, ...res.entries]);
       setNextBefore(res.next_before);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (started === generation.current) setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      if (started === generation.current) setLoading(false);
     }
   }
 
   useEffect(() => {
-    loadFirst();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    let cancelled = false;
+    fetchPage(id, { actionPrefix: prefixOrEmpty(actionFilter) }).then(
+      (res) => {
+        if (cancelled) return;
+        setEntries(res.entries);
+        setNextBefore(res.next_before);
+        setError(null);
+        setLoading(false);
+      },
+      (e) => {
+        if (cancelled) return;
+        if (e instanceof ApiError && e.status === 403) {
+          setError(
+            "You don't have admin permission on this team — audit log is admin-only.",
+          );
+        } else {
+          setError(e instanceof Error ? e.message : String(e));
+        }
+        setLoading(false);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
   }, [id, actionFilter]);
 
   return (
@@ -103,7 +114,11 @@ export default function TeamAuditPage({
         </span>
         <select
           value={actionFilter}
-          onChange={(e) => setActionFilter(e.target.value)}
+          onChange={(e) => {
+            generation.current += 1;
+            setLoading(true);
+            setActionFilter(e.target.value);
+          }}
           className="bg-transparent text-sm"
           style={{ borderBottom: "1px solid var(--color-border-default)" }}
         >
@@ -115,7 +130,9 @@ export default function TeamAuditPage({
         </select>
       </div>
 
-      {entries.length === 0 && !loading ? (
+      {entries.length === 0 && loading ? (
+        <SkeletonList />
+      ) : entries.length === 0 ? (
         <p className="card px-4 py-6 text-sm" style={{ color: "var(--color-body)" }}>
           no entries.
         </p>

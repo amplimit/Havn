@@ -13,7 +13,7 @@
  * is currently running so the user knows to expect that.
  */
 
-import { use, useEffect, useState } from "react";
+import { use, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
@@ -27,6 +27,23 @@ import {
   type ModelsView,
 } from "@/lib/api";
 
+function useFlash(ms = 4000): [boolean, () => void] {
+  const [on, setOn] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (timer.current) clearTimeout(timer.current);
+    },
+    [],
+  );
+  const flash = useCallback(() => {
+    setOn(true);
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = setTimeout(() => setOn(false), ms);
+  }, [ms]);
+  return [on, flash];
+}
+
 export default function SettingsPage({
   params,
 }: {
@@ -38,7 +55,7 @@ export default function SettingsPage({
   const [agent, setAgent] = useState<AgentView | null>(null);
   const [embedding, setEmbedding] = useState<EmbeddingStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [saved, flashSaved] = useFlash();
   const [busy, setBusy] = useState(false);
 
   // Form state, seeded from the agent on load. Local-only until Save.
@@ -112,7 +129,7 @@ export default function SettingsPage({
         config,
       });
       setAgent(updated);
-      setSavedAt(Date.now());
+      flashSaved();
     } catch (e) {
       if (e instanceof ApiError) setError(e.message);
       else setError(e instanceof Error ? e.message : String(e));
@@ -139,7 +156,7 @@ export default function SettingsPage({
 
   if (error && !agent) {
     return (
-      <div className="mx-auto max-w-3xl px-8 py-12">
+      <div className="mx-auto max-w-3xl px-4 py-8 sm:px-8 sm:py-12">
         <div
           className="card px-4 py-3 text-sm"
           style={{
@@ -154,14 +171,14 @@ export default function SettingsPage({
   }
   if (!agent) {
     return (
-      <div className="px-8 py-12" style={{ color: "var(--color-body)" }}>
+      <div className="px-4 py-8 sm:px-8 sm:py-12" style={{ color: "var(--color-body)" }}>
         loading…
       </div>
     );
   }
 
   return (
-    <div className="mx-auto max-w-3xl px-8 py-10">
+    <div className="mx-auto max-w-3xl px-4 py-8 sm:px-8 sm:py-10">
       <header className="mb-6">
         <Link
           href={`/agents/${id}`}
@@ -260,7 +277,7 @@ export default function SettingsPage({
           >
             {busy ? "saving…" : "save"}
           </button>
-          {savedAt && (
+          {saved && (
             <span
               className="text-xs"
               style={{ color: "var(--color-success-text)" }}
@@ -275,10 +292,9 @@ export default function SettingsPage({
 
       <McpEditor agentId={id} />
 
-      <RetrievalEditor
-        embedding={embedding}
-        onChange={(next) => setEmbedding(next)}
-      />
+      {embedding && (
+        <RetrievalEditor embedding={embedding} onChange={(next) => setEmbedding(next)} />
+      )}
 
 
       <section
@@ -332,7 +348,9 @@ function BootstrapEditor({ agentId }: { agentId: string }) {
   const [user, setUser] = useState("");
   const [heartbeat, setHeartbeat] = useState("");
   const [saving, setSaving] = useState<string | null>(null);
-  const [savedAt, setSavedAt] = useState<Record<string, number>>({});
+  const [savedSystem, flashSystem] = useFlash();
+  const [savedUser, flashUser] = useFlash();
+  const [savedHeartbeat, flashHeartbeat] = useFlash();
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -361,7 +379,7 @@ function BootstrapEditor({ agentId }: { agentId: string }) {
     try {
       const next = await api.bootstrap.put(agentId, { [field]: value });
       setLoaded(next);
-      setSavedAt((m) => ({ ...m, [field]: Date.now() }));
+      ({ system: flashSystem, user: flashUser, heartbeat: flashHeartbeat })[field]();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -399,7 +417,7 @@ function BootstrapEditor({ agentId }: { agentId: string }) {
         loaded={loaded?.system ?? ""}
         onSave={() => save("system", system)}
         saving={saving === "system"}
-        savedAt={savedAt.system ?? null}
+        justSaved={savedSystem}
       />
       <BootstrapFileEditor
         title="USER.md — what the agent knows about you"
@@ -409,7 +427,7 @@ function BootstrapEditor({ agentId }: { agentId: string }) {
         loaded={loaded?.user ?? ""}
         onSave={() => save("user", user)}
         saving={saving === "user"}
-        savedAt={savedAt.user ?? null}
+        justSaved={savedUser}
       />
       <BootstrapFileEditor
         title="HEARTBEAT.md — periodic self-tick instructions"
@@ -419,7 +437,7 @@ function BootstrapEditor({ agentId }: { agentId: string }) {
         loaded={loaded?.heartbeat ?? ""}
         onSave={() => save("heartbeat", heartbeat)}
         saving={saving === "heartbeat"}
-        savedAt={savedAt.heartbeat ?? null}
+        justSaved={savedHeartbeat}
       />
     </section>
   );
@@ -433,7 +451,7 @@ function BootstrapFileEditor({
   loaded,
   onSave,
   saving,
-  savedAt,
+  justSaved,
 }: {
   title: string;
   hint: string;
@@ -442,10 +460,9 @@ function BootstrapFileEditor({
   loaded: string;
   onSave: () => void;
   saving: boolean;
-  savedAt: number | null;
+  justSaved: boolean;
 }) {
   const dirty = value !== loaded;
-  const justSaved = savedAt !== null && Date.now() - savedAt < 4000;
   return (
     <div className="mb-5">
       <label className="block">
@@ -516,7 +533,7 @@ function McpEditor({ agentId }: { agentId: string }) {
   const [view, setView] = useState<McpView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [justSaved, flashSaved] = useFlash();
 
   // "draft" form for adding a new server. We don't allow inline rename;
   // remove + re-add is enough.
@@ -548,7 +565,7 @@ function McpEditor({ agentId }: { agentId: string }) {
     try {
       const next = await api.mcp.patch(agentId, { can_use_mcp });
       setView(next);
-      setSavedAt(Date.now());
+      flashSaved();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -564,7 +581,7 @@ function McpEditor({ agentId }: { agentId: string }) {
     try {
       const updated = await api.mcp.patch(agentId, { servers: next });
       setView(updated);
-      setSavedAt(Date.now());
+      flashSaved();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -627,7 +644,6 @@ function McpEditor({ agentId }: { agentId: string }) {
     }
   }
 
-  const justSaved = savedAt !== null && Date.now() - savedAt < 4000;
   const serverEntries = view ? Object.entries(view.servers) : [];
 
   return (
@@ -897,47 +913,45 @@ function splitPaths(raw: string): string[] {
  *   truth — file-driven so IaC / backups / Linux-service expectations
  *   keep working).
  */
+function embeddingForm(embedding: EmbeddingStatus) {
+  const cfg = embedding.config as Record<string, unknown>;
+  const oa = (cfg.openai as Record<string, unknown> | undefined) ?? {};
+  const lo = (cfg.local as Record<string, unknown> | undefined) ?? {};
+  const hr = (cfg.hrr as Record<string, unknown> | undefined) ?? {};
+  const str = (v: unknown, fallback: string) => (typeof v === "string" ? v : fallback);
+  const num = (v: unknown, fallback: string) => (typeof v === "number" ? String(v) : fallback);
+  return {
+    provider: embedding.provider,
+    openaiModel: str(oa.model, "text-embedding-3-small"),
+    openaiDimensions: num(oa.dimensions, "1536"),
+    openaiApiKeyEnv: str(oa.api_key_env, "OPENAI_API_KEY"),
+    openaiBaseUrl: str(oa.base_url, "https://api.openai.com/v1"),
+    localModel: str(lo.model, "BAAI/bge-small-en-v1.5"),
+    localDimensions: num(lo.dimensions, "384"),
+    hrrDimensions: num(hr.dimensions, "1024"),
+  };
+}
+
 function RetrievalEditor({
   embedding,
   onChange,
 }: {
-  embedding: EmbeddingStatus | null;
+  embedding: EmbeddingStatus;
   onChange: (next: EmbeddingStatus) => void;
 }) {
-  const [provider, setProvider] = useState<string>("disabled");
-  const [openaiModel, setOpenaiModel] = useState("text-embedding-3-small");
-  const [openaiDimensions, setOpenaiDimensions] = useState<string>("1536");
-  const [openaiApiKeyEnv, setOpenaiApiKeyEnv] = useState("OPENAI_API_KEY");
-  const [openaiBaseUrl, setOpenaiBaseUrl] = useState(
-    "https://api.openai.com/v1",
-  );
-  const [localModel, setLocalModel] = useState("BAAI/bge-small-en-v1.5");
-  const [localDimensions, setLocalDimensions] = useState<string>("384");
-  const [hrrDimensions, setHrrDimensions] = useState<string>("1024");
+  const [initial] = useState(() => embeddingForm(embedding));
+  const [provider, setProvider] = useState(initial.provider);
+  const [openaiModel, setOpenaiModel] = useState(initial.openaiModel);
+  const [openaiDimensions, setOpenaiDimensions] = useState(initial.openaiDimensions);
+  const [openaiApiKeyEnv, setOpenaiApiKeyEnv] = useState(initial.openaiApiKeyEnv);
+  const [openaiBaseUrl, setOpenaiBaseUrl] = useState(initial.openaiBaseUrl);
+  const [localModel, setLocalModel] = useState(initial.localModel);
+  const [localDimensions, setLocalDimensions] = useState(initial.localDimensions);
+  const [hrrDimensions, setHrrDimensions] = useState(initial.hrrDimensions);
 
   const [saving, setSaving] = useState(false);
-  const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [justSaved, flashSaved] = useFlash();
   const [error, setError] = useState<string | null>(null);
-
-  // Seed form fields from the live config when it loads.
-  useEffect(() => {
-    if (!embedding) return;
-    setProvider(embedding.provider);
-    const cfg = embedding.config as Record<string, unknown>;
-    const oa = (cfg.openai as Record<string, unknown> | undefined) ?? {};
-    if (typeof oa.model === "string") setOpenaiModel(oa.model);
-    if (typeof oa.dimensions === "number")
-      setOpenaiDimensions(String(oa.dimensions));
-    if (typeof oa.api_key_env === "string") setOpenaiApiKeyEnv(oa.api_key_env);
-    if (typeof oa.base_url === "string") setOpenaiBaseUrl(oa.base_url);
-    const lo = (cfg.local as Record<string, unknown> | undefined) ?? {};
-    if (typeof lo.model === "string") setLocalModel(lo.model);
-    if (typeof lo.dimensions === "number")
-      setLocalDimensions(String(lo.dimensions));
-    const hr = (cfg.hrr as Record<string, unknown> | undefined) ?? {};
-    if (typeof hr.dimensions === "number")
-      setHrrDimensions(String(hr.dimensions));
-  }, [embedding]);
 
   async function onSave() {
     setSaving(true);
@@ -975,7 +989,17 @@ function RetrievalEditor({
         body as { provider: string; [k: string]: unknown },
       );
       onChange(next);
-      setSavedAt(Date.now());
+      // Show what the gateway applied, not just what was typed.
+      const applied = embeddingForm(next);
+      setProvider(applied.provider);
+      setOpenaiModel(applied.openaiModel);
+      setOpenaiDimensions(applied.openaiDimensions);
+      setOpenaiApiKeyEnv(applied.openaiApiKeyEnv);
+      setOpenaiBaseUrl(applied.openaiBaseUrl);
+      setLocalModel(applied.localModel);
+      setLocalDimensions(applied.localDimensions);
+      setHrrDimensions(applied.hrrDimensions);
+      flashSaved();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -983,7 +1007,6 @@ function RetrievalEditor({
     }
   }
 
-  const justSaved = savedAt !== null && Date.now() - savedAt < 4000;
 
   return (
     <section className="mt-10 card px-4 py-4">
