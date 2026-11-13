@@ -156,6 +156,7 @@ havn is **infrastructure, not SaaS**. The test: does it require kernel primitive
 
 - **Individual** — one $5 VPS, gateway + agents co-located, managed via CLI or dashboard
 - **Small team (5–50)** — same single server, cgroup resource partitioning per agent, reverse proxy for auth
+- **Several customers per server** — one unprivileged LXD container per customer, each with its own gateway; see [docs/multi-tenant.md](docs/multi-tenant.md)
 
 ## Security Model
 
