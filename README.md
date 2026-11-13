@@ -103,15 +103,17 @@ Agent cgroups are `/sys/fs/cgroup/havn/agent-<id>`. The gateway creates that top
 
 ```bash
 sudo -i
-# Replace the binaries; the running gateway is not touched yet
-curl -fsSL https://raw.githubusercontent.com/amplimit/havn/main/install.sh | HAVN_VERSION=v0.1.5 bash
+# Replace the binaries with the release you move to; the running gateway is not touched yet
+curl -fsSL https://raw.githubusercontent.com/amplimit/havn/main/install.sh | HAVN_VERSION=<version> bash
 systemctl stop havn
-# Back up the database while the gateway is stopped (its path is db_path in config.toml)
-mkdir -p ~/havn-backup && cp -a ~/.local/share/havn/havn.db* ~/havn-backup/
+# While it is stopped, back up the data: havn.db and every agent's agent.db
+cp -a ~/.local/share/havn ~/havn-backup-$(date +%F)
 systemctl start havn
 ```
 
-A stopping gateway takes no new messages and gives the agents up to 30 seconds to finish what they are doing. Open chats still get those replies, and are told when one was cut off. Agents that were running start again with the gateway, and the dashboard reconnects on its own. The new gateway migrates the database when it starts, and there is no way back, so keep the copy until the new version works. Upgrade the dashboard separately: check out the new tag in its directory, then run `npm install` and `npm run build`, and restart it.
+A stopping gateway takes no new messages and gives the agents up to 30 seconds to finish what they are doing. Open chats still get those replies, and are told when one was cut off. Gateways up to v0.1.4 stop their agents at once, so the stop before leaving one of them drops work in progress; choose a quiet moment for it. Agents that were running start again with the gateway, and the dashboard reconnects on its own.
+
+The new gateway and agents migrate their databases when they start, and there is no way back, so keep the backup until the new version works. With a `db_path` or `workspace_root` other than the default, back up those too. Upgrade the dashboard separately: check out the new tag in its directory, then run `npm install` and `npm run build`, and restart it.
 
 ### Build from source
 

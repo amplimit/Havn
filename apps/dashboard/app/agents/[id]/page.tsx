@@ -35,6 +35,18 @@ function turnBubbles(turns: ConversationTurn[], nextId: () => number): Bubble[] 
     }));
 }
 
+// The stored conversation, fetched from `since` on, replaces what is on
+// screen, except notices (they exist only in this tab) and live bubbles
+// newer than the fetch that it does not have yet.
+function mergeStored(prev: Bubble[], stored: Bubble[], since: number): Bubble[] {
+  const kept = prev.filter(
+    (b) =>
+      b.role === "system" ||
+      (b.ts >= since && !stored.some((s) => s.role === b.role && s.content === b.content)),
+  );
+  return [...stored, ...kept].sort((a, b) => a.ts - b.ts);
+}
+
 export default function ChatPage({
   params,
 }: {
@@ -109,9 +121,11 @@ export default function ChatPage({
     let cancelled = false;
     (async () => {
       try {
+        const since = Date.now();
         const r = await api.conversation.list(id, HISTORY_LIMIT);
         if (cancelled || r.turns.length === 0) return;
-        setBubbles(turnBubbles(r.turns, () => bubbleIdRef.current++));
+        const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
+        setBubbles((prev) => mergeStored(prev, stored, since));
       } catch (e) {
         // Not fatal — chat works fine without history (just won't show
         // past turns). Surface the error so we know if it's persistent.
@@ -154,25 +168,23 @@ export default function ChatPage({
 
   // WebSocket lifecycle — open ONCE per (page, token) pair. The
   // gateway lazy-spawns the runtime if needed. After an unintentional
-  // close it keeps reconnecting, and each reconnect reloads the stored
-  // conversation, which has the replies sent while the chat was away.
+  // close it keeps reconnecting, and each open reloads the stored
+  // conversation, which has the replies sent while the chat was away
+  // (and the history, if the gateway was down when the page loaded).
   useEffect(() => {
     if (!me) return;
     if (chatRef.current) return;
 
     let cancelled = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-    let opened = false;
 
     async function catchUp() {
       try {
+        const since = Date.now();
         const r = await api.conversation.list(id, HISTORY_LIMIT);
         if (cancelled) return;
         const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
-        // Notices exist only in this tab; keep them where they were.
-        setBubbles((prev) =>
-          [...stored, ...prev.filter((b) => b.role === "system")].sort((a, b) => a.ts - b.ts),
-        );
+        setBubbles((prev) => mergeStored(prev, stored, since));
       } catch (e) {
         console.warn("[chat] history reload failed", e);
       }
@@ -184,8 +196,7 @@ export default function ChatPage({
       const handle = openChat(id, me!.ws_token, {
         onOpen: () => {
           setWsState("open");
-          if (opened) void catchUp();
-          opened = true;
+          void catchUp();
         },
         onMessage: (msg) => {
           // Either a real reply or a soft error closes the "replying…"

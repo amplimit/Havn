@@ -183,6 +183,11 @@ pub(crate) fn watch(state: &AppState, handle: AgentHandle, generation: u64) {
                 return;
             }
         };
+        if state.supervisor.shutting_down() {
+            // Left during a drain. It stays registered so `shut_down`
+            // releases what the spawner holds before the gateway exits.
+            return;
+        }
         // Gone from the registry: stopped on purpose, or already handled.
         let Some(instance) = state
             .registry
@@ -254,7 +259,8 @@ async fn recover(state: &AppState, instance: Instance, ended: Ended) {
     let ran_for_s = ran_for.as_secs();
 
     if state.supervisor.shutting_down() {
-        // Left during a drain, as asked; `shut_down` cleans up the rest.
+        // Ended as the gateway stops (the flag was set after `watch` took
+        // it out of the registry): release it, but no audit or restart.
         debug!(agent_id = %id, "agent left while the gateway is stopping");
         if let Err(e) = state.spawner.stop(&instance.handle).await {
             debug!(agent_id = %id, error = %e, "spawner had nothing left to stop");
@@ -478,12 +484,13 @@ pub(crate) async fn drain(state: &AppState, limit: Duration) {
         limit_s = limit.as_secs(),
         "letting agents finish their work"
     );
+    let deadline = tokio::time::Instant::now() + limit;
     for id in &connected {
-        if let Err(e) = state.registry.send(*id, GatewayToAgent::Drain).await {
+        // A full queue means a stalled agent: `shut_down` stops it.
+        if let Err(e) = state.registry.try_send(*id, GatewayToAgent::Drain).await {
             debug!(agent_id = %id, error = %e, "could not ask agent to drain");
         }
     }
-    let deadline = tokio::time::Instant::now() + limit;
     let mut busy = connected;
     loop {
         let mut still = Vec::with_capacity(busy.len());
@@ -1277,7 +1284,12 @@ mod tests {
             .await
             .expect("drain ends once the agent has left")
             .expect("join");
+        assert!(
+            state.registry.is_registered(id).await,
+            "left for shut_down to release"
+        );
         shut_down(&state).await;
+        assert!(spawner.procs.lock().unwrap().is_empty(), "released");
 
         tokio::time::sleep(quick_policy().max_delay * 4).await;
         assert_eq!(spawner.spawns(), 1, "not restarted");
