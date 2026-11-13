@@ -69,7 +69,8 @@ impl Schedule {
     /// later than `now`. Advancing from the slot rather than the firing time
     /// keeps the job on its interval however late the scheduler noticed it,
     /// and slots missed while the gateway was down are skipped, not replayed.
-    /// Returns `None` for one-shot schedules — the job is finished and should
+    /// Returns `None` for one-shot schedules, and for an interval whose next
+    /// slot is past the range of a timestamp — the job is finished and should
     /// be disabled.
     pub fn advance_from(
         &self,
@@ -80,7 +81,8 @@ impl Schedule {
             Self::Interval { seconds } => {
                 let behind = (now - scheduled).num_seconds().max(0);
                 let slots = behind / seconds + 1;
-                Some(scheduled + ChronoDuration::seconds(slots.saturating_mul(*seconds)))
+                let step = ChronoDuration::try_seconds(slots.checked_mul(*seconds)?)?;
+                scheduled.checked_add_signed(step)
             }
             Self::At { .. } => None,
         }
@@ -436,6 +438,28 @@ mod tests {
             s.advance_from(slot, fired),
             Some(at("2026-05-01T12:01:00Z"))
         );
+    }
+
+    #[test]
+    fn a_slot_that_came_due_after_the_run_is_skipped() {
+        // Only the scheduler's tick time keeps this from happening to a
+        // delayed dispatch (see the gateway's `dispatch`).
+        let s = Schedule::Interval { seconds: 60 };
+        let slot = at("2026-05-01T12:00:00Z");
+        let fired = at("2026-05-01T12:01:00.200Z");
+        assert_eq!(
+            s.advance_from(slot, fired),
+            Some(at("2026-05-01T12:02:00Z"))
+        );
+    }
+
+    #[test]
+    fn an_interval_past_the_timestamp_range_ends_the_job() {
+        let s = Schedule::Interval {
+            seconds: i64::MAX / 2,
+        };
+        let slot = at("2026-05-01T12:00:00Z");
+        assert_eq!(s.advance_from(slot, slot), None);
     }
 
     #[test]

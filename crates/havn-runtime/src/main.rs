@@ -1167,7 +1167,8 @@ async fn handle_cron(tick: CronTick, ctx: Ctx) {
     };
     let turn = match &outcome {
         CronOutcome::Success => output.clone(),
-        CronOutcome::Error { message } => format!("({message})"),
+        CronOutcome::Error { message } if output.is_empty() => format!("({message})"),
+        CronOutcome::Error { message } => format!("{output}\n\n({message})"),
     };
     if let Err(e) = conversations::record(&ctx.pool, &channel_id, Role::Assistant, &turn).await {
         warn!(%job_id, error = %e, "could not persist cron assistant turn");

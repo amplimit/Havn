@@ -152,12 +152,13 @@ impl std::error::Error for RunError {}
 /// surface as [`RunError`] variants instead of being smuggled into
 /// the success channel as sentinel strings.
 ///
-/// Most callers want [`run`]'s flatten-to-String shape (heartbeat / cron
-/// / parent-session / subagent all do). [`run_typed`] is for callers
-/// that need to forward a structured outcome — currently only
-/// `handle_incoming_query` (spec §4.4 v0.7), which translates `RunError`
-/// into `AgentQueryOutcome::Error` so the calling agent's `tool_result`
-/// gets `is_error: true` rather than an error-shaped success string.
+/// Most callers want [`run`]'s flatten-to-String shape (heartbeat /
+/// parent-session / subagent all do). [`run_typed`] is for callers
+/// that need to forward a structured outcome: `handle_incoming_query`
+/// (spec §4.4 v0.7), which translates `RunError` into
+/// `AgentQueryOutcome::Error` so the calling agent's `tool_result` gets
+/// `is_error: true` rather than an error-shaped success string, and
+/// `handle_cron`, which reports a failed run as `CronOutcome::Error`.
 pub async fn run_typed(
     handle: &LoopHandle,
     context: &'static str,
@@ -215,7 +216,7 @@ pub async fn run_typed(
 ///
 /// LLM errors and iteration-cap exhaustion fold into the returned
 /// `String` with sentinel prefixes — preserving the v0.6 single-channel
-/// contract for parent / cron / heartbeat / subagent callers.
+/// contract for parent / heartbeat / subagent callers.
 /// Callers that need to distinguish those degraded paths should use
 /// [`run_typed`] and translate `RunError` themselves.
 pub async fn run(
