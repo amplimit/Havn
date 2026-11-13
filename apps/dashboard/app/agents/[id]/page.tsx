@@ -271,7 +271,7 @@ export default function ChatPage({
             {agent.id}
           </p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2 sm:gap-3">
           <Link
             href={`/agents/${agent.id}/memory`}
             className="btn-ghost inline-flex items-center gap-1.5"

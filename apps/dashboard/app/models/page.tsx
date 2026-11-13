@@ -226,7 +226,7 @@ export default function ModelsPage() {
 
       <ul className="grid gap-3">
         {view?.models.map((m, i) => (
-          <li key={m.id} className="card flex items-center justify-between px-5 py-4">
+          <li key={m.id} className="card flex flex-wrap items-center justify-between gap-3 px-5 py-4">
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-3">
                 <span className="display-h3">{m.label ?? m.id}</span>
@@ -246,7 +246,7 @@ export default function ModelsPage() {
               )}
             </div>
             {editable && (
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
                 <button
                   type="button"
                   className="btn-ghost"

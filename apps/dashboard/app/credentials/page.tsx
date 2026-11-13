@@ -212,7 +212,7 @@ export default function CredentialsPage() {
           const cap = typeof raw === "number" && raw > 0 ? raw : null;
           const usdCap = c.limits?.max_usd_per_day !== undefined;
           return (
-            <li key={c.id} className="card flex items-center justify-between px-5 py-4">
+            <li key={c.id} className="card flex flex-wrap items-center justify-between gap-3 px-5 py-4">
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-3">
                   <span className="display-h3">{c.provider}</span>
