@@ -130,7 +130,7 @@ export default function RolesPage({
       <section className="card px-4 py-4">
         <h2 className="display-h3 mb-3">create role</h2>
         <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
-          New roles get a narrow default policy. Click "edit policy" on
+          New roles get a narrow default policy. Click &quot;edit policy&quot; on
           the role below to broaden permissions.
         </p>
         <form onSubmit={onCreate} className="flex items-end gap-3">

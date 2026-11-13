@@ -5,10 +5,10 @@ on:
     - cron: '17 6 * * *'
   push:
     branches: [main]
-    paths: ['Cargo.lock', '**/Cargo.toml', 'deny.toml', '.github/workflows/audit.yml']
+    paths: ['Cargo.lock', '**/Cargo.toml', 'deny.toml', 'apps/dashboard/package*.json', '.github/workflows/audit.yml']
   pull_request:
     branches: [main]
-    paths: ['Cargo.lock', '**/Cargo.toml', 'deny.toml', '.github/workflows/audit.yml']
+    paths: ['Cargo.lock', '**/Cargo.toml', 'deny.toml', 'apps/dashboard/package*.json', '.github/workflows/audit.yml']
   workflow_call:
   workflow_dispatch:
 
@@ -25,9 +25,25 @@ jobs:
         with:
           command: check advisories
 
+  npm-advisories:
+    name: npm audit (dashboard)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: apps/dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # All dependencies: the README deployment installs the dev ones too and
+      # runs the CSS toolchain in `npm run build`. Reads package-lock.json, so
+      # no install is needed.
+      - run: npm audit --audit-level=high
+
   report:
     name: report scheduled failure
-    needs: advisories
+    needs: [advisories, npm-advisories]
     if: failure() && github.event_name == 'schedule'
     runs-on: ubuntu-24.04
     permissions:
@@ -36,12 +52,12 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TITLE: 'audit: scheduled cargo-deny advisories check failed'
+          TITLE: 'audit: scheduled advisories check failed'
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           existing=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number')
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body "Still failing: $RUN_URL"
           else
-            gh issue create --title "$TITLE" --body "The daily RustSec advisories check failed on \`main\`: $RUN_URL"
+            gh issue create --title "$TITLE" --body "The daily advisories check (RustSec and npm) failed on \`main\`: $RUN_URL"
           fi

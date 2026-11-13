@@ -51,7 +51,7 @@ export default function HomePage() {
             style={{ color: "var(--color-body)", fontSize: 18, lineHeight: 1.4 }}
           >
             Click an agent to chat. The runtime starts on first use and stays
-            warm — you don't manage start/stop yourself.
+            warm — you don&apos;t manage start/stop yourself.
           </p>
         </div>
         <Link href="/agents/new" className="btn-primary">

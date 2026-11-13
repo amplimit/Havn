@@ -103,7 +103,7 @@ export default function SkillsPage({
           className="mt-2 max-w-2xl"
           style={{ color: "var(--color-body)", fontSize: 18, lineHeight: 1.4 }}
         >
-          Skills the agent has available, and the curator's history of what
+          Skills the agent has available, and the curator&apos;s history of what
           it consolidated or archived.
         </p>
       </header>
@@ -266,7 +266,7 @@ export default function SkillsPage({
             </h2>
             {reports.length === 0 ? (
               <p style={{ color: "var(--color-body)" }}>
-                The curator hasn't run yet for this agent. It runs every 7
+                The curator hasn&apos;t run yet for this agent. It runs every 7
                 days when the agent has been idle for at least 2 hours.
               </p>
             ) : (

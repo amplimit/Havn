@@ -115,7 +115,7 @@ export default function MembersPage({
           The user must already exist in the users table. Provision new
           users from the host with{" "}
           <code className="font-mono">
-            havn user add &lt;uuid&gt; --display-name "..."
+            havn user add &lt;uuid&gt; --display-name &quot;...&quot;
           </code>
           .
         </p>
