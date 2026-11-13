@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { Lock } from "lucide-react";
 import { api, type CredentialView } from "@/lib/api";
 
@@ -68,9 +69,17 @@ export default function CredentialsPage() {
       <header className="mb-8">
         <h1 className="display-h1">credentials</h1>
         <p className="mt-2" style={{ color: "var(--color-body)", fontSize: 18 }}>
-          LLM provider keys, with optional daily token caps. The gateway proxies
-          every model call through these — agent processes never see the raw
-          keys (spec §7).
+          LLM provider keys, with optional daily token caps. The gateway makes
+          every model call with these; agents never see the keys.
+        </p>
+        <p className="mt-2 max-w-3xl text-sm" style={{ color: "var(--color-body)" }}>
+          Keys here are yours: only your agents use them. To share a key, a
+          team admin adds it on the team&apos;s credentials page under{" "}
+          <Link href="/teams" className="underline" style={{ color: "var(--color-stripe-purple)" }}>
+            teams
+          </Link>
+          ; then every member&apos;s personal agents, and the team&apos;s agents,
+          can use it.
         </p>
         <div
           className="mt-3 inline-flex items-center gap-2 rounded px-3 py-1.5 text-sm"
@@ -79,7 +88,7 @@ export default function CredentialsPage() {
             color: "var(--color-stripe-purple)",
             border: "1px solid rgba(83, 58, 253, 0.18)",
           }}
-          title="Stored as age-encrypted ciphertext (spec §13). The gateway needs HAVN_AGE_KEY in its environment to decrypt at use time; a stolen DB file alone is useless without the key."
+          title="Stored as age-encrypted ciphertext. The gateway needs HAVN_AGE_KEY in its environment to decrypt at use time; a stolen DB file alone is useless without the key."
         >
           <Lock size={14} className="shrink-0" aria-hidden="true" />
           keys are encrypted at rest with age (HAVN_AGE_KEY)
@@ -109,6 +118,7 @@ export default function CredentialsPage() {
               <option value="anthropic">anthropic</option>
               <option value="openai">openai</option>
               <option value="openrouter">openrouter</option>
+              <option value="gemini">gemini</option>
             </select>
           </div>
           <div className="md:col-span-2">
@@ -150,7 +160,7 @@ export default function CredentialsPage() {
               className="input tabular"
             />
             <p className="mt-1.5 text-xs" style={{ color: "var(--color-body)" }}>
-              gateway falls through to the next-priority credential when this is exhausted (spec §7.4).
+              when this is used up, the gateway falls through to the next credential by priority.
             </p>
           </div>
           <div className="flex items-end justify-end md:col-span-2">

@@ -3,11 +3,13 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { api, type AgentView } from "@/lib/api";
+import { SetupChecklist } from "@/components/SetupChecklist";
 
 export default function HomePage() {
   const [agents, setAgents] = useState<AgentView[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [checklistShown, setChecklistShown] = useState(false);
 
   async function reload() {
     try {
@@ -69,25 +71,17 @@ export default function HomePage() {
         </div>
       )}
 
+      <SetupChecklist agentCount={agents?.length ?? null} onVisibleChange={setChecklistShown} />
+
       {agents === null && !error && (
         <div className="card px-4 py-6 text-sm" style={{ color: "var(--color-body)" }}>
           loading…
         </div>
       )}
 
-      {agents?.length === 0 && (
-        <div className="card-elevated px-8 py-16 text-center">
-          <p
-            className="display-h3 mb-2"
-          >
-            no agents yet
-          </p>
-          <p style={{ color: "var(--color-body)" }} className="mb-6">
-            Create your first agent to start chatting.
-          </p>
-          <Link href="/agents/new" className="btn-primary inline-block">
-            create your first agent
-          </Link>
+      {agents?.length === 0 && !checklistShown && (
+        <div className="card px-5 py-10 text-center" style={{ color: "var(--color-body)" }}>
+          no agents yet
         </div>
       )}
 

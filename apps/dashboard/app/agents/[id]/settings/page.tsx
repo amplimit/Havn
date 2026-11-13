@@ -175,9 +175,8 @@ export default function SettingsPage({
           className="mt-2 text-sm"
           style={{ color: "var(--color-body)" }}
         >
-          Changes apply on the agent&apos;s next start. The currently-running
-          runtime keeps its frozen system prompt + Welcome-snapshot
-          policy until it&apos;s restarted (spec §9.4).
+          Changes apply on the agent&apos;s next start. A running agent keeps
+          the system prompt and policy it started with until it restarts.
         </p>
       </header>
 
@@ -240,7 +239,7 @@ export default function SettingsPage({
 
         <Field
           label="Heartbeat interval (minutes)"
-          hint="How often the agent's heartbeat tick fires (spec §9.6 — proactive self-tick reading HEARTBEAT.md). Empty = use the default 30 min. Lower bound 1 min."
+          hint="How often the agent's heartbeat tick fires (a proactive tick that reads HEARTBEAT.md). Empty = use the default 30 min. Lower bound 1 min."
         >
           <input
             type="number"
@@ -375,8 +374,8 @@ function BootstrapEditor({ agentId }: { agentId: string }) {
       <h2 className="display-h3 mb-2">bootstrap files</h2>
       <p className="mb-4 text-sm" style={{ color: "var(--color-body)" }}>
         Three plain-text files in the agent&apos;s workspace that drive
-        persona, durable user-facing facts, and heartbeat behaviour
-        (spec §5.3, §9.4 layer 2). Each saves independently. Empty
+        persona, durable user-facing facts, and heartbeat behaviour.
+        Each saves independently. Empty
         body deletes the file.
       </p>
       {error && (
@@ -414,7 +413,7 @@ function BootstrapEditor({ agentId }: { agentId: string }) {
       />
       <BootstrapFileEditor
         title="HEARTBEAT.md — periodic self-tick instructions"
-        hint="Re-read on every heartbeat tick (the deliberate exception to the frozen-prompt invariant — spec §9.4 / §9.6). Edits take effect on the next tick."
+        hint="Re-read on every heartbeat tick (unlike the system prompt, which is fixed while the agent runs). Edits take effect on the next tick."
         value={heartbeat}
         onChange={setHeartbeat}
         loaded={loaded?.heartbeat ?? ""}
@@ -635,8 +634,8 @@ function McpEditor({ agentId }: { agentId: string }) {
     <section className="mt-10 card px-4 py-4">
       <h2 className="display-h3 mb-2">MCP servers</h2>
       <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
-        Model Context Protocol servers (spec §13 Phase 3) — operator-
-        installed stdio binaries the agent can invoke as
+        Model Context Protocol servers: stdio binaries the operator
+        installed, which the agent can invoke as
         <code className="font-mono"> mcp__&lt;server&gt;__&lt;tool&gt;</code>.
         Only binaries placed under{" "}
         <code className="font-mono">/usr/share/havn/mcp-servers/</code>{" "}
@@ -825,7 +824,7 @@ function McpEditor({ agentId }: { agentId: string }) {
               </Field>
               <Field
                 label="extra_paths_rw"
-                hint="Newline-separated host paths the server may read+write. Unioned into the agent's Landlock allowlist (spec §13). Typical: /workspace/data."
+                hint="Newline-separated host paths the server may read+write. Unioned into the agent's Landlock allowlist. Typical: /workspace/data."
               >
                 <textarea
                   value={newPathsRw}
@@ -991,11 +990,10 @@ function RetrievalEditor({
       <h2 className="display-h3 mb-2">retrieval layer</h2>
       <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
         Hybrid retrieval (vector + BM25 keyword) drives both typed
-        memory and skill discovery — one config, both surfaces (spec
-        §9.4 / §13). Switch the provider here; the change applies to
-        the <strong>next agent spawn</strong> immediately. Already-
-        running agents keep their snapshot (frozen-prompt invariant —
-        restart them to pick up the change). The override is held{" "}
+        memory and skill discovery — one config, both surfaces. Switch
+        the provider here; the change applies to the{" "}
+        <strong>next agent spawn</strong> immediately. Running agents keep
+        the setting they started with; restart them to pick up the change. The override is held{" "}
         <strong>in-memory</strong>: a gateway restart reverts to the
         value in <code className="font-mono">~/.config/havn/config.toml</code>
         , the canonical source of truth — edit there too if you want
@@ -1021,7 +1019,7 @@ function RetrievalEditor({
           <div className="grid gap-4">
             <Field
               label="provider"
-              hint="disabled = FTS5 keyword-only (v0.6 default). openai = remote semantic embeddings (recommended). local = fastembed-rs (requires --features local-embed at build time). hrr = pure-Rust deterministic bag-of-tokens (zero deps, weakest semantic recall)."
+              hint="disabled = FTS5 keyword-only (the default). openai = remote semantic embeddings (recommended). local = fastembed-rs (requires --features local-embed at build time). hrr = pure-Rust deterministic bag-of-tokens (zero deps, weakest semantic recall)."
             >
               <select
                 value={provider}

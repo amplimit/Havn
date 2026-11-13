@@ -1,9 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ApiError, api, type ModelEntry, type ModelsView } from "@/lib/api";
-
-const PROVIDERS = ["anthropic", "openai", "openrouter", "gemini"];
+import { ApiError, LLM_PROVIDERS as PROVIDERS, api, type ModelEntry, type ModelsView } from "@/lib/api";
 
 export default function ModelsPage() {
   const [view, setView] = useState<ModelsView | null>(null);

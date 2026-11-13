@@ -88,7 +88,7 @@ export default function MemoryPage({
       if (e instanceof ApiError) {
         if (e.status === 409) {
           setForgetError(
-            "Start the agent before deleting memory — agent.db is single-writer (spec §5.2).",
+            "Start the agent before deleting memory — agent.db is single-writer.",
           );
         } else if (e.status === 404) {
           // Already gone — refresh.

@@ -133,7 +133,7 @@ export default function TeamCredentialsPage({
           color: "var(--color-stripe-purple)",
           border: "1px solid rgba(83, 58, 253, 0.18)",
         }}
-        title="Stored as age-encrypted ciphertext (spec §13). The gateway needs HAVN_AGE_KEY in its environment to decrypt at use time."
+        title="Stored as age-encrypted ciphertext. The gateway needs HAVN_AGE_KEY in its environment to decrypt at use time."
       >
         <Lock size={14} className="shrink-0" aria-hidden="true" />
         keys are encrypted at rest with age (HAVN_AGE_KEY)
@@ -143,9 +143,9 @@ export default function TeamCredentialsPage({
         <section className="card px-4 py-4">
           <h2 className="display-h3 mb-3">add team credential</h2>
           <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
-            Falls back AFTER each member&apos;s personal credentials per spec
-            §7.2. Per-user caps clamp one user&apos;s burn so they don&apos;t
-            exhaust the team&apos;s daily quota.
+            Members&apos; personal agents and this team&apos;s agents use
+            these after their owner&apos;s own keys. Per-user caps keep one
+            user from using up the team&apos;s daily quota.
           </p>
           <form onSubmit={onCreate} className="grid gap-3">
             <div className="grid gap-3 sm:grid-cols-3">

@@ -242,7 +242,8 @@ const ERROR_KINDS = /^(bad request|forbidden|conflict): /i;
 const MAX_ERROR_LENGTH = 300;
 
 function statusMessage(status: number): string {
-  if (status === 401 || status === 403) return "you are not allowed to do this";
+  if (status === 401) return "you are not signed in; reload the page to sign in again";
+  if (status === 403) return "you are not allowed to do this";
   if (status === 502 || status === 503 || status === 504) return "the gateway is not reachable";
   return `request failed (${status})`;
 }
@@ -277,8 +278,9 @@ export class ApiError extends Error {
     public status: number,
     public body: string,
     contentType = "",
+    message?: string,
   ) {
-    super(readableError(status, body, contentType));
+    super(message ?? readableError(status, body, contentType));
   }
 }
 
@@ -307,11 +309,13 @@ async function request<T>(
   // 204 No Content has no body.
   if (res.status === 204) return undefined as T;
   // A sign-in page from an SSO proxy whose session expired arrives as 200.
-  if (!(res.headers.get("content-type") ?? "").includes("json")) {
+  const type = res.headers.get("content-type") ?? "";
+  if (!type.includes("json")) {
     throw new ApiError(
       res.status,
-      "{\"error\":\"the response was not from the gateway; your sign-in may have expired, reload the page\"}",
-      "application/json",
+      await res.text(),
+      type,
+      "the response was not from the gateway; your sign-in may have expired, reload the page",
     );
   }
   return (await res.json()) as T;
@@ -585,3 +589,57 @@ export const api = {
     },
   },
 };
+
+export const LLM_PROVIDERS = ["anthropic", "openai", "openrouter", "gemini"];
+
+// Credentials are stored as `llm:<provider>` or a bare name; channel and
+// SaaS tokens are not LLM keys.
+export function llmProvider(credentialProvider: string): string | null {
+  const name = credentialProvider.startsWith("llm:")
+    ? credentialProvider.slice(4)
+    : credentialProvider;
+  return LLM_PROVIDERS.includes(name) ? name : null;
+}
+
+export function modelProvider(id: string | null | undefined): string | null {
+  const provider = id?.split(":")[0];
+  return provider ? provider : null;
+}
+
+export type KeyScopes = { own: Set<string>; teams: Map<string, Set<string>> };
+
+function enabledProviders(creds: CredentialView[]): Set<string> {
+  const out = new Set<string>();
+  for (const c of creds) {
+    const provider = llmProvider(c.provider);
+    if (c.enabled && provider) out.add(provider);
+  }
+  return out;
+}
+
+// Rejects when a list cannot be read, so callers show no coverage rather
+// than a false gap; only a team the user has just left (403) counts as empty.
+export async function keyScopes(teams: TeamView[]): Promise<KeyScopes> {
+  const [own, ...shared] = await Promise.all([
+    api.credentials.list(),
+    ...teams.map((t) =>
+      api.teams.credentials.list(t.id).catch((e: unknown) => {
+        if (e instanceof ApiError && e.status === 403) return [] as CredentialView[];
+        throw e;
+      }),
+    ),
+  ]);
+  return {
+    own: enabledProviders(own),
+    teams: new Map(teams.map((t, i) => [t.id, enabledProviders(shared[i])])),
+  };
+}
+
+// As the gateway resolves keys: the owner's own, plus the agent's team, or
+// every team the owner is in for an agent without a team.
+export function reachable(scopes: KeyScopes, teamId: string | null): Set<string> {
+  const out = new Set(scopes.own);
+  const teams = teamId ? [scopes.teams.get(teamId)] : [...scopes.teams.values()];
+  for (const set of teams) for (const p of set ?? []) out.add(p);
+  return out;
+}
