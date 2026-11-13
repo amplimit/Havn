@@ -308,6 +308,19 @@ pub struct LlmConfig {
     /// are sent there. Operator config only; agents and API users cannot set
     /// it.
     pub base_url: std::collections::BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    pub models: Vec<crate::model_catalog::ModelEntry>,
+}
+
+impl LlmConfig {
+    #[must_use]
+    pub fn catalog(&self) -> crate::model_catalog::ModelCatalog {
+        crate::model_catalog::ModelCatalog {
+            default_model: self.default_model.clone(),
+            models: self.models.clone(),
+        }
+    }
 }
 
 pub const DEFAULT_MAX_TOKENS_CEILING: u32 = 128_000;
@@ -334,6 +347,8 @@ impl Default for LlmConfig {
         Self {
             max_tokens_ceiling: DEFAULT_MAX_TOKENS_CEILING,
             base_url: std::collections::BTreeMap::new(),
+            default_model: None,
+            models: Vec::new(),
         }
     }
 }
@@ -494,7 +509,7 @@ impl GatewayConfig {
             };
             *url = parsed.as_str().trim_end_matches('/').to_string();
         }
-        Ok(())
+        self.llm.catalog().validate()
     }
 
     /// Reject `|` (the `channel_id_codec` separator) in any channel

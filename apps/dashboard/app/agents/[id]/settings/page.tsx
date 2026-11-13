@@ -24,17 +24,8 @@ import {
   type EmbeddingStatus,
   type McpServerConfig,
   type McpView,
+  type ModelsView,
 } from "@/lib/api";
-
-// Latest Anthropic models as of 2026-05; user can also type a custom
-// id if they want something not on this list (a model the gateway's
-// allowed_models policy permits).
-const MODEL_PRESETS = [
-  { id: "claude-opus-4-7", label: "Opus 4.7 — best reasoning, ~5× cost" },
-  { id: "claude-opus-4-6", label: "Opus 4.6 — prior generation Opus" },
-  { id: "claude-sonnet-4-6", label: "Sonnet 4.6 — fast + cheap default" },
-  { id: "claude-haiku-4-5-20251001", label: "Haiku 4.5 — cheapest" },
-];
 
 export default function SettingsPage({
   params,
@@ -53,6 +44,7 @@ export default function SettingsPage({
   // Form state, seeded from the agent on load. Local-only until Save.
   const [name, setName] = useState("");
   const [model, setModel] = useState("");
+  const [models, setModels] = useState<ModelsView | null>(null);
   const [heartbeatMin, setHeartbeatMin] = useState<string>("");
 
   useEffect(() => {
@@ -66,6 +58,13 @@ export default function SettingsPage({
         setName(a.name);
         const cfg = a.config as Record<string, unknown>;
         setModel(typeof cfg.model === "string" ? cfg.model : "");
+        // Without the list the picker only offers the current model.
+        api.models
+          .get()
+          .then((m) => {
+            if (!cancelled) setModels(m);
+          })
+          .catch(() => {});
         const hb =
           (cfg.heartbeat as Record<string, unknown> | undefined) ?? {};
         const secs = typeof hb.interval_seconds === "number"
@@ -95,12 +94,12 @@ export default function SettingsPage({
       // Build a minimal config patch — shallow-merged server-side, so
       // keys we don't touch stay untouched.
       const config: Record<string, unknown> = {};
-      if (model.trim()) {
-        config.model = model.trim();
-      } else {
-        // null clears the key — runtime will fall back to its compiled
-        // default (currently claude-opus-4-6).
-        config.model = null;
+      // Only a changed model is sent: an agent whose model was taken off
+      // the list can still be renamed. null clears the key, and the agent
+      // then follows the gateway's default model.
+      const saved = (agent.config as Record<string, unknown>).model;
+      if (model !== (typeof saved === "string" ? saved : "")) {
+        config.model = model || null;
       }
       const hbNum = Number(heartbeatMin);
       if (heartbeatMin.trim() && Number.isFinite(hbNum) && hbNum > 0) {
@@ -211,43 +210,32 @@ export default function SettingsPage({
 
         <Field
           label="Model"
-          hint="Anthropic model id used for every LLM call. Pick a preset or paste any id allowed by your role's policy."
+          hint="Used for every LLM call of this agent. The list is the gateway's [[llm.models]]; your role's policy may allow only some of them."
         >
-          <input
-            type="text"
+          <select
             value={model}
             onChange={(e) => setModel(e.target.value)}
-            list="model-presets"
             className="input font-mono"
-            placeholder="claude-sonnet-4-6"
-          />
-          <datalist id="model-presets">
-            {MODEL_PRESETS.map((m) => (
+          >
+            <option value="">
+              {models?.effective_default
+                ? `gateway default (${models.effective_default})`
+                : "gateway default"}
+            </option>
+            {(models?.models ?? []).map((m) => (
               <option key={m.id} value={m.id}>
-                {m.label}
+                {m.label ? `${m.label} (${m.id})` : m.id}
               </option>
             ))}
-          </datalist>
-          <div className="mt-2 grid gap-1">
-            {MODEL_PRESETS.map((m) => (
-              <button
-                key={m.id}
-                type="button"
-                onClick={() => setModel(m.id)}
-                className="text-left text-xs"
-                style={{
-                  color:
-                    model === m.id
-                      ? "var(--color-stripe-purple)"
-                      : "var(--color-body)",
-                  textDecoration: model === m.id ? "underline" : "none",
-                }}
-              >
-                <code className="font-mono">{m.id}</code>
-                <span className="ml-2">{m.label.replace(/^[^—]+— /, "")}</span>
-              </button>
-            ))}
-          </div>
+            {model && !models?.models.some((m) => m.id === model) && (
+              <option value={model}>{model} (not in the model list)</option>
+            )}
+          </select>
+          <p className="mt-1.5 text-xs" style={{ color: "var(--color-body)" }}>
+            <Link href="/models" className="underline">
+              Manage the model list
+            </Link>
+          </p>
         </Field>
 
         <Field

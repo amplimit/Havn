@@ -74,6 +74,14 @@ pub const RULES: &[ReloadRule] = &[
     // to the operator to apply on `havn gateway restart` (spec §3.5), not
     // hot-swapped live.
     ReloadRule {
+        prefix: "llm.models",
+        kind: ReloadKind::Hot,
+    },
+    ReloadRule {
+        prefix: "llm.default_model",
+        kind: ReloadKind::Hot,
+    },
+    ReloadRule {
         prefix: "reload",
         kind: ReloadKind::Restart,
     },
@@ -177,12 +185,14 @@ fn walk(old: &Value, new: &Value, prefix: &str, out: &mut Vec<String>) {
 #[derive(Clone)]
 pub struct ReloadHandles {
     pub allowed_origins: Arc<ArcSwap<Vec<String>>>,
+    pub models: Arc<ArcSwap<crate::model_catalog::ModelCatalog>>,
 }
 
 impl ReloadHandles {
     pub fn from_config(cfg: &GatewayConfig) -> Self {
         Self {
             allowed_origins: Arc::new(ArcSwap::from_pointee(cfg.allowed_origins.clone())),
+            models: Arc::new(ArcSwap::from_pointee(cfg.llm.catalog())),
         }
     }
 
@@ -197,6 +207,14 @@ impl ReloadHandles {
                     new_count = new.allowed_origins.len(),
                     "hot-reloaded allowed_origins"
                 );
+            } else if path.starts_with("llm.models") || path.starts_with("llm.default_model") {
+                let catalog = new.llm.catalog();
+                info!(
+                    models = catalog.models.len(),
+                    default = ?catalog.default_entry().map(|m| m.id.as_str()),
+                    "hot-reloaded the model list"
+                );
+                self.models.store(Arc::new(catalog));
             } else {
                 warn!(path, "hot path has no live applier — silently ignored");
             }
@@ -404,5 +422,26 @@ mod tests {
 
         let live = handles.allowed_origins.load();
         assert_eq!(&**live, &vec!["https://example.com".to_string()]);
+    }
+
+    #[test]
+    fn model_list_changes_apply_in_place() {
+        let old = GatewayConfig::default();
+        let handles = ReloadHandles::from_config(&old);
+        let mut new = old.clone();
+        new.llm.models = vec![crate::model_catalog::ModelEntry {
+            id: "openai:gpt-5".into(),
+            label: None,
+            max_output_tokens: None,
+        }];
+        new.llm.default_model = Some("openai:gpt-5".into());
+        let changed = diff_paths(
+            &serde_json::to_value(&old).unwrap(),
+            &serde_json::to_value(&new).unwrap(),
+        );
+        let plan = ReloadPlan::build(&changed);
+        assert!(plan.restart_paths.is_empty(), "{changed:?}");
+        handles.apply_hot(&new, &plan.hot_paths);
+        assert_eq!(*handles.models.load_full(), new.llm.catalog());
     }
 }

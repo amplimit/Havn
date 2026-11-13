@@ -16,7 +16,9 @@ pub use codec::{FrameError, read_frame, write_frame};
 
 /// Current wire-protocol version. Mismatch on `Hello` is a hard error.
 /// 0.2.0: `CronTick`/`CronResult` carry `run_id`.
-pub const PROTOCOL_VERSION: &str = "0.2.0";
+/// 0.3.0: models are `provider:model`; an empty `LlmRequest.model` asks
+/// for the gateway's default model.
+pub const PROTOCOL_VERSION: &str = "0.3.0";
 
 /// How often a runtime sends [`AgentToGateway::LivenessPing`] once it is
 /// up. The gateway restarts an agent that stays connected but silent for
@@ -93,11 +95,11 @@ pub enum GatewayToAgent {
         /// (the runtime falls back to the agent_id string).
         #[serde(default)]
         agent_name: Option<String>,
-        /// Model the runtime should use for this session's LLM calls.
-        /// Resolved gateway-side from `agent.config.model`; `None`
-        /// when the agent's config doesn't pin one (runtime falls back
-        /// to its compiled-in default). Defaulted on deserialize so an
-        /// older gateway can interop.
+        /// Model the runtime should use for this session's LLM calls:
+        /// the agent's `config.model` as `provider:model`, or `None`
+        /// when the agent's config doesn't pin one. The runtime then
+        /// sends an empty `LlmRequest.model`, which the gateway resolves
+        /// to its current default model at each call.
         #[serde(default)]
         model: Option<String>,
         #[serde(default)]
@@ -369,6 +371,8 @@ pub enum AdminOutcome {
 pub struct LlmRequest {
     /// Correlation ID; the agent matches the [`LlmResponse`] back via this.
     pub request_id: String,
+    /// `provider:model` from the gateway's model list, or empty for its
+    /// default model.
     pub model: String,
     /// Provider-shaped messages array, passed through to the LLM provider.
     pub messages: serde_json::Value,

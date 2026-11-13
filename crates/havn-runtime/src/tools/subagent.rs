@@ -282,7 +282,7 @@ mod tests {
                 tool_env: env,
                 max_iterations: SUBAGENT_MAX_ITERATIONS,
                 messages_mirror: None,
-                model: Arc::new(crate::tool_loop::DEFAULT_MODEL.to_string()),
+                model: Arc::new(String::new()),
                 max_tokens: crate::tool_loop::DEFAULT_MAX_TOKENS,
                 billing_user_id: None,
             },

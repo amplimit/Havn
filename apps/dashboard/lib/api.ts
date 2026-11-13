@@ -160,6 +160,23 @@ export type RoleView = {
   created_at: string;
 };
 
+export type ModelEntry = {
+  id: string;
+  label?: string;
+  max_output_tokens?: number;
+};
+
+export type ModelsView = {
+  /** Pass back on put: the gateway refuses it if the list changed since. */
+  version: string;
+  /** Default set in config.toml; null when the first entry is the default. */
+  default_model: string | null;
+  effective_default: string | null;
+  models: ModelEntry[];
+  /** False with trust_header on: the list is then edited in config.toml only. */
+  editable: boolean;
+};
+
 export type EmbeddingStatus = {
   /** "disabled" | "openai" | "local" | "hrr". */
   provider: string;
@@ -274,6 +291,19 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(body),
     }),
+  models: {
+    get: () => request<ModelsView>("/llm/models"),
+    /** Replaces the whole list; the gateway writes it to config.toml. */
+    put: (body: {
+      version: string;
+      default_model: string | null;
+      models: ModelEntry[];
+    }) =>
+      request<ModelsView>("/llm/models", {
+        method: "PUT",
+        body: JSON.stringify(body),
+      }),
+  },
   myAuditLog: (before?: string, limit = 100) =>
     request<AuditListResponse>(`/me/audit-log${qs({ before, limit })}`),
 

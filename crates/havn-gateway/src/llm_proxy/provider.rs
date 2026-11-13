@@ -16,8 +16,8 @@
 //!    always did for Anthropic.
 //!
 //! Provider selection is data-driven by the credential's `provider` string
-//! ([`super::anthropic::AnthropicProvider::NAME`] etc). Model-name inference exists for
-//! callers that don't carry an explicit hint — see [`provider_for_model`].
+//! ([`super::anthropic::AnthropicProvider::NAME`] etc), named by the
+//! `provider:` half of the model id in `[[llm.models]]`.
 
 use async_trait::async_trait;
 
@@ -92,42 +92,6 @@ pub trait LlmProvider: Send + Sync {
     ) -> Result<AnthropicResponse, ProviderError>;
 }
 
-/// Best-effort provider inference from the model string when the caller
-/// didn't pass an explicit provider hint. Used as a fallback in
-/// [`super::complete`].
-///
-/// Returns the **bare** provider name (`"anthropic"`, `"openai"`, …)
-/// — the LLM proxy's internal dispatcher (which picks the upstream
-/// HTTP client to call) keys off this. v0.2 credential rows live
-/// under namespaced provider strings (`llm:anthropic`); the
-/// credential resolver does the namespacing transparently
-/// (`credential_resolver::list_active` tries both forms).
-///
-/// The mapping is intentionally conservative — when in doubt we
-/// return `"anthropic"` rather than guessing a new provider, so
-/// unrecognised models keep the v0.6 behaviour.
-#[must_use]
-pub fn provider_for_model(model: &str) -> &'static str {
-    if model.starts_with("claude-") {
-        "anthropic"
-    } else if model.starts_with("gpt-")
-        || model.starts_with("o1")
-        || model.starts_with("o3")
-        || model.starts_with("o4")
-        || model.starts_with("chatgpt-")
-    {
-        "openai"
-    } else if model.starts_with("gemini-") {
-        "gemini"
-    } else if model.contains('/') {
-        // Vendor-prefixed model strings ("anthropic/claude-3.5-sonnet",
-        // "meta-llama/llama-3.1-70b") are OpenRouter's convention.
-        "openrouter"
-    } else {
-        "anthropic"
-    }
-}
-
 /// Maximum output tokens of known models, keyed by model-name prefix in
 /// the normalized form [`model_output_limit`] matches against. The longest
 /// matching prefix wins; models not listed are not clamped.
@@ -198,11 +162,10 @@ pub fn model_output_limit(model: &str) -> Option<u32> {
         .map(|&(_, limit)| limit)
 }
 
-/// `requested` clamped to the model's known output limit and to the
-/// operator's ceiling, whichever is lower.
 #[must_use]
-pub fn clamp_max_tokens(model: &str, requested: u32, ceiling: u32) -> u32 {
-    model_output_limit(model)
+pub fn clamp_max_tokens(model: &str, limit: Option<u32>, requested: u32, ceiling: u32) -> u32 {
+    limit
+        .or_else(|| model_output_limit(model))
         .map_or(requested, |limit| requested.min(limit))
         .min(ceiling)
 }
@@ -239,24 +202,6 @@ pub(super) fn classify(err: ProviderError) -> super::Attempt {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn provider_for_model_routes_known_prefixes() {
-        assert_eq!(provider_for_model("claude-opus-4-7"), "anthropic");
-        assert_eq!(provider_for_model("claude-sonnet-4-6"), "anthropic");
-        assert_eq!(provider_for_model("gpt-4o"), "openai");
-        assert_eq!(provider_for_model("gpt-5"), "openai");
-        assert_eq!(provider_for_model("o1-preview"), "openai");
-        assert_eq!(provider_for_model("o3-mini"), "openai");
-        assert_eq!(provider_for_model("chatgpt-4o-latest"), "openai");
-        assert_eq!(provider_for_model("gemini-2.5-pro"), "gemini");
-        assert_eq!(provider_for_model("gemini-1.5-flash"), "gemini");
-        assert_eq!(
-            provider_for_model("anthropic/claude-3.5-sonnet"),
-            "openrouter"
-        );
-        assert_eq!(provider_for_model("meta-llama/llama-3.1-70b"), "openrouter");
-    }
 
     #[test]
     fn output_limits_match_by_longest_prefix() {
@@ -298,29 +243,41 @@ mod tests {
     fn max_tokens_is_clamped_to_model_limit_and_ceiling() {
         const NONE: u32 = u32::MAX;
         assert_eq!(
-            clamp_max_tokens("claude-3-haiku-20240307", 8_192, NONE),
+            clamp_max_tokens("claude-3-haiku-20240307", None, 8_192, NONE),
             4_096
         );
-        assert_eq!(clamp_max_tokens("claude-opus-5-5", 8_192, NONE), 8_192);
-        assert_eq!(clamp_max_tokens("claude-opus-5-5", 200_000, NONE), 128_000);
-        assert_eq!(clamp_max_tokens("claude-opus-5-5", 8_192, 2_000), 2_000);
-        assert_eq!(clamp_max_tokens("claude-3-haiku", 8_192, 6_000), 4_096);
         assert_eq!(
-            clamp_max_tokens("mystery-model", 1_000_000, NONE),
+            clamp_max_tokens("claude-opus-5-5", None, 8_192, NONE),
+            8_192
+        );
+        assert_eq!(
+            clamp_max_tokens("claude-opus-5-5", None, 200_000, NONE),
+            128_000
+        );
+        assert_eq!(
+            clamp_max_tokens("claude-opus-5-5", None, 8_192, 2_000),
+            2_000
+        );
+        assert_eq!(
+            clamp_max_tokens("claude-3-haiku", None, 8_192, 6_000),
+            4_096
+        );
+        assert_eq!(
+            clamp_max_tokens("mystery-model", None, 1_000_000, NONE),
             1_000_000
         );
         assert_eq!(
-            clamp_max_tokens("mystery-model", 1_000_000, 128_000),
+            clamp_max_tokens("mystery-model", None, 1_000_000, 128_000),
             128_000
         );
         assert_eq!(model_output_limit("gemini-2.5-flash-image"), Some(32_768));
-    }
-
-    #[test]
-    fn provider_for_model_falls_back_to_anthropic_on_unknown() {
-        // Unknown bare model string with no slash → anthropic (preserves
-        // v0.6 default behaviour for callers passing odd model names).
-        assert_eq!(provider_for_model("mystery-model-9000"), "anthropic");
-        assert_eq!(provider_for_model(""), "anthropic");
+        assert_eq!(
+            clamp_max_tokens("claude-opus-5-5", Some(16_000), 200_000, NONE),
+            16_000
+        );
+        assert_eq!(
+            clamp_max_tokens("mystery-model", Some(16_000), 200_000, 8_000),
+            8_000
+        );
     }
 }

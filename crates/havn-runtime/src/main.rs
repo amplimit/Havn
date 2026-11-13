@@ -138,8 +138,9 @@ struct Ctx {
     /// inbound message so the scheduler can detect "user is in active
     /// conversation, don't disrupt" before firing a curator pass.
     last_inbound: curator_scheduler::LastInbound,
-    /// Model resolved at handshake from the agent's `config.model`.
-    /// `Arc<String>` so cloning into per-loop `LoopHandle`s is cheap.
+    /// The agent's `config.model` from the handshake, or empty for the
+    /// gateway's default. `Arc<String>` so cloning into per-loop
+    /// `LoopHandle`s is cheap.
     model: Arc<String>,
     max_tokens: u32,
     /// Pending oneshots for outbound `agent_query` calls (spec §4.4
@@ -652,13 +653,9 @@ async fn main() -> anyhow::Result<()> {
         workspace_dir: Arc::clone(&workspace_dir),
         writer_tx: writer_tx.clone(),
         pending: Arc::clone(&pending),
-        // The agent's own model: one the operator's credentials and the
-        // policy's allowed_models already cover. A fixed model would fail
-        // on every pass for agents restricted to other models or
-        // providers.
-        model: model
-            .clone()
-            .unwrap_or_else(|| crate::tool_loop::DEFAULT_MODEL.to_string()),
+        // The agent's own model, or empty for the gateway's default: one
+        // the gateway lists and the policy allows.
+        model: model.clone().unwrap_or_default(),
     };
     let curator_last_inbound = Arc::clone(&last_inbound);
     let _curator_task = tokio::spawn(async move {
@@ -669,15 +666,11 @@ async fn main() -> anyhow::Result<()> {
     //    `child_handle` carries the BASE registry — no subagent_spawn —
     //    so a subagent invocation cannot itself invoke subagent_spawn.
     //    Wrapping the parent registry happens just below.
-    // Resolve the runtime's per-session model: gateway-supplied via Welcome,
-    // fall back to the compiled-in default. `Arc<String>` so every cloned
-    // LoopHandle (parent + each subagent task) shares one allocation.
+    // The runtime's per-session model from Welcome; empty asks the gateway
+    // for its default model. `Arc<String>` so every cloned LoopHandle
+    // (parent + each subagent task) shares one allocation.
     let session_max_tokens: u32 = max_tokens.unwrap_or(crate::tool_loop::DEFAULT_MAX_TOKENS);
-    let session_model: Arc<String> = Arc::new(
-        model
-            .clone()
-            .unwrap_or_else(|| crate::tool_loop::DEFAULT_MODEL.to_string()),
-    );
+    let session_model: Arc<String> = Arc::new(model.clone().unwrap_or_default());
     let bridge = Arc::new(subagent_tool::Bridge {
         parent_system_prompt: Arc::clone(&system_prompt),
         child_handle: LoopHandle {

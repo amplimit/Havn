@@ -15,12 +15,8 @@
 //!
 //! ## Provider selection
 //!
-//! [`complete`] picks a provider via:
-//! 1. Explicit hint in `LlmRequest.options.provider` (string, set by the
-//!    runtime when an agent's policy pins a provider regardless of model).
-//! 2. Otherwise model-name inference via [`provider::provider_for_model`].
-//!
-//! The chosen provider name keys both:
+//! The caller names the provider: the `provider:` half of the model's id in
+//! `[[llm.models]]` (see [`crate::model_catalog`]). It keys both:
 //! - The credential resolver (`Credential.provider` is matched as an opaque
 //!   string — the resolver doesn't care which provider).
 //! - The provider trait dispatch in [`dispatch_provider`].
@@ -219,9 +215,7 @@ pub(crate) enum Attempt {
     Fatal(ProxyError),
 }
 
-/// Run an LLM completion through the gateway proxy with credential fallback.
-/// Provider is resolved from `request.model` (or callers can pre-resolve it
-/// via [`complete_with_provider`]).
+/// Run an LLM completion through `provider_name` with credential fallback.
 ///
 /// Iterates the user's credential chain (highest priority first); on each:
 /// - token caps leave no room for the request → try next.
@@ -231,29 +225,16 @@ pub(crate) enum Attempt {
 /// - 5xx / network → try next.
 /// - 4xx (other) → fatal — caller's request is malformed; do not iterate.
 #[allow(
-    dead_code,
-    reason = "public API; callers without a provider hint use this entry"
+    clippy::too_many_arguments,
+    reason = "one call site per caller; a parameter struct would only rename them"
 )]
-pub async fn complete(
-    db: &SqlitePool,
-    http: &reqwest::Client,
-    keyring: &KeyRing,
-    billing: &Billing,
-    request: &AnthropicRequest,
-    llm: &LlmConfig,
-) -> Result<AnthropicResponse, ProxyError> {
-    let provider_name = provider::provider_for_model(&request.model);
-    complete_with_provider(db, http, keyring, billing, provider_name, request, llm).await
-}
-
-/// Like [`complete`], but the caller has already decided which provider to
-/// use (e.g. the runtime read it out of `LlmRequest.options.provider`).
 pub async fn complete_with_provider(
     db: &SqlitePool,
     http: &reqwest::Client,
     keyring: &KeyRing,
     billing: &Billing,
     provider_name: &str,
+    max_output_tokens: Option<u32>,
     request: &AnthropicRequest,
     llm: &LlmConfig,
 ) -> Result<AnthropicResponse, ProxyError> {
@@ -265,6 +246,7 @@ pub async fn complete_with_provider(
             .base_url
             .get(provider_name)
             .map_or(provider.default_base_url(), |url| url.trim_end_matches('/')),
+        max_output_tokens,
     };
     complete_through(
         db,
@@ -279,12 +261,14 @@ pub async fn complete_with_provider(
 }
 
 /// The provider implementation a call goes through, the provider name
-/// its credentials are stored under, and the API base URL it calls.
+/// its credentials are stored under, the API base URL it calls, and the
+/// model's output limit from `[[llm.models]]`, if it sets one.
 #[derive(Clone, Copy)]
 struct Route<'a> {
     provider: &'a dyn LlmProvider,
     name: &'a str,
     base_url: &'a str,
+    max_output_tokens: Option<u32>,
 }
 
 fn with_max_tokens(request: &AnthropicRequest, max_tokens: u32) -> Cow<'_, AnthropicRequest> {
@@ -309,8 +293,12 @@ async fn complete_through(
     request: &AnthropicRequest,
     max_tokens_ceiling: u32,
 ) -> Result<AnthropicResponse, ProxyError> {
-    let max_tokens =
-        provider::clamp_max_tokens(&request.model, request.max_tokens, max_tokens_ceiling);
+    let max_tokens = provider::clamp_max_tokens(
+        &request.model,
+        route.max_output_tokens,
+        request.max_tokens,
+        max_tokens_ceiling,
+    );
     let request = with_max_tokens(request, max_tokens);
     let request = request.as_ref();
 
@@ -694,20 +682,6 @@ fn input_token_estimate(request: &AnthropicRequest) -> i64 {
     i64::try_from(count.tokens()).unwrap_or(i64::MAX)
 }
 
-/// Back-compat wrapper. Phase 1 callers used `anthropic_complete`; we keep
-/// the name working so external integrations (and the test endpoint) don't
-/// break. Equivalent to [`complete_with_provider`] with `"anthropic"`.
-pub async fn anthropic_complete(
-    db: &SqlitePool,
-    http: &reqwest::Client,
-    keyring: &KeyRing,
-    billing: &Billing,
-    request: &AnthropicRequest,
-    llm: &LlmConfig,
-) -> Result<AnthropicResponse, ProxyError> {
-    complete_with_provider(db, http, keyring, billing, "anthropic", request, llm).await
-}
-
 /// HTTP client for provider calls. Redirects are not followed: requests
 /// carry the provider's API key, which must not reach whatever host a
 /// redirect names.
@@ -719,7 +693,13 @@ pub fn http_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
-/// Whether `name` is a provider the proxy can call.
+pub const PROVIDERS: &[&str] = &[
+    anthropic::AnthropicProvider::NAME,
+    openai::OpenAiProvider::OPENAI_NAME,
+    openai::OpenAiProvider::OPENROUTER_NAME,
+    gemini::GeminiProvider::NAME,
+];
+
 #[must_use]
 pub fn is_provider(name: &str) -> bool {
     dispatch_provider(name).is_ok()
@@ -1111,6 +1091,7 @@ mod tests {
                     provider,
                     name: "anthropic",
                     base_url: provider.default_base_url(),
+                    max_output_tokens: None,
                 },
                 billing,
                 request,

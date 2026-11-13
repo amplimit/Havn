@@ -1,0 +1,255 @@
+use std::sync::Arc;
+
+use axum::Json;
+use axum::extract::State;
+use serde::{Deserialize, Serialize};
+use tracing::info;
+
+use crate::AppState;
+use crate::api::ApiError;
+use crate::audit;
+use crate::auth::AuthedUser;
+use crate::model_catalog::{self, ModelCatalog, ModelEntry};
+
+#[derive(Debug, Serialize)]
+pub struct ModelsView {
+    pub version: String,
+    pub default_model: Option<String>,
+    pub effective_default: Option<String>,
+    pub models: Vec<ModelEntry>,
+    pub editable: bool,
+}
+
+fn view(state: &AppState) -> ModelsView {
+    let catalog = state.models.load();
+    ModelsView {
+        version: catalog.version(),
+        default_model: catalog.default_model.clone(),
+        effective_default: catalog.default_entry().map(|m| m.id.clone()),
+        models: catalog.models.clone(),
+        editable: state.trusted_proxies.is_none(),
+    }
+}
+
+pub async fn get(State(state): State<AppState>, _user: AuthedUser) -> Json<ModelsView> {
+    Json(view(&state))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelsPut {
+    pub version: String,
+    #[serde(default)]
+    pub default_model: Option<String>,
+    pub models: Vec<ModelEntry>,
+}
+
+pub async fn put(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Json(req): Json<ModelsPut>,
+) -> Result<Json<ModelsView>, ApiError> {
+    if state.trusted_proxies.is_some() {
+        return Err(ApiError::Forbidden(
+            "the model list is gateway-wide; with trust_header enabled it can only be \
+             changed in config.toml"
+                .into(),
+        ));
+    }
+    let catalog = ModelCatalog {
+        default_model: req.default_model,
+        models: req.models,
+    };
+    catalog
+        .validate()
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    let _writing = state.models_write.lock().await;
+    let path = state.config_path.clone();
+    let written = catalog.clone();
+    let expected = req.version;
+    let applied = tokio::task::spawn_blocking(move || {
+        // The file is compared, not the running list: a hand edit the
+        // watcher has not applied yet must not be overwritten either.
+        if model_catalog::write_if_unchanged(&path, &expected, &written)? {
+            return Ok(None);
+        }
+        // Retrying only helps if the gateway can load what is there now.
+        Ok::<_, anyhow::Error>(Some(match crate::config::GatewayConfig::load_from(&path) {
+            Ok(_) => {
+                "the model list changed since it was read; load it again and retry".to_string()
+            }
+            Err(e) => format!(
+                "config.toml has changes the gateway could not load ({e:#}); fix the file, \
+                 then retry"
+            ),
+        }))
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?
+    .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    if let Some(conflict) = applied {
+        return Err(ApiError::Conflict(conflict));
+    }
+    let ids: Vec<String> = catalog.models.iter().map(|m| m.id.clone()).collect();
+    let default_model = catalog.default_model.clone();
+    state.models.store(Arc::new(catalog));
+
+    audit::record_user_action(
+        &state.db,
+        user.id,
+        "llm.models.updated",
+        serde_json::json!({ "models": ids, "default_model": default_model }),
+    )
+    .await;
+    info!(models = ?ids, default = ?default_model, by = %user.id, "model list written to config.toml");
+    Ok(Json(view(&state)))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use crate::auth::tests::state_with;
+
+    fn body(version: &str, ids: &[&str]) -> Json<ModelsPut> {
+        Json(ModelsPut {
+            version: version.into(),
+            default_model: None,
+            models: ids
+                .iter()
+                .map(|id| ModelEntry {
+                    id: (*id).into(),
+                    label: None,
+                    max_output_tokens: None,
+                })
+                .collect(),
+        })
+    }
+
+    fn user(id: havn_core::UserId) -> AuthedUser {
+        AuthedUser {
+            id,
+            display_name: "operator".into(),
+        }
+    }
+
+    fn empty() -> String {
+        ModelCatalog::default().version()
+    }
+
+    #[tokio::test]
+    async fn put_writes_the_config_file_and_takes_effect() {
+        let (state, user_id) = state_with(false).await;
+        let first = get(State(state.clone()), user(user_id)).await.0.version;
+        let view = put(
+            State(state.clone()),
+            user(user_id),
+            body(&first, &["openai:gpt-5", "anthropic:claude-opus-4-7"]),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(view.effective_default.as_deref(), Some("openai:gpt-5"));
+        assert!(view.editable);
+        assert!(
+            state
+                .models
+                .load()
+                .get("anthropic:claude-opus-4-7")
+                .is_some()
+        );
+        let parsed: crate::config::GatewayConfig =
+            toml::from_str(&std::fs::read_to_string(&state.config_path).unwrap()).unwrap();
+        assert_eq!(parsed.llm.catalog(), *state.models.load_full());
+        let _ = std::fs::remove_file(&state.config_path);
+    }
+
+    #[tokio::test]
+    async fn put_refuses_a_writer_that_read_an_older_list() {
+        let (state, user_id) = state_with(false).await;
+        let first = put(
+            State(state.clone()),
+            user(user_id),
+            body(&empty(), &["openai:gpt-5"]),
+        )
+        .await
+        .unwrap()
+        .0
+        .version;
+        let err = put(
+            State(state.clone()),
+            user(user_id),
+            body(&empty(), &["gemini:gemini-2.5-pro"]),
+        )
+        .await
+        .expect_err("stale version");
+        assert!(matches!(err, ApiError::Conflict(_)), "{err:?}");
+
+        // A hand edit the watcher has not applied yet counts as a change.
+        let edited = ModelCatalog {
+            default_model: None,
+            models: vec![],
+        };
+        model_catalog::write_to_file(&state.config_path, &edited).unwrap();
+        let err = put(
+            State(state.clone()),
+            user(user_id),
+            body(&first, &["gemini:gemini-2.5-pro"]),
+        )
+        .await
+        .expect_err("file changed underneath");
+        assert!(matches!(err, ApiError::Conflict(_)), "{err:?}");
+        assert_eq!(
+            model_catalog::read_from_file(&state.config_path).unwrap(),
+            edited
+        );
+
+        // A file the gateway cannot load is named as the reason.
+        let mut raw = std::fs::read_to_string(&state.config_path).unwrap();
+        raw.push_str("\n[llm.base_url]\nnobody = \"https://x.example\"\n");
+        std::fs::write(&state.config_path, raw).unwrap();
+        let err = put(
+            State(state.clone()),
+            user(user_id),
+            body(&first, &["gemini:gemini-2.5-pro"]),
+        )
+        .await
+        .expect_err("broken file");
+        assert!(
+            matches!(&err, ApiError::Conflict(m) if m.contains("could not load")),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_file(&state.config_path);
+    }
+
+    #[tokio::test]
+    async fn put_rejects_an_invalid_list() {
+        let (state, user_id) = state_with(false).await;
+        let err = put(
+            State(state.clone()),
+            user(user_id),
+            body(&empty(), &["gpt-5"]),
+        )
+        .await
+        .expect_err("a model without a provider");
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+        assert!(!state.config_path.exists());
+    }
+
+    #[tokio::test]
+    async fn put_is_refused_in_multi_user_mode() {
+        let (state, user_id) = state_with(true).await;
+        let err = put(
+            State(state.clone()),
+            user(user_id),
+            body(&empty(), &["openai:gpt-5"]),
+        )
+        .await
+        .expect_err("trust_header mode must refuse");
+        assert!(matches!(err, ApiError::Forbidden(_)), "{err:?}");
+        assert!(state.models.load().models.is_empty());
+        assert!(!get(State(state), user(user_id)).await.0.editable);
+    }
+}

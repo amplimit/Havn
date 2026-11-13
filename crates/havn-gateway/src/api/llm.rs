@@ -28,13 +28,23 @@ pub async fn anthropic(
     if req.max_tokens == 0 {
         return Err(ApiError::BadRequest("max_tokens must be > 0".into()));
     }
+    let id = format!("anthropic:{}", req.model);
+    let max_output_tokens = state
+        .models
+        .load()
+        .get(&id)
+        .map(|m| m.max_output_tokens)
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "model {id:?} is not in the gateway's model list ([[llm.models]])"
+            ))
+        })?;
     // No agent here, so no agent budget; the caller's own policy still
     // decides which models they may use.
     let policy = crate::policy_resolver::for_user(&state.db, user.id).await;
-    if !llm_proxy::model_allowed(&policy.allowed_models, &req.model) {
+    if !llm_proxy::model_allowed(&policy.allowed_models, &id) {
         return Err(ApiError::Forbidden(format!(
-            "model {:?} is not allowed by your policy",
-            req.model
+            "model {id:?} is not allowed by your policy"
         )));
     }
 
@@ -47,11 +57,13 @@ pub async fn anthropic(
         ApiError::NoCredential("anthropic".into())
     })?;
 
-    let resp = llm_proxy::anthropic_complete(
+    let resp = llm_proxy::complete_with_provider(
         &state.db,
         &state.http,
         ring,
         &llm_proxy::Billing::user(user.id),
+        "anthropic",
+        max_output_tokens,
         &req,
         &state.llm,
     )

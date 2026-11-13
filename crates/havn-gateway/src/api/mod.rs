@@ -28,6 +28,7 @@ pub mod mcp;
 pub mod me;
 pub mod members;
 pub mod memory;
+pub mod models;
 pub mod roles;
 pub mod skills;
 pub mod team_credentials;

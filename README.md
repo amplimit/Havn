@@ -71,6 +71,10 @@ havn start
 # In another shell: add your LLM credential (encrypted at rest).
 # `credential add` talks to the running gateway.
 havn credential add anthropic sk-ant-...
+
+# The models agents may use, as provider:model; the first one added is the
+# default. With an OpenRouter key: havn model add openrouter:<vendor>/<model>
+havn model add anthropic:claude-sonnet-4-6
 ```
 
 For a dev box without isolation, `HAVN_SPAWNER=subprocess havn start` runs agents as plain unsandboxed processes, and the gateway cannot tell which agent a connection comes from; do not use it for anything untrusted.
@@ -164,8 +168,8 @@ havn is **infrastructure, not SaaS**. The test: does it require kernel primitive
 - Agents do not start if Landlock is not available (kernel 5.13+ with `landlock` in the `lsm=` list; `havn doctor` checks it). To run agents without filesystem restriction on such a kernel anyway, start the gateway with `HAVN_ALLOW_NO_LANDLOCK=1`
 - Agents with network egress reach the public internet only: traffic to the gateway host (including Docker-published ports), other agents, private, link-local (including cloud metadata), CGNAT and reserved addresses is dropped in `mangle PREROUTING` before any other firewall rule, and the host end of the agent link has no IPv6. The configured `agent_dns` servers stay reachable on port 53, also when they run on the gateway host; list other internal addresses agents may use under `[network] agent_private_access = ["10.0.5.20", "192.168.1.0/24"]`. If these rules cannot be installed (no `iptables`), agents get no network access at all. A `firewall-cmd --reload` or similar flush removes them; agents started afterwards get no network until the gateway restarts. A host-wide rule that redirects port 53 to a local resolver also breaks agent DNS, since the redirected destination is no longer an `agent_dns` server
 - API keys encrypted at rest with [age](https://age-encryption.org/) — agent processes never see them
-- Token caps enforced gateway-side: per credential (`max_tokens_per_day`), per user on a shared credential (`per_user.max_tokens_per_day`, `per_user.max_requests_per_minute`) and per agent across all credentials (policy `budget.max_tokens_per_day`, 1,000,000 for the seeded member role; `on_exhaust = "warn_only"` only logs, other values refuse the call). Each call reserves its worst case (estimated input plus `max_tokens`) before it is sent and is settled to the provider's reported usage afterwards, so parallel requests cannot overspend a cap; near a cap, `max_tokens` is lowered to what remains. Usage counts prompt-cache reads and writes and reasoning tokens; a response without usage keeps its reservation as the recorded usage. `max_tokens` is also clamped to the model's output limit for known Anthropic, OpenAI and Gemini models and to `[llm] max_tokens_ceiling`
-- A policy's `allowed_models` is enforced by the gateway; entries are exact model names, or `*` for any model. For agents without network egress, the gateway also refuses LLM requests that would make the provider fetch a URL (URL-sourced images and documents, provider-side tools, models with built-in web search under common names); restrict `allowed_models` to be sure an agent cannot pick a model with its own web access
+- Token caps enforced gateway-side: per credential (`max_tokens_per_day`), per user on a shared credential (`per_user.max_tokens_per_day`, `per_user.max_requests_per_minute`) and per agent across all credentials (policy `budget.max_tokens_per_day`, 1,000,000 for the seeded member role; `on_exhaust = "warn_only"` only logs, other values refuse the call). Each call reserves its worst case (estimated input plus `max_tokens`) before it is sent and is settled to the provider's reported usage afterwards, so parallel requests cannot overspend a cap; near a cap, `max_tokens` is lowered to what remains. Usage counts prompt-cache reads and writes and reasoning tokens; a response without usage keeps its reservation as the recorded usage. `max_tokens` is also clamped to the model's `max_output_tokens` in `[[llm.models]]` (or, without one, its known output limit for Anthropic, OpenAI and Gemini models) and to `[llm] max_tokens_ceiling`
+- Agents can only use the models in `[[llm.models]]`. A policy's `allowed_models` narrows that further; entries are `provider:model` ids, or `*` for any listed model. For agents without network egress, the gateway also refuses LLM requests that would make the provider fetch a URL (URL-sourced images and documents, provider-side tools, models with built-in web search under common names); restrict `allowed_models` to be sure an agent cannot pick a model with its own web access
 - WebChat WebSocket connections are checked against an Origin allowlist (`allowed_origins`) and must present the caller's `ws_token` from `GET /me`; the token identifies the user rather than being a secret, so the Origin check is what blocks cross-site connections
 - No marketplace — skills are local files; sharing via git
 
@@ -197,6 +201,23 @@ listen = "127.0.0.1:8080"
 db_path = "~/.local/share/havn/havn.db"
 ```
 
+The models agents may use are listed in `[[llm.models]]`, each as `provider:model`, where the provider is `anthropic`, `openai`, `openrouter` or `gemini` and picks the API and the credentials used; the model name is everything after the first `:`. Agents without a `model` of their own use `[llm] default_model`, or the first entry when it is unset, and follow it when it changes. A model that is not listed is refused, so with an empty list agents cannot chat. `havn model add/remove/default` and the dashboard's models page edit this list through the gateway, which writes it back to this file (other keys and comments are kept); with `trust_header` on, only the file can change it:
+
+```toml
+[llm]
+default_model = "openrouter:deepseek/deepseek-v4.1-flash-1017"   # optional
+
+[[llm.models]]
+id = "anthropic:claude-sonnet-4-6"
+label = "Sonnet 4.6"            # optional, shown in the dashboard
+
+[[llm.models]]
+id = "openrouter:deepseek/deepseek-v4.1-flash-1017"
+max_output_tokens = 32000       # optional cap on max_tokens for this model
+```
+
+On the first start after an upgrade from a gateway without the list, agent and policy model names are rewritten to `provider:model` with the provider older gateways inferred from the name, and if `config.toml` has no `[llm] models` yet, the models existing agents use are added to it (led by `anthropic:claude-opus-4-6`, the model older gateways gave agents without one, if there are such agents). A new install starts with an empty list.
+
 `max_tokens` on every LLM call is capped by `[llm] max_tokens_ceiling` (default 128000, the largest output limit of a known model; applied on `havn gateway restart`), whatever agents ask for. A running call holds a reservation of up to that many output tokens against the caps it is billed to, so with small caps on a shared credential, lower it to keep one user's large `max_tokens` from tying up everyone else's remaining budget:
 
 ```toml
@@ -211,7 +232,7 @@ To send a provider's calls to another endpoint that speaks the same API (an inte
 anthropic = "https://llm-gateway.internal.example"
 ```
 
-Config edits are picked up live: hot-reloadable fields (`allowed_origins`, `[[bindings]]`, `[[channels]]`) apply in place, while deploy-time fields (`listen`, `db_path`, paths) are logged as needing a `havn gateway restart` to apply — the gateway never restarts itself. Per-agent resource limits come from the agent's role policy, not a global config block.
+Config edits are picked up live: `allowed_origins`, `[llm] default_model` and `[[llm.models]]` apply in place, while every other change (`listen`, `db_path`, paths, `[[bindings]]`, `[[channels]]`, ...) is logged as needing a `havn gateway restart` to apply — the gateway never restarts itself. Per-agent resource limits come from the agent's role policy, not a global config block.
 
 For non-loopback exposure, configure a reverse proxy and enable trust-header mode:
 

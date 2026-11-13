@@ -4,8 +4,8 @@
 # dashboard's own server in a headless browser.
 #
 # Steps, as in the README: install.sh, `havn setup`, `havn start` as root,
-# `havn credential add anthropic ...`, and the dashboard's install, build
-# and start. CI has no LLM key, so the credential is a dummy and
+# `havn credential add anthropic ...`, `havn model add anthropic:...`, and
+# the dashboard's install, build and start. CI has no LLM key, so the credential is a dummy and
 # `[llm.base_url]` points anthropic calls at a mock provider that
 # scripts/dashboard-chat.mjs runs for the chat.
 #
@@ -59,6 +59,7 @@ for line in \
     "export HAVN_AGE_KEY=" \
     "havn start" \
     "havn credential add anthropic " \
+    "havn model add anthropic:" \
     "cd havn/apps/dashboard" \
     "npm install" \
     "npm run build" \
@@ -128,6 +129,15 @@ wait_for gateway "$GATEWAY_URL/healthz" 60 \
 log "havn credential add anthropic"
 "${AS_ROOT[@]}" havn credential add anthropic "$MOCK_KEY" >/dev/null \
     || { tail -50 "$GATEWAY_LOG" >&2; die "credential add failed"; }
+
+# README: `havn model add anthropic:...`, the model the dashboard's new
+# agent then uses as the gateway default.
+MODEL="$(awk 'index($0, "havn model add anthropic:") == 1 { print $4; exit }' README.md)"
+log "havn model add $MODEL"
+if ! "${AS_ROOT[@]}" havn model list | awk -v m="$MODEL" '$1 == m { f = 1 } END { exit !f }'; then
+    "${AS_ROOT[@]}" havn model add "$MODEL" >/dev/null \
+        || { tail -50 "$GATEWAY_LOG" >&2; die "model add failed"; }
+fi
 
 # README: `cd havn/apps/dashboard && npm install && npm run build && npm start`;
 # `npm ci` installs the same lockfile without rewriting it.

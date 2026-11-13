@@ -178,6 +178,7 @@ export function Sidebar() {
         </div>
         <SidebarLink href="/teams" pathname={pathname} label="👥 teams" />
         <SidebarLink href="/credentials" pathname={pathname} label="🔑 credentials" />
+        <SidebarLink href="/models" pathname={pathname} label="models" />
         <SidebarLink href="/" pathname={pathname} label="🤖 agents" />
       </div>
     </aside>

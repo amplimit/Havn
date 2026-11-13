@@ -56,9 +56,9 @@ pub struct LoopHandle {
     /// turn). Subagents pass `None` — they don't republish their own
     /// state and recursion is forbidden anyway.
     pub messages_mirror: Option<Arc<RwLock<Vec<Value>>>>,
-    /// Model the gateway resolved for this session (from the agent's
-    /// `config.model`, fallback to [`DEFAULT_MODEL`]). Subagents
-    /// inherit the parent's model — same agent, same compute budget.
+    /// The agent's `config.model`, or empty for the gateway's default
+    /// model. Subagents inherit the parent's model — same agent, same
+    /// compute budget.
     pub model: Arc<String>,
     pub max_tokens: u32,
     /// Billing override for cross-agent queries (spec §4.4 v0.7). When
@@ -75,9 +75,6 @@ pub struct LoopHandle {
 /// `config.max_tokens` does not set one. Sized for tool use: a `file_write`
 /// call carries the whole file in its input.
 pub const DEFAULT_MAX_TOKENS: u32 = 8192;
-
-/// Default model when the per-call options don't override.
-pub const DEFAULT_MODEL: &str = "claude-opus-4-6";
 
 /// Upper bound on waiting for the gateway's answer to one LLM request. The
 /// gateway's provider calls time out long before this (120 s per
@@ -556,7 +553,7 @@ mod tests {
     fn request(request_id: &str) -> LlmRequest {
         LlmRequest {
             request_id: request_id.into(),
-            model: DEFAULT_MODEL.into(),
+            model: String::new(),
             messages: serde_json::json!([{ "role": "user", "content": "hi" }]),
             options: serde_json::json!({}),
             billing_user_id: None,
