@@ -389,6 +389,12 @@ enum StopSignal {
 /// exits are observed without anyone polling. Signals go through the same
 /// task: it only signals a child it has not reaped yet, so a recycled pid
 /// is never hit.
+///
+/// Spawners start each agent as the leader of its own session, so the
+/// agent's process group holds the agent and the tool processes it
+/// started. Stop signals go to the whole group, and once the agent has
+/// exited whatever it left in its group is killed, so tools do not
+/// outlive their agent.
 #[derive(Debug, Clone)]
 pub(crate) struct ChildWatch {
     serial: u64,
@@ -400,6 +406,7 @@ impl ChildWatch {
     pub(crate) fn start(mut child: tokio::process::Child, handle: &AgentHandle) -> Self {
         let (exit_tx, exit) = tokio::sync::watch::channel(None);
         let (signals, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let pid = child.id();
         tokio::spawn(async move {
             let status = loop {
                 tokio::select! {
@@ -407,6 +414,13 @@ impl ChildWatch {
                     Some(signal) = requests.recv() => deliver(&mut child, signal),
                 }
             };
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                // A group number stays taken while any member is alive,
+                // so this reaches only what the agent left behind; with no
+                // members left it finds no group.
+                signal_group(pid, libc::SIGKILL);
+            }
             exit_tx.send_replace(Some(AgentExit::from(status)));
         });
         Self {
@@ -442,17 +456,39 @@ fn deliver(child: &mut tokio::process::Child, signal: StopSignal) {
         StopSignal::Terminate => {
             #[cfg(unix)]
             if let Some(pid) = child.id() {
-                // SAFETY: `pid` belongs to a child this task has not reaped,
-                // so it cannot have been reused; SIGTERM is a defined signal.
-                unsafe {
-                    let _ = libc::kill(pid.cast_signed(), libc::SIGTERM);
+                // `pid` belongs to a child this task has not reaped, so it
+                // cannot have been reused.
+                if !signal_group(pid, libc::SIGTERM) {
+                    // SAFETY: as above; SIGTERM is a defined signal.
+                    unsafe {
+                        let _ = libc::kill(pid.cast_signed(), libc::SIGTERM);
+                    }
                 }
             }
         }
         StopSignal::Kill => {
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                signal_group(pid, libc::SIGKILL);
+            }
             let _ = child.start_kill();
         }
     }
+}
+
+/// Send `signal` to the process group `pid` leads. False when there is no
+/// such group, e.g. a child that is not a group leader.
+#[cfg(unix)]
+fn signal_group(pid: u32, signal: libc::c_int) -> bool {
+    // 0 and 1 would name the caller's own group and init.
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 1 {
+        return false;
+    }
+    // SAFETY: kill with a negative pid signals that process group only.
+    unsafe { libc::kill(-pid, signal) == 0 }
 }
 
 #[async_trait]

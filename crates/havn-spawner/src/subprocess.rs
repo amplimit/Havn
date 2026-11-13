@@ -317,17 +317,20 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn an_agent_has_its_own_session_and_no_terminal_input() {
-        // The "runtime" records its session id and stdin, then waits to be
-        // stopped. Arguments: --agent-id <id> --gateway-socket <p> --workspace <w>.
+    async fn an_agent_has_its_own_session_and_its_tools_stop_with_it() {
+        // The "runtime" starts a "tool" in the background, records its
+        // session id, stdin and the tool's pid, then waits to be stopped.
+        // Arguments: --agent-id <id> --gateway-socket <p> --workspace <w>.
         let dir = std::env::temp_dir().join(format!("havn-test-session-{}", AgentId::new()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         let runtime = dir.join("runtime.sh");
         std::fs::write(
             &runtime,
             "#!/bin/sh\n\
+             sleep 300 &\n\
              cut -d' ' -f6 /proc/$$/stat > \"$6/sid.tmp\"\n\
              readlink /proc/$$/fd/0 >> \"$6/sid.tmp\"\n\
+             echo $! >> \"$6/sid.tmp\"\n\
              mv \"$6/sid.tmp\" \"$6/sid\"\n\
              exec sleep 60\n",
         )
@@ -339,10 +342,19 @@ mod tests {
         }
         let spawner = SubprocessSpawner::new();
         let cfg = config_for(AgentId::new(), runtime);
-        let handle = spawner
-            .spawn(&cfg, &Policy::default())
-            .await
-            .expect("spawn");
+        // Another test thread forking while the script was open for
+        // writing can make the exec fail with ETXTBSY for a moment.
+        let mut attempt = 0;
+        let handle = loop {
+            match spawner.spawn(&cfg, &Policy::default()).await {
+                Ok(handle) => break handle,
+                Err(SpawnerError::Spawn(m)) if m.contains("busy") && attempt < 20 => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("spawn: {e:?}"),
+            }
+        };
 
         let report = cfg.workspace_dir.join("sid");
         let mut seen = None;
@@ -362,6 +374,17 @@ mod tests {
         let sid: u32 = lines.next().expect("sid").trim().parse().expect("number");
         assert_eq!(sid, handle.pid, "the agent leads a session of its own");
         assert_eq!(lines.next(), Some("/dev/null"), "stdin");
+        let tool = lines.next().expect("tool pid").trim().to_owned();
+        let mut alive = true;
+        for _ in 0..100 {
+            alive = std::fs::read_to_string(format!("/proc/{tool}/stat"))
+                .is_ok_and(|stat| !stat.contains(") Z "));
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!alive, "the agent's tool process {tool} outlived it");
     }
 
     fn which(name: &str) -> Option<PathBuf> {

@@ -671,13 +671,19 @@ async fn main() -> anyhow::Result<()> {
 
     let addr: SocketAddr = cfg.listen.parse().context("parsing listen address")?;
     let listener = TcpListener::bind(addr).await.context("binding listener")?;
-    axum::serve(
+    let signals = count_stop_signals();
+    let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .context("serving HTTP")?;
+    .with_graceful_shutdown(stop_signals(signals.clone(), 1));
+    // A second signal stops waiting for open HTTP requests as well.
+    tokio::select! {
+        served = std::future::IntoFuture::into_future(serve) => served.context("serving HTTP")?,
+        () = stop_signals(signals.clone(), 2) => {
+            warn!("signalled again; not waiting for open HTTP requests");
+        }
+    }
 
     // No new ticks, and no liveness verdicts on agents that are leaving.
     for task in [liveness_task, heartbeat_task, cron_task] {
@@ -685,8 +691,13 @@ async fn main() -> anyhow::Result<()> {
         let _ = task.await;
     }
     // The agent socket stays up while agents finish their turns. A second
-    // Ctrl-C or SIGTERM stops waiting for them.
-    supervisor::drain(&shutdown_state, supervisor::DRAIN_LIMIT, shutdown_signal()).await;
+    // stop signal stops waiting for them.
+    supervisor::drain(
+        &shutdown_state,
+        supervisor::DRAIN_LIMIT,
+        stop_signals(signals, 2),
+    )
+    .await;
     supervisor::shut_down(&shutdown_state).await;
     socket_task.abort();
     let _ = socket_task.await;
@@ -1228,28 +1239,47 @@ mod tests {
     }
 }
 
+/// Count the stop signals the gateway receives: Ctrl-C, SIGTERM, and
+/// SIGHUP (the terminal running `havn start` closed). The handlers are
+/// installed once, here, so a signal that arrives while shutdown is busy
+/// elsewhere is still counted.
 #[allow(
     clippy::expect_used,
     reason = "startup-only signal handler installation"
 )]
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c().await.expect("install ctrl-c handler");
-    };
-
+fn count_stop_signals() -> tokio::sync::watch::Receiver<u32> {
+    let (count, signals) = tokio::sync::watch::channel(0_u32);
     #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
+    {
+        use signal::unix::{SignalKind, signal as listen};
+        let mut interrupt = listen(SignalKind::interrupt()).expect("install SIGINT handler");
+        let mut terminate = listen(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut hangup = listen(SignalKind::hangup()).expect("install SIGHUP handler");
+        tokio::spawn(async move {
+            loop {
+                let name = tokio::select! {
+                    _ = interrupt.recv() => "ctrl-c",
+                    _ = terminate.recv() => "SIGTERM",
+                    _ = hangup.recv() => "SIGHUP",
+                };
+                count.send_modify(|n| *n += 1);
+                info!(signal = name, "received {name}, shutting down");
+            }
+        });
+    }
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    tokio::spawn(async move {
+        while signal::ctrl_c().await.is_ok() {
+            count.send_modify(|n| *n += 1);
+            info!("received ctrl-c, shutting down");
+        }
+    });
+    signals
+}
 
-    tokio::select! {
-        () = ctrl_c => info!("received ctrl-c, shutting down"),
-        () = terminate => info!("received SIGTERM, shutting down"),
+/// Resolves once the gateway has received `n` stop signals.
+async fn stop_signals(mut signals: tokio::sync::watch::Receiver<u32>, n: u32) {
+    if signals.wait_for(|count| *count >= n).await.is_err() {
+        std::future::pending::<()>().await;
     }
 }

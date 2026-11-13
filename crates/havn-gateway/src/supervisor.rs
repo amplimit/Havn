@@ -518,7 +518,15 @@ pub(crate) async fn drain(
         tokio::select! {
             () = tokio::time::sleep(DRAIN_POLL) => {}
             () = &mut cut_short => {
-                warn!(agents = busy.len(), "signalled again; not waiting for the agents");
+                warn!("signalled again; not waiting for the agents");
+                // Agents that left since the last poll finished their work.
+                let mut still = Vec::with_capacity(busy.len());
+                for id in busy {
+                    if state.registry.is_connected(id).await {
+                        still.push(id);
+                    }
+                }
+                busy = still;
                 break;
             }
         }
