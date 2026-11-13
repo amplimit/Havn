@@ -156,6 +156,9 @@ fn apply(plan: &Plan) -> anyhow::Result<()> {
     println!(
         "  havn credential add anthropic <KEY>  # add an LLM provider key (after gateway is up)"
     );
+    println!(
+        "  havn model add anthropic:claude-sonnet-4-6  # a model agents may use (provider:model)"
+    );
     println!("  havn agent create my-agent        # create your first agent");
     Ok(())
 }

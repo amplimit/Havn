@@ -218,7 +218,7 @@ id = "openrouter:deepseek/deepseek-v4.1-flash-1017"
 max_output_tokens = 32000       # optional cap on max_tokens for this model
 ```
 
-On the first start after an upgrade from a gateway without the list, agent and policy model names are rewritten to `provider:model` with the provider older gateways inferred from the name, and if `config.toml` has no `[llm] models` yet, the models existing agents use are added to it (led by `anthropic:claude-opus-4-6`, the model older gateways gave agents without one, if there are such agents). A new install starts with an empty list.
+On the first start after an upgrade from a gateway without the list, agent and policy model names are rewritten to `provider:model` with the provider older gateways inferred from the name, and if `config.toml` has no `[llm] models` yet, the models existing agents use are added to it (led by `anthropic:claude-opus-4-6`, the model older gateways gave agents without one, if there are such agents). A new install, or an upgraded one without agents, starts with an empty list: add a model with `havn model add` before the first chat.
 
 `max_tokens` on every LLM call is capped by `[llm] max_tokens_ceiling` (default 128000, the largest output limit of a known model; applied on `havn gateway restart`), whatever agents ask for. A running call holds a reservation of up to that many output tokens against the caps it is billed to, so with small caps on a shared credential, lower it to keep one user's large `max_tokens` from tying up everyone else's remaining budget:
 
