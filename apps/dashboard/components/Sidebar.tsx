@@ -240,15 +240,17 @@ function VersionLine({ gateway }: { gateway: string | null }) {
         dashboard {DASHBOARD_VERSION}
         {gateway !== null && <> · gateway {gateway}</>}
       </p>
-      {mismatch && (
-        <p role="status" className="mt-1 flex items-start gap-1" style={{ color: WARNING_TEXT }}>
-          <TriangleAlert size={12} className="mt-px shrink-0" aria-hidden="true" />
-          <span>
-            Different releases: build the dashboard from the tag that matches{" "}
-            <code className="font-mono">havn --version</code>.
-          </span>
-        </p>
-      )}
+      <div role="status">
+        {mismatch && (
+          <p className="mt-1 flex items-start gap-1" style={{ color: WARNING_TEXT }}>
+            <TriangleAlert size={12} className="mt-px shrink-0" aria-hidden="true" />
+            <span>
+              Different releases: build the dashboard from the tag that matches{" "}
+              <code className="font-mono">havn --version</code>.
+            </span>
+          </p>
+        )}
+      </div>
     </div>
   );
 }

@@ -242,7 +242,8 @@ const ERROR_KINDS = /^(bad request|forbidden|conflict): /i;
 const MAX_ERROR_LENGTH = 300;
 
 function statusMessage(status: number): string {
-  if (status === 401 || status === 403) return "you are not allowed to do this";
+  if (status === 401) return "you are not signed in; reload the page to sign in again";
+  if (status === 403) return "you are not allowed to do this";
   if (status === 502 || status === 503 || status === 504) return "the gateway is not reachable";
   return `request failed (${status})`;
 }
@@ -277,8 +278,9 @@ export class ApiError extends Error {
     public status: number,
     public body: string,
     contentType = "",
+    message?: string,
   ) {
-    super(readableError(status, body, contentType));
+    super(message ?? readableError(status, body, contentType));
   }
 }
 
@@ -307,11 +309,13 @@ async function request<T>(
   // 204 No Content has no body.
   if (res.status === 204) return undefined as T;
   // A sign-in page from an SSO proxy whose session expired arrives as 200.
-  if (!(res.headers.get("content-type") ?? "").includes("json")) {
+  const type = res.headers.get("content-type") ?? "";
+  if (!type.includes("json")) {
     throw new ApiError(
       res.status,
-      "{\"error\":\"the response was not from the gateway; your sign-in may have expired, reload the page\"}",
-      "application/json",
+      await res.text(),
+      type,
+      "the response was not from the gateway; your sign-in may have expired, reload the page",
     );
   }
   return (await res.json()) as T;
@@ -585,3 +589,37 @@ export const api = {
     },
   },
 };
+
+/** The LLM provider a credential is for, or null for channel and SaaS
+ * tokens. Credentials are stored as `llm:<provider>` or a bare name. */
+export function llmProvider(credentialProvider: string): string | null {
+  if (credentialProvider.startsWith("llm:")) return credentialProvider.slice(4);
+  return credentialProvider.includes(":") ? null : credentialProvider;
+}
+
+/** The provider half of a `provider:model` id. */
+export function modelProvider(id: string | null | undefined): string | null {
+  const provider = id?.split(":")[0];
+  return provider ? provider : null;
+}
+
+/** LLM providers whose keys an agent can use: its owner's own enabled
+ * credentials, plus those of the agent's team, or of every team the owner
+ * belongs to for an agent without a team (as the gateway resolves them).
+ * Team lists a member cannot read count as empty. */
+export async function reachableProviders(
+  teams: TeamView[],
+  teamId: string | null,
+): Promise<Set<string>> {
+  const scopes = teamId ? [teamId] : teams.map((t) => t.id);
+  const [own, ...shared] = await Promise.all([
+    api.credentials.list(),
+    ...scopes.map((id) => api.teams.credentials.list(id).catch(() => [] as CredentialView[])),
+  ]);
+  const providers = new Set<string>();
+  for (const c of [...own, ...shared.flat()]) {
+    const provider = llmProvider(c.provider);
+    if (c.enabled && provider) providers.add(provider);
+  }
+  return providers;
+}

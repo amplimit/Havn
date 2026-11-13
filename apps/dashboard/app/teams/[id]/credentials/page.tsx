@@ -133,7 +133,7 @@ export default function TeamCredentialsPage({
           color: "var(--color-stripe-purple)",
           border: "1px solid rgba(83, 58, 253, 0.18)",
         }}
-        title="Stored as age-encrypted ciphertext (spec §13). The gateway needs HAVN_AGE_KEY in its environment to decrypt at use time."
+        title="Stored as age-encrypted ciphertext. The gateway needs HAVN_AGE_KEY in its environment to decrypt at use time."
       >
         <Lock size={14} className="shrink-0" aria-hidden="true" />
         keys are encrypted at rest with age (HAVN_AGE_KEY)

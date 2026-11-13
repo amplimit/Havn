@@ -79,7 +79,7 @@ export default function SkillsPage({
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
         setPinError(
-          "Start the agent before changing pins — skills_index is single-writer (spec §5.2).",
+          "Start the agent before changing pins — skills_index is single-writer.",
         );
       } else {
         setPinError(e instanceof Error ? e.message : String(e));

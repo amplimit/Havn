@@ -753,7 +753,7 @@ function MemoryPill({ embedding }: { embedding: EmbeddingStatus | null }) {
   const LabelIcon = hybrid ? Layers : Search;
   const tip = hybrid
     ? `Hybrid retrieval (memory + skills): vector (${provider}) + BM25 keyword. Semantic-near queries work even with no shared words.`
-    : "FTS5 keyword-only (memory + skills). Set [embedding] in config.toml to enable hybrid retrieval (spec §9.4 / §13).";
+    : "FTS5 keyword-only (memory + skills). Set [embedding] in config.toml to enable hybrid retrieval.";
   return (
     <span
       className="pill pill-stopped"
