@@ -464,8 +464,13 @@ const CUT_OFF_NOTICE: &str = "The gateway restarted before the agent finished. S
 /// connected agent to finish what it is doing and exit, and wait up to
 /// `limit` for them. The agent socket and LLM proxy must keep running
 /// meanwhile. Agents still busy at the end are left to [`shut_down`];
-/// their open chats are told the reply was cut off.
-pub(crate) async fn drain(state: &AppState, limit: Duration) {
+/// their open chats are told the reply was cut off. When `cut_short`
+/// completes first (the operator signalled again), the wait ends there.
+pub(crate) async fn drain(
+    state: &AppState,
+    limit: Duration,
+    cut_short: impl std::future::Future<Output = ()>,
+) {
     state.supervisor.shutting_down.store(true, Ordering::SeqCst);
     state.registry.start_draining();
     let connected: Vec<AgentId> = state
@@ -489,6 +494,7 @@ pub(crate) async fn drain(state: &AppState, limit: Duration) {
     // offered again on every poll until the agent takes it or the limit.
     let mut unasked = connected.clone();
     let mut busy = connected;
+    let mut cut_short = std::pin::pin!(cut_short);
     loop {
         let mut refused = Vec::new();
         for id in unasked {
@@ -509,16 +515,19 @@ pub(crate) async fn drain(state: &AppState, limit: Duration) {
         if busy.is_empty() || tokio::time::Instant::now() >= deadline {
             break;
         }
-        tokio::time::sleep(DRAIN_POLL).await;
+        tokio::select! {
+            () = tokio::time::sleep(DRAIN_POLL) => {}
+            () = &mut cut_short => {
+                warn!(agents = busy.len(), "signalled again; not waiting for the agents");
+                break;
+            }
+        }
     }
     if busy.is_empty() {
         info!("agents finished their work");
         return;
     }
-    warn!(
-        agents = busy.len(),
-        "agents still busy after the drain limit; stopping them"
-    );
+    warn!(agents = busy.len(), "agents still busy; stopping them");
     for id in busy {
         state.webchat_router.notice(id, CUT_OFF_NOTICE).await;
     }
@@ -1266,7 +1275,9 @@ mod tests {
 
         let drain = {
             let state = state.clone();
-            tokio::spawn(async move { drain(&state, Duration::from_secs(30)).await })
+            tokio::spawn(async move {
+                drain(&state, Duration::from_secs(30), std::future::pending()).await
+            })
         };
         let mut seen = Vec::new();
         eventually("asked to drain", || {
@@ -1318,7 +1329,7 @@ mod tests {
             .register(uuid::Uuid::now_v7(), id, tab_tx)
             .await;
 
-        drain(&state, Duration::from_millis(100)).await;
+        drain(&state, Duration::from_millis(100), std::future::pending()).await;
 
         match tab.try_recv() {
             Ok(crate::webchat::ServerMessage::Error { message }) => {
@@ -1327,6 +1338,43 @@ mod tests {
             other => panic!("expected a notice, got {other:?}"),
         }
         assert!(state.registry.is_connected(id).await, "left to shut_down");
+        shut_down(&state).await;
+        assert!(spawner.procs.lock().unwrap().is_empty(), "stopped");
+    }
+
+    #[tokio::test]
+    async fn a_second_signal_ends_the_drain_early() {
+        let (state, spawner, user) = fixture(quick_policy(), true, false).await;
+        let id = running_agent(&state, user).await;
+        eventually("connected", || async {
+            state.registry.is_connected(id).await
+        })
+        .await;
+        let (tab_tx, mut tab) = mpsc::channel(8);
+        let _registration = state
+            .webchat_router
+            .register(uuid::Uuid::now_v7(), id, tab_tx)
+            .await;
+
+        let started = tokio::time::Instant::now();
+        drain(
+            &state,
+            Duration::from_secs(30),
+            tokio::time::sleep(Duration::from_millis(200)),
+        )
+        .await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited {:?}",
+            started.elapsed()
+        );
+        match tab.try_recv() {
+            Ok(crate::webchat::ServerMessage::Error { message }) => {
+                assert!(message.contains("restarted"), "{message}");
+            }
+            other => panic!("expected a notice, got {other:?}"),
+        }
         shut_down(&state).await;
         assert!(spawner.procs.lock().unwrap().is_empty(), "stopped");
     }

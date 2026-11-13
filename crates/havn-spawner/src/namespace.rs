@@ -311,6 +311,8 @@ impl AgentSpawner for NamespaceSpawner {
             )
         })?;
         let mut cmd = Command::new(init_binary);
+        // The agent never reads the terminal the gateway runs in.
+        cmd.stdin(std::process::Stdio::null());
         cmd.env_clear()
             .envs(crate::agent_environment(&config.env_passthrough, |name| {
                 std::env::var_os(name)
@@ -444,6 +446,7 @@ impl AgentSpawner for NamespaceSpawner {
         )]
         unsafe {
             cmd.as_std_mut().pre_exec(move || {
+                ns_setup::leave_terminal_session()?;
                 ns_setup::join_cgroup(&cgroup_procs)?;
                 ns_setup::unshare_namespaces()?;
                 ns_setup::write_user_namespace_maps(host_uid, host_gid)?;

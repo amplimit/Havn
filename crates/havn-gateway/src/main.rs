@@ -684,8 +684,9 @@ async fn main() -> anyhow::Result<()> {
         task.abort();
         let _ = task.await;
     }
-    // The agent socket stays up while agents finish their turns.
-    supervisor::drain(&shutdown_state, supervisor::DRAIN_LIMIT).await;
+    // The agent socket stays up while agents finish their turns. A second
+    // Ctrl-C or SIGTERM stops waiting for them.
+    supervisor::drain(&shutdown_state, supervisor::DRAIN_LIMIT, shutdown_signal()).await;
     supervisor::shut_down(&shutdown_state).await;
     socket_task.abort();
     let _ = socket_task.await;
