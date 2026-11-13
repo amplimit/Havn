@@ -20,9 +20,8 @@ nor was anything under
 
 - **Several gateways directly on the host** is not supported. All gateways use
   the same cgroup root `/sys/fs/cgroup/havn` and the same `HAVN-AGENT-EGRESS`
-  firewall chain, and a starting gateway removes agent cgroups it does not
-  track, which kills the other gateway's agents
-  ([#80](https://github.com/amplimit/havn/issues/80)).
+  firewall chain, so a second gateway that isolates agents refuses to start
+  while another one runs on the host.
 - **Docker** does not let Havn create its agent sandboxes inside an ordinary
   container. `--privileged` makes it work, but it hands the container the
   host's devices and all kernel capabilities, so escaping one tenant's agent

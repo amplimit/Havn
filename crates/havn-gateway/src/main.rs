@@ -267,6 +267,11 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("creating workspace root {}", cfg.workspace_root.display()))?;
 
+    // Taken before anything touches the database, the agent socket, agent
+    // cgroups or the egress chain: a second gateway stops here instead of
+    // killing the first one's agents and taking over its socket (#80).
+    let _instance_locks = instance_locks(&cfg.db_path)?;
+
     let db = havn_db::connect(&cfg.db_path)
         .await
         .with_context(|| format!("opening database at {}", cfg.db_path.display()))?;
@@ -688,6 +693,82 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Where an isolated gateway marks that it owns this host's agent cgroup
+/// root and egress chain.
+const HOST_LOCK: &str = "/run/havn-gateway.lock";
+
+/// One lock per database, and, when agents run isolated, one per host: two
+/// gateways on the same data would fight over its agent socket and agents,
+/// and two isolated ones over `/sys/fs/cgroup/havn` and `HAVN-AGENT-EGRESS`
+/// whatever their config.
+fn instance_locks(db_path: &std::path::Path) -> anyhow::Result<Vec<std::fs::File>> {
+    let mut locks = vec![instance_lock(
+        &data_lock_path(db_path),
+        &format!("the database {}", db_path.display()),
+    )?];
+    let isolated = cfg!(target_os = "linux")
+        && !matches!(std::env::var("HAVN_SPAWNER").as_deref(), Ok("subprocess"));
+    if isolated {
+        match instance_lock(
+            std::path::Path::new(HOST_LOCK),
+            "agent isolation on this host (/sys/fs/cgroup/havn, HAVN-AGENT-EGRESS)",
+        ) {
+            Ok(lock) => locks.push(lock),
+            // Only root can write /run, and only root can isolate agents;
+            // the spawner refuses an unprivileged start on its own.
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(locks)
+}
+
+fn data_lock_path(db_path: &std::path::Path) -> PathBuf {
+    let mut name = db_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    db_path.with_file_name(name)
+}
+
+/// Lock `path` for as long as the returned file is open, recording this
+/// process's pid in it, or fail naming the pid that holds it.
+fn instance_lock(path: &std::path::Path, what: &str) -> anyhow::Result<std::fs::File> {
+    use std::io::{Read as _, Seek as _, Write as _};
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("opening {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let mut holder = String::new();
+            let _ = file.read_to_string(&mut holder);
+            let holder = match holder.trim() {
+                "" => "unknown pid".to_string(),
+                pid => format!("pid {pid}"),
+            };
+            anyhow::bail!(
+                "another havn gateway ({holder}) is already running for {what}; stop it first \
+                 (`systemctl stop havn` or `havn gateway stop`). Lock: {}",
+                path.display()
+            );
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            return Err(e).with_context(|| format!("locking {}", path.display()));
+        }
+    }
+    file.set_len(0)?;
+    file.rewind()?;
+    writeln!(file, "{}", std::process::id())?;
+    Ok(file)
+}
+
 /// Pick the agent spawner: [`havn_spawner::namespace::NamespaceSpawner`]
 /// (namespaces + Landlock + seccomp + cgroup v2) on Linux. If it cannot
 /// initialise, startup fails instead of silently running agents without
@@ -977,6 +1058,23 @@ async fn healthz(State(state): State<AppState>) -> Response {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_second_gateway_on_the_same_lock_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = data_lock_path(&dir.path().join("havn.db"));
+        assert_eq!(path, dir.path().join("havn.db.lock"));
+        let first = instance_lock(&path, "the database x").expect("first");
+        let err = instance_lock(&path, "the database x")
+            .expect_err("second")
+            .to_string();
+        assert!(
+            err.contains(&format!("pid {}", std::process::id())) && err.contains("database x"),
+            "{err}"
+        );
+        drop(first);
+        drop(instance_lock(&path, "the database x").expect("free again"));
+    }
 
     #[test]
     fn loopback_addresses_pass() {
