@@ -71,18 +71,25 @@ pub async fn put(
     let applied = tokio::task::spawn_blocking(move || {
         // The file is compared, not the running list: a hand edit the
         // watcher has not applied yet must not be overwritten either.
-        if model_catalog::read_from_file(&path)?.version() != expected {
-            return Ok(false);
+        if model_catalog::write_if_unchanged(&path, &expected, &written)? {
+            return Ok(None);
         }
-        model_catalog::write_to_file(&path, &written).map(|()| true)
+        // Retrying only helps if the gateway can load what is there now.
+        Ok::<_, anyhow::Error>(Some(match crate::config::GatewayConfig::load_from(&path) {
+            Ok(_) => {
+                "the model list changed since it was read; load it again and retry".to_string()
+            }
+            Err(e) => format!(
+                "config.toml has changes the gateway could not load ({e:#}); fix the file, \
+                 then retry"
+            ),
+        }))
     })
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?
     .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
-    if !applied {
-        return Err(ApiError::Conflict(
-            "the model list changed since it was read; load it again and retry".into(),
-        ));
+    if let Some(conflict) = applied {
+        return Err(ApiError::Conflict(conflict));
     }
     let ids: Vec<String> = catalog.models.iter().map(|m| m.id.clone()).collect();
     let default_model = catalog.default_model.clone();
@@ -197,6 +204,22 @@ mod tests {
         assert_eq!(
             model_catalog::read_from_file(&state.config_path).unwrap(),
             edited
+        );
+
+        // A file the gateway cannot load is named as the reason.
+        let mut raw = std::fs::read_to_string(&state.config_path).unwrap();
+        raw.push_str("\n[llm.base_url]\nnobody = \"https://x.example\"\n");
+        std::fs::write(&state.config_path, raw).unwrap();
+        let err = put(
+            State(state.clone()),
+            user(user_id),
+            body(&first, &["gemini:gemini-2.5-pro"]),
+        )
+        .await
+        .expect_err("broken file");
+        assert!(
+            matches!(&err, ApiError::Conflict(m) if m.contains("could not load")),
+            "{err:?}"
         );
         let _ = std::fs::remove_file(&state.config_path);
     }

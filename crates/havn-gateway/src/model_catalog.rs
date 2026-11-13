@@ -138,6 +138,7 @@ struct FileConfig {
 }
 
 // The list as the config file at `path` has it now; empty for a missing file.
+#[cfg(test)]
 pub fn read_from_file(path: &Path) -> anyhow::Result<ModelCatalog> {
     use anyhow::Context as _;
     let raw = match std::fs::read_to_string(path) {
@@ -145,8 +146,11 @@ pub fn read_from_file(path: &Path) -> anyhow::Result<ModelCatalog> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ModelCatalog::default()),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let file: FileConfig =
-        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    parse_catalog(&raw).with_context(|| format!("parsing {}", path.display()))
+}
+
+fn parse_catalog(raw: &str) -> anyhow::Result<ModelCatalog> {
+    let file: FileConfig = toml::from_str(raw)?;
     Ok(ModelCatalog {
         default_model: file.llm.default_model,
         models: file.llm.models,
@@ -184,6 +188,24 @@ fn entry_table(value: toml_edit::Value) -> anyhow::Result<Table> {
 // after the other `[llm]` tables, or before the first table when there are
 // none. A missing file is created.
 pub fn write_to_file(path: &Path, catalog: &ModelCatalog) -> anyhow::Result<()> {
+    write_checked(path, catalog, None).map(|_| ())
+}
+
+// Like `write_to_file`, but only if the file's list still has `version`;
+// false when it does not. The check uses the same read as the write.
+pub fn write_if_unchanged(
+    path: &Path,
+    version: &str,
+    catalog: &ModelCatalog,
+) -> anyhow::Result<bool> {
+    write_checked(path, catalog, Some(version))
+}
+
+fn write_checked(
+    path: &Path,
+    catalog: &ModelCatalog,
+    expected: Option<&str>,
+) -> anyhow::Result<bool> {
     use anyhow::Context as _;
 
     catalog.validate()?;
@@ -197,6 +219,13 @@ pub fn write_to_file(path: &Path, catalog: &ModelCatalog) -> anyhow::Result<()> 
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("reading {}", target.display())),
     };
+    if let Some(expected) = expected {
+        let current =
+            parse_catalog(&raw).with_context(|| format!("parsing {}", target.display()))?;
+        if current.version() != expected {
+            return Ok(false);
+        }
+    }
     let mut doc: DocumentMut = raw
         .parse()
         .with_context(|| format!("parsing {}", target.display()))?;
@@ -301,7 +330,8 @@ pub fn write_to_file(path: &Path, catalog: &ModelCatalog) -> anyhow::Result<()> 
         llm.insert("models", Item::ArrayOfTables(models));
     }
 
-    replace_file(&target, doc.to_string().as_bytes())
+    replace_file(&target, doc.to_string().as_bytes())?;
+    Ok(true)
 }
 
 // Write a sibling file, flush it, give it the original's owner and mode,
@@ -338,6 +368,14 @@ fn replace_file(target: &Path, contents: &[u8]) -> anyhow::Result<()> {
             #[cfg(unix)]
             let _ = std::os::unix::fs::chown(&tmp, Some(meta.uid()), Some(meta.gid()));
             std::fs::set_permissions(&tmp, meta.permissions())?;
+        } else {
+            // A new file gets the usual config mode, readable by the CLI
+            // run as another user.
+            #[cfg(unix)]
+            std::fs::set_permissions(
+                &tmp,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+            )?;
         }
         std::fs::rename(&tmp, target)
     })();
@@ -924,6 +962,68 @@ mod tests {
         let again = upgrade(&db, &path, c.clone()).await.unwrap();
         assert_eq!(again, c);
         assert_eq!(stored(&db).await, rows);
+    }
+
+    // Migration 0010 again on the current rows, as on an older database.
+    async fn marks(db: &SqlitePool) -> bool {
+        sqlx::query("DROP TABLE model_names_upgrade")
+            .execute(db)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../havn-db/migrations/0010_model_names_upgrade.sql"
+        ))
+        .execute(db)
+        .await
+        .unwrap();
+        marked(db).await
+    }
+
+    #[tokio::test]
+    async fn the_migration_marks_databases_with_agents_or_custom_roles() {
+        let db = db().await;
+        assert!(!marks(&db).await, "seeded roles alone need no upgrade");
+        sqlx::query("INSERT INTO roles (id, team_id, name, policy) VALUES (?, NULL, ?, ?)")
+            .bind(uuid::Uuid::now_v7().to_string())
+            .bind("legacy")
+            .bind(r#"{ "allowed_models" : [ "claude-sonnet-4-6" ] }"#)
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(marks(&db).await, "a role naming models");
+        sqlx::query("DELETE FROM roles WHERE name = 'legacy'")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(!marks(&db).await);
+        insert_agent(&db, "a", serde_json::json!({})).await;
+        assert!(marks(&db).await, "an agent");
+    }
+
+    #[test]
+    fn a_conditional_write_needs_the_files_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let first = catalog(&["openai:gpt-5"], None);
+        assert!(write_if_unchanged(&path, &ModelCatalog::default().version(), &first).unwrap());
+        let other = catalog(&["gemini:gemini-2.5-pro"], None);
+        assert!(!write_if_unchanged(&path, &ModelCatalog::default().version(), &other).unwrap());
+        assert_eq!(read_from_file(&path).unwrap(), first);
+        assert!(write_if_unchanged(&path, &first.version(), &other).unwrap());
+        assert_eq!(read_from_file(&path).unwrap(), other);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_created_file_is_readable_by_others() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_to_file(&path, &catalog(&["openai:gpt-5"], None)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
     }
 
     #[tokio::test]
