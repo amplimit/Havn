@@ -9,6 +9,7 @@ export default function HomePage() {
   const [agents, setAgents] = useState<AgentView[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [checklistShown, setChecklistShown] = useState(false);
 
   async function reload() {
     try {
@@ -70,7 +71,7 @@ export default function HomePage() {
         </div>
       )}
 
-      <SetupChecklist agentCount={agents?.length ?? null} />
+      <SetupChecklist agentCount={agents?.length ?? null} onVisibleChange={setChecklistShown} />
 
       {agents === null && !error && (
         <div className="card px-4 py-6 text-sm" style={{ color: "var(--color-body)" }}>
@@ -78,7 +79,7 @@ export default function HomePage() {
         </div>
       )}
 
-      {agents?.length === 0 && (
+      {agents?.length === 0 && !checklistShown && (
         <div className="card px-5 py-10 text-center" style={{ color: "var(--color-body)" }}>
           no agents yet
         </div>

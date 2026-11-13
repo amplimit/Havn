@@ -78,7 +78,8 @@ export default function CredentialsPage() {
           <Link href="/teams" className="underline" style={{ color: "var(--color-stripe-purple)" }}>
             teams
           </Link>
-          ; every member&apos;s agents can then use it.
+          ; then every member&apos;s personal agents, and the team&apos;s agents,
+          can use it.
         </p>
         <div
           className="mt-3 inline-flex items-center gap-2 rounded px-3 py-1.5 text-sm"

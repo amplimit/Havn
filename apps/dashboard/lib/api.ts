@@ -590,36 +590,56 @@ export const api = {
   },
 };
 
-/** The LLM provider a credential is for, or null for channel and SaaS
- * tokens. Credentials are stored as `llm:<provider>` or a bare name. */
+export const LLM_PROVIDERS = ["anthropic", "openai", "openrouter", "gemini"];
+
+// Credentials are stored as `llm:<provider>` or a bare name; channel and
+// SaaS tokens are not LLM keys.
 export function llmProvider(credentialProvider: string): string | null {
-  if (credentialProvider.startsWith("llm:")) return credentialProvider.slice(4);
-  return credentialProvider.includes(":") ? null : credentialProvider;
+  const name = credentialProvider.startsWith("llm:")
+    ? credentialProvider.slice(4)
+    : credentialProvider;
+  return LLM_PROVIDERS.includes(name) ? name : null;
 }
 
-/** The provider half of a `provider:model` id. */
 export function modelProvider(id: string | null | undefined): string | null {
   const provider = id?.split(":")[0];
   return provider ? provider : null;
 }
 
-/** LLM providers whose keys an agent can use: its owner's own enabled
- * credentials, plus those of the agent's team, or of every team the owner
- * belongs to for an agent without a team (as the gateway resolves them).
- * Team lists a member cannot read count as empty. */
-export async function reachableProviders(
-  teams: TeamView[],
-  teamId: string | null,
-): Promise<Set<string>> {
-  const scopes = teamId ? [teamId] : teams.map((t) => t.id);
+export type KeyScopes = { own: Set<string>; teams: Map<string, Set<string>> };
+
+function enabledProviders(creds: CredentialView[]): Set<string> {
+  const out = new Set<string>();
+  for (const c of creds) {
+    const provider = llmProvider(c.provider);
+    if (c.enabled && provider) out.add(provider);
+  }
+  return out;
+}
+
+// Rejects when a list cannot be read, so callers show no coverage rather
+// than a false gap; only a team the user has just left (403) counts as empty.
+export async function keyScopes(teams: TeamView[]): Promise<KeyScopes> {
   const [own, ...shared] = await Promise.all([
     api.credentials.list(),
-    ...scopes.map((id) => api.teams.credentials.list(id).catch(() => [] as CredentialView[])),
+    ...teams.map((t) =>
+      api.teams.credentials.list(t.id).catch((e: unknown) => {
+        if (e instanceof ApiError && e.status === 403) return [] as CredentialView[];
+        throw e;
+      }),
+    ),
   ]);
-  const providers = new Set<string>();
-  for (const c of [...own, ...shared.flat()]) {
-    const provider = llmProvider(c.provider);
-    if (c.enabled && provider) providers.add(provider);
-  }
-  return providers;
+  return {
+    own: enabledProviders(own),
+    teams: new Map(teams.map((t, i) => [t.id, enabledProviders(shared[i])])),
+  };
+}
+
+// As the gateway resolves keys: the owner's own, plus the agent's team, or
+// every team the owner is in for an agent without a team.
+export function reachable(scopes: KeyScopes, teamId: string | null): Set<string> {
+  const out = new Set(scopes.own);
+  const teams = teamId ? [scopes.teams.get(teamId)] : [...scopes.teams.values()];
+  for (const set of teams) for (const p of set ?? []) out.add(p);
+  return out;
 }

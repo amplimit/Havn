@@ -3,26 +3,29 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { Circle, CircleCheck, TriangleAlert } from "lucide-react";
-import { api, modelProvider, reachableProviders, type ModelsView } from "@/lib/api";
+import { api, keyScopes, modelProvider, reachable, type ModelsView } from "@/lib/api";
 
 type Setup = {
   providers: Set<string>;
   models: ModelsView;
 };
 
-/**
- * First-run steps on the home page: a key, a model, an agent. Hidden once
- * all three are done and the default model has a key; nothing to dismiss.
- */
-export function SetupChecklist({ agentCount }: { agentCount: number | null }) {
+// First-run steps; gone once there is a key, a model and an agent.
+export function SetupChecklist({
+  agentCount,
+  onVisibleChange,
+}: {
+  agentCount: number | null;
+  onVisibleChange?: (visible: boolean) => void;
+}) {
   const [setup, setSetup] = useState<Setup | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     Promise.all([api.teams.list(), api.models.get()])
       .then(async ([teams, models]) => {
-        const providers = await reachableProviders(teams, null);
-        if (!cancelled) setSetup({ providers, models });
+        const scopes = await keyScopes(teams);
+        if (!cancelled) setSetup({ providers: reachable(scopes, null), models });
       })
       .catch(() => {
         // Without the data there is nothing reliable to show.
@@ -32,14 +35,20 @@ export function SetupChecklist({ agentCount }: { agentCount: number | null }) {
     };
   }, []);
 
-  if (!setup || agentCount === null) return null;
-  const { providers, models } = setup;
-  const hasKey = providers.size > 0;
-  const hasModel = models.models.length > 0;
-  const hasAgent = agentCount > 0;
-  const defaultProvider = modelProvider(models.effective_default);
-  const defaultUncovered = hasModel && defaultProvider !== null && !providers.has(defaultProvider);
-  if (hasKey && hasModel && hasAgent && !defaultUncovered) return null;
+  const providers = setup?.providers;
+  const models = setup?.models;
+  const anyKey = (providers?.size ?? 0) > 0;
+  const hasModel = (models?.models.length ?? 0) > 0;
+  const hasAgent = (agentCount ?? 0) > 0;
+  const defaultProvider = modelProvider(models?.effective_default);
+  const keyDone = hasModel && defaultProvider ? providers?.has(defaultProvider) === true : anyKey;
+  const visible = setup !== null && agentCount !== null && !(anyKey && hasModel && hasAgent);
+
+  useEffect(() => {
+    onVisibleChange?.(visible);
+  }, [visible, onVisibleChange]);
+
+  if (!visible || !models) return null;
 
   return (
     <section aria-labelledby="setup-title" className="card-elevated mb-8 p-6">
@@ -49,14 +58,27 @@ export function SetupChecklist({ agentCount }: { agentCount: number | null }) {
       <p className="mb-5 text-sm" style={{ color: "var(--color-body)" }}>
         Three steps before the first chat. Done steps are checked.
       </p>
-      <ol className="grid gap-4">
+      <ol role="list" className="grid gap-4">
         <Step
-          done={hasKey}
+          done={keyDone}
           title="Add an LLM provider key"
           action={{ href: "/credentials", label: "add a key" }}
         >
           A key you add is yours. To share one, a team admin adds it to the
-          team&apos;s credentials: every member&apos;s agents can then use it.
+          team&apos;s credentials; members&apos; personal agents and the
+          team&apos;s agents can then use it.
+          {hasModel && anyKey && !keyDone && (
+            <span
+              className="mt-1.5 flex items-start gap-1.5"
+              style={{ color: "var(--color-warning-text)" }}
+            >
+              <TriangleAlert size={14} className="mt-0.5 shrink-0" aria-hidden="true" />
+              <span>
+                None of your keys is for <strong className="font-normal">{defaultProvider}</strong>,
+                the provider of the default model {models.effective_default}.
+              </span>
+            </span>
+          )}
         </Step>
         <Step
           done={hasModel}
@@ -70,22 +92,6 @@ export function SetupChecklist({ agentCount }: { agentCount: number | null }) {
             </>
           ) : (
             <>The operator lists models in the gateway&apos;s config.toml.</>
-          )}
-          {defaultUncovered && (
-            <span
-              className="mt-1.5 flex items-start gap-1.5"
-              style={{ color: "#c0164f" }}
-            >
-              <TriangleAlert size={14} className="mt-0.5 shrink-0" aria-hidden="true" />
-              <span>
-                No key for <strong className="font-normal">{defaultProvider}</strong>, the
-                provider of the default model {models.effective_default}, reaches your agents.{" "}
-                <Link href="/credentials" className="underline">
-                  Add one
-                </Link>
-                .
-              </span>
-            </span>
           )}
         </Step>
         <Step

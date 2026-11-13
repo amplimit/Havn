@@ -18,8 +18,6 @@ const POLL_MS = 5000;
 const DASHBOARD_VERSION = process.env.NEXT_PUBLIC_DASHBOARD_VERSION ?? "unknown";
 
 const ACTIVE_BG = "rgba(83, 58, 253, 0.07)";
-// Darker than --color-ruby: readable at 11px (4.5:1 on white).
-const WARNING_TEXT = "#c0164f";
 const NO_VERSION = "version not reported";
 
 export function Sidebar() {
@@ -242,7 +240,7 @@ function VersionLine({ gateway }: { gateway: string | null }) {
       </p>
       <div role="status">
         {mismatch && (
-          <p className="mt-1 flex items-start gap-1" style={{ color: WARNING_TEXT }}>
+          <p className="mt-1 flex items-start gap-1" style={{ color: "var(--color-warning-text)" }}>
             <TriangleAlert size={12} className="mt-px shrink-0" aria-hidden="true" />
             <span>
               Different releases: build the dashboard from the tag that matches{" "}

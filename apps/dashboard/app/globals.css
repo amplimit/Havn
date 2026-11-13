@@ -38,6 +38,8 @@
   --color-success-text: #108c3d;
   --color-lemon: #9b6829;
   --color-ruby: #ea2261;
+  /* Ruby darkened for small warning text: 6:1 on white. */
+  --color-warning-text: #c0164f;
   --color-magenta: #f96bee;
   --color-magenta-light: #ffd7ef;
 

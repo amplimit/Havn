@@ -6,8 +6,10 @@ import { useEffect, useState } from "react";
 import { TriangleAlert } from "lucide-react";
 import {
   api,
+  keyScopes,
   modelProvider,
-  reachableProviders,
+  reachable,
+  type KeyScopes,
   type ModelsView,
   type TeamView,
 } from "@/lib/api";
@@ -20,8 +22,8 @@ export default function NewAgentPage() {
   const [models, setModels] = useState<ModelsView | null>(null);
   const [teams, setTeams] = useState<TeamView[]>([]);
   const [teamId, setTeamId] = useState("");
-  // LLM providers with a key this agent could use; null until known.
-  const [providers, setProviders] = useState<Set<string> | null>(null);
+  // Keys by scope, read once; null until every list is in or if one failed.
+  const [scopes, setScopes] = useState<KeyScopes | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -43,8 +45,11 @@ export default function NewAgentPage() {
         setTeams(t);
         if (wanted && t.some((team) => team.id === wanted && team.can_create_agents))
           setTeamId(wanted);
+        const s = await keyScopes(t);
+        if (!cancelled) setScopes(s);
       } catch {
-        // Without the team list the agent is created as a personal agent.
+        // Without the team list the agent is created as a personal agent,
+        // and without the key lists there is no coverage warning.
       }
     })();
     return () => {
@@ -52,22 +57,9 @@ export default function NewAgentPage() {
     };
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    reachableProviders(teams, teamId || null)
-      .then((p) => {
-        if (!cancelled) setProviders(p);
-      })
-      .catch(() => {
-        // Without the credential lists there is no warning to give.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [teams, teamId]);
-
   const provider = modelProvider(model || models?.effective_default);
-  const uncovered = providers !== null && provider !== null && !providers.has(provider);
+  const uncovered =
+    scopes !== null && provider !== null && !reachable(scopes, teamId || null).has(provider);
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -143,7 +135,8 @@ export default function NewAgentPage() {
             >
               A personal agent can use your keys and those of all your
               teams. A team agent uses your keys and that team&apos;s, runs
-              under your role in the team and counts toward its agent limit.
+              under your role in the team and counts toward your role&apos;s
+              agent limit there.
             </p>
           </div>
         )}
@@ -170,7 +163,7 @@ export default function NewAgentPage() {
             ))}
           </select>
           {models && models.models.length === 0 && (
-            <p className="mt-1.5 text-xs" style={{ color: "var(--color-ruby)" }}>
+            <p className="mt-1.5 text-xs" style={{ color: "var(--color-warning-text)" }}>
               The gateway lists no models yet, so the agent cannot chat.{" "}
               <Link href="/models" className="underline">
                 Add one
@@ -178,11 +171,11 @@ export default function NewAgentPage() {
               first.
             </p>
           )}
+          <div role="status">
           {uncovered && (
             <p
-              role="status"
               className="mt-2 flex items-start gap-1.5 text-xs"
-              style={{ color: "#c0164f" }}
+              style={{ color: "var(--color-warning-text)" }}
             >
               <TriangleAlert size={14} className="mt-px shrink-0" aria-hidden="true" />
               <span>
@@ -197,6 +190,7 @@ export default function NewAgentPage() {
               </span>
             </p>
           )}
+          </div>
         </div>
 
         {error && (

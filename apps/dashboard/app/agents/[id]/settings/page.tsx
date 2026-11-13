@@ -634,8 +634,8 @@ function McpEditor({ agentId }: { agentId: string }) {
     <section className="mt-10 card px-4 py-4">
       <h2 className="display-h3 mb-2">MCP servers</h2>
       <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
-        Model Context Protocol servers — operator-
-        installed stdio binaries the agent can invoke as
+        Model Context Protocol servers: stdio binaries the operator
+        installed, which the agent can invoke as
         <code className="font-mono"> mcp__&lt;server&gt;__&lt;tool&gt;</code>.
         Only binaries placed under{" "}
         <code className="font-mono">/usr/share/havn/mcp-servers/</code>{" "}
@@ -990,11 +990,10 @@ function RetrievalEditor({
       <h2 className="display-h3 mb-2">retrieval layer</h2>
       <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
         Hybrid retrieval (vector + BM25 keyword) drives both typed
-        memory and skill discovery — one config, both surfaces (spec
-        §9.4 / §13). Switch the provider here; the change applies to
-        the <strong>next agent spawn</strong> immediately. Already-
-        running agents keep their snapshot (frozen-prompt invariant —
-        restart them to pick up the change). The override is held{" "}
+        memory and skill discovery — one config, both surfaces. Switch
+        the provider here; the change applies to the{" "}
+        <strong>next agent spawn</strong> immediately. Running agents keep
+        the setting they started with; restart them to pick up the change. The override is held{" "}
         <strong>in-memory</strong>: a gateway restart reverts to the
         value in <code className="font-mono">~/.config/havn/config.toml</code>
         , the canonical source of truth — edit there too if you want
@@ -1020,7 +1019,7 @@ function RetrievalEditor({
           <div className="grid gap-4">
             <Field
               label="provider"
-              hint="disabled = FTS5 keyword-only (v0.6 default). openai = remote semantic embeddings (recommended). local = fastembed-rs (requires --features local-embed at build time). hrr = pure-Rust deterministic bag-of-tokens (zero deps, weakest semantic recall)."
+              hint="disabled = FTS5 keyword-only (the default). openai = remote semantic embeddings (recommended). local = fastembed-rs (requires --features local-embed at build time). hrr = pure-Rust deterministic bag-of-tokens (zero deps, weakest semantic recall)."
             >
               <select
                 value={provider}
