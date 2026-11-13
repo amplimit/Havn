@@ -119,6 +119,7 @@ cleanup() {
         curl -fs --max-time 15 -X POST "$GATEWAY_URL/agents/$id/stop" -o /dev/null || true
     done
     "${AS_ROOT[@]}" kill "$GW_PID" 2>/dev/null || true
+    wait "$GW_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 

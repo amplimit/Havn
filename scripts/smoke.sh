@@ -50,6 +50,8 @@ cleanup() {
         curl -fs --max-time 5 -X POST "$GATEWAY_URL/agents/$AGENT_ID/stop" -o /dev/null || true
     fi
     kill "$GW_PID" 2>/dev/null || true
+    # The next gateway (CI starts more) needs this one's locks.
+    wait "$GW_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 
