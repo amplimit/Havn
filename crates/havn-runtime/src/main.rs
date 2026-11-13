@@ -451,6 +451,16 @@ async fn main() -> anyhow::Result<()> {
             // havn-init applied the rules before exec, covering every
             // thread of this process.
             info!("landlock applied before exec by havn-init");
+            // Tool processes run as the same uid; a non-dumpable runtime
+            // keeps them from reading its memory through /proc/1/mem.
+            // Exec resets it, so the tools themselves stay dumpable.
+            // SAFETY: prctl with integer arguments only.
+            if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+                return Err(anyhow!(
+                    "PR_SET_DUMPABLE failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
         } else if init::is_pid_one() {
             // PID 1 means the namespace spawner started us through
             // havn-init, which should have applied the rules; applying

@@ -134,8 +134,24 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
             if tr '\0' '\n' < "/proc/$pid/environ" | grep -q '^HAVN_LANDLOCK_R[WO]='; then
                 die "havn-runtime (pid $pid) still carries the Landlock rule lists"
             fi
+            # Agent uid 0 is host uid 0: it must hold no capabilities.
+            for set in CapInh CapPrm CapEff CapBnd CapAmb; do
+                grep -q "^$set:[[:space:]]*0000000000000000$" "/proc/$pid/status" \
+                    || die "havn-runtime (pid $pid) has capabilities: $(grep "^$set:" "/proc/$pid/status")"
+            done
+            # A tool runs as the same uid without capabilities: it must not
+            # read the runtime's memory or environment. The privileged read
+            # first shows the probe itself works.
+            in_agent() { nsenter -t "$pid" -U -m -p -- "$@"; }
+            in_agent head -c 1 /proc/1/environ >/dev/null \
+                || die "cannot probe the agent's namespaces with nsenter"
+            if in_agent setpriv --securebits +noroot --bounding-set -all --inh-caps -all -- \
+                head -c 1 /proc/1/environ >/dev/null 2>&1; then
+                die "a process without capabilities in the agent can read the runtime's environment"
+            fi
         done
         ok "every runtime thread is under seccomp with no_new_privs"
+        ok "the agent runtime holds no capabilities, and its tools cannot read its memory"
         ok "NamespaceSpawner isolation: memory.max=$(cat "$CGROUP/memory.max") pids.max=$(cat "$CGROUP/pids.max")"
         ;;
     subprocess)

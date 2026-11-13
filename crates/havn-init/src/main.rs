@@ -279,6 +279,14 @@ unsafe fn fork_and_exec_runtime(
             // would not achieve.
             let (rw, ro) = landlock_rules;
             apply_landlock_or_exit(rw, ro);
+            // The agent's uid 0 is the gateway's host uid: without this
+            // it would run with a full capability set in its namespaces.
+            // SAFETY: this forked child is single-threaded.
+            if let Err(e) = unsafe { ns_setup::drop_all_capabilities() } {
+                eprintln!("havn-init: dropping capabilities failed: {e}");
+                // SAFETY: `_exit` is async-signal-safe.
+                unsafe { libc::_exit(1) };
+            }
             let mut command = std::process::Command::new(runtime_binary);
             command
                 .args(runtime_args)
