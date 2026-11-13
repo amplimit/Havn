@@ -384,7 +384,7 @@ impl AgentSpawner for NamespaceSpawner {
         }
         // Network egress flag (spec §6.3 v0.7). Single source of truth
         // is `policy.network_policy.egress_allowed`. havn-init gates
-        // /etc/resolv.conf + /etc/ssl writes on it; this spawner gates
+        // the /etc/resolv.conf write on it; this spawner gates
         // `configure_agent_network` (step 4 below) on the same bit.
         // Default off — spec §1.5 says "agent processes never see API
         // keys" and the original posture is "no direct outbound,

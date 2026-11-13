@@ -134,6 +134,11 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
             if tr '\0' '\n' < "/proc/$pid/environ" | grep -q '^HAVN_LANDLOCK_R[WO]='; then
                 die "havn-runtime (pid $pid) still carries the Landlock rule lists"
             fi
+            # Only the CA certificates of /etc/ssl, never private/.
+            [ -e "/proc/$pid/root/etc/ssl/certs" ] \
+                || die "the agent has no /etc/ssl/certs"
+            [ "$(ls -A "/proc/$pid/root/etc/ssl")" = "certs" ] \
+                || die "the agent sees more of /etc/ssl than certs: $(ls -A "/proc/$pid/root/etc/ssl" | paste -sd' ')"
         done
         ok "every runtime thread is under seccomp with no_new_privs"
         ok "NamespaceSpawner isolation: memory.max=$(cat "$CGROUP/memory.max") pids.max=$(cat "$CGROUP/pids.max")"

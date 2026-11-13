@@ -50,7 +50,7 @@
 //! root from the host's `/` to a freshly-built tmpfs that exposes only:
 //! `/usr` (ro bind), `/lib`/`/lib64`/`/bin`/`/sbin` (symlinks → `/usr/*`),
 //! `/proc` (PID-ns view), `/tmp` (tmpfs), `/dev/{null,urandom,zero,random}`,
-//! `/etc/{resolv.conf,ssl}` (when network allowed), and the agent's
+//! `/etc/ssl/certs` (ro), `/etc/resolv.conf` (when network allowed), and the agent's
 //! workspace mirror-bound at its host path. Everything else (`/var`,
 //! `/home`, `/root`, `/srv`, `/sys`, `/etc/{shadow,passwd,...}`) is
 //! invisible to the agent — Landlock no longer the only thing keeping
@@ -521,27 +521,23 @@ pub unsafe fn pivot_root_into_minimal_rootfs(
         // The runtime unconditionally builds a reqwest HTTP client at
         // startup (used by tools, MCP, embedding providers), and reqwest
         // refuses to construct without a CA bundle ("No CA certificates
-        // were loaded from the system"). Mounting the bundle into the
-        // agent ns is a no-op for security: it's read-only public data
-        // that grants nothing on its own. The egress gate is the netns
+        // were loaded from the system"). The egress gate is the netns
         // (no veth = no packets out), not the absence of CA certs.
-        mkdir_under_newroot("etc/ssl", 0o755)?;
-        let ssl_target = cstr_under_newroot("etc/ssl");
-        libc::mount(
-            c"/etc/ssl".as_ptr(),
-            ssl_target.as_ptr(),
-            std::ptr::null(),
-            libc::MS_BIND | libc::MS_REC,
-            std::ptr::null(),
-        );
-        // Best-effort RO remount.
-        libc::mount(
-            std::ptr::null(),
-            ssl_target.as_ptr(),
-            std::ptr::null(),
-            libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
-            std::ptr::null(),
-        );
+        //
+        // Only `/etc/ssl/certs`, read-only: the rest of `/etc/ssl` holds
+        // `private/`, where hosts keep TLS keys, and the agent's uid 0 is
+        // the host's, so it could read them. The certificates there link
+        // into `/usr/share/ca-certificates`, already under the /usr bind.
+        // A read-only remount that fails stops the agent from starting.
+        let ca_certificates = Path::new("/etc/ssl/certs");
+        if ca_certificates.is_dir() {
+            mirror_bind_into_newroot(ca_certificates, true)?;
+        } else {
+            eprintln!(
+                "havn-init: no {}; HTTPS will fail in the agent",
+                ca_certificates.display()
+            );
+        }
 
         // 9. Mirror-bind workspace (rw) at its host path so the
         //    runtime's `--workspace <abs-path>` argument resolves
