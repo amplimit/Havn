@@ -9,7 +9,7 @@
  * we render JSON inline.
  */
 
-import { use, useEffect, useState } from "react";
+import { use, useEffect, useRef, useState } from "react";
 import { ApiError, type AuditEntryView } from "@/lib/api";
 import { SkeletonList } from "@/components/SkeletonList";
 
@@ -44,20 +44,26 @@ export default function TeamAuditPage({
   // Promote to `lib/api.ts` when a third caller appears.
 
 
+  // Bumped on every filter change, so an older page requested under the
+  // previous filter is dropped when it arrives.
+  const generation = useRef(0);
+
   async function loadMore() {
     if (!nextBefore || loading) return;
+    const started = generation.current;
     setLoading(true);
     try {
       const res = await fetchPage(id, {
         actionPrefix: prefixOrEmpty(actionFilter),
         before: nextBefore,
       });
+      if (started !== generation.current) return;
       setEntries((prev) => [...prev, ...res.entries]);
       setNextBefore(res.next_before);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (started === generation.current) setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      if (started === generation.current) setLoading(false);
     }
   }
 
@@ -108,8 +114,8 @@ export default function TeamAuditPage({
         </span>
         <select
           value={actionFilter}
-          disabled={loading}
           onChange={(e) => {
+            generation.current += 1;
             setLoading(true);
             setActionFilter(e.target.value);
           }}

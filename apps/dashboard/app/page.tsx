@@ -86,13 +86,7 @@ export default function HomePage() {
       )}
 
       <div className="flex flex-col">
-      <div
-        className={`empty:hidden ${agents && agents.length > 0 ? "order-2 mt-8" : "order-0"}`}
-      >
-        <SetupChecklist agentCount={agents?.length ?? null} onVisibleChange={setChecklistShown} />
-      </div>
-
-      <div className="order-1">
+      <div>
       {agents === null && !error && (
         <SkeletonList />
       )}
@@ -141,6 +135,14 @@ export default function HomePage() {
           </li>
         ))}
       </ul>
+      </div>
+
+      {/* After the list in reading order; drawn first only when there is
+          no list to push down. */}
+      <div
+        className={`empty:hidden ${agents && agents.length > 0 ? "mt-8" : "order-first"}`}
+      >
+        <SetupChecklist agentCount={agents?.length ?? null} onVisibleChange={setChecklistShown} />
       </div>
       </div>
     </div>

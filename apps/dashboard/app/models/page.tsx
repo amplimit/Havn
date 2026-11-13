@@ -229,7 +229,7 @@ export default function ModelsPage() {
           <li key={m.id} className="card flex flex-wrap items-center justify-between gap-3 px-5 py-4">
             <div className="min-w-[14rem] flex-1">
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                <span className="display-h3 break-all">{m.label ?? m.id}</span>
+                <span className="display-h3 wrap-anywhere">{m.label ?? m.id}</span>
                 {view.effective_default === m.id && (
                   <span className="pill pill-running">default</span>
                 )}
@@ -240,7 +240,7 @@ export default function ModelsPage() {
                 )}
               </div>
               {m.label && (
-                <p className="mt-1 break-all font-mono text-xs" style={{ color: "var(--color-body)" }}>
+                <p className="mt-1 font-mono text-xs wrap-anywhere" style={{ color: "var(--color-body)" }}>
                   {m.id}
                 </p>
               )}

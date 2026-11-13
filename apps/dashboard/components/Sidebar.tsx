@@ -54,7 +54,15 @@ export function Sidebar() {
         if (e.key === "Escape") setOpen(false);
       };
       document.addEventListener("keydown", onKey);
+      // At md and up the drawer is the regular sidebar; a window widened
+      // (or a tablet rotated) while it is open must not stay modal.
+      const wide = window.matchMedia("(min-width: 48rem)");
+      const onWide = (e: MediaQueryListEvent) => {
+        if (e.matches) setOpen(false);
+      };
+      wide.addEventListener("change", onWide);
       return () => {
+        wide.removeEventListener("change", onWide);
         document.removeEventListener("keydown", onKey);
         for (const el of behind) if (el instanceof HTMLElement) el.inert = false;
         html.style.overflow = overflow;
