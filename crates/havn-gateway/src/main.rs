@@ -267,6 +267,11 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("creating workspace root {}", cfg.workspace_root.display()))?;
 
+    // Taken before anything touches the database, the agent socket, agent
+    // cgroups or the egress chain: a second gateway stops here instead of
+    // killing the first one's agents and taking over its socket (#80).
+    let _instance_locks = instance_locks(&cfg.db_path, &cfg.agent_socket_path, host_lock())?;
+
     let db = havn_db::connect(&cfg.db_path)
         .await
         .with_context(|| format!("opening database at {}", cfg.db_path.display()))?;
@@ -688,6 +693,140 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Where an isolated gateway marks that it owns this host's agent cgroup
+/// root and egress chain.
+const HOST_LOCK: &str = "/run/havn-gateway.lock";
+
+/// Locks that keep a second gateway from touching what a running one owns:
+/// its database, its agent socket (a separate config key), and, when agents
+/// run isolated (`host` is `Some`), this host's `/sys/fs/cgroup/havn` and
+/// `HAVN-AGENT-EGRESS`, which every isolated gateway shares whatever its
+/// config.
+fn instance_locks(
+    db_path: &std::path::Path,
+    socket_path: &std::path::Path,
+    host: Option<&std::path::Path>,
+) -> anyhow::Result<Vec<std::fs::File>> {
+    let db_lock = lock_path_for(db_path);
+    let mut locks = vec![instance_lock(
+        &db_lock,
+        &format!("the database {}", db_path.display()),
+    )?];
+    let socket_lock = lock_path_for(socket_path);
+    if socket_lock != db_lock {
+        // The listener creates this directory too, but only later; it may
+        // be on a tmpfs that is empty after a reboot.
+        if let Some(dir) = socket_lock.parent()
+            && !dir.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        locks.push(instance_lock(
+            &socket_lock,
+            &format!("the agent socket {}", socket_path.display()),
+        )?);
+    }
+    let Some(host) = host else {
+        return Ok(locks);
+    };
+    match instance_lock(
+        host,
+        "agent isolation on this host (/sys/fs/cgroup/havn, HAVN-AGENT-EGRESS)",
+    ) {
+        Ok(lock) => locks.push(lock),
+        Err(e) if e.is::<LockHeld>() => return Err(e),
+        // A lock file that cannot be opened (read-only or missing /run):
+        // say that a second isolated gateway is not stopped here rather
+        // than refuse a start that worked before.
+        Err(e) => warn!(
+            lock = %host.display(),
+            error = %format!("{e:#}"),
+            "could not take the host lock; nothing stops a second isolated gateway on this \
+             host from killing this one's agents"
+        ),
+    }
+    Ok(locks)
+}
+
+/// The host lock applies to gateways that isolate agents, which only root
+/// can do.
+fn host_lock() -> Option<&'static std::path::Path> {
+    let isolated = cfg!(target_os = "linux")
+        && !matches!(std::env::var("HAVN_SPAWNER").as_deref(), Ok("subprocess"))
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        && unsafe { libc::geteuid() } == 0;
+    isolated.then(|| std::path::Path::new(HOST_LOCK))
+}
+
+/// Another gateway holds the lock (as opposed to the lock file being
+/// unusable).
+#[derive(Debug)]
+struct LockHeld(String);
+
+impl std::fmt::Display for LockHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LockHeld {}
+
+fn lock_path_for(path: &std::path::Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+/// Lock `path` for as long as the returned file is open, recording this
+/// process's pid in it, or fail naming the pid that holds it. A symlink is
+/// not followed, so a planted link cannot make root truncate another file.
+fn instance_lock(path: &std::path::Path, what: &str) -> anyhow::Result<std::fs::File> {
+    use std::io::{Read as _, Seek as _, Write as _};
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o644).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("opening {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let mut holder = String::new();
+            let _ = file.read_to_string(&mut holder);
+            let stop = match holder.trim() {
+                "" => "stop it first (`systemctl stop havn` or `havn gateway stop`)".to_string(),
+                pid => format!(
+                    "stop it first (`systemctl stop havn`, `havn gateway stop`, or `kill {pid}` \
+                     for one started in a shell)"
+                ),
+            };
+            let holder = match holder.trim() {
+                "" => "unknown pid".to_string(),
+                pid => format!("pid {pid}"),
+            };
+            return Err(LockHeld(format!(
+                "another havn gateway ({holder}) is already running for {what}; {stop}. Lock: {}",
+                path.display()
+            ))
+            .into());
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            return Err(e).with_context(|| format!("locking {}", path.display()));
+        }
+    }
+    file.set_len(0)
+        .and_then(|()| file.rewind())
+        .and_then(|()| writeln!(file, "{}", std::process::id()))
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(file)
+}
+
 /// Pick the agent spawner: [`havn_spawner::namespace::NamespaceSpawner`]
 /// (namespaces + Landlock + seccomp + cgroup v2) on Linux. If it cannot
 /// initialise, startup fails instead of silently running agents without
@@ -977,6 +1116,80 @@ async fn healthz(State(state): State<AppState>) -> Response {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_second_gateway_on_the_same_lock_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = lock_path_for(&dir.path().join("havn.db"));
+        assert_eq!(path, dir.path().join("havn.db.lock"));
+        let first = instance_lock(&path, "the database x").expect("first");
+        let err = instance_lock(&path, "the database x")
+            .expect_err("second")
+            .to_string();
+        let pid = std::process::id();
+        assert!(
+            err.contains(&format!("pid {pid}"))
+                && err.contains(&format!("kill {pid}"))
+                && err.contains("database x"),
+            "{err}"
+        );
+        drop(first);
+        drop(instance_lock(&path, "the database x").expect("free again"));
+    }
+
+    #[test]
+    fn gateways_sharing_a_socket_or_the_host_are_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path();
+        let host = d.join("host.lock");
+        let first = instance_locks(&d.join("a.db"), &d.join("a.sock"), Some(&host)).expect("a");
+        assert_eq!(first.len(), 3);
+
+        let socket = instance_locks(&d.join("b.db"), &d.join("a.sock"), None)
+            .expect_err("same socket")
+            .to_string();
+        assert!(socket.contains("agent socket"), "{socket}");
+        let isolated = instance_locks(&d.join("c.db"), &d.join("c.sock"), Some(&host))
+            .expect_err("same host")
+            .to_string();
+        assert!(isolated.contains("agent isolation"), "{isolated}");
+        // Gateways that do not isolate agents only need their own data.
+        drop(instance_locks(&d.join("d.db"), &d.join("d.sock"), None).expect("other data"));
+        drop(first);
+        drop(instance_locks(&d.join("c.db"), &d.join("c.sock"), Some(&host)).expect("freed"));
+    }
+
+    #[test]
+    fn the_socket_directory_is_created_for_its_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path();
+        let locks =
+            instance_locks(&d.join("a.db"), &d.join("run/havn/agent.sock"), None).expect("starts");
+        assert_eq!(locks.len(), 2);
+        assert!(d.join("run/havn/agent.sock.lock").exists());
+    }
+
+    #[test]
+    fn an_unusable_host_lock_does_not_stop_the_gateway() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path();
+        let missing = d.join("no-such-dir/host.lock");
+        let locks =
+            instance_locks(&d.join("a.db"), &d.join("a.sock"), Some(&missing)).expect("starts");
+        assert_eq!(locks.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_lock_file_is_not_followed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("precious");
+        std::fs::write(&target, "keep").expect("write");
+        let link = dir.path().join("havn.db.lock");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(instance_lock(&link, "x").is_err());
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), "keep");
+    }
 
     #[test]
     fn loopback_addresses_pass() {

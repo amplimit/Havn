@@ -33,6 +33,31 @@ pub fn start(detach: bool) -> anyhow::Result<()> {
     }
 }
 
+// The gateway locks `<db_path>.lock` while it runs. Checking it catches a
+// gateway the pid file does not know, such as the systemd unit's; otherwise
+// a detached start would report success for a gateway that exits at once.
+fn running_gateway(cfg: &paths::CliConfig) -> Option<String> {
+    use std::io::Read as _;
+    let db = cfg
+        .db_path
+        .clone()
+        .unwrap_or_else(|| paths::data_dir(cfg).join("havn.db"));
+    let mut name = db.file_name()?.to_os_string();
+    name.push(".lock");
+    let mut file = std::fs::File::open(db.with_file_name(name)).ok()?;
+    match file.try_lock() {
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let mut pid = String::new();
+            let _ = file.read_to_string(&mut pid);
+            Some(match pid.trim() {
+                "" => "unknown pid".to_string(),
+                pid => format!("pid {pid}"),
+            })
+        }
+        _ => None,
+    }
+}
+
 fn start_detached() -> anyhow::Result<()> {
     let cfg = paths::load_config().unwrap_or_default();
     let bin = resolve_gateway_bin()?;
@@ -54,6 +79,13 @@ fn start_detached() -> anyhow::Result<()> {
             pid_path.display()
         );
         let _ = std::fs::remove_file(&pid_path);
+    }
+
+    if let Some(holder) = running_gateway(&cfg) {
+        return Err(anyhow!(
+            "a gateway ({holder}) is already running for this data; stop it first \
+             (`systemctl stop havn`, or `kill` it if it was started in a shell)"
+        ));
     }
 
     std::fs::create_dir_all(&data)
