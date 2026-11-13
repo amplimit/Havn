@@ -310,6 +310,7 @@ cat <<EOF >&2
 next:
   havn start                                    # launch the gateway (as root)
   havn credential add anthropic <YOUR_API_KEY>  # in another shell, after gateway is up
+  havn model add anthropic:claude-sonnet-4-6    # a model agents may use (provider:model)
   havn agent create my-first-agent
   open http://127.0.0.1:8080/healthz            # confirm the gateway responds
   havn doctor                                   # check isolation and network prerequisites
