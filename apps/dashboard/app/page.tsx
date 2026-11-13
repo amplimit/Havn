@@ -103,7 +103,7 @@ export default function HomePage() {
         {agents?.map((a) => (
           <li key={a.id} className="card px-5 py-4">
             <div className="flex flex-wrap items-center justify-between gap-4">
-              <div className="min-w-0 flex-1">
+              <div className="min-w-[12rem] flex-1">
                 <div className="flex items-center gap-3">
                   <Link
                     href={`/agents/${a.id}`}

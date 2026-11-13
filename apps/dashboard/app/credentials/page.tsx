@@ -213,7 +213,7 @@ export default function CredentialsPage() {
           const usdCap = c.limits?.max_usd_per_day !== undefined;
           return (
             <li key={c.id} className="card flex flex-wrap items-center justify-between gap-3 px-5 py-4">
-              <div className="min-w-0 flex-1">
+              <div className="min-w-[12rem] flex-1">
                 <div className="flex items-center gap-3">
                   <span className="display-h3">{c.provider}</span>
                   <span className="pill pill-stopped tabular">priority {c.priority}</span>
