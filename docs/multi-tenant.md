@@ -85,7 +85,7 @@ matters for capability packs whose workload nests user namespaces, such as
 Chromium-based browser packs.
 
 The gateway and the dashboard listen on 127.0.0.1 inside the container, so
-nothing in a tenant is reachable from outside it by default.
+neither is reachable from outside the container by default.
 
 ## Check a tenant
 
@@ -124,14 +124,19 @@ workspaces.
   cover. Drop forwarded traffic from `lxdbr0` back to `lxdbr0` in the host
   firewall.
 - **Isolation by default.** Setting the options on the default profile
-  (`lxc profile device set default eth0 security.port_isolation=true`)
-  keeps a tenant created without them from being left open.
+  (`lxc profile set default security.nesting=true security.idmap.isolated=true`
+  and `lxc profile device set default eth0 security.port_isolation=true`)
+  keeps a tenant created without them from being left open. A tenant created
+  with the `lxc config device add ... eth0` line above has its own `eth0`,
+  which overrides the profile's, so it needs the option on that line.
 - **Dashboard access.** The dashboard has no login of its own. To give a
   tenant access to it, add a proxy device that listens on the host's loopback
   only, for example
   `lxc config device add acme dash proxy listen=tcp:127.0.0.1:3101 connect=tcp:127.0.0.1:3000`,
   and point an authenticating reverse proxy on the host at that port (see the
   [dashboard README](../apps/dashboard/README.md) for what the proxy must
-  send). Never listen on `0.0.0.0` or the `lxdbr0` address: the dashboard sees
-  every connection through the proxy device as coming from 127.0.0.1, so
-  anyone who can reach that port is treated as local.
+  send). The proxy device connects to the dashboard from 127.0.0.1 inside the
+  container, so that is the address to set in `HAVN_DASHBOARD_TRUSTED_PROXIES`
+  there, not the address of the reverse proxy on the host. For the same
+  reason, never listen on `0.0.0.0` or the `lxdbr0` address: anyone who can
+  reach that port is treated as the trusted proxy.
