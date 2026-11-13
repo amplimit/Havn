@@ -3,11 +3,18 @@
 To serve several customers (tenants) from one server, give each tenant its own
 unprivileged [LXD](https://canonical.com/lxd) system container and install a
 separate Havn gateway inside it. Each tenant then has its own gateway, agents,
-credentials, users and data, and nothing is shared but the kernel.
+credentials, users and data. The kernel and the host's CPU, memory, disk and
+network are still shared.
 
-This setup was tested with Havn v0.1.3 and LXD 6.10 on Ubuntu 24.04: the README
-install, the systemd unit, the dashboard and the full acceptance probe suite
-work unchanged inside the container, and `havn doctor` reports every check ok.
+What was tested, with Havn v0.1.3 and LXD 6.10 on Ubuntu 24.04: the container
+options under [Create a tenant](#create-a-tenant), the README install, the
+systemd unit, the dashboard and the full acceptance probe suite inside the
+container, isolation between two tenants, and port isolation on NICs attached
+to `lxdbr0`. In that test the tenants reached the internet through a macvlan
+NIC and the `lxdbr0` NICs had static addresses, so the `lxdbr0` DHCP, NAT and
+firewall steps under [Prepare the host](#prepare-the-host) were not exercised,
+nor was anything under
+[Further hardening](#further-hardening-not-tested-with-havn).
 
 ## Why not something else
 
@@ -16,16 +23,15 @@ work unchanged inside the container, and `havn doctor` reports every check ok.
   firewall chain, and a starting gateway removes agent cgroups it does not
   track, which kills the other gateway's agents
   ([#80](https://github.com/amplimit/havn/issues/80)).
-- **Docker** does not let Havn create its agent sandboxes (user namespaces,
-  cgroups, iptables rules) inside an ordinary container. `--privileged` makes
-  it work, but then root in the container can read the host disks and load
-  kernel modules, so escaping one tenant's agent sandbox gives the whole
-  server. Docker also hides securityfs, so `havn doctor` cannot confirm
-  Landlock.
+- **Docker** does not let Havn create its agent sandboxes inside an ordinary
+  container. `--privileged` makes it work, but it hands the container the
+  host's devices and all kernel capabilities, so escaping one tenant's agent
+  sandbox gives the whole server. Docker also hides securityfs, so
+  `havn doctor` cannot confirm Landlock.
 - In an **unprivileged LXD container**, root inside the container is an
-  ordinary uid on the host, and `security.nesting` lets Havn build its sandboxes
-  inside it. An agent that escaped Havn's sandbox would still be confined to
-  its tenant's container.
+  ordinary uid on the host, and with `security.nesting` Havn can build its
+  sandboxes inside it. An agent that escaped Havn's sandbox would still be
+  confined to its tenant's container.
 
 ## Prepare the host
 
@@ -34,19 +40,21 @@ host, Docker in particular, interfere with the container network and widen
 what a compromised tenant can reach.
 
 ```bash
-sudo snap install lxd
+sudo snap install lxd --channel=6/stable
 sudo lxd init --minimal
 ```
 
 `lxd init --minimal` creates the bridge `lxdbr0`, which hands out addresses to
-the containers and NATs their traffic to the internet. If UFW is active, it
-blocks that traffic; allow only DHCP, DNS and outbound forwarding with the
-restrictive rules in LXD's
-[firewall guide](https://canonical.com/lxd/docs/latest/howto/network_bridge_firewalld/).
-Root in a tenant container is not subject to the agent egress rules, so it can
-reach anything the host routes to, such as a cloud provider's metadata
-address or a private network; block those in the host firewall if tenants
-must not reach them.
+the containers and NATs their traffic to the internet.
+
+Root in a tenant container is not subject to Havn's agent egress rules. It can
+reach the host's own services on the `lxdbr0` address (sshd, LXD's DNS and
+DHCP, any proxy listener), a cloud provider's metadata address and any private
+network the host routes to. Run a host firewall even though UFW is inactive on
+a fresh Ubuntu install, allow guests only DHCP and DNS to the host, as the
+restrictive UFW rules in LXD's
+[firewall guide](https://canonical.com/lxd/docs/latest/howto/network_bridge_firewalld/)
+do, and block whatever else tenants must not reach.
 
 ## Create a tenant
 
@@ -58,15 +66,15 @@ lxc config device add acme eth0 nic network=lxdbr0 name=eth0 security.port_isola
 lxc start acme
 ```
 
-- `security.nesting=true` lets Havn create user namespaces, cgroups and
-  firewall rules for its agents inside the container.
+- `security.nesting=true` relaxes the container's restrictions on mounting
+  `/proc` and `/sys` inside new namespaces, which Havn's agent sandboxes do.
 - `security.idmap.isolated=true` gives the tenant its own range of host uids.
   Without it, all containers map to the same host uids, so a process that
   escaped one container would own the files of the others.
-- `security.port_isolation=true` stops this tenant's container from talking to
-  other containers on the bridge. It only blocks traffic between two isolated
-  ports, so set it on **every** tenant: a tenant without it can still reach,
-  and be reached by, all the others.
+- `security.port_isolation=true` stops direct traffic between this container
+  and the other isolated containers on the bridge. It only blocks traffic
+  between two isolated ports, so set it on **every** tenant: a tenant without
+  it can still reach, and be reached by, all the others.
 
 Then open a shell in the container (`lxc exec acme -- bash`) and follow
 [Quick Start](../README.md#quick-start) and
@@ -77,19 +85,18 @@ matters for capability packs whose workload nests user namespaces, such as
 Chromium-based browser packs.
 
 The gateway and the dashboard listen on 127.0.0.1 inside the container, so
-nothing in a tenant is reachable from outside it by default. To give a tenant
-access to its dashboard, forward a host port to the container's dashboard with
-an LXD [proxy device](https://canonical.com/lxd/docs/latest/reference/devices_proxy/)
-and put an authenticating reverse proxy in front of it, as described in the
-[dashboard README](../apps/dashboard/README.md).
+nothing in a tenant is reachable from outside it by default.
 
 ## Check a tenant
 
 ```bash
 lxc exec acme -- havn doctor                      # no failures, Landlock enabled
 lxc exec acme -- cat /proc/self/uid_map           # a host range no other tenant has
-bridge -d link show master lxdbr0 | grep -c 'isolated on'   # one per tenant
+bridge -d link show master lxdbr0 | grep -c 'isolated on'   # one per running tenant
 ```
+
+Run from `lxc exec`, `havn doctor` also warns that `HAVN_AGE_KEY` is not set in
+that shell; the systemd unit reads it from `/etc/havn/havn.env`.
 
 ## Remove a tenant
 
@@ -99,3 +106,32 @@ lxc delete --force acme
 
 This deletes the container with its gateway database, credentials and agent
 workspaces.
+
+## Further hardening (not tested with Havn)
+
+- **Resource limits.** Without them one tenant's agents can use up the
+  host's memory, CPU or disk for every tenant. Set container limits such as
+  `lxc config set acme limits.memory=4GiB limits.cpu=2 limits.processes=2000`,
+  sized to the tenant's agents. The `dir` storage pool that
+  `lxd init --minimal` creates cannot cap disk usage; use a zfs or btrfs pool
+  and set a root disk `size` to do that.
+- **Address spoofing.** Port isolation does not stop root in one tenant from
+  claiming another tenant's IP or MAC address towards the host. Add
+  `security.ipv4_filtering=true security.ipv6_filtering=true` to the NIC,
+  which also turns on MAC filtering.
+- **Traffic routed through the host.** A tenant can send packets to another
+  tenant through the host's `lxdbr0` address, which port isolation does not
+  cover. Drop forwarded traffic from `lxdbr0` back to `lxdbr0` in the host
+  firewall.
+- **Isolation by default.** Setting the options on the default profile
+  (`lxc profile device set default eth0 security.port_isolation=true`)
+  keeps a tenant created without them from being left open.
+- **Dashboard access.** The dashboard has no login of its own. To give a
+  tenant access to it, add a proxy device that listens on the host's loopback
+  only, for example
+  `lxc config device add acme dash proxy listen=tcp:127.0.0.1:3101 connect=tcp:127.0.0.1:3000`,
+  and point an authenticating reverse proxy on the host at that port (see the
+  [dashboard README](../apps/dashboard/README.md) for what the proxy must
+  send). Never listen on `0.0.0.0` or the `lxdbr0` address: the dashboard sees
+  every connection through the proxy device as coming from 127.0.0.1, so
+  anyone who can reach that port is treated as local.
