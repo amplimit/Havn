@@ -13,6 +13,7 @@ use crate::model_catalog::{self, ModelCatalog, ModelEntry};
 
 #[derive(Debug, Serialize)]
 pub struct ModelsView {
+    pub version: String,
     pub default_model: Option<String>,
     pub effective_default: Option<String>,
     pub models: Vec<ModelEntry>,
@@ -22,6 +23,7 @@ pub struct ModelsView {
 fn view(state: &AppState) -> ModelsView {
     let catalog = state.models.load();
     ModelsView {
+        version: catalog.version(),
         default_model: catalog.default_model.clone(),
         effective_default: catalog.default_entry().map(|m| m.id.clone()),
         models: catalog.models.clone(),
@@ -36,6 +38,7 @@ pub async fn get(State(state): State<AppState>, _user: AuthedUser) -> Json<Model
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelsPut {
+    pub version: String,
     #[serde(default)]
     pub default_model: Option<String>,
     pub models: Vec<ModelEntry>,
@@ -64,10 +67,23 @@ pub async fn put(
     let _writing = state.models_write.lock().await;
     let path = state.config_path.clone();
     let written = catalog.clone();
-    tokio::task::spawn_blocking(move || model_catalog::write_to_file(&path, &written))
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?
-        .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    let expected = req.version;
+    let applied = tokio::task::spawn_blocking(move || {
+        // The file is compared, not the running list: a hand edit the
+        // watcher has not applied yet must not be overwritten either.
+        if model_catalog::read_from_file(&path)?.version() != expected {
+            return Ok(false);
+        }
+        model_catalog::write_to_file(&path, &written).map(|()| true)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?
+    .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    if !applied {
+        return Err(ApiError::Conflict(
+            "the model list changed since it was read; load it again and retry".into(),
+        ));
+    }
     let ids: Vec<String> = catalog.models.iter().map(|m| m.id.clone()).collect();
     let default_model = catalog.default_model.clone();
     state.models.store(Arc::new(catalog));
@@ -90,9 +106,10 @@ mod tests {
     use super::*;
     use crate::auth::tests::state_with;
 
-    fn body(ids: &[&str], default: Option<&str>) -> Json<ModelsPut> {
+    fn body(version: &str, ids: &[&str]) -> Json<ModelsPut> {
         Json(ModelsPut {
-            default_model: default.map(str::to_string),
+            version: version.into(),
+            default_model: None,
             models: ids
                 .iter()
                 .map(|id| ModelEntry {
@@ -111,13 +128,18 @@ mod tests {
         }
     }
 
+    fn empty() -> String {
+        ModelCatalog::default().version()
+    }
+
     #[tokio::test]
     async fn put_writes_the_config_file_and_takes_effect() {
         let (state, user_id) = state_with(false).await;
+        let first = get(State(state.clone()), user(user_id)).await.0.version;
         let view = put(
             State(state.clone()),
             user(user_id),
-            body(&["openai:gpt-5", "anthropic:claude-opus-4-7"], None),
+            body(&first, &["openai:gpt-5", "anthropic:claude-opus-4-7"]),
         )
         .await
         .unwrap()
@@ -138,11 +160,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_refuses_a_writer_that_read_an_older_list() {
+        let (state, user_id) = state_with(false).await;
+        let first = put(
+            State(state.clone()),
+            user(user_id),
+            body(&empty(), &["openai:gpt-5"]),
+        )
+        .await
+        .unwrap()
+        .0
+        .version;
+        let err = put(
+            State(state.clone()),
+            user(user_id),
+            body(&empty(), &["gemini:gemini-2.5-pro"]),
+        )
+        .await
+        .expect_err("stale version");
+        assert!(matches!(err, ApiError::Conflict(_)), "{err:?}");
+
+        // A hand edit the watcher has not applied yet counts as a change.
+        let edited = ModelCatalog {
+            default_model: None,
+            models: vec![],
+        };
+        model_catalog::write_to_file(&state.config_path, &edited).unwrap();
+        let err = put(
+            State(state.clone()),
+            user(user_id),
+            body(&first, &["gemini:gemini-2.5-pro"]),
+        )
+        .await
+        .expect_err("file changed underneath");
+        assert!(matches!(err, ApiError::Conflict(_)), "{err:?}");
+        assert_eq!(
+            model_catalog::read_from_file(&state.config_path).unwrap(),
+            edited
+        );
+        let _ = std::fs::remove_file(&state.config_path);
+    }
+
+    #[tokio::test]
     async fn put_rejects_an_invalid_list() {
         let (state, user_id) = state_with(false).await;
-        let err = put(State(state.clone()), user(user_id), body(&["gpt-5"], None))
-            .await
-            .expect_err("a model without a provider");
+        let err = put(
+            State(state.clone()),
+            user(user_id),
+            body(&empty(), &["gpt-5"]),
+        )
+        .await
+        .expect_err("a model without a provider");
         assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
         assert!(!state.config_path.exists());
     }
@@ -153,7 +221,7 @@ mod tests {
         let err = put(
             State(state.clone()),
             user(user_id),
-            body(&["openai:gpt-5"], None),
+            body(&empty(), &["openai:gpt-5"]),
         )
         .await
         .expect_err("trust_header mode must refuse");

@@ -167,6 +167,8 @@ export type ModelEntry = {
 };
 
 export type ModelsView = {
+  /** Pass back on put: the gateway refuses it if the list changed since. */
+  version: string;
   /** Default set in config.toml; null when the first entry is the default. */
   default_model: string | null;
   effective_default: string | null;
@@ -292,7 +294,11 @@ export const api = {
   models: {
     get: () => request<ModelsView>("/llm/models"),
     /** Replaces the whole list; the gateway writes it to config.toml. */
-    put: (body: { default_model: string | null; models: ModelEntry[] }) =>
+    put: (body: {
+      version: string;
+      default_model: string | null;
+      models: ModelEntry[];
+    }) =>
       request<ModelsView>("/llm/models", {
         method: "PUT",
         body: JSON.stringify(body),

@@ -385,7 +385,8 @@ async fn main() -> anyhow::Result<()> {
             "model list"
         ),
         None => warn!(
-            "[[llm.models]] lists no model: agents cannot call an LLM until one is added in              config.toml, with `havn model add`, or on the dashboard"
+            "[[llm.models]] lists no model: agents cannot call an LLM until one is added in \
+             config.toml, with `havn model add`, or on the dashboard"
         ),
     }
     cfg.llm.default_model = catalog.default_model;

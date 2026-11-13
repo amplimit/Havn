@@ -58,7 +58,8 @@ for line in \
     "havn setup --non-interactive" \
     "export HAVN_AGE_KEY=" \
     "havn start" \
-    "havn credential add anthropic "     "havn model add anthropic:" \
+    "havn credential add anthropic " \
+    "havn model add anthropic:" \
     "cd havn/apps/dashboard" \
     "npm install" \
     "npm run build" \
@@ -133,7 +134,10 @@ log "havn credential add anthropic"
 # agent then uses as the gateway default.
 MODEL="$(awk 'index($0, "havn model add anthropic:") == 1 { print $4; exit }' README.md)"
 log "havn model add $MODEL"
-"${AS_ROOT[@]}" havn model add "$MODEL" >/dev/null     || { tail -50 "$GATEWAY_LOG" >&2; die "model add failed"; }
+if ! "${AS_ROOT[@]}" havn model list | awk -v m="$MODEL" '$1 == m { f = 1 } END { exit !f }'; then
+    "${AS_ROOT[@]}" havn model add "$MODEL" >/dev/null \
+        || { tail -50 "$GATEWAY_LOG" >&2; die "model add failed"; }
+fi
 
 # README: `cd havn/apps/dashboard && npm install && npm run build && npm start`;
 # `npm ci` installs the same lockfile without rewriting it.

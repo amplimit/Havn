@@ -423,4 +423,25 @@ mod tests {
         let live = handles.allowed_origins.load();
         assert_eq!(&**live, &vec!["https://example.com".to_string()]);
     }
+
+    #[test]
+    fn model_list_changes_apply_in_place() {
+        let old = GatewayConfig::default();
+        let handles = ReloadHandles::from_config(&old);
+        let mut new = old.clone();
+        new.llm.models = vec![crate::model_catalog::ModelEntry {
+            id: "openai:gpt-5".into(),
+            label: None,
+            max_output_tokens: None,
+        }];
+        new.llm.default_model = Some("openai:gpt-5".into());
+        let changed = diff_paths(
+            &serde_json::to_value(&old).unwrap(),
+            &serde_json::to_value(&new).unwrap(),
+        );
+        let plan = ReloadPlan::build(&changed);
+        assert!(plan.restart_paths.is_empty(), "{changed:?}");
+        handles.apply_hot(&new, &plan.hot_paths);
+        assert_eq!(*handles.models.load_full(), new.llm.catalog());
+    }
 }

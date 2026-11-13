@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { api, type ModelEntry, type ModelsView } from "@/lib/api";
+import { ApiError, api, type ModelEntry, type ModelsView } from "@/lib/api";
 
 const PROVIDERS = ["anthropic", "openai", "openrouter", "gemini"];
 
@@ -27,10 +27,21 @@ export default function ModelsPage() {
     setBusy(true);
     setError(null);
     try {
-      setView(await api.models.put({ default_model: defaultModel, models }));
+      setView(
+        await api.models.put({
+          version: view?.version ?? "",
+          default_model: defaultModel,
+          models,
+        }),
+      );
       return true;
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (e instanceof ApiError && e.status === 409) {
+        setError("The list was changed elsewhere; this is the current list. Try again.");
+        api.models.get().then(setView).catch(() => {});
+      } else {
+        setError(e instanceof Error ? e.message : String(e));
+      }
       return false;
     } finally {
       setBusy(false);
@@ -91,6 +102,25 @@ export default function ModelsPage() {
           The list lives in <code className="font-mono">[[llm.models]]</code>{" "}
           of the gateway&apos;s config.toml; changes here are written there.
         </p>
+        {view && editable && view.default_model && (
+          <p className="mt-3 text-sm" style={{ color: "var(--color-body)" }}>
+            The default is set to {view.default_model}.{" "}
+            <button
+              type="button"
+              className="underline"
+              disabled={busy}
+              onClick={() => save(null, view.models)}
+            >
+              Use the first entry instead
+            </button>
+          </p>
+        )}
+        {view && editable && !view.default_model && view.models.length > 1 && (
+          <p className="mt-3 text-sm" style={{ color: "var(--color-body)" }}>
+            No default is set, so moving another entry to the top changes the
+            model of every agent that does not choose its own.
+          </p>
+        )}
         {view && !editable && (
           <p className="mt-3 text-sm" style={{ color: "var(--color-ruby)" }}>
             With trust_header on, the list can only be changed in config.toml.

@@ -51,18 +51,20 @@ export default function SettingsPage({
     let cancelled = false;
     (async () => {
       try {
-        const [a, e, m] = await Promise.all([
-          api.agents.get(id),
-          api.embedding(),
-          api.models.get(),
-        ]);
+        const [a, e] = await Promise.all([api.agents.get(id), api.embedding()]);
         if (cancelled) return;
         setAgent(a);
         setEmbedding(e);
-        setModels(m);
         setName(a.name);
         const cfg = a.config as Record<string, unknown>;
         setModel(typeof cfg.model === "string" ? cfg.model : "");
+        // Without the list the picker only offers the current model.
+        api.models
+          .get()
+          .then((m) => {
+            if (!cancelled) setModels(m);
+          })
+          .catch(() => {});
         const hb =
           (cfg.heartbeat as Record<string, unknown> | undefined) ?? {};
         const secs = typeof hb.interval_seconds === "number"
@@ -92,9 +94,13 @@ export default function SettingsPage({
       // Build a minimal config patch — shallow-merged server-side, so
       // keys we don't touch stay untouched.
       const config: Record<string, unknown> = {};
-      // null clears the key: the agent then follows the gateway's
-      // default model.
-      config.model = model || null;
+      // Only a changed model is sent: an agent whose model was taken off
+      // the list can still be renamed. null clears the key, and the agent
+      // then follows the gateway's default model.
+      const saved = (agent.config as Record<string, unknown>).model;
+      if (model !== (typeof saved === "string" ? saved : "")) {
+        config.model = model || null;
+      }
       const hbNum = Number(heartbeatMin);
       if (heartbeatMin.trim() && Number.isFinite(hbNum) && hbNum > 0) {
         config.heartbeat = { interval_seconds: Math.round(hbNum * 60) };
@@ -221,7 +227,7 @@ export default function SettingsPage({
                 {m.label ? `${m.label} (${m.id})` : m.id}
               </option>
             ))}
-            {model && models && !models.models.some((m) => m.id === model) && (
+            {model && !models?.models.some((m) => m.id === model) && (
               <option value={model}>{model} (not in the model list)</option>
             )}
           </select>

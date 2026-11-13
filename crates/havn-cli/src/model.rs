@@ -17,19 +17,23 @@ pub struct ModelEntry {
 
 #[derive(Debug, Deserialize)]
 pub struct ModelsView {
+    pub version: String,
     pub default_model: Option<String>,
     pub effective_default: Option<String>,
     pub models: Vec<ModelEntry>,
 }
 
+// `version` is the one the list was read at: the gateway refuses the write
+// if the list changed since.
 async fn save(
     gw: &Gateway,
+    version: &str,
     default_model: Option<&str>,
     models: &[ModelEntry],
 ) -> anyhow::Result<ModelsView> {
     gw.put_json(
         "/llm/models",
-        &json!({ "default_model": default_model, "models": models }),
+        &json!({ "version": version, "default_model": default_model, "models": models }),
     )
     .await
 }
@@ -86,7 +90,7 @@ pub async fn add(
     } else {
         view.default_model.as_deref()
     };
-    let saved = save(&gw, default_model, &models).await?;
+    let saved = save(&gw, &view.version, default_model, &models).await?;
     println!(
         "added {id}; default model: {}",
         saved.effective_default.as_deref().unwrap_or("none")
@@ -104,7 +108,7 @@ pub async fn remove(id: &str) -> anyhow::Result<()> {
         anyhow::bail!("{id} is not listed");
     }
     let default_model = view.default_model.as_deref().filter(|d| *d != id);
-    let saved = save(&gw, default_model, &models).await?;
+    let saved = save(&gw, &view.version, default_model, &models).await?;
     println!(
         "removed {id}; default model: {}",
         saved.effective_default.as_deref().unwrap_or("none")
@@ -118,7 +122,7 @@ pub async fn set_default(id: &str) -> anyhow::Result<()> {
     if !view.models.iter().any(|m| m.id == id) {
         anyhow::bail!("{id} is not listed; add it with `havn model add {id}`");
     }
-    save(&gw, Some(id), &view.models).await?;
+    save(&gw, &view.version, Some(id), &view.models).await?;
     println!("default model: {id}");
     Ok(())
 }

@@ -216,7 +216,7 @@ id = "openrouter:deepseek/deepseek-v4.1-flash-1017"
 max_output_tokens = 32000       # optional cap on max_tokens for this model
 ```
 
-On upgrade from a gateway without the list, agent and policy model names are rewritten to `provider:model` with the provider older gateways inferred from the name, and if `config.toml` has no `[llm] models` yet, the models existing agents use are added to it.
+On the first start after an upgrade from a gateway without the list, agent and policy model names are rewritten to `provider:model` with the provider older gateways inferred from the name, and if `config.toml` has no `[llm] models` yet, the models existing agents use are added to it (led by `anthropic:claude-opus-4-6`, the model older gateways gave agents without one, if there are such agents). A new install starts with an empty list.
 
 `max_tokens` on every LLM call is capped by `[llm] max_tokens_ceiling` (default 128000, the largest output limit of a known model; applied on `havn gateway restart`), whatever agents ask for. A running call holds a reservation of up to that many output tokens against the caps it is billed to, so with small caps on a shared credential, lower it to keep one user's large `max_tokens` from tying up everyone else's remaining budget:
 
@@ -232,7 +232,7 @@ To send a provider's calls to another endpoint that speaks the same API (an inte
 anthropic = "https://llm-gateway.internal.example"
 ```
 
-Config edits are picked up live: hot-reloadable fields (`allowed_origins`, `[llm] default_model`, `[[llm.models]]`, `[[bindings]]`, `[[channels]]`) apply in place, while deploy-time fields (`listen`, `db_path`, paths) are logged as needing a `havn gateway restart` to apply — the gateway never restarts itself. Per-agent resource limits come from the agent's role policy, not a global config block.
+Config edits are picked up live: `allowed_origins`, `[llm] default_model` and `[[llm.models]]` apply in place, while every other change (`listen`, `db_path`, paths, `[[bindings]]`, `[[channels]]`, ...) is logged as needing a `havn gateway restart` to apply — the gateway never restarts itself. Per-agent resource limits come from the agent's role policy, not a global config block.
 
 For non-loopback exposure, configure a reverse proxy and enable trust-header mode:
 

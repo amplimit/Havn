@@ -665,22 +665,28 @@ async fn check_models() -> Verdict {
     let Ok(view) = gw.get_json::<crate::model::ModelsView>("/llm/models").await else {
         return Verdict::Ok;
     };
-    let creds: Vec<CredentialProvider> = gw.get_json("/credentials").await.unwrap_or_default();
-    let (verdict, msg) = models_verdict(&view, &creds);
+    let creds: Option<Vec<CredentialProvider>> = gw.get_json("/credentials").await.ok();
+    let (verdict, msg) = models_verdict(&view, creds.as_deref());
     line(verdict, "models", &msg);
     verdict
 }
 
 fn models_verdict(
     view: &crate::model::ModelsView,
-    creds: &[CredentialProvider],
+    creds: Option<&[CredentialProvider]>,
 ) -> (Verdict, String) {
     let Some(default) = view.effective_default.as_deref() else {
         return (
             Verdict::Warn,
-            "no model in [[llm.models]]: agents cannot chat until one is added, e.g.              `havn model add anthropic:claude-sonnet-4-6`"
+            "no model in [[llm.models]]: agents cannot chat until one is added, e.g. \
+             `havn model add anthropic:claude-sonnet-4-6`"
                 .into(),
         );
+    };
+    let listed = format!("{} listed, default {default}", view.models.len());
+    // Without the credential list there is nothing to check them against.
+    let Some(creds) = creds else {
+        return (Verdict::Ok, listed);
     };
     let mut missing: Vec<&str> = Vec::new();
     for m in &view.models {
@@ -693,15 +699,14 @@ fn models_verdict(
         }
     }
     if missing.is_empty() {
-        (
-            Verdict::Ok,
-            format!("{} listed, default {default}", view.models.len()),
-        )
+        (Verdict::Ok, listed)
     } else {
         (
             Verdict::Warn,
             format!(
-                "no enabled credential of yours for {}: calls to those models fail until one                  is added with `havn credential add <provider> <key>`",
+                "{listed}; no enabled credential of yours for {}: calls to those models fail \
+                 unless a team credential covers them or one is added with \
+                 `havn credential add <provider> <key>`",
                 missing.join(", ")
             ),
         )
@@ -716,6 +721,7 @@ mod tests {
 
     fn view(ids: &[&str]) -> crate::model::ModelsView {
         crate::model::ModelsView {
+            version: String::new(),
             default_model: None,
             effective_default: ids.first().map(|s| (*s).to_string()),
             models: ids
@@ -738,25 +744,30 @@ mod tests {
 
     #[test]
     fn models_need_a_list_and_a_credential_per_provider() {
-        let (v, msg) = models_verdict(&view(&[]), &[]);
+        let (v, msg) = models_verdict(&view(&[]), Some(&[]));
         assert!(
             matches!(v, Verdict::Warn) && msg.contains("havn model add"),
             "{msg}"
         );
         let (v, msg) = models_verdict(
             &view(&["openrouter:deepseek/deepseek-r1:free", "anthropic:claude-x"]),
-            &[cred("llm:openrouter", true), cred("anthropic", false)],
+            Some(&[cred("llm:openrouter", true), cred("anthropic", false)]),
         );
         assert!(matches!(v, Verdict::Warn), "{msg}");
         assert!(
-            msg.contains("anthropic") && !msg.contains("openrouter"),
+            msg.contains("for anthropic") && !msg.contains("for openrouter"),
             "{msg}"
         );
         let (v, msg) = models_verdict(
             &view(&["openrouter:deepseek/deepseek-r1:free"]),
-            &[cred("openrouter", true)],
+            Some(&[cred("openrouter", true)]),
         );
         assert!(matches!(v, Verdict::Ok), "{msg}");
+        let (v, msg) = models_verdict(&view(&["anthropic:claude-x"]), None);
+        assert!(
+            matches!(v, Verdict::Ok),
+            "unreadable credentials are not missing: {msg}"
+        );
     }
 
     fn probe(parent_exists: bool, writable: io::Result<()>, root_user: bool) -> ParentProbe {
