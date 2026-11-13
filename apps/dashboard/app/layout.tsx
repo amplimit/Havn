@@ -16,9 +16,14 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body>
+        <a href="#main" className="skip-link">
+          Skip to content
+        </a>
         <div className="flex min-h-screen">
           <Sidebar />
-          <main className="flex-1 overflow-x-hidden">{children}</main>
+          <main id="main" tabIndex={-1} className="flex-1 overflow-x-hidden focus:outline-none">
+            {children}
+          </main>
         </div>
       </body>
     </html>

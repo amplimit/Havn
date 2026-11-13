@@ -16,6 +16,7 @@
  */
 
 import { use, useEffect, useState } from "react";
+import { Lock } from "lucide-react";
 import { ApiError, api, type CredentialView, type TeamView } from "@/lib/api";
 
 export default function TeamCredentialsPage({
@@ -134,7 +135,8 @@ export default function TeamCredentialsPage({
         }}
         title="Stored as age-encrypted ciphertext (spec §13). The gateway needs HAVN_AGE_KEY in its environment to decrypt at use time."
       >
-        🔐 keys are encrypted at rest with age (HAVN_AGE_KEY)
+        <Lock size={14} className="shrink-0" aria-hidden="true" />
+          keys are encrypted at rest with age (HAVN_AGE_KEY)
       </div>
 
       {team?.is_admin && (

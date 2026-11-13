@@ -86,7 +86,7 @@ export default function RolesPage({
       await load();
     } catch (err) {
       if (err instanceof ApiError) {
-        setError(`${err.status}: ${err.body}`);
+        setError(err.message);
       } else {
         setError(err instanceof Error ? err.message : String(err));
       }

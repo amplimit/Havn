@@ -123,6 +123,35 @@
     background-color: var(--color-stripe-purple-light);
     color: var(--color-deep-navy);
   }
+
+  /* Tailwind 4 resets buttons to the default cursor. */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  select:not(:disabled),
+  summary,
+  label[for] {
+    cursor: pointer;
+  }
+
+  /* Keyboard focus. Text fields keep their own ring (.input:focus). */
+  :focus-visible {
+    outline: 2px solid var(--color-stripe-purple);
+    outline-offset: 2px;
+  }
+  .input:focus-visible {
+    outline: none;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
 }
 
 @layer components {
@@ -240,6 +269,23 @@
     background-color: rgba(234, 34, 97, 0.12);
     color: var(--color-ruby);
     border: 1px solid rgba(234, 34, 97, 0.3);
+  }
+
+  /* Skip link: off screen until focused with the keyboard. */
+  .skip-link {
+    position: absolute;
+    left: 16px;
+    top: -48px;
+    z-index: 50;
+    padding: 8px 12px;
+    border-radius: var(--radius-tight);
+    background-color: var(--color-stripe-purple);
+    color: #ffffff;
+    font-size: 14px;
+    transition: top 120ms ease;
+  }
+  .skip-link:focus {
+    top: 12px;
   }
 
   /* === Display headlines (DESIGN.md §3) === */

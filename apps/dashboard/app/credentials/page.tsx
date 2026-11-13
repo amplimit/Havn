@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { Lock } from "lucide-react";
 import { api, type CredentialView } from "@/lib/api";
 
 export default function CredentialsPage() {
@@ -80,7 +81,8 @@ export default function CredentialsPage() {
           }}
           title="Stored as age-encrypted ciphertext (spec §13). The gateway needs HAVN_AGE_KEY in its environment to decrypt at use time; a stolen DB file alone is useless without the key."
         >
-          🔐 keys are encrypted at rest with age (HAVN_AGE_KEY)
+          <Lock size={14} className="shrink-0" aria-hidden="true" />
+          keys are encrypted at rest with age (HAVN_AGE_KEY)
         </div>
       </header>
 

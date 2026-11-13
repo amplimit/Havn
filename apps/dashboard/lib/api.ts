@@ -236,14 +236,47 @@ export type AuditListResponse = {
   next_before: string | null;
 };
 
+// The gateway answers errors with `{"error": "<kind>: <message>"}`; the
+// kind repeats the status, so only the message is shown.
+const ERROR_KINDS =
+  /^(bad request|forbidden|conflict|not found|unauthorized|internal|upstream provider error): /i;
+
+export function readableError(status: number, body: string): string {
+  let text = body.trim();
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && "error" in parsed) {
+      const { error } = parsed as { error: unknown };
+      if (typeof error === "string") text = error;
+    }
+  } catch {
+    // Not JSON: a proxy or the dashboard server answered; keep the text.
+  }
+  text = text.replace(ERROR_KINDS, "");
+  if (status === 401 || status === 403) {
+    return text || "you are not allowed to do this";
+  }
+  if (status === 502 || status === 503 || status === 504) {
+    return text || "the gateway is not reachable";
+  }
+  return text || `request failed (${status})`;
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
     public body: string,
   ) {
-    super(`gateway returned ${status}: ${body}`);
+    super(readableError(status, body));
   }
 }
+
+export type AuthInfo = {
+  identity_header: string;
+  trust_header: boolean;
+  /** Absent on gateways before 0.1.5. */
+  version?: string;
+};
 
 async function request<T>(
   path: string,
@@ -277,6 +310,7 @@ function qs(params: Record<string, string | number | undefined>): string {
 
 export const api = {
   me: () => request<MeView>("/me"),
+  authInfo: () => request<AuthInfo>("/auth/info"),
   /** System-level embedding/hybrid retrieval config (spec §9.4 v0.7). */
   embedding: () => request<EmbeddingStatus>("/embedding"),
   /** Switch the active provider at runtime. The config is swapped

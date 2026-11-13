@@ -2,6 +2,7 @@
 
 import { use, useEffect, useState } from "react";
 import Link from "next/link";
+import { Pin } from "lucide-react";
 import {
   ApiError,
   api,
@@ -342,7 +343,8 @@ function PinPill() {
         color: "var(--color-success-text)",
       }}
     >
-      📌 pinned
+      <Pin size={12} className="shrink-0" aria-hidden="true" />
+      pinned
     </span>
   );
 }
