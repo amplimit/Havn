@@ -149,9 +149,15 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
                 head -c 1 /proc/1/environ >/dev/null 2>&1; then
                 die "a process without capabilities in the agent can read the runtime's environment"
             fi
+            # Only the CA certificates of /etc/ssl, never private/.
+            [ -e "/proc/$pid/root/etc/ssl/certs" ] \
+                || die "the agent has no /etc/ssl/certs"
+            [ "$(ls -A "/proc/$pid/root/etc/ssl")" = "certs" ] \
+                || die "the agent sees more of /etc/ssl than certs: $(ls -A "/proc/$pid/root/etc/ssl" | paste -sd' ')"
         done
         ok "every runtime thread is under seccomp with no_new_privs"
         ok "the agent runtime holds no capabilities, and its tools cannot read its memory"
+        ok "the agent sees only the CA certificates of /etc/ssl"
         ok "NamespaceSpawner isolation: memory.max=$(cat "$CGROUP/memory.max") pids.max=$(cat "$CGROUP/pids.max")"
         ;;
     subprocess)

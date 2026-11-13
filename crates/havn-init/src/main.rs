@@ -89,7 +89,7 @@ fn main() {
         // Network policy bit (spec §6.3 v0.7). Spawner sets
         // HAVN_NETWORK_OUTBOUND=1 only when policy.network_policy
         // .egress_allowed is true; absent / "0" means the agent ns
-        // stays empty (no /etc/resolv.conf, no /etc/ssl bind). Mirrors
+        // gets no /etc/resolv.conf. Mirrors
         // the gate the spawner uses for `configure_agent_network`,
         // keeping the two layers in sync — operator changing one and
         // not the other shouldn't be possible because they're driven
