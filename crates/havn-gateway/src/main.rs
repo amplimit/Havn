@@ -714,6 +714,13 @@ fn instance_locks(
     )?];
     let socket_lock = lock_path_for(socket_path);
     if socket_lock != db_lock {
+        // The listener creates this directory too, but only later; it may
+        // be on a tmpfs that is empty after a reboot.
+        if let Some(dir) = socket_lock.parent()
+            && !dir.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
         locks.push(instance_lock(
             &socket_lock,
             &format!("the agent socket {}", socket_path.display()),
@@ -1150,6 +1157,16 @@ mod tests {
         drop(instance_locks(&d.join("d.db"), &d.join("d.sock"), None).expect("other data"));
         drop(first);
         drop(instance_locks(&d.join("c.db"), &d.join("c.sock"), Some(&host)).expect("freed"));
+    }
+
+    #[test]
+    fn the_socket_directory_is_created_for_its_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path();
+        let locks =
+            instance_locks(&d.join("a.db"), &d.join("run/havn/agent.sock"), None).expect("starts");
+        assert_eq!(locks.len(), 2);
+        assert!(d.join("run/havn/agent.sock.lock").exists());
     }
 
     #[test]

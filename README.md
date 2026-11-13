@@ -93,7 +93,7 @@ systemctl enable --now havn
 journalctl -u havn -f
 ```
 
-One gateway runs per database and agent socket, and one gateway that isolates agents per host (with `HAVN_SPAWNER=subprocess` only the first applies). A second one, such as `havn start` while the unit runs, exits with an error naming the running one's pid instead of starting; the locks are `<db_path>.lock`, `<agent_socket_path>.lock` and `/run/havn-gateway.lock`. A gateway from before 0.1.4 holds none of them, so restart the unit after upgrading before starting any other gateway.
+One gateway runs per database and agent socket, and one gateway that isolates agents per host (with `HAVN_SPAWNER=subprocess` only the first applies). A second one, such as `havn start` while the unit runs, exits with an error naming the running one's pid instead of starting; the locks are `<db_path>.lock`, `<agent_socket_path>.lock` and `/run/havn-gateway.lock`. A gateway from release v0.1.3 or earlier holds none of them, so restart the unit after upgrading before starting any other gateway.
 
 Keep `/etc/havn/havn.env` mode 0600 and owned by root, and write the key with an editor rather than `echo`, which leaves it in the shell history. systemd takes the value inside single quotes literally; it must not contain `'` or `\`.
 
