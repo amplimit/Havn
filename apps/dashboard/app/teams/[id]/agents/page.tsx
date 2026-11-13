@@ -69,7 +69,7 @@ export default function TeamAgentsPage({
 
   if (agents.length === 0) {
     return (
-      <div className="card-elevated px-8 py-12 text-center">
+      <div className="card-elevated px-6 py-12 text-center sm:px-8">
         <p className="display-h3 mb-2">no team agents</p>
         <p style={{ color: "var(--color-body)" }}>
           Members create team agents from{" "}

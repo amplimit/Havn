@@ -57,7 +57,7 @@ export default function TeamLayout({
   }, [id]);
 
   return (
-    <div className="mx-auto max-w-5xl px-8 py-8">
+    <div className="mx-auto max-w-5xl px-4 py-6 sm:px-8 sm:py-8">
       <header className="mb-6">
         <Link
           href="/teams"

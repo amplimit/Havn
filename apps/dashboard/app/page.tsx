@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { api, type AgentView } from "@/lib/api";
 import { SetupChecklist } from "@/components/SetupChecklist";
+import { SkeletonList } from "@/components/SkeletonList";
 
 export default function HomePage() {
   const [agents, setAgents] = useState<AgentView[] | null>(null);
@@ -21,7 +22,20 @@ export default function HomePage() {
   }
 
   useEffect(() => {
-    reload();
+    let cancelled = false;
+    api.agents.list().then(
+      (a) => {
+        if (cancelled) return;
+        setAgents(a);
+        setError(null);
+      },
+      (e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   async function deleteAgent(id: string) {
@@ -44,8 +58,8 @@ export default function HomePage() {
   }
 
   return (
-    <div className="mx-auto max-w-5xl px-8 py-12">
-      <header className="mb-8 flex items-end justify-between">
+    <div className="mx-auto max-w-5xl px-4 py-8 sm:px-8 sm:py-12">
+      <header className="mb-8 flex flex-wrap items-end justify-between gap-4">
         <div>
           <h1 className="display-h1">your agents</h1>
           <p
@@ -71,12 +85,12 @@ export default function HomePage() {
         </div>
       )}
 
-      <SetupChecklist agentCount={agents?.length ?? null} onVisibleChange={setChecklistShown} />
+      {agents?.length === 0 && (
+        <SetupChecklist agentCount={0} onVisibleChange={setChecklistShown} />
+      )}
 
       {agents === null && !error && (
-        <div className="card px-4 py-6 text-sm" style={{ color: "var(--color-body)" }}>
-          loading…
-        </div>
+        <SkeletonList />
       )}
 
       {agents?.length === 0 && !checklistShown && (
@@ -123,6 +137,13 @@ export default function HomePage() {
           </li>
         ))}
       </ul>
+
+      {/* Below an existing list, so loading it does not push the list down. */}
+      {agents && agents.length > 0 && (
+        <div className="mt-8">
+          <SetupChecklist agentCount={agents.length} />
+        </div>
+      )}
     </div>
   );
 }

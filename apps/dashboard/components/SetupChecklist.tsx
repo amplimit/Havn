@@ -74,8 +74,9 @@ export function SetupChecklist({
             >
               <TriangleAlert size={14} className="mt-0.5 shrink-0" aria-hidden="true" />
               <span>
-                None of your keys is for <strong className="font-normal">{defaultProvider}</strong>,
-                the provider of the default model {models.effective_default}.
+                No key your agents can use is for{" "}
+                <strong className="font-normal">{defaultProvider}</strong>, the provider of the
+                default model {models.effective_default}.
               </span>
             </span>
           )}

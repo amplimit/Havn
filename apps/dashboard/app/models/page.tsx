@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { ApiError, LLM_PROVIDERS as PROVIDERS, api, type ModelEntry, type ModelsView } from "@/lib/api";
+import { SkeletonList } from "@/components/SkeletonList";
 
 export default function ModelsPage() {
   const [view, setView] = useState<ModelsView | null>(null);
@@ -91,7 +92,7 @@ export default function ModelsPage() {
   const editable = view?.editable ?? false;
 
   return (
-    <div className="mx-auto max-w-4xl px-8 py-12">
+    <div className="mx-auto max-w-4xl px-4 py-8 sm:px-8 sm:py-12">
       <header className="mb-8">
         <h1 className="display-h1">models</h1>
         <p className="mt-2" style={{ color: "var(--color-body)", fontSize: 18 }}>
@@ -214,9 +215,7 @@ export default function ModelsPage() {
       <h2 className="display-h2 mb-4">listed ({view?.models.length ?? "…"})</h2>
 
       {view === null && !error && (
-        <div className="card px-4 py-6 text-sm" style={{ color: "var(--color-body)" }}>
-          loading…
-        </div>
+        <SkeletonList />
       )}
 
       {view?.models.length === 0 && (

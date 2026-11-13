@@ -590,7 +590,7 @@ export const api = {
   },
 };
 
-export const LLM_PROVIDERS = ["anthropic", "openai", "openrouter", "gemini"];
+export const LLM_PROVIDERS: readonly string[] = ["anthropic", "openai", "openrouter", "gemini"];
 
 // Credentials are stored as `llm:<provider>` or a bare name; channel and
 // SaaS tokens are not LLM keys.

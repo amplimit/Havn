@@ -314,6 +314,18 @@
   }
 }
 
+/* Phone widths: smaller display type so headings fit 390px. */
+@media (max-width: 639px) {
+  .display-h1 {
+    font-size: 34px;
+    letter-spacing: -0.6px;
+  }
+  .display-h2 {
+    font-size: 26px;
+    letter-spacing: -0.4px;
+  }
+}
+
 /* === Markdown content (chat bubbles + composer preview) ===
  * Keep prose tight — chat bubbles are narrow columns, not articles.
  * Code blocks use SourceCodePro per DESIGN.md §3 (12px / line-height 2).

@@ -233,14 +233,14 @@ export default function ChatPage({
 
   if (!agent && !error) {
     return (
-      <div className="px-8 py-12" style={{ color: "var(--color-body)" }}>
+      <div className="px-4 py-8 sm:px-8 sm:py-12" style={{ color: "var(--color-body)" }}>
         loading…
       </div>
     );
   }
   if (error) {
     return (
-      <div className="mx-auto max-w-3xl px-8 py-12">
+      <div className="mx-auto max-w-3xl px-4 py-8 sm:px-8 sm:py-12">
         <div
           className="card px-4 py-3 text-sm"
           style={{ color: "var(--color-ruby)", borderColor: "rgba(234, 34, 97, 0.3)" }}
@@ -256,10 +256,10 @@ export default function ChatPage({
   if (!agent) return null;
 
   return (
-    <div className="flex h-screen flex-col">
+    <div className="flex h-[calc(100dvh-60px)] flex-col md:h-dvh">
       {/* Header */}
       <div
-        className="flex items-center justify-between border-b px-8 py-4"
+        className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-4 sm:px-8"
         style={{ borderColor: "var(--color-border-default)" }}
       >
         <div>
@@ -304,7 +304,7 @@ export default function ChatPage({
       {/* Conversation */}
       <div
         ref={scrollRef}
-        className="flex-1 overflow-y-auto px-8 py-6"
+        className="flex-1 overflow-y-auto px-4 py-6 sm:px-8"
         style={{ backgroundColor: "var(--color-surface-muted)" }}
       >
         <div className="mx-auto flex max-w-3xl flex-col gap-3">
@@ -592,7 +592,7 @@ function Composer({
   return (
     <form
       onSubmit={onSubmit}
-      className="border-t px-8 py-3"
+      className="border-t px-4 py-3 sm:px-8"
       style={{ borderColor: "var(--color-border-default)" }}
     >
       <div className="mx-auto max-w-3xl">

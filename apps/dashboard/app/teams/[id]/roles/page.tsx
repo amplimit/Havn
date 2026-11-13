@@ -48,8 +48,20 @@ export default function RolesPage({
   }
 
   useEffect(() => {
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    let cancelled = false;
+    api.teams.roles.list(id).then(
+      (r) => {
+        if (cancelled) return;
+        setRoles(r);
+        setError(null);
+      },
+      (e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
   }, [id]);
 
   async function onCreate(e: React.FormEvent) {

@@ -32,7 +32,8 @@ export default function TeamAuditPage({
   const { id } = use(params);
   const [entries, setEntries] = useState<AuditEntryView[]>([]);
   const [nextBefore, setNextBefore] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  // True while the first page for the current filter loads.
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [actionFilter, setActionFilter] = useState<string>("(all)");
   // Note: the gateway's filter builder takes optional `action_prefix`,
@@ -41,25 +42,6 @@ export default function TeamAuditPage({
   // the prefix changes (the lib client only exposes `(before,limit)`).
   // Promote to `lib/api.ts` when a third caller appears.
 
-  async function loadFirst() {
-    setLoading(true);
-    try {
-      const res = await fetchPage(id, { actionPrefix: prefixOrEmpty(actionFilter) });
-      setEntries(res.entries);
-      setNextBefore(res.next_before);
-      setError(null);
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 403) {
-        setError(
-          "You don't have admin permission on this team — audit log is admin-only.",
-        );
-      } else {
-        setError(e instanceof Error ? e.message : String(e));
-      }
-    } finally {
-      setLoading(false);
-    }
-  }
 
   async function loadMore() {
     if (!nextBefore || loading) return;
@@ -79,8 +61,30 @@ export default function TeamAuditPage({
   }
 
   useEffect(() => {
-    loadFirst();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    let cancelled = false;
+    fetchPage(id, { actionPrefix: prefixOrEmpty(actionFilter) }).then(
+      (res) => {
+        if (cancelled) return;
+        setEntries(res.entries);
+        setNextBefore(res.next_before);
+        setError(null);
+        setLoading(false);
+      },
+      (e) => {
+        if (cancelled) return;
+        if (e instanceof ApiError && e.status === 403) {
+          setError(
+            "You don't have admin permission on this team — audit log is admin-only.",
+          );
+        } else {
+          setError(e instanceof Error ? e.message : String(e));
+        }
+        setLoading(false);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
   }, [id, actionFilter]);
 
   return (
@@ -103,7 +107,10 @@ export default function TeamAuditPage({
         </span>
         <select
           value={actionFilter}
-          onChange={(e) => setActionFilter(e.target.value)}
+          onChange={(e) => {
+            setLoading(true);
+            setActionFilter(e.target.value);
+          }}
           className="bg-transparent text-sm"
           style={{ borderBottom: "1px solid var(--color-border-default)" }}
         >

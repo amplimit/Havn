@@ -107,7 +107,7 @@ export default function MemoryPage({
   const grouped = groupByKind(entries ?? []);
 
   return (
-    <div className="mx-auto max-w-5xl px-8 py-12">
+    <div className="mx-auto max-w-5xl px-4 py-8 sm:px-8 sm:py-12">
       <header className="mb-8">
         <Link
           href={`/agents/${id}`}
@@ -161,7 +161,7 @@ export default function MemoryPage({
       )}
 
       {entries !== null && uninitialised && (
-        <div className="card-elevated px-8 py-12 text-center">
+        <div className="card-elevated px-6 py-12 text-center sm:px-8">
           <p className="display-h3 mb-2">no memory yet</p>
           <p style={{ color: "var(--color-body)" }}>
             The agent hasn&apos;t been started yet, so its database hasn&apos;t been
@@ -172,7 +172,7 @@ export default function MemoryPage({
       )}
 
       {entries !== null && !uninitialised && entries.length === 0 && (
-        <div className="card-elevated px-8 py-12 text-center">
+        <div className="card-elevated px-6 py-12 text-center sm:px-8">
           <p className="display-h3 mb-2">no memory yet</p>
           <p style={{ color: "var(--color-body)" }}>
             The agent has been running but hasn&apos;t written any memory yet.
