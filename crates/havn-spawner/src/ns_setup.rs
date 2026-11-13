@@ -931,30 +931,51 @@ struct CapabilityWords {
     inheritable: u32,
 }
 
-/// Give up every capability for good, so the agent's uid 0 — which is the
-/// gateway's host uid — is an ordinary user to the kernel: no
+/// Give up every capability in the agent's user namespace for good: no
 /// `CAP_DAC_OVERRIDE` on files it can see, no `CAP_SYS_PTRACE`, nothing
-/// regained by exec'ing a root-owned or file-capability binary. Called by
-/// `havn-init` last before it execs the runtime, after the mounts that
-/// need the namespace's capabilities.
+/// regained by exec'ing a root-owned or file-capability binary. The
+/// agent's uid 0 is still the gateway's host uid, so it keeps the owner's
+/// permissions on host-root files it can reach. A user namespace the
+/// agent creates starts with its own full set, confined to that namespace.
+/// Called by `havn-init` last before it execs the runtime, after the
+/// mounts that need the namespace's capabilities.
 ///
 /// Locks the securebits first (needs `CAP_SETPCAP`), then empties the
 /// bounding set (also needs it), the ambient set, and finally the
-/// effective, permitted and inheritable sets.
-pub fn drop_all_capabilities() -> io::Result<()> {
+/// effective, permitted and inheritable sets, and checks the bounding set
+/// is empty.
+///
+/// # Safety
+///
+/// Each step affects the calling thread only, so the process must be
+/// single-threaded (havn-init's child after `fork` is).
+pub unsafe fn drop_all_capabilities() -> io::Result<()> {
     // SAFETY: prctl with integer arguments only.
     if unsafe { libc::prctl(libc::PR_SET_SECUREBITS, LOCKED_NO_ROOT_SECUREBITS, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    for cap in 0..=63 {
-        // SAFETY: prctl with integer arguments only.
-        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) } != 0 {
+    for cap in 0..=63_u32 {
+        // SAFETY: prctl with integer arguments only; the kernel reads the
+        // capability as an unsigned long.
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, libc::c_ulong::from(cap), 0, 0, 0) } != 0 {
             let err = io::Error::last_os_error();
             // EINVAL: past the kernel's last capability.
             if err.raw_os_error() == Some(libc::EINVAL) && cap > 0 {
                 break;
             }
             return Err(err);
+        }
+    }
+    for cap in 0..=63_u32 {
+        // SAFETY: prctl with integer arguments only.
+        match unsafe { libc::prctl(libc::PR_CAPBSET_READ, libc::c_ulong::from(cap), 0, 0, 0) } {
+            0 => {}
+            1 => {
+                return Err(io::Error::other(format!(
+                    "capability {cap} is still in the bounding set"
+                )));
+            }
+            _ => break,
         }
     }
     // SAFETY: prctl with integer arguments only.

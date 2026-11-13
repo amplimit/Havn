@@ -281,7 +281,8 @@ unsafe fn fork_and_exec_runtime(
             apply_landlock_or_exit(rw, ro);
             // The agent's uid 0 is the gateway's host uid: without this
             // it would run with a full capability set in its namespaces.
-            if let Err(e) = ns_setup::drop_all_capabilities() {
+            // SAFETY: this forked child is single-threaded.
+            if let Err(e) = unsafe { ns_setup::drop_all_capabilities() } {
                 eprintln!("havn-init: dropping capabilities failed: {e}");
                 // SAFETY: `_exit` is async-signal-safe.
                 unsafe { libc::_exit(1) };
