@@ -44,12 +44,21 @@ export function Sidebar() {
 
   useEffect(() => {
     if (open) {
+      const behind = [document.getElementById("main"), document.querySelector(".skip-link")];
+      for (const el of behind) if (el instanceof HTMLElement) el.inert = true;
+      const html = document.documentElement;
+      const overflow = html.style.overflow;
+      html.style.overflow = "hidden";
       closeButton.current?.focus();
       const onKey = (e: KeyboardEvent) => {
         if (e.key === "Escape") setOpen(false);
       };
       document.addEventListener("keydown", onKey);
-      return () => document.removeEventListener("keydown", onKey);
+      return () => {
+        document.removeEventListener("keydown", onKey);
+        for (const el of behind) if (el instanceof HTMLElement) el.inert = false;
+        html.style.overflow = overflow;
+      };
     }
     if (wasOpen.current) menuButton.current?.focus();
   }, [open]);
@@ -93,7 +102,8 @@ export function Sidebar() {
   return (
     <>
       <header
-        className="sticky top-0 z-30 flex items-center justify-between border-b px-4 py-2 md:hidden"
+        inert={open}
+        className="sticky top-0 z-30 flex h-15 items-center justify-between border-b px-4 md:hidden"
         style={{
           borderColor: "var(--color-border-default)",
           backgroundColor: "var(--color-surface)",
@@ -126,8 +136,12 @@ export function Sidebar() {
       <aside
         id="sidebar"
         aria-label="Navigation"
-        className={`fixed inset-y-0 left-0 z-50 flex w-72 max-w-[85vw] flex-col overflow-y-auto border-r transition-[transform,visibility] duration-200 md:sticky md:top-0 md:z-auto md:h-screen md:w-64 md:max-w-none md:shrink-0 md:translate-x-0 ${
-          open ? "translate-x-0" : "max-md:invisible max-md:-translate-x-full"
+        role={open ? "dialog" : undefined}
+        aria-modal={open ? true : undefined}
+        className={`fixed inset-y-0 left-0 z-50 flex w-72 max-w-[85vw] flex-col overflow-y-auto overscroll-contain border-r transition-[translate] duration-200 md:sticky md:top-0 md:z-auto md:h-screen md:w-64 md:max-w-none md:shrink-0 md:translate-x-0 ${
+          open
+            ? "translate-x-0"
+            : "max-md:invisible max-md:-translate-x-full max-md:transition-[translate,visibility]"
         }`}
         style={{
           borderColor: "var(--color-border-default)",

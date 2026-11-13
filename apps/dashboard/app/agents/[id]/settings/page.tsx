@@ -989,6 +989,16 @@ function RetrievalEditor({
         body as { provider: string; [k: string]: unknown },
       );
       onChange(next);
+      // Show what the gateway applied, not just what was typed.
+      const applied = embeddingForm(next);
+      setProvider(applied.provider);
+      setOpenaiModel(applied.openaiModel);
+      setOpenaiDimensions(applied.openaiDimensions);
+      setOpenaiApiKeyEnv(applied.openaiApiKeyEnv);
+      setOpenaiBaseUrl(applied.openaiBaseUrl);
+      setLocalModel(applied.localModel);
+      setLocalDimensions(applied.localDimensions);
+      setHrrDimensions(applied.hrrDimensions);
       flashSaved();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

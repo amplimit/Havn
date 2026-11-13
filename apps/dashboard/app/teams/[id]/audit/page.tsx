@@ -11,6 +11,7 @@
 
 import { use, useEffect, useState } from "react";
 import { ApiError, type AuditEntryView } from "@/lib/api";
+import { SkeletonList } from "@/components/SkeletonList";
 
 const ACTION_PREFIXES = [
   "(all)",
@@ -107,6 +108,7 @@ export default function TeamAuditPage({
         </span>
         <select
           value={actionFilter}
+          disabled={loading}
           onChange={(e) => {
             setLoading(true);
             setActionFilter(e.target.value);
@@ -122,7 +124,9 @@ export default function TeamAuditPage({
         </select>
       </div>
 
-      {entries.length === 0 && !loading ? (
+      {entries.length === 0 && loading ? (
+        <SkeletonList />
+      ) : entries.length === 0 ? (
         <p className="card px-4 py-6 text-sm" style={{ color: "var(--color-body)" }}>
           no entries.
         </p>

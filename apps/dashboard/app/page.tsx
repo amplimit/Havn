@@ -10,7 +10,7 @@ export default function HomePage() {
   const [agents, setAgents] = useState<AgentView[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const [checklistShown, setChecklistShown] = useState(false);
+  const [checklistShown, setChecklistShown] = useState<boolean | null>(null);
 
   async function reload() {
     try {
@@ -85,15 +85,19 @@ export default function HomePage() {
         </div>
       )}
 
-      {agents?.length === 0 && (
-        <SetupChecklist agentCount={0} onVisibleChange={setChecklistShown} />
-      )}
+      <div className="flex flex-col">
+      <div
+        className={`empty:hidden ${agents && agents.length > 0 ? "order-2 mt-8" : "order-0"}`}
+      >
+        <SetupChecklist agentCount={agents?.length ?? null} onVisibleChange={setChecklistShown} />
+      </div>
 
+      <div className="order-1">
       {agents === null && !error && (
         <SkeletonList />
       )}
 
-      {agents?.length === 0 && !checklistShown && (
+      {agents?.length === 0 && checklistShown === false && (
         <div className="card px-5 py-10 text-center" style={{ color: "var(--color-body)" }}>
           no agents yet
         </div>
@@ -137,13 +141,8 @@ export default function HomePage() {
           </li>
         ))}
       </ul>
-
-      {/* Below an existing list, so loading it does not push the list down. */}
-      {agents && agents.length > 0 && (
-        <div className="mt-8">
-          <SetupChecklist agentCount={agents.length} />
-        </div>
-      )}
+      </div>
+      </div>
     </div>
   );
 }

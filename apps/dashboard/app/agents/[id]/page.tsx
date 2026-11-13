@@ -256,7 +256,7 @@ export default function ChatPage({
   if (!agent) return null;
 
   return (
-    <div className="flex h-[calc(100dvh-60px)] flex-col md:h-dvh">
+    <div className="flex h-[calc(100dvh-(--spacing(15)))] flex-col md:h-dvh">
       {/* Header */}
       <div
         className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-4 sm:px-8"
