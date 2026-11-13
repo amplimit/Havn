@@ -107,7 +107,7 @@ sudo -i
 curl -fsSL https://raw.githubusercontent.com/amplimit/havn/main/install.sh | HAVN_VERSION=<version> bash
 systemctl stop havn
 # While it is stopped, back up the data: havn.db and every agent's agent.db
-cp -a ~/.local/share/havn ~/havn-backup-$(date +%F)
+cp -a ~/.local/share/havn ~/havn-backup-$(date +%Y%m%d-%H%M%S)
 systemctl start havn
 ```
 

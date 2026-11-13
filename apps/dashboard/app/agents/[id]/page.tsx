@@ -35,14 +35,18 @@ function turnBubbles(turns: ConversationTurn[], nextId: () => number): Bubble[] 
     }));
 }
 
+// Allowance for the gap between the gateway's clock and this browser's.
+const CLOCK_SKEW_MS = 60_000;
+
 // The stored conversation, fetched from `since` on, replaces what is on
 // screen, except notices (they exist only in this tab) and live bubbles
 // newer than the fetch that it does not have yet.
 function mergeStored(prev: Bubble[], stored: Bubble[], since: number): Bubble[] {
+  const recent = stored.filter((s) => s.ts >= since - CLOCK_SKEW_MS);
   const kept = prev.filter(
     (b) =>
       b.role === "system" ||
-      (b.ts >= since && !stored.some((s) => s.role === b.role && s.content === b.content)),
+      (b.ts >= since && !recent.some((s) => s.role === b.role && s.content === b.content)),
   );
   return [...stored, ...kept].sort((a, b) => a.ts - b.ts);
 }

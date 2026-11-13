@@ -485,14 +485,19 @@ pub(crate) async fn drain(state: &AppState, limit: Duration) {
         "letting agents finish their work"
     );
     let deadline = tokio::time::Instant::now() + limit;
-    for id in &connected {
-        // A full queue means a stalled agent: `shut_down` stops it.
-        if let Err(e) = state.registry.try_send(*id, GatewayToAgent::Drain).await {
-            debug!(agent_id = %id, error = %e, "could not ask agent to drain");
-        }
-    }
+    // Agents not asked yet: a full queue refuses the frame, so it is
+    // offered again on every poll until the agent takes it or the limit.
+    let mut unasked = connected.clone();
     let mut busy = connected;
     loop {
+        let mut refused = Vec::new();
+        for id in unasked {
+            if let Err(e) = state.registry.try_send(id, GatewayToAgent::Drain).await {
+                debug!(agent_id = %id, error = %e, "could not ask agent to drain yet");
+                refused.push(id);
+            }
+        }
+        unasked = refused;
         let mut still = Vec::with_capacity(busy.len());
         for id in busy {
             if state.registry.is_connected(id).await {
@@ -500,6 +505,7 @@ pub(crate) async fn drain(state: &AppState, limit: Duration) {
             }
         }
         busy = still;
+        unasked.retain(|id| busy.contains(id));
         if busy.is_empty() || tokio::time::Instant::now() >= deadline {
             break;
         }
