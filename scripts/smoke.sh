@@ -155,9 +155,26 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
             [ "$(ls -A "/proc/$pid/root/etc/ssl")" = "certs" ] \
                 || die "the agent sees more of /etc/ssl than certs: $(ls -A "/proc/$pid/root/etc/ssl" | paste -sd' ')"
         done
+        for pid in $RUNTIME_PIDS; do
+            # Without capabilities the agent can still ping and bind low
+            # ports in its own network namespace.
+            [ "$(nsenter -t "$pid" -n cat /proc/sys/net/ipv4/ping_group_range | awk '{print $1, $2}')" = "0 0" ] \
+                || die "the agent's network namespace does not allow ping"
+            [ "$(nsenter -t "$pid" -n cat /proc/sys/net/ipv4/ip_unprivileged_port_start)" = "0" ] \
+                || die "the agent's network namespace does not allow low ports"
+            # As a tool runs: no capabilities, the agent's locked
+            # securebits, under no_new_privs.
+            if command -v ping >/dev/null; then
+                nsenter -t "$pid" -U -m -n -p -- setpriv --no-new-privs \
+                    --securebits +noroot,+noroot_locked,+no_setuid_fixup,+no_setuid_fixup_locked \
+                    --bounding-set -all --inh-caps -all -- ping -c 1 -W 2 127.0.0.1 >/dev/null 2>&1 \
+                    || die "a process without capabilities in the agent cannot ping"
+            fi
+        done
         ok "every runtime thread is under seccomp with no_new_privs"
         ok "the agent runtime holds no capabilities, and its tools cannot read its memory"
         ok "the agent sees only the CA certificates of /etc/ssl"
+        ok "tools without capabilities can use localhost, ping and ports below 1024"
         ok "NamespaceSpawner isolation: memory.max=$(cat "$CGROUP/memory.max") pids.max=$(cat "$CGROUP/pids.max")"
         ;;
     subprocess)

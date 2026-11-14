@@ -9,9 +9,12 @@
 //! checks at setup so the operator gets advance notice rather than a
 //! surprise at first agent spawn.
 //!
-//! The test forks once, performs `unshare(CLONE_NEWUSER)` twice
-//! back-to-back inside the child, and runs `/bin/true` to confirm a
-//! clean exec inside the inner ns. No havn machinery; no pack
+//! The test forks once, performs `unshare(CLONE_NEWUSER)`, drops every
+//! capability (an agent's tools have none), performs it again, and runs
+//! `/bin/true` to confirm a clean exec inside the inner ns. Without the
+//! drop, the second call would have the first namespace's capabilities,
+//! which lets it past restrictions an agent's tools meet (Ubuntu's
+//! AppArmor `restrict_unprivileged_userns`). No havn machinery; no pack
 //! dependency; ~1 ms.
 
 #![cfg(target_os = "linux")]
@@ -35,6 +38,8 @@ pub enum NestedUserNsResult {
     /// `kernel.max_user_namespaces` exhausted, an LSM blocking the
     /// nesting, or `user.max_user_namespaces` set low.
     NestedFailed { errno: i32 },
+    /// Dropping the capabilities between the two calls failed.
+    CapDropFailed,
     /// `execve(/bin/true)` inside the inner ns failed. Probably means
     /// `/bin/true` isn't accessible (rare) or the kernel rejected exec
     /// across the namespace boundary.
@@ -77,6 +82,13 @@ impl NestedUserNsResult {
                         .into(),
                 ),
             ),
+            Self::CapDropFailed => (
+                "could not drop capabilities inside the first user namespace".into(),
+                Some(
+                    "Unusual; re-run, and file an issue with the kernel version if it persists."
+                        .into(),
+                ),
+            ),
             Self::ExecFailed { errno } => (
                 format!("execve(/bin/true) inside inner user-ns failed (errno {errno})"),
                 Some("Unusual; check that /bin/true exists and is executable.".into()),
@@ -97,11 +109,40 @@ const EXIT_OK: i32 = 0;
 const EXIT_OUTER_FAILED: i32 = 10;
 const EXIT_NESTED_FAILED: i32 = 11;
 const EXIT_EXEC_FAILED: i32 = 12;
+const EXIT_CAP_DROP_FAILED: i32 = 13;
+
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 
 /// Run the precheck. Forks once. Returns within ~50 ms on a healthy
 /// host. Idempotent and safe to call from `havn setup` and `havn doctor`
 /// at the same time (each is its own fork).
 pub fn check() -> NestedUserNsResult {
+    // Built before fork: the child must not allocate.
+    let prog = CString::new("/bin/true").expect("static cstr");
+    let argv = [prog.as_ptr(), std::ptr::null()];
+    let header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let no_caps = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
     // SAFETY: `fork` is async-signal-safe. Branch on the documented
     // return; do not touch tokio / allocator state in the child beyond
     // what the libc calls below need.
@@ -114,14 +155,17 @@ pub fn check() -> NestedUserNsResult {
             if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
                 unsafe { libc::_exit(EXIT_OUTER_FAILED) };
             }
+            // SAFETY: capset with a valid header and two data words.
+            if unsafe { libc::syscall(libc::SYS_capset, &raw const header, no_caps.as_ptr()) } != 0
+            {
+                unsafe { libc::_exit(EXIT_CAP_DROP_FAILED) };
+            }
             if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
                 unsafe { libc::_exit(EXIT_NESTED_FAILED) };
             }
             // Run /bin/true inside the inner ns. If exec succeeds, the
             // process becomes /bin/true and exits 0. We treat any exec
             // failure path (rare) as EXIT_EXEC_FAILED.
-            let prog = CString::new("/bin/true").expect("static cstr");
-            let argv = [prog.as_ptr(), std::ptr::null()];
             unsafe { libc::execve(prog.as_ptr(), argv.as_ptr(), std::ptr::null()) };
             unsafe { libc::_exit(EXIT_EXEC_FAILED) };
         }
@@ -138,6 +182,7 @@ pub fn check() -> NestedUserNsResult {
                     EXIT_OK => NestedUserNsResult::Ok,
                     EXIT_OUTER_FAILED => NestedUserNsResult::OuterFailed { errno: libc::EPERM },
                     EXIT_NESTED_FAILED => NestedUserNsResult::NestedFailed { errno: libc::EPERM },
+                    EXIT_CAP_DROP_FAILED => NestedUserNsResult::CapDropFailed,
                     EXIT_EXEC_FAILED => NestedUserNsResult::ExecFailed {
                         errno: libc::ENOENT,
                     },
