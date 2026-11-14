@@ -11,7 +11,9 @@
 //! `unshare(CLONE_NEWPID)` is "the next fork lands the child in the new
 //! PID ns" — so we fork once here:
 //!
-//! - **child** (PID 1 in the new PID ns): builds a minimal read-only
+//! - **child** (PID 1 in the new PID ns): opens the host paths it binds
+//!   while it still has the gateway's host uid, switches to the agent's
+//!   own ids (uid 0 of the namespace), builds a minimal read-only
 //!   rootfs via [`ns_setup::pivot_root_into_minimal_rootfs`] (binds /usr,
 //!   symlinks /lib, /lib64, /bin, /sbin → /usr/*, mounts a fresh `/proc`
 //!   inside the new ns, mirror-binds the agent's workspace at the same
@@ -164,10 +166,10 @@ fn main() {
             }
         };
 
-        // SAFETY: caller (NamespaceSpawner) has already done
-        //   unshare(CLONE_NEWUSER|NEWNS|NEWNET|NEWPID),
-        //   write_user_namespace_maps, and mark_mounts_private. The next
-        //   fork will land the child in the new PID ns as PID 1.
+        // SAFETY: caller (NamespaceSpawner) has already unshared
+        //   CLONE_NEWUSER|NEWNS|NEWNET|NEWPID, had the id maps written and
+        //   marked mounts private. The next fork will land the child in
+        //   the new PID ns as PID 1.
         let runtime_path = PathBuf::from(&runtime_binary);
         let exit_code = unsafe {
             fork_and_exec_runtime(
@@ -236,9 +238,30 @@ unsafe fn fork_and_exec_runtime(
             1
         }
         0 => {
+            // The paths are opened with the gateway's host uid, which may
+            // be the only one that can reach them; everything after runs
+            // as the agent's own ids.
+            let mut bound = vec![workspace, gateway_socket];
+            bound.extend(runtime_path.parent());
+            bound.extend(extra_mounts.iter().map(|m| m.path.as_path()));
+            let host = match ns_setup::HostPaths::open(bound) {
+                Ok(host) => host,
+                Err(e) => {
+                    eprintln!("havn-init: {e}");
+                    // SAFETY: `_exit` is async-signal-safe.
+                    unsafe { libc::_exit(1) };
+                }
+            };
+            // SAFETY: this forked child is single-threaded.
+            if let Err(e) = unsafe { ns_setup::become_namespace_root() } {
+                eprintln!("havn-init: switching to the agent's ids failed: {e}");
+                // SAFETY: `_exit` is async-signal-safe.
+                unsafe { libc::_exit(1) };
+            }
             // The runtime must not outlive this reaper: if the reaper is
             // killed (with the gateway, or by hand), so is the runtime and,
-            // with it as PID 1, everything in its namespace.
+            // with it as PID 1, everything in its namespace. After the
+            // switch above, which clears it.
             // The lifeline covers a reaper that died before the prctl.
             if let Err(e) = ns_setup::kill_with_parent(None) {
                 eprintln!("havn-init: PR_SET_PDEATHSIG failed: {e}");
@@ -259,6 +282,7 @@ unsafe fn fork_and_exec_runtime(
             // after the parent's unshare + this fork.
             if let Err(e) = unsafe {
                 ns_setup::pivot_root_into_minimal_rootfs(
+                    &host,
                     workspace,
                     runtime_path,
                     gateway_socket,
@@ -287,8 +311,8 @@ unsafe fn fork_and_exec_runtime(
             }
             let (rw, ro) = landlock_rules;
             apply_landlock_or_exit(rw, ro);
-            // The agent's uid 0 is the gateway's host uid: without this
-            // it would run with a full capability set in its namespaces.
+            // Without this the agent would run with a full capability set
+            // in its namespaces.
             // SAFETY: this forked child is single-threaded.
             if let Err(e) = unsafe { ns_setup::drop_all_capabilities() } {
                 eprintln!("havn-init: dropping capabilities failed: {e}");

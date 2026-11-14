@@ -7,12 +7,15 @@
 //! an already-open directory handle (through `/proc/self/fd/<fd>/<name>`,
 //! which does not re-walk the directory's own path), refuses to follow a
 //! symlink in the final component (`O_NOFOLLOW`), never blocks on special
-//! files (`O_NONBLOCK`) and only reads or writes regular files.
+//! files (`O_NONBLOCK`) and only reads or writes regular files. What it
+//! creates gets the owner of the directory it is in: under a root gateway
+//! that is the agent's own host uid, and the agent must be able to change
+//! what the gateway writes for it.
 
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::AsRawFd as _;
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 const NOFOLLOW_FLAGS: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
@@ -82,6 +85,7 @@ impl WorkspaceDir {
             .custom_flags(NOFOLLOW_FLAGS)
             .open(self.child(name)?)?;
         require_regular(name, &file.metadata()?)?;
+        self.give_to_owner(&file)?;
         file.set_len(0)?;
         file.write_all(contents.as_bytes())
     }
@@ -96,10 +100,37 @@ impl WorkspaceDir {
             .custom_flags(NOFOLLOW_FLAGS)
             .open(self.child(name)?)
         {
-            Ok(mut file) => file.write_all(contents.as_bytes()),
+            Ok(mut file) => {
+                self.give_to_owner(&file)?;
+                file.write_all(contents.as_bytes())
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Create the subdirectory `name` unless an entry of any kind already
+    /// has that name (mkdir does not follow a symlink there).
+    pub fn create_subdir_if_missing(&self, name: &str) -> io::Result<()> {
+        match std::fs::create_dir(self.child(name)?) {
+            Ok(()) => {
+                let created = Self::open(&self.child(name)?)?;
+                self.give_to_owner(&created.dir)
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Give `file`, created or opened in this directory, the directory's
+    /// owner and group.
+    fn give_to_owner(&self, file: &File) -> io::Result<()> {
+        let dir = self.dir.metadata()?;
+        let meta = file.metadata()?;
+        if (meta.uid(), meta.gid()) != (dir.uid(), dir.gid()) {
+            std::os::unix::fs::fchown(file, Some(dir.uid()), Some(dir.gid()))?;
+        }
+        Ok(())
     }
 
     /// Remove the entry `name` (unlinking a symlink itself, never its

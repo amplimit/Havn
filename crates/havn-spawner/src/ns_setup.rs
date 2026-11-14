@@ -20,11 +20,12 @@
 //!    everything it later forks, is inside the agent cgroup before exec.
 //! 1. `unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWNET)` — three new
 //!    namespaces atomically. The child enters them; the parent is unaffected.
-//! 2. Map the host UID/GID to UID/GID 0 inside the user namespace
-//!    (`/proc/self/setgroups` → "deny" — required for unprivileged
-//!    user-ns to write `gid_map` — then `/proc/self/uid_map` and
-//!    `/proc/self/gid_map`). After this the agent runs as UID 0 in its
-//!    own namespace, which is the host's unprivileged UID.
+//! 2. Map UID/GID 0 inside the user namespace to the agent's host ids.
+//!    Under a root gateway these are the agent's own unprivileged ids,
+//!    which only a process outside the namespace may map
+//!    ([`unshare_with_host_ids`]); `havn-init` then switches to them
+//!    ([`become_namespace_root`]). An unprivileged gateway maps its own
+//!    ids from inside ([`write_user_namespace_maps`]).
 //! 3. Mark mount propagation `MS_PRIVATE` so any future mount/unmount the
 //!    agent does inside its mount namespace doesn't escape to the host.
 //! 4. `PR_SET_PDEATHSIG` ([`kill_with_parent`]) so the agent is SIGKILLed
@@ -58,7 +59,9 @@
 
 use std::ffi::{CStr, CString};
 use std::io;
-use std::path::Path;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 /// Pid the outer (host-PID-ns) reaper forwards `SIGTERM` / `SIGINT` /
@@ -118,12 +121,13 @@ pub fn gid_map_line(host_gid: u32) -> String {
     format!("0 {host_gid} 1\n")
 }
 
-/// Write the user-namespace mapping files. Order matters:
+/// Write the user-namespace mapping files, mapping the caller's own host
+/// ids (the only ones it may map from inside). Order matters:
 ///
 /// 1. `/proc/self/setgroups` ← "deny"  (required for unprivileged user-ns
 ///    before writing `gid_map`; without it the kernel rejects the write).
-/// 2. `/proc/self/uid_map`   ← `0 <host_uid> 1\n`
-/// 3. `/proc/self/gid_map`   ← `0 <host_gid> 1\n`
+/// 2. `/proc/self/uid_map`   ← `uid_map`, a [`uid_map_line`]
+/// 3. `/proc/self/gid_map`   ← `gid_map`, a [`gid_map_line`]
 ///
 /// # Safety
 ///
@@ -132,22 +136,282 @@ pub fn gid_map_line(host_gid: u32) -> String {
 /// `/proc/self/uid_map` writes go to the calling process's existing
 /// namespace, which is usually the host's user namespace where the
 /// kernel rejects them).
-#[allow(
-    clippy::similar_names,
-    reason = "uid/gid is the canonical spelling for these Linux primitives"
-)]
-pub unsafe fn write_user_namespace_maps(host_uid: u32, host_gid: u32) -> io::Result<()> {
+pub unsafe fn write_user_namespace_maps(uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
     // SAFETY: `write_proc_file`'s contract requires being called inside the
     // child after `unshare(CLONE_NEWUSER)`. That's exactly our caller's
     // contract (this function is unsafe with the same precondition).
     unsafe {
         write_proc_file(c"/proc/self/setgroups", b"deny")?;
-        let uid = uid_map_line(host_uid);
-        write_proc_file(c"/proc/self/uid_map", uid.as_bytes())?;
-        let gid = gid_map_line(host_gid);
-        write_proc_file(c"/proc/self/gid_map", gid.as_bytes())?;
+        write_proc_file(c"/proc/self/uid_map", uid_map)?;
+        write_proc_file(c"/proc/self/gid_map", gid_map)?;
     }
     Ok(())
+}
+
+/// Leave the gateway's supplementary groups, which for root often include
+/// gid 0, so the agent holds no host group but its own.
+///
+/// # Safety
+///
+/// Between fork and exec in a child of a root process, before
+/// [`unshare_with_host_ids`].
+pub unsafe fn clear_supplementary_groups() -> io::Result<()> {
+    // SAFETY: an empty list needs no buffer.
+    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Unshare the namespaces [`unshare_namespaces`] does and map uid 0 and gid 0 of the new user
+/// namespace to the host ids in `uid_map` and `gid_map` ([`uid_map_line`]
+/// and [`gid_map_line`]). A process inside the namespace may map only its
+/// own ids, so a helper forked first, which stays outside with the
+/// gateway's root privileges, writes the maps once the unshare is done.
+///
+/// The caller keeps its host uid 0, which the namespace does not map: it
+/// holds every capability in the namespace but owns nothing there until
+/// it switches to the namespace's root ([`become_namespace_root`]).
+///
+/// # Safety
+///
+/// Between fork and exec in a child of a root process. Only
+/// `socketpair`, `fork`, `unshare`, `send`, `read`, `open`, `write`,
+/// `waitpid` and `_exit`, none of which allocate.
+pub unsafe fn unshare_with_host_ids(uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
+    let mut fds: [libc::c_int; 2] = [-1; 2];
+    // A socket rather than a pipe: `send` with MSG_NOSIGNAL cannot raise
+    // SIGPIPE in this child if the helper is gone.
+    // SAFETY: `fds` is a valid two-element array for socketpair to fill.
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let [ours, helpers] = fds;
+    // SAFETY: getpid cannot fail.
+    let target = unsafe { libc::getpid() };
+    // SAFETY: the helper below makes only async-signal-safe calls.
+    let helper = unsafe { libc::fork() };
+    if helper == -1 {
+        let err = io::Error::last_os_error();
+        // SAFETY: closing both ends created above.
+        unsafe {
+            libc::close(ours);
+            libc::close(helpers);
+        }
+        return Err(err);
+    }
+    if helper == 0 {
+        // SAFETY: closing the end the helper does not use.
+        unsafe { libc::close(ours) };
+        let mut go = 0u8;
+        let received = loop {
+            // SAFETY: one byte into a live stack byte.
+            let n = unsafe { libc::read(helpers, (&raw mut go).cast(), 1) };
+            if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break n;
+        };
+        // Nothing arrives when the unshare failed; there is nothing to map.
+        let code = if received == 1 {
+            write_id_maps(target, uid_map, gid_map)
+                .err()
+                .map_or(0, |e| e.raw_os_error().unwrap_or(libc::EIO))
+        } else {
+            0
+        };
+        // SAFETY: `_exit` is async-signal-safe and never returns.
+        unsafe { libc::_exit(code) };
+    }
+    // SAFETY: closing the helper's end in this process.
+    unsafe { libc::close(helpers) };
+    // SAFETY: a defined flag set.
+    let unshared = unsafe { libc::unshare(NAMESPACE_FLAGS) } == 0;
+    let unshare_error = (!unshared).then(io::Error::last_os_error);
+    if unshared {
+        // SAFETY: one byte from a static; a gone helper shows in its status.
+        unsafe { libc::send(ours, b"1".as_ptr().cast(), 1, libc::MSG_NOSIGNAL) };
+    }
+    // SAFETY: closing our end, which also tells a waiting helper to stop.
+    unsafe { libc::close(ours) };
+    let status = wait_for_child_exit_code(helper);
+    if let Some(err) = unshare_error {
+        return Err(err);
+    }
+    match status {
+        0 => Ok(()),
+        code => Err(io::Error::from_raw_os_error(code)),
+    }
+}
+
+/// The helper of [`unshare_with_host_ids`]: write `pid`'s id maps from
+/// outside its user namespace.
+fn write_id_maps(pid: libc::pid_t, uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
+    let mut buf = [0u8; 48];
+    for (leaf, data) in [
+        (&b"setgroups"[..], &b"deny"[..]),
+        (&b"uid_map"[..], uid_map),
+        (&b"gid_map"[..], gid_map),
+    ] {
+        let path = proc_pid_path(&mut buf, pid, leaf)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENAMETOOLONG))?;
+        // SAFETY: a proc control file of a process this one forked from.
+        unsafe { write_proc_file(path, data) }?;
+    }
+    Ok(())
+}
+
+/// `/proc/<pid>/<leaf>` as a C string in `buf`, without allocating.
+fn proc_pid_path<'a>(buf: &'a mut [u8; 48], pid: libc::pid_t, leaf: &[u8]) -> Option<&'a CStr> {
+    let mut digits = [0u8; 10];
+    let mut rest = u32::try_from(pid).ok()?;
+    let mut count = 0;
+    loop {
+        *digits.get_mut(count)? = b'0' + u8::try_from(rest % 10).ok()?;
+        count += 1;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    let mut at = 0;
+    for &byte in b"/proc/"
+        .iter()
+        .chain(digits[..count].iter().rev())
+        .chain(b"/")
+        .chain(leaf)
+    {
+        *buf.get_mut(at)? = byte;
+        at += 1;
+    }
+    *buf.get_mut(at)? = 0;
+    CStr::from_bytes_with_nul(&buf[..=at]).ok()
+}
+
+/// Carry the namespace's capabilities across the exec of `havn-init`.
+/// After [`unshare_with_host_ids`] the caller's host uid 0 is not the
+/// namespace's root, so exec would clear them; raised into the ambient set
+/// (through the inheritable set) they survive it. `havn-init` empties
+/// every set before it execs the runtime.
+///
+/// # Safety
+///
+/// Only `capget`, `capset` and `prctl`, on the calling thread.
+pub unsafe fn keep_capabilities_across_exec() -> io::Result<()> {
+    let mut header = CapabilityHeader {
+        version: CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut words = [CapabilityWords {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: capget fills two capability words for the calling thread.
+    if unsafe { libc::syscall(libc::SYS_capget, &raw mut header, words.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for word in &mut words {
+        word.inheritable = word.permitted;
+    }
+    // SAFETY: capset reads the header and the two words, live for the call.
+    if unsafe { libc::syscall(libc::SYS_capset, &raw mut header, words.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for cap in 0..=63_u32 {
+        // SAFETY: prctl with integer arguments only.
+        if unsafe {
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_RAISE,
+                libc::c_ulong::from(cap),
+                0,
+                0,
+            )
+        } != 0
+        {
+            let err = io::Error::last_os_error();
+            // EINVAL: past the kernel's last capability.
+            if err.raw_os_error() == Some(libc::EINVAL) && cap > 0 {
+                break;
+            }
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// Switch to uid 0 and gid 0 of the agent's user namespace, keeping the
+/// namespace's capabilities: the agent's own host ids under a root
+/// gateway, the ids already held otherwise. Like every credential change
+/// it clears `PR_SET_PDEATHSIG`.
+///
+/// # Safety
+///
+/// In the agent's user namespace, single-threaded.
+pub unsafe fn become_namespace_root() -> io::Result<()> {
+    // SAFETY: plain credential calls.
+    unsafe {
+        if libc::setresgid(0, 0, 0) != 0 || libc::setresuid(0, 0, 0) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Host paths the agent's rootfs binds, opened while `havn-init` still
+/// has the gateway's host uid. The agent's own uid may not be able to walk
+/// to them (a workspace under `/root`); a bind from the open handle
+/// (`/proc/self/fd/<n>`) does not walk the path again.
+#[derive(Debug, Default)]
+pub struct HostPaths {
+    opened: Vec<(PathBuf, OwnedFd)>,
+}
+
+impl HostPaths {
+    /// Open each path, following symlinks as a bind would. One that cannot
+    /// be opened is left out, with a line on stderr unless it is missing:
+    /// binding it then fails, or, for an extra mount, is skipped.
+    pub fn open<'a>(paths: impl IntoIterator<Item = &'a Path>) -> io::Result<Self> {
+        let mut opened = Vec::new();
+        for path in paths {
+            let c_path = CString::new(path.as_os_str().as_bytes()).map_err(io_invalid)?;
+            // SAFETY: a valid C string; O_PATH opens without reading.
+            let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+            if fd < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ENOENT) {
+                    eprintln!("havn-init: cannot open {}: {err}", path.display());
+                }
+                continue;
+            }
+            // SAFETY: `fd` was just opened and nothing else owns it.
+            opened.push((path.to_path_buf(), unsafe { OwnedFd::from_raw_fd(fd) }));
+        }
+        Ok(Self { opened })
+    }
+
+    fn contains(&self, path: &Path) -> bool {
+        self.opened.iter().any(|(p, _)| p == path)
+    }
+
+    /// What to bind for `path`: its open handle, or the path itself.
+    fn source(&self, path: &Path) -> io::Result<CString> {
+        match self.opened.iter().find(|(p, _)| p == path) {
+            Some((_, fd)) => {
+                CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_err(io_invalid)
+            }
+            None => CString::new(path.as_os_str().as_bytes()).map_err(io_invalid),
+        }
+    }
 }
 
 /// # Safety
@@ -378,6 +642,7 @@ const NEW_ROOT_PATH: &str = "/tmp/.havn-newroot";
     reason = "linear sequence of 13 numbered isolation steps; splitting it obscures the order"
 )]
 pub unsafe fn pivot_root_into_minimal_rootfs(
+    host: &HostPaths,
     workspace_dir: &Path,
     runtime_binary: &Path,
     gateway_socket: &Path,
@@ -525,13 +790,12 @@ pub unsafe fn pivot_root_into_minimal_rootfs(
         // (no veth = no packets out), not the absence of CA certs.
         //
         // Only `/etc/ssl/certs`, read-only: the rest of `/etc/ssl` holds
-        // `private/`, where hosts keep TLS keys, and the agent's uid 0 is
-        // the host's, so it could read them. The certificates there link
+        // `private/`, where hosts keep TLS keys. The certificates there link
         // into `/usr/share/ca-certificates`, already under the /usr bind.
         // A read-only remount that fails stops the agent from starting.
         let ca_certificates = Path::new("/etc/ssl/certs");
         if ca_certificates.is_dir() {
-            mirror_bind_into_newroot(ca_certificates, true)?;
+            mirror_bind_into_newroot(host, ca_certificates, true)?;
         } else {
             eprintln!(
                 "havn-init: no {}; HTTPS will fail in the agent",
@@ -542,7 +806,7 @@ pub unsafe fn pivot_root_into_minimal_rootfs(
         // 9. Mirror-bind workspace (rw) at its host path so the
         //    runtime's `--workspace <abs-path>` argument resolves
         //    identically inside the new rootfs.
-        mirror_bind_into_newroot(workspace_dir, false)?;
+        mirror_bind_into_newroot(host, workspace_dir, false)?;
 
         // 9b. Mirror-bind the runtime binary's parent directory (ro) so
         //     `exec(runtime_binary)` from havn-init's child resolves
@@ -555,7 +819,7 @@ pub unsafe fn pivot_root_into_minimal_rootfs(
         if let Some(parent) = runtime_binary.parent()
             && !path_starts_with_any(parent, &[Path::new("/usr")])
         {
-            mirror_bind_into_newroot(parent, true)?;
+            mirror_bind_into_newroot(host, parent, true)?;
         }
 
         // 9c. Mirror-bind the gateway's Unix socket file at its host
@@ -563,7 +827,7 @@ pub unsafe fn pivot_root_into_minimal_rootfs(
         //     immediately after startup; without this bind the
         //     connect() returns ENOENT post-pivot. Single-file bind —
         //     creates an empty placeholder at the target then binds.
-        mirror_bind_file_into_newroot(gateway_socket)?;
+        mirror_bind_file_into_newroot(host, gateway_socket)?;
 
         // 9d. Operator-declared extra mounts (spec §4.1 v0.7). Each
         //     gets a mirror-bind at the same absolute path. RO is the
@@ -575,9 +839,9 @@ pub unsafe fn pivot_root_into_minimal_rootfs(
         //     `command not found` (visible in tool_result), not at
         //     spawn time.
         for mount in extra_mounts {
-            if !mount.path.exists() {
+            if !host.contains(&mount.path) {
                 eprintln!(
-                    "havn-init: extra_mounts entry {} doesn't exist on host — skipping",
+                    "havn-init: extra_mounts entry {} cannot be opened on the host — skipping",
                     mount.path.display()
                 );
                 continue;
@@ -586,7 +850,7 @@ pub unsafe fn pivot_root_into_minimal_rootfs(
             // Reuse the workspace-bind helper. It walks parents,
             // mkdirs each, and binds the leaf; the RO remount dance
             // happens inside.
-            mirror_bind_into_newroot(&mount.path, read_only)?;
+            mirror_bind_into_newroot(host, &mount.path, read_only)?;
         }
 
         // 9e. Operator-declared tmpfs mounts (spec §16.2). Pack-agnostic;
@@ -693,7 +957,11 @@ pub unsafe fn pivot_root_into_minimal_rootfs(
 ///
 /// Same contract as the surrounding `pivot_root_into_minimal_rootfs`:
 /// must run inside the new mount namespace, single-threaded.
-unsafe fn mirror_bind_into_newroot(host_path: &Path, read_only: bool) -> io::Result<()> {
+unsafe fn mirror_bind_into_newroot(
+    host: &HostPaths,
+    host_path: &Path,
+    read_only: bool,
+) -> io::Result<()> {
     let host_str = host_path.to_str().ok_or_else(|| {
         io::Error::other(format!("path is not valid UTF-8: {}", host_path.display()))
     })?;
@@ -709,12 +977,12 @@ unsafe fn mirror_bind_into_newroot(host_path: &Path, read_only: bool) -> io::Res
         unsafe { mkdir_under_newroot(&acc, 0o755) }?;
     }
     let target = cstr_under_newroot(trimmed);
-    let host_c = CString::new(host_str).map_err(io_invalid)?;
+    let source = host.source(host_path)?;
     // SAFETY: src/dest are valid CStrings; null fstype/data with MS_BIND
     // is the canonical bind invocation.
     unsafe {
         check(libc::mount(
-            host_c.as_ptr(),
+            source.as_ptr(),
             target.as_ptr(),
             std::ptr::null(),
             libc::MS_BIND | libc::MS_REC,
@@ -737,7 +1005,7 @@ fn path_starts_with_any(candidate: &Path, prefixes: &[&Path]) -> bool {
 /// the in-rootfs path, then `mount --bind`s the host file onto it.
 /// Used for the gateway Unix socket — the runtime opens it via
 /// `UnixStream::connect` and the path must exist inside the rootfs.
-unsafe fn mirror_bind_file_into_newroot(host_path: &Path) -> io::Result<()> {
+unsafe fn mirror_bind_file_into_newroot(host: &HostPaths, host_path: &Path) -> io::Result<()> {
     let host_str = host_path.to_str().ok_or_else(|| {
         io::Error::other(format!("path is not valid UTF-8: {}", host_path.display()))
     })?;
@@ -766,11 +1034,11 @@ unsafe fn mirror_bind_file_into_newroot(host_path: &Path) -> io::Result<()> {
         // SAFETY: closing an owned valid fd.
         unsafe { libc::close(fd) };
     }
-    let host_c = CString::new(host_str).map_err(io_invalid)?;
+    let source = host.source(host_path)?;
     // SAFETY: bind-mount file onto file is well-defined; both pointers valid.
     unsafe {
         check(libc::mount(
-            host_c.as_ptr(),
+            source.as_ptr(),
             target.as_ptr(),
             std::ptr::null(),
             libc::MS_BIND,
@@ -1091,10 +1359,9 @@ unsafe fn loopback_up() -> io::Result<()> {
 
 /// Give up every capability in the agent's user namespace for good: no
 /// `CAP_DAC_OVERRIDE` on files it can see, no `CAP_SYS_PTRACE`, nothing
-/// regained by exec'ing a root-owned or file-capability binary. The
-/// agent's uid 0 is still the gateway's host uid, so it keeps the owner's
-/// permissions on host-root files it can reach. A user namespace the
-/// agent creates starts with its own full set, confined to that namespace.
+/// regained by exec'ing a root-owned or file-capability binary. A user
+/// namespace the agent creates starts with its own full set, confined to
+/// that namespace.
 /// Called by `havn-init` last before it execs the runtime, after the
 /// mounts that need the namespace's capabilities.
 ///
@@ -1327,6 +1594,51 @@ mod tests {
         }
         let err = cmd.spawn().expect_err("parent check must fail");
         assert_eq!(err.raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[test]
+    fn proc_pid_paths_are_built_without_allocating() {
+        let mut buf = [0u8; 48];
+        assert_eq!(
+            proc_pid_path(&mut buf, 4_194_304, b"uid_map").map(CStr::to_bytes),
+            Some(&b"/proc/4194304/uid_map"[..])
+        );
+        assert_eq!(
+            proc_pid_path(&mut buf, 7, b"setgroups").map(CStr::to_bytes),
+            Some(&b"/proc/7/setgroups"[..])
+        );
+        assert!(proc_pid_path(&mut buf, -1, b"uid_map").is_none());
+        assert!(proc_pid_path(&mut buf, 1, &[b'x'; 40]).is_none());
+    }
+
+    /// As root only: a child maps the namespace's root to an id of its
+    /// own and, once it switches to it, holds that id on the host.
+    #[test]
+    fn a_root_child_runs_as_its_own_host_id() {
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: geteuid cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let id: u32 = 0x7100_0000 + 4_000_000;
+        let uid_map = uid_map_line(id);
+        let gid_map = gid_map_line(id);
+        let mut cmd = std::process::Command::new("cat");
+        cmd.arg("/proc/self/uid_map");
+        // SAFETY: the hook makes only the calls each helper documents.
+        unsafe {
+            cmd.pre_exec(move || {
+                clear_supplementary_groups()?;
+                unshare_with_host_ids(uid_map.as_bytes(), gid_map.as_bytes())?;
+                become_namespace_root()
+            });
+        }
+        let out = cmd.output().expect("run");
+        assert!(out.status.success(), "{out:?}");
+        let map = String::from_utf8_lossy(&out.stdout);
+        let fields: Vec<&str> = map.split_whitespace().collect();
+        let host = id.to_string();
+        assert_eq!(fields, ["0", host.as_str(), "1"], "{map}");
     }
 
     #[test]

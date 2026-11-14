@@ -164,9 +164,7 @@ async fn try_auto_commit(workspace: &Path, resolved: &Path, rel_path: &str) -> O
         return None;
     }
     // git add
-    let add = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(workspace)
+    let add = git(workspace)
         .arg("add")
         .arg(resolved)
         .output()
@@ -182,9 +180,7 @@ async fn try_auto_commit(workspace: &Path, resolved: &Path, rel_path: &str) -> O
     // git commit. -q to silence chatter; we surface the hash from a
     // follow-up rev-parse so we don't have to parse `git commit`'s
     // human-readable output.
-    let commit = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(workspace)
+    let commit = git(workspace)
         .arg("commit")
         .arg("-q")
         .arg("-m")
@@ -202,9 +198,7 @@ async fn try_auto_commit(workspace: &Path, resolved: &Path, rel_path: &str) -> O
         tracing::debug!(stderr = %stderr, "auto_commit: git commit failed; skipping");
         return None;
     }
-    let hash = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(workspace)
+    let hash = git(workspace)
         .arg("rev-parse")
         .arg("--short")
         .arg("HEAD")
@@ -216,6 +210,16 @@ async fn try_auto_commit(workspace: &Path, resolved: &Path, rel_path: &str) -> O
     }
     let s = String::from_utf8(hash.stdout).ok()?.trim().to_string();
     if s.is_empty() { None } else { Some(s) }
+}
+
+/// `git -C <workspace>`, run as a tool's process: the workspace's git
+/// config and hooks are the agent's to write.
+fn git(workspace: &Path) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C").arg(workspace);
+    #[cfg(target_os = "linux")]
+    crate::sandbox::confine_tool(&mut cmd);
+    cmd
 }
 
 /// Join a user-provided path under `workspace`, rejecting absolute paths and

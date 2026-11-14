@@ -1,9 +1,10 @@
 //! `shell` tool — run a bash command in the agent's process context.
 //!
 //! Under `NamespaceSpawner` the shell runs inside the agent's namespaces,
-//! cgroup, Landlock and seccomp confinement (spec §4.1). Under the
-//! dev-only `SubprocessSpawner` it inherits whatever the runtime can do on
-//! the host.
+//! cgroup, Landlock and seccomp confinement (spec §4.1), in the Landlock
+//! domain of tool processes (`sandbox::confine_tool`). Under the dev-only
+//! `SubprocessSpawner` it inherits whatever the runtime can do on the
+//! host.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -56,6 +57,8 @@ impl Tool for ShellTool {
             .arg(command)
             .current_dir(&ctx.workspace_dir)
             .kill_on_drop(true);
+        #[cfg(target_os = "linux")]
+        crate::sandbox::confine_tool(&mut cmd);
 
         let output = match timeout(COMMAND_TIMEOUT, cmd.output()).await {
             Ok(Ok(o)) => o,
