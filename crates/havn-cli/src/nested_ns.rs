@@ -39,8 +39,12 @@ pub enum NestedUserNsResult {
     /// `kernel.max_user_namespaces` exhausted, an LSM blocking the
     /// nesting, or `user.max_user_namespaces` set low.
     NestedFailed { errno: i32 },
-    /// Mapping the ids or dropping the capabilities between the two
-    /// calls failed.
+    /// The first namespace refused the uid/gid mapping, so the process
+    /// stayed without ids there. Ubuntu's AppArmor
+    /// `restrict_unprivileged_userns` does this to unprivileged callers;
+    /// root without `CAP_SETFCAP` cannot map uid 0 either.
+    MapFailed,
+    /// Dropping the capabilities between the two calls failed.
     CapDropFailed,
     /// `execve(/bin/true)` inside the inner ns failed. Probably means
     /// `/bin/true` isn't accessible (rare) or the kernel rejected exec
@@ -84,8 +88,19 @@ impl NestedUserNsResult {
                         .into(),
                 ),
             ),
+            Self::MapFailed => (
+                "a new user namespace refused its uid/gid mapping".into(),
+                Some(
+                    "A security module confines unprivileged user namespaces (on Ubuntu, \
+                     AppArmor's `kernel.apparmor_restrict_unprivileged_userns=1`), or the \
+                     caller lacks CAP_SETFCAP to map uid 0. Run the check as the user the \
+                     gateway runs as. Capability packs whose workload nests user \
+                     namespaces may not run on this host."
+                        .into(),
+                ),
+            ),
             Self::CapDropFailed => (
-                "could not map ids or drop capabilities inside the first user namespace".into(),
+                "could not drop capabilities inside the first user namespace".into(),
                 Some(
                     "Unusual; re-run, and file an issue with the kernel version if it persists."
                         .into(),
@@ -112,6 +127,7 @@ const EXIT_OUTER_FAILED: i32 = 10;
 const EXIT_NESTED_FAILED: i32 = 11;
 const EXIT_EXEC_FAILED: i32 = 12;
 const EXIT_CAP_DROP_FAILED: i32 = 13;
+const EXIT_MAP_FAILED: i32 = 14;
 
 #[repr(C)]
 struct CapHeader {
@@ -134,8 +150,9 @@ const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 /// at the same time (each is its own fork).
 pub fn check() -> NestedUserNsResult {
     // Built before fork: the child must not allocate.
-    // SAFETY: getuid/getgid cannot fail.
-    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    // The kernel lets a process map only its effective ids in one line.
+    // SAFETY: geteuid/getegid cannot fail.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
     let uid_map = format!("0 {uid} 1");
     let gid_map = format!("0 {gid} 1");
     let prog = CString::new("/bin/true").expect("static cstr");
@@ -171,10 +188,10 @@ pub fn check() -> NestedUserNsResult {
                     && write_file(c"/proc/self/gid_map", gid_map.as_bytes())
             };
             // SAFETY: capset with a valid header and two data words.
-            if !mapped
-                || unsafe { libc::syscall(libc::SYS_capset, &raw mut header, no_caps.as_ptr()) }
-                    != 0
-            {
+            if !mapped {
+                unsafe { libc::_exit(EXIT_MAP_FAILED) };
+            }
+            if unsafe { libc::syscall(libc::SYS_capset, &raw mut header, no_caps.as_ptr()) } != 0 {
                 unsafe { libc::_exit(EXIT_CAP_DROP_FAILED) };
             }
             if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
@@ -199,6 +216,7 @@ pub fn check() -> NestedUserNsResult {
                     EXIT_OK => NestedUserNsResult::Ok,
                     EXIT_OUTER_FAILED => NestedUserNsResult::OuterFailed { errno: libc::EPERM },
                     EXIT_NESTED_FAILED => NestedUserNsResult::NestedFailed { errno: libc::EPERM },
+                    EXIT_MAP_FAILED => NestedUserNsResult::MapFailed,
                     EXIT_CAP_DROP_FAILED => NestedUserNsResult::CapDropFailed,
                     EXIT_EXEC_FAILED => NestedUserNsResult::ExecFailed {
                         errno: libc::ENOENT,

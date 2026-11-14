@@ -856,9 +856,10 @@ const ST_NOSYMFOLLOW: libc::c_ulong = 0x2000;
 /// falls back to what an unprivileged user can do.
 ///
 /// Uses `mount_setattr` (Linux 5.12+), which only adds the two flags and
-/// so keeps every other one, locked ones included. Older kernels get a
-/// bind remount of `dest` alone that repeats the flags it has, since in a
-/// user namespace the kernel refuses a remount that drops a locked one.
+/// so keeps every other one, locked ones included. Where it is missing or
+/// filtered, a bind remount of `dest` alone repeats the flags it has, since
+/// in a user namespace the kernel refuses a remount that drops a locked
+/// one.
 ///
 /// # Safety
 ///
@@ -886,7 +887,9 @@ unsafe fn restrict_bind(dest: &CStr, read_only: bool) -> io::Result<()> {
         return Ok(());
     }
     let err = io::Error::last_os_error();
-    if err.raw_os_error() != Some(libc::ENOSYS) {
+    // ENOSYS before Linux 5.12; EPERM from a seccomp profile that predates
+    // the call (container runtimes, systemd SystemCallFilter).
+    if !matches!(err.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) {
         return Err(err);
     }
     // SAFETY: a zeroed statvfs is a valid out-parameter.

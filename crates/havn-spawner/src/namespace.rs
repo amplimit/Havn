@@ -471,8 +471,9 @@ impl AgentSpawner for NamespaceSpawner {
         //    **Gated on `policy.network_policy.egress_allowed`** (default
         //    false). The pre_exec hook above already unshared
         //    CLONE_NEWNET, so an agent without egress sits in an empty
-        //    netns with only `lo` (havn-init brings it up) — credential-proxy paths over
-        //    the Unix gateway socket still work, but `web_fetch`, MCP
+        //    netns with only `lo` (havn-init brings it up) —
+        //    credential-proxy paths over the Unix gateway socket still
+        //    work, but `web_fetch`, MCP
         //    servers that reach the internet, and capability packs like
         //    havn-pack-browser stay offline. This preserves the spec
         //    §1.5 / §11 security narrative: agents do not directly
