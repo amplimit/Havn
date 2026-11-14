@@ -422,8 +422,9 @@ impl WebSearch {
             return Err("credential encryption is not configured: set HAVN_AGE_KEY".into());
         };
         // OpenRouter adds the results to the model's input; the dedicated
-        // search APIs use no tokens, but each search still counts against
-        // the key's request rate and needs room in the agent's budget.
+        // search APIs use no tokens, but each search is recorded against the
+        // key's request rate as one token, so it needs room in the agent's
+        // budget like any call.
         let (tokens_in, tokens_out, model) = if candidate.backend == Backend::OpenRouter {
             (
                 OPENROUTER_TOKENS_PER_RESULT * i64::from(count) + 200,
@@ -431,7 +432,7 @@ impl WebSearch {
                 candidate.model.as_deref().unwrap_or_default(),
             )
         } else {
-            (0, 0, TOOL_NAME)
+            (0, 1, TOOL_NAME)
         };
         let mut last = String::from("no usable credential");
         for credential in &candidate.credentials {
@@ -791,10 +792,15 @@ async fn openrouter(
     )
     .await?;
     if let Some(error) = body.get("error") {
-        let message = text_at(error, &["message"]).unwrap_or("unknown error");
+        let mut message = text_at(error, &["message"])
+            .unwrap_or("unknown error")
+            .to_string();
+        if !key.is_empty() {
+            message = message.replace(key, "[key]");
+        }
         return Err(Failure {
             next: true,
-            message: clean(message, 200),
+            message: clean(&message, 200),
         });
     }
     let citations: Vec<Value> = body
