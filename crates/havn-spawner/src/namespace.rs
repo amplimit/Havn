@@ -804,16 +804,19 @@ impl HostIdRange {
             .into_iter()
             .chain(subid_ranges(subgid))
             .collect();
-        let ours = |file: &str| {
+        let ours = |file: &str| -> Vec<(u64, u64)> {
             subid_ranges(file)
                 .into_iter()
-                .find(|(owner, ..)| *owner == Self::RESERVED_FOR)
+                .filter(|(owner, ..)| *owner == Self::RESERVED_FOR)
                 .map(|(_, lo, hi)| (lo, hi))
+                .collect()
         };
-        if let (Some(uid), Some(gid)) = (ours(subuid), ours(subgid))
-            && uid == gid
-            && both.iter().any(|&(lo, hi)| lo <= uid.0 && uid.1 <= hi)
-            && let Some(range) = Self::from_extent(uid.0, uid.1)
+        let reserved_gids = ours(subgid);
+        if let Some(range) = ours(subuid)
+            .into_iter()
+            .filter(|uids| reserved_gids.contains(uids))
+            .filter(|&(ulo, uhi)| both.iter().any(|&(lo, hi)| lo <= ulo && uhi <= hi))
+            .find_map(|(lo, hi)| Self::from_extent(lo, hi))
         {
             return Some((range, false));
         }
@@ -822,9 +825,12 @@ impl HostIdRange {
             .filter(|(owner, ..)| *owner != Self::RESERVED_FOR)
             .map(|(_, lo, hi)| (lo, hi))
             .collect();
+        // Never past the preferred range: ids from systemd's foreign range
+        // up, and above 2^31 in particular, are no place for agents.
+        let end = u64::from(Self::PREFERRED.base) + u64::from(Self::PREFERRED.count);
         let free = subtract(
             both.into_iter()
-                .map(|(lo, hi)| (lo.max(Self::FIRST_FREE), hi))
+                .map(|(lo, hi)| (lo.max(Self::FIRST_FREE), hi.min(end)))
                 .filter(|(lo, hi)| lo < hi)
                 .collect(),
             &taken,
@@ -1021,6 +1027,42 @@ mod tests {
             HostIdRange::within(small, small, reserved, reserved).expect("range");
         assert!(reserve);
         assert!(u64::from(range.base) + u64::from(range.count) <= 1_000_000);
+    }
+
+    #[test]
+    fn any_reservation_the_maps_hold_is_kept() {
+        // An earlier reservation the maps no longer hold comes first.
+        let small = "         0    1065536    1000000\n";
+        let reserved = "havn-agents:600000000:70000\nhavn-agents:582768:417232\n";
+        assert_eq!(
+            HostIdRange::within(small, small, reserved, reserved),
+            Some((
+                HostIdRange {
+                    base: 582_768,
+                    count: 417_232
+                },
+                false
+            ))
+        );
+        // A range reserved for uids only is chosen again.
+        let (_, reserve) =
+            HostIdRange::within(small, small, reserved, "havn-agents:600000000:70000\n")
+                .expect("range");
+        assert!(reserve);
+    }
+
+    #[test]
+    fn on_a_host_agents_stay_below_the_foreign_range() {
+        let host = "         0          0 4294967295\n";
+        let overlapping = "odd:1895825408:100\n";
+        let (range, reserve) =
+            HostIdRange::within(host, host, overlapping, overlapping).expect("range");
+        assert!(reserve);
+        assert!(u64::from(range.base) + u64::from(range.count) <= 0x7FFE_0000);
+        assert!(
+            u64::from(range.base) >= 1_895_825_408 + 100
+                || u64::from(range.base) + u64::from(range.count) <= 1_895_825_408
+        );
     }
 
     #[test]

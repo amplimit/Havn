@@ -174,10 +174,7 @@ pub async fn run_listener(socket_path: &Path, ctx: AgentSocketCtx) -> anyhow::Re
         tokio::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o666))
             .await
             .with_context(|| format!("opening agent socket {} to agents", socket_path.display()))?;
-        if let Some(dir) = socket_path.parent()
-            && let Ok(meta) = tokio::fs::metadata(dir).await
-            && meta.permissions().mode() & 0o001 != 0
-        {
+        if other_users_reach(socket_path) {
             warn!(
                 dir = %dir.display(),
                 "other users can reach the agent socket; the gateway closes their connections, \
@@ -193,6 +190,15 @@ pub async fn run_listener(socket_path: &Path, ctx: AgentSocketCtx) -> anyhow::Re
         MAX_PENDING_HANDSHAKES_PER_AGENT,
     );
     serve(listener, ctx, Arc::new(admission)).await
+}
+
+/// Whether users other than the owners can walk to `path`: every directory
+/// above it lets others search it.
+fn other_users_reach(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    path.ancestors()
+        .skip(1)
+        .all(|dir| std::fs::metadata(dir).is_ok_and(|meta| meta.permissions().mode() & 0o001 != 0))
 }
 
 type PendingPerAgent = Arc<std::sync::Mutex<HashMap<AgentId, usize>>>;
