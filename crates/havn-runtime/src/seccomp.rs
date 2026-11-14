@@ -43,6 +43,10 @@
 //!   `_sysctl`)
 //! - misc local-privilege escalation footguns (`modify_ldt`,
 //!   `userfaultfd`, `lookup_dcookie`, `vmsplice`, `quotactl`)
+//!
+//! New user namespaces are refused too, with `EPERM` rather than a kill
+//! ([`user_namespace_guard`]), unless the operator allows them with
+//! [`USER_NAMESPACES`].
 
 #![cfg(target_os = "linux")]
 
@@ -92,6 +96,7 @@ pub enum SeccompError {
 /// silently honouring a typo.
 pub fn restrict_syscalls(allow_extra: &[String]) -> Result<(), SeccompError> {
     let blocked = effective_blocklist(allow_extra)?;
+    let user_namespaces = allow_extra.iter().any(|n| n.trim() == USER_NAMESPACES);
     let mut rules = BTreeMap::new();
     for syscall in &blocked {
         rules.insert(*syscall, vec![match_any_rule()?]);
@@ -117,10 +122,17 @@ pub fn restrict_syscalls(allow_extra: &[String]) -> Result<(), SeccompError> {
     #[cfg(target_arch = "x86_64")]
     seccompiler::apply_filter_all_threads(&x32_guard())
         .map_err(|e| SeccompError::Apply(e.to_string()))?;
+    if !user_namespaces {
+        for program in user_namespace_guard()? {
+            seccompiler::apply_filter_all_threads(&program)
+                .map_err(|e| SeccompError::Apply(e.to_string()))?;
+        }
+    }
 
     info!(
         blocked = blocked.len(),
         relaxed = allow_extra.len(),
+        user_namespaces,
         "seccomp filter installed"
     );
     Ok(())
@@ -156,6 +168,65 @@ fn x32_guard() -> BpfProgram {
     ]
 }
 
+/// `[seccomp] allow_extra` entry that lets the agent create user
+/// namespaces, for capability packs whose workload nests them (Chromium's
+/// sandbox).
+pub const USER_NAMESPACES: &str = "user_namespaces";
+
+/// `clone3` (Linux 5.3): the same number on x86_64 and aarch64.
+const SYS_CLONE3: i64 = 435;
+
+/// Filters that refuse new user namespaces. A process gets every
+/// capability in a user namespace it creates, which opens kernel code
+/// otherwise reserved to privileged callers (nf_tables, other namespaced
+/// subsystems) and a long line of local privilege escalations to the
+/// agent's tools. `unshare` and `clone` with `CLONE_NEWUSER` fail with
+/// `EPERM`, which callers that try a user namespace expect. `clone3`
+/// takes its flags in memory seccomp cannot read, so it fails with
+/// `ENOSYS`, on which glibc falls back to `clone`.
+fn user_namespace_guard() -> Result<Vec<BpfProgram>, SeccompError> {
+    let new_user = || -> Result<SeccompRule, SeccompError> {
+        let flag = u64::try_from(libc::CLONE_NEWUSER)
+            .map_err(|e| SeccompError::Build(format!("CLONE_NEWUSER: {e}")))?;
+        let cond = SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(flag),
+            flag,
+        )
+        .map_err(|e| SeccompError::Build(format!("condition: {e:?}")))?;
+        SeccompRule::new(vec![cond]).map_err(|e| SeccompError::Build(format!("rule: {e:?}")))
+    };
+    let errno = |code: i32| {
+        u32::try_from(code)
+            .map(SeccompAction::Errno)
+            .map_err(|e| SeccompError::Build(e.to_string()))
+    };
+    let refuse = SeccompFilter::new(
+        BTreeMap::from([
+            (libc::SYS_unshare, vec![new_user()?]),
+            (libc::SYS_clone, vec![new_user()?]),
+        ]),
+        SeccompAction::Allow,
+        errno(libc::EPERM)?,
+        TARGET_ARCH,
+    )
+    .map_err(|e| SeccompError::Build(e.to_string()))?;
+    let hide_clone3 = SeccompFilter::new(
+        BTreeMap::from([(SYS_CLONE3, vec![match_any_rule()?])]),
+        SeccompAction::Allow,
+        errno(libc::ENOSYS)?,
+        TARGET_ARCH,
+    )
+    .map_err(|e| SeccompError::Build(e.to_string()))?;
+    [refuse, hide_clone3]
+        .into_iter()
+        .map(|filter| {
+            BpfProgram::try_from(filter).map_err(|e| SeccompError::Compile(format!("{e:?}")))
+        })
+        .collect()
+}
+
 /// Build the blocklist with operator-declared relaxations applied.
 /// Pure function — separable for unit tests, no kernel calls.
 fn effective_blocklist(allow_extra: &[String]) -> Result<Vec<i64>, SeccompError> {
@@ -165,6 +236,9 @@ fn effective_blocklist(allow_extra: &[String]) -> Result<Vec<i64>, SeccompError>
     let mut to_remove: Vec<i64> = Vec::with_capacity(allow_extra.len());
     for name in allow_extra {
         let trimmed = name.trim();
+        if trimmed == USER_NAMESPACES {
+            continue;
+        }
         let id = OPERATOR_RELAXABLE_SYSCALLS
             .iter()
             .find(|(n, _)| *n == trimmed)
@@ -192,7 +266,8 @@ fn effective_blocklist(allow_extra: &[String]) -> Result<Vec<i64>, SeccompError>
 /// relaxable — even an operator deliberately trying to make a hostile
 /// pack cannot let an agent insert a kernel module. Today the only
 /// motivating case is browser packs needing Chromium's user-namespace
-/// sandbox (`pivot_root`, `userfaultfd`); add new entries only when a
+/// sandbox (`pivot_root`, `userfaultfd`, along with [`USER_NAMESPACES`],
+/// which is not a syscall name); add new entries only when a
 /// concrete pack requires them and the security impact is well
 /// understood.
 const OPERATOR_RELAXABLE_SYSCALLS: &[(&str, i64)] = &[
@@ -423,6 +498,87 @@ mod tests {
             .status()
             .expect("run probe");
         assert_eq!(status.signal(), Some(libc::SIGSYS), "{status:?}");
+    }
+
+    /// With the filter in place `unshare` and `clone` asking for a new
+    /// user namespace fail with EPERM and `clone3` with ENOSYS, while
+    /// threads and processes still start; `user_namespaces` in allow_extra
+    /// lets all three through. Each call carries an argument the kernel
+    /// rejects with EINVAL, so only the filter can make it fail otherwise,
+    /// whether or not the host allows user namespaces, and none of them
+    /// creates anything.
+    #[test]
+    fn new_user_namespaces_are_refused_unless_allowed() {
+        const PROBE: &str = "HAVN_SECCOMP_USERNS_PROBE";
+        // Not 0: a probe that ran no test exits 0.
+        const PROBE_PASSED: i32 = 42;
+        if let Some(mode) = std::env::var_os(PROBE) {
+            let allowed = mode == "allow";
+            let allow: Vec<String> = if allowed {
+                vec![USER_NAMESPACES.into()]
+            } else {
+                Vec::new()
+            };
+            restrict_syscalls(&allow).expect("install filter");
+            let errno = |rc: i64| {
+                assert_eq!(rc, -1);
+                std::io::Error::last_os_error().raw_os_error()
+            };
+            // CLONE_SETTLS is not an unshare flag.
+            // SAFETY: rejected by the kernel or the filter before any effect.
+            let unshare = errno(i64::from(unsafe {
+                libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_SETTLS)
+            }));
+            // CLONE_THREAD needs CLONE_SIGHAND.
+            // SAFETY: as above; no child is created.
+            let clone = errno(unsafe {
+                libc::syscall(
+                    libc::SYS_clone,
+                    libc::CLONE_NEWUSER | libc::CLONE_THREAD,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            });
+            // A zero-sized clone_args.
+            // SAFETY: as above.
+            let clone3 = errno(unsafe { libc::syscall(SYS_CLONE3, std::ptr::null::<u8>(), 0) });
+            let expected = if allowed {
+                [Some(libc::EINVAL); 3]
+            } else {
+                [Some(libc::EPERM), Some(libc::EPERM), Some(libc::ENOSYS)]
+            };
+            assert_eq!([unshare, clone, clone3], expected, "unshare, clone, clone3");
+            // A thread and a process still start (glibc falls back from
+            // clone3 to clone).
+            std::thread::spawn(|| ()).join().expect("thread");
+            assert!(
+                std::process::Command::new("true")
+                    .status()
+                    .expect("spawn")
+                    .success()
+            );
+            std::process::exit(PROBE_PASSED);
+        }
+        for mode in ["deny", "allow"] {
+            let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "seccomp::tests::new_user_namespaces_are_refused_unless_allowed",
+                ])
+                .env(PROBE, mode)
+                .status()
+                .expect("run probe");
+            assert_eq!(status.code(), Some(PROBE_PASSED), "{mode}: {status:?}");
+        }
+    }
+
+    #[test]
+    fn user_namespaces_is_accepted_in_allow_extra() {
+        let blocked = effective_blocklist(&[USER_NAMESPACES.into()]).expect("ok");
+        assert_eq!(blocked.len(), DANGEROUS_SYSCALLS.len());
+        user_namespace_guard().expect("filters compile");
     }
 
     /// 32-bit system calls (int 0x80) use a different syscall table, so the

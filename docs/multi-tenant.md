@@ -91,7 +91,8 @@ Then open a shell in the container (`lxc exec acme -- bash`) and follow
 with a passphrase (`HAVN_AGE_KEY`) and LLM credentials of the tenant's own.
 `havn setup` may report that the nested user-namespace check failed; that only
 matters for capability packs whose workload nests user namespaces, such as
-Chromium-based browser packs.
+Chromium-based browser packs, which also need
+`[seccomp] allow_extra = ["user_namespaces"]` in the gateway config.
 
 The gateway and the dashboard listen on 127.0.0.1 inside the container, so
 neither is reachable from outside the container by default.
