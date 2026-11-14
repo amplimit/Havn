@@ -100,6 +100,15 @@ pub struct AgentSpawnConfig {
     pub agent_dns: Vec<String>,
     #[serde(default)]
     pub env_passthrough: Vec<String>,
+    /// The agent's slot in the range of host ids agents run as under
+    /// [`namespace::NamespaceSpawner`] when the gateway runs as root: its
+    /// uid 0 and gid 0 map to the id at that offset
+    /// ([`namespace::HostIdRange`]). Assigned by the gateway and never
+    /// given to another agent. A root gateway refuses to start an agent
+    /// without one; an unprivileged gateway maps its own ids and ignores
+    /// it.
+    #[serde(default)]
+    pub host_id_slot: Option<u32>,
 }
 
 const AGENT_BASE_ENV: &[&str] = &[
