@@ -9,10 +9,14 @@
 //! checks at setup so the operator gets advance notice rather than a
 //! surprise at first agent spawn.
 //!
-//! The test forks once, performs `unshare(CLONE_NEWUSER)` twice
-//! back-to-back inside the child, and runs `/bin/true` to confirm a
-//! clean exec inside the inner ns. No havn machinery; no pack
-//! dependency; ~1 ms.
+//! The test forks once and recreates an agent tool's position: it performs
+//! `unshare(CLONE_NEWUSER)`, maps its uid and gid to 0 there (as an
+//! agent's namespace is), drops every capability (an agent's tools have
+//! none), performs `unshare(CLONE_NEWUSER)` again, and runs `/bin/true` to
+//! confirm a clean exec inside the inner ns. Without the mapping the second
+//! call always fails; with the capabilities it gets past restrictions an
+//! agent's tools meet (Ubuntu's AppArmor `restrict_unprivileged_userns`).
+//! No havn machinery; no pack dependency; ~1 ms.
 
 #![cfg(target_os = "linux")]
 #![allow(unsafe_code, reason = "fork + unshare + execve are kernel primitives")]
@@ -35,6 +39,13 @@ pub enum NestedUserNsResult {
     /// `kernel.max_user_namespaces` exhausted, an LSM blocking the
     /// nesting, or `user.max_user_namespaces` set low.
     NestedFailed { errno: i32 },
+    /// The first namespace refused the uid/gid mapping, so the process
+    /// stayed without ids there. Ubuntu's AppArmor
+    /// `restrict_unprivileged_userns` does this to unprivileged callers;
+    /// root without `CAP_SETFCAP` cannot map uid 0 either.
+    MapFailed,
+    /// Dropping the capabilities between the two calls failed.
+    CapDropFailed,
     /// `execve(/bin/true)` inside the inner ns failed. Probably means
     /// `/bin/true` isn't accessible (rare) or the kernel rejected exec
     /// across the namespace boundary.
@@ -77,6 +88,24 @@ impl NestedUserNsResult {
                         .into(),
                 ),
             ),
+            Self::MapFailed => (
+                "a new user namespace refused its uid/gid mapping".into(),
+                Some(
+                    "A security module confines unprivileged user namespaces (on Ubuntu, \
+                     AppArmor's `kernel.apparmor_restrict_unprivileged_userns=1`), or the \
+                     caller lacks CAP_SETFCAP to map uid 0. Run the check as the user the \
+                     gateway runs as. Capability packs whose workload nests user \
+                     namespaces may not run on this host."
+                        .into(),
+                ),
+            ),
+            Self::CapDropFailed => (
+                "could not drop capabilities inside the first user namespace".into(),
+                Some(
+                    "Unusual; re-run, and file an issue with the kernel version if it persists."
+                        .into(),
+                ),
+            ),
             Self::ExecFailed { errno } => (
                 format!("execve(/bin/true) inside inner user-ns failed (errno {errno})"),
                 Some("Unusual; check that /bin/true exists and is executable.".into()),
@@ -97,11 +126,46 @@ const EXIT_OK: i32 = 0;
 const EXIT_OUTER_FAILED: i32 = 10;
 const EXIT_NESTED_FAILED: i32 = 11;
 const EXIT_EXEC_FAILED: i32 = 12;
+const EXIT_CAP_DROP_FAILED: i32 = 13;
+const EXIT_MAP_FAILED: i32 = 14;
+
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 
 /// Run the precheck. Forks once. Returns within ~50 ms on a healthy
 /// host. Idempotent and safe to call from `havn setup` and `havn doctor`
 /// at the same time (each is its own fork).
 pub fn check() -> NestedUserNsResult {
+    // Built before fork: the child must not allocate.
+    // The kernel lets a process map only its effective ids in one line.
+    // SAFETY: geteuid/getegid cannot fail.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let uid_map = format!("0 {uid} 1");
+    let gid_map = format!("0 {gid} 1");
+    let prog = CString::new("/bin/true").expect("static cstr");
+    let argv = [prog.as_ptr(), std::ptr::null()];
+    let mut header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let no_caps = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
     // SAFETY: `fork` is async-signal-safe. Branch on the documented
     // return; do not touch tokio / allocator state in the child beyond
     // what the libc calls below need.
@@ -114,14 +178,28 @@ pub fn check() -> NestedUserNsResult {
             if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
                 unsafe { libc::_exit(EXIT_OUTER_FAILED) };
             }
+            // The kernel refuses a user namespace to a process whose ids
+            // have no mapping in the current one. Written by the process
+            // itself, `setgroups` must be denied before the gid map.
+            // SAFETY: constant paths; byte slices outlive the calls.
+            let mapped = unsafe {
+                write_file(c"/proc/self/setgroups", b"deny")
+                    && write_file(c"/proc/self/uid_map", uid_map.as_bytes())
+                    && write_file(c"/proc/self/gid_map", gid_map.as_bytes())
+            };
+            // SAFETY: capset with a valid header and two data words.
+            if !mapped {
+                unsafe { libc::_exit(EXIT_MAP_FAILED) };
+            }
+            if unsafe { libc::syscall(libc::SYS_capset, &raw mut header, no_caps.as_ptr()) } != 0 {
+                unsafe { libc::_exit(EXIT_CAP_DROP_FAILED) };
+            }
             if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
                 unsafe { libc::_exit(EXIT_NESTED_FAILED) };
             }
             // Run /bin/true inside the inner ns. If exec succeeds, the
             // process becomes /bin/true and exits 0. We treat any exec
             // failure path (rare) as EXIT_EXEC_FAILED.
-            let prog = CString::new("/bin/true").expect("static cstr");
-            let argv = [prog.as_ptr(), std::ptr::null()];
             unsafe { libc::execve(prog.as_ptr(), argv.as_ptr(), std::ptr::null()) };
             unsafe { libc::_exit(EXIT_EXEC_FAILED) };
         }
@@ -138,6 +216,8 @@ pub fn check() -> NestedUserNsResult {
                     EXIT_OK => NestedUserNsResult::Ok,
                     EXIT_OUTER_FAILED => NestedUserNsResult::OuterFailed { errno: libc::EPERM },
                     EXIT_NESTED_FAILED => NestedUserNsResult::NestedFailed { errno: libc::EPERM },
+                    EXIT_MAP_FAILED => NestedUserNsResult::MapFailed,
+                    EXIT_CAP_DROP_FAILED => NestedUserNsResult::CapDropFailed,
                     EXIT_EXEC_FAILED => NestedUserNsResult::ExecFailed {
                         errno: libc::ENOENT,
                     },
@@ -155,6 +235,25 @@ pub fn check() -> NestedUserNsResult {
             }
         }
     }
+}
+
+/// Write `data` to `path` with `open`/`write`/`close` only, for use after
+/// `fork`. True when all of it was written.
+///
+/// # Safety
+///
+/// `data` must stay valid for the call.
+unsafe fn write_file(path: &std::ffi::CStr, data: &[u8]) -> bool {
+    // SAFETY: path is a valid C string.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: fd is open and data valid for its length.
+    let written = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+    // SAFETY: closing the fd opened above.
+    unsafe { libc::close(fd) };
+    usize::try_from(written).is_ok_and(|n| n == data.len())
 }
 
 fn errno_now() -> i32 {
