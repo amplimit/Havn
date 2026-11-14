@@ -74,22 +74,25 @@ impl Tool for GatewayTool {
         }
         let request_id = Uuid::now_v7().to_string();
         let (tx, rx) = oneshot::channel();
-        // Registered before sending, so a fast reply always finds it.
+        // Registered before sending, so a fast reply always finds it, and
+        // removed however the call ends, also when this future is dropped.
         self.pending.lock().await.insert(request_id.clone(), tx);
+        let _entry = crate::tool_loop::PendingEntry {
+            pending: &self.pending,
+            request_id: request_id.clone(),
+        };
         let frame = AgentToGateway::GatewayToolCall(GatewayToolCall {
             request_id: request_id.clone(),
             name: self.spec.name.clone(),
             input,
         });
         if self.writer_tx.send(frame).await.is_err() {
-            self.pending.lock().await.remove(&request_id);
             return ToolResult::Error("the gateway connection is closed".into());
         }
         let result = match tokio::time::timeout(CALL_TIMEOUT, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => return ToolResult::Error("the gateway connection is closed".into()),
             Err(_) => {
-                self.pending.lock().await.remove(&request_id);
                 return ToolResult::Error(format!(
                     "{} got no answer from the gateway within {}s",
                     self.spec.name,
@@ -201,6 +204,23 @@ mod tests {
         let result = tool.execute(&ctx().await, input).await;
         assert!(result.is_error());
         assert!(writer_rx.try_recv().is_err());
+        assert!(pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_call_leaves_no_pending_entry() {
+        let pending: PendingGatewayCalls = Arc::default();
+        let (writer_tx, mut writer_rx) = mpsc::channel(4);
+        let tool = GatewayTool::new(spec(), Arc::clone(&pending), writer_tx);
+        let ctx = ctx().await;
+        let mut call = Box::pin(tool.execute(&ctx, serde_json::json!({"query": "q"})));
+        // Poll until the frame is out, then abandon the call.
+        tokio::select! {
+            _ = &mut call => panic!("no reply was sent"),
+            frame = writer_rx.recv() => assert!(frame.is_some()),
+        }
+        assert_eq!(pending.lock().await.len(), 1);
+        drop(call);
         assert!(pending.lock().await.is_empty());
     }
 }

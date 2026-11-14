@@ -399,12 +399,12 @@ pub async fn request_llm(
 
 /// Removes a request's pending entry however its call ends, including when
 /// the calling future is dropped.
-struct PendingEntry<'a> {
-    pending: &'a Pending,
-    request_id: String,
+pub(crate) struct PendingEntry<'a, T: Send + 'static> {
+    pub(crate) pending: &'a Arc<Mutex<HashMap<String, oneshot::Sender<T>>>>,
+    pub(crate) request_id: String,
 }
 
-impl Drop for PendingEntry<'_> {
+impl<T: Send + 'static> Drop for PendingEntry<'_, T> {
     fn drop(&mut self) {
         if let Ok(mut map) = self.pending.try_lock() {
             map.remove(&self.request_id);

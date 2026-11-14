@@ -590,6 +590,15 @@ impl GatewayConfig {
         if provider == "searxng" && search.searxng_url.is_none() {
             anyhow::bail!("[search] provider = \"searxng\" needs searxng_url");
         }
+        if let Some(model) = &search.openrouter_model
+            && model
+                .strip_prefix("openrouter:")
+                .unwrap_or(model)
+                .trim()
+                .is_empty()
+        {
+            anyhow::bail!("[search] openrouter_model names no model");
+        }
         if !(1..=MAX_SEARCH_RESULTS).contains(&search.max_results) {
             anyhow::bail!("[search] max_results must be between 1 and {MAX_SEARCH_RESULTS}");
         }
@@ -1090,6 +1099,7 @@ mod tests {
             "[search]\nprovider = \"google\"\n",
             "[search]\nprovider = \"searxng\"\n",
             "[search]\nmax_results = 0\n",
+            "[search]\nopenrouter_model = \"openrouter:\"\n",
             "[search]\nmax_results = 11\n",
             "[search]\nsearxng_url = \"ftp://searx.example\"\n",
             "[search.base_url]\nopenrouter = \"https://openrouter.example\"\n",

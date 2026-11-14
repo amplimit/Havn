@@ -17,14 +17,30 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 
 use crate::config::{LlmConfig, MAX_SEARCH_RESULTS, SearchConfig};
-use crate::credential_resolver::resolve_for_user;
+use crate::credential_resolver::{
+    credential_caps, minute_ago_utc_rfc3339, resolve_for_user, today_start_utc_rfc3339,
+};
 use crate::keyring::KeyRing;
+use crate::llm_proxy::{Billing, ReservationGuard};
 use crate::model_catalog::ModelCatalog;
+use havn_db::repo::credential_usage::{self, Caps, Reservation};
 
 pub const TOOL_NAME: &str = "web_search";
 
-/// Each backend request; the runtime waits 90 s for the whole call.
+/// Each backend request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// The whole call, every backend and credential tried included; under the
+/// runtime's 90 s wait.
+const SEARCH_DEADLINE: Duration = Duration::from_secs(60);
+/// Largest response body read from a search API.
+const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_URL_CHARS: usize = 2048;
+/// `max_tokens` of the OpenRouter call: the results come as annotations,
+/// so the model's own answer can stop at once.
+const OPENROUTER_MAX_TOKENS: u32 = 16;
+/// Input tokens reserved per requested OpenRouter result; Exa excerpts
+/// run to a few thousand characters each.
+const OPENROUTER_TOKENS_PER_RESULT: i64 = 1500;
 const MAX_QUERY_CHARS: usize = 400;
 const MAX_TITLE_CHARS: usize = 200;
 const MAX_SNIPPET_CHARS: usize = 700;
@@ -77,6 +93,11 @@ impl Backend {
         }
     }
 
+    /// Provider name recorded with the search's usage.
+    fn usage_provider(self) -> &'static str {
+        self.credential_provider().unwrap_or("searxng")
+    }
+
     fn default_base_url(self) -> &'static str {
         match self {
             Self::Brave => "https://api.search.brave.com",
@@ -94,6 +115,19 @@ pub struct Hit {
     pub url: String,
     pub snippet: String,
     pub published: Option<String>,
+}
+
+/// What one backend request returned, with the tokens it used when it
+/// ran through a model.
+struct Answer {
+    hits: Vec<Hit>,
+    tokens: Option<(i64, i64)>,
+}
+
+impl From<Vec<Hit>> for Answer {
+    fn from(hits: Vec<Hit>) -> Self {
+        Self { hits, tokens: None }
+    }
 }
 
 #[derive(Debug)]
@@ -235,7 +269,12 @@ impl WebSearch {
 
     fn openrouter_model(&self, catalog: &ModelCatalog) -> Option<String> {
         if let Some(model) = &self.config.openrouter_model {
-            return Some(model.clone());
+            return Some(
+                model
+                    .strip_prefix("openrouter:")
+                    .unwrap_or(model)
+                    .to_string(),
+            );
         }
         let openrouter = |m: &&crate::model_catalog::ModelEntry| m.provider() == "openrouter";
         catalog
@@ -245,23 +284,28 @@ impl WebSearch {
             .map(|m| m.model().to_string())
     }
 
-    /// Take one search from `user`'s allowance for the current minute.
-    async fn admit(&self, user: UserId) -> bool {
+    /// Take one call from `user`'s allowance for the current minute. Every
+    /// call counts, including ones refused later, so a runtime cannot make
+    /// the gateway do unlimited work with failing calls.
+    pub async fn admit(&self, user: UserId) -> bool {
+        self.admit_at(user, Instant::now()).await
+    }
+
+    async fn admit_at(&self, user: UserId, now: Instant) -> bool {
         let limit = self.config.per_user_per_minute as usize;
         if limit == 0 {
             return true;
         }
-        let now = Instant::now();
         let mut recent = self.recent.lock().await;
         recent.retain(|_, times| {
             times
                 .back()
-                .is_some_and(|t| now.duration_since(*t) < RATE_WINDOW)
+                .is_some_and(|t| now.saturating_duration_since(*t) < RATE_WINDOW)
         });
         let times = recent.entry(user).or_default();
         while times
             .front()
-            .is_some_and(|t| now.duration_since(*t) >= RATE_WINDOW)
+            .is_some_and(|t| now.saturating_duration_since(*t) >= RATE_WINDOW)
         {
             times.pop_front();
         }
@@ -272,22 +316,12 @@ impl WebSearch {
         true
     }
 
-    /// Run one `web_search` call for an agent owned by `user`. The error is
-    /// shown to the model as is.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one call site; a parameter struct would only rename them"
-    )]
-    pub async fn run(
-        &self,
-        db: &SqlitePool,
-        http: &reqwest::Client,
-        keyring: Option<&KeyRing>,
-        catalog: &ModelCatalog,
-        user: UserId,
-        team: Option<TeamId>,
-        input: &Value,
-    ) -> Result<Report, String> {
+    #[must_use]
+    pub fn per_user_per_minute(&self) -> u32 {
+        self.config.per_user_per_minute
+    }
+
+    fn parse(&self, input: &Value) -> Result<(String, u32), String> {
         let query = input
             .get("query")
             .and_then(Value::as_str)
@@ -307,8 +341,24 @@ impl WebSearch {
                     "max_results must be an integer from 1 to {MAX_SEARCH_RESULTS}"
                 ))?,
         };
+        Ok((query, count))
+    }
+
+    /// Run one `web_search` call for an agent billed as `billing`. Each
+    /// attempt is booked against the credential's caps and the agent's
+    /// token budget like an LLM call. The error is shown to the model.
+    pub async fn run(
+        &self,
+        db: &SqlitePool,
+        http: &reqwest::Client,
+        keyring: Option<&KeyRing>,
+        catalog: &ModelCatalog,
+        billing: &Billing,
+        input: &Value,
+    ) -> Result<Report, String> {
+        let (query, count) = self.parse(input)?;
         let candidates = self
-            .candidates(db, user, team, catalog)
+            .candidates(db, billing.user_id, billing.agent_team, catalog)
             .await
             .map_err(|e| format!("could not look up search credentials: {e}"))?;
         if candidates.is_empty() {
@@ -319,35 +369,45 @@ impl WebSearch {
                     .into(),
             );
         }
-        if !self.admit(user).await {
-            return Err(format!(
-                "this user's agents have run {} searches in the last minute; wait and retry",
-                self.config.per_user_per_minute
-            ));
-        }
-        let mut failures = Vec::new();
-        for candidate in candidates {
-            match self
-                .search_with(http, keyring, &candidate, &query, count)
-                .await
-            {
-                Ok(hits) => {
-                    return Ok(Report {
-                        backend: candidate.backend,
-                        query,
-                        hits,
-                    });
+        let attempts = async {
+            let mut failures = Vec::new();
+            for candidate in &candidates {
+                let found = self
+                    .search_with(db, http, keyring, billing, candidate, &query, count)
+                    .await;
+                match found {
+                    Ok(hits) => return Ok((candidate.backend, hits)),
+                    Err(message) => {
+                        failures.push(format!("{}: {message}", candidate.backend.name()));
+                    }
                 }
-                Err(message) => failures.push(format!("{}: {message}", candidate.backend.name())),
             }
+            Err(format!("web search failed ({})", failures.join("; ")))
+        };
+        match tokio::time::timeout(SEARCH_DEADLINE, attempts).await {
+            Ok(Ok((backend, hits))) => Ok(Report {
+                backend,
+                query,
+                hits,
+            }),
+            Ok(Err(message)) => Err(message),
+            Err(_) => Err(format!(
+                "web search found nothing within {}s",
+                SEARCH_DEADLINE.as_secs()
+            )),
         }
-        Err(format!("web search failed ({})", failures.join("; ")))
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one call site; a parameter struct would only rename them"
+    )]
     async fn search_with(
         &self,
+        db: &SqlitePool,
         http: &reqwest::Client,
         keyring: Option<&KeyRing>,
+        billing: &Billing,
         candidate: &Candidate,
         query: &str,
         count: u32,
@@ -360,6 +420,18 @@ impl WebSearch {
         }
         let Some(keyring) = keyring else {
             return Err("credential encryption is not configured: set HAVN_AGE_KEY".into());
+        };
+        // OpenRouter adds the results to the model's input; the dedicated
+        // search APIs use no tokens, but each search still counts against
+        // the key's request rate and needs room in the agent's budget.
+        let (tokens_in, tokens_out, model) = if candidate.backend == Backend::OpenRouter {
+            (
+                OPENROUTER_TOKENS_PER_RESULT * i64::from(count) + 200,
+                i64::from(OPENROUTER_MAX_TOKENS),
+                candidate.model.as_deref().unwrap_or_default(),
+            )
+        } else {
+            (0, 0, TOOL_NAME)
         };
         let mut last = String::from("no usable credential");
         for credential in &candidate.credentials {
@@ -374,6 +446,39 @@ impl WebSearch {
                     continue;
                 }
             };
+            let day_start = today_start_utc_rfc3339();
+            let minute_start = minute_ago_utc_rfc3339();
+            let reservation = Reservation {
+                credential_id: credential.id,
+                user_id: billing.user_id,
+                agent_id: billing.agent_id,
+                provider: candidate.backend.usage_provider(),
+                model,
+                tokens_in,
+                max_tokens_out: tokens_out,
+                min_tokens_out: tokens_out,
+                caps: Caps {
+                    agent_tokens: billing.enforced_agent_tokens(),
+                    ..credential_caps(credential)
+                },
+                day_start: &day_start,
+                minute_start: &minute_start,
+            };
+            let guard = match credential_usage::reserve(db, reservation).await {
+                Ok(Some(reserved)) => ReservationGuard::new(db, reserved.id),
+                Ok(None) => {
+                    last = format!(
+                        "the caps of credential {} or the agent's daily token budget leave no \
+                         room for a search",
+                        credential.id
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    last = format!("could not record the search's usage: {e}");
+                    continue;
+                }
+            };
             let result = match candidate.backend {
                 Backend::Brave => {
                     brave(http, self.base_url(Backend::Brave), &key, query, count).await
@@ -383,15 +488,29 @@ impl WebSearch {
                 }
                 Backend::Exa => exa(http, self.base_url(Backend::Exa), &key, query, count).await,
                 Backend::OpenRouter => {
-                    let model = candidate.model.as_deref().unwrap_or_default();
                     openrouter(http, &self.openrouter_url, &key, model, query, count).await
                 }
                 Backend::Searxng => unreachable!("handled above"),
             };
             match result {
-                Ok(hits) => return Ok(hits),
-                Err(failure) if failure.next => last = failure.message,
-                Err(failure) => return Err(failure.message),
+                Ok(Answer {
+                    hits,
+                    tokens: Some((used_in, used_out)),
+                }) => {
+                    guard.settle_tokens(model, used_in, used_out).await;
+                    return Ok(hits);
+                }
+                Ok(Answer { hits, tokens: None }) => {
+                    guard.keep();
+                    return Ok(hits);
+                }
+                Err(failure) => {
+                    guard.release().await;
+                    if !failure.next {
+                        return Err(failure.message);
+                    }
+                    last = failure.message;
+                }
             }
         }
         Err(last)
@@ -435,12 +554,18 @@ pub fn render(report: &Report, now: DateTime<Utc>) -> String {
 fn clean(text: &str, max: usize) -> String {
     let mut plain = String::with_capacity(text.len());
     let mut in_tag = false;
-    for c in text.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' if in_tag => in_tag = false,
-            _ if !in_tag => plain.push(c),
-            _ => {}
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_tag {
+            in_tag = c != '>';
+        } else if c == '<'
+            && chars
+                .peek()
+                .is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, '/' | '!'))
+        {
+            in_tag = true;
+        } else {
+            plain.push(c);
         }
     }
     let plain = plain
@@ -479,7 +604,9 @@ fn hits(
         .flatten()
         .filter_map(|item| {
             let url = text_at(item, &["url"])?.trim();
-            if !(url.starts_with("https://") || url.starts_with("http://")) {
+            if !(url.starts_with("https://") || url.starts_with("http://"))
+                || url.len() > MAX_URL_CHARS
+            {
                 return None;
             }
             Some(Hit {
@@ -503,7 +630,30 @@ fn with_query(url: &str, params: &[(&str, &str)]) -> Result<reqwest::Url, Failur
     })
 }
 
-async fn send(request: reqwest::RequestBuilder) -> Result<Value, Failure> {
+/// The body of `response`, or an error once it passes `MAX_RESPONSE_BYTES`.
+async fn capped_body(mut response: reqwest::Response) -> Result<Vec<u8>, Failure> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| Failure {
+        next: true,
+        message: "the search API's answer broke off".into(),
+    })? {
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(Failure {
+                next: true,
+                message: format!(
+                    "the search API's answer is larger than {} MiB",
+                    MAX_RESPONSE_BYTES / (1024 * 1024)
+                ),
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Send `request` and parse its JSON answer. `key`, when given, is cut out
+/// of any error text the API sends back.
+async fn send(request: reqwest::RequestBuilder, key: Option<&str>) -> Result<Value, Failure> {
     let response = request
         .timeout(REQUEST_TIMEOUT)
         .send()
@@ -518,7 +668,11 @@ async fn send(request: reqwest::RequestBuilder) -> Result<Value, Failure> {
         })?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = capped_body(response).await.unwrap_or_default();
+        let mut body = String::from_utf8_lossy(&body).into_owned();
+        if let Some(key) = key.filter(|k| !k.is_empty()) {
+            body = body.replace(key, "[key]");
+        }
         let detail = clean(&body, 200);
         let next = matches!(status.as_u16(), 401 | 402 | 403 | 429) || status.is_server_error();
         return Err(Failure {
@@ -530,7 +684,8 @@ async fn send(request: reqwest::RequestBuilder) -> Result<Value, Failure> {
             },
         });
     }
-    response.json::<Value>().await.map_err(|_| Failure {
+    let body = capped_body(response).await?;
+    serde_json::from_slice(&body).map_err(|_| Failure {
         next: true,
         message: "the search API answered with something other than JSON".into(),
     })
@@ -542,7 +697,7 @@ async fn brave(
     key: &str,
     query: &str,
     count: u32,
-) -> Result<Vec<Hit>, Failure> {
+) -> Result<Answer, Failure> {
     let body = send(
         http.get(with_query(
             &format!("{base}/res/v1/web/search"),
@@ -550,15 +705,16 @@ async fn brave(
         )?)
         .header("Accept", "application/json")
         .header("X-Subscription-Token", key),
+        Some(key),
     )
     .await?;
-    Ok(hits(
+    Ok(Answer::from(hits(
         body.pointer("/web/results").and_then(Value::as_array),
         count,
         &["title"],
         &["description"],
         &["page_age", "age"],
-    ))
+    )))
 }
 
 async fn tavily(
@@ -567,20 +723,21 @@ async fn tavily(
     key: &str,
     query: &str,
     count: u32,
-) -> Result<Vec<Hit>, Failure> {
+) -> Result<Answer, Failure> {
     let body = send(
         http.post(format!("{base}/search"))
             .bearer_auth(key)
             .json(&json!({"query": query, "max_results": count, "search_depth": "basic"})),
+        Some(key),
     )
     .await?;
-    Ok(hits(
+    Ok(Answer::from(hits(
         body.get("results").and_then(Value::as_array),
         count,
         &["title"],
         &["content"],
         &["published_date"],
-    ))
+    )))
 }
 
 async fn exa(
@@ -589,7 +746,7 @@ async fn exa(
     key: &str,
     query: &str,
     count: u32,
-) -> Result<Vec<Hit>, Failure> {
+) -> Result<Answer, Failure> {
     let body = send(
         http.post(format!("{base}/search"))
             .header("x-api-key", key)
@@ -598,15 +755,16 @@ async fn exa(
                 "numResults": count,
                 "contents": {"text": {"maxCharacters": MAX_SNIPPET_CHARS}}
             })),
+        Some(key),
     )
     .await?;
-    Ok(hits(
+    Ok(Answer::from(hits(
         body.get("results").and_then(Value::as_array),
         count,
         &["title"],
         &["text", "summary"],
         &["publishedDate"],
-    ))
+    )))
 }
 
 /// OpenRouter's `web` plugin searches Exa with the message text as the
@@ -619,16 +777,17 @@ async fn openrouter(
     model: &str,
     query: &str,
     count: u32,
-) -> Result<Vec<Hit>, Failure> {
+) -> Result<Answer, Failure> {
     let body = send(
         http.post(format!("{base}/chat/completions"))
             .bearer_auth(key)
             .json(&json!({
                 "model": model,
-                "max_tokens": 16,
+                "max_tokens": OPENROUTER_MAX_TOKENS,
                 "messages": [{"role": "user", "content": query}],
                 "plugins": [{"id": "web", "engine": "exa", "max_results": count}]
             })),
+        Some(key),
     )
     .await?;
     if let Some(error) = body.get("error") {
@@ -646,7 +805,14 @@ async fn openrouter(
         .filter(|a| a.get("type").and_then(Value::as_str) == Some("url_citation"))
         .filter_map(|a| a.get("url_citation").cloned())
         .collect();
-    Ok(hits(Some(&citations), count, &["title"], &["content"], &[]))
+    let used = |field: &str| {
+        body.pointer(&format!("/usage/{field}"))
+            .and_then(Value::as_i64)
+    };
+    Ok(Answer {
+        hits: hits(Some(&citations), count, &["title"], &["content"], &[]),
+        tokens: used("prompt_tokens").zip(used("completion_tokens")),
+    })
 }
 
 async fn searxng(
@@ -655,10 +821,13 @@ async fn searxng(
     query: &str,
     count: u32,
 ) -> Result<Vec<Hit>, Failure> {
-    let body = send(http.get(with_query(
-        &format!("{base}/search"),
-        &[("q", query), ("format", "json")],
-    )?))
+    let body = send(
+        http.get(with_query(
+            &format!("{base}/search"),
+            &[("q", query), ("format", "json")],
+        )?),
+        None,
+    )
     .await?;
     Ok(hits(
         body.get("results").and_then(Value::as_array),
@@ -817,6 +986,31 @@ mod tests {
             Some(Backend::Searxng)
         );
 
+        let all = owner_with(
+            &db,
+            &[
+                "search:exa",
+                "search:tavily",
+                "search:brave",
+                "llm:openrouter",
+            ],
+        )
+        .await;
+        let tavily_exa = owner_with(&db, &["search:exa", "search:tavily"]).await;
+        assert_eq!(
+            s.backend_for(&db, all, None, &models).await.unwrap(),
+            Some(Backend::Brave)
+        );
+        assert_eq!(
+            s.backend_for(&db, tavily_exa, None, &models).await.unwrap(),
+            Some(Backend::Tavily)
+        );
+        assert_eq!(
+            s.backend_for(&db, openrouter, None, &models).await.unwrap(),
+            Some(Backend::OpenRouter),
+            "an OpenRouter key comes before SearXNG"
+        );
+
         config.provider = "off".into();
         let s = search(config.clone());
         assert_eq!(s.backend_for(&db, both, None, &models).await.unwrap(), None);
@@ -850,8 +1044,7 @@ mod tests {
                 &reqwest::Client::new(),
                 Some(ring()),
                 &catalog(&["openrouter:cheap/model"]),
-                user,
-                None,
+                &Billing::user(user),
                 &json!({"query": "  havn   news ", "max_results": 3}),
             )
             .await
@@ -882,6 +1075,77 @@ mod tests {
         assert_eq!(body["messages"][0]["content"], "havn news");
         assert_eq!(body["plugins"][0]["id"], "web");
         assert_eq!(body["plugins"][0]["max_results"], 3);
+    }
+
+    #[tokio::test]
+    async fn openrouter_searches_are_booked_against_the_agent_budget() {
+        let (url, _) = fake_api(
+            "/chat/completions",
+            json!({"choices": [{"message": {"annotations": [
+                {"type": "url_citation", "url_citation": {"url": "https://example.com/a"}}
+            ]}}], "usage": {"prompt_tokens": 2000, "completion_tokens": 16}}),
+            200,
+        )
+        .await;
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let user = owner_with(&db, &["llm:openrouter"]).await;
+        let agent = havn_db::repo::agents::create(
+            &db,
+            havn_db::repo::agents::NewAgent {
+                owner_id: user,
+                team_id: None,
+                name: "a",
+                config: json!({}),
+            },
+        )
+        .await
+        .expect("agent");
+        let mut llm = LlmConfig::default();
+        llm.base_url.insert("openrouter".into(), url);
+        let s = WebSearch::new(SearchConfig::default(), &llm);
+        let models = catalog(&["openrouter:cheap/model"]);
+        let mut billing = Billing {
+            user_id: user,
+            agent_id: Some(agent.id),
+            agent_team: None,
+            budget: havn_core::BudgetPolicy {
+                max_tokens_per_day: 1_000_000,
+                ..havn_core::BudgetPolicy::default()
+            },
+        };
+        let http = reqwest::Client::new();
+        s.run(
+            &db,
+            &http,
+            Some(ring()),
+            &models,
+            &billing,
+            &json!({"query": "q"}),
+        )
+        .await
+        .expect("search");
+        let used: (i64, i64) = sqlx::query_as(
+            "SELECT tokens_in, tokens_out FROM credential_usages WHERE agent_id = ?1",
+        )
+        .bind(agent.id.to_string())
+        .fetch_one(&db)
+        .await
+        .expect("usage row");
+        assert_eq!(used, (2000, 16));
+
+        billing.budget.max_tokens_per_day = 3000;
+        let error = s
+            .run(
+                &db,
+                &http,
+                Some(ring()),
+                &models,
+                &billing,
+                &json!({"query": "q"}),
+            )
+            .await
+            .expect_err("over budget");
+        assert!(error.contains("budget"), "{error}");
     }
 
     #[tokio::test]
@@ -926,8 +1190,7 @@ mod tests {
                     &reqwest::Client::new(),
                     Some(ring()),
                     &catalog(&[]),
-                    user,
-                    None,
+                    &Billing::user(user),
                     &json!({"query": "q"}),
                 )
                 .await
@@ -963,8 +1226,7 @@ mod tests {
                 &reqwest::Client::new(),
                 None,
                 &catalog(&[]),
-                user,
-                None,
+                &Billing::user(user),
                 &json!({"query": "q", "max_results": 1}),
             )
             .await
@@ -978,7 +1240,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_backend_falls_through_to_the_next() {
-        let (exa_url, _) = fake_api("/search", json!({"error": "quota"}), 429).await;
+        let (exa_url, _) =
+            fake_api("/search", json!({"error": "quota exceeded for key-1"}), 429).await;
         let (searxng_url, _) = fake_api(
             "/search",
             json!({"results": [{"title": "S", "url": "https://s.example"}]}),
@@ -998,8 +1261,7 @@ mod tests {
                 &reqwest::Client::new(),
                 Some(ring()),
                 &catalog(&[]),
-                user,
-                None,
+                &Billing::user(user),
                 &json!({"query": "q"}),
             )
             .await
@@ -1013,13 +1275,13 @@ mod tests {
                 &reqwest::Client::new(),
                 Some(ring()),
                 &catalog(&[]),
-                user,
-                None,
+                &Billing::user(user),
                 &json!({"query": "q"}),
             )
             .await
             .expect_err("only exa, which fails");
         assert!(error.contains("exa: HTTP 429"), "{error}");
+        assert!(error.contains("quota exceeded for [key]"), "{error}");
         assert!(!error.contains("key-1"), "{error}");
     }
 
@@ -1042,7 +1304,7 @@ mod tests {
             (json!({"query": "q"}), "not set up"),
         ] {
             let error = s
-                .run(&db, &http, None, &models, user, None, &input)
+                .run(&db, &http, None, &models, &Billing::user(user), &input)
                 .await
                 .expect_err("refused");
             assert!(error.contains(expected), "{input}: {error}");
@@ -1061,6 +1323,13 @@ mod tests {
         assert!(s.admit(a).await);
         assert!(!s.admit(a).await);
         assert!(s.admit(b).await);
+        let later = Instant::now() + RATE_WINDOW;
+        assert!(s.admit_at(a, later).await, "the window has passed");
+        assert_eq!(
+            s.recent.lock().await.len(),
+            1,
+            "b's expired entry is pruned"
+        );
 
         let unlimited = search(SearchConfig {
             per_user_per_minute: 0,
@@ -1102,5 +1371,7 @@ mod tests {
     fn clean_strips_markup_and_truncates() {
         assert_eq!(clean("<b>a</b>&amp;<i>b</i>\n\n c", 100), "a&b c");
         assert_eq!(clean("abcdef", 3), "abc...");
+        assert_eq!(clean("x < 5 and y > 2", 100), "x < 5 and y > 2");
+        assert_eq!(clean("a <!-- note --> b", 100), "a b");
     }
 }

@@ -1229,11 +1229,26 @@ async fn run_gateway_tool(
         Ok(None) => return Err(format!("agent {agent_id} not found")),
         Err(e) => return Err(format!("agent lookup failed: {e}")),
     };
+    // First, before any other work: every call counts against the owner's
+    // rate, and refusals here are not audited, so a runtime cannot make the
+    // gateway query or write without bound.
+    if !ctx.search.admit(agent.owner_id).await {
+        return Err(format!(
+            "this user's agents have made {} web_search calls in the last minute; wait and retry",
+            ctx.search.per_user_per_minute()
+        ));
+    }
     // The policy may have changed since Welcome offered the tool.
     let policy = policy_resolver::for_session(&ctx.db, &agent, ctx.multi_user).await;
     if !policy.permissions.can_search_web {
         return Err("this agent's policy does not allow web search".into());
     }
+    let billing = llm_proxy::Billing {
+        user_id: agent.owner_id,
+        agent_id: Some(agent_id),
+        agent_team: agent.team_id,
+        budget: policy.budget.clone(),
+    };
     let result = ctx
         .search
         .run(
@@ -1241,8 +1256,7 @@ async fn run_gateway_tool(
             &ctx.http,
             ctx.keyring.as_ref(),
             &ctx.models.load(),
-            agent.owner_id,
-            agent.team_id,
+            &billing,
             &call.input,
         )
         .await;
@@ -1262,8 +1276,15 @@ async fn run_gateway_tool(
         }),
         Err(message) => serde_json::json!({ "query": query, "error": message }),
     };
-    crate::audit::record_agent_action(&ctx.db, agent.owner_id, agent_id, "web.search", details)
-        .await;
+    crate::audit::record(
+        &ctx.db,
+        agent.owner_id,
+        agent.team_id,
+        Some(agent_id),
+        "web.search",
+        details,
+    )
+    .await;
     result.map(|report| crate::web_search::render(&report, chrono::Utc::now()))
 }
 
