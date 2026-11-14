@@ -162,13 +162,20 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
                 || die "the agent's network namespace does not allow ping"
             [ "$(nsenter -t "$pid" -n cat /proc/sys/net/ipv4/ip_unprivileged_port_start)" = "0" ] \
                 || die "the agent's network namespace does not allow low ports"
-            # As a tool runs: no capabilities, the agent's locked
-            # securebits, under no_new_privs.
-            if command -v ping >/dev/null; then
+            # As a tool runs: no capabilities, havn-init's locked
+            # securebits (KEEP_CAPS left settable), under no_new_privs.
+            as_tool() {
                 nsenter -t "$pid" -U -m -n -p -- setpriv --no-new-privs \
                     --securebits +noroot,+noroot_locked,+no_setuid_fixup,+no_setuid_fixup_locked \
-                    --bounding-set -all --inh-caps -all -- ping -c 1 -W 2 127.0.0.1 >/dev/null 2>&1 \
+                    --bounding-set -all --inh-caps -all -- "$@"
+            }
+            if command -v ping >/dev/null; then
+                as_tool ping -c 1 -W 2 127.0.0.1 >/dev/null 2>&1 \
                     || die "a process without capabilities in the agent cannot ping"
+            fi
+            if command -v python3 >/dev/null; then
+                as_tool python3 -c 'import socket; socket.socket().bind(("127.0.0.1", 80))' \
+                    || die "a process without capabilities in the agent cannot bind port 80"
             fi
         done
         ok "every runtime thread is under seccomp with no_new_privs"

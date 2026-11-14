@@ -720,8 +720,7 @@ unsafe fn mirror_bind_into_newroot(host_path: &Path, read_only: bool) -> io::Res
             libc::MS_BIND | libc::MS_REC,
             std::ptr::null(),
         ))?;
-        let read_only = if read_only { libc::MS_RDONLY } else { 0 };
-        remount_bind(&target, read_only | libc::MS_NOSUID)?;
+        restrict_bind(&target, read_only)?;
     }
     Ok(())
 }
@@ -815,6 +814,10 @@ unsafe fn symlink_under_newroot(target: &str, linkname: &str) -> io::Result<()> 
 /// Bind `src` onto `dest` read-only and `nosuid`. The 2-step is required
 /// because the initial `MS_BIND` ignores those flags (kernel compatibility
 /// quirk).
+///
+/// # Safety
+///
+/// As [`restrict_bind`].
 unsafe fn bind_ro(src: &CStr, dest: &CStr) -> io::Result<()> {
     // SAFETY: src and dest are valid C strings; the flag set is well-defined.
     unsafe {
@@ -825,45 +828,101 @@ unsafe fn bind_ro(src: &CStr, dest: &CStr) -> io::Result<()> {
             libc::MS_BIND | libc::MS_REC,
             std::ptr::null(),
         ))?;
-        remount_bind(dest, libc::MS_RDONLY | libc::MS_NOSUID)
+        restrict_bind(dest, true)
     }
 }
 
-/// Remount the bind mount at `dest` with `flags` added to the ones it has.
-/// `nosuid` keeps setuid bits and file capabilities from taking effect in
-/// the agent: an agent process holds no capabilities, so exec'ing a binary
-/// with file capabilities (`ping` on many distributions) would otherwise
-/// fail with `EPERM`; without them it falls back to what an unprivileged
-/// user can do. The flags the mount already has are kept: in a user
-/// namespace the kernel refuses a remount that drops a locked one.
+/// `struct mount_attr` of `mount_setattr(2)`; libc does not define it.
+#[repr(C)]
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+
+const MOUNT_ATTR_RDONLY: u64 = 0x1;
+const MOUNT_ATTR_NOSUID: u64 = 0x2;
+/// `ST_RELATIME` and `ST_NOSYMFOLLOW` of statvfs(3); libc defines neither
+/// for musl.
+const ST_RELATIME: libc::c_ulong = 0x1000;
+const ST_NOSYMFOLLOW: libc::c_ulong = 0x2000;
+
+/// Make the bind mount at `dest` and every mount below it `nosuid`, and
+/// read-only when `read_only`. `nosuid` keeps setuid bits and file
+/// capabilities from taking effect in the agent: an agent process holds
+/// no capabilities, so exec'ing a binary with file capabilities (`ping` on
+/// many distributions) would otherwise fail with `EPERM`; without them it
+/// falls back to what an unprivileged user can do.
+///
+/// Uses `mount_setattr` (Linux 5.12+), which only adds the two flags and
+/// so keeps every other one, locked ones included. Older kernels get a
+/// bind remount of `dest` alone that repeats the flags it has, since in a
+/// user namespace the kernel refuses a remount that drops a locked one.
 ///
 /// # Safety
 ///
-/// Only `statvfs` and `mount`, so safe in a forked child.
-unsafe fn remount_bind(dest: &CStr, flags: libc::c_ulong) -> io::Result<()> {
+/// Only `mount_setattr`, `statvfs` and `mount`, so safe in a forked child.
+unsafe fn restrict_bind(dest: &CStr, read_only: bool) -> io::Result<()> {
+    let attr = MountAttr {
+        attr_set: MOUNT_ATTR_NOSUID | if read_only { MOUNT_ATTR_RDONLY } else { 0 },
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    // SAFETY: dest is a valid C string and attr a valid mount_attr of the
+    // size passed.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            libc::AT_FDCWD,
+            dest.as_ptr(),
+            libc::AT_RECURSIVE,
+            &raw const attr,
+            std::mem::size_of::<MountAttr>(),
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::ENOSYS) {
+        return Err(err);
+    }
     // SAFETY: a zeroed statvfs is a valid out-parameter.
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: dest is a valid C string and st a valid out-pointer.
     unsafe { check(libc::statvfs(dest.as_ptr(), &raw mut st)) }?;
-    let kept = [
+    let has = |flag: libc::c_ulong| st.f_flag & flag != 0;
+    let mut flags = libc::MS_REMOUNT | libc::MS_BIND | libc::MS_NOSUID;
+    for (st_flag, ms_flag) in [
         (libc::ST_RDONLY, libc::MS_RDONLY),
-        (libc::ST_NOSUID, libc::MS_NOSUID),
         (libc::ST_NODEV, libc::MS_NODEV),
         (libc::ST_NOEXEC, libc::MS_NOEXEC),
         (libc::ST_NOATIME, libc::MS_NOATIME),
         (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
-        (libc::ST_RELATIME, libc::MS_RELATIME),
-    ]
-    .into_iter()
-    .filter(|(st_flag, _)| st.f_flag & *st_flag != 0)
-    .fold(0, |acc, (_, ms_flag)| acc | ms_flag);
+        (ST_RELATIME, libc::MS_RELATIME),
+        (ST_NOSYMFOLLOW, libc::MS_NOSYMFOLLOW),
+    ] {
+        if has(st_flag) {
+            flags |= ms_flag;
+        }
+    }
+    // statvfs reports no flag for strictatime; without one the remount
+    // would switch the mount to relatime.
+    if !has(libc::ST_NOATIME) && !has(ST_RELATIME) {
+        flags |= libc::MS_STRICTATIME;
+    }
+    if read_only {
+        flags |= libc::MS_RDONLY;
+    }
     // SAFETY: dest is a valid C string; a bind remount takes no source or data.
     unsafe {
         check(libc::mount(
             std::ptr::null(),
             dest.as_ptr(),
             std::ptr::null(),
-            libc::MS_REMOUNT | libc::MS_BIND | kept | flags,
+            flags,
             std::ptr::null(),
         ))
     }
@@ -980,6 +1039,22 @@ pub unsafe fn prepare_agent_network() -> io::Result<()> {
     loopback.and(ping).and(ports)
 }
 
+// `ioctl`'s request is a `c_ulong` with glibc and a `c_int` with musl.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::unnecessary_cast,
+    reason = "the request numbers fit both types"
+)]
+const IOCTL_GET_FLAGS: libc::Ioctl = libc::SIOCGIFFLAGS as libc::Ioctl;
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::unnecessary_cast,
+    reason = "the request numbers fit both types"
+)]
+const IOCTL_SET_FLAGS: libc::Ioctl = libc::SIOCSIFFLAGS as libc::Ioctl;
+
 /// Set `IFF_UP` on `lo` in the calling process's network namespace.
 ///
 /// # Safety
@@ -998,12 +1073,12 @@ unsafe fn loopback_up() -> io::Result<()> {
     }
     // SAFETY: fd is a socket and req a valid ifreq for both requests.
     let result = unsafe {
-        check(libc::ioctl(fd, libc::SIOCGIFFLAGS, &raw mut req)).and_then(|()| {
+        check(libc::ioctl(fd, IOCTL_GET_FLAGS, &raw mut req)).and_then(|()| {
             #[allow(clippy::cast_possible_truncation, reason = "IFF_UP fits in a short")]
             {
                 req.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
             }
-            check(libc::ioctl(fd, libc::SIOCSIFFLAGS, &raw const req))
+            check(libc::ioctl(fd, IOCTL_SET_FLAGS, &raw const req))
         })
     };
     // SAFETY: closing the socket opened above.

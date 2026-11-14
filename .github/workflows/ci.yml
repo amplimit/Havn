@@ -38,6 +38,31 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  musl:
+    # The release binaries are musl builds; a libc type that differs from
+    # glibc (ioctl's request) breaks them while every glibc check passes.
+    name: musl build (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl-${{ matrix.target }}
+      - name: install zig + cargo-zigbuild
+        run: |
+          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
+            | sudo tar -xJ -C /opt
+          echo "/opt/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+          cargo install --locked cargo-zigbuild
+      - run: cargo zigbuild --target ${{ matrix.target }} --bins
+
   test:
     name: test
     runs-on: ubuntu-24.04
