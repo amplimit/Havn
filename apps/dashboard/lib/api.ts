@@ -39,6 +39,25 @@ export type CredentialView = {
   created_at: string;
 };
 
+/** `GET /search`: the backend the caller's agents search with. */
+export type SearchStatus = {
+  /** `[search] provider` in the gateway config: auto, off, or one backend. */
+  provider: string;
+  backend: string | null;
+};
+
+/** `/agents/{id}/web`: one agent's web access, from its next start. */
+export type AgentWebView = {
+  can_search_web: boolean;
+  /** Network egress, and with it the in-sandbox web_fetch tool. */
+  egress_allowed: boolean;
+  /** What the owner's policy permits; false only in multi-user mode. */
+  search_permitted: boolean;
+  egress_permitted: boolean;
+  /** The backend this agent would search with, or null when none is set up. */
+  search_backend: string | null;
+};
+
 export type MemoryKind = "identity" | "preference" | "project" | "event";
 
 export type MemoryEntry = {
@@ -348,6 +367,19 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(body),
     }),
+  search: {
+    get: () => request<SearchStatus>("/search"),
+    agent: (agentId: string) => request<AgentWebView>(`/agents/${agentId}/web`),
+    patchAgent: (
+      agentId: string,
+      patch: { can_search_web?: boolean; egress_allowed?: boolean },
+    ) =>
+      request<AgentWebView>(`/agents/${agentId}/web`, {
+        method: "PATCH",
+        body: JSON.stringify(patch),
+      }),
+  },
+
   models: {
     get: () => request<ModelsView>("/llm/models"),
     /** Replaces the whole list; the gateway writes it to config.toml. */
@@ -591,6 +623,13 @@ export const api = {
 };
 
 export const LLM_PROVIDERS: readonly string[] = ["anthropic", "openai", "openrouter", "gemini"];
+
+/** Web search backends whose keys are stored as `search:<name>`. */
+export const SEARCH_PROVIDERS: readonly string[] = ["brave", "tavily", "exa"];
+
+export function isSearchCredential(credentialProvider: string): boolean {
+  return credentialProvider.startsWith("search:");
+}
 
 // Credentials are stored as `llm:<provider>` or a bare name; channel and
 // SaaS tokens are not LLM keys.

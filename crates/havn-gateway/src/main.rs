@@ -638,6 +638,10 @@ async fn main() -> anyhow::Result<()> {
             "/agents/{id}/mcp",
             get(api::mcp::get).patch(api::mcp::patch),
         )
+        .route(
+            "/agents/{id}/web",
+            get(api::search::agent_get).patch(api::search::agent_patch),
+        )
         .route("/agents/{id}/memory", get(api::memory::list))
         .route(
             "/agents/{id}/memory/{key}",
