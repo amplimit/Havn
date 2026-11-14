@@ -85,8 +85,7 @@ impl NestedUserNsResult {
                 ),
             ),
             Self::CapDropFailed => (
-                "could not map ids or drop capabilities inside the first user namespace"
-                    .into(),
+                "could not map ids or drop capabilities inside the first user namespace".into(),
                 Some(
                     "Unusual; re-run, and file an issue with the kernel version if it persists."
                         .into(),
@@ -173,7 +172,8 @@ pub fn check() -> NestedUserNsResult {
             };
             // SAFETY: capset with a valid header and two data words.
             if !mapped
-                || unsafe { libc::syscall(libc::SYS_capset, &raw mut header, no_caps.as_ptr()) } != 0
+                || unsafe { libc::syscall(libc::SYS_capset, &raw mut header, no_caps.as_ptr()) }
+                    != 0
             {
                 unsafe { libc::_exit(EXIT_CAP_DROP_FAILED) };
             }
