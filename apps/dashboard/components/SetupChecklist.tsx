@@ -61,6 +61,8 @@ export function SetupChecklist({
   }, [decided, visible, onVisibleChange]);
 
   if (!visible || !models) return null;
+  // Hidden on a gateway without search, or with search turned off.
+  const searchStep = setup?.search && setup.search.provider !== "off" ? setup.search : null;
 
   return (
     <section aria-labelledby="setup-title" className="card-elevated mb-8 p-6">
@@ -68,8 +70,8 @@ export function SetupChecklist({
         get started
       </h2>
       <p className="mb-5 text-sm" style={{ color: "var(--color-body)" }}>
-        Three steps before the first chat, and one optional. Done steps are
-        checked.
+        Three steps before the first chat{searchStep ? ", and one optional" : ""}.
+        Done steps are checked.
       </p>
       <ol role="list" className="grid gap-4">
         <Step
@@ -115,14 +117,14 @@ export function SetupChecklist({
         >
           Each agent gets its own workspace and a chat here.
         </Step>
-        {setup?.search && setup.search.provider !== "off" && (
+        {searchStep && (
           <Step
-            done={setup.search.backend !== null}
+            done={searchStep.backend !== null}
             title="Optional: let agents search the web"
             action={{ href: "/credentials", label: "add a search key" }}
           >
-            {setup.search.backend ? (
-              <>Agents search with {setup.search.backend}.</>
+            {searchStep.backend ? (
+              <>Agents search with {searchStep.backend}.</>
             ) : (
               <>
                 Add a Brave, Tavily or Exa key as a web search key; with only an

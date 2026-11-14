@@ -11,7 +11,7 @@ use axum::extract::{Path, State};
 use havn_db::repo::agents::Agent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::AppState;
 use crate::api::ApiError;
@@ -70,6 +70,8 @@ async fn view(state: &AppState, agent: &Agent) -> Result<AgentWebView, ApiError>
     let multi_user = state.trusted_proxies.is_some();
     let policy = policy_resolver::for_session(&state.db, agent, multi_user).await;
     let owner = policy_resolver::for_owner(&state.db, agent).await;
+    // Shown for information only: a failed lookup must not fail a PATCH
+    // that has already been saved.
     let backend = state
         .search
         .backend_for(
@@ -79,7 +81,10 @@ async fn view(state: &AppState, agent: &Agent) -> Result<AgentWebView, ApiError>
             &state.models.load(),
         )
         .await
-        .map_err(|e| ApiError::Internal(format!("search credential lookup failed: {e}")))?;
+        .unwrap_or_else(|e| {
+            warn!(agent_id = %agent.id, error = %e, "search credential lookup failed");
+            None
+        });
     let egress =
         |p: &havn_core::Policy| p.permissions.can_access_network && p.network_policy.egress_allowed;
     Ok(AgentWebView {
@@ -109,6 +114,9 @@ pub async fn agent_patch(
     Json(req): Json<AgentWebPatch>,
 ) -> Result<Json<AgentWebView>, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    if req.can_search_web.is_none() && req.egress_allowed.is_none() {
+        return Ok(Json(view(&state, &agent).await?));
+    }
     let config = with_web_access(&agent.config, &req);
     if let Some(policy) = config.get("policy") {
         serde_json::from_value::<havn_core::Policy>(policy.clone())

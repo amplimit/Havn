@@ -525,6 +525,8 @@ function BootstrapFileEditor({
 function WebAccessEditor({ agentId }: { agentId: string }) {
   const [view, setView] = useState<AgentWebView | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // A gateway older than these settings has no /agents/{id}/web.
+  const [unsupported, setUnsupported] = useState(false);
   const [saving, setSaving] = useState(false);
   const [justSaved, flashSaved] = useFlash();
 
@@ -535,7 +537,9 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
         if (!cancelled) setView(v);
       },
       (e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+        if (cancelled) return;
+        if (e instanceof ApiError && e.status === 404) setUnsupported(true);
+        else setError(e instanceof Error ? e.message : String(e));
       },
     );
     return () => {
@@ -556,6 +560,10 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
     }
   }
 
+  if (unsupported) return null;
+  const searchLocked = saving || (view !== null && !view.search_permitted && !view.can_search_web);
+  const egressLocked = saving || (view !== null && !view.egress_permitted && !view.egress_allowed);
+
   return (
     <section className="mt-10 card px-4 py-4" aria-labelledby="web-access-title">
       <h2 id="web-access-title" className="display-h3 mb-2">
@@ -563,14 +571,13 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
       </h2>
       <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
         Changes apply on the agent&apos;s next start.
-        {justSaved && (
-          <span className="ml-2" style={{ color: "var(--color-success-text)" }} role="status">
-            saved
-          </span>
-        )}
+        <span className="ml-2" style={{ color: "var(--color-success-text)" }} role="status">
+          {justSaved ? "saved" : ""}
+        </span>
       </p>
       {error && (
         <div
+          role="alert"
           className="mb-3 px-3 py-2 text-sm"
           style={{
             background: "rgba(234, 34, 97, 0.05)",
@@ -589,9 +596,9 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
           <label className="flex items-start gap-3 text-sm">
             <input
               type="checkbox"
-              className="mt-1 h-4 w-4 shrink-0 cursor-pointer"
+              className={`mt-1 h-4 w-4 shrink-0 ${searchLocked ? "cursor-not-allowed" : "cursor-pointer"}`}
               checked={view.can_search_web}
-              disabled={saving || (!view.search_permitted && !view.can_search_web)}
+              disabled={searchLocked}
               onChange={(e) => save({ can_search_web: e.target.checked })}
             />
             <span>
@@ -615,9 +622,9 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
           <label className="flex items-start gap-3 text-sm">
             <input
               type="checkbox"
-              className="mt-1 h-4 w-4 shrink-0 cursor-pointer"
+              className={`mt-1 h-4 w-4 shrink-0 ${egressLocked ? "cursor-not-allowed" : "cursor-pointer"}`}
               checked={view.egress_allowed}
-              disabled={saving || (!view.egress_permitted && !view.egress_allowed)}
+              disabled={egressLocked}
               onChange={(e) => save({ egress_allowed: e.target.checked })}
             />
             <span>
