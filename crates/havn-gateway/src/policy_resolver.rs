@@ -4,8 +4,9 @@
 //! single-user default when they belong to no team); `for_team_member`
 //! is the user's role policy in one team, which governs agents created in
 //! that team. `for_session` adds the per-agent override
-//! (`Agent.config["policy"]`): applied as written in single-user mode,
-//! clamped to the owner's policy in multi-user mode.
+//! (`Agent.config["policy"]`): laid over the owner's policy, so it changes
+//! only the keys it sets, and clamped to the owner's policy in multi-user
+//! mode.
 //!
 //! The snapshot shipped to the runtime in the `Welcome` frame (and the
 //! sandbox set up at spawn) is resolved once per agent connection, so
@@ -16,7 +17,7 @@
 use havn_core::{Policy, TeamId, UserId};
 use havn_db::repo::agents::Agent;
 use sqlx::SqlitePool;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Resolve the effective policy for a user (independent of any one
 /// agent — used to enforce `max_agents`, `can_bind_channels`,
@@ -185,6 +186,55 @@ fn lay_over(base: &mut serde_json::Value, over: &serde_json::Value, top: bool) {
     }
 }
 
+/// One-time upgrade of overrides stored by gateways before v0.2.0, which
+/// migration 0011 marks with a row in `policy_overrides_upgrade`. Those
+/// gateways gave the keys an override left out their defaults; each such
+/// override is rewritten as that full policy, so it keeps its meaning now
+/// that overrides are laid over the owner's policy. Malformed overrides,
+/// which were ignored, are left as they are.
+pub async fn upgrade_stored_overrides(db: &SqlitePool) -> anyhow::Result<()> {
+    let pending: Option<(i64,)> = sqlx::query_as("SELECT id FROM policy_overrides_upgrade")
+        .fetch_optional(db)
+        .await?;
+    if pending.is_none() {
+        return Ok(());
+    }
+    let mut tx = db.begin().await?;
+    let agents: Vec<(String, String)> = sqlx::query_as("SELECT id, config FROM agents")
+        .fetch_all(&mut *tx)
+        .await?;
+    let mut rewritten = 0usize;
+    for (id, raw) in agents {
+        let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(stored) = config.get("policy").filter(|p| p.is_object()) else {
+            continue;
+        };
+        let Ok(full) = serde_json::from_value::<Policy>(stored.clone()) else {
+            continue;
+        };
+        config["policy"] = serde_json::to_value(&full)?;
+        sqlx::query("UPDATE agents SET config = ? WHERE id = ?")
+            .bind(config.to_string())
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        rewritten += 1;
+    }
+    sqlx::query("DELETE FROM policy_overrides_upgrade")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    if rewritten > 0 {
+        info!(
+            agents = rewritten,
+            "per-agent policy overrides rewritten as the full policies they stood for"
+        );
+    }
+    Ok(())
+}
+
 /// The owner's policy as it applies to `agent`: their role in the agent's
 /// team for a team agent, else [`for_user`].
 pub async fn for_owner(db: &SqlitePool, agent: &Agent) -> Policy {
@@ -331,6 +381,89 @@ mod tests {
             cron.disabled,
             vec!["shell".to_string(), "web_fetch".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn stored_partial_overrides_keep_their_meaning_after_upgrade() {
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let user = havn_db::repo::users::ensure_default(&db)
+            .await
+            .expect("user");
+        let insert = |name: &'static str, config: serde_json::Value| {
+            let db = db.clone();
+            async move {
+                let id = AgentId::new();
+                sqlx::query("INSERT INTO agents (id, owner_id, name, config) VALUES (?, ?, ?, ?)")
+                    .bind(id.to_string())
+                    .bind(user.id.to_string())
+                    .bind(name)
+                    .bind(config.to_string())
+                    .execute(&db)
+                    .await
+                    .expect("agent");
+                id
+            }
+        };
+        let partial = insert(
+            "p",
+            json!({"model": "m", "policy": {"permissions": {"can_use_mcp": true}}}),
+        )
+        .await;
+        let malformed = insert(
+            "b",
+            json!({"policy": {"permissions": {"can_use_shell": "yes"}}}),
+        )
+        .await;
+        let plain = insert("n", json!({"model": "m"})).await;
+        sqlx::query("INSERT INTO policy_overrides_upgrade (id) VALUES (1)")
+            .execute(&db)
+            .await
+            .expect("mark");
+
+        upgrade_stored_overrides(&db).await.expect("upgrade");
+
+        let config = |id: AgentId| {
+            let db = db.clone();
+            async move {
+                let (raw,): (String,) = sqlx::query_as("SELECT config FROM agents WHERE id = ?")
+                    .bind(id.to_string())
+                    .fetch_one(&db)
+                    .await
+                    .expect("row");
+                serde_json::from_str::<serde_json::Value>(&raw).expect("json")
+            }
+        };
+        let expanded = config(partial).await;
+        assert_eq!(expanded["model"], "m");
+        assert_eq!(expanded["policy"]["permissions"]["can_use_mcp"], true);
+        // Keys the old override left out are now written as the defaults
+        // they stood for, so a permissive owner no longer fills them in.
+        assert_eq!(
+            expanded["policy"]["network_policy"]["egress_allowed"],
+            false
+        );
+        assert_eq!(
+            expanded["policy"]["permissions"]["can_spawn_subagents"],
+            false
+        );
+        let mut owner = Policy::default();
+        owner.network_policy.egress_allowed = true;
+        let agent = agent_with(expanded);
+        let p = override_for(&agent, &owner).expect("override");
+        assert!(!p.network_policy.egress_allowed);
+        assert!(p.permissions.can_use_mcp);
+
+        assert_eq!(
+            config(malformed).await,
+            json!({"policy": {"permissions": {"can_use_shell": "yes"}}}),
+            "malformed overrides are left as they are"
+        );
+        assert_eq!(config(plain).await, json!({"model": "m"}));
+        let left: Option<(i64,)> = sqlx::query_as("SELECT id FROM policy_overrides_upgrade")
+            .fetch_optional(&db)
+            .await
+            .expect("marker");
+        assert!(left.is_none(), "the upgrade runs once");
     }
 
     fn widening_override() -> Agent {
