@@ -489,6 +489,14 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(e) => return Err(anyhow!("seccomp restriction failed: {e}")),
         }
+        // Before the MCP servers start, which stay in this domain.
+        match sandbox::create_tool_domain() {
+            Ok(()) => info!("tool processes run in a Landlock domain nested under the runtime's"),
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EOPNOTSUPP)) => {
+                warn!("no Landlock: tool processes can read the environment of MCP servers")
+            }
+            Err(e) => return Err(anyhow!("creating the tools' Landlock domain failed: {e}")),
+        }
     }
 
     // 4. Load PreToolUse hooks: the policy's rules plus any rules the
