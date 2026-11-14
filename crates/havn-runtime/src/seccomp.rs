@@ -510,6 +510,8 @@ mod tests {
     #[test]
     fn new_user_namespaces_are_refused_unless_allowed() {
         const PROBE: &str = "HAVN_SECCOMP_USERNS_PROBE";
+        // Not 0: a probe that ran no test exits 0.
+        const PROBE_PASSED: i32 = 42;
         if let Some(mode) = std::env::var_os(PROBE) {
             let allowed = mode == "allow";
             let allow: Vec<String> = if allowed {
@@ -557,7 +559,7 @@ mod tests {
                     .expect("spawn")
                     .success()
             );
-            std::process::exit(0);
+            std::process::exit(PROBE_PASSED);
         }
         for mode in ["deny", "allow"] {
             let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
@@ -568,7 +570,7 @@ mod tests {
                 .env(PROBE, mode)
                 .status()
                 .expect("run probe");
-            assert!(status.success(), "{mode}: {status:?}");
+            assert_eq!(status.code(), Some(PROBE_PASSED), "{mode}: {status:?}");
         }
     }
 
