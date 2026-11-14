@@ -409,7 +409,19 @@ mod tests {
 
         // The domain takes no file access away: linking a file into
         // another directory, which Landlock refuses by default from ABI 2,
-        // still works.
+        // still works. ABI 1 kernels refuse it to every Landlock domain.
+        // SAFETY: the version query takes no attribute.
+        let abi = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                std::ptr::null::<ToolRulesetAttr>(),
+                0usize,
+                CREATE_RULESET_VERSION,
+            )
+        };
+        if abi < 2 {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("havn-tool-domain-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(dir.join("a")).expect("a");
         std::fs::create_dir_all(dir.join("b")).expect("b");
