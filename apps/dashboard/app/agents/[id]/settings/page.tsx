@@ -20,6 +20,7 @@ import {
   ApiError,
   api,
   type AgentView,
+  type AgentWebView,
   type BootstrapView,
   type EmbeddingStatus,
   type McpServerConfig,
@@ -290,6 +291,8 @@ export default function SettingsPage({
 
       <BootstrapEditor agentId={id} />
 
+      <WebAccessEditor agentId={id} />
+
       <McpEditor agentId={id} />
 
       {embedding && (
@@ -515,6 +518,126 @@ function BootstrapFileEditor({
         )}
       </div>
     </div>
+  );
+}
+
+// Web search and network egress, two switches in the agent's policy.
+function WebAccessEditor({ agentId }: { agentId: string }) {
+  const [view, setView] = useState<AgentWebView | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // A gateway older than these settings has no /agents/{id}/web.
+  const [unsupported, setUnsupported] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [justSaved, flashSaved] = useFlash();
+
+  useEffect(() => {
+    let cancelled = false;
+    api.search.agent(agentId).then(
+      (v) => {
+        if (!cancelled) setView(v);
+      },
+      (e) => {
+        if (cancelled) return;
+        if (e instanceof ApiError && e.status === 404) setUnsupported(true);
+        else setError(e instanceof Error ? e.message : String(e));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId]);
+
+  async function save(patch: { can_search_web?: boolean; egress_allowed?: boolean }) {
+    setSaving(true);
+    setError(null);
+    try {
+      setView(await api.search.patchAgent(agentId, patch));
+      flashSaved();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (unsupported) return null;
+  const searchLocked = saving || (view !== null && !view.search_permitted && !view.can_search_web);
+  const egressLocked = saving || (view !== null && !view.egress_permitted && !view.egress_allowed);
+
+  return (
+    <section className="mt-10 card px-4 py-4" aria-labelledby="web-access-title">
+      <h2 id="web-access-title" className="display-h3 mb-2">
+        web access
+      </h2>
+      <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
+        Changes apply on the agent&apos;s next start.
+        <span className="ml-2" style={{ color: "var(--color-success-text)" }} role="status">
+          {justSaved ? "saved" : ""}
+        </span>
+      </p>
+      {error && (
+        <div
+          role="alert"
+          className="mb-3 px-3 py-2 text-sm"
+          style={{
+            background: "rgba(234, 34, 97, 0.05)",
+            border: "1px solid rgba(234, 34, 97, 0.3)",
+            borderRadius: 4,
+            color: "var(--color-ruby)",
+          }}
+        >
+          {error}
+        </div>
+      )}
+      {!view ? (
+        !error && <p style={{ color: "var(--color-body)" }}>loading…</p>
+      ) : (
+        <div className="grid gap-4">
+          <label className="flex items-start gap-3 text-sm">
+            <input
+              type="checkbox"
+              className={`mt-1 h-4 w-4 shrink-0 ${searchLocked ? "cursor-not-allowed" : "cursor-pointer"}`}
+              checked={view.can_search_web}
+              disabled={searchLocked}
+              onChange={(e) => save({ can_search_web: e.target.checked })}
+            />
+            <span>
+              <strong>web search</strong>: the gateway searches for the agent, so it
+              works without network access and the search key stays out of the
+              sandbox. Queries go to the search provider.{" "}
+              {view.search_backend ? (
+                <>Searches use {view.search_backend}.</>
+              ) : (
+                <>
+                  No search backend is set up yet: add a key on the{" "}
+                  <Link href="/credentials" className="underline" style={{ color: "var(--color-stripe-purple)" }}>
+                    credentials
+                  </Link>{" "}
+                  page.
+                </>
+              )}
+              {!view.search_permitted && " Your role does not allow it."}
+            </span>
+          </label>
+          <label className="flex items-start gap-3 text-sm">
+            <input
+              type="checkbox"
+              className={`mt-1 h-4 w-4 shrink-0 ${egressLocked ? "cursor-not-allowed" : "cursor-pointer"}`}
+              checked={view.egress_allowed}
+              disabled={egressLocked}
+              onChange={(e) => save({ egress_allowed: e.target.checked })}
+            />
+            <span>
+              <strong>network access</strong>: the agent reaches the public internet
+              from its sandbox and gets <code className="font-mono">web_fetch</code>;
+              its shell tools can download and upload too. Private, link-local and
+              gateway-host addresses stay blocked.
+              {!view.egress_permitted && " Your role does not allow it."}
+            </span>
+          </label>
+        </div>
+      )}
+    </section>
   );
 }
 

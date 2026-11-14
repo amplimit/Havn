@@ -3,11 +3,20 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { Circle, CircleCheck, TriangleAlert } from "lucide-react";
-import { api, keyScopes, modelProvider, reachable, type ModelsView } from "@/lib/api";
+import {
+  api,
+  keyScopes,
+  modelProvider,
+  reachable,
+  type ModelsView,
+  type SearchStatus,
+} from "@/lib/api";
 
 type Setup = {
   providers: Set<string>;
   models: ModelsView;
+  /** Null when the gateway predates GET /search. */
+  search: SearchStatus | null;
 };
 
 // First-run steps; gone once there is a key, a model and an agent.
@@ -23,10 +32,10 @@ export function SetupChecklist({
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([api.teams.list(), api.models.get()])
-      .then(async ([teams, models]) => {
+    Promise.all([api.teams.list(), api.models.get(), api.search.get().catch(() => null)])
+      .then(async ([teams, models, search]) => {
         const scopes = await keyScopes(teams);
-        if (!cancelled) setSetup({ providers: reachable(scopes, null), models });
+        if (!cancelled) setSetup({ providers: reachable(scopes, null), models, search });
       })
       .catch(() => {
         // Without the data there is nothing reliable to show.
@@ -52,6 +61,8 @@ export function SetupChecklist({
   }, [decided, visible, onVisibleChange]);
 
   if (!visible || !models) return null;
+  // Hidden on a gateway without search, or with search turned off.
+  const searchStep = setup?.search && setup.search.provider !== "off" ? setup.search : null;
 
   return (
     <section aria-labelledby="setup-title" className="card-elevated mb-8 p-6">
@@ -59,7 +70,8 @@ export function SetupChecklist({
         get started
       </h2>
       <p className="mb-5 text-sm" style={{ color: "var(--color-body)" }}>
-        Three steps before the first chat. Done steps are checked.
+        Three steps before the first chat{searchStep ? ", and one optional" : ""}.
+        Done steps are checked.
       </p>
       <ol role="list" className="grid gap-4">
         <Step
@@ -105,6 +117,23 @@ export function SetupChecklist({
         >
           Each agent gets its own workspace and a chat here.
         </Step>
+        {searchStep && (
+          <Step
+            done={searchStep.backend !== null}
+            title="Optional: let agents search the web"
+            action={{ href: "/credentials", label: "add a search key" }}
+          >
+            {searchStep.backend ? (
+              <>Agents search with {searchStep.backend}.</>
+            ) : (
+              <>
+                Add a Brave, Tavily or Exa key as a web search key; with only an
+                OpenRouter key and an <code className="font-mono">openrouter:</code>{" "}
+                model, agents search through OpenRouter.
+              </>
+            )}
+          </Step>
+        )}
       </ol>
     </section>
   );

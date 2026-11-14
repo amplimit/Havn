@@ -4,8 +4,9 @@
 //! single-user default when they belong to no team); `for_team_member`
 //! is the user's role policy in one team, which governs agents created in
 //! that team. `for_session` adds the per-agent override
-//! (`Agent.config["policy"]`): applied as written in single-user mode,
-//! clamped to the owner's policy in multi-user mode.
+//! (`Agent.config["policy"]`): laid over the owner's policy, so it changes
+//! only the keys it sets, and clamped to the owner's policy in multi-user
+//! mode.
 //!
 //! The snapshot shipped to the runtime in the `Welcome` frame (and the
 //! sandbox set up at spawn) is resolved once per agent connection, so
@@ -16,7 +17,7 @@
 use havn_core::{Policy, TeamId, UserId};
 use havn_db::repo::agents::Agent;
 use sqlx::SqlitePool;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Resolve the effective policy for a user (independent of any one
 /// agent — used to enforce `max_agents`, `can_bind_channels`,
@@ -131,16 +132,30 @@ fn restrictive_fallback() -> Policy {
     p
 }
 
-/// Per-agent override only — pure / sync. Returns `None` when the
-/// agent has no `config.policy` field or when it is malformed (logged;
+/// Keys of a policy whose value is replaced as a whole by an override,
+/// not merged entry by entry: each entry is a complete setting.
+const REPLACED_WHOLE: [&str; 2] = ["mcp_servers", "context_toolsets"];
+
+/// The agent's `config.policy` laid over `owner` — pure / sync. The keys
+/// the override sets replace the owner's, objects merging key by key, so
+/// an override that names only `permissions.can_search_web` changes only
+/// that; everything else stays the owner's. Returns `None` when the agent
+/// has no `config.policy` field or when the result is malformed (logged;
 /// the chain then falls through to the owner's policy). `PATCH
-/// /agents/{id}` rejects a malformed override, so the latter only
-/// happens for config written another way. Public for tests;
-/// production code should use [`for_session`] which folds this into
-/// the full chain.
-pub fn override_for(agent: &Agent) -> Option<Policy> {
+/// /agents/{id}` rejects a malformed override, so the latter only happens
+/// for config written another way. Public for tests; production code
+/// should use [`for_session`] which folds this into the full chain.
+pub fn override_for(agent: &Agent, owner: &Policy) -> Option<Policy> {
     let raw = agent.config.get("policy")?;
-    match serde_json::from_value::<Policy>(raw.clone()) {
+    let mut merged = match serde_json::to_value(owner) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(agent_id = %agent.id, error = %e, "could not serialize the owner's policy");
+            return None;
+        }
+    };
+    lay_over(&mut merged, raw, true);
+    match serde_json::from_value::<Policy>(merged) {
         Ok(p) => Some(p),
         Err(e) => {
             warn!(
@@ -151,6 +166,73 @@ pub fn override_for(agent: &Agent) -> Option<Policy> {
             None
         }
     }
+}
+
+fn lay_over(base: &mut serde_json::Value, over: &serde_json::Value, top: bool) {
+    match (base, over) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(over)) => {
+            for (key, value) in over {
+                match base.get_mut(key) {
+                    Some(slot) if !(top && REPLACED_WHOLE.contains(&key.as_str())) => {
+                        lay_over(slot, value, false);
+                    }
+                    _ => {
+                        base.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (base, over) => *base = over.clone(),
+    }
+}
+
+/// One-time upgrade of overrides stored by gateways before v0.2.0, which
+/// migration 0011 marks with a row in `policy_overrides_upgrade`. Those
+/// gateways gave the keys an override left out their defaults; each such
+/// override is rewritten as that full policy, so it keeps its meaning now
+/// that overrides are laid over the owner's policy. Malformed overrides,
+/// which were ignored, are left as they are.
+pub async fn upgrade_stored_overrides(db: &SqlitePool) -> anyhow::Result<()> {
+    let pending: Option<(i64,)> = sqlx::query_as("SELECT id FROM policy_overrides_upgrade")
+        .fetch_optional(db)
+        .await?;
+    if pending.is_none() {
+        return Ok(());
+    }
+    let mut tx = db.begin().await?;
+    let agents: Vec<(String, String)> = sqlx::query_as("SELECT id, config FROM agents")
+        .fetch_all(&mut *tx)
+        .await?;
+    let mut rewritten = 0usize;
+    for (id, raw) in agents {
+        let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(stored) = config.get("policy").filter(|p| p.is_object()) else {
+            continue;
+        };
+        let Ok(full) = serde_json::from_value::<Policy>(stored.clone()) else {
+            continue;
+        };
+        config["policy"] = serde_json::to_value(&full)?;
+        sqlx::query("UPDATE agents SET config = ? WHERE id = ?")
+            .bind(config.to_string())
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        rewritten += 1;
+    }
+    sqlx::query("DELETE FROM policy_overrides_upgrade")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    if rewritten > 0 {
+        info!(
+            agents = rewritten,
+            "per-agent policy overrides rewritten as the full policies they stood for"
+        );
+    }
+    Ok(())
 }
 
 /// The owner's policy as it applies to `agent`: their role in the agent's
@@ -177,7 +259,7 @@ pub async fn for_owner(db: &SqlitePool, agent: &Agent) -> Policy {
 /// 512 MiB. Drift fix.
 pub async fn for_session(db: &SqlitePool, agent: &Agent, multi_user: bool) -> Policy {
     let owner = for_owner(db, agent).await;
-    match override_for(agent) {
+    match override_for(agent, &owner) {
         Some(p) if multi_user => p.clamp_to(&owner),
         Some(mut p) => {
             p.hooks = p.hooks.union(&owner.hooks);
@@ -217,34 +299,64 @@ mod tests {
         // No `config.policy` field → None. The full chain (`for_session`)
         // would then fall through to `for_user`, but the override-only
         // helper returns None here.
-        let p = override_for(&agent_with(json!({})));
+        let p = override_for(&agent_with(json!({})), &Policy::default());
         assert!(p.is_none());
     }
 
     #[test]
-    fn explicit_policy_overrides_default() {
-        let p = override_for(&agent_with(json!({
-            "policy": {
-                "permissions": {
-                    "can_use_shell": false,
-                    "can_access_network": false,
+    fn an_override_changes_only_the_keys_it_sets() {
+        let mut owner = Policy::default();
+        owner.permissions.can_spawn_subagents = true;
+        owner.permissions.can_install_skills = false;
+        owner.network_policy.egress_allowed = true;
+        owner.resource_limits.memory_mb = 1024;
+        owner.mcp_servers.insert(
+            "fs".into(),
+            serde_json::from_value(json!({"binary": "fs"})).expect("server"),
+        );
+        let p = override_for(
+            &agent_with(json!({
+                "policy": {
+                    "permissions": {
+                        "can_use_shell": false,
+                        "can_search_web": false,
+                    },
+                    "network_policy": { "blocked_domains": ["example.com"] }
                 }
-            }
-        })))
+            })),
+            &owner,
+        )
         .expect("override present");
         assert!(!p.permissions.can_use_shell);
-        assert!(!p.permissions.can_access_network);
-        // Unmentioned fields keep their defaults.
-        assert!(p.permissions.can_install_skills);
+        assert!(!p.permissions.can_search_web);
+        assert_eq!(
+            p.network_policy.blocked_domains,
+            vec!["example.com".to_string()]
+        );
+        // Everything the override does not name stays the owner's.
+        assert!(p.permissions.can_spawn_subagents);
+        assert!(!p.permissions.can_install_skills);
+        assert!(p.network_policy.egress_allowed);
+        assert_eq!(p.resource_limits.memory_mb, 1024);
+        assert!(p.mcp_servers.contains_key("fs"));
+
+        // A server map in the override replaces the owner's, entry by entry
+        // being whole settings.
+        let p = override_for(&agent_with(json!({"policy": {"mcp_servers": {}}})), &owner)
+            .expect("override present");
+        assert!(p.mcp_servers.is_empty());
     }
 
     #[test]
     fn malformed_policy_falls_through_to_chain() {
         // can_use_shell is supposed to be a bool — a string here is malformed.
         // Override returns None so for_session falls through to for_user.
-        let p = override_for(&agent_with(json!({
-            "policy": { "permissions": { "can_use_shell": "yes" } }
-        })));
+        let p = override_for(
+            &agent_with(json!({
+                "policy": { "permissions": { "can_use_shell": "yes" } }
+            })),
+            &Policy::default(),
+        );
         assert!(
             p.is_none(),
             "malformed override should fall through, not silently apply"
@@ -253,19 +365,105 @@ mod tests {
 
     #[test]
     fn context_toolsets_round_trip() {
-        let p = override_for(&agent_with(json!({
-            "policy": {
-                "context_toolsets": {
-                    "cron": { "disabled": ["shell", "web_fetch"] }
+        let p = override_for(
+            &agent_with(json!({
+                "policy": {
+                    "context_toolsets": {
+                        "cron": { "disabled": ["shell", "web_fetch"] }
+                    }
                 }
-            }
-        })))
+            })),
+            &Policy::default(),
+        )
         .expect("override present");
         let cron = p.context_toolsets.0.get("cron").expect("cron entry");
         assert_eq!(
             cron.disabled,
             vec!["shell".to_string(), "web_fetch".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn stored_partial_overrides_keep_their_meaning_after_upgrade() {
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let user = havn_db::repo::users::ensure_default(&db)
+            .await
+            .expect("user");
+        let insert = |name: &'static str, config: serde_json::Value| {
+            let db = db.clone();
+            async move {
+                let id = AgentId::new();
+                sqlx::query("INSERT INTO agents (id, owner_id, name, config) VALUES (?, ?, ?, ?)")
+                    .bind(id.to_string())
+                    .bind(user.id.to_string())
+                    .bind(name)
+                    .bind(config.to_string())
+                    .execute(&db)
+                    .await
+                    .expect("agent");
+                id
+            }
+        };
+        let partial = insert(
+            "p",
+            json!({"model": "m", "policy": {"permissions": {"can_use_mcp": true}}}),
+        )
+        .await;
+        let malformed = insert(
+            "b",
+            json!({"policy": {"permissions": {"can_use_shell": "yes"}}}),
+        )
+        .await;
+        let plain = insert("n", json!({"model": "m"})).await;
+        sqlx::query("INSERT INTO policy_overrides_upgrade (id) VALUES (1)")
+            .execute(&db)
+            .await
+            .expect("mark");
+
+        upgrade_stored_overrides(&db).await.expect("upgrade");
+
+        let config = |id: AgentId| {
+            let db = db.clone();
+            async move {
+                let (raw,): (String,) = sqlx::query_as("SELECT config FROM agents WHERE id = ?")
+                    .bind(id.to_string())
+                    .fetch_one(&db)
+                    .await
+                    .expect("row");
+                serde_json::from_str::<serde_json::Value>(&raw).expect("json")
+            }
+        };
+        let expanded = config(partial).await;
+        assert_eq!(expanded["model"], "m");
+        assert_eq!(expanded["policy"]["permissions"]["can_use_mcp"], true);
+        // Keys the old override left out are now written as the defaults
+        // they stood for, so a permissive owner no longer fills them in.
+        assert_eq!(
+            expanded["policy"]["network_policy"]["egress_allowed"],
+            false
+        );
+        assert_eq!(
+            expanded["policy"]["permissions"]["can_spawn_subagents"],
+            false
+        );
+        let mut owner = Policy::default();
+        owner.network_policy.egress_allowed = true;
+        let agent = agent_with(expanded);
+        let p = override_for(&agent, &owner).expect("override");
+        assert!(!p.network_policy.egress_allowed);
+        assert!(p.permissions.can_use_mcp);
+
+        assert_eq!(
+            config(malformed).await,
+            json!({"policy": {"permissions": {"can_use_shell": "yes"}}}),
+            "malformed overrides are left as they are"
+        );
+        assert_eq!(config(plain).await, json!({"model": "m"}));
+        let left: Option<(i64,)> = sqlx::query_as("SELECT id FROM policy_overrides_upgrade")
+            .fetch_optional(&db)
+            .await
+            .expect("marker");
+        assert!(left.is_none(), "the upgrade runs once");
     }
 
     fn widening_override() -> Agent {

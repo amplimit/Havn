@@ -2,12 +2,21 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { Lock } from "lucide-react";
-import { api, type CredentialView } from "@/lib/api";
+import { Globe, Lock } from "lucide-react";
+import {
+  api,
+  isSearchCredential,
+  LLM_PROVIDERS,
+  SEARCH_PROVIDERS,
+  type CredentialView,
+  type SearchStatus,
+} from "@/lib/api";
 import { SkeletonList } from "@/components/SkeletonList";
 
 export default function CredentialsPage() {
   const [creds, setCreds] = useState<CredentialView[] | null>(null);
+  // Null until loaded, and when the gateway predates GET /search.
+  const [search, setSearch] = useState<SearchStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -16,6 +25,7 @@ export default function CredentialsPage() {
   const [apiKey, setApiKey] = useState("");
   const [priority, setPriority] = useState(10);
   const [maxTokensPerDay, setMaxTokensPerDay] = useState<string>(""); // empty = unlimited
+  const searchKey = isSearchCredential(provider);
 
   async function reload() {
     try {
@@ -24,6 +34,7 @@ export default function CredentialsPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
+    setSearch(await api.search.get().catch(() => null));
   }
 
   useEffect(() => {
@@ -38,6 +49,12 @@ export default function CredentialsPage() {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
       },
     );
+    api.search.get().then(
+      (s) => {
+        if (!cancelled) setSearch(s);
+      },
+      () => {},
+    );
     return () => {
       cancelled = true;
     };
@@ -46,7 +63,8 @@ export default function CredentialsPage() {
   async function onAdd(e: React.FormEvent) {
     e.preventDefault();
     const limits: Record<string, unknown> = {};
-    if (maxTokensPerDay.trim()) {
+    // Token caps apply to model calls only.
+    if (!searchKey && maxTokensPerDay.trim()) {
       const n = Number(maxTokensPerDay);
       if (!Number.isInteger(n) || n <= 0) {
         setError("max tokens / day must be a whole number above 0, or blank for unlimited");
@@ -83,8 +101,9 @@ export default function CredentialsPage() {
       <header className="mb-8">
         <h1 className="display-h1">credentials</h1>
         <p className="mt-2" style={{ color: "var(--color-body)", fontSize: 18 }}>
-          LLM provider keys, with optional daily token caps. The gateway makes
-          every model call with these; agents never see the keys.
+          LLM provider keys, with optional daily token caps, and web search
+          keys. The gateway makes every model call and search with these;
+          agents never see the keys.
         </p>
         <p className="mt-2 max-w-3xl text-sm" style={{ color: "var(--color-body)" }}>
           Keys here are yours: only your agents use them. To share a key, a
@@ -109,6 +128,8 @@ export default function CredentialsPage() {
         </div>
       </header>
 
+      {search && <SearchNote status={search} />}
+
       {error && (
         <div
           className="card mb-6 px-4 py-3 text-sm"
@@ -129,10 +150,20 @@ export default function CredentialsPage() {
               onChange={(e) => setProvider(e.target.value)}
               className="input"
             >
-              <option value="anthropic">anthropic</option>
-              <option value="openai">openai</option>
-              <option value="openrouter">openrouter</option>
-              <option value="gemini">gemini</option>
+              <optgroup label="LLM">
+                {LLM_PROVIDERS.map((p) => (
+                  <option key={p} value={p}>
+                    {p}
+                  </option>
+                ))}
+              </optgroup>
+              <optgroup label="web search">
+                {SEARCH_PROVIDERS.map((p) => (
+                  <option key={p} value={`search:${p}`}>
+                    {p}
+                  </option>
+                ))}
+              </optgroup>
             </select>
           </div>
           <div className="md:col-span-2">
@@ -143,7 +174,7 @@ export default function CredentialsPage() {
               required
               autoComplete="off"
               spellCheck={false}
-              placeholder="sk-…"
+              placeholder={searchKey ? "search API key" : "sk-…"}
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
               className="input font-mono"
@@ -161,6 +192,7 @@ export default function CredentialsPage() {
               className="input tabular"
             />
           </div>
+          {!searchKey && (
           <div className="md:col-span-2">
             <label className="label" htmlFor="cap">max tokens / day (blank = unlimited)</label>
             <input
@@ -177,7 +209,8 @@ export default function CredentialsPage() {
               when this is used up, the gateway falls through to the next credential by priority.
             </p>
           </div>
-          <div className="flex items-end justify-end md:col-span-2">
+          )}
+          <div className={`flex items-end justify-end ${searchKey ? "md:col-span-4" : "md:col-span-2"}`}>
             <button
               type="submit"
               className="btn-primary"
@@ -217,7 +250,9 @@ export default function CredentialsPage() {
                 <div className="flex items-center gap-3">
                   <span className="display-h3">{c.provider}</span>
                   <span className="pill pill-stopped tabular">priority {c.priority}</span>
-                  {cap ? (
+                  {isSearchCredential(c.provider) ? (
+                    <span className="pill pill-stopped">web search</span>
+                  ) : cap ? (
                     <span className="pill pill-running tabular">
                       cap {cap.toLocaleString()} tokens/day
                     </span>
@@ -249,6 +284,49 @@ export default function CredentialsPage() {
           );
         })}
       </ul>
+    </div>
+  );
+}
+
+// Whether agents can search the web, and how to make them.
+function SearchNote({ status }: { status: SearchStatus }) {
+  let text: React.ReactNode;
+  if (status.backend === "openrouter") {
+    text = (
+      <>
+        Web search: your agents search through your OpenRouter key (Exa, about
+        $0.007 per search). A Brave, Tavily or Exa key, added below as a web
+        search key, takes precedence.
+      </>
+    );
+  } else if (status.backend) {
+    text = <>Web search: your agents search with {status.backend}.</>;
+  } else if (status.provider === "off") {
+    text = <>Web search is turned off in the gateway&apos;s config ([search] provider).</>;
+  } else {
+    text = (
+      <>
+        Web search is not set up: your agents have no web_search tool. Add a
+        Brave, Tavily or Exa key below (each has a free tier), or an OpenRouter
+        key{status.provider === "auto" ? ", or have the operator set [search] searxng_url" : ""}.
+        Agents started before you add one get the tool on their next start.
+      </>
+    );
+  }
+  const ready = status.backend !== null;
+  return (
+    <div
+      className="card mb-6 flex items-start gap-3 px-4 py-3 text-sm"
+      style={{ color: "var(--color-body)" }}
+      role="status"
+    >
+      <Globe
+        size={16}
+        className="mt-0.5 shrink-0"
+        style={{ color: ready ? "var(--color-success-text)" : "var(--color-warning-text)" }}
+        aria-hidden="true"
+      />
+      <p>{text}</p>
     </div>
   );
 }

@@ -385,6 +385,9 @@ async fn main() -> anyhow::Result<()> {
     let catalog = model_catalog::upgrade(&db, &config_path, cfg.llm.catalog())
         .await
         .context("upgrading model names to provider:model")?;
+    policy_resolver::upgrade_stored_overrides(&db)
+        .await
+        .context("upgrading per-agent policy overrides")?;
     match catalog.default_entry() {
         Some(default) => info!(
             models = catalog.models.len(),
@@ -637,6 +640,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/agents/{id}/mcp",
             get(api::mcp::get).patch(api::mcp::patch),
+        )
+        .route(
+            "/agents/{id}/web",
+            get(api::search::agent_get).patch(api::search::agent_patch),
         )
         .route("/agents/{id}/memory", get(api::memory::list))
         .route(

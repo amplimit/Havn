@@ -5,9 +5,11 @@
 //! agent's `policy.permissions.can_use_mcp` flag + `policy.mcp_servers`
 //! map without making the operator hand-edit the SQLite row. Both
 //! fields live as JSON inside `agent.config.policy`; the per-session
-//! resolver (`policy_resolver::override_for`) reads them at every
-//! agent start (spec §6.3 / §9.4 frozen-prompt invariant — edits
-//! land on the next restart).
+//! resolver (`policy_resolver::override_for`) lays them over the owner's
+//! policy at every agent start (spec §6.3 / §9.4 frozen-prompt invariant —
+//! edits land on the next restart). The view shows the override's own
+//! values, which the editor sends back whole; servers the owner's role
+//! grants without the override naming them are not listed.
 //!
 //! Writes never touch unrelated policy keys (allowed_models,
 //! resource_limits, …) — we read agent.config, splice in only the
