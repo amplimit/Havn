@@ -277,6 +277,14 @@ unsafe fn fork_and_exec_runtime(
             // every thread the runtime starts and every process its tools
             // run, which a call from inside the multi-threaded runtime
             // would not achieve.
+            // Before the capability drop, which takes CAP_NET_ADMIN.
+            // A failure costs localhost, `ping` or low ports, not isolation.
+            // SAFETY: this forked child is single-threaded.
+            if let Err(e) = unsafe { ns_setup::prepare_agent_network() } {
+                eprintln!(
+                    "havn-init: could not set up the agent's loopback, ping or low ports: {e}"
+                );
+            }
             let (rw, ro) = landlock_rules;
             apply_landlock_or_exit(rw, ro);
             // The agent's uid 0 is the gateway's host uid: without this

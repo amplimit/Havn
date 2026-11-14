@@ -720,15 +720,7 @@ unsafe fn mirror_bind_into_newroot(host_path: &Path, read_only: bool) -> io::Res
             libc::MS_BIND | libc::MS_REC,
             std::ptr::null(),
         ))?;
-        if read_only {
-            check(libc::mount(
-                std::ptr::null(),
-                target.as_ptr(),
-                std::ptr::null(),
-                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
-                std::ptr::null(),
-            ))?;
-        }
+        restrict_bind(&target, read_only)?;
     }
     Ok(())
 }
@@ -819,8 +811,13 @@ unsafe fn symlink_under_newroot(target: &str, linkname: &str) -> io::Result<()> 
     Err(err)
 }
 
-/// Bind `src` onto `dest` read-only. The 2-step is required because the
-/// initial `MS_BIND` ignores `MS_RDONLY` (kernel compatibility quirk).
+/// Bind `src` onto `dest` read-only and `nosuid`. The 2-step is required
+/// because the initial `MS_BIND` ignores those flags (kernel compatibility
+/// quirk).
+///
+/// # Safety
+///
+/// As [`restrict_bind`].
 unsafe fn bind_ro(src: &CStr, dest: &CStr) -> io::Result<()> {
     // SAFETY: src and dest are valid C strings; the flag set is well-defined.
     unsafe {
@@ -831,11 +828,104 @@ unsafe fn bind_ro(src: &CStr, dest: &CStr) -> io::Result<()> {
             libc::MS_BIND | libc::MS_REC,
             std::ptr::null(),
         ))?;
+        restrict_bind(dest, true)
+    }
+}
+
+/// `struct mount_attr` of `mount_setattr(2)`; libc does not define it.
+#[repr(C)]
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+
+const MOUNT_ATTR_RDONLY: u64 = 0x1;
+const MOUNT_ATTR_NOSUID: u64 = 0x2;
+/// `ST_RELATIME` and `ST_NOSYMFOLLOW` of statvfs(3); libc defines neither
+/// for musl.
+const ST_RELATIME: libc::c_ulong = 0x1000;
+const ST_NOSYMFOLLOW: libc::c_ulong = 0x2000;
+
+/// Make the bind mount at `dest` and every mount below it `nosuid`, and
+/// read-only when `read_only`. `nosuid` keeps setuid bits and file
+/// capabilities from taking effect in the agent: an agent process holds
+/// no capabilities, so exec'ing a binary with file capabilities (`ping` on
+/// many distributions) would otherwise fail with `EPERM`; without them it
+/// falls back to what an unprivileged user can do.
+///
+/// Uses `mount_setattr` (Linux 5.12+), which only adds the two flags and
+/// so keeps every other one, locked ones included. Where it is missing or
+/// filtered, a bind remount of `dest` alone repeats the flags it has, since
+/// in a user namespace the kernel refuses a remount that drops a locked
+/// one.
+///
+/// # Safety
+///
+/// Only `mount_setattr`, `statvfs` and `mount`, so safe in a forked child.
+unsafe fn restrict_bind(dest: &CStr, read_only: bool) -> io::Result<()> {
+    let attr = MountAttr {
+        attr_set: MOUNT_ATTR_NOSUID | if read_only { MOUNT_ATTR_RDONLY } else { 0 },
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    // SAFETY: dest is a valid C string and attr a valid mount_attr of the
+    // size passed.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            libc::AT_FDCWD,
+            dest.as_ptr(),
+            libc::AT_RECURSIVE,
+            &raw const attr,
+            std::mem::size_of::<MountAttr>(),
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    // ENOSYS before Linux 5.12; EPERM from a seccomp profile that predates
+    // the call (container runtimes, systemd SystemCallFilter).
+    if !matches!(err.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) {
+        return Err(err);
+    }
+    // SAFETY: a zeroed statvfs is a valid out-parameter.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: dest is a valid C string and st a valid out-pointer.
+    unsafe { check(libc::statvfs(dest.as_ptr(), &raw mut st)) }?;
+    let has = |flag: libc::c_ulong| st.f_flag & flag != 0;
+    let mut flags = libc::MS_REMOUNT | libc::MS_BIND | libc::MS_NOSUID;
+    for (st_flag, ms_flag) in [
+        (libc::ST_RDONLY, libc::MS_RDONLY),
+        (libc::ST_NODEV, libc::MS_NODEV),
+        (libc::ST_NOEXEC, libc::MS_NOEXEC),
+        (libc::ST_NOATIME, libc::MS_NOATIME),
+        (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
+        (ST_RELATIME, libc::MS_RELATIME),
+        (ST_NOSYMFOLLOW, libc::MS_NOSYMFOLLOW),
+    ] {
+        if has(st_flag) {
+            flags |= ms_flag;
+        }
+    }
+    // statvfs reports no flag for strictatime; without one the remount
+    // would switch the mount to relatime.
+    if !has(libc::ST_NOATIME) && !has(ST_RELATIME) {
+        flags |= libc::MS_STRICTATIME;
+    }
+    if read_only {
+        flags |= libc::MS_RDONLY;
+    }
+    // SAFETY: dest is a valid C string; a bind remount takes no source or data.
+    unsafe {
         check(libc::mount(
             std::ptr::null(),
             dest.as_ptr(),
             std::ptr::null(),
-            libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
+            flags,
             std::ptr::null(),
         ))
     }
@@ -900,13 +990,13 @@ extern "C" fn forward_signal_to_inner(sig: libc::c_int) {
 /// Securebits that stop uid 0 from meaning anything to capabilities, each
 /// locked so no descendant can unset it: exec as uid 0 grants nothing
 /// (`NOROOT`), uid changes leave capabilities alone (`NO_SETUID_FIXUP`),
-/// nothing keeps capabilities across a uid change (`KEEP_CAPS` locked
-/// off), and ambient capabilities cannot be raised.
+/// and ambient capabilities cannot be raised. `KEEP_CAPS` stays settable:
+/// with no capabilities to keep and `NO_SETUID_FIXUP` locked it changes
+/// nothing, and tools such as `ping` exit when they cannot set it.
 const LOCKED_NO_ROOT_SECUREBITS: libc::c_ulong = (1 << 0) // SECBIT_NOROOT
     | (1 << 1) // SECBIT_NOROOT_LOCKED
     | (1 << 2) // SECBIT_NO_SETUID_FIXUP
     | (1 << 3) // SECBIT_NO_SETUID_FIXUP_LOCKED
-    | (1 << 5) // SECBIT_KEEP_CAPS_LOCKED
     | (1 << 6) // SECBIT_NO_CAP_AMBIENT_RAISE
     | (1 << 7); // SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED
 
@@ -925,6 +1015,78 @@ struct CapabilityWords {
     effective: u32,
     permitted: u32,
     inheritable: u32,
+}
+
+/// Make the agent's own network namespace usable without capabilities:
+/// bring up its loopback, so tools can serve and reach `localhost` with or
+/// without egress, and let them ping and bind ports below 1024. All of it
+/// belongs to that namespace alone: the host's settings are untouched, and
+/// the agent reaches only what its routes allow. Needs the namespace's
+/// `CAP_NET_ADMIN`, so it runs before [`drop_all_capabilities`], after
+/// `/proc` is mounted.
+///
+/// # Safety
+///
+/// Uses only `socket`/`ioctl`/`open`/`write`/`close`, so it is safe in a
+/// forked child of a multi-threaded process.
+pub unsafe fn prepare_agent_network() -> io::Result<()> {
+    // SAFETY: documented contract of `loopback_up`.
+    let loopback = unsafe { loopback_up() };
+    // Gid 0, the only gid mapped in the agent's user namespace (the kernel
+    // refuses a range with unmapped gids), may open ICMP datagram sockets,
+    // which is what `ping` uses.
+    // SAFETY: constant proc paths and byte strings.
+    let ping = unsafe { write_proc_file(c"/proc/sys/net/ipv4/ping_group_range", b"0 0") };
+    // SAFETY: as above.
+    let ports = unsafe { write_proc_file(c"/proc/sys/net/ipv4/ip_unprivileged_port_start", b"0") };
+    loopback.and(ping).and(ports)
+}
+
+// `ioctl`'s request is a `c_ulong` with glibc and a `c_int` with musl.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::unnecessary_cast,
+    reason = "the request numbers fit both types"
+)]
+const IOCTL_GET_FLAGS: libc::Ioctl = libc::SIOCGIFFLAGS as libc::Ioctl;
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::unnecessary_cast,
+    reason = "the request numbers fit both types"
+)]
+const IOCTL_SET_FLAGS: libc::Ioctl = libc::SIOCSIFFLAGS as libc::Ioctl;
+
+/// Set `IFF_UP` on `lo` in the calling process's network namespace.
+///
+/// # Safety
+///
+/// Only `socket`, `ioctl` and `close`.
+unsafe fn loopback_up() -> io::Result<()> {
+    // SAFETY: plain socket creation.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a zeroed ifreq is valid; the name fits with its NUL.
+    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    for (slot, byte) in req.ifr_name.iter_mut().zip(b"lo") {
+        *slot = libc::c_char::try_from(*byte).unwrap_or_default();
+    }
+    // SAFETY: fd is a socket and req a valid ifreq for both requests.
+    let result = unsafe {
+        check(libc::ioctl(fd, IOCTL_GET_FLAGS, &raw mut req)).and_then(|()| {
+            #[allow(clippy::cast_possible_truncation, reason = "IFF_UP fits in a short")]
+            {
+                req.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
+            }
+            check(libc::ioctl(fd, IOCTL_SET_FLAGS, &raw const req))
+        })
+    };
+    // SAFETY: closing the socket opened above.
+    unsafe { libc::close(fd) };
+    result
 }
 
 /// Give up every capability in the agent's user namespace for good: no
