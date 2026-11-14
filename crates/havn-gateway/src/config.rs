@@ -259,7 +259,8 @@ pub struct SeccompConfig {
     /// See spec §16.2 — the only mechanism by which an operator can let
     /// a workload (typically a capability pack) call a syscall the
     /// default blocklist denies. Pack documentation lists which names
-    /// are needed; the operator pastes them here.
+    /// are needed; the operator pastes them here. `user_namespaces` lets
+    /// agents create user namespaces, which they otherwise cannot.
     #[serde(default)]
     pub allow_extra: Vec<String>,
 }
