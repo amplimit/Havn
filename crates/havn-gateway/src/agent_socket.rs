@@ -163,6 +163,25 @@ pub async fn run_listener(socket_path: &Path, ctx: AgentSocketCtx) -> anyhow::Re
 
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("binding agent socket {}", socket_path.display()))?;
+    // Under a root gateway isolated agents run as host ids of their own
+    // and need write access to connect. Their cgroup, not the socket's
+    // mode, is what admits them: a peer outside every agent cgroup is
+    // closed at once. havn-init binds the socket into the agent from a
+    // handle, so its directory can stay closed to other users.
+    // SAFETY: geteuid cannot fail.
+    if ctx.verify_peer_cgroup && unsafe { libc::geteuid() } == 0 {
+        use std::os::unix::fs::PermissionsExt as _;
+        tokio::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o666))
+            .await
+            .with_context(|| format!("opening agent socket {} to agents", socket_path.display()))?;
+        if other_users_reach(socket_path) {
+            warn!(
+                path = %socket_path.display(),
+                "other users can reach the agent socket; the gateway closes their connections, \
+                 but a directory only root can enter keeps them away"
+            );
+        }
+    }
     info!(path = %socket_path.display(), "agent socket listening");
 
     let admission = Admission::new(
@@ -171,6 +190,15 @@ pub async fn run_listener(socket_path: &Path, ctx: AgentSocketCtx) -> anyhow::Re
         MAX_PENDING_HANDSHAKES_PER_AGENT,
     );
     serve(listener, ctx, Arc::new(admission)).await
+}
+
+/// Whether users other than the owners can walk to `path`: every directory
+/// above it lets others search it.
+fn other_users_reach(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    path.ancestors()
+        .skip(1)
+        .all(|dir| std::fs::metadata(dir).is_ok_and(|meta| meta.permissions().mode() & 0o001 != 0))
 }
 
 type PendingPerAgent = Arc<std::sync::Mutex<HashMap<AgentId, usize>>>;

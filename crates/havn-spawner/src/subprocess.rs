@@ -177,6 +177,7 @@ mod tests {
 
     fn config_for(agent_id: AgentId, runtime: PathBuf) -> AgentSpawnConfig {
         AgentSpawnConfig {
+            host_id_slot: None,
             agent_id,
             workspace_dir: std::env::temp_dir().join(format!("havn-test-{agent_id}")),
             runtime_binary: runtime,

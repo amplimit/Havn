@@ -134,7 +134,23 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
             if tr '\0' '\n' < "/proc/$pid/environ" | grep -q '^HAVN_LANDLOCK_R[WO]='; then
                 die "havn-runtime (pid $pid) still carries the Landlock rule lists"
             fi
-            # Agent uid 0 is host uid 0: it must hold no capabilities.
+            # The agent runs as host ids of its own, with no supplementary
+            # group, and owns its workspace, which no other host user can
+            # reach.
+            uid=$(awk '/^Uid:/ {print $2}' "/proc/$pid/status")
+            gid=$(awk '/^Gid:/ {print $2}' "/proc/$pid/status")
+            [ "$uid" -ge $((0x71000000)) ] && [ "$gid" = "$uid" ] \
+                || die "havn-runtime (pid $pid) runs as host uid $uid and gid $gid, not ids of its own"
+            [ -z "$(awk '/^Groups:/ {$1 = ""; print}' "/proc/$pid/status" | tr -d ' ')" ] \
+                || die "havn-runtime (pid $pid) keeps supplementary groups: $(grep '^Groups:' "/proc/$pid/status")"
+            workspace=$(tr '\0' '\n' < "/proc/$pid/cmdline" | sed -n '/^--workspace$/{n;p;}')
+            [ "$(stat -c %u:%g "$workspace")" = "$uid:$gid" ] \
+                || die "the agent does not own its workspace $workspace: $(stat -c %u:%g "$workspace")"
+            [ "$(stat -c %a "$(dirname "$workspace")")" = "700" ] \
+                || die "other host users can enter $(dirname "$workspace")"
+            [ -z "$(find "$workspace" ! -uid "$uid")" ] \
+                || die "files in the workspace belong to other users: $(find "$workspace" ! -uid "$uid" | head -3)"
+            # It must hold no capabilities.
             for set in CapInh CapPrm CapEff CapBnd CapAmb; do
                 grep -q "^$set:[[:space:]]*0000000000000000$" "/proc/$pid/status" \
                     || die "havn-runtime (pid $pid) has capabilities: $(grep "^$set:" "/proc/$pid/status")"
@@ -157,8 +173,10 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
         done
         for pid in $RUNTIME_PIDS; do
             # Without capabilities the agent can still ping and bind low
-            # ports in its own network namespace.
-            [ "$(nsenter -t "$pid" -n cat /proc/sys/net/ipv4/ping_group_range | awk '{print $1, $2}')" = "0 0" ] \
+            # ports in its own network namespace. Read from the host, the
+            # agent's gid 0 shows as its host gid.
+            gid=$(awk '/^Gid:/ {print $2}' "/proc/$pid/status")
+            [ "$(nsenter -t "$pid" -n cat /proc/sys/net/ipv4/ping_group_range | awk '{print $1, $2}')" = "$gid $gid" ] \
                 || die "the agent's network namespace does not allow ping"
             [ "$(nsenter -t "$pid" -n cat /proc/sys/net/ipv4/ip_unprivileged_port_start)" = "0" ] \
                 || die "the agent's network namespace does not allow low ports"
@@ -179,6 +197,7 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
             fi
         done
         ok "every runtime thread is under seccomp with no_new_privs"
+        ok "the agent runs as host ids of its own and owns its workspace"
         ok "the agent runtime holds no capabilities, and its tools cannot read its memory"
         ok "the agent sees only the CA certificates of /etc/ssl"
         ok "tools without capabilities can use localhost, ping and ports below 1024"
