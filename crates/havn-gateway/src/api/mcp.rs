@@ -7,7 +7,9 @@
 //! fields live as JSON inside `agent.config.policy`; the per-session
 //! resolver (`policy_resolver::override_for`) lays them over the owner's
 //! policy at every agent start (spec §6.3 / §9.4 frozen-prompt invariant —
-//! edits land on the next restart).
+//! edits land on the next restart). The view shows the override's own
+//! values, which the editor sends back whole; servers the owner's role
+//! grants without the override naming them are not listed.
 //!
 //! Writes never touch unrelated policy keys (allowed_models,
 //! resource_limits, …) — we read agent.config, splice in only the
@@ -71,7 +73,7 @@ pub async fn get(
     Path(id): Path<String>,
 ) -> Result<Json<McpView>, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
-    let (can_use_mcp, servers) = effective_mcp(&state, &agent).await;
+    let (can_use_mcp, servers) = read_mcp_from_config(&agent.config);
     let available_binaries = list_installed_binaries().await;
     Ok(Json(McpView {
         can_use_mcp,
@@ -141,7 +143,7 @@ pub async fn patch(
     .await;
     info!(agent_id = %id, "mcp config patched");
 
-    let (can_use_mcp, servers) = effective_mcp(&state, &updated).await;
+    let (can_use_mcp, servers) = read_mcp_from_config(&updated.config);
     Ok(Json(McpView {
         can_use_mcp,
         servers,
@@ -149,16 +151,25 @@ pub async fn patch(
     }))
 }
 
-/// The agent's (can_use_mcp, mcp_servers) as its next start resolves
-/// them: its override laid over the owner's policy, which may grant both.
-async fn effective_mcp(
-    state: &AppState,
-    agent: &havn_db::repo::agents::Agent,
-) -> (bool, HashMap<String, McpServerConfig>) {
-    let policy =
-        crate::policy_resolver::for_session(&state.db, agent, state.trusted_proxies.is_some())
-            .await;
-    (policy.permissions.can_use_mcp, policy.mcp_servers)
+/// Pull the (can_use_mcp, mcp_servers) pair out of agent.config.
+/// Both fields default to "off / empty" when missing or malformed —
+/// matches the runtime's "default permissions = MCP off" stance.
+fn read_mcp_from_config(config: &serde_json::Value) -> (bool, HashMap<String, McpServerConfig>) {
+    let can_use_mcp = config
+        .get("policy")
+        .and_then(|p| p.get("permissions"))
+        .and_then(|p| p.get("can_use_mcp"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let servers = config
+        .get("policy")
+        .and_then(|p| p.get("mcp_servers"))
+        .map(|v| {
+            serde_json::from_value::<HashMap<String, McpServerConfig>>(v.clone())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    (can_use_mcp, servers)
 }
 
 async fn list_installed_binaries() -> Vec<String> {
