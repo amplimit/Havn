@@ -23,6 +23,7 @@ mod query_broker;
 mod reload;
 mod secret_ref;
 mod supervisor;
+mod web_search;
 mod webchat;
 mod workspace;
 
@@ -169,6 +170,7 @@ struct AppState {
     pub models: Arc<ArcSwap<model_catalog::ModelCatalog>>,
     pub config_path: PathBuf,
     pub models_write: Arc<tokio::sync::Mutex<()>>,
+    pub search: Arc<web_search::WebSearch>,
 }
 
 #[tokio::main]
@@ -472,6 +474,23 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
+    for (backend, url) in cfg
+        .search
+        .base_url
+        .iter()
+        .map(|(b, u)| (b.as_str(), u))
+        .chain(cfg.search.searxng_url.iter().map(|u| ("searxng", u)))
+    {
+        info!(backend, url = %url, "web searches go to [search]");
+        if config::is_plaintext_to_another_host(url) {
+            warn!(
+                backend,
+                url = %url,
+                "[search] URL is plain http to another host: queries and keys cross the network unencrypted"
+            );
+        }
+    }
+    let search = Arc::new(web_search::WebSearch::new(cfg.search.clone(), &cfg.llm));
     let llm = Arc::new(cfg.llm.clone());
     let state = AppState {
         db: db.clone(),
@@ -509,6 +528,7 @@ async fn main() -> anyhow::Result<()> {
         models: models.clone(),
         config_path: config_path.clone(),
         models_write: Arc::new(tokio::sync::Mutex::new(())),
+        search: Arc::clone(&search),
     };
 
     // Background task: agent socket listener.
@@ -539,6 +559,7 @@ async fn main() -> anyhow::Result<()> {
         tmpfs_mounts: cfg.tmpfs_mounts.clone(),
         seccomp_allow_extra: cfg.seccomp.allow_extra.clone(),
         keyring: keyring.clone(),
+        search,
     };
     let socket_path = cfg.agent_socket_path.clone();
     let socket_task = tokio::spawn(async move {
@@ -577,6 +598,7 @@ async fn main() -> anyhow::Result<()> {
             "/embedding",
             get(api::embedding::status).patch(api::embedding::patch),
         )
+        .route("/search", get(api::search::status))
         .route(
             "/llm/models",
             get(api::models::get).put(api::models::put),

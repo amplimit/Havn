@@ -47,6 +47,7 @@ struct Entry {
     /// In-flight caps, kept per agent so reconnecting does not reset them.
     llm_slots: Arc<Semaphore>,
     query_slots: Arc<Semaphore>,
+    tool_slots: Arc<Semaphore>,
     /// Tells the writer of the connection that attached `tx` to give up;
     /// set and cleared together with `tx`.
     disconnect: Option<Arc<Notify>>,
@@ -113,16 +114,18 @@ pub struct Silent {
     pub silent_for: Duration,
 }
 
-/// Caps on `LlmRequest` / `AgentQuery` frames one agent may have handled at
-/// once. Each is a gateway task outside the agent's cgroup; frames over the
-/// cap get an immediate error reply.
+/// Caps on `LlmRequest` / `AgentQuery` / `GatewayToolCall` frames one agent
+/// may have handled at once. Each is a gateway task outside the agent's
+/// cgroup; frames over the cap get an immediate error reply.
 pub const MAX_INFLIGHT_LLM_REQUESTS: usize = 16;
 pub const MAX_INFLIGHT_AGENT_QUERIES: usize = 8;
+pub const MAX_INFLIGHT_TOOL_CALLS: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Slot {
     Llm,
     Query,
+    Tool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,6 +189,7 @@ impl AgentRegistry {
                 busy_since: None,
                 llm_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_LLM_REQUESTS)),
                 query_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_AGENT_QUERIES)),
+                tool_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_TOOL_CALLS)),
                 disconnect: None,
             },
         );
@@ -224,6 +228,7 @@ impl AgentRegistry {
             match slot {
                 Slot::Llm => Arc::clone(&entry.llm_slots),
                 Slot::Query => Arc::clone(&entry.query_slots),
+                Slot::Tool => Arc::clone(&entry.tool_slots),
             }
         };
         slots.try_acquire_owned().ok()

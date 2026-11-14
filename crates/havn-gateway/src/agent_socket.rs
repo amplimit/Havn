@@ -29,7 +29,8 @@ use havn_core::{AgentId, UserId};
 use havn_proto::codec::MAX_FRAME_BYTES;
 use havn_proto::{
     AgentQuery, AgentQueryOutcome, AgentQueryResponse, AgentQueryResult, AgentToGateway,
-    FrameError, GatewayToAgent, IncomingQuery, LlmOutcome, LlmRequest, LlmResponse, LlmUsage,
+    FrameError, GatewayToAgent, GatewayToolCall, GatewayToolOutcome, GatewayToolResult,
+    GatewayToolSpec, IncomingQuery, LlmOutcome, LlmRequest, LlmResponse, LlmUsage,
     PROTOCOL_VERSION, read_frame, write_frame,
 };
 use sqlx::SqlitePool;
@@ -40,7 +41,8 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::agent_registry::{
-    AgentRegistry, MAX_INFLIGHT_AGENT_QUERIES, MAX_INFLIGHT_LLM_REQUESTS, SendError, Slot,
+    AgentRegistry, MAX_INFLIGHT_AGENT_QUERIES, MAX_INFLIGHT_LLM_REQUESTS, MAX_INFLIGHT_TOOL_CALLS,
+    SendError, Slot,
 };
 use crate::cron::CronScheduler;
 use crate::llm_proxy::{self, AnthropicMessage, AnthropicRequest};
@@ -149,6 +151,8 @@ pub struct AgentSocketCtx {
     /// that mode `LlmRequest`s short-circuit with NoCredential
     /// rather than touching the proxy.
     pub keyring: Option<crate::keyring::KeyRing>,
+    /// Backend selection and rate limit of the `web_search` gateway tool.
+    pub search: Arc<crate::web_search::WebSearch>,
 }
 
 /// Bind the Unix-socket listener and accept agent connections forever.
@@ -584,11 +588,12 @@ async fn handle_connection(
     //    unavailable, ship `Policy::default()` rather than refuse the
     //    connection. Refusing here would just orphan the runtime; the
     //    spawner would retry into the same dead end.
-    let (policy, model, max_tokens, agent_name): (
+    let (policy, model, max_tokens, agent_name, gateway_tools): (
         Policy,
         Option<String>,
         Option<u32>,
         Option<String>,
+        Vec<GatewayToolSpec>,
     ) = match agents_repo::find_by_id(&ctx.db, agent_id).await {
         Ok(Some(agent)) => {
             let model = agent
@@ -607,20 +612,17 @@ async fn handle_connection(
             // merged → default. Same chain used at spawn time so
             // cgroup limits and tool registry stay consistent
             // (spec §6.3).
-            (
-                policy_resolver::for_session(&ctx.db, &agent, ctx.multi_user).await,
-                model,
-                max_tokens,
-                name,
-            )
+            let policy = policy_resolver::for_session(&ctx.db, &agent, ctx.multi_user).await;
+            let gateway_tools = gateway_tools_for(&ctx, &agent, &policy).await;
+            (policy, model, max_tokens, name, gateway_tools)
         }
         Ok(None) => {
             warn!(%agent_id, "agent not found at handshake; sending default policy");
-            (Policy::default(), None, None, None)
+            (Policy::default(), None, None, None, Vec::new())
         }
         Err(e) => {
             warn!(%agent_id, error = %e, "policy lookup failed; sending default policy");
-            (Policy::default(), None, None, None)
+            (Policy::default(), None, None, None, Vec::new())
         }
     };
 
@@ -652,6 +654,7 @@ async fn handle_connection(
             })
             .collect(),
         seccomp_allow_extra: ctx.seccomp_allow_extra.clone(),
+        gateway_tools,
     };
     let write_welcome = write_frame(&mut write, &welcome);
     let sent = match tokio::time::timeout(AGENT_WRITE_TIMEOUT, write_welcome).await {
@@ -1136,12 +1139,153 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
             // so the caller-side handler can wake.
             ctx.query_broker.resolve(agent_id, resp).await;
         }
+        AgentToGateway::GatewayToolCall(call) => {
+            if call.request_id.len() > MAX_REQUEST_ID_BYTES {
+                warn!(%agent_id, len = call.request_id.len(), "dropping GatewayToolCall with an oversized request_id");
+                return;
+            }
+            let Some(permit) = ctx.registry.try_reserve(agent_id, Slot::Tool).await else {
+                warn!(%agent_id, limit = MAX_INFLIGHT_TOOL_CALLS, "too many gateway tool calls in flight; refusing one");
+                let refusal = GatewayToAgent::GatewayToolResult(GatewayToolResult {
+                    request_id: call.request_id,
+                    outcome: GatewayToolOutcome::Error {
+                        message: format!(
+                            "this agent already has {MAX_INFLIGHT_TOOL_CALLS} gateway tool calls in flight; retry when one finishes"
+                        ),
+                    },
+                });
+                refuse(ctx, agent_id, refusal).await;
+                return;
+            };
+            let ctx_cloned = ctx.clone();
+            tokio::spawn(async move {
+                handle_gateway_tool_call(agent_id, call, ctx_cloned).await;
+                drop(permit);
+            });
+        }
         // The protocol enum is `#[non_exhaustive]`; future variants land
         // here so older gateways gracefully ignore frames they don't know.
         other => {
             warn!(%agent_id, ?other, "unknown frame variant — ignoring");
         }
     }
+}
+
+/// The gateway-run tools `agent` may use: `web_search` when its policy
+/// allows it and its owner has a search backend.
+async fn gateway_tools_for(
+    ctx: &AgentSocketCtx,
+    agent: &havn_db::repo::agents::Agent,
+    policy: &Policy,
+) -> Vec<GatewayToolSpec> {
+    if !policy.permissions.can_search_web {
+        return Vec::new();
+    }
+    match ctx
+        .search
+        .backend_for(&ctx.db, agent.owner_id, agent.team_id, &ctx.models.load())
+        .await
+    {
+        Ok(Some(backend)) => {
+            debug!(agent_id = %agent.id, backend = backend.name(), "offering web_search");
+            vec![ctx.search.spec()]
+        }
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            warn!(agent_id = %agent.id, error = %e, "search credential lookup failed; not offering web_search");
+            Vec::new()
+        }
+    }
+}
+
+async fn handle_gateway_tool_call(agent_id: AgentId, call: GatewayToolCall, ctx: AgentSocketCtx) {
+    let outcome = match run_gateway_tool(agent_id, &call, &ctx).await {
+        Ok(content) => GatewayToolOutcome::Ok { content },
+        Err(message) => GatewayToolOutcome::Error { message },
+    };
+    let result = GatewayToolResult {
+        request_id: call.request_id,
+        outcome,
+    };
+    if let Err(e) = ctx
+        .registry
+        .send(agent_id, GatewayToAgent::GatewayToolResult(result))
+        .await
+    {
+        warn!(%agent_id, error = %e, "could not deliver GatewayToolResult");
+    }
+}
+
+async fn run_gateway_tool(
+    agent_id: AgentId,
+    call: &GatewayToolCall,
+    ctx: &AgentSocketCtx,
+) -> Result<String, String> {
+    if call.name != crate::web_search::TOOL_NAME {
+        return Err(format!("the gateway has no tool named {:?}", call.name));
+    }
+    let agent = match agents_repo::find_by_id(&ctx.db, agent_id).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => return Err(format!("agent {agent_id} not found")),
+        Err(e) => return Err(format!("agent lookup failed: {e}")),
+    };
+    // First, before any other work: every call counts against the owner's
+    // rate, and refusals here are not audited, so a runtime cannot make the
+    // gateway query or write without bound.
+    if !ctx.search.admit(agent.owner_id).await {
+        return Err(format!(
+            "this user's agents have made {} web_search calls in the last minute; wait and retry",
+            ctx.search.per_user_per_minute()
+        ));
+    }
+    // The policy may have changed since Welcome offered the tool.
+    let policy = policy_resolver::for_session(&ctx.db, &agent, ctx.multi_user).await;
+    if !policy.permissions.can_search_web {
+        return Err("this agent's policy does not allow web search".into());
+    }
+    let billing = llm_proxy::Billing {
+        user_id: agent.owner_id,
+        agent_id: Some(agent_id),
+        agent_team: agent.team_id,
+        budget: policy.budget.clone(),
+    };
+    let result = ctx
+        .search
+        .run(
+            &ctx.db,
+            &ctx.http,
+            ctx.keyring.as_ref(),
+            &ctx.models.load(),
+            &billing,
+            &call.input,
+        )
+        .await;
+    let query: String = call
+        .input
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .chars()
+        .take(400)
+        .collect();
+    let details = match &result {
+        Ok(report) => serde_json::json!({
+            "query": query,
+            "backend": report.backend.name(),
+            "results": report.hits.len(),
+        }),
+        Err(message) => serde_json::json!({ "query": query, "error": message }),
+    };
+    crate::audit::record(
+        &ctx.db,
+        agent.owner_id,
+        agent.team_id,
+        Some(agent_id),
+        "web.search",
+        details,
+    )
+    .await;
+    result.map(|report| crate::web_search::render(&report, chrono::Utc::now()))
 }
 
 async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocketCtx) {
@@ -1899,6 +2043,10 @@ mod tests {
             tmpfs_mounts: Vec::new(),
             seccomp_allow_extra: Vec::new(),
             keyring: None,
+            search: Arc::new(crate::web_search::WebSearch::new(
+                crate::config::SearchConfig::default(),
+                &crate::config::LlmConfig::default(),
+            )),
         }
     }
 
@@ -1968,6 +2116,114 @@ mod tests {
         assert!(
             target_rx.try_recv().is_err(),
             "the target must not receive the query"
+        );
+    }
+
+    async fn add_openrouter_key(ctx: &AgentSocketCtx, owner: UserId) {
+        havn_db::repo::credentials::create(
+            &ctx.db,
+            havn_db::repo::credentials::NewCredential {
+                scope: havn_db::repo::credentials::CredentialScope::User,
+                scope_id: &owner.to_string(),
+                provider: "llm:openrouter",
+                name: None,
+                api_key_ciphertext: b"unused",
+                priority: 0,
+                limits: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("credential");
+        ctx.models
+            .store(Arc::new(crate::model_catalog::ModelCatalog {
+                default_model: None,
+                models: vec![crate::model_catalog::ModelEntry {
+                    id: "openrouter:cheap/model".into(),
+                    label: None,
+                    max_output_tokens: None,
+                }],
+            }));
+    }
+
+    fn policy_without_search() -> serde_json::Value {
+        let mut p = Policy::default();
+        p.permissions.can_search_web = false;
+        serde_json::json!({ "policy": p })
+    }
+
+    #[tokio::test]
+    async fn web_search_is_offered_with_a_backend_and_the_permission() {
+        let ctx = ctx_with(false, false).await;
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (agent, _rx) = connected_agent(&ctx, owner, "a", serde_json::json!({})).await;
+        let (denied, _rx2) = connected_agent(&ctx, owner, "b", policy_without_search()).await;
+        let tools_of = |id: AgentId| {
+            let ctx = ctx.clone();
+            async move {
+                let agent = agents_repo::find_by_id(&ctx.db, id)
+                    .await
+                    .expect("lookup")
+                    .expect("agent");
+                let policy = policy_resolver::for_session(&ctx.db, &agent, false).await;
+                gateway_tools_for(&ctx, &agent, &policy)
+                    .await
+                    .into_iter()
+                    .map(|t| t.name)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        assert!(tools_of(agent).await.is_empty(), "no backend yet");
+        add_openrouter_key(&ctx, owner).await;
+        assert_eq!(tools_of(agent).await, vec!["web_search".to_string()]);
+        assert!(tools_of(denied).await.is_empty(), "policy denies search");
+    }
+
+    #[tokio::test]
+    async fn gateway_tool_calls_are_checked_and_audited() {
+        let ctx = ctx_with(false, false).await;
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (agent, mut rx) = connected_agent(&ctx, owner, "a", serde_json::json!({})).await;
+        let (denied, _rx2) = connected_agent(&ctx, owner, "b", policy_without_search()).await;
+        let call = |name: &str| GatewayToolCall {
+            request_id: "t1".into(),
+            name: name.into(),
+            input: serde_json::json!({"query": "havn"}),
+        };
+
+        let unknown = run_gateway_tool(agent, &call("shell"), &ctx).await;
+        assert!(unknown.expect_err("unknown").contains("no tool named"));
+        let refused = run_gateway_tool(denied, &call("web_search"), &ctx).await;
+        assert!(refused.expect_err("denied").contains("does not allow"));
+
+        handle_gateway_tool_call(agent, call("web_search"), ctx.clone()).await;
+        match rx.try_recv().expect("a result") {
+            GatewayToAgent::GatewayToolResult(r) => {
+                assert_eq!(r.request_id, "t1");
+                let GatewayToolOutcome::Error { message } = r.outcome else {
+                    panic!("expected an error: {:?}", r.outcome);
+                };
+                assert!(message.contains("not set up"), "{message}");
+            }
+            other => panic!("unexpected frame {other:?}"),
+        }
+        let audited: Vec<(String, String)> =
+            sqlx::query_as("SELECT agent_id, details FROM audit_log WHERE action = 'web.search'")
+                .fetch_all(&ctx.db)
+                .await
+                .expect("audit rows");
+        assert_eq!(audited.len(), 1, "{audited:?}");
+        assert_eq!(audited[0].0, agent.to_string());
+        assert!(
+            audited[0].1.contains("\"query\":\"havn\""),
+            "{}",
+            audited[0].1
         );
     }
 

@@ -94,7 +94,7 @@ impl Billing {
     /// The agent's daily token cap as enforced by reservations: 0 (none)
     /// without an agent, for an unlimited budget, or for
     /// `on_exhaust = warn_only`.
-    fn enforced_agent_tokens(&self) -> i64 {
+    pub(crate) fn enforced_agent_tokens(&self) -> i64 {
         if self.agent_id.is_none() || self.budget.on_exhaust == BudgetExhaustAction::WarnOnly {
             return 0;
         }
@@ -431,40 +431,43 @@ async fn complete_through(
 /// Owns a reservation row until it is settled, released or kept. Dropped
 /// while armed (the caller's future was cancelled mid-call, e.g. an HTTP
 /// client disconnected), it releases the row from a spawned task.
-struct ReservationGuard {
+pub(crate) struct ReservationGuard {
     db: SqlitePool,
     id: Option<String>,
 }
 
 impl ReservationGuard {
-    fn new(db: &SqlitePool, id: String) -> Self {
+    pub(crate) fn new(db: &SqlitePool, id: String) -> Self {
         Self {
             db: db.clone(),
             id: Some(id),
         }
     }
 
-    async fn settle(mut self, resp: &AnthropicResponse) {
-        let Some(id) = self.id.take() else { return };
+    async fn settle(self, resp: &AnthropicResponse) {
         let tokens_in = i64::try_from(resp.usage.total_input_tokens()).unwrap_or(i64::MAX);
         let tokens_out = i64::try_from(resp.usage.output_tokens).unwrap_or(i64::MAX);
+        self.settle_tokens(&resp.model, tokens_in, tokens_out).await;
+    }
+
+    pub(crate) async fn settle_tokens(mut self, model: &str, tokens_in: i64, tokens_out: i64) {
+        let Some(id) = self.id.take() else { return };
         // A failed write leaves the reservation in place, which
         // over-counts rather than under-counts.
-        if let Err(e) =
-            credential_usage::settle(&self.db, &id, &resp.model, tokens_in, tokens_out).await
+        if let Err(e) = credential_usage::settle(&self.db, &id, model, tokens_in, tokens_out).await
         {
             warn!(error = %e, "usage settlement failed (non-fatal)");
         }
     }
 
-    async fn release(mut self) {
+    pub(crate) async fn release(mut self) {
         if let Some(id) = self.id.take() {
             release(&self.db, &id).await;
         }
     }
 
     /// Leave the reservation as the recorded usage.
-    fn keep(mut self) {
+    pub(crate) fn keep(mut self) {
         self.id = None;
     }
 }

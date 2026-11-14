@@ -91,6 +91,8 @@ pub async fn run() -> anyhow::Result<()> {
     mark!(v);
     let v = check_models().await;
     mark!(v);
+    let v = check_search().await;
+    mark!(v);
 
     println!();
     if fails == 0 && warns == 0 {
@@ -671,6 +673,50 @@ async fn check_models() -> Verdict {
     verdict
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct SearchStatus {
+    provider: String,
+    backend: Option<String>,
+}
+
+// Needs the running gateway, like `check_models`.
+async fn check_search() -> Verdict {
+    let Ok(gw) = Gateway::from_env() else {
+        return Verdict::Ok;
+    };
+    let Ok(status) = gw.get_json::<SearchStatus>("/search").await else {
+        return Verdict::Ok;
+    };
+    let (verdict, msg) = search_verdict(&status);
+    line(verdict, "web search", &msg);
+    verdict
+}
+
+fn search_verdict(status: &SearchStatus) -> (Verdict, String) {
+    match (&status.backend, status.provider.as_str()) {
+        (Some(backend), _) => (Verdict::Ok, format!("web_search runs on {backend}")),
+        (None, "off") => (Verdict::Ok, "off ([search] provider = \"off\")".into()),
+        (None, "auto") => (
+            Verdict::Warn,
+            "your agents have no web_search: add a search key with `havn credential add \
+             search:brave <key>` (or search:tavily, search:exa), an OpenRouter key, or set \
+             [search] searxng_url"
+                .into(),
+        ),
+        (None, provider) => (
+            Verdict::Warn,
+            format!(
+                "your agents have no web_search: [search] provider = {provider:?} needs {}",
+                if provider == "openrouter" {
+                    "an OpenRouter key and an openrouter: model".to_string()
+                } else {
+                    format!("a search:{provider} key")
+                }
+            ),
+        ),
+    }
+}
+
 fn models_verdict(
     view: &crate::model::ModelsView,
     creds: Option<&[CredentialProvider]>,
@@ -767,6 +813,31 @@ mod tests {
         assert!(
             matches!(v, Verdict::Ok),
             "unreadable credentials are not missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn search_reports_the_backend_or_how_to_add_one() {
+        let status = |provider: &str, backend: Option<&str>| SearchStatus {
+            provider: provider.into(),
+            backend: backend.map(str::to_string),
+        };
+        let (v, msg) = search_verdict(&status("auto", Some("openrouter")));
+        assert!(
+            matches!(v, Verdict::Ok) && msg.contains("openrouter"),
+            "{msg}"
+        );
+        let (v, _) = search_verdict(&status("off", None));
+        assert!(matches!(v, Verdict::Ok));
+        let (v, msg) = search_verdict(&status("auto", None));
+        assert!(
+            matches!(v, Verdict::Warn) && msg.contains("search:brave"),
+            "{msg}"
+        );
+        let (v, msg) = search_verdict(&status("exa", None));
+        assert!(
+            matches!(v, Verdict::Warn) && msg.contains("search:exa"),
+            "{msg}"
         );
     }
 

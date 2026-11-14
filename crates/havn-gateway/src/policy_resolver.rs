@@ -127,6 +127,7 @@ fn restrictive_fallback() -> Policy {
     p.permissions.can_access_network = false;
     p.permissions.can_use_shell = false;
     p.permissions.can_schedule_cron = false;
+    p.permissions.can_search_web = false;
     p
 }
 

@@ -438,6 +438,10 @@ pub(crate) mod tests {
             config_path: std::env::temp_dir()
                 .join(format!("havn-test-config-{}.toml", uuid::Uuid::now_v7())),
             models_write: Arc::new(tokio::sync::Mutex::new(())),
+            search: Arc::new(crate::web_search::WebSearch::new(
+                crate::config::SearchConfig::default(),
+                &crate::config::LlmConfig::default(),
+            )),
         };
         (app, bootstrap)
     }
