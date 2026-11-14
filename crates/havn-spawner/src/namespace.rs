@@ -107,9 +107,14 @@ impl NamespaceSpawner {
             pool_cidr = %pool.cidr(),
             "NamespaceSpawner cgroup v2 ready"
         );
-        let host_ids = HostIdRange::of_this_process();
         // SAFETY: geteuid cannot fail.
-        if unsafe { libc::geteuid() } == 0 {
+        let root = unsafe { libc::geteuid() } == 0;
+        let host_ids = if root {
+            HostIdRange::of_this_process()
+        } else {
+            None
+        };
+        if root {
             match host_ids {
                 Some(range) => info!(
                     first = range.base,
@@ -741,20 +746,49 @@ impl HostIdRange {
     /// The fewest ids a fallback range may hold.
     const MIN_COUNT: u32 = 0x1_0000;
 
+    /// Owner name of the line that reserves a range chosen inside a
+    /// container in `/etc/subuid` and `/etc/subgid`. No such user needs to
+    /// exist: the line keeps `useradd` from giving those ids to a user of
+    /// the container, who could then map them with `newuidmap` and act as
+    /// an agent.
+    const RESERVED_FOR: &'static str = "havn-agents";
+
     /// The range for the calling process's user namespace, or `None`
-    /// when its maps cannot be read or map too few ids.
+    /// when its maps cannot be read or leave too few ids. A range chosen
+    /// inside a container is reserved in `/etc/subuid` and `/etc/subgid`.
+    /// For a root gateway only.
     pub fn of_this_process() -> Option<Self> {
         let uid_map = std::fs::read_to_string("/proc/self/uid_map").ok()?;
         let gid_map = std::fs::read_to_string("/proc/self/gid_map").ok()?;
-        Self::within(&uid_map, &gid_map)
+        let subuid = std::fs::read_to_string("/etc/subuid").unwrap_or_default();
+        let subgid = std::fs::read_to_string("/etc/subgid").unwrap_or_default();
+        let (range, reserve) = Self::within(&uid_map, &gid_map, &subuid, &subgid)?;
+        if reserve {
+            let line = format!("{}:{}:{}\n", Self::RESERVED_FOR, range.base, range.count);
+            for path in ["/etc/subuid", "/etc/subgid"] {
+                if let Err(e) = append_line(Path::new(path), &line) {
+                    warn!(
+                        path,
+                        error = %e,
+                        "cannot reserve the agents' ids; useradd may give them to a user"
+                    );
+                }
+            }
+        }
+        Some(range)
     }
 
-    /// [`Self::PREFERRED`] where both maps hold it whole, as on a host.
-    /// A container maps fewer (LXD: ids 0 to 999999999 by default); there
-    /// agents get the upper half of the largest run of ids above 65535
-    /// that both map, away from the container's users and from the
-    /// subordinate ids its own tools hand out from the bottom.
-    fn within(uid_map: &str, gid_map: &str) -> Option<Self> {
+    /// The range, and whether it still has to be reserved, given the
+    /// gateway's id maps and `/etc/subuid` and `/etc/subgid`.
+    ///
+    /// [`Self::PREFERRED`] where both maps hold it whole and no
+    /// subordinate ids overlap it, as on a host. A container maps fewer
+    /// (LXD: ids 0 to 999999999 by default); there agents keep a range
+    /// reserved earlier that the maps still hold, or get the upper half of
+    /// the largest run of ids above 65535 that both maps hold and no
+    /// subordinate range takes, which leaves room below for the
+    /// subordinate ids `useradd` hands out from 100000.
+    fn within(uid_map: &str, gid_map: &str, subuid: &str, subgid: &str) -> Option<(Self, bool)> {
         let uids = map_extents(uid_map);
         let gids = map_extents(gid_map);
         let both: Vec<(u64, u64)> = uids
@@ -766,25 +800,53 @@ impl HostIdRange {
                 })
             })
             .collect();
+        let subordinate: Vec<(&str, u64, u64)> = subid_ranges(subuid)
+            .into_iter()
+            .chain(subid_ranges(subgid))
+            .collect();
+        let ours = |file: &str| {
+            subid_ranges(file)
+                .into_iter()
+                .find(|(owner, ..)| *owner == Self::RESERVED_FOR)
+                .map(|(_, lo, hi)| (lo, hi))
+        };
+        if let (Some(uid), Some(gid)) = (ours(subuid), ours(subgid))
+            && uid == gid
+            && both.iter().any(|&(lo, hi)| lo <= uid.0 && uid.1 <= hi)
+            && let Some(range) = Self::from_extent(uid.0, uid.1)
+        {
+            return Some((range, false));
+        }
+        let taken: Vec<(u64, u64)> = subordinate
+            .into_iter()
+            .filter(|(owner, ..)| *owner != Self::RESERVED_FOR)
+            .map(|(_, lo, hi)| (lo, hi))
+            .collect();
+        let free = subtract(
+            both.into_iter()
+                .map(|(lo, hi)| (lo.max(Self::FIRST_FREE), hi))
+                .filter(|(lo, hi)| lo < hi)
+                .collect(),
+            &taken,
+        );
         let preferred = (
             u64::from(Self::PREFERRED.base),
             u64::from(Self::PREFERRED.base) + u64::from(Self::PREFERRED.count),
         );
-        if both
+        if free
             .iter()
             .any(|&(lo, hi)| lo <= preferred.0 && preferred.1 <= hi)
         {
-            return Some(Self::PREFERRED);
+            return Some((Self::PREFERRED, false));
         }
-        let (lo, hi) = both
-            .into_iter()
-            .map(|(lo, hi)| (lo.max(Self::FIRST_FREE), hi))
-            .filter(|(lo, hi)| lo < hi)
-            .max_by_key(|(lo, hi)| hi - lo)?;
-        let base = lo + (hi - lo) / 2;
-        let count = u32::try_from(hi - base).ok()?;
+        let (lo, hi) = free.into_iter().max_by_key(|(lo, hi)| hi - lo)?;
+        Self::from_extent(lo + (hi - lo) / 2, hi).map(|range| (range, true))
+    }
+
+    fn from_extent(lo: u64, hi: u64) -> Option<Self> {
+        let count = u32::try_from(hi.checked_sub(lo)?).ok()?;
         (count >= Self::MIN_COUNT).then_some(Self {
-            base: u32::try_from(base).ok()?,
+            base: u32::try_from(lo).ok()?,
             count,
         })
     }
@@ -792,6 +854,49 @@ impl HostIdRange {
     fn id(self, slot: u32) -> Option<u32> {
         (slot < self.count).then(|| self.base + slot)
     }
+}
+
+/// The `owner`, `[first, end)` ranges of an `/etc/subuid` or `/etc/subgid`.
+fn subid_ranges(file: &str) -> Vec<(&str, u64, u64)> {
+    file.lines()
+        .filter_map(|line| {
+            let mut fields = line.trim().split(':');
+            let owner = fields.next()?;
+            let first = fields.next()?.parse::<u64>().ok()?;
+            let count = fields.next()?.parse::<u64>().ok()?;
+            Some((owner, first, first + count))
+        })
+        .collect()
+}
+
+/// `extents` without the ids in `taken`.
+fn subtract(extents: Vec<(u64, u64)>, taken: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    taken.iter().fold(extents, |free, &(tlo, thi)| {
+        free.into_iter()
+            .flat_map(|(lo, hi)| {
+                [(lo, tlo.min(hi)), (thi.max(lo), hi)]
+                    .into_iter()
+                    .filter(|(l, h)| l < h)
+            })
+            .collect()
+    })
+}
+
+/// Append `line` to the file at `path`, starting a new line if the file
+/// does not end with one.
+fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o644)
+        .open(path)?;
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        file.write_all(b"\n")?;
+    }
+    file.write_all(line.as_bytes())
 }
 
 /// The `[first, end)` runs of ids, as the reading namespace numbers them,
@@ -863,38 +968,80 @@ mod tests {
     #[test]
     fn agents_get_the_preferred_ids_where_the_namespace_maps_them() {
         let host = "         0          0 4294967295\n";
-        assert_eq!(
-            HostIdRange::within(host, host),
-            Some(HostIdRange::PREFERRED)
-        );
-        let range = HostIdRange::within(host, host).expect("range");
+        let subids = "ubuntu:100000:65536\nops:165536:65536\n";
+        let (range, reserve) = HostIdRange::within(host, host, subids, subids).expect("range");
+        assert_eq!(range, HostIdRange::PREFERRED);
+        assert!(!reserve, "nothing to reserve on a host");
         assert_eq!(range.id(0), Some(0x7100_0000));
         assert_eq!(range.id(range.count), None);
     }
 
     #[test]
-    fn in_a_container_agents_get_the_upper_half_of_its_ids() {
+    fn in_a_container_agents_get_the_upper_half_of_its_free_ids() {
         let lxd = "         0    1000000 1000000000\n";
-        let range = HostIdRange::within(lxd, lxd).expect("range");
+        let (range, reserve) = HostIdRange::within(lxd, lxd, "", "").expect("range");
         assert_eq!(range.base, 500_032_768);
         assert_eq!(
             u64::from(range.base) + u64::from(range.count),
             1_000_000_000
         );
+        assert!(reserve);
         // Ids both maps hold: a gid map ending earlier ends the range.
         let gids = "         0    1000000 600000000\n";
-        let narrow = HostIdRange::within(lxd, gids).expect("range");
+        let (narrow, _) = HostIdRange::within(lxd, gids, "", "").expect("range");
         assert_eq!(
             u64::from(narrow.base) + u64::from(narrow.count),
             600_000_000
         );
+        // Subordinate ids are never an agent's.
+        let small = "         0    1065536    1000000\n";
+        let subids = "ubuntu:100000:65536\nbig:300000:500000\n";
+        let (range, _) = HostIdRange::within(small, small, subids, "").expect("range");
+        assert_eq!(range.base, 900_000);
+        assert_eq!(u64::from(range.base) + u64::from(range.count), 1_000_000);
+    }
+
+    #[test]
+    fn a_reserved_range_is_kept() {
+        let lxd = "         0    1000000 1000000000\n";
+        let reserved = "havn-agents:600000000:70000\nubuntu:100000:65536\n";
+        assert_eq!(
+            HostIdRange::within(lxd, lxd, reserved, reserved),
+            Some((
+                HostIdRange {
+                    base: 600_000_000,
+                    count: 70_000
+                },
+                false
+            ))
+        );
+        // One the maps no longer hold is chosen again.
+        let small = "         0    1065536    1000000\n";
+        let (range, reserve) =
+            HostIdRange::within(small, small, reserved, reserved).expect("range");
+        assert!(reserve);
+        assert!(u64::from(range.base) + u64::from(range.count) <= 1_000_000);
     }
 
     #[test]
     fn a_namespace_with_few_ids_gives_agents_none() {
         let small = "         0     100000      65536\n";
-        assert_eq!(HostIdRange::within(small, small), None);
-        assert_eq!(HostIdRange::within("", ""), None);
+        assert_eq!(HostIdRange::within(small, small, "", ""), None);
+        assert_eq!(HostIdRange::within("", "", "", ""), None);
+        let full = "         0     100000     200000\n";
+        assert_eq!(
+            HostIdRange::within(full, full, "u:65536:134464\n", ""),
+            None,
+            "subordinate ids take every id above 65535"
+        );
+    }
+
+    #[test]
+    fn subtracting_ranges() {
+        assert_eq!(
+            subtract(vec![(0, 100)], &[(10, 20), (50, 200), (300, 400)]),
+            vec![(0, 10), (20, 50)]
+        );
     }
 
     #[tokio::test]

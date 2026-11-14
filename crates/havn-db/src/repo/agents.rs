@@ -276,8 +276,13 @@ pub async fn patch(
 /// assigned on first use. A slot is never given to another agent, even
 /// after this one is deleted.
 pub async fn host_id_slot(pool: &SqlitePool, id: AgentId) -> Result<u32> {
+    // Inserting only when the agent has no row: an insert that hits the
+    // conflict still advances AUTOINCREMENT, which would spend a slot on
+    // every start.
     sqlx::query(
-        "INSERT INTO agent_host_ids (agent_id) VALUES (?1) ON CONFLICT (agent_id) DO NOTHING",
+        "INSERT INTO agent_host_ids (agent_id) \
+         SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM agent_host_ids WHERE agent_id = ?1) \
+         ON CONFLICT (agent_id) DO NOTHING",
     )
     .bind(id.to_string())
     .execute(pool)
@@ -371,6 +376,42 @@ mod tests {
         .await
         .expect("create user")
         .id
+    }
+
+    #[tokio::test]
+    async fn host_id_slots_are_per_agent_and_not_spent_by_restarts() {
+        let pool = connect_in_memory().await.expect("connect");
+        let owner = make_user(&pool, "slots").await;
+        let agent = |name: &'static str| {
+            let pool = pool.clone();
+            async move {
+                create(
+                    &pool,
+                    NewAgent {
+                        owner_id: owner,
+                        team_id: None,
+                        name,
+                        config: serde_json::json!({}),
+                    },
+                )
+                .await
+                .expect("agent")
+                .id
+            }
+        };
+        let a = agent("a").await;
+        let b = agent("b").await;
+        for _ in 0..5 {
+            assert_eq!(host_id_slot(&pool, a).await.expect("slot"), 1);
+        }
+        assert_eq!(host_id_slot(&pool, b).await.expect("slot"), 2);
+        delete(&pool, b).await.expect("delete");
+        let c = agent("c").await;
+        assert_eq!(
+            host_id_slot(&pool, c).await.expect("slot"),
+            3,
+            "a deleted agent's slot is not handed out again"
+        );
     }
 
     #[tokio::test]

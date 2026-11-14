@@ -377,9 +377,9 @@ pub struct HostPaths {
 }
 
 impl HostPaths {
-    /// Open each path that exists, following symlinks as a bind would. A
-    /// missing one is left out: binding it then fails, or, for an extra
-    /// mount, is skipped.
+    /// Open each path, following symlinks as a bind would. One that cannot
+    /// be opened is left out, with a line on stderr unless it is missing:
+    /// binding it then fails, or, for an extra mount, is skipped.
     pub fn open<'a>(paths: impl IntoIterator<Item = &'a Path>) -> io::Result<Self> {
         let mut opened = Vec::new();
         for path in paths {
@@ -388,13 +388,10 @@ impl HostPaths {
             let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
             if fd < 0 {
                 let err = io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::ENOENT) {
-                    continue;
+                if err.raw_os_error() != Some(libc::ENOENT) {
+                    eprintln!("havn-init: cannot open {}: {err}", path.display());
                 }
-                return Err(io::Error::new(
-                    err.kind(),
-                    format!("opening {}: {err}", path.display()),
-                ));
+                continue;
             }
             // SAFETY: `fd` was just opened and nothing else owns it.
             opened.push((path.to_path_buf(), unsafe { OwnedFd::from_raw_fd(fd) }));
@@ -844,7 +841,7 @@ pub unsafe fn pivot_root_into_minimal_rootfs(
         for mount in extra_mounts {
             if !host.contains(&mount.path) {
                 eprintln!(
-                    "havn-init: extra_mounts entry {} doesn't exist on host — skipping",
+                    "havn-init: extra_mounts entry {} cannot be opened on the host — skipping",
                     mount.path.display()
                 );
                 continue;

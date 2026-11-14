@@ -77,6 +77,9 @@ lxc start acme
   thousand such tenants. A tenant created without it gets it with
   `lxc config set acme security.idmap.size=1000000` and a restart, during
   which LXD shifts the container's files to the new range.
+  The gateway records the agents' range in the container's `/etc/subuid` and
+  `/etc/subgid` as `havn-agents`, so `useradd` never gives a user of the
+  container subordinate ids an agent runs as.
 - `security.port_isolation=true` stops direct traffic between this container
   and the other isolated containers on the bridge. It only blocks traffic
   between two isolated ports, so set it on **every** tenant: a tenant without
