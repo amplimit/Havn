@@ -254,6 +254,10 @@ pub struct Permissions {
     /// at the runtime level (an agent serving an incoming query never
     /// sees `agent_query` in its registry, regardless of this flag).
     pub can_query_other_agents: bool,
+    /// `web_search`, run by the gateway with the operator's search backend.
+    /// Needs no egress: the agent sees results, never the network. Queries
+    /// leave the host, so turn it off for agents whose data must not.
+    pub can_search_web: bool,
 }
 
 impl Default for Permissions {
@@ -269,6 +273,7 @@ impl Default for Permissions {
             can_schedule_cron: true,
             can_use_mcp: false,
             can_query_other_agents: false,
+            can_search_web: true,
         }
     }
 }
@@ -417,6 +422,7 @@ impl Policy {
                 can_schedule_cron: own.can_schedule_cron && cap.can_schedule_cron,
                 can_use_mcp: own.can_use_mcp && cap.can_use_mcp,
                 can_query_other_agents: own.can_query_other_agents && cap.can_query_other_agents,
+                can_search_web: own.can_search_web && cap.can_search_web,
             },
             network_policy: NetworkPolicy {
                 egress_allowed: self.network_policy.egress_allowed
@@ -491,6 +497,7 @@ impl Policy {
                 can_schedule_cron: a.can_schedule_cron || b.can_schedule_cron,
                 can_use_mcp: a.can_use_mcp || b.can_use_mcp,
                 can_query_other_agents: a.can_query_other_agents || b.can_query_other_agents,
+                can_search_web: a.can_search_web || b.can_search_web,
             },
             network_policy: NetworkPolicy {
                 egress_allowed: self.network_policy.egress_allowed
@@ -671,6 +678,7 @@ mod tests {
         let mut cap = Policy::default();
         cap.permissions.can_use_shell = false;
         cap.permissions.can_use_mcp = false;
+        cap.permissions.can_search_web = false;
         cap.resource_limits.memory_mb = 256;
         cap.resource_limits.pids_max = 32;
         cap.budget.max_tokens_per_day = 10_000;
@@ -687,6 +695,7 @@ mod tests {
         assert!(!p.permissions.can_use_shell);
         assert!(!p.permissions.can_use_mcp);
         assert!(!p.permissions.can_spawn_subagents);
+        assert!(!p.permissions.can_search_web);
         assert!(!p.network_policy.egress_allowed);
         assert_eq!(p.resource_limits.memory_mb, 256);
         assert_eq!(p.resource_limits.pids_max, 32);

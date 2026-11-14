@@ -149,6 +149,8 @@ struct Ctx {
     /// reader loop pops on `AgentQueryResult` and resolves the future.
     /// Same shape as [`Pending`] but typed against `AgentQueryResult`.
     agent_query_pending: tools::agent_query::PendingQueries,
+    /// Calls to gateway-run tools waiting for their `GatewayToolResult`.
+    gateway_pending: tools::gateway::PendingGatewayCalls,
     /// Base registry **without** `subagent_spawn` and `agent_query`.
     /// Used to build the temp loop that answers
     /// [`GatewayToAgent::IncomingQuery`] frames. Keeping the base
@@ -271,6 +273,7 @@ async fn main() -> anyhow::Result<()> {
         extra_mounts,
         tmpfs_mounts,
         seccomp_allow_extra,
+        gateway_tools,
     ): (
         Arc<Policy>,
         Option<String>,
@@ -280,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
         Vec<(std::path::PathBuf, bool)>,
         Vec<std::path::PathBuf>,
         Vec<String>,
+        Vec<havn_proto::GatewayToolSpec>,
     ) = match first_frame {
         Some(GatewayToAgent::Welcome {
             session_token: _,
@@ -291,6 +295,7 @@ async fn main() -> anyhow::Result<()> {
             extra_mounts: extra_mounts_wire,
             tmpfs_mounts: tmpfs_mounts_wire,
             seccomp_allow_extra: seccomp_allow_extra_list,
+            gateway_tools,
         }) => {
             // Materialise the embedding provider from the
             // gateway-shipped JSON. Absent / null / "disabled"
@@ -367,6 +372,7 @@ async fn main() -> anyhow::Result<()> {
                 extra_mounts = extra_mount_pairs.len(),
                 tmpfs_mounts = tmpfs_paths.len(),
                 seccomp_allow_extra = seccomp_allow_extra_list.len(),
+                gateway_tools = ?gateway_tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
                 "agent welcomed by gateway with policy"
             );
             (
@@ -378,6 +384,7 @@ async fn main() -> anyhow::Result<()> {
                 extra_mount_pairs,
                 tmpfs_paths,
                 seccomp_allow_extra_list,
+                gateway_tools,
             )
         }
         Some(other) => return Err(anyhow!("expected Welcome, got {other:?}")),
@@ -520,8 +527,13 @@ async fn main() -> anyhow::Result<()> {
     //    the layer that controls what the LLM ever sees. MCP tools are
     //    folded in here so subagents inherit the same MCP surface as
     //    the parent (same trust boundary).
+    // The writer channel exists before the registry: gateway tools send
+    // through it. Its task starts in step 5.
+    let (writer_tx, mut writer_rx) = mpsc::channel::<AgentToGateway>(OUTBOUND_QUEUE_CAPACITY);
+    let gateway_pending: tools::gateway::PendingGatewayCalls = Arc::default();
     let base_registry = ToolRegistry::standard(&policy)
         .with_hooks(Arc::clone(&hooks))
+        .with_gateway_tools(gateway_tools, &gateway_pending, &writer_tx)
         .with_mcp(&mcp_servers);
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
@@ -563,7 +575,6 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // 5. Writer task + shared LLM-response routing map.
-    let (writer_tx, mut writer_rx) = mpsc::channel::<AgentToGateway>(OUTBOUND_QUEUE_CAPACITY);
     // Signalled once the reader loop ends (for ANY reason: SIGTERM, gateway
     // Shutdown frame, or EOF) so the writer flushes its queue and stops. The
     // channel never closes on its own — long-lived tasks (curator, subagent
@@ -747,6 +758,7 @@ async fn main() -> anyhow::Result<()> {
         model: session_model,
         max_tokens: session_max_tokens,
         agent_query_pending,
+        gateway_pending,
         incoming_query_registry,
     };
     let dispatch = run_reader_loop(&mut reader, ctx).await;
@@ -941,6 +953,12 @@ where
                         req = %result.request_id,
                         "AgentQueryResult with no pending entry — caller timed out"
                     );
+                }
+            }
+            GatewayToAgent::GatewayToolResult(result) => {
+                let request_id = result.request_id.clone();
+                if !tools::gateway::resolve(&ctx.gateway_pending, result).await {
+                    warn!(req = %request_id, "GatewayToolResult with no pending call");
                 }
             }
             GatewayToAgent::Shutdown => {

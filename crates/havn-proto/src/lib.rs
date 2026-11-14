@@ -65,6 +65,11 @@ pub enum AgentToGateway {
     /// forwards a [`GatewayToAgent::AgentQueryResult`] back to the
     /// caller.
     AgentQueryResponse(AgentQueryResponse),
+    /// Call one of the tools the gateway listed in
+    /// [`GatewayToAgent::Welcome`]'s `gateway_tools`. The gateway runs it
+    /// and answers with [`GatewayToAgent::GatewayToolResult`] carrying the
+    /// same `request_id`.
+    GatewayToolCall(GatewayToolCall),
 }
 
 /// Frames sent from the gateway to the agent runtime.
@@ -137,6 +142,12 @@ pub enum GatewayToAgent {
         /// Defaulted for older-gateway interop.
         #[serde(default)]
         seccomp_allow_extra: Vec<String>,
+        /// Tools the gateway runs on the agent's behalf, such as
+        /// `web_search`: they need keys or network access the sandbox does
+        /// not have. The runtime offers each one to the model and forwards
+        /// calls as [`AgentToGateway::GatewayToolCall`].
+        #[serde(default)]
+        gateway_tools: Vec<GatewayToolSpec>,
     },
     /// Inbound message from a channel adapter.
     InboundMessage(InboundMessage),
@@ -191,6 +202,39 @@ pub enum GatewayToAgent {
     /// Routed back from the target agent (or synthesised by the gateway
     /// on rejection / timeout / not-running).
     AgentQueryResult(AgentQueryResult),
+    /// Reply to an [`AgentToGateway::GatewayToolCall`].
+    GatewayToolResult(GatewayToolResult),
+}
+
+/// A tool the gateway runs, described the way the model sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayToolSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayToolCall {
+    pub request_id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayToolResult {
+    pub request_id: String,
+    pub outcome: GatewayToolOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum GatewayToolOutcome {
+    /// Text handed to the model as the tool result.
+    Ok { content: String },
+    /// Shown to the model as an error result.
+    Error { message: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -530,6 +574,7 @@ mod tests {
             extra_mounts: Vec::new(),
             tmpfs_mounts: Vec::new(),
             seccomp_allow_extra: Vec::new(),
+            gateway_tools: Vec::new(),
         };
         let line = serde_json::to_string(&frame).expect("serialize");
         assert!(line.contains("\"type\":\"welcome\""));
@@ -564,6 +609,7 @@ mod tests {
             extra_mounts: Vec::new(),
             tmpfs_mounts: Vec::new(),
             seccomp_allow_extra: Vec::new(),
+            gateway_tools: Vec::new(),
         };
         let line = serde_json::to_string(&frame).expect("serialize");
         let parsed: GatewayToAgent = serde_json::from_str(&line).expect("parse");

@@ -21,6 +21,7 @@ use tracing::warn;
 
 pub mod agent_query;
 pub mod files;
+pub mod gateway;
 pub mod memory;
 pub mod network;
 pub mod shell;
@@ -210,6 +211,29 @@ impl ToolRegistry {
         self.tools.push(Arc::new(agent_query::AgentQueryTool::new(
             pending, writer_tx,
         )));
+        self
+    }
+
+    /// Offer the tools the gateway runs for this agent. The gateway lists
+    /// only what the agent's policy allows; a name the registry already
+    /// has keeps its local tool.
+    pub fn with_gateway_tools(
+        mut self,
+        specs: Vec<havn_proto::GatewayToolSpec>,
+        pending: &gateway::PendingGatewayCalls,
+        writer_tx: &tokio::sync::mpsc::Sender<havn_proto::AgentToGateway>,
+    ) -> Self {
+        for spec in specs {
+            if self.tools.iter().any(|t| t.name() == spec.name) {
+                warn!(tool = %spec.name, "gateway tool shadows a local tool; ignoring it");
+                continue;
+            }
+            self.tools.push(Arc::new(gateway::GatewayTool::new(
+                spec,
+                Arc::clone(pending),
+                writer_tx.clone(),
+            )));
+        }
         self
     }
 

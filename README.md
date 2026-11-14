@@ -187,6 +187,7 @@ havn is **infrastructure, not SaaS**. The test: does it require kernel primitive
 - Of the host's `/etc`, agents see only `/etc/ssl/certs` (read-only) and, with network egress, a generated `/etc/resolv.conf`
 - Agents do not start if Landlock is not available (kernel 5.13+ with `landlock` in the `lsm=` list; `havn doctor` checks it). To run agents without filesystem restriction on such a kernel anyway, start the gateway with `HAVN_ALLOW_NO_LANDLOCK=1`
 - Agents with network egress reach the public internet only: traffic to the gateway host (including Docker-published ports), other agents, private, link-local (including cloud metadata), CGNAT and reserved addresses is dropped in `mangle PREROUTING` before any other firewall rule, and the host end of the agent link has no IPv6. The configured `agent_dns` servers stay reachable on port 53, also when they run on the gateway host; list other internal addresses agents may use under `[network] agent_private_access = ["10.0.5.20", "192.168.1.0/24"]`. If these rules cannot be installed (no `iptables`), agents get no network access at all. A `firewall-cmd --reload` or similar flush removes them; agents started afterwards get no network until the gateway restarts. A host-wide rule that redirects port 53 to a local resolver also breaks agent DNS, since the redirected destination is no longer an `agent_dns` server
+- Search queries leave the host even for agents without network egress: `web_search` sends them to the search backend, so an agent could put data from its workspace into a query. Turn off `can_search_web` for agents whose data must not leave
 - API keys encrypted at rest with [age](https://age-encryption.org/) — agent processes never see them
 - Token caps enforced gateway-side: per credential (`max_tokens_per_day`), per user on a shared credential (`per_user.max_tokens_per_day`, `per_user.max_requests_per_minute`) and per agent across all credentials (policy `budget.max_tokens_per_day`, 1,000,000 for the seeded member role; `on_exhaust = "warn_only"` only logs, other values refuse the call). Each call reserves its worst case (estimated input plus `max_tokens`) before it is sent and is settled to the provider's reported usage afterwards, so parallel requests cannot overspend a cap; near a cap, `max_tokens` is lowered to what remains. Usage counts prompt-cache reads and writes and reasoning tokens; a response without usage keeps its reservation as the recorded usage. `max_tokens` is also clamped to the model's `max_output_tokens` in `[[llm.models]]` (or, without one, its known output limit for Anthropic, OpenAI and Gemini models) and to `[llm] max_tokens_ceiling`
 - Agents can only use the models in `[[llm.models]]`. A policy's `allowed_models` narrows that further; entries are `provider:model` ids, or `*` for any listed model. For agents without network egress, the gateway also refuses LLM requests that would make the provider fetch a URL (URL-sourced images and documents, provider-side tools, models with built-in web search under common names); restrict `allowed_models` to be sure an agent cannot pick a model with its own web access
@@ -250,6 +251,27 @@ To send a provider's calls to another endpoint that speaks the same API (an inte
 ```toml
 [llm.base_url]
 anthropic = "https://llm-gateway.internal.example"
+```
+
+### Web search
+
+Agents get a `web_search` tool that the gateway runs for them, so it works for agents without network egress and the search key never enters the sandbox. The tool returns titles, URLs, excerpts and publication dates, and agents are told to cite the URLs as plain links. With the default `provider = "auto"`, each agent owner's searches use the first of these they have a key for:
+
+1. a Brave, Tavily or Exa key, added as a credential under `search:brave`, `search:tavily` or `search:exa` (`havn credential add search:brave <key>`);
+2. their OpenRouter LLM key, through OpenRouter's Exa-backed web search (about $0.007 per search on OpenRouter credits), when an `openrouter:` model is listed. The search runs through `[search] openrouter_model`, else the default model if it is an OpenRouter one, else the first listed OpenRouter model;
+3. a SearXNG instance at `searxng_url`, which needs no key (enable its `json` format).
+
+If a backend fails (quota, outage, rejected key), the next one is tried. Without any of them the tool is not offered; `havn doctor` and `GET /search` show which backend is used. Each search is recorded in the audit log as `web.search` with its query, and a user's agents may run `per_user_per_minute` searches per minute together. The policy permission `can_search_web` (on by default) removes the tool. Applies on `havn gateway restart`:
+
+```toml
+[search]
+provider = "auto"            # or off, brave, tavily, exa, openrouter, searxng
+searxng_url = "http://127.0.0.1:8888"
+max_results = 5              # 1 to 10; the agent can ask for a number
+per_user_per_minute = 20     # 0 lifts the limit
+
+[search.base_url]            # optional: brave, tavily, exa
+brave = "https://search-proxy.internal.example"
 ```
 
 Config edits are picked up live: `allowed_origins`, `[llm] default_model` and `[[llm.models]]` apply in place, while every other change (`listen`, `db_path`, paths, `[[bindings]]`, `[[channels]]`, ...) is logged as needing a `havn gateway restart` to apply — the gateway never restarts itself. Per-agent resource limits come from the agent's role policy, not a global config block.

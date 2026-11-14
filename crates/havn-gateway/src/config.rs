@@ -110,6 +110,16 @@ pub struct GatewayConfig {
     /// ```
     #[serde(default)]
     pub llm: LlmConfig,
+    /// Backend of the `web_search` tool.
+    ///
+    /// TOML form:
+    /// ```toml
+    /// [search]
+    /// provider = "auto"   # or off, openrouter, brave, tavily, exa, searxng
+    /// searxng_url = "http://127.0.0.1:8888"
+    /// ```
+    #[serde(default)]
+    pub search: SearchConfig,
     /// Channel-adapter account configuration (spec §3.4). Keyed by
     /// channel id ("telegram", "slack", …); each value lists the
     /// operator-controlled accounts (bot identities) on that channel.
@@ -325,6 +335,65 @@ impl LlmConfig {
 
 pub const DEFAULT_MAX_TOKENS_CEILING: u32 = 128_000;
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct SearchConfig {
+    /// `auto` picks, for each agent owner, the first of `brave`, `tavily`
+    /// and `exa` they have a `search:<provider>` key for, then `openrouter`
+    /// with their OpenRouter LLM key, then `searxng` when `searxng_url` is
+    /// set. A named provider is the only one used; `off` removes the tool.
+    pub provider: String,
+    /// A SearXNG instance with the JSON format enabled. No key needed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub searxng_url: Option<String>,
+    /// Model the `openrouter` backend runs the search through. It only
+    /// carries the query, so the cheapest model will do. Defaults to the
+    /// default model when that is an OpenRouter one, else the first listed
+    /// OpenRouter model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openrouter_model: Option<String>,
+    /// Results returned when the agent does not ask for a number; at most
+    /// [`MAX_SEARCH_RESULTS`].
+    pub max_results: u32,
+    /// Searches one user's agents may run per minute, together; 0 lifts
+    /// the limit.
+    pub per_user_per_minute: u32,
+    /// API base URL per backend (`brave`, `tavily`, `exa`) in place of the
+    /// public one. `openrouter` uses `[llm.base_url]`.
+    pub base_url: std::collections::BTreeMap<String, String>,
+}
+
+pub const MAX_SEARCH_RESULTS: u32 = 10;
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            provider: "auto".into(),
+            searxng_url: None,
+            openrouter_model: None,
+            max_results: 5,
+            per_user_per_minute: 20,
+            base_url: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// `url` in normalized form without a trailing slash, or `None` unless it
+/// is an http(s) URL without credentials, query or fragment.
+fn normalized_base_url(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()
+        .filter(|u| {
+            matches!(u.scheme(), "http" | "https")
+                && u.has_host()
+                && u.username().is_empty()
+                && u.password().is_none()
+                && u.query().is_none()
+                && u.fragment().is_none()
+        })
+        .map(|u| u.as_str().trim_end_matches('/').to_string())
+}
+
 /// True for a plain-`http` URL to a host other than this one: whatever is
 /// sent there, API keys included, crosses the network unencrypted.
 #[must_use]
@@ -383,6 +452,7 @@ impl Default for GatewayConfig {
             seccomp: SeccompConfig::default(),
             network: NetworkConfig::default(),
             llm: LlmConfig::default(),
+            search: SearchConfig::default(),
             channels: std::collections::BTreeMap::new(),
             bindings: Vec::new(),
         }
@@ -480,6 +550,7 @@ impl GatewayConfig {
         let mut parsed: Self = toml::from_str(&raw)?;
         parsed.validate_channel_ids()?;
         parsed.validate_llm()?;
+        parsed.validate_search()?;
         Ok(parsed)
     }
 
@@ -493,23 +564,59 @@ impl GatewayConfig {
             if !crate::llm_proxy::is_provider(provider) {
                 anyhow::bail!("[llm.base_url] names an unknown provider {provider:?}");
             }
-            let parsed = reqwest::Url::parse(url).ok().filter(|u| {
-                matches!(u.scheme(), "http" | "https")
-                    && u.has_host()
-                    && u.username().is_empty()
-                    && u.password().is_none()
-                    && u.query().is_none()
-                    && u.fragment().is_none()
-            });
-            let Some(parsed) = parsed else {
+            let Some(normalized) = normalized_base_url(url) else {
                 anyhow::bail!(
                     "[llm.base_url] {provider} = {url:?} must be an http(s) URL without \
                      credentials, query or fragment"
                 );
             };
-            *url = parsed.as_str().trim_end_matches('/').to_string();
+            *url = normalized;
         }
         self.llm.catalog().validate()
+    }
+
+    /// Also stores the search URLs in normalized form.
+    fn validate_search(&mut self) -> anyhow::Result<()> {
+        let search = &mut self.search;
+        let provider = search.provider.as_str();
+        if !matches!(provider, "auto" | "off")
+            && crate::web_search::Backend::named(provider).is_none()
+        {
+            anyhow::bail!(
+                "[search] provider = {provider:?} is not one of auto, off, openrouter, brave, \
+                 tavily, exa, searxng"
+            );
+        }
+        if provider == "searxng" && search.searxng_url.is_none() {
+            anyhow::bail!("[search] provider = \"searxng\" needs searxng_url");
+        }
+        if !(1..=MAX_SEARCH_RESULTS).contains(&search.max_results) {
+            anyhow::bail!("[search] max_results must be between 1 and {MAX_SEARCH_RESULTS}");
+        }
+        if let Some(url) = &mut search.searxng_url {
+            let Some(normalized) = normalized_base_url(url) else {
+                anyhow::bail!(
+                    "[search] searxng_url = {url:?} must be an http(s) URL without credentials, \
+                     query or fragment"
+                );
+            };
+            *url = normalized;
+        }
+        for (backend, url) in &mut search.base_url {
+            if !matches!(backend.as_str(), "brave" | "tavily" | "exa") {
+                anyhow::bail!(
+                    "[search.base_url] names {backend:?}; only brave, tavily and exa take one"
+                );
+            }
+            let Some(normalized) = normalized_base_url(url) else {
+                anyhow::bail!(
+                    "[search.base_url] {backend} = {url:?} must be an http(s) URL without \
+                     credentials, query or fragment"
+                );
+            };
+            *url = normalized;
+        }
+        Ok(())
     }
 
     /// Reject `|` (the `channel_id_codec` separator) in any channel
@@ -958,6 +1065,41 @@ mod tests {
             "stored without the trailing slash"
         );
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn search_config_is_checked_and_normalized() {
+        let defaults = GatewayConfig::default().search;
+        assert_eq!(defaults.provider, "auto");
+        assert_eq!(defaults.max_results, 5);
+        let p = write_tmp_config(
+            "[search]\nprovider = \"searxng\"\nsearxng_url = \"http://127.0.0.1:8888/\"\n\
+             [search.base_url]\nbrave = \"https://search.example/\"\n",
+        );
+        let cfg = GatewayConfig::load_from(&p).expect("load");
+        assert_eq!(
+            cfg.search.searxng_url.as_deref(),
+            Some("http://127.0.0.1:8888")
+        );
+        assert_eq!(
+            cfg.search.base_url.get("brave").map(String::as_str),
+            Some("https://search.example")
+        );
+        let _ = std::fs::remove_file(&p);
+        for bad in [
+            "[search]\nprovider = \"google\"\n",
+            "[search]\nprovider = \"searxng\"\n",
+            "[search]\nmax_results = 0\n",
+            "[search]\nmax_results = 11\n",
+            "[search]\nsearxng_url = \"ftp://searx.example\"\n",
+            "[search.base_url]\nopenrouter = \"https://openrouter.example\"\n",
+            "[search.base_url]\nexa = \"https://user:pw@exa.example\"\n",
+        ] {
+            let p = write_tmp_config(bad);
+            let msg = format!("{:#}", GatewayConfig::load_from(&p).expect_err(bad));
+            assert!(msg.contains("[search"), "{msg}");
+            let _ = std::fs::remove_file(&p);
+        }
     }
 
     #[test]
