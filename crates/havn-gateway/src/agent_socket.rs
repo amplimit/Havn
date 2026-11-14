@@ -176,7 +176,7 @@ pub async fn run_listener(socket_path: &Path, ctx: AgentSocketCtx) -> anyhow::Re
             .with_context(|| format!("opening agent socket {} to agents", socket_path.display()))?;
         if other_users_reach(socket_path) {
             warn!(
-                dir = %dir.display(),
+                path = %socket_path.display(),
                 "other users can reach the agent socket; the gateway closes their connections, \
                  but a directory only root can enter keeps them away"
             );
