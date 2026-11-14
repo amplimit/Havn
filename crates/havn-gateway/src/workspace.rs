@@ -37,18 +37,20 @@ const BOOTSTRAP_FILES: &[&str] = &["SOUL.md", "USER.md", "HEARTBEAT.md"];
 /// Create the workspace directory and all bootstrap files if they don't already exist.
 /// Idempotent — safe to call on an existing workspace.
 pub async fn ensure(workspace_dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
     tokio::fs::create_dir_all(workspace_dir).await?;
+    // Only the gateway goes through the agent's directory: no other host
+    // user reaches the workspace, or runs a setuid file an agent left in
+    // it.
+    if let Some(agent_dir) = workspace_dir.parent() {
+        tokio::fs::set_permissions(agent_dir, std::fs::Permissions::from_mode(0o700)).await?;
+    }
     let workspace_dir = workspace_dir.to_path_buf();
     // The workspace is agent-writable: create missing entries without
     // following anything the agent may have put there.
     tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         let ws = crate::agent_files::WorkspaceDir::open(&workspace_dir)?;
-        // mkdir does not follow a symlink in its last component; an
-        // existing entry of any kind is left alone.
-        match std::fs::create_dir(workspace_dir.join("skills")) {
-            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
-            _ => {}
-        }
+        ws.create_subdir_if_missing("skills")?;
         ws.create_if_missing("README.md", README)?;
         for name in BOOTSTRAP_FILES {
             ws.create_if_missing(name, "")?;
@@ -75,6 +77,19 @@ mod tests {
         }
         assert!(workspace.join("README.md").exists());
         assert!(workspace.join("skills").is_dir());
+    }
+
+    #[tokio::test]
+    async fn only_the_gateway_enters_the_agent_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir();
+        let workspace = dir.join("agent").join("workspace");
+        ensure(&workspace).await.expect("create");
+        let mode = std::fs::metadata(dir.join("agent"))
+            .expect("agent dir")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[tokio::test]

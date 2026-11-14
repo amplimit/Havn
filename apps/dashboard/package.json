@@ -1,6 +1,6 @@
 {
   "name": "havn-dashboard",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": true,
   "license": "Apache-2.0",
   "description": "havn dashboard — agent list, chat, credentials, settings (spec §10).",

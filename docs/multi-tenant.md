@@ -60,7 +60,7 @@ do, and block whatever else tenants must not reach.
 Replace `acme` with the tenant's name:
 
 ```bash
-lxc init ubuntu:24.04 acme -c security.nesting=true -c security.idmap.isolated=true
+lxc init ubuntu:24.04 acme -c security.nesting=true -c security.idmap.isolated=true -c security.idmap.size=1000000
 lxc config device add acme eth0 nic network=lxdbr0 name=eth0 security.port_isolation=true
 lxc start acme
 ```
@@ -70,6 +70,16 @@ lxc start acme
 - `security.idmap.isolated=true` gives the tenant its own range of host uids.
   Without it, all containers map to the same host uids, so a process that
   escaped one container would own the files of the others.
+- `security.idmap.size=1000000` makes that range a million ids instead of
+  65536. Each agent runs as a uid of its own from the upper half of the ids
+  above 65535 the container maps; in a container with only 65536 agents do
+  not start. LXD's default allocation of a billion host ids holds about a
+  thousand such tenants. A tenant created without it gets it with
+  `lxc config set acme security.idmap.size=1000000` and a restart, during
+  which LXD shifts the container's files to the new range.
+  The gateway records the agents' range in the container's `/etc/subuid` and
+  `/etc/subgid` as `havn-agents`, so `useradd` never gives a user of the
+  container subordinate ids an agent runs as.
 - `security.port_isolation=true` stops direct traffic between this container
   and the other isolated containers on the bridge. It only blocks traffic
   between two isolated ports, so set it on **every** tenant: a tenant without
@@ -81,7 +91,8 @@ Then open a shell in the container (`lxc exec acme -- bash`) and follow
 with a passphrase (`HAVN_AGE_KEY`) and LLM credentials of the tenant's own.
 `havn setup` may report that the nested user-namespace check failed; that only
 matters for capability packs whose workload nests user namespaces, such as
-Chromium-based browser packs.
+Chromium-based browser packs, which also need
+`[seccomp] allow_extra = ["user_namespaces"]` in the gateway config.
 
 The gateway and the dashboard listen on 127.0.0.1 inside the container, so
 neither is reachable from outside the container by default.
@@ -123,7 +134,7 @@ workspaces.
   cover. Drop forwarded traffic from `lxdbr0` back to `lxdbr0` in the host
   firewall.
 - **Isolation by default.** Setting the options on the default profile
-  (`lxc profile set default security.nesting=true security.idmap.isolated=true`
+  (`lxc profile set default security.nesting=true security.idmap.isolated=true security.idmap.size=1000000`
   and `lxc profile device set default eth0 security.port_isolation=true`)
   keeps a tenant created without them from being left open. A tenant created
   with the `lxc config device add ... eth0` line above has its own `eth0`,
