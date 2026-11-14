@@ -26,10 +26,15 @@
 //!
 //! The seccomp filter in [`crate::seccomp`] additionally restricts the
 //! _syscall surface_ regardless of which paths the agent can see.
+//!
+//! Every process a tool starts runs in a Landlock domain of its own nested
+//! under the runtime's ([`create_tool_domain`], [`confine_tool`]).
 
 #![cfg(target_os = "linux")]
 
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use landlock::{
     ABI, Access as _, AccessFs, BitFlags, PathBeneath, PathFd, Ruleset, RulesetAttr,
@@ -222,6 +227,78 @@ fn rebuild_or_die() -> CreatedRuleset {
     panic!("landlock ruleset became unrecoverable after add_rule failure");
 }
 
+/// Ruleset of the Landlock domain tool processes run in, once
+/// [`create_tool_domain`] has made it.
+static TOOL_DOMAIN: OnceLock<OwnedFd> = OnceLock::new();
+
+/// `LANDLOCK_ACCESS_FS_MAKE_BLOCK`.
+const ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
+
+/// The first field of `struct landlock_ruleset_attr`, all a Landlock ABI 1
+/// kernel reads.
+#[repr(C)]
+struct ToolRulesetAttr {
+    handled_access_fs: u64,
+}
+
+/// Create the ruleset of the domain every process a tool starts runs in,
+/// nested under the runtime's. Landlock lets a process ptrace another,
+/// which reading its `/proc/<pid>/environ`, `mem`, `fd/` or `cwd` takes,
+/// only when that one is in the same domain or one nested under it. MCP
+/// servers stay in the runtime's domain, so a tool, though it runs as the
+/// same uid, cannot read the secrets the operator passed to them. The
+/// ruleset handles only creating block devices, which a process without
+/// capabilities cannot do anyway, and allows it nowhere.
+///
+/// Fails with `ENOSYS` or `EOPNOTSUPP` on a kernel without Landlock.
+pub fn create_tool_domain() -> std::io::Result<()> {
+    let attr = ToolRulesetAttr {
+        handled_access_fs: ACCESS_FS_MAKE_BLOCK,
+    };
+    // SAFETY: a valid attribute struct of the size passed; no flags.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &raw const attr,
+            std::mem::size_of::<ToolRulesetAttr>(),
+            0u32,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = libc::c_int::try_from(fd).map_err(std::io::Error::other)?;
+    // SAFETY: the kernel just returned this descriptor (close-on-exec), and
+    // nothing else owns it.
+    let ruleset = unsafe { OwnedFd::from_raw_fd(fd) };
+    // A second call keeps the first ruleset; they are the same.
+    let _ = TOOL_DOMAIN.set(ruleset);
+    Ok(())
+}
+
+/// Have the process `command` starts enter the tools' domain before it
+/// execs, once [`create_tool_domain`] has made it; the spawn fails if it
+/// cannot. Sets `no_new_privs`, which Landlock requires and the runtime's
+/// seccomp filter has already set.
+pub fn confine_tool(command: &mut tokio::process::Command) {
+    let Some(ruleset) = TOOL_DOMAIN.get() else {
+        return;
+    };
+    let fd = ruleset.as_raw_fd();
+    // SAFETY: the hook makes two raw syscalls with integer arguments, both
+    // async-signal-safe, on a descriptor that lives as long as the process.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                || libc::syscall(libc::SYS_landlock_restrict_self, fd, 0u32) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +314,39 @@ mod tests {
                 "SYSTEM_READ_PATHS missing required {required}"
             );
         }
+    }
+
+    /// A tool's process cannot read the environment of a process outside
+    /// its domain, such as an MCP server, though both run as this uid.
+    #[tokio::test]
+    async fn tools_cannot_read_the_environment_of_processes_outside_their_domain() {
+        match create_tool_domain() {
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EOPNOTSUPP)) => {
+                return;
+            }
+            other => other.expect("tool domain"),
+        }
+        let mut server = tokio::process::Command::new("sleep")
+            .arg("30")
+            .env("MCP_SECRET", "s3cret")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("sleep");
+        let environ = format!("/proc/{}/environ", server.id().expect("pid"));
+        let read = |confined: bool| {
+            let mut cmd = tokio::process::Command::new("cat");
+            cmd.arg(&environ);
+            if confined {
+                confine_tool(&mut cmd);
+            }
+            cmd.output()
+        };
+        let outside = read(false).await.expect("cat");
+        assert!(String::from_utf8_lossy(&outside.stdout).contains("MCP_SECRET=s3cret"));
+        let tool = read(true).await.expect("cat");
+        assert!(!tool.status.success(), "{tool:?}");
+        assert!(!String::from_utf8_lossy(&tool.stdout).contains("s3cret"));
+        server.kill().await.expect("kill");
     }
 
     #[test]
