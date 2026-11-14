@@ -441,6 +441,9 @@ pub(crate) async fn start_agent(
         workspace::ensure(&workspace)
             .await
             .map_err(|e| not_spawned(ApiError::Internal(format!("workspace: {e}"))))?;
+        let host_id_slot = repo::host_id_slot(&state.db, id)
+            .await
+            .map_err(|e| not_spawned(e.into()))?;
 
         let cfg = AgentSpawnConfig {
             agent_id: id,
@@ -454,6 +457,7 @@ pub(crate) async fn start_agent(
             seccomp_allow_extra: state.seccomp_allow_extra.clone(),
             agent_dns: state.agent_dns.clone(),
             env_passthrough: state.agent_env_passthrough.as_ref().clone(),
+            host_id_slot: Some(host_id_slot),
         };
         let policy =
             policy_resolver::for_session(&state.db, &agent_row, state.trusted_proxies.is_some())

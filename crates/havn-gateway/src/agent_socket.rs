@@ -163,6 +163,15 @@ pub async fn run_listener(socket_path: &Path, ctx: AgentSocketCtx) -> anyhow::Re
 
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("binding agent socket {}", socket_path.display()))?;
+    // Isolated agents run as host ids of their own and need write access
+    // to connect. Their cgroup, not the socket's mode, is what admits
+    // them: a peer outside every agent cgroup is closed at once.
+    if ctx.verify_peer_cgroup {
+        use std::os::unix::fs::PermissionsExt as _;
+        tokio::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o666))
+            .await
+            .with_context(|| format!("opening agent socket {} to agents", socket_path.display()))?;
+    }
     info!(path = %socket_path.display(), "agent socket listening");
 
     let admission = Admission::new(

@@ -11,8 +11,9 @@
 //!   previous gateway run left behind, including the ones gateways before
 //!   #66 put under `/sys/fs/cgroup/havn.slice`.
 //! - **User + mount + network + PID namespaces** — `unshare(CLONE_NEWUSER
-//!   | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWPID)` in `pre_exec`, host UID
-//!   mapped to agent's in-namespace UID 0, mount propagation marked
+//!   | CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWPID)` in `pre_exec`, the
+//!   agent's in-namespace UID 0 mapped to its own unprivileged host uid
+//!   (the gateway's uid when it is not root), mount propagation marked
 //!   `MS_PRIVATE` so the agent's mount changes can't escape, network
 //!   limited to the new namespace's loopback. After unshare, `pre_exec`
 //!   forks: the parent stays in the host PID ns and `_exit`s with the
@@ -76,6 +77,9 @@ pub struct NamespaceSpawner {
     /// systemd's runtime directory, `/run/systemd`; tests point it
     /// elsewhere so they never ask the host's systemd.
     systemd_runtime: PathBuf,
+    /// The host ids agents run as under a root gateway; `None` when the
+    /// gateway's user namespace maps too few.
+    host_ids: Option<HostIdRange>,
 }
 
 #[derive(Debug)]
@@ -103,12 +107,30 @@ impl NamespaceSpawner {
             pool_cidr = %pool.cidr(),
             "NamespaceSpawner cgroup v2 ready"
         );
+        let host_ids = HostIdRange::of_this_process();
+        // SAFETY: geteuid cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            match host_ids {
+                Some(range) => info!(
+                    first = range.base,
+                    count = range.count,
+                    "agents run as host ids of their own"
+                ),
+                None => warn!(
+                    "this user namespace maps too few ids for agents to run as ids of their \
+                     own, so agents will not start: give it at least {} ids above 65535 \
+                     (in an LXD container, raise security.idmap.size)",
+                    2 * HostIdRange::MIN_COUNT
+                ),
+            }
+        }
         Ok(Self {
             cgroup,
             state: Arc::new(Mutex::new(HashMap::new())),
             pool,
             network_ready: false,
             systemd_runtime: PathBuf::from(SYSTEMD_RUNTIME),
+            host_ids,
         })
     }
 
@@ -122,6 +144,7 @@ impl NamespaceSpawner {
             pool: crate::network::AgentSubnetPool::default(),
             network_ready: false,
             systemd_runtime: PathBuf::from(SYSTEMD_RUNTIME),
+            host_ids: Some(HostIdRange::PREFERRED),
         }
     }
 
@@ -261,6 +284,7 @@ impl AgentSpawner for NamespaceSpawner {
         // 1. Workspace must exist before exec — the runtime opens agent.db
         //    in it on startup.
         tokio::fs::create_dir_all(&config.workspace_dir).await?;
+        let ids = HostIds::for_agent(config, self.host_ids)?;
 
         // 2. Start from an empty cgroup. A previous instance still tracked
         //    here is stopped; a cgroup left from anything else is cleared.
@@ -279,6 +303,12 @@ impl AgentSpawner for NamespaceSpawner {
                     stale.display()
                 ))
             })?;
+        }
+
+        // The previous instance is gone, so nothing changes the workspace
+        // while it passes to the agent's own ids.
+        if let HostIds::Dedicated(id) = ids {
+            hand_over_workspace(&config.workspace_dir, id).await?;
         }
 
         // 3. Create the cgroup with policy limits BEFORE spawning so we
@@ -407,16 +437,11 @@ impl AgentSpawner for NamespaceSpawner {
         //   - writes `0` to the agent cgroup's `cgroup.procs` via
         //     [`crate::ns_setup::join_cgroup`] (raw libc I/O, path prepared
         //     before fork),
-        //   - calls `libc::unshare` (async-signal-safe),
-        //   - writes to `/proc/self/{setgroups,uid_map,gid_map}` via
-        //     [`crate::ns_setup::write_user_namespace_maps`] (raw libc I/O,
-        //     no allocator paths),
-        //   - calls `libc::mount` (async-signal-safe).
-        // It does perform a `format!` for the map lines; in practice the
-        // gateway's allocator does not hold cross-thread locks across fork,
-        // so this is sound for our deployment. If we ever hit deadlocks, swap
-        // for stack-buffer formatting and the code in `ns_setup` is the only
-        // file to update.
+        //   - calls `libc::unshare` (async-signal-safe), and has the id
+        //     maps (formatted before fork) written, by itself or by a helper
+        //     it forks ([`crate::ns_setup::unshare_with_host_ids`]),
+        //   - calls `libc::mount`, `setgroups`, `capset` and `prctl`
+        //     (async-signal-safe).
         //
         // Note: PID namespace was unshared above (spec §4.1), but the kernel
         // semantic is "next fork enters the new PID ns" — the calling
@@ -427,9 +452,8 @@ impl AgentSpawner for NamespaceSpawner {
         // Instead `cmd` below is set to exec `havn-init`, which forks
         // inside its own main: one side becomes PID 1 in the new ns and
         // exec's the runtime, the other side waits + `_exit`s.
-        // SAFETY: `getuid` / `getgid` are async-signal-safe and infallible.
-        let host_uid = unsafe { libc::getuid() };
-        let host_gid = unsafe { libc::getgid() };
+        let uid_map = ns_setup::uid_map_line(ids.uid());
+        let gid_map = ns_setup::gid_map_line(ids.gid());
         // havn-init dies with the gateway (and takes the runtime along).
         let gateway_pid = std::process::id().cast_signed();
         // The child joins its cgroup itself, before exec, so havn-init and
@@ -440,16 +464,18 @@ impl AgentSpawner for NamespaceSpawner {
             .map_err(|e| SpawnerError::Spawn(format!("cgroup path contains NUL: {e}")))?;
         // SAFETY: pre_exec runs in the child after fork, before exec; it
         // restricts itself to the contracts spelled out in `ns_setup`.
-        #[allow(
-            clippy::similar_names,
-            reason = "uid/gid is the canonical spelling for these Linux primitives"
-        )]
         unsafe {
             cmd.as_std_mut().pre_exec(move || {
                 ns_setup::leave_terminal_session()?;
                 ns_setup::join_cgroup(&cgroup_procs)?;
-                ns_setup::unshare_namespaces()?;
-                ns_setup::write_user_namespace_maps(host_uid, host_gid)?;
+                if let HostIds::Dedicated(_) = ids {
+                    ns_setup::clear_supplementary_groups()?;
+                    ns_setup::unshare_with_host_ids(uid_map.as_bytes(), gid_map.as_bytes())?;
+                    ns_setup::keep_capabilities_across_exec()?;
+                } else {
+                    ns_setup::unshare_namespaces()?;
+                    ns_setup::write_user_namespace_maps(uid_map.as_bytes(), gid_map.as_bytes())?;
+                }
                 ns_setup::mark_mounts_private()?;
                 // Last, after every credential change, which could clear it.
                 ns_setup::kill_with_parent(Some(gateway_pid))?;
@@ -640,6 +666,184 @@ impl AgentSpawner for NamespaceSpawner {
     }
 }
 
+/// The host ids an agent's uid 0 and gid 0 map to.
+#[derive(Debug, Clone, Copy)]
+enum HostIds {
+    /// The agent's own unprivileged uid and gid, under a root gateway.
+    Dedicated(u32),
+    /// An unprivileged gateway's own ids, the only ones it can map.
+    Gateway { uid: u32, gid: u32 },
+}
+
+impl HostIds {
+    fn for_agent(config: &AgentSpawnConfig, range: Option<HostIdRange>) -> Result<Self> {
+        // SAFETY: geteuid / getegid cannot fail.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        if uid != 0 {
+            return Ok(Self::Gateway { uid, gid });
+        }
+        let slot = config.host_id_slot.ok_or_else(|| {
+            SpawnerError::Spawn(format!(
+                "agent {} has no host id of its own; a root gateway does not run it as root",
+                config.agent_id
+            ))
+        })?;
+        let range = range.ok_or_else(|| {
+            SpawnerError::Spawn(format!(
+                "the gateway's user namespace maps too few ids for agents to run as ids of \
+                 their own: give it at least {} ids above 65535 (in an LXD container, raise \
+                 security.idmap.size)",
+                2 * HostIdRange::MIN_COUNT
+            ))
+        })?;
+        range.id(slot).map(Self::Dedicated).ok_or_else(|| {
+            SpawnerError::Spawn(format!(
+                "agent slot {slot} is past the {} host ids for agents",
+                range.count
+            ))
+        })
+    }
+
+    fn uid(self) -> u32 {
+        match self {
+            Self::Dedicated(id) => id,
+            Self::Gateway { uid, .. } => uid,
+        }
+    }
+
+    fn gid(self) -> u32 {
+        match self {
+            Self::Dedicated(id) => id,
+            Self::Gateway { gid, .. } => gid,
+        }
+    }
+}
+
+/// The host ids agents run as under a root gateway: `count` of them from
+/// `base`, as the gateway's user namespace numbers them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostIdRange {
+    base: u32,
+    count: u32,
+}
+
+impl HostIdRange {
+    /// systemd leaves 0x70000000-0x7FFDFFFF unassigned: clear of the
+    /// subordinate ids `useradd` and LXD hand out from 100000 and 1000000,
+    /// of systemd-nspawn's containers (up to 0x6FFFFFFF) and of systemd's
+    /// foreign range from 0x7FFE0000.
+    const PREFERRED: Self = Self {
+        base: 0x7100_0000,
+        count: 0x7FFE_0000 - 0x7100_0000,
+    };
+    /// Ids below this belong to the system and to regular users.
+    const FIRST_FREE: u64 = 0x1_0000;
+    /// The fewest ids a fallback range may hold.
+    const MIN_COUNT: u32 = 0x1_0000;
+
+    /// The range for the calling process's user namespace, or `None`
+    /// when its maps cannot be read or map too few ids.
+    pub fn of_this_process() -> Option<Self> {
+        let uid_map = std::fs::read_to_string("/proc/self/uid_map").ok()?;
+        let gid_map = std::fs::read_to_string("/proc/self/gid_map").ok()?;
+        Self::within(&uid_map, &gid_map)
+    }
+
+    /// [`Self::PREFERRED`] where both maps hold it whole, as on a host.
+    /// A container maps fewer (LXD: ids 0 to 999999999 by default); there
+    /// agents get the upper half of the largest run of ids above 65535
+    /// that both map, away from the container's users and from the
+    /// subordinate ids its own tools hand out from the bottom.
+    fn within(uid_map: &str, gid_map: &str) -> Option<Self> {
+        let uids = map_extents(uid_map);
+        let gids = map_extents(gid_map);
+        let both: Vec<(u64, u64)> = uids
+            .iter()
+            .flat_map(|&(ulo, uhi)| {
+                gids.iter().filter_map(move |&(glo, ghi)| {
+                    let (lo, hi) = (ulo.max(glo), uhi.min(ghi));
+                    (lo < hi).then_some((lo, hi))
+                })
+            })
+            .collect();
+        let preferred = (
+            u64::from(Self::PREFERRED.base),
+            u64::from(Self::PREFERRED.base) + u64::from(Self::PREFERRED.count),
+        );
+        if both
+            .iter()
+            .any(|&(lo, hi)| lo <= preferred.0 && preferred.1 <= hi)
+        {
+            return Some(Self::PREFERRED);
+        }
+        let (lo, hi) = both
+            .into_iter()
+            .map(|(lo, hi)| (lo.max(Self::FIRST_FREE), hi))
+            .filter(|(lo, hi)| lo < hi)
+            .max_by_key(|(lo, hi)| hi - lo)?;
+        let base = lo + (hi - lo) / 2;
+        let count = u32::try_from(hi - base).ok()?;
+        (count >= Self::MIN_COUNT).then_some(Self {
+            base: u32::try_from(base).ok()?,
+            count,
+        })
+    }
+
+    fn id(self, slot: u32) -> Option<u32> {
+        (slot < self.count).then(|| self.base + slot)
+    }
+}
+
+/// The `[first, end)` runs of ids, as the reading namespace numbers them,
+/// that a `/proc/<pid>/uid_map` or `gid_map` maps.
+fn map_extents(map: &str) -> Vec<(u64, u64)> {
+    map.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace().map(str::parse::<u64>);
+            let first = fields.next()?.ok()?;
+            fields.next()?.ok()?;
+            let count = fields.next()?.ok()?;
+            Some((first, first + count))
+        })
+        .collect()
+}
+
+/// Give the workspace to the agent's own host ids. A workspace that
+/// already has them is left alone; one that does not, created just now or
+/// by a gateway before 0.1.7 (whose agents ran as host root), is chowned
+/// whole without following symlinks. The agent could only hard-link files
+/// inside its workspace bind, so every inode there is its own.
+async fn hand_over_workspace(workspace: &Path, id: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = tokio::fs::symlink_metadata(workspace).await?;
+    if !meta.is_dir() {
+        return Err(SpawnerError::Spawn(format!(
+            "workspace {} is not a directory",
+            workspace.display()
+        )));
+    }
+    if meta.uid() == id && meta.gid() == id {
+        return Ok(());
+    }
+    let chown = crate::network::resolve_tool("chown")
+        .map_err(|e| SpawnerError::Spawn(format!("cannot hand the workspace over: {e}")))?;
+    let out = Command::new(chown)
+        .args(["-R", "-P", "-h", &format!("{id}:{id}"), "--"])
+        .arg(workspace)
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(SpawnerError::Spawn(format!(
+            "chown of workspace {} to {id}:{id} failed: {}",
+            workspace.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    info!(workspace = %workspace.display(), host_id = id, "workspace handed over to the agent's host ids");
+    Ok(())
+}
+
 fn map_cgroup_err(e: &CgroupError) -> SpawnerError {
     SpawnerError::IsolationUnavailable(e.to_string())
 }
@@ -654,6 +858,37 @@ mod tests {
 
     fn fake_cgroup_root() -> PathBuf {
         fake_root(ALL_CONTROLLERS, ALL_CONTROLLERS)
+    }
+
+    #[test]
+    fn agents_get_the_preferred_ids_where_the_namespace_maps_them() {
+        let host = "         0          0 4294967295\n";
+        assert_eq!(
+            HostIdRange::within(host, host),
+            Some(HostIdRange::PREFERRED)
+        );
+        let range = HostIdRange::within(host, host).expect("range");
+        assert_eq!(range.id(0), Some(0x7100_0000));
+        assert_eq!(range.id(range.count), None);
+    }
+
+    #[test]
+    fn in_a_container_agents_get_the_upper_half_of_its_ids() {
+        let lxd = "         0    1000000 1000000000\n";
+        let range = HostIdRange::within(lxd, lxd).expect("range");
+        assert_eq!(range.base, 500_032_768);
+        assert_eq!(u64::from(range.base) + u64::from(range.count), 1_000_000_000);
+        // Ids both maps hold: a gid map ending earlier ends the range.
+        let gids = "         0    1000000 600000000\n";
+        let narrow = HostIdRange::within(lxd, gids).expect("range");
+        assert_eq!(u64::from(narrow.base) + u64::from(narrow.count), 600_000_000);
+    }
+
+    #[test]
+    fn a_namespace_with_few_ids_gives_agents_none() {
+        let small = "         0     100000      65536\n";
+        assert_eq!(HostIdRange::within(small, small), None);
+        assert_eq!(HostIdRange::within("", ""), None);
     }
 
     #[tokio::test]
@@ -684,6 +919,7 @@ mod tests {
             seccomp_allow_extra: Vec::new(),
             agent_dns: Vec::new(),
             env_passthrough: Vec::new(),
+            host_id_slot: Some(0),
         };
         let policy = Policy::default();
 
@@ -727,6 +963,7 @@ mod tests {
             seccomp_allow_extra: Vec::new(),
             agent_dns: Vec::new(),
             env_passthrough: Vec::new(),
+            host_id_slot: Some(0),
         };
         let err = spawner
             .spawn(&cfg, &Policy::default())
