@@ -266,7 +266,8 @@ fn effective_blocklist(allow_extra: &[String]) -> Result<Vec<i64>, SeccompError>
 /// relaxable — even an operator deliberately trying to make a hostile
 /// pack cannot let an agent insert a kernel module. Today the only
 /// motivating case is browser packs needing Chromium's user-namespace
-/// sandbox (`pivot_root`, `userfaultfd`); add new entries only when a
+/// sandbox (`pivot_root`, `userfaultfd`, along with [`USER_NAMESPACES`],
+/// which is not a syscall name); add new entries only when a
 /// concrete pack requires them and the security impact is well
 /// understood.
 const OPERATOR_RELAXABLE_SYSCALLS: &[(&str, i64)] = &[
@@ -499,19 +500,54 @@ mod tests {
         assert_eq!(status.signal(), Some(libc::SIGSYS), "{status:?}");
     }
 
-    /// With the filter in place a new user namespace is refused, by
-    /// `unshare` and by `clone`, while threads and processes still start;
-    /// `user_namespaces` in allow_extra lets it through.
+    /// With the filter in place `unshare` and `clone` asking for a new
+    /// user namespace fail with EPERM and `clone3` with ENOSYS, while
+    /// threads and processes still start; `user_namespaces` in allow_extra
+    /// lets all three through. Each call carries an argument the kernel
+    /// rejects with EINVAL, so only the filter can make it fail otherwise,
+    /// whether or not the host allows user namespaces, and none of them
+    /// creates anything.
     #[test]
     fn new_user_namespaces_are_refused_unless_allowed() {
         const PROBE: &str = "HAVN_SECCOMP_USERNS_PROBE";
         if let Some(mode) = std::env::var_os(PROBE) {
-            let allow: Vec<String> = if mode == "allow" {
+            let allowed = mode == "allow";
+            let allow: Vec<String> = if allowed {
                 vec![USER_NAMESPACES.into()]
             } else {
                 Vec::new()
             };
             restrict_syscalls(&allow).expect("install filter");
+            let errno = |rc: i64| {
+                assert_eq!(rc, -1);
+                std::io::Error::last_os_error().raw_os_error()
+            };
+            // CLONE_SETTLS is not an unshare flag.
+            // SAFETY: rejected by the kernel or the filter before any effect.
+            let unshare = errno(i64::from(unsafe {
+                libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_SETTLS)
+            }));
+            // CLONE_THREAD needs CLONE_SIGHAND.
+            // SAFETY: as above; no child is created.
+            let clone = errno(unsafe {
+                libc::syscall(
+                    libc::SYS_clone,
+                    libc::CLONE_NEWUSER | libc::CLONE_THREAD,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            });
+            // A zero-sized clone_args.
+            // SAFETY: as above.
+            let clone3 = errno(unsafe { libc::syscall(SYS_CLONE3, std::ptr::null::<u8>(), 0) });
+            let expected = if allowed {
+                [Some(libc::EINVAL); 3]
+            } else {
+                [Some(libc::EPERM), Some(libc::EPERM), Some(libc::ENOSYS)]
+            };
+            assert_eq!([unshare, clone, clone3], expected, "unshare, clone, clone3");
             // A thread and a process still start (glibc falls back from
             // clone3 to clone).
             std::thread::spawn(|| ()).join().expect("thread");
@@ -521,45 +557,19 @@ mod tests {
                     .expect("spawn")
                     .success()
             );
-            // In a single-threaded child, as a tool would.
-            let mut child = std::process::Command::new("true");
-            // SAFETY: the hook makes one async-signal-safe call.
-            unsafe {
-                std::os::unix::process::CommandExt::pre_exec(&mut child, || {
-                    if libc::unshare(libc::CLONE_NEWUSER) == 0 {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::last_os_error())
-                    }
-                });
-            }
-            let code = match child.status() {
-                Ok(status) if status.success() => 10,
-                Err(e) if e.raw_os_error() == Some(libc::EPERM) => 20,
-                _ => 30,
-            };
-            std::process::exit(code);
+            std::process::exit(0);
         }
-        let run = |mode: &str| {
-            std::process::Command::new(std::env::current_exe().expect("test binary"))
+        for mode in ["deny", "allow"] {
+            let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
                 .args([
                     "--exact",
                     "seccomp::tests::new_user_namespaces_are_refused_unless_allowed",
                 ])
                 .env(PROBE, mode)
                 .status()
-                .expect("run probe")
-                .code()
-        };
-        assert_eq!(
-            run("deny"),
-            Some(20),
-            "unshare(CLONE_NEWUSER) must fail with EPERM"
-        );
-        // Where the host itself refuses unprivileged user namespaces the
-        // allowed case fails too; only a refusal by seccomp matters here.
-        let allowed = run("allow");
-        assert!(matches!(allowed, Some(10 | 20 | 30)), "{allowed:?}");
+                .expect("run probe");
+            assert!(status.success(), "{mode}: {status:?}");
+        }
     }
 
     #[test]

@@ -88,7 +88,7 @@ pub struct GatewayConfig {
     /// TOML form:
     /// ```toml
     /// [seccomp]
-    /// allow_extra = ["pivot_root", "userfaultfd"]
+    /// allow_extra = ["pivot_root", "userfaultfd", "user_namespaces"]
     /// ```
     #[serde(default)]
     pub seccomp: SeccompConfig,
