@@ -163,7 +163,7 @@ pub unsafe fn clear_supplementary_groups() -> io::Result<()> {
     Ok(())
 }
 
-/// Unshare [`NAMESPACE_FLAGS`] and map uid 0 and gid 0 of the new user
+/// Unshare the namespaces [`unshare_namespaces`] does and map uid 0 and gid 0 of the new user
 /// namespace to the host ids in `uid_map` and `gid_map` ([`uid_map_line`]
 /// and [`gid_map_line`]). A process inside the namespace may map only its
 /// own ids, so a helper forked first, which stays outside with the

@@ -877,11 +877,17 @@ mod tests {
         let lxd = "         0    1000000 1000000000\n";
         let range = HostIdRange::within(lxd, lxd).expect("range");
         assert_eq!(range.base, 500_032_768);
-        assert_eq!(u64::from(range.base) + u64::from(range.count), 1_000_000_000);
+        assert_eq!(
+            u64::from(range.base) + u64::from(range.count),
+            1_000_000_000
+        );
         // Ids both maps hold: a gid map ending earlier ends the range.
         let gids = "         0    1000000 600000000\n";
         let narrow = HostIdRange::within(lxd, gids).expect("range");
-        assert_eq!(u64::from(narrow.base) + u64::from(narrow.count), 600_000_000);
+        assert_eq!(
+            u64::from(narrow.base) + u64::from(narrow.count),
+            600_000_000
+        );
     }
 
     #[test]

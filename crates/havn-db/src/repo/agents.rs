@@ -276,10 +276,12 @@ pub async fn patch(
 /// assigned on first use. A slot is never given to another agent, even
 /// after this one is deleted.
 pub async fn host_id_slot(pool: &SqlitePool, id: AgentId) -> Result<u32> {
-    sqlx::query("INSERT INTO agent_host_ids (agent_id) VALUES (?1) ON CONFLICT (agent_id) DO NOTHING")
-        .bind(id.to_string())
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO agent_host_ids (agent_id) VALUES (?1) ON CONFLICT (agent_id) DO NOTHING",
+    )
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
     let (slot,): (i64,) = sqlx::query_as("SELECT slot FROM agent_host_ids WHERE agent_id = ?1")
         .bind(id.to_string())
         .fetch_one(pool)
