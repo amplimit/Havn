@@ -542,7 +542,7 @@ async fn write_report(workspace: &Path, report: &CuratorReport) -> anyhow::Resul
 }
 
 /// Concatenate `text` content blocks from an Anthropic Messages API response.
-fn extract_text(provider_response: &serde_json::Value) -> Option<String> {
+pub(crate) fn extract_text(provider_response: &serde_json::Value) -> Option<String> {
     let content = provider_response.get("content")?.as_array()?;
     let mut out = String::new();
     for block in content {

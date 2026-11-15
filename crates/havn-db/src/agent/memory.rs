@@ -524,6 +524,18 @@ pub async fn get(pool: &SqlitePool, key: &str) -> Result<Option<Entry>> {
     fetch_one(pool, "WHERE key = ?1 AND archived_at IS NULL", &[key]).await
 }
 
+/// Whether `key` holds an entry or ever did: active, replaced, forgotten
+/// or expired (their keys carry an `@...` suffix).
+pub async fn key_known(pool: &SqlitePool, key: &str) -> Result<bool> {
+    let found: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM memory WHERE key = ?1 OR substr(key, 1, length(?1) + 1) = ?1 || '@' LIMIT 1",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(found.is_some())
+}
+
 /// Audit helper: list every archived row that ever held this key (the
 /// dashboard's "what did you used to think" view). Walks the
 /// `@archived:` / `@reactivated:` suffixes via prefix LIKE.
@@ -1249,6 +1261,25 @@ mod tests {
         let (old_key, old_archived) = archived.expect("old row exists");
         assert!(old_key.starts_with("user.employer@archived:"));
         assert!(old_archived.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_key_is_still_known() {
+        let pool = connect_in_memory().await.expect("connect");
+        let entry = NewEntry {
+            key: "user.address",
+            value: "1 Lake Road",
+            kind: Kind::Identity,
+            source: Source::UserTold,
+            ttl_days: None,
+        };
+        assert!(!key_known(&pool, "user.address").await.expect("known"));
+        remember(&pool, entry).await.expect("save");
+        assert!(key_known(&pool, "user.address").await.expect("known"));
+        assert!(forget(&pool, "user.address").await.expect("forget"));
+        assert!(key_known(&pool, "user.address").await.expect("known"));
+        assert!(!key_known(&pool, "user.addr").await.expect("known"));
+        assert!(!key_known(&pool, "user").await.expect("known"));
     }
 
     #[tokio::test]
