@@ -129,8 +129,9 @@ pub struct Supervisor {
     limits: LivenessLimits,
     history: Arc<Mutex<HashMap<AgentId, History>>>,
     /// Why each agent's last run ended, when it said: what its process
-    /// wrote to stderr last, with the instance's generation (0 for a
-    /// start that spawned nothing).
+    /// wrote to stderr last (or why it could not be spawned), with the
+    /// latest instance generation that noted anything, empty lines
+    /// included, so an older instance's late note cannot come back.
     last_stderr: Arc<Mutex<HashMap<AgentId, (u64, Vec<String>)>>>,
     shutting_down: Arc<AtomicBool>,
 }
@@ -186,19 +187,26 @@ impl Supervisor {
         if last.get(&id).is_some_and(|(newer, _)| *newer > generation) {
             return;
         }
-        if stderr.is_empty() {
-            last.remove(&id);
-        } else {
-            last.insert(id, (generation, stderr.to_vec()));
-        }
+        last.insert(id, (generation, stderr.to_vec()));
+    }
+
+    /// Record why a start of agent `id` spawned no process: there is no
+    /// instance, so it replaces whatever an earlier one wrote.
+    async fn note_spawn_failure(&self, id: AgentId, reason: String) {
+        let mut last = self.last_stderr.lock().await;
+        let generation = last.get(&id).map_or(0, |(generation, _)| *generation);
+        last.insert(id, (generation, vec![reason]));
     }
 
     /// Drop what instance `generation` of agent `id` wrote: it was
-    /// stopped, so it says nothing about the agent.
+    /// stopped, or found unresponsive and recovered without its exit, so
+    /// its lines are not why the agent is down.
     async fn drop_stderr(&self, id: AgentId, generation: u64) {
         let mut last = self.last_stderr.lock().await;
-        if last.get(&id).is_some_and(|(noted, _)| *noted == generation) {
-            last.remove(&id);
+        if let Some((noted, lines)) = last.get_mut(&id)
+            && *noted == generation
+        {
+            lines.clear();
         }
     }
 
@@ -425,7 +433,7 @@ fn restart(state: AppState, owner: UserId, id: AgentId, ran_for: Duration) {
                     // What giving up reports, rather than an earlier run's.
                     state
                         .supervisor
-                        .note_stderr(id, 0, &[format!("could not be started: {}", e.error)])
+                        .note_spawn_failure(id, format!("could not be started: {}", e.error))
                         .await;
                     ran_for = Duration::ZERO;
                 }
@@ -1198,6 +1206,31 @@ mod tests {
         assert_eq!(state.supervisor.last_stderr(id).await, later);
         state.supervisor.drop_stderr(id, 5).await;
         assert!(state.supervisor.last_stderr(id).await.is_empty());
+        // An empty exit still keeps an older instance's late note out.
+        state.supervisor.note_stderr(id, 6, &[]).await;
+        state.supervisor.note_stderr(id, 5, &["late".into()]).await;
+        assert!(state.supervisor.last_stderr(id).await.is_empty());
+        // A start that spawns nothing replaces a run's lines.
+        state
+            .supervisor
+            .note_stderr(id, 7, &["crashed".into()])
+            .await;
+        state
+            .supervisor
+            .note_spawn_failure(id, "could not be started: no binary".into())
+            .await;
+        assert_eq!(
+            state.supervisor.last_stderr(id).await,
+            vec!["could not be started: no binary".to_string()]
+        );
+        state
+            .supervisor
+            .note_stderr(id, 8, &["next run".into()])
+            .await;
+        assert_eq!(
+            state.supervisor.last_stderr(id).await,
+            vec!["next run".to_string()]
+        );
     }
 
     #[tokio::test]

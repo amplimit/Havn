@@ -520,6 +520,9 @@ async fn relay_stderr(
         }
         tail.push_back(text);
     }
+    if skipped > 0 {
+        tracing::warn!(agent_id = %agent_id, skipped, "agent stderr: lines not logged");
+    }
 }
 
 /// Read the next line of `reader` into `line`, at most
