@@ -119,6 +119,8 @@ pub struct CronJob {
     pub enabled_toolsets: Vec<String>,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
+    /// The chat it was created in, which its results go to.
+    pub chat: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +133,7 @@ pub struct NewCronJob<'a> {
     pub wake_check: Option<&'a str>,
     pub deliver: &'a str,
     pub enabled_toolsets: &'a [String],
+    pub chat: Option<&'a str>,
 }
 
 pub async fn create(pool: &SqlitePool, new: NewCronJob<'_>) -> Result<CronJob> {
@@ -142,8 +145,8 @@ pub async fn create(pool: &SqlitePool, new: NewCronJob<'_>) -> Result<CronJob> {
         })?;
     sqlx::query(
         "INSERT INTO cron_jobs (id, agent_id, name, prompt, schedule, next_run_at, wake_check, \
-                                deliver, enabled_toolsets) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                deliver, enabled_toolsets, chat) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )
     .bind(id.to_string())
     .bind(new.agent_id.to_string())
@@ -154,6 +157,7 @@ pub async fn create(pool: &SqlitePool, new: NewCronJob<'_>) -> Result<CronJob> {
     .bind(new.wake_check)
     .bind(new.deliver)
     .bind(toolsets)
+    .bind(new.chat)
     .execute(pool)
     .await?;
     find_by_id(pool, id).await?.ok_or(DbError::NotFound)
@@ -168,13 +172,13 @@ pub async fn find_by_id(pool: &SqlitePool, id: CronJobId) -> Result<Option<CronJ
 }
 
 const SELECT_FIELDS_SQL: &str = "SELECT id, agent_id, name, prompt, schedule, next_run_at, \
-                                        wake_check, deliver, enabled_toolsets, enabled, created_at \
+                                        wake_check, deliver, enabled_toolsets, enabled, created_at, chat \
                                  FROM cron_jobs WHERE id = ?1";
 
 pub async fn list_for_agent(pool: &SqlitePool, agent_id: AgentId) -> Result<Vec<CronJob>> {
     let rows: Vec<CronJobRow> = sqlx::query_as::<_, CronJobRow>(
         "SELECT id, agent_id, name, prompt, schedule, next_run_at, wake_check, deliver, \
-                enabled_toolsets, enabled, created_at \
+                enabled_toolsets, enabled, created_at, chat \
          FROM cron_jobs WHERE agent_id = ?1 ORDER BY created_at",
     )
     .bind(agent_id.to_string())
@@ -202,7 +206,7 @@ fn readable(rows: Vec<CronJobRow>) -> Vec<CronJob> {
 pub async fn list_due(pool: &SqlitePool, now: DateTime<Utc>, limit: u32) -> Result<Vec<CronJob>> {
     let rows: Vec<CronJobRow> = sqlx::query_as::<_, CronJobRow>(
         "SELECT id, agent_id, name, prompt, schedule, next_run_at, wake_check, deliver, \
-                enabled_toolsets, enabled, created_at \
+                enabled_toolsets, enabled, created_at, chat \
          FROM cron_jobs \
          WHERE enabled = 1 AND next_run_at <= ?1 \
          ORDER BY next_run_at LIMIT ?2",
@@ -269,6 +273,7 @@ struct CronJobRow {
     enabled_toolsets: String,
     enabled: i32,
     created_at: DateTime<Utc>,
+    chat: Option<String>,
 }
 
 impl TryFrom<CronJobRow> for CronJob {
@@ -291,6 +296,7 @@ impl TryFrom<CronJobRow> for CronJob {
             enabled_toolsets: toolsets,
             enabled: r.enabled != 0,
             created_at: r.created_at,
+            chat: r.chat,
         })
     }
 }
@@ -557,6 +563,7 @@ mod tests {
         let job = create(
             &pool,
             NewCronJob {
+                chat: None,
                 agent_id,
                 name: "morning email",
                 prompt: "summarise unread emails",
@@ -586,6 +593,7 @@ mod tests {
         let due = create(
             &pool,
             NewCronJob {
+                chat: None,
                 agent_id,
                 name: "due",
                 prompt: "p",
@@ -601,6 +609,7 @@ mod tests {
         let _not_yet = create(
             &pool,
             NewCronJob {
+                chat: None,
                 agent_id,
                 name: "later",
                 prompt: "p",
@@ -627,6 +636,7 @@ mod tests {
         let recurring = create(
             &pool,
             NewCronJob {
+                chat: None,
                 agent_id,
                 name: "rec",
                 prompt: "p",
@@ -653,6 +663,7 @@ mod tests {
         let one_shot = create(
             &pool,
             NewCronJob {
+                chat: None,
                 agent_id,
                 name: "one",
                 prompt: "p",
@@ -676,6 +687,7 @@ mod tests {
         let job = create(
             &pool,
             NewCronJob {
+                chat: None,
                 agent_id,
                 name: "n",
                 prompt: "p",

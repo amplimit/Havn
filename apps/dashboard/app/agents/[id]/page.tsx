@@ -111,6 +111,10 @@ export default function ChatPage({
   const [chat, setChat] = useState<string | null>(null);
   const chatIdRef = useRef<string | null>(null);
   const [chats, setChats] = useState<ChatSummary[]>([]);
+  // Replies still due in chats not on screen, kept for when they are.
+  const waitingElsewhere = useRef(new Map<string, number>());
+  // Chats deleted here: what they still send is dropped.
+  const deletedChats = useRef(new Set<string>());
   // The chat list on narrow screens, where it replaces the chat.
   const [showChats, setShowChats] = useState(false);
 
@@ -290,10 +294,15 @@ export default function ChatPage({
             return;
           }
           if (msg.type === "agent_message" && msg.conversation) {
+            if (deletedChats.current.has(msg.conversation)) return;
             void refreshChats();
             const current = chatIdRef.current;
             // A reply in another chat shows there.
-            if (current && msg.conversation !== current) return;
+            if (current && msg.conversation !== current) {
+              const due = waitingElsewhere.current.get(msg.conversation) ?? 0;
+              if (!msg.broadcast && due > 0) waitingElsewhere.current.set(msg.conversation, due - 1);
+              return;
+            }
             if (!current) selectChat(msg.conversation);
           }
           if (msg.type === "agent_message") {
@@ -366,13 +375,19 @@ export default function ChatPage({
     chatRef.current?.stop(chatIdRef.current ?? undefined);
   }
 
-  // Show chat `next`, or a new one: its replies and approvals start over.
+  // Show chat `next`, or a new one. Approvals stay: they are the agent's,
+  // whichever chat asked.
   function openChatById(next: string | null) {
     setShowChats(false);
     if (next !== null && next === chatIdRef.current) return;
-    selectChat(next ?? newChatId());
+    const previous = chatIdRef.current;
+    const target = next ?? newChatId();
+    selectChat(target);
     setBubbles([]);
-    setWaiting(0);
+    setWaiting((n) => {
+      if (previous) waitingElsewhere.current.set(previous, n);
+      return waitingElsewhere.current.get(target) ?? 0;
+    });
   }
 
   async function renameChat(c: ChatSummary) {
@@ -394,6 +409,8 @@ export default function ChatPage({
       pushBubble("system", `error: ${e instanceof Error ? e.message : String(e)}`);
       return;
     }
+    deletedChats.current.add(c.id);
+    waitingElsewhere.current.delete(c.id);
     if (c.id === chatIdRef.current) {
       // The next message starts a new chat.
       selectChat(null);

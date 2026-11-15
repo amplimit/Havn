@@ -880,7 +880,7 @@ async fn oversized_reply(
                     .deliver(
                         agent_id,
                         havn_core::OutboundMessage {
-                            conversation: None,
+                            conversation: msg.conversation,
                             channel_id: msg.channel_id,
                             content: havn_core::MessageContent::Text { text: notice },
                             reply_to: None,
@@ -1484,6 +1484,7 @@ async fn run_schedule(
         agent.owner_id,
         agent_id,
         call.conversation.as_deref(),
+        call.chat.as_deref(),
         &call.input,
     )
     .await;
@@ -2618,6 +2619,7 @@ mod tests {
             name: "web_fetch".into(),
             input: serde_json::json!({"url": url, "prompt": "what is it"}),
             conversation: None,
+            chat: None,
         };
 
         let refused = run_gateway_tool(denied, &call("https://example.com/"), &ctx).await;
@@ -2650,6 +2652,7 @@ mod tests {
             name: name.into(),
             input: serde_json::json!({"query": "havn"}),
             conversation: None,
+            chat: None,
         };
 
         let unknown = run_gateway_tool(agent, &call("shell"), &ctx).await;

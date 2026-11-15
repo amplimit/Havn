@@ -415,16 +415,17 @@ impl WebChatRouter {
     /// silently — the per-tab writer task already handles that path — and
     /// tabs whose queue is full are dropped (see [`Self::offer`]).
     pub async fn broadcast(&self, agent_id: AgentId, msg: OutboundMessage) -> usize {
+        let conversation = msg.conversation;
         let server_msg = match msg.content {
             MessageContent::Text { text } => ServerMessage::AgentMessage {
                 content: text,
                 broadcast: true,
-                conversation: None,
+                conversation,
             },
             other => ServerMessage::AgentMessage {
                 content: format!("(unsupported content variant: {other:?})"),
                 broadcast: true,
-                conversation: None,
+                conversation,
             },
         };
         self.fan_out(agent_id, server_msg).await

@@ -263,6 +263,7 @@ impl CronScheduler {
             run_id: run_id.clone(),
             prompt: job.prompt.clone(),
             enabled_toolsets: job.enabled_toolsets.clone(),
+            chat: job.chat.clone(),
         });
         if let Err(e) = self.registry.send(agent_id, frame).await {
             warn!(%job_id, %agent_id, error = %e, "could not deliver CronTick");
@@ -500,14 +501,14 @@ impl CronScheduler {
         match (&outcome, conversation) {
             (RunOutcome::Success, _) if result.silent => Ok(None),
             (RunOutcome::Success, Some(channel_id)) => Ok(Some(OutboundMessage {
-                conversation: None,
+                conversation: job.chat.clone(),
                 channel_id: channel_id.to_string(),
                 content: text(result.output),
                 reply_to: None,
             })),
             (RunOutcome::Success, None) if job.deliver == "webchat" => {
                 let outbound = OutboundMessage {
-                    conversation: None,
+                    conversation: job.chat.clone(),
                     channel_id: "broadcast".into(),
                     content: text(result.output),
                     reply_to: None,
@@ -527,7 +528,7 @@ impl CronScheduler {
                     .take(200)
                     .collect();
                 let notice = OutboundMessage {
-                    conversation: None,
+                    conversation: job.chat.clone(),
                     channel_id: target.unwrap_or("broadcast").to_string(),
                     content: text(format!(
                         "(The scheduled task \"{}\" failed: {reason}. I will not report it \
@@ -879,6 +880,7 @@ mod tests {
         let job = cron::create(
             pool,
             cron::NewCronJob {
+                chat: None,
                 agent_id: agent.id,
                 name: "j",
                 prompt: "p",

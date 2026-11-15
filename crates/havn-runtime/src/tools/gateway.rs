@@ -95,6 +95,7 @@ impl Tool for GatewayTool {
             name: self.spec.name.clone(),
             input,
             conversation: CONVERSATION.try_with(Clone::clone).ok(),
+            chat: CHAT.try_with(Clone::clone).ok(),
         });
         if self.writer_tx.send(frame).await.is_err() {
             return ToolResult::Error("the gateway connection is closed".into());

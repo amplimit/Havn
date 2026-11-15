@@ -61,6 +61,11 @@ struct ConversationRows {
 }
 
 #[derive(Debug, Deserialize)]
+struct Found {
+    found: bool,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ChatPatch {
     pub title: String,
 }
@@ -153,7 +158,7 @@ pub async fn chat_patch(
     if title.is_empty() {
         return Err(ApiError::BadRequest("title must be non-empty".into()));
     }
-    let _: serde_json::Value = crate::api::agents::agent_data(
+    let renamed: Found = crate::api::agents::agent_data(
         &state,
         user.id,
         agent.id,
@@ -165,6 +170,9 @@ pub async fn chat_patch(
         true,
     )
     .await?;
+    if !renamed.found {
+        return Err(ApiError::NotFound);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -177,7 +185,7 @@ pub async fn chat_delete(
 ) -> Result<StatusCode, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
     let conversation = chat_param(Some(chat))?.unwrap_or_default();
-    let _: serde_json::Value = crate::api::agents::agent_data(
+    let deleted: Found = crate::api::agents::agent_data(
         &state,
         user.id,
         agent.id,
@@ -188,6 +196,9 @@ pub async fn chat_delete(
         true,
     )
     .await?;
+    if !deleted.found {
+        return Err(ApiError::NotFound);
+    }
     crate::audit::record_agent_action(
         &state.db,
         user.id,

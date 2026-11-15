@@ -984,7 +984,7 @@ where
                     Ok(chat) => msg.conversation = Some(chat),
                     Err(e) => {
                         error!(error = %e, "could not find the message's chat");
-                        send_text(&ctx, msg.channel_id, format!("(internal error: {e})"));
+                        send_text(&ctx, msg.channel_id, None, format!("(internal error: {e})"));
                         continue;
                     }
                 }
@@ -999,20 +999,25 @@ where
                     }
                     turns::Admitted::Queued {
                         channel_id,
+                        conversation,
                         channel,
                         ahead,
                     } => {
                         info!(%channel_id, ahead, "message queued behind a running turn");
                         // The dashboard shows queued messages itself.
                         if channel != "webchat" {
-                            send_text(&ctx, channel_id, queued_notice(ahead));
+                            send_text(&ctx, channel_id, conversation, queued_notice(ahead));
                         }
                     }
-                    turns::Admitted::Full { channel_id, .. } => {
+                    turns::Admitted::Full {
+                        channel_id,
+                        conversation,
+                    } => {
                         warn!(%channel_id, "conversation queue full; dropping a message");
                         send_text(
                             &ctx,
                             channel_id,
+                            conversation,
                             format!(
                                 "(Too many messages are waiting ({}); this one was dropped. \
                                  Send it again once I have answered, or /stop.)",
@@ -1028,16 +1033,24 @@ where
                 }
             }
             GatewayToAgent::StopTurn(stop) => {
-                let chat = conversations::existing_chat(
-                    &ctx.pool,
-                    &stop.channel_id,
-                    stop.conversation.as_deref(),
-                )
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| stop.channel_id.clone());
-                if ctx.turns.stop(&chat) {
+                // The chat named, or every chat of the conversation (a
+                // channel's `/stop`, which names none).
+                let chat = match stop.conversation.as_deref() {
+                    Some(_) => conversations::existing_chat(
+                        &ctx.pool,
+                        &stop.channel_id,
+                        stop.conversation.as_deref(),
+                    )
+                    .await
+                    .ok()
+                    .flatten(),
+                    None => None,
+                };
+                let stopped = match chat {
+                    Some(chat) => ctx.turns.stop(&chat),
+                    None => ctx.turns.stop_scope(&stop.channel_id),
+                };
+                if stopped {
                     info!(channel_id = %stop.channel_id, "turn stopped by the user");
                 }
             }
@@ -1116,7 +1129,12 @@ where
                 // Queued messages would wait past the drain limit; tell
                 // their senders instead of losing them quietly.
                 for queued in ctx.turns.take_queued() {
-                    send_text(&ctx, queued.channel_id, RESTART_NOTICE.to_string());
+                    send_text(
+                        &ctx,
+                        queued.channel_id,
+                        queued.conversation,
+                        RESTART_NOTICE.to_string(),
+                    );
                 }
             }
             other => {
@@ -1349,6 +1367,15 @@ async fn handle_cron(tick: CronTick, ctx: Ctx) {
     if let Err(e) = conversations::record(&ctx.pool, &channel_id, Role::Assistant, &turn).await {
         warn!(%job_id, error = %e, "could not persist cron assistant turn");
     }
+    // A task scheduled in a chat keeps its result there, as a reply.
+    if let Some(chat) = &tick.chat
+        && matches!(outcome, CronOutcome::Success)
+        && !is_silent_output(&output)
+        && let Err(e) =
+            conversations::record_in_chat(&ctx.pool, chat, Role::Assistant, &output).await
+    {
+        warn!(%job_id, error = %e, "could not keep the cron result in its chat");
+    }
     let result = CronResult {
         job_id: job_id.clone(),
         run_id: tick.run_id.clone(),
@@ -1491,9 +1518,9 @@ fn queued_notice(ahead: usize) -> String {
     }
 }
 
-fn send_text(ctx: &Ctx, channel_id: String, text: String) {
+fn send_text(ctx: &Ctx, channel_id: String, conversation: Option<String>, text: String) {
     let outbound = OutboundMessage {
-        conversation: None,
+        conversation,
         channel_id,
         content: MessageContent::Text { text },
         reply_to: None,
@@ -1520,17 +1547,32 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     // The chat's history; replies go to `channel_id`.
     let chat = turns::key(&msg);
     // Persist user turn before LLM call so a crash doesn't lose it.
-    if let Err(e) = conversations::record(&ctx.pool, &chat, Role::User, &user_text).await {
-        error!(error = %e, "could not persist user turn");
-        send_text(&ctx, msg.channel_id, format!("(internal error: {e})"));
-        return;
+    match conversations::record_in_chat(&ctx.pool, &chat, Role::User, &user_text).await {
+        Ok(true) => {}
+        // Deleted while the message waited.
+        Ok(false) => return,
+        Err(e) => {
+            error!(error = %e, "could not persist user turn");
+            send_text(
+                &ctx,
+                msg.channel_id,
+                Some(chat),
+                format!("(internal error: {e})"),
+            );
+            return;
+        }
     }
 
     let history = match conversations::recent(&ctx.pool, &chat, HISTORY_WINDOW).await {
         Ok(h) => h,
         Err(e) => {
             error!(error = %e, "could not load conversation history");
-            send_text(&ctx, msg.channel_id, format!("(internal error: {e})"));
+            send_text(
+                &ctx,
+                msg.channel_id,
+                Some(chat),
+                format!("(internal error: {e})"),
+            );
             return;
         }
     };
@@ -1579,8 +1621,11 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
 
     // Persist assistant turn (visible reply only — intermediate tool turns
     // exist only in-memory for this iteration).
-    if let Err(e) = conversations::record(&ctx.pool, &chat, Role::Assistant, &final_text).await {
-        warn!(error = %e, "could not persist assistant turn");
+    match conversations::record_in_chat(&ctx.pool, &chat, Role::Assistant, &final_text).await {
+        Ok(true) => {}
+        // The chat was deleted while it ran: its reply goes nowhere.
+        Ok(false) => return,
+        Err(e) => warn!(error = %e, "could not persist assistant turn"),
     }
 
     let outbound = OutboundMessage {
@@ -1853,28 +1898,23 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                 conversation,
                 title,
             } => {
-                let renamed =
+                let found =
                     conversations::rename_chat(&ctx.pool, &channel_id, &conversation, &title)
                         .await
                         .map_err(|e| e.to_string())?;
-                if renamed {
-                    Ok(serde_json::Value::Null)
-                } else {
-                    Err(format!("no chat {conversation}"))
-                }
+                Ok(serde_json::json!({ "found": found }))
             }
             DataQuery::DeleteChat {
                 channel_id,
                 conversation,
             } => {
-                let deleted = conversations::delete_chat(&ctx.pool, &channel_id, &conversation)
+                let found = conversations::delete_chat(&ctx.pool, &channel_id, &conversation)
                     .await
                     .map_err(|e| e.to_string())?;
-                if deleted {
-                    Ok(serde_json::Value::Null)
-                } else {
-                    Err(format!("no chat {conversation}"))
+                if found {
+                    ctx.turns.discard(&conversation);
                 }
+                Ok(serde_json::json!({ "found": found }))
             }
             DataQuery::LeaveChat { channel_id } => {
                 conversations::leave_active(&ctx.pool, &channel_id)

@@ -792,23 +792,28 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
         return;
     }
     // `/new` starts a new chat with the agent; the old one is kept.
+    // Off the account's read loop: it may start the agent and wait for it.
     if is_command_message(&content, "/new") {
-        let reply = match new_chat(state, agent_id, &encoded_channel_id).await {
-            Ok(()) => NEW_CHAT_MESSAGE,
-            Err(e) => {
-                warn!(channel, %agent_id, error = ?e, "could not start a new chat");
-                NEW_CHAT_FAILED_MESSAGE
-            }
-        };
-        tell_sender(
-            state,
-            channel,
-            &inb.account_id,
-            &inb.sender_id,
-            &inb.channel_message_id,
-            reply,
-        )
-        .await;
+        let state = state.clone();
+        let channel = channel.to_string();
+        tokio::spawn(async move {
+            let reply = match new_chat(&state, agent_id, &encoded_channel_id).await {
+                Ok(()) => NEW_CHAT_MESSAGE,
+                Err(e) => {
+                    warn!(channel, %agent_id, error = ?e, "could not start a new chat");
+                    NEW_CHAT_FAILED_MESSAGE
+                }
+            };
+            tell_sender(
+                &state,
+                &channel,
+                &inb.account_id,
+                &inb.sender_id,
+                &inb.channel_message_id,
+                reply,
+            )
+            .await;
+        });
         return;
     }
     let msg = InboundMessage {

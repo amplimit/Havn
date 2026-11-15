@@ -73,14 +73,17 @@ pub fn spec() -> GatewayToolSpec {
 }
 
 /// Run `schedule` for `agent`, owned by `owner`. `conversation` is where
-/// the call came from; a task created there reports back to it.
+/// the call came from, and `chat` its chat; a task created there reports
+/// back to it.
 pub async fn run(
     db: &SqlitePool,
     owner: UserId,
     agent: AgentId,
     conversation: Option<&str>,
+    chat: Option<&str>,
     input: &Value,
 ) -> Result<String, String> {
+    let chat = chat.filter(|c| !c.is_empty() && c.len() <= MAX_CONVERSATION_BYTES);
     let action = text(input, "action").ok_or("schedule needs an action")?;
     let conversation = conversation.filter(|c| !c.is_empty());
     if let Some(c) = conversation
@@ -96,7 +99,7 @@ pub async fn run(
     let scope = Scope::of(conversation);
     let _change = CHANGES.lock().await;
     match action {
-        "create" => create(db, owner, agent, conversation, input).await,
+        "create" => create(db, owner, agent, conversation, chat, input).await,
         "list" => list(db, owner, agent, &scope).await,
         "pause" | "resume" => {
             let job = own_job(db, agent, &scope, input).await?;
@@ -312,6 +315,7 @@ async fn create(
     owner: UserId,
     agent: AgentId,
     conversation: Option<&str>,
+    chat: Option<&str>,
     input: &Value,
 ) -> Result<String, String> {
     let name = text(input, "name").ok_or("create needs a name")?;
@@ -338,6 +342,7 @@ async fn create(
     let job = cron::create(
         db,
         NewCronJob {
+            chat,
             agent_id: agent,
             name,
             prompt,
@@ -519,6 +524,7 @@ mod tests {
             owner,
             agent,
             HERE,
+            None,
             &create(json!({"name": "news", "every": "daily 08:00"})),
         )
         .await
@@ -529,31 +535,42 @@ mod tests {
         let id = job.id.to_string();
         let act = |action: &str| json!({"action": action, "id": id});
 
-        let listed = run(&db, owner, agent, HERE, &json!({"action": "list"}))
+        let listed = run(&db, owner, agent, HERE, None, &json!({"action": "list"}))
             .await
             .unwrap();
         assert!(
             listed.contains("\"news\"") && listed.contains("next "),
             "{listed}"
         );
-        let hidden = run(&db, owner, agent, ELSEWHERE, &json!({"action": "list"}))
-            .await
-            .unwrap();
+        let hidden = run(
+            &db,
+            owner,
+            agent,
+            ELSEWHERE,
+            None,
+            &json!({"action": "list"}),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             hidden, "No scheduled tasks.",
             "another sender's conversation"
         );
         assert!(
-            run(&db, owner, agent, ELSEWHERE, &act("delete"))
+            run(&db, owner, agent, ELSEWHERE, None, &act("delete"))
                 .await
                 .is_err()
         );
         assert!(
-            run(&db, owner, agent, None, &act("pause")).await.is_err(),
+            run(&db, owner, agent, None, None, &act("pause"))
+                .await
+                .is_err(),
             "a scheduled run cannot change tasks"
         );
 
-        run(&db, owner, agent, HERE, &act("pause")).await.unwrap();
+        run(&db, owner, agent, HERE, None, &act("pause"))
+            .await
+            .unwrap();
         assert!(
             !cron::find_by_id(&db, job.id)
                 .await
@@ -561,8 +578,12 @@ mod tests {
                 .unwrap()
                 .enabled
         );
-        run(&db, owner, agent, HERE, &act("resume")).await.unwrap();
-        run(&db, owner, agent, CHAT, &act("delete")).await.unwrap();
+        run(&db, owner, agent, HERE, None, &act("resume"))
+            .await
+            .unwrap();
+        run(&db, owner, agent, CHAT, None, &act("delete"))
+            .await
+            .unwrap();
         assert!(cron::find_by_id(&db, job.id).await.unwrap().is_none());
     }
 
@@ -580,16 +601,23 @@ mod tests {
             json!({"in_minutes": 2.5}),
         ] {
             assert!(
-                run(&db, owner, agent, CHAT, &create(bad.clone()))
+                run(&db, owner, agent, CHAT, None, &create(bad.clone()))
                     .await
                     .is_err(),
                 "{bad}"
             );
         }
         assert!(
-            run(&db, owner, agent, None, &create(json!({"in_minutes": 30})))
-                .await
-                .is_err(),
+            run(
+                &db,
+                owner,
+                agent,
+                None,
+                None,
+                &create(json!({"in_minutes": 30}))
+            )
+            .await
+            .is_err(),
             "outside a conversation"
         );
         run(
@@ -597,6 +625,7 @@ mod tests {
             owner,
             agent,
             CHAT,
+            None,
             &create(json!({"in_minutes": 30.0})),
         )
         .await
@@ -608,6 +637,7 @@ mod tests {
             owner,
             AgentId::new(),
             CHAT,
+            None,
             &json!({"action": "delete", "id": job.id.to_string()}),
         )
         .await
@@ -621,14 +651,22 @@ mod tests {
                 owner,
                 agent,
                 CHAT,
+                None,
                 &create(json!({"in_minutes": minutes})),
             )
             .await
             .unwrap();
         }
-        let full = run(&db, owner, agent, CHAT, &create(json!({"in_minutes": 99})))
-            .await
-            .unwrap_err();
+        let full = run(
+            &db,
+            owner,
+            agent,
+            CHAT,
+            None,
+            &create(json!({"in_minutes": 99})),
+        )
+        .await
+        .unwrap_err();
         assert!(full.contains("active tasks"), "{full}");
     }
 
@@ -638,6 +676,7 @@ mod tests {
         let job = cron::create(
             &db,
             NewCronJob {
+                chat: None,
                 agent_id: agent,
                 name: "ran",
                 prompt: "p",
@@ -653,7 +692,7 @@ mod tests {
         .await
         .unwrap();
         cron::set_enabled(&db, job.id, false).await.unwrap();
-        let listed = run(&db, owner, agent, CHAT, &json!({"action": "list"}))
+        let listed = run(&db, owner, agent, CHAT, None, &json!({"action": "list"}))
             .await
             .unwrap();
         assert!(listed.contains("done"), "{listed}");
@@ -662,6 +701,7 @@ mod tests {
             owner,
             agent,
             CHAT,
+            None,
             &json!({"action": "resume", "id": job.id.to_string()}),
         )
         .await

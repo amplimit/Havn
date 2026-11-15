@@ -24,6 +24,8 @@ pub struct Turns {
 
 #[derive(Debug)]
 struct Running {
+    /// The conversation the chat is of.
+    scope: String,
     stop: CancellationToken,
     queue: VecDeque<InboundMessage>,
     /// When the running turn came off the queue, if it did.
@@ -38,11 +40,15 @@ pub enum Admitted {
     /// (the running one included).
     Queued {
         channel_id: String,
+        conversation: Option<String>,
         channel: String,
         ahead: usize,
     },
     /// The queue is full; the message was dropped.
-    Full { channel_id: String },
+    Full {
+        channel_id: String,
+        conversation: Option<String>,
+    },
 }
 
 /// The turn queue `msg` belongs to: its chat, or its conversation when it
@@ -60,12 +66,15 @@ impl Turns {
         match running.get_mut(&key(&msg)) {
             Some(turn) if turn.queue.len() >= MAX_QUEUED => Admitted::Full {
                 channel_id: msg.channel_id,
+                conversation: msg.conversation,
             },
             Some(turn) => {
                 let (channel_id, channel) = (msg.channel_id.clone(), msg.channel.clone());
+                let conversation = msg.conversation.clone();
                 turn.queue.push_back(msg);
                 Admitted::Queued {
                     channel_id,
+                    conversation,
                     channel,
                     ahead: turn.queue.len(),
                 }
@@ -75,6 +84,7 @@ impl Turns {
                 running.insert(
                     key(&msg),
                     Running {
+                        scope: msg.channel_id.clone(),
                         stop: stop.clone(),
                         queue: VecDeque::new(),
                         dequeued_at: None,
@@ -124,6 +134,30 @@ impl Turns {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Stop the running turns of every chat of conversation `scope`, as
+    /// [`Self::stop`] does; false when none was stopped.
+    pub fn stop_scope(&self, scope: &str) -> bool {
+        let now = Instant::now();
+        let chats: Vec<String> = self
+            .lock()
+            .iter()
+            .filter(|(_, turn)| turn.scope == scope)
+            .map(|(chat, _)| chat.clone())
+            .collect();
+        chats
+            .iter()
+            .fold(false, |any, chat| self.stop_at(chat, now) || any)
+    }
+
+    /// Stop the running turn of `chat` and drop the messages queued behind
+    /// it, for a chat that is deleted.
+    pub fn discard(&self, chat: &str) {
+        if let Some(turn) = self.lock().get_mut(chat) {
+            turn.queue.clear();
+            turn.stop.cancel();
         }
     }
 
@@ -181,6 +215,23 @@ mod tests {
         assert!(matches!(turns.admit(b), Admitted::Start(..)));
         assert!(turns.stop("chat-a"));
         assert!(!turns.stop("c"), "the conversation itself runs nothing");
+        // `/stop` in the conversation stops each of its chats.
+        assert!(turns.stop_scope("c"));
+        assert!(!turns.stop_scope("other"));
+    }
+
+    #[test]
+    fn a_discarded_chat_runs_nothing_more() {
+        let turns = Turns::default();
+        let mut first = msg("c", "1");
+        first.conversation = Some("x".into());
+        let Admitted::Start(_, stop) = turns.admit(first.clone()) else {
+            panic!("the first message runs");
+        };
+        assert!(matches!(turns.admit(first), Admitted::Queued { .. }));
+        turns.discard("x");
+        assert!(stop.is_cancelled());
+        assert!(turns.next("x").is_none(), "the queue was dropped");
     }
 
     #[test]

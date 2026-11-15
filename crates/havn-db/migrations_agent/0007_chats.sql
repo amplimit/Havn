@@ -24,12 +24,16 @@ CREATE TABLE active_chats (
 INSERT INTO chats (id, scope, title, created_at, updated_at)
 SELECT c.channel_id,
        c.channel_id,
+       -- The first line of the first user message, as `title_from` takes it.
        COALESCE((
-           SELECT substr(replace(replace(f.content, char(13), ' '), char(10), ' '), 1, 80)
-           FROM conversations f
-           WHERE f.channel_id = c.channel_id AND f.role = 'user'
-           ORDER BY f.created_at, f.rowid
-           LIMIT 1
+           SELECT substr(trim(substr(t.body, 1, instr(t.body || char(10), char(10)) - 1)), 1, 80)
+           FROM (
+               SELECT ltrim(replace(f.content, char(13), ''), ' ' || char(9) || char(10)) AS body
+               FROM conversations f
+               WHERE f.channel_id = c.channel_id AND f.role = 'user'
+               ORDER BY f.created_at, f.rowid
+               LIMIT 1
+           ) t
        ), ''),
        MIN(c.created_at),
        MAX(c.created_at)

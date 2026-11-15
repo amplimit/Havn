@@ -67,6 +67,27 @@ pub async fn record(pool: &SqlitePool, channel_id: &str, role: Role, content: &s
     Ok(())
 }
 
+/// Record a turn of chat `chat`, unless the chat was deleted meanwhile:
+/// false then, and nothing is written.
+pub async fn record_in_chat(
+    pool: &SqlitePool,
+    chat: &str,
+    role: Role,
+    content: &str,
+) -> Result<bool> {
+    let res = sqlx::query(
+        "INSERT INTO conversations (id, channel_id, role, content) \
+         SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM chats WHERE id = ?2)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(chat)
+    .bind(role.as_str())
+    .bind(content)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
 /// Same as [`recent`] but with the channel_id surfaced on each turn.
 /// Public for the dashboard's history-load endpoint, which doesn't
 /// know the channel id ahead of time. Newest-first internally then
@@ -472,7 +493,20 @@ mod tests {
                 .expect("db")
         );
         assert!(delete_chat(&pool, "s", &new).await.expect("db"));
-        assert!(recent(&pool, &old, 10).await.expect("recent").len() == 1);
+        assert!(
+            !record_in_chat(&pool, &new, Role::Assistant, "late reply")
+                .await
+                .expect("db"),
+            "a deleted chat gets no more turns"
+        );
+        assert!(recent(&pool, &new, 10).await.expect("recent").is_empty());
+        assert!(
+            record_in_chat(&pool, &old, Role::Assistant, "ok")
+                .await
+                .expect("db")
+        );
+        assert_eq!(recent(&pool, &old, 10).await.expect("recent").len(), 2);
+
         let listed = chats(&pool, "s", 10).await.expect("list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].title, "Renamed");

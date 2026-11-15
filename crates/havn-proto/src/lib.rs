@@ -291,6 +291,10 @@ pub struct GatewayToolCall {
     /// as `schedule`. `None` outside a user's conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
+    /// Its chat ([`InboundMessage::conversation`]), which a scheduled
+    /// task's results go to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -364,13 +368,14 @@ pub enum DataQuery {
     },
     /// The chats of `channel_id`, most recently used first.
     Chats { channel_id: String, limit: u32 },
-    /// Rename chat `conversation` of `channel_id`.
+    /// Rename chat `conversation` of `channel_id`: `{"found": bool}`.
     RenameChat {
         channel_id: String,
         conversation: String,
         title: String,
     },
-    /// Delete chat `conversation` of `channel_id` and its history.
+    /// Delete chat `conversation` of `channel_id` and its history, stopping
+    /// its turn and dropping its queue: `{"found": bool}`.
     DeleteChat {
         channel_id: String,
         conversation: String,
@@ -609,6 +614,9 @@ pub struct CronTick {
     /// default policy-allowed set; spec §6.2 `context_toolsets.cron`).
     #[serde(default)]
     pub enabled_toolsets: Vec<String>,
+    /// The chat the task was scheduled in; its result is kept there.
+    #[serde(default)]
+    pub chat: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
