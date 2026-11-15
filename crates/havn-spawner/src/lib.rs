@@ -451,6 +451,127 @@ impl From<std::io::Result<std::process::ExitStatus>> for AgentExit {
     }
 }
 
+/// How an agent's process ended, with the last lines it wrote to stderr:
+/// the runtime's error when it fails, say, before it connects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitReport {
+    pub exit: AgentExit,
+    pub stderr: Vec<String>,
+}
+
+impl ExitReport {
+    pub fn new(exit: AgentExit) -> Self {
+        Self {
+            exit,
+            stderr: Vec::new(),
+        }
+    }
+}
+
+/// Lines of an agent's stderr an [`ExitReport`] keeps.
+const STDERR_TAIL_LINES: usize = 12;
+/// Longest stderr line kept or logged; the rest of the line is dropped.
+const STDERR_LINE_BYTES: usize = 1024;
+/// Stderr lines of one agent logged per [`STDERR_LOG_WINDOW`]; the rest
+/// are counted, and still kept for the exit.
+const STDERR_LOG_LINES: usize = 120;
+const STDERR_LOG_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long an exit waits for the lines the agent wrote just before it.
+const STDERR_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
+type StderrTail = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>;
+
+/// Log each line of agent `agent_id`'s stderr, keeping the last ones in
+/// `tail`, until every process holding it has closed it.
+async fn relay_stderr(
+    agent_id: AgentId,
+    stderr: impl tokio::io::AsyncRead + Unpin,
+    tail: StderrTail,
+) {
+    let mut reader = tokio::io::BufReader::new(stderr);
+    let mut line = Vec::new();
+    let mut window = std::time::Instant::now();
+    let (mut logged, mut skipped) = (0_usize, 0_usize);
+    while let Ok(true) = next_line(&mut reader, &mut line).await {
+        let text = printable(&line);
+        if text.trim().is_empty() {
+            continue;
+        }
+        // A chatty agent (an MCP server logging every request) must not
+        // crowd the gateway's own lines out of the journal.
+        if window.elapsed() >= STDERR_LOG_WINDOW {
+            if skipped > 0 {
+                tracing::warn!(agent_id = %agent_id, skipped, "agent stderr: lines not logged");
+            }
+            window = std::time::Instant::now();
+            (logged, skipped) = (0, 0);
+        }
+        if logged < STDERR_LOG_LINES {
+            logged += 1;
+            tracing::warn!(agent_id = %agent_id, "agent stderr: {text}");
+        } else {
+            skipped += 1;
+        }
+        let mut tail = tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tail.len() == STDERR_TAIL_LINES {
+            tail.pop_front();
+        }
+        tail.push_back(text);
+    }
+    if skipped > 0 {
+        tracing::warn!(agent_id = %agent_id, skipped, "agent stderr: lines not logged");
+    }
+}
+
+/// Read the next line of `reader` into `line`, at most
+/// [`STDERR_LINE_BYTES`] of it. False at the end.
+async fn next_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> std::io::Result<bool> {
+    use tokio::io::AsyncBufReadExt as _;
+    line.clear();
+    let mut read = false;
+    loop {
+        let buf = reader.fill_buf().await?;
+        if buf.is_empty() {
+            return Ok(read);
+        }
+        read = true;
+        let newline = buf.iter().position(|&b| b == b'\n');
+        let end = newline.unwrap_or(buf.len());
+        let room = STDERR_LINE_BYTES.saturating_sub(line.len());
+        line.extend_from_slice(&buf[..end.min(room)]);
+        let used = newline.map_or(buf.len(), |i| i + 1);
+        reader.consume(used);
+        if newline.is_some() {
+            return Ok(true);
+        }
+    }
+}
+
+/// `line` as text that cannot pass for other log lines or move the
+/// terminal: control characters, line and paragraph separators and
+/// bidirectional controls become U+FFFD.
+fn printable(line: &[u8]) -> String {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    String::from_utf8_lossy(line)
+        .chars()
+        .map(|c| if unprintable(c) { '\u{fffd}' } else { c })
+        .collect()
+}
+
+fn unprintable(c: char) -> bool {
+    (c.is_control() && c != '\t')
+        || matches!(
+            c,
+            '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
 impl std::fmt::Display for AgentExit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -477,10 +598,13 @@ enum StopSignal {
 /// started. Stop signals go to the whole group, and once the agent has
 /// exited whatever it left in its group is killed, so tools do not
 /// outlive their agent.
+///
+/// A child spawned with a piped stderr has it logged as the agent's, and
+/// its last lines reported with the exit.
 #[derive(Debug, Clone)]
 pub(crate) struct ChildWatch {
     serial: u64,
-    exit: tokio::sync::watch::Receiver<Option<AgentExit>>,
+    exit: tokio::sync::watch::Receiver<Option<ExitReport>>,
     signals: tokio::sync::mpsc::UnboundedSender<StopSignal>,
 }
 
@@ -489,6 +613,11 @@ impl ChildWatch {
         let (exit_tx, exit) = tokio::sync::watch::channel(None);
         let (signals, mut requests) = tokio::sync::mpsc::unbounded_channel();
         let pid = child.id();
+        let tail = StderrTail::default();
+        let mut relay = child
+            .stderr
+            .take()
+            .map(|stderr| tokio::spawn(relay_stderr(handle.agent_id, stderr, tail.clone())));
         tokio::spawn(async move {
             let status = loop {
                 tokio::select! {
@@ -503,7 +632,21 @@ impl ChildWatch {
                 // members left it finds no group.
                 signal_group(pid, libc::SIGKILL);
             }
-            exit_tx.send_replace(Some(AgentExit::from(status)));
+            // What it wrote last may still be in the pipe. The relay goes
+            // on after this while something it started holds the pipe.
+            if let Some(relay) = relay.as_mut() {
+                let _ = tokio::time::timeout(STDERR_SETTLE, relay).await;
+            }
+            let stderr = tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .cloned()
+                .collect();
+            exit_tx.send_replace(Some(ExitReport {
+                exit: AgentExit::from(status),
+                stderr,
+            }));
         });
         Self {
             serial: handle.serial,
@@ -524,11 +667,13 @@ impl ChildWatch {
         let _ = self.signals.send(StopSignal::Kill);
     }
 
-    pub(crate) async fn exited(&self) -> AgentExit {
+    pub(crate) async fn exited(&self) -> ExitReport {
         let mut exit = self.exit.clone();
         match exit.wait_for(Option::is_some).await {
-            Ok(status) => status.unwrap_or(AgentExit::Unknown),
-            Err(_) => AgentExit::Unknown,
+            Ok(report) => report
+                .clone()
+                .unwrap_or(ExitReport::new(AgentExit::Unknown)),
+            Err(_) => ExitReport::new(AgentExit::Unknown),
         }
     }
 }
@@ -588,7 +733,7 @@ pub trait AgentSpawner: Send + Sync + std::fmt::Debug {
     /// Resolve once the agent's process has exited. `NotFound` when the
     /// spawner no longer tracks this process (stopped, or replaced by a
     /// later spawn).
-    async fn wait(&self, handle: &AgentHandle) -> Result<AgentExit>;
+    async fn wait(&self, handle: &AgentHandle) -> Result<ExitReport>;
 
     /// Whether processes of `agent_id` may still run: it is tracked, or a
     /// stop left processes behind (the cleanup is tried again first).
@@ -629,6 +774,12 @@ pub enum SpawnerError {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stderr_lines_cannot_move_the_terminal_or_reorder_text() {
+        let line = "a\u{1b}[2Jb\u{202e}c\u{2028}d\te\r".as_bytes();
+        assert_eq!(printable(line), "a\u{fffd}[2Jb\u{fffd}c\u{fffd}d\te");
+    }
 
     fn gateway_env(name: &str) -> Option<OsString> {
         match name {

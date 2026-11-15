@@ -67,6 +67,12 @@ pub enum ApiError {
     #[error("no usable credential for provider {0:?}")]
     NoCredential(String),
 
+    /// The agent could not be brought up; says why, e.g. what its
+    /// runtime printed before it exited. A 500 that, unlike `Internal`,
+    /// keeps its message: proxies tend to replace a 502 or 503.
+    #[error("{0}")]
+    AgentFailed(String),
+
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -106,6 +112,7 @@ impl IntoResponse for ApiError {
             Self::Forbidden(_) => (StatusCode::FORBIDDEN, self.to_string()),
             Self::Upstream(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
             Self::NoCredential(_) => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
+            Self::AgentFailed(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()),
         };
         (status, Json(json!({ "error": message }))).into_response()

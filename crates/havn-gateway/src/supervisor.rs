@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 use havn_core::{AgentId, UserId};
 use havn_db::repo::agents::{self as repo, AgentStatus};
 use havn_proto::GatewayToAgent;
-use havn_spawner::{AgentExit, AgentHandle};
+use havn_spawner::{AgentHandle, ExitReport};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
@@ -128,6 +128,11 @@ pub struct Supervisor {
     liveness_interval: Duration,
     limits: LivenessLimits,
     history: Arc<Mutex<HashMap<AgentId, History>>>,
+    /// Why each agent's last run ended, when it said: what its process
+    /// wrote to stderr last (or why it could not be spawned), with the
+    /// latest instance generation that noted anything, empty lines
+    /// included, so an older instance's late note cannot come back.
+    last_stderr: Arc<Mutex<HashMap<AgentId, (u64, Vec<String>)>>>,
     shutting_down: Arc<AtomicBool>,
 }
 
@@ -143,6 +148,7 @@ impl Supervisor {
                 busy: BUSY_LIMIT,
             },
             history: Arc::new(Mutex::new(HashMap::new())),
+            last_stderr: Arc::new(Mutex::new(HashMap::new())),
             shutting_down: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -157,6 +163,53 @@ impl Supervisor {
         self.history.lock().await.remove(&id);
     }
 
+    /// The last lines agent `id` wrote to stderr before its process last
+    /// exited on its own, or why it could not be started; empty when
+    /// there were none, or it was stopped or deleted since.
+    pub async fn last_stderr(&self, id: AgentId) -> Vec<String> {
+        self.last_stderr
+            .lock()
+            .await
+            .get(&id)
+            .map(|(_, lines)| lines.clone())
+            .unwrap_or_default()
+    }
+
+    /// Forget what agent `id` wrote to stderr (stopped or deleted).
+    pub async fn clear_stderr(&self, id: AgentId) {
+        self.last_stderr.lock().await.remove(&id);
+    }
+
+    /// Record what instance `generation` of agent `id` wrote, unless a
+    /// later instance already did.
+    async fn note_stderr(&self, id: AgentId, generation: u64, stderr: &[String]) {
+        let mut last = self.last_stderr.lock().await;
+        if last.get(&id).is_some_and(|(newer, _)| *newer > generation) {
+            return;
+        }
+        last.insert(id, (generation, stderr.to_vec()));
+    }
+
+    /// Record why a start of agent `id` spawned no process: there is no
+    /// instance, so it replaces whatever an earlier one wrote.
+    async fn note_spawn_failure(&self, id: AgentId, reason: String) {
+        let mut last = self.last_stderr.lock().await;
+        let generation = last.get(&id).map_or(0, |(generation, _)| *generation);
+        last.insert(id, (generation, vec![reason]));
+    }
+
+    /// Drop what instance `generation` of agent `id` wrote: it was
+    /// stopped, or found unresponsive and recovered without its exit, so
+    /// its lines are not why the agent is down.
+    async fn drop_stderr(&self, id: AgentId, generation: u64) {
+        let mut last = self.last_stderr.lock().await;
+        if let Some((noted, lines)) = last.get_mut(&id)
+            && *noted == generation
+        {
+            lines.clear();
+        }
+    }
+
     async fn next_restart(&self, id: AgentId, ran_for: Duration) -> (Restart, u32) {
         let mut history = self.history.lock().await;
         let entry = history.entry(id).or_default();
@@ -165,9 +218,9 @@ impl Supervisor {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Ended {
-    Exited(AgentExit),
+    Exited(ExitReport),
     Silent(Duration),
 }
 
@@ -176,13 +229,19 @@ enum Ended {
 pub(crate) fn watch(state: &AppState, handle: AgentHandle, generation: u64) {
     let state = state.clone();
     tokio::spawn(async move {
-        let exit = match state.spawner.wait(&handle).await {
-            Ok(exit) => exit,
+        let report = match state.spawner.wait(&handle).await {
+            Ok(report) => report,
             Err(e) => {
                 debug!(agent_id = %handle.agent_id, error = %e, "no process to watch");
                 return;
             }
         };
+        // Before it leaves the registry, so a start waiting for it to
+        // connect finds why it did not.
+        state
+            .supervisor
+            .note_stderr(handle.agent_id, generation, &report.stderr)
+            .await;
         if state.supervisor.shutting_down() {
             // Left during a drain. It stays registered so `shut_down`
             // releases what the spawner holds before the gateway exits.
@@ -194,9 +253,13 @@ pub(crate) fn watch(state: &AppState, handle: AgentHandle, generation: u64) {
             .remove_generation(handle.agent_id, generation)
             .await
         else {
+            state
+                .supervisor
+                .drop_stderr(handle.agent_id, generation)
+                .await;
             return;
         };
-        recover(&state, instance, Ended::Exited(exit)).await;
+        recover(&state, instance, Ended::Exited(report)).await;
     });
 }
 
@@ -270,13 +333,19 @@ async fn recover(state: &AppState, instance: Instance, ended: Ended) {
     match (ended, meant_to_run(state, id).await) {
         // Stopped or deleted meanwhile: its Shutdown frame can make it
         // exit before the stop deregisters it.
-        (Ended::Exited(exit), None) => {
-            debug!(agent_id = %id, %exit, "agent process exited after being stopped");
+        (Ended::Exited(report), None) => {
+            debug!(agent_id = %id, exit = %report.exit, "agent process exited after being stopped");
         }
-        (Ended::Exited(exit), Some(agent)) => {
-            warn!(agent_id = %id, %exit, ran_for_s, "agent process exited");
-            let details =
-                serde_json::json!({"by": "supervisor", "exit": exit, "ran_for_s": ran_for_s});
+        (Ended::Exited(report), Some(agent)) => {
+            warn!(agent_id = %id, exit = %report.exit, ran_for_s, "agent process exited");
+            let mut details = serde_json::json!({
+                "by": "supervisor",
+                "exit": report.exit,
+                "ran_for_s": ran_for_s,
+            });
+            if !report.stderr.is_empty() {
+                details["stderr"] = serde_json::json!(report.stderr);
+            }
             audit::record_agent_action(&state.db, agent.owner_id, id, "agent.exited", details)
                 .await;
         }
@@ -361,6 +430,11 @@ fn restart(state: AppState, owner: UserId, id: AgentId, ran_for: Duration) {
                 Err(e) if e.spawned => return,
                 Err(e) => {
                     warn!(agent_id = %id, error = %e.error, "agent restart failed");
+                    // What giving up reports, rather than an earlier run's.
+                    state
+                        .supervisor
+                        .note_spawn_failure(id, format!("could not be started: {}", e.error))
+                        .await;
                     ran_for = Duration::ZERO;
                 }
             }
@@ -381,22 +455,21 @@ async fn give_up(state: &AppState, owner: UserId, id: AgentId, failures: u32) {
     if !still_wanted || state.registry.is_registered(id).await {
         return;
     }
+    let stderr = state.supervisor.last_stderr(id).await;
     error!(
         agent_id = %id,
         failures,
+        last_stderr = stderr.last().map_or("", String::as_str),
         "agent keeps failing; giving up until it is started again"
     );
     if let Err(e) = repo::set_status(&state.db, id, AgentStatus::Error).await {
         warn!(agent_id = %id, error = %e, "could not mark agent as failed");
     }
-    audit::record_agent_action(
-        &state.db,
-        owner,
-        id,
-        "agent.restart_abandoned",
-        serde_json::json!({"by": "supervisor", "failures": failures}),
-    )
-    .await;
+    let mut details = serde_json::json!({"by": "supervisor", "failures": failures});
+    if !stderr.is_empty() {
+        details["stderr"] = serde_json::json!(stderr);
+    }
+    audit::record_agent_action(&state.db, owner, id, "agent.restart_abandoned", details).await;
 }
 
 /// Gateway startup: kill agent processes an earlier gateway left behind,
@@ -572,7 +645,7 @@ mod tests {
     use havn_core::Policy;
     use havn_db::repo::agents::NewAgent;
     use havn_proto::GatewayToAgent;
-    use havn_spawner::{AgentSpawnConfig, AgentSpawner, ResourceStats, SpawnerError};
+    use havn_spawner::{AgentExit, AgentSpawnConfig, AgentSpawner, ResourceStats, SpawnerError};
     use std::sync::atomic::{AtomicU32, AtomicU64};
     use tokio::sync::{mpsc, watch as watch_channel};
 
@@ -650,6 +723,8 @@ mod tests {
         spawns: AtomicU32,
         orphans_reaped: AtomicU32,
         procs: std::sync::Mutex<HashMap<AgentId, Proc>>,
+        /// What every process it starts writes to stderr.
+        stderr: std::sync::Mutex<Vec<String>>,
     }
 
     #[derive(Debug)]
@@ -672,6 +747,7 @@ mod tests {
                 spawns: AtomicU32::new(0),
                 orphans_reaped: AtomicU32::new(0),
                 procs: std::sync::Mutex::new(HashMap::new()),
+                stderr: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -779,7 +855,7 @@ mod tests {
             }
         }
 
-        async fn wait(&self, handle: &AgentHandle) -> havn_spawner::Result<AgentExit> {
+        async fn wait(&self, handle: &AgentHandle) -> havn_spawner::Result<ExitReport> {
             let mut exit = self
                 .procs
                 .lock()
@@ -793,7 +869,10 @@ mod tests {
                 .await
                 .map(|s| s.unwrap_or(AgentExit::Unknown))
                 .unwrap_or(AgentExit::Unknown);
-            Ok(status)
+            Ok(ExitReport {
+                exit: status,
+                stderr: self.stderr.lock().unwrap().clone(),
+            })
         }
 
         async fn reap_orphans(&self) -> havn_spawner::Result<usize> {
@@ -1054,9 +1133,20 @@ mod tests {
     #[tokio::test]
     async fn a_crash_loop_ends_in_error_status() {
         let (state, spawner, user) = fixture(quick_policy(), false, true).await;
+        let why = vec![
+            "Error: opening agent.db".to_string(),
+            "    migrate: migration 8 was previously applied but has been modified".to_string(),
+        ];
+        *spawner.stderr.lock().unwrap() = why.clone();
         let id = agent(&state, user, "a").await;
         let first = crate::api::agents::ensure_running(&state, user, id).await;
-        assert!(first.is_err(), "the first instance exits during startup");
+        let Err(crate::api::ApiError::AgentFailed(message)) = first else {
+            panic!("the first instance exits during startup: {first:?}");
+        };
+        assert!(
+            message.contains("migration 8 was previously applied"),
+            "{message}"
+        );
 
         eventually("marked as failed", || async {
             status(&state, id).await == AgentStatus::Error
@@ -1068,6 +1158,79 @@ mod tests {
         assert_eq!(spawner.spawns(), 1 + quick_policy().max_failures);
         let actions = audit_actions(&state).await;
         assert_eq!(count(&actions, "agent.restart_abandoned"), 1, "{actions:?}");
+        let filter = havn_db::repo::audit::ListFilter {
+            limit: 100,
+            ..Default::default()
+        };
+        let entries = havn_db::repo::audit::list(&state.db, filter)
+            .await
+            .expect("audit");
+        let abandoned = entries
+            .iter()
+            .find(|e| e.action == "agent.restart_abandoned")
+            .expect("given up");
+        assert_eq!(abandoned.details["stderr"], serde_json::json!(why));
+        assert_eq!(state.supervisor.last_stderr(id).await, why);
+        let view = crate::api::agents::get(
+            axum::extract::State(state.clone()),
+            owner(user),
+            axum::extract::Path(id.to_string()),
+        )
+        .await
+        .expect("get");
+        assert_eq!(view.0.failure.as_deref(), Some(why.join("\n").as_str()));
+    }
+
+    #[tokio::test]
+    async fn what_a_stopped_agent_wrote_is_not_its_failure() {
+        let (state, spawner, user) = fixture(quick_policy(), true, false).await;
+        *spawner.stderr.lock().unwrap() = vec!["mcp server: stdin closed".into()];
+        let id = running_agent(&state, user).await;
+        stop(&state, user, id).await;
+        // The stopped instance's watch has run by the time it is gone.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(state.supervisor.last_stderr(id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_older_instance_does_not_overwrite_a_later_one() {
+        let (state, _spawner, user) = fixture(quick_policy(), true, false).await;
+        let id = agent(&state, user, "a").await;
+        let later = vec!["later".to_string()];
+        state.supervisor.note_stderr(id, 5, &later).await;
+        state
+            .supervisor
+            .note_stderr(id, 4, &["earlier".into()])
+            .await;
+        state.supervisor.drop_stderr(id, 4).await;
+        assert_eq!(state.supervisor.last_stderr(id).await, later);
+        state.supervisor.drop_stderr(id, 5).await;
+        assert!(state.supervisor.last_stderr(id).await.is_empty());
+        // An empty exit still keeps an older instance's late note out.
+        state.supervisor.note_stderr(id, 6, &[]).await;
+        state.supervisor.note_stderr(id, 5, &["late".into()]).await;
+        assert!(state.supervisor.last_stderr(id).await.is_empty());
+        // A start that spawns nothing replaces a run's lines.
+        state
+            .supervisor
+            .note_stderr(id, 7, &["crashed".into()])
+            .await;
+        state
+            .supervisor
+            .note_spawn_failure(id, "could not be started: no binary".into())
+            .await;
+        assert_eq!(
+            state.supervisor.last_stderr(id).await,
+            vec!["could not be started: no binary".to_string()]
+        );
+        state
+            .supervisor
+            .note_stderr(id, 8, &["next run".into()])
+            .await;
+        assert_eq!(
+            state.supervisor.last_stderr(id).await,
+            vec!["next run".to_string()]
+        );
     }
 
     #[tokio::test]

@@ -19,6 +19,9 @@ export type AgentView = {
   updated_at: string;
   /** Set after the runtime completes its Hello/Welcome handshake. */
   connected: boolean;
+  /** Why an agent that should be up is not: the last lines its runtime
+   * wrote to stderr before it exited. */
+  failure: string | null;
 };
 
 export type MeView = {

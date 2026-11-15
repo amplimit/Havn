@@ -52,7 +52,7 @@ use tracing::{info, warn};
 use crate::cgroup::{CgroupController, CgroupError, RETIRED_PARENT, SliceUnit};
 use crate::ns_setup;
 use crate::{
-    AgentExit, AgentHandle, AgentSpawnConfig, AgentSpawner, ChildWatch, ResourceStats, Result,
+    AgentHandle, AgentSpawnConfig, AgentSpawner, ChildWatch, ExitReport, ResourceStats, Result,
     SpawnerError,
 };
 
@@ -243,8 +243,8 @@ impl NamespaceSpawner {
         //    means either the inner is stuck or the signal forwarder did
         //    not deliver — either way we fall through to cgroup.kill.
         let timed_out = match tokio::time::timeout(STOP_GRACE, child.exited()).await {
-            Ok(exit) => {
-                info!(%agent_id, %exit, "outer reaper exited");
+            Ok(report) => {
+                info!(%agent_id, exit = %report.exit, "outer reaper exited");
                 false
             }
             Err(_) => {
@@ -351,8 +351,12 @@ impl AgentSpawner for NamespaceSpawner {
             )
         })?;
         let mut cmd = Command::new(init_binary);
-        // The agent never reads the terminal the gateway runs in.
+        // The agent never reads the terminal the gateway runs in. Its
+        // stderr goes through the gateway, which logs it as the agent's:
+        // the agent runs in a cgroup of its own, so what it writes to the
+        // journal directly is not under the gateway's unit.
         cmd.stdin(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::piped());
         cmd.env_clear()
             .envs(crate::agent_environment(&config.env_passthrough, |name| {
                 std::env::var_os(name)
@@ -622,7 +626,7 @@ impl AgentSpawner for NamespaceSpawner {
         Ok(())
     }
 
-    async fn wait(&self, handle: &AgentHandle) -> Result<AgentExit> {
+    async fn wait(&self, handle: &AgentHandle) -> Result<ExitReport> {
         let child = self
             .state
             .lock()

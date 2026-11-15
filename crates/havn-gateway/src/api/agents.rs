@@ -74,11 +74,15 @@ pub struct AgentView {
     /// (which only means the process was spawned). The smoke test polls
     /// this to know when the WebSocket endpoint will accept connections.
     pub connected: bool,
+    /// While a running (or given up on) agent is not connected: the last
+    /// lines its runtime wrote to stderr before it exited, which say why.
+    pub failure: Option<String>,
 }
 
 impl AgentView {
     fn from_agent(a: Agent, connected: bool) -> Self {
         Self {
+            failure: None,
             id: a.id.to_string(),
             name: a.name,
             status: a.status.as_str().into(),
@@ -100,9 +104,22 @@ pub async fn list(
     let mut views = Vec::with_capacity(agents.len());
     for a in agents {
         let connected = state.registry.is_connected(a.id).await;
-        views.push(AgentView::from_agent(a, connected));
+        let failure = failure(&state, &a, connected).await;
+        views.push(AgentView {
+            failure,
+            ..AgentView::from_agent(a, connected)
+        });
     }
     Ok(Json(views))
+}
+
+/// Why agent `a` is not up, when it should be and its runtime said.
+async fn failure(state: &AppState, a: &Agent, connected: bool) -> Option<String> {
+    if connected || !matches!(a.status, AgentStatus::Running | AgentStatus::Error) {
+        return None;
+    }
+    let stderr = state.supervisor.last_stderr(a.id).await;
+    (!stderr.is_empty()).then(|| stderr.join("\n"))
 }
 
 pub async fn get(
@@ -112,7 +129,11 @@ pub async fn get(
 ) -> Result<Json<AgentView>, ApiError> {
     let agent = resolve_agent(&id, &user, &state).await?;
     let connected = state.registry.is_connected(agent.id).await;
-    Ok(Json(AgentView::from_agent(agent, connected)))
+    let failure = failure(&state, &agent, connected).await;
+    Ok(Json(AgentView {
+        failure,
+        ..AgentView::from_agent(agent, connected)
+    }))
 }
 
 pub async fn create(
@@ -359,9 +380,9 @@ impl From<StartError> for ApiError {
 /// the rest wait for the existing handshake to complete.
 ///
 /// Returns Ok when the agent finished its Hello/Welcome handshake.
-/// Returns ApiError::Internal on spawn failure, handshake timeout, or
-/// when the process exits before its handshake (caller surfaces a
-/// friendlier message at the boundary).
+/// Returns ApiError::Internal on spawn failure or handshake timeout, and
+/// ApiError::AgentFailed, with what its runtime said, when the process
+/// exits before its handshake.
 pub async fn ensure_running(
     state: &AppState,
     by_user: havn_core::UserId,
@@ -531,11 +552,18 @@ pub(crate) async fn start_agent(
             return Ok(());
         }
         if !state.registry.is_registered(id).await {
+            let stderr = state.supervisor.last_stderr(id).await;
+            let message = if stderr.is_empty() {
+                "the agent exited before it connected".to_string()
+            } else {
+                format!(
+                    "the agent exited before it connected:\n{}",
+                    stderr.join("\n")
+                )
+            };
             return Err(StartError {
                 spawned,
-                error: ApiError::Internal(format!(
-                    "agent {id} exited before completing its handshake"
-                )),
+                error: ApiError::AgentFailed(message),
             });
         }
         tokio::time::sleep(POLL).await;
@@ -602,6 +630,7 @@ pub(crate) async fn stop_agent(
         // down, including a restart that is already pending.
         repo::set_status(&state.db, id, AgentStatus::Stopped).await?;
         state.supervisor.forget(id).await;
+        state.supervisor.clear_stderr(id).await;
 
         // Best-effort graceful shutdown via socket; ignore if not connected.
         if state.registry.is_connected(id).await
@@ -666,6 +695,7 @@ pub async fn delete(
     let agent_lock = start_lock(&state, id).await;
     let _guard = agent_lock.lock().await;
     state.supervisor.forget(id).await;
+    state.supervisor.clear_stderr(id).await;
     repo::set_status(&state.db, id, AgentStatus::Stopped).await?;
     if state.registry.is_connected(id).await {
         let _ = state.registry.send(id, GatewayToAgent::Shutdown).await;

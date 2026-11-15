@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::{
-    AgentExit, AgentHandle, AgentSpawnConfig, AgentSpawner, ChildWatch, ResourceStats, Result,
+    AgentHandle, AgentSpawnConfig, AgentSpawner, ChildWatch, ExitReport, ResourceStats, Result,
     SpawnerError,
 };
 
@@ -70,11 +70,12 @@ impl AgentSpawner for SubprocessSpawner {
         if config.is_subagent {
             cmd.arg("--is-subagent");
         }
-        // Inherit stdout/stderr so logs propagate; in production the namespace
-        // spawner will redirect them to the agent's log file.
         cmd.kill_on_drop(true);
-        // The agent never reads the terminal the gateway runs in.
+        // The agent never reads the terminal the gateway runs in. Its
+        // stdout is the gateway's; its stderr goes through the gateway,
+        // which logs it as the agent's and keeps the last lines.
         cmd.stdin(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::piped());
         // The agent dies with the gateway instead of outliving it, and is
         // out of reach of the gateway terminal's Ctrl-C.
         #[cfg(target_os = "linux")]
@@ -133,7 +134,7 @@ impl AgentSpawner for SubprocessSpawner {
         Ok(())
     }
 
-    async fn wait(&self, handle: &AgentHandle) -> Result<AgentExit> {
+    async fn wait(&self, handle: &AgentHandle) -> Result<ExitReport> {
         let child = self
             .children
             .lock()
@@ -158,12 +159,12 @@ impl AgentSpawner for SubprocessSpawner {
 async fn terminate(agent_id: AgentId, child: &ChildWatch) {
     child.terminate();
     match tokio::time::timeout(STOP_GRACE, child.exited()).await {
-        Ok(exit) => info!(%agent_id, %exit, "agent exited"),
+        Ok(report) => info!(%agent_id, exit = %report.exit, "agent exited"),
         Err(_) => {
             warn!(%agent_id, "SIGTERM grace expired; sending SIGKILL");
             child.kill();
-            let exit = child.exited().await;
-            info!(%agent_id, %exit, "agent killed");
+            let report = child.exited().await;
+            info!(%agent_id, exit = %report.exit, "agent killed");
         }
     }
 }
@@ -173,6 +174,7 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+    use crate::AgentExit;
     use std::path::PathBuf;
 
     fn config_for(agent_id: AgentId, runtime: PathBuf) -> AgentSpawnConfig {
@@ -238,8 +240,8 @@ mod tests {
             .expect("join");
         // The waiter either got the exit or found the child already gone.
         #[cfg(unix)]
-        if let Ok(exit) = exit {
-            assert_eq!(exit, AgentExit::Signal(libc::SIGTERM));
+        if let Ok(report) = exit {
+            assert_eq!(report.exit, AgentExit::Signal(libc::SIGTERM));
         }
         #[cfg(not(unix))]
         let _ = exit;
@@ -254,6 +256,7 @@ mod tests {
         let child = Command::new("sh")
             .arg("-c")
             .arg(script)
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .expect("spawn sh");
@@ -271,11 +274,11 @@ mod tests {
         let spawner = SubprocessSpawner::new();
         let handle = track(&spawner, "exit 3").await;
 
-        let exit = tokio::time::timeout(Duration::from_secs(5), spawner.wait(&handle))
+        let report = tokio::time::timeout(Duration::from_secs(5), spawner.wait(&handle))
             .await
             .expect("exit observed without polling")
             .expect("tracked");
-        assert_eq!(exit, AgentExit::Code(3));
+        assert_eq!(report, ExitReport::new(AgentExit::Code(3)));
 
         // Cleanup of an exited child is immediate and forgets it.
         tokio::time::timeout(Duration::from_secs(1), spawner.stop(&handle))
@@ -286,6 +289,37 @@ mod tests {
             spawner.wait(&handle).await,
             Err(SpawnerError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn an_exit_reports_the_last_lines_of_stderr() {
+        let spawner = SubprocessSpawner::new();
+        let script = "i=0; while [ $i -lt 20 ]; do echo \"line $i\" >&2; i=$((i+1)); done; \
+                      printf 'Error: \\033[31mbad\\r\\n\\n' >&2; exit 1";
+        let handle = track(&spawner, script).await;
+
+        let report = tokio::time::timeout(Duration::from_secs(5), spawner.wait(&handle))
+            .await
+            .expect("exit observed")
+            .expect("tracked");
+        assert_eq!(report.exit, AgentExit::Code(1));
+        let mut expected: Vec<String> = (9..20).map(|i| format!("line {i}")).collect();
+        expected.push("Error: \u{fffd}[31mbad".into());
+        assert_eq!(report.stderr, expected);
+        spawner.stop(&handle).await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn a_long_stderr_line_is_cut() {
+        let spawner = SubprocessSpawner::new();
+        let handle = track(&spawner, "head -c 5000 /dev/zero | tr '\\0' x >&2; exit 2").await;
+
+        let report = tokio::time::timeout(Duration::from_secs(5), spawner.wait(&handle))
+            .await
+            .expect("exit observed")
+            .expect("tracked");
+        assert_eq!(report.stderr, vec!["x".repeat(1024)]);
+        spawner.stop(&handle).await.expect("stop");
     }
 
     #[tokio::test]
