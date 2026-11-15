@@ -606,7 +606,25 @@ mod tests {
         let set = crate::hooks::load(&policy.hooks, dir.path())
             .await
             .expect("hooks");
-        let reg = registry(policy).with_hooks(crate::hooks::handle(set));
+        // Stands in for the MCP server's tool, which the hook must guard.
+        struct McpWrite;
+        #[async_trait]
+        impl Tool for McpWrite {
+            fn name(&self) -> &str {
+                "mcp__fs__write_file"
+            }
+            fn description(&self) -> &str {
+                "write"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _ctx: &ToolCtx, _input: serde_json::Value) -> ToolResult {
+                ToolResult::Ok("written".into())
+            }
+        }
+        let mut reg = registry(policy).with_hooks(crate::hooks::handle(set));
+        reg.tools.push(Arc::new(McpWrite));
         let env = ToolCtx {
             workspace_dir: dir.path().to_path_buf(),
             agent_db: dummy_pool().await,
