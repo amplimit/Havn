@@ -28,6 +28,7 @@ import {
   type McpView,
   type ModelsView,
   type CronJobView,
+  type ApprovalsView,
   type MyDomainsView,
   type TimezoneView,
 } from "@/lib/api";
@@ -298,6 +299,7 @@ export default function SettingsPage({
       <WebAccessEditor agentId={id} />
       <TimezoneEditor />
       <ScheduledTasks agentId={id} />
+      <ApprovalsEditor agentId={id} />
 
       <McpEditor agentId={id} />
 
@@ -524,6 +526,95 @@ function BootstrapFileEditor({
         )}
       </div>
     </div>
+  );
+}
+
+/**
+ * Tools whose every call waits for your approval in the chat (or /approve
+ * in a channel). A name ending in * covers a prefix, such as all tools of
+ * one MCP server. Applies on the agent's next start.
+ */
+function ApprovalsEditor({ agentId }: { agentId: string }) {
+  const [view, setView] = useState<ApprovalsView | null>(null);
+  const [text, setText] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    api.approvals.get(agentId).then(
+      (v) => {
+        if (cancelled) return;
+        setView(v);
+        setText(v.tools.join("\n"));
+      },
+      (e: unknown) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId]);
+  async function save() {
+    setSaving(true);
+    setError(null);
+    try {
+      const tools = text
+        .split(/[\s,]+/)
+        .map((t) => t.trim())
+        .filter((t) => t.length > 0);
+      const v = await api.approvals.put(agentId, tools);
+      setView(v);
+      setText(v.tools.join("\n"));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+  if (!view) return error ? <p className="mt-10 text-sm" role="alert">{error}</p> : null;
+  return (
+    <section className="mt-10 card px-4 py-4" aria-labelledby="approvals-title">
+      <h2 id="approvals-title" className="display-h3 mb-2">
+        tools that need your approval
+      </h2>
+      <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
+        Every call of these tools waits until you approve it in the chat, or with
+        /approve in a channel; unanswered calls are refused after 10 minutes, and
+        scheduled runs cannot use them. One name per line, such as{" "}
+        <code className="font-mono">shell</code> or{" "}
+        <code className="font-mono">mcp__github__*</code>. Applies on the agent&apos;s next
+        start.
+      </p>
+      {error && (
+        <p className="mb-2 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
+          {error}
+        </p>
+      )}
+      <textarea
+        className="input w-full font-mono text-xs"
+        rows={3}
+        value={text}
+        disabled={saving}
+        onChange={(e) => setText(e.target.value)}
+        aria-label="tools that need approval"
+      />
+      {view.inherited.length > 0 && (
+        <p className="mt-1 text-xs" style={{ color: "var(--color-body)" }}>
+          Also, from your role: <span className="font-mono">{view.inherited.join(", ")}</span>
+        </p>
+      )}
+      <div className="mt-2">
+        <button
+          type="button"
+          className="btn-ghost"
+          disabled={saving || text === view.tools.join("\n")}
+          onClick={save}
+        >
+          save
+        </button>
+      </div>
+    </section>
   );
 }
 

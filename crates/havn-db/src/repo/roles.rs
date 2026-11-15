@@ -222,6 +222,7 @@ mod tests {
         policy.hooks.pre_tool_use.push(havn_core::ToolHookRule {
             tool: "shell".into(),
             deny: vec!["^echo".into()],
+            ask: Vec::new(),
         });
         let r = create(
             &pool,

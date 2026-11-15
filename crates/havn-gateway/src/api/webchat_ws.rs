@@ -113,6 +113,7 @@ async fn handle_session(socket: WebSocket, state: AppState, agent_id: AgentId, s
         ws_stream,
         &state.registry,
         &state.webchat_router,
+        &state.db,
         agent_id,
         session_id,
         &sender_id,
@@ -123,11 +124,16 @@ async fn handle_session(socket: WebSocket, state: AppState, agent_id: AgentId, s
 
 /// Serve one tab until the browser closes it, the socket fails, or the
 /// router drops the tab for not reading.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the session's handles; a struct for one call site would only rename them"
+)]
 async fn serve_session<Si, St, E>(
     mut ws_sink: Si,
     mut ws_stream: St,
     registry: &AgentRegistry,
     router: &WebChatRouter,
+    db: &sqlx::SqlitePool,
     agent_id: AgentId,
     session_id: SessionId,
     sender_id: &str,
@@ -207,6 +213,21 @@ async fn serve_session<Si, St, E>(
         };
         let user_text = match parsed {
             ClientMessage::Send { content } => content,
+            ClientMessage::Decide {
+                id,
+                approve,
+                remember,
+            } => {
+                let decision = havn_proto::ApprovalDecision {
+                    channel_id: session_id.to_string(),
+                    request_id: Some(id),
+                    approve,
+                    remember,
+                };
+                crate::agent_socket::forward_decision(registry, db, agent_id, sender_id, decision)
+                    .await;
+                continue;
+            }
             ClientMessage::Stop => {
                 let stop = GatewayToAgent::StopTurn(havn_proto::StopTurn {
                     channel_id: session_id.to_string(),
@@ -326,7 +347,11 @@ mod tests {
         let router = router.clone();
         let task = tokio::spawn(async move {
             let registry = AgentRegistry::new();
-            serve_session(sink, stream, &registry, &router, agent_id, session_id, "u").await;
+            let db = havn_db::connect_in_memory().await.expect("db");
+            serve_session(
+                sink, stream, &registry, &router, &db, agent_id, session_id, "u",
+            )
+            .await;
         });
         (input, task)
     }

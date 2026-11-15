@@ -779,6 +779,25 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
             return;
         }
     };
+    // `/approve` and `/deny` answer a tool call waiting in this
+    // conversation instead of reaching the agent as a message.
+    if let Some((approve, remember)) = approval_command(&content) {
+        let decision = havn_proto::ApprovalDecision {
+            channel_id: encoded_channel_id,
+            request_id: None,
+            approve,
+            remember,
+        };
+        crate::agent_socket::forward_decision(
+            &state.registry,
+            &state.db,
+            agent_id,
+            &format!("{channel}:{}", inb.sender_id),
+            decision,
+        )
+        .await;
+        return;
+    }
     // `/stop` stops the reply running in this conversation instead of
     // reaching the agent as a message.
     if is_stop_command(&content) {
@@ -1051,23 +1070,61 @@ async fn sender_access(
     SenderAccess::Admitted
 }
 
-/// A text message that is only `/stop` (Telegram adds `@botname`).
-fn is_stop_command(content: &MessageContent) -> bool {
-    let MessageContent::Text { text } = content else {
-        return false;
-    };
-    let text = text.trim();
-    text.eq_ignore_ascii_case("/stop")
+/// Whether `text` is the command `name`, alone or with Telegram's
+/// `@botname`.
+fn is_command(text: &str, name: &str) -> bool {
+    text.eq_ignore_ascii_case(name)
         || text.split_once('@').is_some_and(|(cmd, bot)| {
-            cmd.eq_ignore_ascii_case("/stop")
+            cmd.eq_ignore_ascii_case(name)
                 && !bot.is_empty()
                 && bot.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         })
 }
 
+/// A text message that is only `/stop`.
+fn is_stop_command(content: &MessageContent) -> bool {
+    let MessageContent::Text { text } = content else {
+        return false;
+    };
+    is_command(text.trim(), "/stop")
+}
+
+/// `/approve`, `/approve always` or `/deny`, as (approve, remember).
+fn approval_command(content: &MessageContent) -> Option<(bool, bool)> {
+    let MessageContent::Text { text } = content else {
+        return None;
+    };
+    let text = text.trim();
+    let (command, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+    match (rest.trim().to_ascii_lowercase().as_str(), command) {
+        ("", c) if is_command(c, "/approve") => Some((true, false)),
+        ("always", c) if is_command(c, "/approve") => Some((true, true)),
+        ("", c) if is_command(c, "/deny") => Some((false, false)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_commands_are_recognised() {
+        let text = |t: &str| MessageContent::Text { text: t.into() };
+        assert_eq!(approval_command(&text("/approve")), Some((true, false)));
+        assert_eq!(
+            approval_command(&text(" /approve  always ")),
+            Some((true, true))
+        );
+        assert_eq!(
+            approval_command(&text("/approve@havn_bot")),
+            Some((true, false))
+        );
+        assert_eq!(approval_command(&text("/DENY")), Some((false, false)));
+        assert_eq!(approval_command(&text("/deny always")), None);
+        assert_eq!(approval_command(&text("/approve the plan please")), None);
+        assert_eq!(approval_command(&text("approve")), None);
+    }
 
     #[test]
     fn stop_commands_are_recognised() {

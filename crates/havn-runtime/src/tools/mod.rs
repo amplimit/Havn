@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use havn_core::Policy;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use tracing::warn;
+use tracing::{info, warn};
 
 pub mod agent_query;
 pub mod files;
@@ -125,6 +125,8 @@ pub struct ToolRegistry {
     /// `Hooks` so a future hot-reload (spec §8.4) can swap the rules
     /// without locking the dispatch path.
     hooks: Option<crate::hooks::Hooks>,
+    /// Asks the user about calls a hook's `ask` rule matches.
+    approvals: Option<Arc<crate::approvals::Approvals>>,
 }
 
 impl ToolRegistry {
@@ -164,6 +166,7 @@ impl ToolRegistry {
             tools,
             policy: Arc::clone(policy),
             hooks: None,
+            approvals: None,
         }
     }
 
@@ -266,6 +269,14 @@ impl ToolRegistry {
     /// startup; subagents inherit the parent's hooks.
     pub fn with_hooks(mut self, hooks: crate::hooks::Hooks) -> Self {
         self.hooks = Some(hooks);
+        self
+    }
+
+    /// Ask the user, through `approvals`, before calls a hook's `ask`
+    /// rule matches.
+    #[must_use]
+    pub fn with_approvals(mut self, approvals: Arc<crate::approvals::Approvals>) -> Self {
+        self.approvals = Some(approvals);
         self
     }
 
@@ -373,14 +384,42 @@ impl ToolRegistry {
         // cost; surface a structured error so the LLM sees the deny
         // and adapts its plan.
         if let Some(hooks) = &self.hooks {
-            let snapshot = hooks.load();
-            if !snapshot.is_empty() {
-                let flat = flatten_input_for_hook(name, &input);
-                if let crate::hooks::Veto::Deny { reason } = snapshot.veto(name, &flat) {
-                    warn!(name, context, "PreToolUse hook denied dispatch");
-                    return ToolResult::Error(format!(
-                        "tool {name:?} dispatch denied by hook: {reason}"
-                    ));
+            // The snapshot guard is not held across the approval wait.
+            let verdict = {
+                let snapshot = hooks.load();
+                (!snapshot.is_empty()).then(|| {
+                    let flat = flatten_input_for_hook(name, &input);
+                    let veto = snapshot.veto(name, &flat);
+                    (flat, veto)
+                })
+            };
+            if let Some((flat, veto)) = verdict {
+                match veto {
+                    crate::hooks::Veto::Allow => {}
+                    crate::hooks::Veto::Deny { reason } => {
+                        warn!(name, context, "PreToolUse hook denied dispatch");
+                        return ToolResult::Error(format!(
+                            "tool {name:?} dispatch denied by hook: {reason}"
+                        ));
+                    }
+                    crate::hooks::Veto::Ask { reason } => {
+                        let conversation = crate::tools::gateway::CONVERSATION
+                            .try_with(Clone::clone)
+                            .ok();
+                        let decided = match &self.approvals {
+                            Some(approvals) => {
+                                approvals
+                                    .ask(conversation.as_deref(), name, &flat, &reason)
+                                    .await
+                            }
+                            None => Err("it needs the user's approval, which is not set up here"
+                                .to_string()),
+                        };
+                        if let Err(why) = decided {
+                            info!(name, context, why = %why, "tool call not approved");
+                            return ToolResult::Error(format!("tool {name:?} was not run: {why}"));
+                        }
+                    }
                 }
             }
         }
@@ -561,6 +600,7 @@ mod tests {
         policy.hooks.pre_tool_use.push(havn_core::ToolHookRule {
             tool: "mcp__fs__write_file".into(),
             deny: vec!["/etc/".into()],
+            ask: Vec::new(),
         });
         let dir = tempfile::tempdir().expect("tempdir");
         let set = crate::hooks::load(&policy.hooks, dir.path())

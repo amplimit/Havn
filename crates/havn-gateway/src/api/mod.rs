@@ -16,6 +16,7 @@ use serde_json::json;
 pub(crate) const WS_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub mod agents;
+pub mod approvals;
 pub mod audit;
 pub mod bootstrap;
 pub mod channel;

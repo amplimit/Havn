@@ -57,6 +57,13 @@ pub enum ClientMessage {
     Send { content: String },
     /// Stop the reply the agent is working on in this session.
     Stop,
+    /// Answer an [`ServerMessage::Approval`].
+    Decide {
+        id: String,
+        approve: bool,
+        #[serde(default)]
+        remember: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +79,13 @@ pub enum ServerMessage {
     },
     /// Soft error visible to the user (e.g. agent disconnected).
     Error { message: String },
+    /// A tool call waits for the user's approval.
+    Approval {
+        id: String,
+        tool: String,
+        input: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -145,6 +159,22 @@ impl WebChatRouter {
             },
         };
         self.send_to_session(agent_id, session_id, server_msg).await
+    }
+
+    /// Ask every open tab of `session_id` to approve a tool call.
+    pub async fn approval(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        request: havn_proto::ApprovalRequest,
+    ) -> Result<(), DeliverError> {
+        let msg = ServerMessage::Approval {
+            id: request.request_id,
+            tool: request.tool,
+            input: request.input,
+            reason: request.reason,
+        };
+        self.send_to_session(agent_id, session_id, msg).await
     }
 
     /// Show `message` as an error in every open tab of `session_id`.

@@ -14,6 +14,7 @@
 //! - Heartbeat and cron ticks, the skill library and its curator, and
 //!   same-process subagents (`subagent_spawn`).
 
+mod approvals;
 mod curator;
 mod curator_scheduler;
 mod embedding;
@@ -167,6 +168,8 @@ struct Ctx {
     timezone: Arc<std::sync::RwLock<chrono_tz::Tz>>,
     /// Conversations with a turn running, for stop and queueing.
     turns: Arc<turns::Turns>,
+    /// Tool calls waiting for the user's approval.
+    approvals: Arc<approvals::Approvals>,
 }
 
 impl Ctx {
@@ -577,8 +580,10 @@ async fn main() -> anyhow::Result<()> {
     // through it. Its task starts in step 5.
     let (writer_tx, mut writer_rx) = mpsc::channel::<AgentToGateway>(OUTBOUND_QUEUE_CAPACITY);
     let gateway_pending: tools::gateway::PendingGatewayCalls = Arc::default();
+    let approvals = Arc::new(approvals::Approvals::new(writer_tx.clone()));
     let base_registry = ToolRegistry::standard(&policy)
         .with_hooks(Arc::clone(&hooks))
+        .with_approvals(Arc::clone(&approvals))
         .with_gateway_tools(gateway_tools, &gateway_pending, &writer_tx)
         .with_mcp(&mcp_servers);
     let tool_env = ToolCtx {
@@ -812,6 +817,7 @@ async fn main() -> anyhow::Result<()> {
         incoming_query_registry,
         timezone: Arc::new(std::sync::RwLock::new(zone_or_utc(timezone.as_deref()))),
         turns: Arc::new(turns::Turns::default()),
+        approvals,
     };
     let dispatch = run_reader_loop(&mut reader, ctx).await;
 
@@ -986,6 +992,11 @@ where
                             ),
                         );
                     }
+                }
+            }
+            GatewayToAgent::ApprovalDecision(decision) => {
+                if !ctx.approvals.decide(&decision) {
+                    info!(channel_id = %decision.channel_id, "approval decision with nothing waiting");
                 }
             }
             GatewayToAgent::StopTurn(stop) => {

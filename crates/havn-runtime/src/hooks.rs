@@ -67,6 +67,19 @@ use tracing::{debug, info, warn};
 pub struct ToolHook {
     pub tool: String,
     pub deny: Vec<Regex>,
+    /// Patterns whose calls wait for the user's approval.
+    pub ask: Vec<Regex>,
+}
+
+impl ToolHook {
+    /// Whether the rule is about `tool`: its name, a prefix ending in `*`,
+    /// and `file_write` covering `file_edit`, which changes the same files.
+    fn covers(&self, tool: &str) -> bool {
+        match self.tool.strip_suffix('*') {
+            Some(prefix) => tool.starts_with(prefix),
+            None => self.tool == tool || (self.tool == "file_write" && tool == "file_edit"),
+        }
+    }
 }
 
 /// Loaded hook configuration. Wrapped in `Arc<ArcSwap<...>>` in the
@@ -139,6 +152,8 @@ fn parse(yaml: &str) -> Result<HookSet, String> {
         tool: String,
         #[serde(default)]
         deny: Vec<String>,
+        #[serde(default)]
+        ask: Vec<String>,
     }
     let file: File = serde_norway::from_str(yaml).map_err(|e| format!("yaml: {e}"))?;
     if file.pre_tool_use.len() > MAX_HOOK_RULES {
@@ -154,15 +169,22 @@ fn parse(yaml: &str) -> Result<HookSet, String> {
             warn!("hooks.yaml rule with an empty tool ignored");
             continue;
         }
-        let mut deny = Vec::with_capacity(rule.deny.len());
-        for pattern in &rule.deny {
+        let mut compiled = [Vec::new(), Vec::new()];
+        for (kind, pattern) in rule
+            .deny
+            .iter()
+            .map(|p| (0, p))
+            .chain(rule.ask.iter().map(|p| (1, p)))
+        {
             if patterns_left == 0 {
                 warn!(
-                    "hooks.yaml has more than {MAX_HOOK_PATTERNS} deny patterns; ignoring the rest"
+                    "hooks.yaml has more than {MAX_HOOK_PATTERNS} deny and ask patterns; ignoring the rest"
                 );
+                let [deny, ask] = compiled;
                 rules.push(ToolHook {
                     tool: rule.tool,
                     deny,
+                    ask,
                 });
                 break 'rules;
             }
@@ -172,15 +194,17 @@ fn parse(yaml: &str) -> Result<HookSet, String> {
             }
             match havn_core::compile_hook_pattern(pattern, COMPILE_SIZE_LIMIT) {
                 Ok(re) => {
-                    deny.push(re);
+                    compiled[kind].push(re);
                     patterns_left -= 1;
                 }
                 Err(e) => warn!(tool = %rule.tool, error = %e, "hooks.yaml pattern ignored"),
             }
         }
+        let [deny, ask] = compiled;
         rules.push(ToolHook {
             tool: rule.tool,
             deny,
+            ask,
         });
     }
     Ok(HookSet { rules })
@@ -189,15 +213,19 @@ fn parse(yaml: &str) -> Result<HookSet, String> {
 fn compile(hooks: &HookPolicy) -> Result<HookSet, String> {
     let mut rules = Vec::with_capacity(hooks.pre_tool_use.len());
     for h in &hooks.pre_tool_use {
-        let mut compiled = Vec::with_capacity(h.deny.len());
-        for pat in &h.deny {
-            let re = havn_core::compile_hook_pattern(pat, COMPILE_SIZE_LIMIT)
-                .map_err(|e| format!("tool {:?}: {e}", h.tool))?;
-            compiled.push(re);
-        }
+        let compile_all = |patterns: &[String]| -> Result<Vec<Regex>, String> {
+            patterns
+                .iter()
+                .map(|pat| {
+                    havn_core::compile_hook_pattern(pat, COMPILE_SIZE_LIMIT)
+                        .map_err(|e| format!("tool {:?}: {e}", h.tool))
+                })
+                .collect()
+        };
         rules.push(ToolHook {
             tool: h.tool.clone(),
-            deny: compiled,
+            deny: compile_all(&h.deny)?,
+            ask: compile_all(&h.ask)?,
         });
     }
     Ok(HookSet { rules })
@@ -209,7 +237,13 @@ fn compile(hooks: &HookPolicy) -> Result<HookSet, String> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Veto {
     Allow,
-    Deny { reason: String },
+    Deny {
+        reason: String,
+    },
+    /// The call may run once the user approves it.
+    Ask {
+        reason: String,
+    },
 }
 
 impl HookSet {
@@ -222,11 +256,19 @@ impl HookSet {
     /// query) can pass an empty string — patterns then need to match
     /// the empty string, which is rare by design.
     pub fn veto(&self, tool: &str, flat_input: &str) -> Veto {
+        let mut ask = None;
         for rule in &self.rules {
-            // A `file_write` rule guards `file_edit` too, which changes
-            // the same files.
-            if rule.tool != tool && !(rule.tool == "file_write" && tool == "file_edit") {
+            if !rule.covers(tool) {
                 continue;
+            }
+            if ask.is_none()
+                && let Some(pat) = rule.ask.iter().find(|p| p.is_match(flat_input))
+            {
+                ask = Some(format!(
+                    "PreToolUse hook ({}/ask): pattern {:?} matched",
+                    rule.tool,
+                    pat.as_str()
+                ));
             }
             for pat in &rule.deny {
                 if pat.is_match(flat_input) {
@@ -241,7 +283,11 @@ impl HookSet {
                 }
             }
         }
-        Veto::Allow
+        // A deny anywhere wins over an ask.
+        match ask {
+            Some(reason) => Veto::Ask { reason },
+            None => Veto::Allow,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -255,7 +301,7 @@ impl HookSet {
             .rules
             .iter()
             .map(|r| r.tool.as_str())
-            .filter(|t| !known.contains(t))
+            .filter(|t| !t.ends_with('*') && !known.contains(t))
             .collect();
         unknown.sort_unstable();
         unknown.dedup();
@@ -326,6 +372,34 @@ mod tests {
 ",
         );
         assert!(matches!(edit_only.veto("file_write", "x"), Veto::Allow));
+    }
+
+    #[test]
+    fn ask_rules_wait_and_deny_wins() {
+        let set = set_with(
+            "pre_tool_use:
+  - tool: mcp__github__*
+    ask: ['(?s).*']
+  - tool: shell
+    ask: ['deploy']
+    deny: ['^rm']
+",
+        );
+        assert!(matches!(
+            set.veto("mcp__github__create_issue", "{}"),
+            Veto::Ask { .. }
+        ));
+        assert!(matches!(set.veto("mcp__gitlab__x", "{}"), Veto::Allow));
+        assert!(matches!(set.veto("shell", "make deploy"), Veto::Ask { .. }));
+        assert!(
+            matches!(set.veto("shell", "rm deploy"), Veto::Deny { .. }),
+            "deny wins"
+        );
+        assert!(matches!(set.veto("shell", "ls"), Veto::Allow));
+        assert!(
+            set.unknown_tools(&["shell"]).is_empty(),
+            "prefix rules are not typos"
+        );
     }
 
     #[test]

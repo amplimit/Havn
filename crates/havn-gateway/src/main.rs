@@ -687,6 +687,10 @@ async fn serve() -> anyhow::Result<()> {
             "/agents/{id}/web",
             get(api::search::agent_get).patch(api::search::agent_patch),
         )
+        .route(
+            "/agents/{id}/approvals",
+            get(api::approvals::get).put(api::approvals::put),
+        )
         .route("/agents/{id}/memory", get(api::memory::list))
         .route(
             "/agents/{id}/memory/{key}",
