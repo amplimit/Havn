@@ -521,7 +521,7 @@ async fn main() -> anyhow::Result<()> {
         match made {
             Ok(()) => sandbox::set_tool_home(home),
             Err(e) => {
-                warn!(home = %home.display(), error = %e, "cannot create the tools' home directory")
+                warn!(home = %home.display(), error = %e, "cannot create the tools' home directory; tools keep the gateway's HOME")
             }
         }
     }
