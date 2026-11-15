@@ -180,7 +180,21 @@ pub async fn list_for_agent(pool: &SqlitePool, agent_id: AgentId) -> Result<Vec<
     .bind(agent_id.to_string())
     .fetch_all(pool)
     .await?;
-    rows.into_iter().map(CronJob::try_from).collect()
+    Ok(readable(rows))
+}
+
+/// The jobs of `rows` that can be read; a job whose stored values do not
+/// parse (a time zone a later tz database dropped, say) is logged and
+/// left out, so it cannot stop every other job.
+fn readable(rows: Vec<CronJobRow>) -> Vec<CronJob> {
+    rows.into_iter()
+        .filter_map(|row| {
+            let id = row.id.clone();
+            CronJob::try_from(row)
+                .map_err(|e| tracing::warn!(job_id = %id, error = %e, "skipping a cron job that cannot be read"))
+                .ok()
+        })
+        .collect()
 }
 
 /// Jobs whose `next_run_at <= now` and that are still enabled. Bounded result
@@ -197,7 +211,7 @@ pub async fn list_due(pool: &SqlitePool, now: DateTime<Utc>, limit: u32) -> Resu
     .bind(limit)
     .fetch_all(pool)
     .await?;
-    rows.into_iter().map(CronJob::try_from).collect()
+    Ok(readable(rows))
 }
 
 /// Apply the post-run state transition: advance `next_run_at` for recurring

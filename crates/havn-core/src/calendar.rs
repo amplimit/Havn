@@ -5,8 +5,9 @@
 //! Fields take `*`, numbers, ranges `a-b`, lists `a,b` and steps `*/n` or
 //! `a-b/n`; months and weekdays also take names (`jan`, `mon`), and weekday
 //! 7 is Sunday like 0. When both day fields are restricted, a day matching
-//! either runs, as in Vixie cron. A local time skipped by a DST change does
-//! not run that day; one repeated by it runs once, the first time.
+//! either runs, as in Vixie cron (a field starting with `*` counts as
+//! unrestricted). A local time skipped by a DST change runs right after the
+//! change; one repeated by it runs once, the first time.
 
 use chrono::{DateTime, Datelike as _, Days, LocalResult, NaiveDate, TimeZone as _, Utc};
 use chrono_tz::Tz;
@@ -56,8 +57,8 @@ impl Calendar {
             days: u32::try_from(field(day, 1, 31, &[], 0, "day-of-month")?).unwrap_or(0),
             months: u16::try_from(field(month, 1, 12, &MONTHS, 1, "month")?).unwrap_or(0),
             weekdays: u8::try_from(weekdays).unwrap_or(0),
-            any_day: day == "*",
-            any_weekday: weekday == "*",
+            any_day: day.starts_with('*'),
+            any_weekday: weekday.starts_with('*'),
         })
     }
 
@@ -70,28 +71,42 @@ impl Calendar {
             .split_whitespace()
             .map(str::to_ascii_lowercase)
             .collect();
+        let number = |s: &str| -> Option<u32> {
+            (!s.is_empty() && s.len() <= 2 && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse().ok())
+                .flatten()
+        };
         let time = |s: &str| -> Option<(u32, u32)> {
             let (h, m) = s.split_once(':')?;
-            let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
+            let (h, m) = (number(h)?, number(m)?);
             (h < 24 && m < 60).then_some((h, m))
         };
         match words.iter().map(String::as_str).collect::<Vec<_>>()[..] {
             ["hourly", at] => {
-                let m: u32 = at.strip_prefix(':')?.parse().ok()?;
+                let m = number(at.strip_prefix(':')?)?;
                 (m < 60).then(|| format!("{m} * * * *"))
             }
             ["daily", t] => time(t).map(|(h, m)| format!("{m} {h} * * *")),
             ["weekdays", t] => time(t).map(|(h, m)| format!("{m} {h} * * 1-5")),
             ["weekends", t] => time(t).map(|(h, m)| format!("{m} {h} * * 0,6")),
             ["weekly", day, t] => {
+                const FULL: [&str; 7] = [
+                    "sunday",
+                    "monday",
+                    "tuesday",
+                    "wednesday",
+                    "thursday",
+                    "friday",
+                    "saturday",
+                ];
                 let d = WEEKDAYS
                     .iter()
-                    .position(|w| day.starts_with(w))
-                    .filter(|_| day.len() >= 3)?;
+                    .zip(FULL)
+                    .position(|(short, full)| day == *short || day == full)?;
                 time(t).map(|(h, m)| format!("{m} {h} * * {d}"))
             }
             ["monthly", day, t] => {
-                let d: u32 = day.parse().ok().filter(|d| (1..=31).contains(d))?;
+                let d = number(day).filter(|d| (1..=31).contains(d))?;
                 time(t).map(|(h, m)| format!("{m} {h} {d} * *"))
             }
             _ => None,
@@ -125,7 +140,11 @@ impl Calendar {
                     };
                     let at = match self.zone.from_local_datetime(&local) {
                         LocalResult::Single(t) | LocalResult::Ambiguous(t, _) => t,
-                        LocalResult::None => continue,
+                        // Skipped by a DST change: the first time after it.
+                        LocalResult::None => match first_after_gap(self.zone, local) {
+                            Some(t) => t,
+                            None => continue,
+                        },
                     };
                     let at = at.with_timezone(&Utc);
                     if at > after {
@@ -150,6 +169,18 @@ impl Calendar {
             (false, false) => day || weekday,
         }
     }
+}
+
+/// The first local time after `skipped` that exists in `zone`, within the
+/// three hours a DST change can skip.
+fn first_after_gap(zone: Tz, skipped: chrono::NaiveDateTime) -> Option<DateTime<Tz>> {
+    (1..=180).find_map(|minutes| {
+        let local = skipped.checked_add_signed(chrono::Duration::minutes(minutes))?;
+        match zone.from_local_datetime(&local) {
+            LocalResult::Single(t) | LocalResult::Ambiguous(t, _) => Some(t),
+            LocalResult::None => None,
+        }
+    })
 }
 
 /// The values one field allows, as bits; `names[i]` stands for
@@ -227,10 +258,17 @@ mod tests {
     #[test]
     fn skipped_and_repeated_local_times() {
         let gap = Calendar::parse("Europe/Berlin", "30 2 * * *").unwrap();
-        // 02:30 does not exist on 2026-03-29; the next run is the day after.
+        // 02:30 does not exist on 2026-03-29; it runs at 03:00, right after
+        // the change.
         assert_eq!(
             gap.next_after(utc("2026-03-28T02:00:00Z")),
-            Some(utc("2026-03-30T00:30:00Z"))
+            Some(utc("2026-03-29T01:00:00Z"))
+        );
+        let midnight = Calendar::parse("America/Sao_Paulo", "0 0 * * *").unwrap();
+        // Brazil's 2018 change skipped midnight: the day still runs, at 01:00.
+        assert_eq!(
+            midnight.next_after(utc("2018-11-03T12:00:00Z")),
+            Some(utc("2018-11-04T03:00:00Z"))
         );
         let repeat = Calendar::parse("Europe/Berlin", "30 2 * * *").unwrap();
         // 02:30 happens twice on 2026-10-25; it runs the first time only.
@@ -260,6 +298,17 @@ mod tests {
         assert_eq!(
             leap.next_after(utc("2026-03-01T00:00:00Z")),
             Some(utc("2028-02-29T00:00:00Z"))
+        );
+        // A day field starting with `*` is unrestricted: odd days that are
+        // Mondays, as in Vixie cron.
+        let odd_mondays = Calendar::parse("UTC", "0 0 */2 * mon").unwrap();
+        assert_eq!(
+            odd_mondays.next_after(utc("2026-11-01T00:00:00Z")),
+            Some(utc("2026-11-02T00:00:00Z"))
+        );
+        assert_eq!(
+            odd_mondays.next_after(utc("2026-11-02T00:00:00Z")),
+            Some(utc("2026-11-09T00:00:00Z"))
         );
         let either = Calendar::parse("UTC", "0 0 1 * mon").unwrap();
         // The 1st, or any Monday: Monday 2026-11-16 comes first.
@@ -321,6 +370,8 @@ mod tests {
         );
         assert_eq!(Calendar::from_words("daily 25:00"), None);
         assert_eq!(Calendar::from_words("weekly mo 10:00"), None);
+        assert_eq!(Calendar::from_words("weekly monkey 10:00"), None);
+        assert_eq!(Calendar::from_words("daily +8:+5"), None);
         assert_eq!(Calendar::from_words("0 8 * * *"), None);
     }
 }

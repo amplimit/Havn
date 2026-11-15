@@ -739,7 +739,9 @@ async fn main() -> anyhow::Result<()> {
         child_handle: LoopHandle {
             writer_tx: writer_tx.clone(),
             pending: Arc::clone(&pending),
-            registry: base_registry.clone(),
+            // The user's settings are for the agent's own turns, not for a
+            // subagent's task or another agent's query.
+            registry: base_registry.clone().without("set_timezone"),
             tool_env: tool_env.clone(),
             max_iterations: subagent_tool::SUBAGENT_MAX_ITERATIONS,
             // Subagents do not republish their own state, and recursion
@@ -762,7 +764,7 @@ async fn main() -> anyhow::Result<()> {
     // subagent_spawn, no agent_query — handed to the temp loop that
     // answers IncomingQuery frames. Combined with the gateway's
     // same-owner + caller-self check, that makes the call graph depth-1.
-    let incoming_query_registry = base_registry.clone();
+    let incoming_query_registry = base_registry.clone().without("set_timezone");
 
     let parent_registry = base_registry
         .with_subagent(Arc::clone(&bridge))
@@ -1571,8 +1573,8 @@ fn time_section(now: chrono::DateTime<chrono::Utc>, zone: chrono_tz::Tz) -> Stri
     )
 }
 
-/// Build a per-turn system prompt by appending two sections to the frozen
-/// base (per-call only — the base stays untouched per spec §9.4):
+/// Build a per-turn system prompt by appending sections to the frozen base
+/// (per-call only — the base stays untouched per spec §9.4):
 ///
 /// 1. **Recent events (last 7 days)** — auto-loaded from typed memory
 ///    (kind = event), so the agent knows what just happened without
@@ -1581,18 +1583,11 @@ fn time_section(now: chrono::DateTime<chrono::Utc>, zone: chrono_tz::Tz) -> Stri
 /// 2. **Skills relevant to this turn** — FTS5-retrieved from the skill
 ///    index based on `user_text`.
 ///
-/// Either section is omitted when empty. Order: events first (most
-/// volatile content), skills second.
+/// 3. **Current time** in the owner's time zone, always, and last.
+///
+/// The first two are omitted when empty.
 async fn augment_with_skills(ctx: &Ctx, base: &SystemPrompt, user_text: &str) -> SystemPrompt {
     let mut augmented = base.clone();
-
-    // Section 0: the current time, per call so the frozen base keeps its
-    // prompt cache.
-    let zone = *ctx
-        .timezone
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    augmented = augmented.augmented(&time_section(chrono::Utc::now(), zone));
 
     // Section 1: recent events.
     let days = recent_events_days();
@@ -1641,6 +1636,13 @@ async fn augment_with_skills(ctx: &Ctx, base: &SystemPrompt, user_text: &str) ->
         Err(e) => warn!(error = %e, "skill retrieval failed; skipping section"),
     }
 
+    // Section 3: the current time, last, as it changes every minute: what
+    // comes before it, the frozen base above all, keeps its prompt cache.
+    let zone = *ctx
+        .timezone
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    augmented = augmented.augmented(&time_section(chrono::Utc::now(), zone));
     augmented
 }
 

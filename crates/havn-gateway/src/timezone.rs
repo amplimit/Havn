@@ -101,7 +101,9 @@ pub async fn set(
                     let update = GatewayToAgent::TimezoneUpdate(TimezoneUpdate {
                         timezone: effective.clone(),
                     });
-                    if let Err(e) = registry.send(agent.id, update).await {
+                    // Never wait on a stalled agent; its next Welcome
+                    // carries the zone anyway.
+                    if let Err(e) = registry.try_send(agent.id, update).await {
                         warn!(agent_id = %agent.id, error = ?e, "could not send the new time zone");
                     }
                 }
@@ -135,20 +137,52 @@ pub fn spec() -> GatewayToolSpec {
     }
 }
 
-/// Run `set_timezone` for `owner`'s agent.
+/// `set_timezone` calls one user's agents may make per minute, together.
+pub const TOOL_PER_USER_PER_MINUTE: u32 = 3;
+
+/// Run `set_timezone` for `agent`, owned by `owner`. Audited as
+/// `user.timezone.updated` with the agent.
 pub async fn run_tool(
     db: &SqlitePool,
     registry: &AgentRegistry,
+    rate: &crate::web_search::UserRate,
     owner: UserId,
+    agent: AgentId,
     input: &Value,
 ) -> Result<String, String> {
     let name = input
         .get("timezone")
         .and_then(Value::as_str)
         .ok_or("set_timezone needs a timezone")?;
-    let now = set(db, registry, owner, Some(name)).await?;
+    let wanted = canonical(name)?;
+    if havn_db::repo::users::timezone(db, owner)
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some(&wanted)
+    {
+        return Ok(format!("The user's time zone already is {wanted}."));
+    }
+    if !rate.admit(owner).await {
+        return Err(format!(
+            "the time zone was changed {TOOL_PER_USER_PER_MINUTE} times in the last minute; \
+             ask the user to set it on the dashboard"
+        ));
+    }
+    let now = set(db, registry, owner, Some(&wanted)).await?;
+    crate::audit::record(
+        db,
+        owner,
+        None,
+        Some(agent),
+        "user.timezone.updated",
+        json!({ "timezone": now, "by": "set_timezone" }),
+    )
+    .await;
     Ok(format!(
-        "The user's time zone is now {now}. Their agents tell the time in it from the next turn."
+        "The user's time zone is now {now}. Their agents tell the time in it from the next turn; \
+         they can change it on the dashboard."
     ))
 }
 

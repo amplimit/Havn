@@ -592,6 +592,9 @@ async fn serve() -> anyhow::Result<()> {
         fetch: Arc::new(
             web_fetch::WebFetch::new(cfg.fetch.clone()).context("building the web_fetch client")?,
         ),
+        timezone_rate: Arc::new(web_search::UserRate::new(
+            timezone::TOOL_PER_USER_PER_MINUTE,
+        )),
     };
     let socket_path = cfg.agent_socket_path.clone();
     let socket_task = tokio::spawn(async move {

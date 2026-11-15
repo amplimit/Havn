@@ -158,6 +158,8 @@ pub struct AgentSocketCtx {
     /// Rate limit, page cache and answer model of the `web_fetch` gateway
     /// tool.
     pub fetch: Arc<crate::web_fetch::WebFetch>,
+    /// Rate of the `set_timezone` gateway tool, per owner.
+    pub timezone_rate: Arc<crate::web_search::UserRate>,
 }
 
 /// Bind the Unix-socket listener and accept agent connections forever.
@@ -1278,7 +1280,15 @@ async fn run_set_timezone(
         Ok(None) => return Err(format!("agent {agent_id} not found")),
         Err(e) => return Err(format!("agent lookup failed: {e}")),
     };
-    crate::timezone::run_tool(&ctx.db, &ctx.registry, owner, &call.input).await
+    crate::timezone::run_tool(
+        &ctx.db,
+        &ctx.registry,
+        &ctx.timezone_rate,
+        owner,
+        agent_id,
+        &call.input,
+    )
+    .await
 }
 
 async fn run_web_fetch(
@@ -2210,6 +2220,9 @@ mod tests {
                 crate::web_fetch::WebFetch::new(crate::config::FetchConfig::default())
                     .expect("fetch client"),
             ),
+            timezone_rate: Arc::new(crate::web_search::UserRate::new(
+                crate::timezone::TOOL_PER_USER_PER_MINUTE,
+            )),
         }
     }
 
