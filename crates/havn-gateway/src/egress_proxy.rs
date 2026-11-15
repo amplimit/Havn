@@ -18,7 +18,7 @@ use havn_spawner::network::AgentSubnetPool;
 use sqlx::SqlitePool;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -33,6 +33,8 @@ const DECISION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// How long "allow" (not "always") lets a domain through, and how long a
 /// denial holds before the owner is asked again.
 const DECIDED_FOR: Duration = Duration::from_secs(10 * 60);
+/// How long a connection through the proxy may carry nothing.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Open connections one agent link may have through the proxy.
 const MAX_CONNECTIONS_PER_AGENT: usize = 64;
 /// New questions one agent may raise per minute; past that, domains on
@@ -118,8 +120,6 @@ pub struct EgressProxy {
     multi_user: bool,
     pool: AgentSubnetPool,
     state: std::sync::Mutex<State>,
-    /// Serialises "always allow" writes to an agent's config.
-    saving: Mutex<()>,
 }
 
 /// An agent link's open connection, counted until dropped.
@@ -154,7 +154,6 @@ impl EgressProxy {
             multi_user,
             pool,
             state: std::sync::Mutex::new(State::default()),
-            saving: Mutex::new(()),
         })
     }
 
@@ -164,10 +163,10 @@ impl EgressProxy {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The proxy URL `agent`'s tools use.
+    /// The proxy URL the tools of the agent at link `slot` use.
     #[must_use]
-    pub fn url_for(pool: AgentSubnetPool, agent: AgentId, port: u16) -> String {
-        let net = havn_spawner::network::network_for(agent, pool);
+    pub fn url_for(pool: AgentSubnetPool, slot: u16, port: u16) -> String {
+        let net = havn_spawner::network::network_for(slot, pool);
         format!("http://{}:{port}", net.host_ip)
     }
 
@@ -221,18 +220,15 @@ impl EgressProxy {
         let IpAddr::V4(local) = local else {
             return None;
         };
-        let running = havn_db::repo::agents::list_with_status(
-            &self.db,
-            havn_db::repo::agents::AgentStatus::Running,
-        )
-        .await
-        .ok()?;
-        let mut found = running.into_iter().filter(|agent| {
-            let net = havn_spawner::network::network_for(agent.id, self.pool);
-            net.ns_ip == peer && net.host_ip == local
-        });
-        let agent = found.next()?;
-        found.next().is_none().then_some(agent)
+        let slot = havn_spawner::network::slot_of(peer, self.pool)?;
+        let net = havn_spawner::network::network_for(slot, self.pool);
+        if net.host_ip != local {
+            return None;
+        }
+        let agent = havn_db::repo::agents::at_link(&self.db, slot)
+            .await
+            .ok()??;
+        (agent.status == havn_db::repo::agents::AgentStatus::Running).then_some(agent)
     }
 
     async fn handle(
@@ -294,7 +290,7 @@ impl EgressProxy {
                 .await
                 .map_err(|e| e.to_string())?;
             upstream.write_all(&rest).await.map_err(|e| e.to_string())?;
-            let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            relay(&mut client, &mut upstream).await;
             return Ok(());
         }
         forward_plain(&mut client, &mut upstream, &request, rest).await
@@ -444,45 +440,37 @@ impl EgressProxy {
     /// Add `hosts` to the agent's own allowed domains, on its config as it
     /// is now.
     async fn add_allowed(&self, agent_id: AgentId, hosts: &[String]) -> Result<(), String> {
-        let _saving = self.saving.lock().await;
-        let agent = havn_db::repo::agents::find_by_id(&self.db, agent_id)
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or("the agent is gone")?;
-        let mut config = agent.config.as_object().cloned().unwrap_or_default();
-        let mut policy = config
-            .get("policy")
-            .and_then(serde_json::Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let mut network = policy
-            .get("network_policy")
-            .and_then(serde_json::Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let mut allowed: Vec<String> = network
-            .get("allowed_domains")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        for host in hosts {
-            if !allowed.contains(host) {
-                allowed.push(host.clone());
+        havn_db::repo::agents::update_config(&self.db, agent_id, None, |current| {
+            let mut config = current.as_object().cloned().unwrap_or_default();
+            let mut policy = config
+                .get("policy")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let mut network = policy
+                .get("network_policy")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let mut allowed: Vec<String> = network
+                .get("allowed_domains")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            for host in hosts {
+                if !allowed.contains(host) {
+                    allowed.push(host.clone());
+                }
             }
-        }
-        havn_core::policy::validate_domains("allowed_domains", &allowed)
-            .map_err(|e| e.to_string())?;
-        network.insert("allowed_domains".into(), serde_json::json!(allowed));
-        policy.insert("network_policy".into(), serde_json::Value::Object(network));
-        config.insert("policy".into(), serde_json::Value::Object(policy));
-        havn_db::repo::agents::patch(
-            &self.db,
-            agent.id,
-            None,
-            Some(&serde_json::Value::Object(config)),
-        )
+            havn_core::policy::validate_domains("allowed_domains", &allowed)
+                .map_err(|e| e.to_string())?;
+            network.insert("allowed_domains".into(), serde_json::json!(allowed));
+            policy.insert("network_policy".into(), serde_json::Value::Object(network));
+            config.insert("policy".into(), serde_json::Value::Object(policy));
+            Ok(serde_json::Value::Object(config))
+        })
         .await
+        .map_err(|e| e.to_string())?
         .map(|_| ())
-        .map_err(|e| e.to_string())
     }
 }
 
@@ -716,15 +704,66 @@ async fn forward_plain(
         .map_err(|e| e.to_string())?;
     remaining = remaining.saturating_sub(first as u64);
     if remaining > 0 {
-        let mut body = (&mut *client).take(remaining);
-        tokio::io::copy(&mut body, upstream)
-            .await
-            .map_err(|e| e.to_string())?;
+        copy_idle(&mut (&mut *client).take(remaining), upstream).await?;
     }
-    tokio::io::copy(upstream, client)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    copy_idle(upstream, client).await
+}
+
+/// Copy `from` to `to` until `from` ends, giving up when nothing comes
+/// for [`IDLE_TIMEOUT`].
+async fn copy_idle<R, W>(from: &mut R, to: &mut W) -> Result<(), String>
+where
+    R: tokio::io::AsyncRead + Unpin + ?Sized,
+    W: tokio::io::AsyncWrite + Unpin + ?Sized,
+{
+    let mut buf = vec![0_u8; 16 * 1024];
+    loop {
+        let n = tokio::time::timeout(IDLE_TIMEOUT, from.read(&mut buf))
+            .await
+            .map_err(|_| "idle".to_string())?
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Ok(());
+        }
+        to.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
+    }
+}
+
+/// Both directions of a tunnel, until both end or neither carries
+/// anything for [`IDLE_TIMEOUT`].
+async fn relay(client: &mut TcpStream, upstream: &mut TcpStream) {
+    let (mut client_read, mut client_write) = client.split();
+    let (mut upstream_read, mut upstream_write) = upstream.split();
+    let mut up = vec![0_u8; 16 * 1024];
+    let mut down = vec![0_u8; 16 * 1024];
+    let (mut sending, mut receiving) = (true, true);
+    while sending || receiving {
+        tokio::select! {
+            read = client_read.read(&mut up), if sending => match read {
+                Ok(n) if n > 0 => {
+                    if upstream_write.write_all(&up[..n]).await.is_err() {
+                        return;
+                    }
+                }
+                _ => {
+                    sending = false;
+                    let _ = upstream_write.shutdown().await;
+                }
+            },
+            read = upstream_read.read(&mut down), if receiving => match read {
+                Ok(n) if n > 0 => {
+                    if client_write.write_all(&down[..n]).await.is_err() {
+                        return;
+                    }
+                }
+                _ => {
+                    receiving = false;
+                    let _ = client_write.shutdown().await;
+                }
+            },
+            () = tokio::time::sleep(IDLE_TIMEOUT) => return,
+        }
+    }
 }
 
 async fn reply(stream: &mut TcpStream, code: u16, why: &str) -> std::io::Result<()> {

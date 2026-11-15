@@ -233,27 +233,28 @@ pub async fn patch(
     }
     check_model(&state, req.config.as_ref().and_then(|c| c.get("model")))?;
 
-    // Shallow-merge config patch on top of existing config.
-    let merged_config = req.config.as_ref().map(|patch| {
-        let mut base = agent.config.as_object().cloned().unwrap_or_default();
-        for (k, v) in patch.iter() {
-            // null in the patch clears the key, otherwise overwrite.
-            if v.is_null() {
-                base.remove(k);
-            } else {
-                base.insert(k.clone(), v.clone());
-            }
+    let name = req.name.as_deref().map(str::trim);
+    let updated = match &req.config {
+        // Shallow-merge the config patch on top of the current config.
+        Some(patch) => {
+            let merged = repo::update_config(&state.db, id, name, |current| {
+                let mut base = current.as_object().cloned().unwrap_or_default();
+                for (k, v) in patch {
+                    // null in the patch clears the key, otherwise overwrite.
+                    if v.is_null() {
+                        base.remove(k);
+                    } else {
+                        base.insert(k.clone(), v.clone());
+                    }
+                }
+                Ok::<_, std::convert::Infallible>(serde_json::Value::Object(base))
+            })
+            .await?;
+            let Ok(agent) = merged;
+            agent
         }
-        serde_json::Value::Object(base)
-    });
-
-    let updated = repo::patch(
-        &state.db,
-        id,
-        req.name.as_deref().map(str::trim),
-        merged_config.as_ref(),
-    )
-    .await?;
+        None => repo::patch(&state.db, id, name, None).await?,
+    };
     audit::record_agent_action(
         &state.db,
         user.id,
@@ -446,6 +447,14 @@ pub(crate) async fn start_agent(
         let host_id_slot = repo::host_id_slot(&state.db, id)
             .await
             .map_err(|e| not_spawned(e.into()))?;
+        let link_slot = repo::link_slot(
+            &state.db,
+            id,
+            havn_spawner::network::preferred_slot(id),
+            havn_spawner::network::LINK_SLOTS,
+        )
+        .await
+        .map_err(|e| not_spawned(e.into()))?;
 
         let cfg = AgentSpawnConfig {
             agent_id: id,
@@ -460,6 +469,7 @@ pub(crate) async fn start_agent(
             agent_dns: state.agent_dns.clone(),
             env_passthrough: state.agent_env_passthrough.as_ref().clone(),
             host_id_slot: Some(host_id_slot),
+            link_slot: Some(link_slot),
         };
         let policy =
             policy_resolver::for_session(&state.db, &agent_row, state.trusted_proxies.is_some())

@@ -184,13 +184,16 @@ pub async fn agent_patch(
     if req.is_empty() {
         return Ok(Json(view(&state, &agent).await?));
     }
-    let config = with_web_access(&agent.config, &req);
-    if let Some(policy) = config.get("policy") {
-        serde_json::from_value::<havn_core::Policy>(policy.clone())
-            .map_err(|e| ApiError::BadRequest(format!("config.policy: {e}")))?
-            .validate()?;
-    }
-    let updated = havn_db::repo::agents::patch(&state.db, agent.id, None, Some(&config)).await?;
+    let updated = havn_db::repo::agents::update_config(&state.db, agent.id, None, |current| {
+        let config = with_web_access(current, &req);
+        if let Some(policy) = config.get("policy") {
+            serde_json::from_value::<havn_core::Policy>(policy.clone())
+                .map_err(|e| ApiError::BadRequest(format!("config.policy: {e}")))?
+                .validate()?;
+        }
+        Ok::<_, ApiError>(config)
+    })
+    .await??;
     audit::record_agent_action(
         &state.db,
         user.id,
