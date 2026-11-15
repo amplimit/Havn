@@ -151,10 +151,10 @@ pub struct NewEntry<'a> {
 ///   archived row stays archived (audit) but the agent's view is
 ///   single-valued again.
 ///
-/// - **The agent repeats what the user said** (same value and kind, the
-///   row `user_told`, the caller `agent_inferred` with no `ttl_days`) →
-///   the row stays `user_told` with its lifetime: repeating a fact does
-///   not undo what the user set.
+/// - **A `user_told` row repeated** (same value and kind) → it stays
+///   `user_told`, and without an explicit `ttl_days` it keeps its
+///   lifetime: the agent repeating a fact does not undo what the user
+///   set. The dashboard always passes one.
 ///
 /// Returns the active row's id after the write — capture this and
 /// pass it to [`set_embedding_by_id`] so a concurrent
@@ -215,10 +215,10 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
             if v == new.value && k == new.kind.as_str() =>
         {
             let told = was == Source::UserTold.as_str();
-            let (source, ttl) = if told && new.source == Source::AgentInferred {
-                (Source::UserTold, kept)
-            } else {
-                (new.source, ttl)
+            let source = if told { Source::UserTold } else { new.source };
+            let ttl = match ttl_choice {
+                Ttl::KindDefault if told => kept,
+                _ => ttl,
             };
             sqlx::query(
                 "UPDATE memory \
@@ -1290,9 +1290,10 @@ mod tests {
         .expect("days");
         let row = get(&pool, "trip.dates").await.expect("get").expect("row");
         assert_eq!(row.ttl_days, Some(7));
-        remember(&pool, told).await.expect("default");
+        // Repeated as something the user said, it keeps that too.
+        remember(&pool, told).await.expect("repeat");
         let row = get(&pool, "trip.dates").await.expect("get").expect("row");
-        assert_eq!(row.ttl_days, Kind::Event.default_ttl_days(Source::UserTold));
+        assert_eq!(row.ttl_days, Some(7));
     }
 
     #[tokio::test]

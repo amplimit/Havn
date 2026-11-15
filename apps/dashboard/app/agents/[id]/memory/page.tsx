@@ -433,7 +433,7 @@ function MemoryForm({
     const expiry: MemoryExpiry = mode === "days" ? { days: count } : mode;
     // A new memory without a key gets one; the agent finds memories by
     // what they say, not by key.
-    const chosen = key.trim() || `note.${crypto.getRandomValues(new Uint32Array(1))[0].toString(16)}`;
+    const chosen = entry ? entry.key : key.trim() || `note.${crypto.getRandomValues(new Uint32Array(1))[0].toString(16)}`;
     const failed = await onSave(chosen, { value, kind, expiry }, !entry);
     setSaving(false);
     setError(failed);
