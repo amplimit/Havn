@@ -142,6 +142,37 @@ impl WorkspaceDir {
         }
     }
 
+    /// How many entries of any kind this directory has, counting up to
+    /// `max`.
+    pub fn entry_count(&self, max: usize) -> io::Result<usize> {
+        Ok(std::fs::read_dir(self.proc_path())?.take(max).count())
+    }
+
+    /// `StorageFull` unless the filesystem has `bytes` free for an
+    /// unprivileged user: the root gateway leaves alone what the
+    /// filesystem keeps back for root.
+    pub fn require_free(&self, bytes: u64) -> io::Result<()> {
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `fstatvfs` writes the struct for an open directory fd.
+        if unsafe { libc::fstatvfs(self.dir.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: initialised by the successful call above.
+        let stat = unsafe { stat.assume_init() };
+        #[allow(
+            clippy::useless_conversion,
+            reason = "the field types differ between targets"
+        )]
+        let free = u64::from(stat.f_bavail).saturating_mul(u64::from(stat.f_frsize));
+        if free < bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!("{free} bytes free, {bytes} needed"),
+            ));
+        }
+        Ok(())
+    }
+
     /// Give `file`, created or opened in this directory, the directory's
     /// owner and group.
     fn give_to_owner(&self, file: &File) -> io::Result<()> {
@@ -162,20 +193,18 @@ impl WorkspaceDir {
         }
     }
 
-    /// Names and metadata of up to `max` regular files directly in this
-    /// directory whose names `accept` (symlinks and other entry types are
-    /// skipped). Stops early, so a directory with millions of entries costs
-    /// at most `max` lookups.
+    /// Names and metadata of the regular files among the first `max`
+    /// entries directly in this directory whose names `accept` (symlinks
+    /// and other entry types are skipped). Every entry counts towards
+    /// `max`, so a directory with millions of them costs at most `max`
+    /// lookups.
     pub fn regular_files(
         &self,
         accept: impl Fn(&str) -> bool,
         max: usize,
     ) -> io::Result<Vec<(String, Metadata)>> {
         let mut files = Vec::new();
-        for entry in std::fs::read_dir(self.proc_path())? {
-            if files.len() >= max {
-                break;
-            }
+        for entry in std::fs::read_dir(self.proc_path())?.take(max) {
             let entry = entry?;
             let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                 continue;

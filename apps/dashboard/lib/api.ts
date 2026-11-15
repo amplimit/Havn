@@ -608,7 +608,9 @@ export const api = {
         {
           method: "POST",
           body: file,
-          headers: { "Content-Type": file.type || "application/octet-stream" },
+          // A page on another site cannot set this header, so it cannot
+          // post files in the owner's name.
+          headers: { "Content-Type": file.type || "application/octet-stream", "X-Havn-Upload": "1" },
           cache: "no-store",
         },
       );

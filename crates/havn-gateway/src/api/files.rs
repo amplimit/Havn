@@ -5,7 +5,7 @@
 //! the [`Attachment`] the chat message then carries.
 
 use axum::Json;
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use chrono::Utc;
@@ -20,11 +20,28 @@ use crate::auth::AuthedUser;
 
 /// Largest file the chat takes.
 pub const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
-/// What an agent's inbox may hold in all, and in files.
+/// What an agent's inbox may hold in all, and in entries.
 const MAX_INBOX_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_INBOX_FILES: usize = 5000;
-/// Characters of a sent file's name kept in the saved one.
-const MAX_NAME_CHARS: usize = 100;
+/// Bytes of a sent file's name kept in the saved one: with the stamp, a
+/// number and `.txt` it stays under the 255 bytes a name can have.
+const MAX_NAME_BYTES: usize = 200;
+/// Room the inbox check keeps for a PDF's text, written after it.
+const PDF_TEXT_BYTES: u64 = 8 * 1024 * 1024;
+/// Free space a write leaves on the workspace's filesystem, at least,
+/// counting only what an unprivileged user may use: the root gateway
+/// does not eat into the blocks the filesystem reserves for root.
+const MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
+/// Header the dashboard sends with an upload. A page on another site
+/// cannot set it without a preflight the gateway does not answer, so it
+/// cannot post files here in the owner's name.
+pub const UPLOAD_HEADER: &str = "x-havn-upload";
+
+/// Uploads read and saved at once, across all agents, and PDFs read.
+static UPLOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+/// One check-and-write at a time, so concurrent uploads cannot each find
+/// room the others then take.
+static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Deserialize)]
 pub struct UploadQuery {
@@ -38,9 +55,28 @@ pub async fn upload(
     Path(id): Path<String>,
     Query(q): Query<UploadQuery>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Json<Attachment>, ApiError> {
+    if headers.get(UPLOAD_HEADER).is_none() {
+        return Err(ApiError::Forbidden(format!(
+            "an upload carries the {UPLOAD_HEADER} header"
+        )));
+    }
+    // Before the body is read: whoever may not send files here does not
+    // get 25 MB buffered.
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let _slot = UPLOADS
+        .acquire()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let body = axum::body::to_bytes(body, MAX_UPLOAD_BYTES)
+        .await
+        .map_err(|_| {
+            ApiError::BadRequest(format!(
+                "a file is at most {} MB",
+                MAX_UPLOAD_BYTES / (1024 * 1024)
+            ))
+        })?;
     if body.is_empty() {
         return Err(ApiError::BadRequest("the file is empty".into()));
     }
@@ -53,9 +89,16 @@ pub async fn upload(
 
     let stamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
     let bytes = body.clone();
-    let stored = tokio::task::spawn_blocking(move || save(&workspace, &stamp, &name, &bytes))
-        .await
-        .map_err(|e| ApiError::Internal(format!("saving the file: {e}")))??;
+    let reserve = if media_type == "application/pdf" {
+        PDF_TEXT_BYTES
+    } else {
+        0
+    };
+    let file = name.clone();
+    let stored =
+        tokio::task::spawn_blocking(move || save(&workspace, &stamp, &file, &bytes, reserve))
+            .await
+            .map_err(|e| ApiError::Internal(format!("saving the file: {e}")))??;
 
     // A PDF's text, for the agent to read with file_read. A file whose
     // text cannot be read still arrives.
@@ -67,7 +110,9 @@ pub async fn upload(
                 let text_name = format!("{}.txt", stored.file);
                 let written = text_name.clone();
                 let saved = tokio::task::spawn_blocking(move || {
-                    inbox(&workspace)?.create_new(&written, text.as_bytes())
+                    let inbox = inbox(&workspace)?;
+                    inbox.require_free(text.len() as u64 + MIN_FREE_BYTES)?;
+                    inbox.create_new(&written, text.as_bytes())
                 })
                 .await;
                 match saved {
@@ -90,7 +135,7 @@ pub async fn upload(
 
     let attachment = Attachment {
         path: format!("{INBOX_DIR}/{}", stored.file),
-        name: q.name.chars().take(MAX_NAME_CHARS).collect(),
+        name,
         media_type,
         size: body.len() as u64,
         text_path,
@@ -119,23 +164,39 @@ fn inbox(workspace: &std::path::Path) -> std::io::Result<WorkspaceDir> {
 }
 
 /// Save `bytes` in the inbox as `<stamp>-<name>`, numbered when that is
-/// taken, unless the inbox is full.
+/// taken, unless the inbox would then hold more than its caps (keeping
+/// `reserve` bytes for what goes with the file) or the filesystem too
+/// little free space.
 fn save(
     workspace: &std::path::Path,
     stamp: &str,
     name: &str,
     bytes: &[u8],
+    reserve: u64,
 ) -> Result<Stored, ApiError> {
     let internal = |e: std::io::Error| ApiError::Internal(format!("saving the file: {e}"));
+    let _saving = SAVING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let inbox = inbox(workspace).map_err(internal)?;
+    let entries = inbox.entry_count(MAX_INBOX_FILES + 1).map_err(internal)?;
     let held = inbox
         .regular_files(|_| true, MAX_INBOX_FILES + 1)
         .map_err(internal)?;
     let used: u64 = held.iter().map(|(_, meta)| meta.len()).sum();
-    if held.len() >= MAX_INBOX_FILES || used + bytes.len() as u64 > MAX_INBOX_BYTES {
+    if entries >= MAX_INBOX_FILES || used + bytes.len() as u64 + reserve > MAX_INBOX_BYTES {
         return Err(ApiError::Conflict(
             "the agent's inbox is full; remove files from its inbox/ first".into(),
         ));
+    }
+    match inbox.require_free(bytes.len() as u64 + reserve + MIN_FREE_BYTES) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::StorageFull => {
+            return Err(ApiError::Conflict(
+                "the host is running out of disk space; the file was not saved".into(),
+            ));
+        }
+        Err(e) => return Err(internal(e)),
     }
     for n in 0..100 {
         let file = if n == 0 {
@@ -154,14 +215,23 @@ fn save(
 
 /// `name` as a file name the inbox can hold: its last path component,
 /// without control characters or a leading dot, at most
-/// [`MAX_NAME_CHARS`] characters; `file` when nothing is left.
+/// [`MAX_NAME_BYTES`] bytes, cut at a character in the part before its
+/// extension, which is kept; `file` when nothing is left.
 fn clean_name(name: &str) -> String {
     let last = name.rsplit(['/', '\\']).next().unwrap_or_default();
-    let cleaned: String = last
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_NAME_CHARS)
-        .collect();
+    let whole: String = last.chars().filter(|c| !c.is_control()).collect();
+    let (stem, ext) = match whole.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && ext.len() <= 16 => (stem, format!(".{ext}")),
+        _ => (whole.as_str(), String::new()),
+    };
+    let mut cleaned = String::new();
+    for c in stem.chars() {
+        if cleaned.len() + c.len_utf8() + ext.len() > MAX_NAME_BYTES {
+            break;
+        }
+        cleaned.push(c);
+    }
+    cleaned.push_str(&ext);
     let cleaned = cleaned.trim().trim_start_matches('.').to_string();
     if cleaned.is_empty() {
         "file".into()
@@ -227,7 +297,17 @@ mod tests {
         assert_eq!(clean_name("a\nb.txt"), "ab.txt");
         assert_eq!(clean_name(""), "file");
         assert_eq!(clean_name("..."), "file");
-        assert_eq!(clean_name(&"x".repeat(300)).chars().count(), MAX_NAME_CHARS);
+        assert_eq!(clean_name(&"x".repeat(300)).len(), MAX_NAME_BYTES);
+        let long = clean_name(&"报".repeat(100));
+        assert!(
+            long.len() <= MAX_NAME_BYTES && long.chars().all(|c| c == '报'),
+            "{long}"
+        );
+        let kept = clean_name(&format!("{}.pdf", "报".repeat(120)));
+        assert!(
+            kept.ends_with("报.pdf") && kept.len() <= MAX_NAME_BYTES,
+            "{kept}"
+        );
     }
 
     #[test]
@@ -250,9 +330,9 @@ mod tests {
     #[test]
     fn files_are_saved_in_the_inbox_without_following_links() {
         let dir = tempfile::tempdir().expect("tmp");
-        let first = save(dir.path(), "20261115-120000", "a.txt", b"one").expect("save");
+        let first = save(dir.path(), "20261115-120000", "a.txt", b"one", 0).expect("save");
         assert_eq!(first.file, "20261115-120000-a.txt");
-        let second = save(dir.path(), "20261115-120000", "a.txt", b"two").expect("save");
+        let second = save(dir.path(), "20261115-120000", "a.txt", b"two", 0).expect("save");
         assert_eq!(second.file, "20261115-120000-1-a.txt");
         assert_eq!(
             std::fs::read(dir.path().join("inbox").join(&first.file)).unwrap(),
@@ -263,7 +343,7 @@ mod tests {
         let other = tempfile::tempdir().expect("tmp");
         let ws = tempfile::tempdir().expect("tmp");
         std::os::unix::fs::symlink(other.path(), ws.path().join("inbox")).expect("link");
-        assert!(save(ws.path(), "20261115-120000", "a.txt", b"x").is_err());
+        assert!(save(ws.path(), "20261115-120000", "a.txt", b"x", 0).is_err());
         assert_eq!(std::fs::read_dir(other.path()).unwrap().count(), 0);
     }
 }

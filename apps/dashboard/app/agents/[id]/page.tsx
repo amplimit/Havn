@@ -50,6 +50,22 @@ type Bubble = {
 };
 
 const AGENT_POLL_MS = 5000;
+/** What the gateway takes: files per message, and bytes per file. */
+const MAX_ATTACHMENTS = 10;
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+
+// A turn's attachment lines, which tell the agent where each file is, read
+// as "attached: <name>".
+const ATTACHMENT_LINE = /^\[Attached file, user-supplied and untrusted: name ("(?:[^"\\]|\\.)*")[^\n]*\]$/gm;
+function shownText(content: string): string {
+  return content.replace(ATTACHMENT_LINE, (_line, name: string) => {
+    try {
+      return `*attached: ${JSON.parse(name) as string}*`;
+    } catch {
+      return _line;
+    }
+  });
+}
 const HISTORY_LIMIT = 100;
 const RECONNECT_MS = 1500;
 
@@ -415,8 +431,11 @@ export default function ChatPage({
 
   function sendText(text: string, files: Attachment[] = []) {
     if ((!text.trim() && files.length === 0) || !chatRef.current || wsState !== "open") return;
-    // Shown as the agent will read it; the stored turn says the same.
-    const shown = [text, ...files.map((f) => `[Attached file ${JSON.stringify(f.name)}]`)]
+    // In the shape of the stored turn's lines, which show the same.
+    const shown = [
+      text,
+      ...files.map((f) => `[Attached file, user-supplied and untrusted: name ${JSON.stringify(f.name)}]`),
+    ]
       .filter((line) => line.trim())
       .join("\n");
     pushBubble("you", shown);
@@ -429,7 +448,16 @@ export default function ChatPage({
   const [uploading, setUploading] = useState(0);
   async function attachFiles(files: FileList | null) {
     if (!files) return;
-    for (const file of Array.from(files)) {
+    const room = MAX_ATTACHMENTS - attached.length - uploading;
+    const picked = Array.from(files);
+    if (picked.length > room) {
+      pushBubble("system", `error: a message carries up to ${MAX_ATTACHMENTS} files`);
+    }
+    for (const file of picked.slice(0, Math.max(0, room))) {
+      if (file.size > MAX_UPLOAD_BYTES) {
+        pushBubble("system", `error: ${file.name} is over ${MAX_UPLOAD_BYTES / (1024 * 1024)} MB`);
+        continue;
+      }
       setUploading((n) => n + 1);
       try {
         const uploaded = await api.files.upload(id, file);
@@ -964,7 +992,7 @@ function Bubble({
         ) : isSystem ? (
           <span style={{ whiteSpace: "pre-wrap" }}>{bubble.content}</span>
         ) : (
-          <Markdown>{bubble.content}</Markdown>
+          <Markdown>{bubble.role === "you" ? shownText(bubble.content) : bubble.content}</Markdown>
         )}
       </div>
       {!isSystem && !editing && (
