@@ -162,6 +162,18 @@ pub async fn list() -> anyhow::Result<()> {
 pub async fn delete(id: &str) -> anyhow::Result<()> {
     let user_id = parse_user_id(id)?;
     let pool = open_db().await?;
+    // A running gateway may have the user's agents running: deleting
+    // their rows under it would leave their sandboxes running, unknown to
+    // it, and hand their links to new agents.
+    let agents = havn_db::repo::agents::count_for_owner(&pool, user_id)
+        .await
+        .context("counting the user's agents")?;
+    if agents > 0 && crate::gateway::running() {
+        anyhow::bail!(
+            "user {user_id} owns {agents} agent(s) and the gateway is running: delete the \
+             agents first (dashboard or `havn agent delete`), or stop the gateway"
+        );
+    }
     // Hard-delete. FK cascades on agents.owner_id wipe the user's
     // agents, on credentials they take their credentials, on
     // credential_usages the usage rows. audit_log SETs NULL on the

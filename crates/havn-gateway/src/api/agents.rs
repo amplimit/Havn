@@ -673,7 +673,13 @@ pub async fn delete(
     if let Some(handle) = state.registry.remove(id).await
         && let Err(e) = state.spawner.stop(&handle).await
     {
-        warn!(agent_id = %id, error = %e, "spawner.stop during delete failed");
+        // Kept, so its sandbox is not left running unknown to the
+        // gateway with its link handed to another agent.
+        warn!(agent_id = %id, error = %e, "spawner.stop during delete failed; agent kept");
+        repo::set_status(&state.db, id, AgentStatus::Error).await?;
+        return Err(ApiError::Internal(format!(
+            "agent {id} could not be stopped, so it was not deleted: {e}"
+        )));
     }
 
     // Audit BEFORE delete so the FK SET NULL on agent_id doesn't lose

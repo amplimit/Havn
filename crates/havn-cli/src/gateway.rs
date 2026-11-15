@@ -268,6 +268,17 @@ pub fn status() -> anyhow::Result<()> {
 /// Best-effort TCP connect probe. We're not validating that the gateway
 /// actually answered — just that *something* accepts on the port. The
 /// caller chases the API endpoint for richer health if needed.
+/// Whether the configured gateway runs: its pid file names a live
+/// process, or something answers on its listen address.
+pub fn running() -> bool {
+    let cfg = paths::load_config().unwrap_or_default();
+    let alive = paths::read_pid(&paths::pid_file(&cfg))
+        .ok()
+        .flatten()
+        .is_some_and(paths::pid_alive);
+    alive || tcp_probe(&paths::listen_addr(&cfg))
+}
+
 fn tcp_probe(addr: &str) -> bool {
     match std::net::ToSocketAddrs::to_socket_addrs(&addr) {
         Ok(mut iter) => iter.any(|sa| {
