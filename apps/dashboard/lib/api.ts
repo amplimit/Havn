@@ -59,6 +59,29 @@ export type AgentWebView = {
   egress_permitted: boolean;
   /** The backend this agent would search with, or null when none is set up. */
   search_backend: string | null;
+  /** The agent's own domain lists. */
+  allowed_domains: string[];
+  blocked_domains: string[];
+  /** Added from the owner: their role's and their own lists, the operator's blocks. */
+  inherited_allowed_domains: string[];
+  inherited_blocked_domains: string[];
+};
+
+/** `/me/domains`: the caller's own domain lists, for all their agents. */
+export type MyDomainsView = {
+  allowed_domains: string[];
+  blocked_domains: string[];
+  /** Set by the caller's roles and the operator; not removable. */
+  admin_allowed_domains: string[];
+  admin_blocked_domains: string[];
+};
+
+export type AgentWebPatch = {
+  can_search_web?: boolean;
+  can_fetch_web?: boolean;
+  egress_allowed?: boolean;
+  allowed_domains?: string[];
+  blocked_domains?: string[];
 };
 
 export type MemoryKind = "identity" | "preference" | "project" | "event";
@@ -373,13 +396,16 @@ export const api = {
   search: {
     get: () => request<SearchStatus>("/search"),
     agent: (agentId: string) => request<AgentWebView>(`/agents/${agentId}/web`),
-    patchAgent: (
-      agentId: string,
-      patch: { can_search_web?: boolean; can_fetch_web?: boolean; egress_allowed?: boolean },
-    ) =>
+    patchAgent: (agentId: string, patch: AgentWebPatch) =>
       request<AgentWebView>(`/agents/${agentId}/web`, {
         method: "PATCH",
         body: JSON.stringify(patch),
+      }),
+    myDomains: () => request<MyDomainsView>("/me/domains"),
+    putMyDomains: (lists: { allowed_domains: string[]; blocked_domains: string[] }) =>
+      request<MyDomainsView>("/me/domains", {
+        method: "PUT",
+        body: JSON.stringify(lists),
       }),
   },
 

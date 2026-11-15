@@ -2,9 +2,14 @@
 //! the dashboard and `havn doctor` can say whether search works and how to
 //! turn it on.
 //!
-//! `/agents/{id}/web`: one agent's web access, `web_search` and network
-//! egress, as two switches in its policy override. Edits apply on the
-//! agent's next start, like every policy change.
+//! `/agents/{id}/web`: one agent's web access, the `web_search`,
+//! `web_fetch` and egress switches and its own domain lists, in its policy
+//! override. Edits apply on the agent's next start, like every policy
+//! change.
+//!
+//! `/me/domains`: the caller's own domain lists, added to every agent they
+//! own, beside the blocked domains of their roles and the operator, which
+//! they cannot remove.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -59,6 +64,13 @@ pub struct AgentWebView {
     /// The backend this agent's searches would use, or `None` when its
     /// owner has none set up.
     pub search_backend: Option<&'static str>,
+    /// The agent's own domain lists, from its policy override.
+    pub allowed_domains: Vec<String>,
+    pub blocked_domains: Vec<String>,
+    /// What the agent gets from its owner on top: their role's lists,
+    /// their own and the operator's blocked domains.
+    pub inherited_allowed_domains: Vec<String>,
+    pub inherited_blocked_domains: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -67,6 +79,46 @@ pub struct AgentWebPatch {
     pub can_search_web: Option<bool>,
     pub can_fetch_web: Option<bool>,
     pub egress_allowed: Option<bool>,
+    /// Replace the agent's own lists.
+    pub allowed_domains: Option<Vec<String>>,
+    pub blocked_domains: Option<Vec<String>>,
+}
+
+impl AgentWebPatch {
+    fn is_empty(&self) -> bool {
+        self.can_search_web.is_none()
+            && self.can_fetch_web.is_none()
+            && self.egress_allowed.is_none()
+            && self.allowed_domains.is_none()
+            && self.blocked_domains.is_none()
+    }
+}
+
+/// The agent's own `network_policy.<key>` list from its override.
+fn own_domains(agent: &Agent, key: &str) -> Vec<String> {
+    agent
+        .config
+        .pointer(&format!("/policy/network_policy/{key}"))
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Entries trimmed and lowercased, blanks and repeats dropped.
+fn tidy_domains(list: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in list {
+        let entry = entry.trim().trim_end_matches('.').to_ascii_lowercase();
+        if !entry.is_empty() && !out.contains(&entry) {
+            out.push(entry);
+        }
+    }
+    out
 }
 
 async fn view(state: &AppState, agent: &Agent) -> Result<AgentWebView, ApiError> {
@@ -98,6 +150,10 @@ async fn view(state: &AppState, agent: &Agent) -> Result<AgentWebView, ApiError>
         fetch_permitted: !multi_user || owner.permissions.can_fetch_web,
         egress_permitted: !multi_user || egress(&owner),
         search_backend: backend.map(crate::web_search::Backend::name),
+        allowed_domains: own_domains(agent, "allowed_domains"),
+        blocked_domains: own_domains(agent, "blocked_domains"),
+        inherited_allowed_domains: owner.network_policy.allowed_domains,
+        inherited_blocked_domains: owner.network_policy.blocked_domains,
     })
 }
 
@@ -119,7 +175,7 @@ pub async fn agent_patch(
     Json(req): Json<AgentWebPatch>,
 ) -> Result<Json<AgentWebView>, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
-    if req.can_search_web.is_none() && req.can_fetch_web.is_none() && req.egress_allowed.is_none() {
+    if req.is_empty() {
         return Ok(Json(view(&state, &agent).await?));
     }
     let config = with_web_access(&agent.config, &req);
@@ -138,6 +194,8 @@ pub async fn agent_patch(
             "can_search_web": req.can_search_web,
             "can_fetch_web": req.can_fetch_web,
             "egress_allowed": req.egress_allowed,
+            "allowed_domains": req.allowed_domains.as_deref().map(tidy_domains),
+            "blocked_domains": req.blocked_domains.as_deref().map(tidy_domains),
         }),
     )
     .await;
@@ -153,30 +211,109 @@ fn with_web_access(config: &Value, patch: &AgentWebPatch) -> Value {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let mut set = |section: &str, key: &str, value: bool| {
+    let mut set = |section: &str, key: &str, value: Value| {
         let mut map = policy
             .get(section)
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
-        map.insert(key.into(), Value::Bool(value));
+        map.insert(key.into(), value);
         policy.insert(section.into(), Value::Object(map));
     };
     if let Some(on) = patch.can_search_web {
-        set("permissions", "can_search_web", on);
+        set("permissions", "can_search_web", Value::Bool(on));
     }
     if let Some(on) = patch.can_fetch_web {
-        set("permissions", "can_fetch_web", on);
+        set("permissions", "can_fetch_web", Value::Bool(on));
+    }
+    if let Some(list) = &patch.allowed_domains {
+        set(
+            "network_policy",
+            "allowed_domains",
+            tidy_domains(list).into(),
+        );
+    }
+    if let Some(list) = &patch.blocked_domains {
+        set(
+            "network_policy",
+            "blocked_domains",
+            tidy_domains(list).into(),
+        );
     }
     if let Some(on) = patch.egress_allowed {
-        set("network_policy", "egress_allowed", on);
+        set("network_policy", "egress_allowed", Value::Bool(on));
         // Egress without the permission would leave the agent offline.
         if on {
-            set("permissions", "can_access_network", true);
+            set("permissions", "can_access_network", Value::Bool(true));
         }
     }
     config.insert("policy".into(), Value::Object(policy));
     Value::Object(config)
+}
+
+#[derive(Debug, Serialize)]
+pub struct MyDomainsView {
+    /// The caller's own lists.
+    pub allowed_domains: Vec<String>,
+    pub blocked_domains: Vec<String>,
+    /// Set by their roles and the operator; they cannot remove these.
+    pub admin_allowed_domains: Vec<String>,
+    pub admin_blocked_domains: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MyDomainsPut {
+    pub allowed_domains: Vec<String>,
+    pub blocked_domains: Vec<String>,
+}
+
+async fn my_view(state: &AppState, user: &AuthedUser) -> Result<MyDomainsView, ApiError> {
+    let own = havn_db::repo::users::domains(&state.db, user.id).await?;
+    let roles = policy_resolver::for_user(&state.db, user.id).await;
+    Ok(MyDomainsView {
+        allowed_domains: own.allowed_domains,
+        blocked_domains: own.blocked_domains,
+        admin_allowed_domains: roles.network_policy.allowed_domains,
+        admin_blocked_domains: havn_core::policy::union(
+            &roles.network_policy.blocked_domains,
+            policy_resolver::operator_blocked_domains(),
+        ),
+    })
+}
+
+pub async fn me_get(
+    State(state): State<AppState>,
+    user: AuthedUser,
+) -> Result<Json<MyDomainsView>, ApiError> {
+    Ok(Json(my_view(&state, &user).await?))
+}
+
+/// Replace the caller's own lists. They apply to the caller's agents on
+/// their next start.
+pub async fn me_put(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Json(req): Json<MyDomainsPut>,
+) -> Result<Json<MyDomainsView>, ApiError> {
+    let lists = havn_db::repo::users::UserDomains {
+        allowed_domains: tidy_domains(&req.allowed_domains),
+        blocked_domains: tidy_domains(&req.blocked_domains),
+    };
+    havn_core::policy::validate_domains("allowed_domains", &lists.allowed_domains)?;
+    havn_core::policy::validate_domains("blocked_domains", &lists.blocked_domains)?;
+    havn_db::repo::users::set_domains(&state.db, user.id, &lists).await?;
+    audit::record_user_action(
+        &state.db,
+        user.id,
+        "user.domains.updated",
+        serde_json::json!({
+            "allowed_domains": lists.allowed_domains,
+            "blocked_domains": lists.blocked_domains,
+        }),
+    )
+    .await;
+    Ok(Json(my_view(&state, &user).await?))
 }
 
 #[cfg(test)]
@@ -202,6 +339,7 @@ mod tests {
                 can_search_web: Some(false),
                 can_fetch_web: Some(false),
                 egress_allowed: Some(true),
+                ..AgentWebPatch::default()
             },
         );
         assert_eq!(
@@ -232,14 +370,36 @@ mod tests {
         let off = with_web_access(
             &json!({}),
             &AgentWebPatch {
-                can_search_web: None,
-                can_fetch_web: None,
                 egress_allowed: Some(false),
+                ..AgentWebPatch::default()
             },
         );
         assert_eq!(
             off,
             json!({"policy": {"network_policy": {"egress_allowed": false}}})
+        );
+    }
+
+    #[test]
+    fn domain_lists_replace_the_agents_own_and_are_tidied() {
+        let config = json!({
+            "policy": {"network_policy": {"blocked_domains": ["old.example"], "egress_allowed": true}}
+        });
+        let patched = with_web_access(
+            &config,
+            &AgentWebPatch {
+                allowed_domains: Some(vec![" Docs.RS. ".into(), "docs.rs".into(), String::new()]),
+                blocked_domains: Some(vec!["ads.example".into()]),
+                ..AgentWebPatch::default()
+            },
+        );
+        assert_eq!(
+            patched,
+            json!({"policy": {"network_policy": {
+                "allowed_domains": ["docs.rs"],
+                "blocked_domains": ["ads.example"],
+                "egress_allowed": true
+            }}})
         );
     }
 }

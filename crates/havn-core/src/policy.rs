@@ -100,8 +100,48 @@ impl Policy {
                 )));
             }
         }
+        validate_domains(
+            "network_policy.allowed_domains",
+            &self.network_policy.allowed_domains,
+        )?;
+        validate_domains(
+            "network_policy.blocked_domains",
+            &self.network_policy.blocked_domains,
+        )?;
         self.hooks.validate()
     }
+}
+
+/// Most entries in one domain list.
+pub const MAX_DOMAINS: usize = 500;
+
+/// Checks a domain list: at most [`MAX_DOMAINS`] entries, each an ASCII
+/// host name of two labels or more (letters, digits, `-`, `.`, optionally
+/// after `*.`), without scheme, port or path.
+pub fn validate_domains(what: &str, domains: &[String]) -> crate::Result<()> {
+    if domains.len() > MAX_DOMAINS {
+        return Err(crate::Error::InvalidPolicy(format!(
+            "{what}: more than {MAX_DOMAINS} entries"
+        )));
+    }
+    for entry in domains {
+        let name = entry.strip_prefix("*.").unwrap_or(entry);
+        // A single label (`com`) would cover a whole top-level domain.
+        let valid = name.contains('.')
+            && name.len() <= 253
+            && !name.starts_with(['.', '-'])
+            && name.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            });
+        if !valid {
+            return Err(crate::Error::InvalidPolicy(format!(
+                "{what}: {entry:?} is not a domain such as example.com or *.example.com"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl HookPolicy {
@@ -468,7 +508,9 @@ impl Policy {
             network_policy: NetworkPolicy {
                 egress_allowed: self.network_policy.egress_allowed
                     && ceiling.network_policy.egress_allowed,
-                allowed_domains: narrow_allowlist(
+                // Both lists only add: allowed domains are trust the agent
+                // may add, blocked domains are restrictions it may add.
+                allowed_domains: union(
                     &self.network_policy.allowed_domains,
                     &ceiling.network_policy.allowed_domains,
                 ),
@@ -544,11 +586,13 @@ impl Policy {
             network_policy: NetworkPolicy {
                 egress_allowed: self.network_policy.egress_allowed
                     || other.network_policy.egress_allowed,
-                allowed_domains: widen_allowlist(
+                // Every role's blocked domains hold, as its hook rules do:
+                // a second role does not lift an admin's block.
+                allowed_domains: union(
                     &self.network_policy.allowed_domains,
                     &other.network_policy.allowed_domains,
                 ),
-                blocked_domains: intersect(
+                blocked_domains: union(
                     &self.network_policy.blocked_domains,
                     &other.network_policy.blocked_domains,
                 ),
@@ -597,14 +641,6 @@ fn widen_wildcard_list(a: &[String], b: &[String]) -> Vec<String> {
         vec!["*".to_string()]
     } else {
         union(a, b)
-    }
-}
-
-fn widen_allowlist(a: &[String], b: &[String]) -> Vec<String> {
-    if a.is_empty() || b.is_empty() {
-        Vec::new()
-    } else {
-        widen_wildcard_list(a, b)
     }
 }
 
@@ -677,14 +713,6 @@ fn narrow_wildcard_list(own: &[String], cap: &[String]) -> Vec<String> {
     }
 }
 
-fn narrow_allowlist(own: &[String], cap: &[String]) -> Vec<String> {
-    match (own.is_empty(), cap.is_empty()) {
-        (true, _) => cap.to_vec(),
-        (false, true) => own.to_vec(),
-        (false, false) => narrow_wildcard_list(own, cap),
-    }
-}
-
 fn narrow_channels(own: &ChannelAllowance, cap: &ChannelAllowance) -> ChannelAllowance {
     match (own, cap) {
         (ChannelAllowance::All, other) | (other, ChannelAllowance::All) => other.clone(),
@@ -694,7 +722,9 @@ fn narrow_channels(own: &ChannelAllowance, cap: &ChannelAllowance) -> ChannelAll
     }
 }
 
-fn union(a: &[String], b: &[String]) -> Vec<String> {
+/// `a` followed by the entries of `b` it lacks.
+#[must_use]
+pub fn union(a: &[String], b: &[String]) -> Vec<String> {
     let mut out = a.to_vec();
     out.extend(b.iter().filter(|x| !a.contains(x)).cloned());
     out
@@ -714,6 +744,58 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn domain_lists_only_add_when_merged() {
+        let mut role = Policy::default();
+        role.network_policy.allowed_domains = vec!["corp.example".into()];
+        role.network_policy.blocked_domains = vec!["evil.example".into()];
+        let mut agent = Policy::default();
+        agent.network_policy.allowed_domains = vec!["docs.rs".into()];
+        agent.network_policy.blocked_domains = vec!["ads.example".into()];
+        let p = agent.clamp_to(&role);
+        assert_eq!(
+            p.network_policy.allowed_domains,
+            ["docs.rs", "corp.example"]
+        );
+        assert_eq!(
+            p.network_policy.blocked_domains,
+            ["ads.example", "evil.example"]
+        );
+
+        let other_role = Policy::default();
+        let both = role.widen_with(&other_role);
+        assert_eq!(
+            both.network_policy.blocked_domains,
+            ["evil.example"],
+            "a block holds"
+        );
+        assert_eq!(both.network_policy.allowed_domains, ["corp.example"]);
+    }
+
+    #[test]
+    fn domain_entries_are_validated() {
+        let mut p = Policy::default();
+        p.network_policy.allowed_domains = vec!["example.com".into(), "*.docs.rs".into()];
+        assert!(p.validate().is_ok());
+        for bad in [
+            "https://example.com",
+            "example.com/path",
+            "a..b",
+            "",
+            "*",
+            "com",
+            "*.com",
+            "ex ample.com",
+            "-x.com",
+            "例子.com",
+        ] {
+            p.network_policy.blocked_domains = vec![bad.into()];
+            assert!(p.validate().is_err(), "{bad:?} accepted");
+        }
+        p.network_policy.blocked_domains = vec!["x.com".into(); MAX_DOMAINS + 1];
+        assert!(p.validate().is_err());
+    }
 
     #[test]
     fn domains_match_themselves_and_their_subdomains() {
