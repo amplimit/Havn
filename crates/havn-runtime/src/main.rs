@@ -104,6 +104,16 @@ const HANDSHAKE_RETRY_DELAYS: [std::time::Duration; 3] = [
 ];
 /// Number of recent turns retrieved per channel for context build.
 const HISTORY_WINDOW: u32 = 40;
+/// Turns a chat runs past [`HISTORY_WINDOW`] before its oldest ones are
+/// folded into its summary (issue #105): the model is given the summary
+/// and 40 to 60 turns.
+const SUMMARY_BATCH: u32 = 20;
+/// Longest chat summary kept, in characters.
+const MAX_SUMMARY_CHARS: usize = 6000;
+/// Characters of each turn the summariser reads.
+const SUMMARY_TURN_CHARS: usize = 4000;
+/// Lasting facts one summary pass may save to memory.
+const MAX_FLUSHED_FACTS: usize = 5;
 /// Hard cap on the number of LLM ↔ tool round trips per inbound message.
 /// Bounds runaway loops from buggy tool calls or model mis-behaviour.
 ///
@@ -1632,19 +1642,21 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         }
     };
 
-    let history = match conversations::branch(&ctx.pool, &chat, HISTORY_WINDOW).await {
-        Ok(h) => h,
-        Err(e) => {
-            error!(error = %e, "could not load conversation history");
-            send_text(
-                &ctx,
-                msg.channel_id,
-                Some(chat),
-                format!("(internal error: {e})"),
-            );
-            return;
-        }
-    };
+    // The latest turns, and the summary of what came before them.
+    let (summary, history) =
+        match conversations::context(&ctx.pool, &chat, HISTORY_WINDOW, SUMMARY_BATCH).await {
+            Ok(c) => (c.summary, c.turns),
+            Err(e) => {
+                error!(error = %e, "could not load conversation history");
+                send_text(
+                    &ctx,
+                    msg.channel_id,
+                    Some(chat),
+                    format!("(internal error: {e})"),
+                );
+                return;
+            }
+        };
 
     // Initial messages array from persisted history (already includes the user
     // turn we just wrote). Each entry is a JSON value so we can append
@@ -1675,6 +1687,14 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     // Augment the frozen system prompt with FTS-retrieved skills relevant
     // to the user's turn (spec §9.3). Per-call only; base stays frozen.
     let augmented = augment_with_skills(&ctx, &ctx.system_prompt, &user_text).await;
+    let augmented = match &summary {
+        Some(summary) => augmented.augmented(&format!(
+            "## Earlier in this conversation\n\n\
+             The turns before the ones you are given, summarised. When you \
+             need their exact words, use conversation_search.\n\n{summary}"
+        )),
+        None => augmented,
+    };
 
     let final_text = match tools::gateway::CONVERSATION
         .scope(
@@ -1704,7 +1724,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     // Under the turn it answers, also when the user moved to another
     // branch meanwhile.
     match conversations::record_reply(&ctx.pool, &chat, &answered, &final_text).await {
-        Ok(Some(_)) => {}
+        Ok(Some(_)) => summarize_when_due(&ctx, &chat),
         // The chat was deleted while it ran: its reply goes nowhere.
         Ok(None) => return,
         Err(e) => warn!(error = %e, "could not persist assistant turn"),
@@ -1906,6 +1926,143 @@ fn rows_within_budget<T: serde::Serialize>(
         kept.reverse();
     }
     Ok(kept)
+}
+
+/// Chats a summary pass is running for; one at a time per chat.
+static SUMMARIZING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Fold the oldest turns of chat `chat` into its summary in the
+/// background, once enough have gone past the window (issue #105).
+fn summarize_when_due(ctx: &Ctx, chat: &str) {
+    let chat = chat.to_string();
+    if !SUMMARIZING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(chat.clone())
+    {
+        return;
+    }
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        if let Err(e) = summarize(&ctx, &chat).await {
+            warn!(%chat, error = %e, "could not summarise the chat");
+        }
+        SUMMARIZING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&chat);
+    });
+}
+
+const SUMMARY_PROMPT: &str = "\
+You keep the running summary of a long conversation between a user and an \
+AI assistant, so the assistant can go on with it once its oldest turns are \
+no longer shown. Merge the summary so far, if there is one, with the turns \
+to add. Keep what the user wants and decided, facts, numbers and names they \
+gave, files and links that came up, and open questions and promises. Leave \
+out greetings and small talk. Write in the language of the conversation, at \
+most 400 words.\n\
+\n\
+Also list facts about the user worth keeping beyond this conversation \
+(who they are, lasting preferences, ongoing projects) that the turns to add \
+state, at most 5. None is fine; do not repeat passing details.\n\
+\n\
+Answer with JSON only: {\"summary\": \"...\", \"remember\": [{\"key\": \
+\"user.editor\", \"value\": \"...\", \"kind\": \"identity|preference|project|event\"}]}";
+
+async fn summarize(ctx: &Ctx, chat: &str) -> anyhow::Result<()> {
+    use std::fmt::Write as _;
+    let Some(due) =
+        conversations::summary_due(&ctx.pool, chat, HISTORY_WINDOW, SUMMARY_BATCH).await?
+    else {
+        return Ok(());
+    };
+    let mut transcript = String::new();
+    if let Some(previous) = &due.previous {
+        writeln!(transcript, "Summary so far:\n{previous}\n")?;
+    }
+    transcript.push_str("Turns to add:\n");
+    for turn in &due.turns {
+        if matches!(turn.role, Role::User | Role::Assistant) {
+            let text: String = turn.content.chars().take(SUMMARY_TURN_CHARS).collect();
+            writeln!(
+                transcript,
+                "\n[{}] {}:\n{text}",
+                turn.created_at.format("%Y-%m-%d %H:%M"),
+                turn.role.as_str()
+            )?;
+        }
+    }
+    let request = havn_proto::LlmRequest {
+        request_id: uuid::Uuid::now_v7().to_string(),
+        model: ctx.model.as_str().into(),
+        messages: serde_json::json!([{ "role": "user", "content": transcript }]),
+        options: serde_json::json!({ "max_tokens": 2048, "system": SUMMARY_PROMPT }),
+        billing_user_id: None,
+    };
+    let response = tool_loop::request_llm(&ctx.writer_tx, &ctx.pending, request).await?;
+    let text = match response.outcome {
+        havn_proto::LlmOutcome::Ok => curator::extract_text(&response.provider_response)
+            .ok_or_else(|| anyhow!("the summary had no text"))?,
+        havn_proto::LlmOutcome::Error { message } => return Err(anyhow!("LLM error: {message}")),
+    };
+    let (summary, facts) = parse_summary(&text);
+    if summary.is_empty() {
+        return Err(anyhow!("the summary was empty"));
+    }
+    // The memory flush: what should outlast the turns that leave the
+    // window is saved before they do.
+    for (key, value, kind) in facts.into_iter().take(MAX_FLUSHED_FACTS) {
+        let entry = havn_db::agent::memory::NewEntry {
+            key: &key,
+            value: &value,
+            kind,
+            source: havn_db::agent::memory::Source::AgentInferred,
+            ttl_days: None,
+        };
+        if let Err(e) = tools::memory::save(false, &ctx.tool_env, entry).await {
+            warn!(%key, error = %e, "could not save a fact from the chat summary");
+        }
+    }
+    if conversations::save_summary(&ctx.pool, chat, &due.through, &summary).await? {
+        info!(%chat, folded = due.turns.len(), "chat summary updated");
+    }
+    Ok(())
+}
+
+/// The summary and the facts to remember in what the summariser
+/// answered; its whole text as the summary when that is not the JSON
+/// asked for.
+fn parse_summary(text: &str) -> (String, Vec<(String, String, havn_db::agent::memory::Kind)>) {
+    let cut = |s: &str| s.trim().chars().take(MAX_SUMMARY_CHARS).collect::<String>();
+    let json = text
+        .find('{')
+        .zip(text.rfind('}'))
+        .filter(|(start, end)| start < end)
+        .and_then(|(start, end)| {
+            serde_json::from_str::<serde_json::Value>(&text[start..=end]).ok()
+        });
+    let Some(json) = json else {
+        return (cut(text.trim().trim_matches('`')), Vec::new());
+    };
+    let Some(summary) = json.get("summary").and_then(serde_json::Value::as_str) else {
+        return (cut(text), Vec::new());
+    };
+    let facts = json
+        .get("remember")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|fact| {
+            let key = fact.get("key")?.as_str()?.trim();
+            let value = fact.get("value")?.as_str()?.trim();
+            let kind = havn_db::agent::memory::Kind::parse(fact.get("kind")?.as_str()?)?;
+            (havn_proto::check_memory(key, value, havn_proto::MemoryExpiry::KindDefault).is_ok())
+                .then(|| (key.to_string(), value.to_string(), kind))
+        })
+        .collect();
+    (cut(summary), facts)
 }
 
 /// Answer a dashboard read with rows from this agent's own database.
@@ -2279,6 +2436,23 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_summary_and_the_facts_to_keep_are_read_from_the_answer() {
+        let (summary, facts) = parse_summary(
+            "```json
+{\"summary\": \"They planned a Kyoto trip.\", \"remember\": [             {\"key\": \"user.city\", \"value\": \"lives in Osaka\", \"kind\": \"identity\"},             {\"key\": \"\", \"value\": \"no key\", \"kind\": \"identity\"},             {\"key\": \"x\", \"value\": \"bad kind\", \"kind\": \"mood\"}]}
+```",
+        );
+        assert_eq!(summary, "They planned a Kyoto trip.");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].0, "user.city");
+        let (summary, facts) = parse_summary("Just prose, no JSON.");
+        assert_eq!(summary, "Just prose, no JSON.");
+        assert!(facts.is_empty());
+        let (summary, _) = parse_summary(&format!("{{\"summary\": \"{}\"}}", "a".repeat(9000)));
+        assert_eq!(summary.chars().count(), MAX_SUMMARY_CHARS);
+    }
 
     #[test]
     fn the_time_is_told_in_the_users_zone() {

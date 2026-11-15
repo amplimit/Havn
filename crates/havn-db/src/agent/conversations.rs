@@ -729,8 +729,125 @@ pub async fn delete_chat(pool: &SqlitePool, scope: &str, id: &str) -> Result<boo
         .bind(id)
         .execute(&mut *tx)
         .await?;
+    sqlx::query("DELETE FROM chat_summaries WHERE chat = ?1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(true)
+}
+
+/// What the next turn of a chat is answered with (issue #105): the
+/// summary of its branch up to some turn, if one was written, and the
+/// turns after that turn, at most `window + batch` of them.
+#[derive(Debug, Clone, Default)]
+pub struct ChatContext {
+    pub summary: Option<String>,
+    pub turns: Vec<BranchTurn>,
+}
+
+/// The oldest turns of a chat's context, due to be folded into its
+/// summary so that `window` turns stay after it.
+#[derive(Debug, Clone)]
+pub struct DueSummary {
+    /// The summary they extend, if there is one.
+    pub previous: Option<String>,
+    pub turns: Vec<BranchTurn>,
+    /// The last of `turns`: what the new summary covers through.
+    pub through: String,
+}
+
+/// Chat `chat`'s context: its branch back to the newest turn with a
+/// summary (exclusive), at most `window + batch` turns, oldest first.
+/// When the branch goes further back without one in reach, the nearest
+/// older summary is used.
+pub async fn context(
+    pool: &SqlitePool,
+    chat: &str,
+    window: u32,
+    batch: u32,
+) -> Result<ChatContext> {
+    let mut turns = branch(pool, chat, window.saturating_add(batch)).await?;
+    if turns.is_empty() {
+        return Ok(ChatContext::default());
+    }
+    let marks = vec!["?"; turns.len()].join(", ");
+    let sql = format!("SELECT turn_id, summary FROM chat_summaries WHERE turn_id IN ({marks})");
+    let mut query = sqlx::query_as::<_, (String, String)>(&sql);
+    for turn in &turns {
+        query = query.bind(&turn.id);
+    }
+    let found: std::collections::HashMap<String, String> =
+        query.fetch_all(pool).await?.into_iter().collect();
+    if let Some(at) = turns.iter().rposition(|t| found.contains_key(&t.id)) {
+        let summary = found.get(&turns[at].id).cloned();
+        turns.drain(..=at);
+        return Ok(ChatContext { summary, turns });
+    }
+    let summary = match turns.first().and_then(|t| t.parent_id.clone()) {
+        Some(parent) => {
+            sqlx::query_scalar(
+                "WITH RECURSIVE up(id, depth) AS ( \
+                     SELECT ?1, 0 \
+                     UNION ALL \
+                     SELECT c.parent_id, up.depth + 1 FROM conversations c JOIN up ON c.id = up.id \
+                     WHERE c.parent_id IS NOT NULL \
+                 ) \
+                 SELECT s.summary FROM up JOIN chat_summaries s ON s.turn_id = up.id \
+                 ORDER BY up.depth LIMIT 1",
+            )
+            .bind(parent)
+            .fetch_optional(pool)
+            .await?
+        }
+        None => None,
+    };
+    Ok(ChatContext { summary, turns })
+}
+
+/// The turns of chat `chat` to fold into its summary, once `window +
+/// batch` turns follow the last one: all but the newest `window`.
+pub async fn summary_due(
+    pool: &SqlitePool,
+    chat: &str,
+    window: u32,
+    batch: u32,
+) -> Result<Option<DueSummary>> {
+    let ChatContext { summary, mut turns } = context(pool, chat, window, batch).await?;
+    let keep = window as usize;
+    if batch == 0 || turns.len() < keep + batch as usize {
+        return Ok(None);
+    }
+    turns.truncate(turns.len() - keep);
+    let Some(through) = turns.last().map(|t| t.id.clone()) else {
+        return Ok(None);
+    };
+    Ok(Some(DueSummary {
+        previous: summary,
+        turns,
+        through,
+    }))
+}
+
+/// Keep `summary` as what chat `chat` said through turn `through`. False
+/// when that turn is gone (its chat was deleted meanwhile).
+pub async fn save_summary(
+    pool: &SqlitePool,
+    chat: &str,
+    through: &str,
+    summary: &str,
+) -> Result<bool> {
+    let res = sqlx::query(
+        "INSERT INTO chat_summaries (turn_id, chat, summary) \
+         SELECT id, channel_id, ?2 FROM conversations WHERE id = ?1 AND channel_id = ?3 \
+         ON CONFLICT(turn_id) DO UPDATE SET summary = excluded.summary",
+    )
+    .bind(through)
+    .bind(summary)
+    .bind(chat)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 /// Wrap a free-form user query so it can be passed to FTS5 MATCH safely.
@@ -1200,6 +1317,105 @@ mod tests {
             .await
             .expect("search");
         assert_eq!(contents(&hits), vec!["what is the salary band"]);
+    }
+
+    #[tokio::test]
+    async fn a_long_chat_folds_its_oldest_turns_into_a_summary() {
+        let pool = connect_in_memory().await.expect("connect");
+        let c = chat(6);
+        let mut ids = Vec::new();
+        for n in 1..=5 {
+            let role = if n % 2 == 1 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            ids.push(say(&pool, "me", &c, role, &format!("t{n}")).await);
+        }
+        let ctx = context(&pool, &c, 4, 2).await.expect("context");
+        assert_eq!(ctx.turns.len(), 5);
+        assert!(ctx.summary.is_none());
+        assert!(summary_due(&pool, &c, 4, 2).await.expect("due").is_none());
+
+        ids.push(say(&pool, "me", &c, Role::Assistant, "t6").await);
+        let due = summary_due(&pool, &c, 4, 2)
+            .await
+            .expect("due")
+            .expect("due now");
+        assert_eq!(
+            due.turns
+                .iter()
+                .map(|t| t.content.as_str())
+                .collect::<Vec<_>>(),
+            ["t1", "t2"]
+        );
+        assert_eq!(due.through, ids[1]);
+        assert!(due.previous.is_none());
+        assert!(
+            save_summary(&pool, &c, &due.through, "S1")
+                .await
+                .expect("save")
+        );
+
+        let ctx = context(&pool, &c, 4, 2).await.expect("context");
+        assert_eq!(ctx.summary.as_deref(), Some("S1"));
+        assert_eq!(
+            ctx.turns
+                .iter()
+                .map(|t| t.content.as_str())
+                .collect::<Vec<_>>(),
+            ["t3", "t4", "t5", "t6"]
+        );
+        assert!(summary_due(&pool, &c, 4, 2).await.expect("due").is_none());
+
+        for n in 7..=8 {
+            say(&pool, "me", &c, Role::User, &format!("t{n}")).await;
+        }
+        let due = summary_due(&pool, &c, 4, 2)
+            .await
+            .expect("due")
+            .expect("due again");
+        assert_eq!(due.previous.as_deref(), Some("S1"));
+        assert_eq!(
+            due.turns
+                .iter()
+                .map(|t| t.content.as_str())
+                .collect::<Vec<_>>(),
+            ["t3", "t4"]
+        );
+
+        // Past the reach of the window, the nearest older summary is used.
+        let ctx = context(&pool, &c, 1, 1).await.expect("context");
+        assert_eq!(ctx.summary.as_deref(), Some("S1"));
+        assert_eq!(ctx.turns.len(), 2);
+
+        // An edit of the first message starts a branch the summary is not on.
+        rewind(
+            &pool,
+            &c,
+            Rewind::Edit {
+                turn: &ids[0],
+                text: "t1 again",
+            },
+        )
+        .await
+        .expect("rewind")
+        .expect("edited");
+        let ctx = context(&pool, &c, 4, 2).await.expect("context");
+        assert!(ctx.summary.is_none());
+        assert_eq!(ctx.turns.len(), 1);
+
+        assert!(delete_chat(&pool, "me", &c).await.expect("delete"));
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_summaries")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(left, 0);
+        assert!(
+            !save_summary(&pool, &c, &ids[1], "late")
+                .await
+                .expect("save")
+        );
     }
 
     #[tokio::test]
