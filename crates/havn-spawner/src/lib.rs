@@ -15,7 +15,7 @@
 //! Firecracker) can be added without touching the gateway.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use havn_core::{AgentId, Policy};
@@ -113,7 +113,6 @@ pub struct AgentSpawnConfig {
 
 const AGENT_BASE_ENV: &[&str] = &[
     "PATH",
-    "HOME",
     "LANG",
     "LC_ALL",
     "LC_CTYPE",
@@ -127,13 +126,20 @@ const AGENT_BASE_ENV: &[&str] = &[
     "no_proxy",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
-    "XDG_CACHE_HOME",
     "HAVN_RECENT_EVENTS_DAYS",
     "HAVN_RECENT_EVENTS_LIMIT",
     "HAVN_AUTO_COMMIT",
 ];
 
-pub fn agent_environment<F>(passthrough: &[String], source: F) -> Vec<(String, OsString)>
+/// The environment an agent starts with: the allowlisted variables and
+/// the operator's `env_passthrough` from the gateway's environment, and
+/// `HOME` in the agent's workspace unless the operator passes `HOME`
+/// through. The gateway's own home (`/root`) is not the agent's to write.
+pub fn agent_environment<F>(
+    passthrough: &[String],
+    workspace: &Path,
+    source: F,
+) -> Vec<(String, OsString)>
 where
     F: Fn(&str) -> Option<OsString>,
 {
@@ -143,10 +149,81 @@ where
             names.push(name);
         }
     }
-    names
+    let mut env: Vec<(String, OsString)> = names
         .into_iter()
         .filter_map(|name| source(name).map(|value| (name.to_string(), value)))
+        .collect();
+    if !env.iter().any(|(name, _)| name == "HOME") {
+        env.push((
+            "HOME".to_string(),
+            workspace.join(havn_core::AGENT_HOME_DIR).into_os_string(),
+        ));
+    }
+    env
+}
+
+/// Host directories that installed programs read at run time and that
+/// hold no secrets: Debian's `/etc/alternatives` (the links behind `java`,
+/// `cc`, `awk`, `which` and others in `/usr/bin`), and configuration or
+/// generated data of common toolchains (fontconfig, groff, LibreOffice,
+/// Perl, TeX Live, Ghostscript).
+const TOOL_DIRS: &[&str] = &[
+    "/etc/alternatives",
+    "/etc/fonts",
+    "/etc/groff",
+    "/etc/libreoffice",
+    "/etc/perl",
+    "/etc/texmf",
+    "/var/lib/ghostscript",
+    "/var/lib/texmf",
+];
+
+/// Versioned directories directly under `/etc` bound the same way:
+/// `java-21-openjdk`, `ImageMagick-6`, `python3.12`.
+const TOOL_ETC_PREFIXES: &[&str] = &["java-", "ImageMagick-", "python3"];
+
+/// The [`TOOL_DIRS`] and [`TOOL_ETC_PREFIXES`] directories present under
+/// `root` (`/` on a real host), as read-only mounts at their paths below
+/// `root`. Only real directories: a symlink is not followed to wherever
+/// it points.
+#[must_use]
+pub fn tool_mounts(root: &Path) -> Vec<ExtraMount> {
+    let is_dir = |path: &Path| {
+        std::fs::symlink_metadata(root.join(path.strip_prefix("/").unwrap_or(path)))
+            .is_ok_and(|m| m.is_dir())
+    };
+    let mut paths: Vec<PathBuf> = TOOL_DIRS
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| is_dir(p))
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(root.join("etc")) {
+        let mut versioned: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|name| TOOL_ETC_PREFIXES.iter().any(|p| name.starts_with(p)))
+            .map(|name| Path::new("/etc").join(name))
+            .filter(|p| is_dir(p))
+            .collect();
+        versioned.sort();
+        paths.extend(versioned);
+    }
+    paths
+        .into_iter()
+        .map(|path| ExtraMount {
+            path,
+            mode: MountMode::Ro,
+        })
         .collect()
+}
+
+/// The mounts an agent gets: [`tool_mounts`] of the host, then the
+/// operator's `extra_mounts`, which win where both name a path.
+#[must_use]
+pub fn agent_mounts(extra_mounts: &[ExtraMount]) -> Vec<ExtraMount> {
+    let mut mounts = tool_mounts(Path::new("/"));
+    mounts.retain(|m| !extra_mounts.iter().any(|e| e.path == m.path));
+    mounts.extend(extra_mounts.iter().cloned());
+    mounts
 }
 
 /// One operator-declared tmpfs mount carried into the agent namespace
@@ -562,31 +639,94 @@ mod tests {
         }
     }
 
+    fn workspace() -> &'static Path {
+        Path::new("/var/lib/havn/agents/a/workspace")
+    }
+
     #[test]
     fn agent_environment_keeps_only_allowlisted_variables() {
-        let env = agent_environment(&[], gateway_env);
+        let env = agent_environment(&[], workspace(), gateway_env);
         let names: Vec<&str> = env.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(names, ["PATH", "RUST_LOG"]);
+        assert_eq!(names, ["PATH", "RUST_LOG", "HOME"]);
+    }
+
+    #[test]
+    fn agent_home_is_in_the_workspace() {
+        let source = |name: &str| (name == "HOME").then(|| "/root".into());
+        let env = agent_environment(&[], workspace(), source);
+        assert_eq!(
+            env,
+            [(
+                "HOME".to_string(),
+                OsString::from("/var/lib/havn/agents/a/workspace/.havn/home")
+            )]
+        );
+        let env = agent_environment(&["HOME".to_string()], workspace(), source);
+        assert_eq!(env, [("HOME".to_string(), OsString::from("/root"))]);
+    }
+
+    #[test]
+    fn tool_mounts_are_present_directories_only() {
+        let root = tempfile::tempdir().unwrap();
+        for dir in [
+            "etc/alternatives",
+            "etc/java-25-openjdk",
+            "etc/python3.12",
+            "etc/ssl/private",
+            "var/lib/texmf",
+        ] {
+            std::fs::create_dir_all(root.path().join(dir)).unwrap();
+        }
+        std::fs::write(root.path().join("etc/python3-file"), "").unwrap();
+        std::os::unix::fs::symlink(root.path().join("etc/ssl"), root.path().join("etc/fonts"))
+            .unwrap();
+        let mounts = tool_mounts(root.path());
+        let paths: Vec<&Path> = mounts.iter().map(|m| m.path.as_path()).collect();
+        assert_eq!(
+            paths,
+            [
+                Path::new("/etc/alternatives"),
+                Path::new("/var/lib/texmf"),
+                Path::new("/etc/java-25-openjdk"),
+                Path::new("/etc/python3.12"),
+            ]
+        );
+        assert!(mounts.iter().all(|m| m.mode == MountMode::Ro));
+    }
+
+    #[test]
+    fn operator_mounts_win_over_tool_mounts() {
+        let operator = [ExtraMount {
+            path: PathBuf::from("/etc/alternatives"),
+            mode: MountMode::Rw,
+        }];
+        let mounts = agent_mounts(&operator);
+        let alternatives: Vec<&ExtraMount> = mounts
+            .iter()
+            .filter(|m| m.path == Path::new("/etc/alternatives"))
+            .collect();
+        assert_eq!(alternatives.len(), 1);
+        assert_eq!(alternatives[0].mode, MountMode::Rw);
     }
 
     #[test]
     fn agent_environment_adds_explicit_passthrough() {
-        let env = agent_environment(&["OPENAI_API_KEY".to_string()], gateway_env);
+        let env = agent_environment(&["OPENAI_API_KEY".to_string()], workspace(), gateway_env);
         assert!(env.contains(&("OPENAI_API_KEY".to_string(), "sk-embedding".into())));
         assert!(!env.iter().any(|(name, _)| name == "OPENROUTER_API_KEY"));
     }
 
     #[test]
     fn agent_environment_never_passes_age_key() {
-        let env = agent_environment(&["HAVN_AGE_KEY".to_string()], gateway_env);
+        let env = agent_environment(&["HAVN_AGE_KEY".to_string()], workspace(), gateway_env);
         assert!(!env.iter().any(|(name, _)| name == "HAVN_AGE_KEY"));
     }
 
     #[test]
     fn agent_environment_rejects_any_havn_passthrough() {
         let source = |name: &str| (name == "HAVN_TRUST_HEADER").then(|| "1".into());
-        let env = agent_environment(&["HAVN_TRUST_HEADER".to_string()], source);
-        assert!(env.is_empty());
+        let env = agent_environment(&["HAVN_TRUST_HEADER".to_string()], workspace(), source);
+        assert!(!env.iter().any(|(name, _)| name.starts_with("HAVN_")));
     }
 
     #[test]

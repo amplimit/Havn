@@ -50,10 +50,11 @@ impl AgentSpawner for SubprocessSpawner {
         tokio::fs::create_dir_all(&config.workspace_dir).await?;
 
         let mut cmd = Command::new(&config.runtime_binary);
-        cmd.env_clear()
-            .envs(crate::agent_environment(&config.env_passthrough, |name| {
-                std::env::var_os(name)
-            }));
+        cmd.env_clear().envs(crate::agent_environment(
+            &config.env_passthrough,
+            &config.workspace_dir,
+            |name| std::env::var_os(name),
+        ));
         // Operator opt-out for kernels without Landlock; the runtime
         // refuses to start without Landlock otherwise. Forwarded on its
         // own because HAVN_* variables are never passed through.

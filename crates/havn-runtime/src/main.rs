@@ -226,6 +226,22 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("opening agent.db at {}", agent_db_path.display()))?;
     info!(db = %agent_db_path.display(), "agent db ready");
 
+    // The agent's `HOME` (set by the spawner), for the programs its tools
+    // run. Ignored by git, so a `git add -A` in the workspace leaves
+    // caches and installed packages out.
+    let home = args.workspace.join(havn_core::AGENT_HOME_DIR);
+    let made = std::fs::create_dir_all(&home).and_then(|()| {
+        let ignore = home.join(".gitignore");
+        if ignore.exists() {
+            Ok(())
+        } else {
+            std::fs::write(ignore, "*\n")
+        }
+    });
+    if let Err(e) = made {
+        warn!(home = %home.display(), error = %e, "cannot create the agent's home directory");
+    }
+
     // 2. Load bootstrap files — system prompt assembly is deferred to
     //    step 4c (after the tool registry is built) so the platform-
     //    context preamble can list the actual tool names.
