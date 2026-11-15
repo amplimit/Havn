@@ -79,6 +79,15 @@ pub fn platform_context(agent_name: &str, agent_id: &str, tool_names: &[String])
          \u{2014} things you use stay; things you forget fade. The user can see and delete \
          your memories via the dashboard.\n\
          \n\
+         Save without being asked: people mention lasting things in passing, inside other \
+         requests, and do not ask you to remember them. In the same turn, call \
+         memory_remember (source user_told) when the person states who they are (name, role, \
+         team, where they live), how you should answer or work (language, length, format, \
+         the tools they use), what they work on (projects, stack, how they deploy), or a \
+         plan or event with a date (turn \"next Wednesday\" into the date). Do not save \
+         one-off requests, the content of the task itself, small talk, or what memory already \
+         holds unchanged.\n\
+         \n\
          Past chats: only the latest turns of this chat are in front of you. When the \
          person refers to something said earlier, in this chat or another one, look it \
          up with conversation_search instead of guessing.\n\
@@ -414,6 +423,7 @@ mod tests {
         assert!(ctx.contains("- shell"));
         assert!(ctx.contains("memory_remember, memory_search, and memory_forget"));
         assert!(ctx.contains("conversation_search"));
+        assert!(ctx.contains("Save without being asked"));
         assert!(ctx.contains("skill_manage"));
         assert!(ctx.contains("SOUL.md"));
     }
