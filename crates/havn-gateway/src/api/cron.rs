@@ -156,6 +156,7 @@ pub enum ScheduleView {
 
 impl From<CronJob> for CronJobView {
     fn from(j: CronJob) -> Self {
+        let summary = crate::cron::describe_schedule(&j.schedule);
         let schedule = match j.schedule {
             Schedule::Interval { seconds } => ScheduleView::Interval { seconds },
             Schedule::At { instant } => ScheduleView::At { instant },
@@ -167,7 +168,7 @@ impl From<CronJob> for CronJobView {
         Self {
             id: j.id.to_string(),
             agent_id: j.agent_id.to_string(),
-            summary: crate::cron::describe_schedule(&j.schedule),
+            summary,
             name: j.name,
             prompt: j.prompt,
             schedule,
