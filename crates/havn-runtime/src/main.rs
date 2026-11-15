@@ -1304,7 +1304,7 @@ async fn handle_heartbeat(ctx: Ctx) {
         })
         .collect();
 
-    let augmented = augment_with_skills(&ctx, &ctx.system_prompt, &synthesised, None).await;
+    let augmented = augment_with_skills(&ctx, &ctx.system_prompt, &synthesised, None, false).await;
     let final_text = match run_tool_loop(
         &ctx,
         crate::tools::context::HEARTBEAT,
@@ -1382,7 +1382,7 @@ async fn handle_cron(tick: CronTick, ctx: Ctx) {
 
     let mut messages = vec![serde_json::json!({ "role": "user", "content": tick.prompt.clone() })];
 
-    let augmented = augment_with_skills(&ctx, &ctx.cron_prompt, &tick.prompt, None).await;
+    let augmented = augment_with_skills(&ctx, &ctx.cron_prompt, &tick.prompt, None, false).await;
     let handle = ctx.parent_handle();
     let run = tool_loop::run_typed(
         &handle,
@@ -1690,8 +1690,16 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     // Tool-use loop.
     // Augment the frozen system prompt with FTS-retrieved skills relevant
     // to the user's turn (spec §9.3). Per-call only; base stays frozen.
-    let augmented =
-        augment_with_skills(&ctx, &ctx.system_prompt, &user_text, summary.as_deref()).await;
+    let augmented = augment_with_skills(
+        &ctx,
+        &ctx.system_prompt,
+        &user_text,
+        summary.as_deref(),
+        // The owner's dashboard chats only: a channel may be someone
+        // else, and what it saves is everyone's memory.
+        msg.channel == "webchat",
+    )
+    .await;
 
     let memory_changes = Arc::new(std::sync::Mutex::new(Vec::new()));
     let final_text = match tools::gateway::CONVERSATION
@@ -1822,14 +1830,22 @@ fn time_section(now: chrono::DateTime<chrono::Utc>, zone: chrono_tz::Tz) -> Stri
 /// 3. **Current time** in the owner's time zone, always, and last.
 ///
 /// The first two are omitted when empty.
-/// `summary`: of the turns before the ones given (issue #105).
+/// `summary`: of the turns before the ones given (issue #105); `owner`:
+/// the turn answers the owner in the dashboard, who may be told to save
+/// what they say about themselves.
 async fn augment_with_skills(
     ctx: &Ctx,
     base: &SystemPrompt,
     user_text: &str,
     summary: Option<&str>,
+    owner: bool,
 ) -> SystemPrompt {
     let mut augmented = base.clone();
+
+    // Right after the frozen base, so it stays in the cached prefix.
+    if owner {
+        augmented = augmented.augmented(system_prompt::SAVE_UNPROMPTED);
+    }
 
     // Section 1: recent events.
     let days = recent_events_days();
