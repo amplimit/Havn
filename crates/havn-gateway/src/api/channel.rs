@@ -278,16 +278,20 @@ pub async fn file(
     authenticate(&state, &q, &headers).await?;
     let agent = havn_core::AgentId::from_str(&agent).map_err(|_| ApiError::NotFound)?;
     let outbox = crate::outbox::dir(&state.workspace_root, agent);
-    let (sent, bytes) = tokio::task::spawn_blocking(move || crate::outbox::read(&outbox, &file))
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?
-        .ok_or(ApiError::NotFound)?;
-    match channel_id_codec::decode(&sent.channel_id) {
-        Some((channel, account, _)) if channel == q.channel && account == q.account => {
-            Ok(crate::api::files::attachment_response(&sent, bytes))
+    let (channel, account) = (q.channel.clone(), q.account.clone());
+    // Its metadata first: an adapter gets only files sent through its
+    // own account, and reads nothing of the others'.
+    let found = tokio::task::spawn_blocking(move || {
+        let sent = crate::outbox::meta(&outbox, &file)?;
+        match channel_id_codec::decode(&sent.channel_id) {
+            Some((c, a, _)) if c == channel && a == account => crate::outbox::read(&outbox, &file),
+            _ => None,
         }
-        _ => Err(ApiError::NotFound),
-    }
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?
+    .ok_or(ApiError::NotFound)?;
+    Ok(crate::api::files::attachment_response(&found.0, found.1))
 }
 
 /// Check that the request carries the adapter token of the configured

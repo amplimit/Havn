@@ -30,6 +30,8 @@ const KEEP_DAYS: i64 = 30;
 const MAX_DEPTH: usize = 16;
 /// Characters of a caption kept.
 const MAX_CAPTION_CHARS: usize = 1000;
+/// Free space a send leaves on the filesystem at least.
+const MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[must_use]
 pub fn spec() -> GatewayToolSpec {
@@ -139,6 +141,10 @@ pub fn send(
     }
 
     make_dir(outbox).map_err(|e| format!("the outbox cannot be written: {e}"))?;
+    // The root gateway leaves alone what the filesystem keeps for root.
+    crate::agent_files::WorkspaceDir::open(outbox)
+        .and_then(|dir| dir.require_free(bytes.len() as u64 + MIN_FREE_BYTES))
+        .map_err(|_| "the host is running out of disk space".to_string())?;
     let kept = prune(outbox);
     let used: u64 = kept.iter().map(|s| s.size).sum();
     if kept.len() >= MAX_OUTBOX_FILES || used + bytes.len() as u64 > MAX_OUTBOX_BYTES {
@@ -157,10 +163,18 @@ pub fn send(
         created_at: Utc::now(),
     };
     let meta = serde_json::to_vec(&sent).map_err(|e| e.to_string())?;
-    write_new(&outbox.join(&sent.id), &bytes)
-        .map_err(|e| format!("saving the file failed: {e}"))?;
-    write_new(&outbox.join(format!("{}.json", sent.id)), &meta)
-        .map_err(|e| format!("saving the file failed: {e}"))?;
+    // Written under a temporary name and moved into place once its
+    // metadata is written: a file half written, or without metadata, is
+    // never served, and the next send sweeps it.
+    let part = outbox.join(format!("{}.part", sent.id));
+    let saved = write_new(&part, &bytes)
+        .and_then(|()| write_new(&outbox.join(format!("{}.json", sent.id)), &meta))
+        .and_then(|()| std::fs::rename(&part, outbox.join(&sent.id)));
+    if let Err(e) = saved {
+        let _ = std::fs::remove_file(&part);
+        remove(outbox, &sent.id);
+        return Err(format!("saving the file failed: {e}"));
+    }
     Ok(sent)
 }
 
@@ -182,51 +196,94 @@ fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.write_all(bytes)
 }
 
-/// The files `outbox` keeps, removing those older than [`KEEP_DAYS`].
-fn prune(outbox: &Path) -> Vec<Sent> {
+/// What `outbox` keeps: its files' metadata, oldest first.
+fn kept(outbox: &Path) -> Vec<Sent> {
     let mut kept = Vec::new();
     let Ok(entries) = std::fs::read_dir(outbox) else {
         return kept;
     };
-    let oldest = Utc::now() - chrono::Duration::days(KEEP_DAYS);
-    for entry in entries.flatten().take(MAX_OUTBOX_FILES * 2 + 10) {
+    for entry in entries.flatten().take(MAX_OUTBOX_FILES * 3 + 10) {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let Some(sent) = std::fs::read(&path)
+        if let Some(sent) = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice::<Sent>(&b).ok())
-        else {
-            continue;
-        };
-        if sent.created_at < oldest {
-            let _ = std::fs::remove_file(outbox.join(&sent.id));
-            let _ = std::fs::remove_file(&path);
-        } else {
+            .filter(|s| uuid::Uuid::parse_str(&s.id).is_ok())
+        {
             kept.push(sent);
+        }
+    }
+    kept.sort_by_key(|s| s.created_at);
+    kept
+}
+
+/// The files `outbox` keeps, after removing those older than
+/// [`KEEP_DAYS`] and what a failed send left.
+fn prune(outbox: &Path) -> Vec<Sent> {
+    let oldest = Utc::now() - chrono::Duration::days(KEEP_DAYS);
+    let (expired, kept): (Vec<Sent>, Vec<Sent>) = kept(outbox)
+        .into_iter()
+        .partition(|s| s.created_at < oldest);
+    for sent in &expired {
+        remove(outbox, &sent.id);
+    }
+    if let Ok(entries) = std::fs::read_dir(outbox) {
+        for entry in entries.flatten().take(MAX_OUTBOX_FILES * 3 + 10) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let stem = name.strip_suffix(".part").unwrap_or(&name);
+            // A part another send is still writing is left alone.
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > std::time::Duration::from_secs(3600));
+            let orphan = uuid::Uuid::parse_str(stem).is_ok()
+                && if name.ends_with(".part") {
+                    stale
+                } else {
+                    !kept.iter().any(|s| s.id == stem)
+                };
+            if orphan {
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
     }
     kept
 }
 
+/// Remove file `id` of `outbox`, with its metadata.
+pub fn remove(outbox: &Path, id: &str) {
+    if uuid::Uuid::parse_str(id).is_err() {
+        return;
+    }
+    let _ = std::fs::remove_file(outbox.join(id));
+    let _ = std::fs::remove_file(outbox.join(format!("{id}.json")));
+}
+
 /// The files `outbox` keeps that were sent in chat `conversation` (or
-/// all), oldest first, at most `limit`.
+/// all), oldest first, at most `limit`; it changes nothing.
 pub fn list(outbox: &Path, conversation: Option<&str>, limit: usize) -> Vec<Sent> {
-    let mut sent: Vec<Sent> = prune(outbox)
+    let mut sent: Vec<Sent> = kept(outbox)
         .into_iter()
         .filter(|s| conversation.is_none_or(|c| s.conversation.as_deref() == Some(c)))
         .collect();
-    sent.sort_by_key(|s| s.created_at);
     let skip = sent.len().saturating_sub(limit);
     sent.split_off(skip)
 }
 
-/// File `id` of `outbox` and its bytes, when it is there.
-pub fn read(outbox: &Path, id: &str) -> Option<(Sent, Vec<u8>)> {
+/// The metadata of file `id` of `outbox`, when it is there.
+pub fn meta(outbox: &Path, id: &str) -> Option<Sent> {
     uuid::Uuid::parse_str(id).ok()?;
     let meta = std::fs::read(outbox.join(format!("{id}.json"))).ok()?;
-    let sent: Sent = serde_json::from_slice(&meta).ok()?;
+    serde_json::from_slice(&meta).ok()
+}
+
+/// File `id` of `outbox` and its bytes, when it is there.
+pub fn read(outbox: &Path, id: &str) -> Option<(Sent, Vec<u8>)> {
+    let sent = meta(outbox, id)?;
     let bytes = std::fs::read(outbox.join(id)).ok()?;
     Some((sent, bytes))
 }
@@ -291,5 +348,22 @@ mod tests {
         assert!(send(ws.path(), &outbox, "key", None, "c1", None).is_err());
         assert!(send(ws.path(), &outbox, "dir/key", None, "c1", None).is_err());
         assert!(read(&outbox, "../x").is_none());
+
+        // What a failed send left is swept by the next one.
+        let stray = uuid::Uuid::now_v7().to_string();
+        let part = outbox.join(format!("{stray}.part"));
+        std::fs::write(&part, b"half").expect("part");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(&part)
+            .expect("open")
+            .set_modified(old)
+            .expect("age");
+        std::fs::write(outbox.join(&stray), b"no meta").expect("orphan");
+        send(ws.path(), &outbox, "out/report.pdf", None, "c1", None).expect("send");
+        assert!(!part.exists());
+        assert!(!outbox.join(&stray).exists());
+        assert!(outbox.join(&sent.id).exists(), "a kept file stays");
     }
 }

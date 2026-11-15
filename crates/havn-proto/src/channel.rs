@@ -115,6 +115,11 @@ pub enum ChannelMessageContent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caption: Option<String>,
     },
+    /// Outbound, a file an agent sent (issue #106): `url` is always
+    /// `/api/v1/channel/files/<agent>/<file>` on the gateway. The adapter
+    /// fetches it from the gateway it is connected to, adding
+    /// `?channel=<channel>&account=<account>` and its `X-Adapter-Token`,
+    /// and must not send its token anywhere else.
     File {
         url: String,
         filename: String,

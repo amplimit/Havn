@@ -107,7 +107,10 @@ function withFiles(
   files: { url: string; name: string; caption?: string; ts: number }[],
   nextId: () => number,
 ): Bubble[] {
-  const fresh = files.filter((f) => !prev.some((b) => b.file?.url === f.url));
+  // By the file's id, the last part of its link: the page may name the
+  // agent by its name, the gateway by its id.
+  const fileId = (url: string) => url.slice(url.lastIndexOf("/") + 1);
+  const fresh = files.filter((f) => !prev.some((b) => b.file && fileId(b.file.url) === fileId(f.url)));
   if (fresh.length === 0) return prev;
   const cards: Bubble[] = fresh.map((f) => ({
     id: nextId(),
@@ -351,13 +354,6 @@ export default function ChatPage({
         if (!asked && r.conversation) selectChat(r.conversation);
         const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
         setBubbles((prev) => mergeStored(prev, stored, since));
-        const shown = r.conversation ?? asked ?? undefined;
-        if (shown) {
-          const sent = await api.outbox.list(id, shown).catch(() => []);
-          if (!cancelled && chatIdRef.current === asked) {
-            setBubbles((prev) => withFiles(prev, sentFiles(id, sent), () => bubbleIdRef.current++));
-          }
-        }
       } catch (e) {
         console.warn("[chat] history reload failed", e);
       }
