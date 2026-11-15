@@ -285,6 +285,7 @@ mod tests {
                 model: Arc::new(String::new()),
                 max_tokens: crate::tool_loop::DEFAULT_MAX_TOKENS,
                 billing_user_id: None,
+                stop: None,
             },
             parent_messages: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             semaphore: Arc::new(Semaphore::new(SUBAGENT_MAX_CONCURRENT)),

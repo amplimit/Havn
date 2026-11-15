@@ -56,11 +56,23 @@ impl Tool for ShellTool {
         cmd.arg("-c")
             .arg(command)
             .current_dir(&ctx.workspace_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        // A group of its own, so a timeout or a stopped turn ends every
+        // process the command started, not only `sh`.
+        #[cfg(unix)]
+        cmd.process_group(0);
         #[cfg(target_os = "linux")]
         crate::sandbox::confine_tool(&mut cmd);
 
-        let output = match timeout(COMMAND_TIMEOUT, cmd.output()).await {
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => return ToolResult::Error(format!("exec failed: {e}")),
+        };
+        let mut group = GroupKill(child.id());
+        let output = match timeout(COMMAND_TIMEOUT, child.wait_with_output()).await {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => return ToolResult::Error(format!("exec failed: {e}")),
             Err(_) => {
@@ -70,6 +82,9 @@ impl Tool for ShellTool {
                 ));
             }
         };
+        // It finished: what it left running in the background (a server
+        // started with `&`) is the agent's to keep.
+        group.0 = None;
 
         let mut combined = Vec::with_capacity(output.stdout.len() + output.stderr.len());
         combined.extend_from_slice(&output.stdout);
@@ -104,6 +119,24 @@ impl Tool for ShellTool {
             // Non-zero exit is still "the tool ran"; surface as Error so the LLM
             // sees `is_error=true` and can react.
             ToolResult::Error(out)
+        }
+    }
+}
+
+/// Kills the process group `0` leads when dropped, unless cleared: when a
+/// command times out, or its turn is stopped and the call is dropped.
+struct GroupKill(Option<u32>);
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.and_then(|pid| i32::try_from(pid).ok()) {
+            // SAFETY: kill has no memory-safety preconditions. The group
+            // is the command's own (process_group(0)); once all of it has
+            // exited the call fails with ESRCH and does nothing.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
         }
     }
 }
@@ -146,6 +179,38 @@ mod tests {
             .await;
         assert!(r.is_error());
         assert!(r.text().contains("exit=1"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dropping_a_call_kills_what_the_command_started() {
+        let ctx = ctx().await;
+        let call = ShellTool.execute(
+            &ctx,
+            json!({"command": "sleep 30 & echo $! > bg.pid; wait"}),
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1500), call)
+                .await
+                .is_err(),
+            "the command waits on its background sleep"
+        );
+        let pid = std::fs::read_to_string(ctx.workspace_dir.join("bg.pid")).expect("pid file");
+        let stat = format!("/proc/{}/stat", pid.trim());
+        let mut gone = false;
+        for _ in 0..40 {
+            // Gone, or a zombie waiting for a reaper that is not ours.
+            gone = std::fs::read_to_string(&stat).map_or(true, |s| {
+                s.rsplit(')')
+                    .next()
+                    .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+            });
+            if gone {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(gone, "the background sleep outlived its stopped call");
     }
 
     #[tokio::test]

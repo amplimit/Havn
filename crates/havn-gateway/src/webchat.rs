@@ -55,13 +55,21 @@ pub struct Registration {
 pub enum ClientMessage {
     /// User-typed message.
     Send { content: String },
+    /// Stop the reply the agent is working on in this session.
+    Stop,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     /// Reply from the agent (assistant turn).
-    AgentMessage { content: String },
+    AgentMessage {
+        content: String,
+        /// Sent to every tab on its own (heartbeat, cron), not a reply to
+        /// a message: the dashboard does not count it as one.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        broadcast: bool,
+    },
     /// Soft error visible to the user (e.g. agent disconnected).
     Error { message: String },
 }
@@ -126,10 +134,14 @@ impl WebChatRouter {
             .parse()
             .map_err(|_| DeliverError::InvalidChannelId(msg.channel_id.clone()))?;
         let server_msg = match msg.content {
-            MessageContent::Text { text } => ServerMessage::AgentMessage { content: text },
+            MessageContent::Text { text } => ServerMessage::AgentMessage {
+                content: text,
+                broadcast: false,
+            },
             // Phase 1 webchat is text-only. Stub other variants with a placeholder.
             other => ServerMessage::AgentMessage {
                 content: format!("(unsupported content variant: {other:?})"),
+                broadcast: false,
             },
         };
         self.send_to_session(agent_id, session_id, server_msg).await
@@ -224,9 +236,13 @@ impl WebChatRouter {
     /// tabs whose queue is full are dropped (see [`Self::offer`]).
     pub async fn broadcast(&self, agent_id: AgentId, msg: OutboundMessage) -> usize {
         let server_msg = match msg.content {
-            MessageContent::Text { text } => ServerMessage::AgentMessage { content: text },
+            MessageContent::Text { text } => ServerMessage::AgentMessage {
+                content: text,
+                broadcast: true,
+            },
             other => ServerMessage::AgentMessage {
                 content: format!("(unsupported content variant: {other:?})"),
+                broadcast: true,
             },
         };
         self.fan_out(agent_id, server_msg).await
@@ -286,7 +302,7 @@ mod tests {
 
         let received = rx.recv().await.expect("recv");
         match received {
-            ServerMessage::AgentMessage { content } => assert_eq!(content, "hi"),
+            ServerMessage::AgentMessage { content, .. } => assert_eq!(content, "hi"),
             ServerMessage::Error { .. } => panic!("expected AgentMessage, got Error"),
         }
     }
@@ -369,7 +385,7 @@ mod tests {
 
         for rx in [&mut rx_a, &mut rx_b] {
             match rx.recv().await.expect("frame") {
-                ServerMessage::AgentMessage { content } => assert_eq!(content, "hello"),
+                ServerMessage::AgentMessage { content, .. } => assert_eq!(content, "hello"),
                 ServerMessage::Error { .. } => panic!("unexpected Error"),
             }
         }
@@ -405,7 +421,7 @@ mod tests {
         assert_eq!(n, 1);
         for expected in ["one", "two"] {
             match healthy_rx.try_recv().expect("frame") {
-                ServerMessage::AgentMessage { content } => assert_eq!(content, expected),
+                ServerMessage::AgentMessage { content, .. } => assert_eq!(content, expected),
                 ServerMessage::Error { .. } => panic!("unexpected Error"),
             }
         }
