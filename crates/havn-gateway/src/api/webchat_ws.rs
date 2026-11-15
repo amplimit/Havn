@@ -217,18 +217,42 @@ async fn serve_session<Si, St, E>(
                 content,
                 conversation,
                 edit,
-            } => (
-                content,
-                chat_id(conversation),
-                chat_id(edit).map(|turn| havn_core::Branch::Edit { turn }),
-            ),
-            ClientMessage::Regenerate { conversation, turn } => (
-                String::new(),
-                chat_id(conversation),
-                Some(havn_core::Branch::Regenerate {
-                    turn: chat_id(turn),
-                }),
-            ),
+            } => match (edit.is_some(), chat_id(edit)) {
+                (true, None) => {
+                    let _ = router
+                        .error(
+                            agent_id,
+                            session_id,
+                            "That message cannot be edited.".into(),
+                        )
+                        .await;
+                    continue;
+                }
+                (_, edit) => (
+                    content,
+                    chat_id(conversation),
+                    edit.map(|turn| havn_core::Branch::Edit { turn }),
+                ),
+            },
+            ClientMessage::Regenerate { conversation, turn } => {
+                match (turn.is_some(), chat_id(turn)) {
+                    (true, None) => {
+                        let _ = router
+                            .error(
+                                agent_id,
+                                session_id,
+                                "That reply cannot be regenerated.".into(),
+                            )
+                            .await;
+                        continue;
+                    }
+                    (_, turn) => (
+                        String::new(),
+                        chat_id(conversation),
+                        Some(havn_core::Branch::Regenerate { turn }),
+                    ),
+                }
+            }
             ClientMessage::Decide {
                 id,
                 approve,

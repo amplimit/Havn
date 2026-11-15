@@ -5,18 +5,16 @@ ALTER TABLE conversations ADD COLUMN parent_id TEXT;
 ALTER TABLE chats ADD COLUMN head TEXT;
 
 -- Existing turns become one branch per chat: each follows the turn before
--- it.
+-- it, in the order they were recorded.
 UPDATE conversations
-SET parent_id = (
-    SELECT p.id
-    FROM conversations p
-    WHERE p.channel_id = conversations.channel_id
-      AND (p.created_at < conversations.created_at
-           OR (p.created_at = conversations.created_at AND p.rowid < conversations.rowid))
-    ORDER BY p.created_at DESC, p.rowid DESC
-    LIMIT 1
-)
-WHERE channel_id IN (SELECT id FROM chats);
+SET parent_id = prev.parent
+FROM (
+    SELECT id,
+           LAG(id) OVER (PARTITION BY channel_id ORDER BY created_at, rowid) AS parent
+    FROM conversations
+    WHERE channel_id IN (SELECT id FROM chats)
+) AS prev
+WHERE conversations.id = prev.id;
 
 UPDATE chats
 SET head = (

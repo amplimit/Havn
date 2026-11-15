@@ -76,7 +76,10 @@ const CLOCK_SKEW_MS = 60_000;
 // The stored conversation, fetched from `since` on, replaces what is on
 // screen, except notices (they exist only in this tab) and live bubbles
 // newer than the fetch that it does not have yet.
-function mergeStored(prev: Bubble[], stored: Bubble[], since: number): Bubble[] {
+function mergeStored(prev: Bubble[], fetched: Bubble[], since: number): Bubble[] {
+  // A turn already on screen keeps its bubble (and an editor open on it).
+  const shown = new Map(prev.flatMap((b) => (b.turn ? [[b.turn, b.id] as const] : [])));
+  const stored = fetched.map((s) => (s.turn && shown.has(s.turn) ? { ...s, id: shown.get(s.turn)! } : s));
   const recent = stored.filter((s) => s.ts >= since - CLOCK_SKEW_MS);
   const kept = prev.filter(
     (b) =>
