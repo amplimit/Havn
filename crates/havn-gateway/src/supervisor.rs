@@ -128,9 +128,10 @@ pub struct Supervisor {
     liveness_interval: Duration,
     limits: LivenessLimits,
     history: Arc<Mutex<HashMap<AgentId, History>>>,
-    /// What each agent wrote to stderr last before its process exited,
-    /// when it wrote anything.
-    last_stderr: Arc<Mutex<HashMap<AgentId, Vec<String>>>>,
+    /// Why each agent's last run ended, when it said: what its process
+    /// wrote to stderr last, with the instance's generation (0 for a
+    /// start that spawned nothing).
+    last_stderr: Arc<Mutex<HashMap<AgentId, (u64, Vec<String>)>>>,
     shutting_down: Arc<AtomicBool>,
 }
 
@@ -162,13 +163,14 @@ impl Supervisor {
     }
 
     /// The last lines agent `id` wrote to stderr before its process last
-    /// exited; empty when it wrote none, or was stopped or deleted since.
+    /// exited on its own, or why it could not be started; empty when
+    /// there were none, or it was stopped or deleted since.
     pub async fn last_stderr(&self, id: AgentId) -> Vec<String> {
         self.last_stderr
             .lock()
             .await
             .get(&id)
-            .cloned()
+            .map(|(_, lines)| lines.clone())
             .unwrap_or_default()
     }
 
@@ -177,12 +179,26 @@ impl Supervisor {
         self.last_stderr.lock().await.remove(&id);
     }
 
-    async fn note_stderr(&self, id: AgentId, stderr: &[String]) {
+    /// Record what instance `generation` of agent `id` wrote, unless a
+    /// later instance already did.
+    async fn note_stderr(&self, id: AgentId, generation: u64, stderr: &[String]) {
         let mut last = self.last_stderr.lock().await;
+        if last.get(&id).is_some_and(|(newer, _)| *newer > generation) {
+            return;
+        }
         if stderr.is_empty() {
             last.remove(&id);
         } else {
-            last.insert(id, stderr.to_vec());
+            last.insert(id, (generation, stderr.to_vec()));
+        }
+    }
+
+    /// Drop what instance `generation` of agent `id` wrote: it was
+    /// stopped, so it says nothing about the agent.
+    async fn drop_stderr(&self, id: AgentId, generation: u64) {
+        let mut last = self.last_stderr.lock().await;
+        if last.get(&id).is_some_and(|(noted, _)| *noted == generation) {
+            last.remove(&id);
         }
     }
 
@@ -216,7 +232,7 @@ pub(crate) fn watch(state: &AppState, handle: AgentHandle, generation: u64) {
         // connect finds why it did not.
         state
             .supervisor
-            .note_stderr(handle.agent_id, &report.stderr)
+            .note_stderr(handle.agent_id, generation, &report.stderr)
             .await;
         if state.supervisor.shutting_down() {
             // Left during a drain. It stays registered so `shut_down`
@@ -229,6 +245,10 @@ pub(crate) fn watch(state: &AppState, handle: AgentHandle, generation: u64) {
             .remove_generation(handle.agent_id, generation)
             .await
         else {
+            state
+                .supervisor
+                .drop_stderr(handle.agent_id, generation)
+                .await;
             return;
         };
         recover(&state, instance, Ended::Exited(report)).await;
@@ -402,6 +422,11 @@ fn restart(state: AppState, owner: UserId, id: AgentId, ran_for: Duration) {
                 Err(e) if e.spawned => return,
                 Err(e) => {
                     warn!(agent_id = %id, error = %e.error, "agent restart failed");
+                    // What giving up reports, rather than an earlier run's.
+                    state
+                        .supervisor
+                        .note_stderr(id, 0, &[format!("could not be started: {}", e.error)])
+                        .await;
                     ran_for = Duration::ZERO;
                 }
             }
@@ -1107,7 +1132,7 @@ mod tests {
         *spawner.stderr.lock().unwrap() = why.clone();
         let id = agent(&state, user, "a").await;
         let first = crate::api::agents::ensure_running(&state, user, id).await;
-        let Err(crate::api::ApiError::Unavailable(message)) = first else {
+        let Err(crate::api::ApiError::AgentFailed(message)) = first else {
             panic!("the first instance exits during startup: {first:?}");
         };
         assert!(
@@ -1146,6 +1171,33 @@ mod tests {
         .await
         .expect("get");
         assert_eq!(view.0.failure.as_deref(), Some(why.join("\n").as_str()));
+    }
+
+    #[tokio::test]
+    async fn what_a_stopped_agent_wrote_is_not_its_failure() {
+        let (state, spawner, user) = fixture(quick_policy(), true, false).await;
+        *spawner.stderr.lock().unwrap() = vec!["mcp server: stdin closed".into()];
+        let id = running_agent(&state, user).await;
+        stop(&state, user, id).await;
+        // The stopped instance's watch has run by the time it is gone.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(state.supervisor.last_stderr(id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_older_instance_does_not_overwrite_a_later_one() {
+        let (state, _spawner, user) = fixture(quick_policy(), true, false).await;
+        let id = agent(&state, user, "a").await;
+        let later = vec!["later".to_string()];
+        state.supervisor.note_stderr(id, 5, &later).await;
+        state
+            .supervisor
+            .note_stderr(id, 4, &["earlier".into()])
+            .await;
+        state.supervisor.drop_stderr(id, 4).await;
+        assert_eq!(state.supervisor.last_stderr(id).await, later);
+        state.supervisor.drop_stderr(id, 5).await;
+        assert!(state.supervisor.last_stderr(id).await.is_empty());
     }
 
     #[tokio::test]

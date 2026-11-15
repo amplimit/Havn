@@ -472,6 +472,10 @@ impl ExitReport {
 const STDERR_TAIL_LINES: usize = 12;
 /// Longest stderr line kept or logged; the rest of the line is dropped.
 const STDERR_LINE_BYTES: usize = 1024;
+/// Stderr lines of one agent logged per [`STDERR_LOG_WINDOW`]; the rest
+/// are counted, and still kept for the exit.
+const STDERR_LOG_LINES: usize = 120;
+const STDERR_LOG_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 /// How long an exit waits for the lines the agent wrote just before it.
 const STDERR_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -486,12 +490,28 @@ async fn relay_stderr(
 ) {
     let mut reader = tokio::io::BufReader::new(stderr);
     let mut line = Vec::new();
+    let mut window = std::time::Instant::now();
+    let (mut logged, mut skipped) = (0_usize, 0_usize);
     while let Ok(true) = next_line(&mut reader, &mut line).await {
         let text = printable(&line);
         if text.trim().is_empty() {
             continue;
         }
-        tracing::warn!(agent_id = %agent_id, "agent stderr: {text}");
+        // A chatty agent (an MCP server logging every request) must not
+        // crowd the gateway's own lines out of the journal.
+        if window.elapsed() >= STDERR_LOG_WINDOW {
+            if skipped > 0 {
+                tracing::warn!(agent_id = %agent_id, skipped, "agent stderr: lines not logged");
+            }
+            window = std::time::Instant::now();
+            (logged, skipped) = (0, 0);
+        }
+        if logged < STDERR_LOG_LINES {
+            logged += 1;
+            tracing::warn!(agent_id = %agent_id, "agent stderr: {text}");
+        } else {
+            skipped += 1;
+        }
         let mut tail = tail
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -530,19 +550,23 @@ async fn next_line<R: tokio::io::AsyncBufRead + Unpin>(
 }
 
 /// `line` as text that cannot pass for other log lines or move the
-/// terminal: control characters become U+FFFD.
+/// terminal: control characters, line and paragraph separators and
+/// bidirectional controls become U+FFFD.
 fn printable(line: &[u8]) -> String {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     String::from_utf8_lossy(line)
         .chars()
-        .map(|c| {
-            if c.is_control() && c != '\t' {
-                '\u{fffd}'
-            } else {
-                c
-            }
-        })
+        .map(|c| if unprintable(c) { '\u{fffd}' } else { c })
         .collect()
+}
+
+fn unprintable(c: char) -> bool {
+    (c.is_control() && c != '\t')
+        || matches!(
+            c,
+            '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
 }
 
 impl std::fmt::Display for AgentExit {
@@ -747,6 +771,12 @@ pub enum SpawnerError {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stderr_lines_cannot_move_the_terminal_or_reorder_text() {
+        let line = "a\u{1b}[2Jb\u{202e}c\u{2028}d\te\r".as_bytes();
+        assert_eq!(printable(line), "a\u{fffd}[2Jb\u{fffd}c\u{fffd}d\te");
+    }
 
     fn gateway_env(name: &str) -> Option<OsString> {
         match name {

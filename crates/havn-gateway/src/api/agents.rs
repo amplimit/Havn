@@ -380,9 +380,9 @@ impl From<StartError> for ApiError {
 /// the rest wait for the existing handshake to complete.
 ///
 /// Returns Ok when the agent finished its Hello/Welcome handshake.
-/// Returns ApiError::Internal on spawn failure, handshake timeout, or
-/// when the process exits before its handshake (caller surfaces a
-/// friendlier message at the boundary).
+/// Returns ApiError::Internal on spawn failure or handshake timeout, and
+/// ApiError::AgentFailed, with what its runtime said, when the process
+/// exits before its handshake.
 pub async fn ensure_running(
     state: &AppState,
     by_user: havn_core::UserId,
@@ -554,16 +554,16 @@ pub(crate) async fn start_agent(
         if !state.registry.is_registered(id).await {
             let stderr = state.supervisor.last_stderr(id).await;
             let message = if stderr.is_empty() {
-                format!("agent {id} exited before completing its handshake")
+                "the agent exited before it connected".to_string()
             } else {
                 format!(
-                    "agent {id} exited before completing its handshake; its runtime said:\n{}",
+                    "the agent exited before it connected:\n{}",
                     stderr.join("\n")
                 )
             };
             return Err(StartError {
                 spawned,
-                error: ApiError::Unavailable(message),
+                error: ApiError::AgentFailed(message),
             });
         }
         tokio::time::sleep(POLL).await;

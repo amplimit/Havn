@@ -52,8 +52,31 @@ pub struct AuditEntryView {
     pub created_at: DateTime<Utc>,
 }
 
+#[cfg(test)]
+#[test]
+fn an_agents_stderr_is_not_shown_in_the_audit_log() {
+    let entry = AuditEntry {
+        id: "e".into(),
+        team_id: None,
+        user_id: havn_core::UserId::new(),
+        agent_id: None,
+        action: "agent.restart_abandoned".into(),
+        details: serde_json::json!({"failures": 6, "stderr": ["user text in a panic"]}),
+        created_at: Utc::now(),
+    };
+    let view = AuditEntryView::from(entry);
+    assert_eq!(view.details, serde_json::json!({"failures": 6}));
+}
+
 impl From<AuditEntry> for AuditEntryView {
-    fn from(e: AuditEntry) -> Self {
+    fn from(mut e: AuditEntry) -> Self {
+        // An agent's stderr can quote its conversations (a panic message,
+        // an MCP server's log), which the audit log's readers may not be
+        // allowed to see. Its owner sees it on the agent; the operator in
+        // the journal and `havn doctor`.
+        if let Some(details) = e.details.as_object_mut() {
+            details.remove("stderr");
+        }
         Self {
             id: e.id,
             team_id: e.team_id.map(|t| t.to_string()),
