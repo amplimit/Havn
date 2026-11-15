@@ -709,61 +709,90 @@ async fn forward_plain(
     copy_idle(upstream, client).await
 }
 
-/// Copy `from` to `to` until `from` ends, giving up when nothing comes
+/// Copy `from` to `to` until `from` ends, giving up when nothing moves
 /// for [`IDLE_TIMEOUT`].
 async fn copy_idle<R, W>(from: &mut R, to: &mut W) -> Result<(), String>
 where
     R: tokio::io::AsyncRead + Unpin + ?Sized,
     W: tokio::io::AsyncWrite + Unpin + ?Sized,
 {
-    let mut buf = vec![0_u8; 16 * 1024];
-    loop {
-        let n = tokio::time::timeout(IDLE_TIMEOUT, from.read(&mut buf))
-            .await
-            .map_err(|_| "idle".to_string())?
-            .map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Ok(());
+    pipe(from, to, &Activity::new()).await
+}
+
+/// When a connection last carried anything, shared by its directions.
+struct Activity {
+    start: Instant,
+    last_ms: std::sync::atomic::AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            last_ms: std::sync::atomic::AtomicU64::new(0),
         }
-        to.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
+    }
+
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn touch(&self) {
+        self.last_ms
+            .store(self.now_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn idle(&self) -> bool {
+        let last = self.last_ms.load(std::sync::atomic::Ordering::Relaxed);
+        self.now_ms().saturating_sub(last)
+            >= u64::try_from(IDLE_TIMEOUT.as_millis()).unwrap_or(u64::MAX)
     }
 }
 
-/// Both directions of a tunnel, until both end or neither carries
-/// anything for [`IDLE_TIMEOUT`].
+/// One direction of a connection, until `from` ends. A read waits as long
+/// as either direction moves; a write that does not finish within
+/// [`IDLE_TIMEOUT`] ends it.
+async fn pipe<R, W>(from: &mut R, to: &mut W, activity: &Activity) -> Result<(), String>
+where
+    R: tokio::io::AsyncRead + Unpin + ?Sized,
+    W: tokio::io::AsyncWrite + Unpin + ?Sized,
+{
+    let mut buf = vec![0_u8; 16 * 1024];
+    loop {
+        let n = match tokio::time::timeout(IDLE_TIMEOUT, from.read(&mut buf)).await {
+            Ok(read) => read.map_err(|e| e.to_string())?,
+            Err(_) if activity.idle() => return Err("idle".into()),
+            Err(_) => continue,
+        };
+        if n == 0 {
+            return Ok(());
+        }
+        activity.touch();
+        tokio::time::timeout(IDLE_TIMEOUT, to.write_all(&buf[..n]))
+            .await
+            .map_err(|_| "the other end stopped reading".to_string())?
+            .map_err(|e| e.to_string())?;
+        activity.touch();
+    }
+}
+
+/// Both directions of a tunnel, each on its own, until both end; a
+/// direction that fails or idles ends the tunnel.
 async fn relay(client: &mut TcpStream, upstream: &mut TcpStream) {
     let (mut client_read, mut client_write) = client.split();
     let (mut upstream_read, mut upstream_write) = upstream.split();
-    let mut up = vec![0_u8; 16 * 1024];
-    let mut down = vec![0_u8; 16 * 1024];
-    let (mut sending, mut receiving) = (true, true);
-    while sending || receiving {
-        tokio::select! {
-            read = client_read.read(&mut up), if sending => match read {
-                Ok(n) if n > 0 => {
-                    if upstream_write.write_all(&up[..n]).await.is_err() {
-                        return;
-                    }
-                }
-                _ => {
-                    sending = false;
-                    let _ = upstream_write.shutdown().await;
-                }
-            },
-            read = upstream_read.read(&mut down), if receiving => match read {
-                Ok(n) if n > 0 => {
-                    if client_write.write_all(&down[..n]).await.is_err() {
-                        return;
-                    }
-                }
-                _ => {
-                    receiving = false;
-                    let _ = client_write.shutdown().await;
-                }
-            },
-            () = tokio::time::sleep(IDLE_TIMEOUT) => return,
-        }
-    }
+    let activity = Activity::new();
+    let sending = async {
+        pipe(&mut client_read, &mut upstream_write, &activity).await?;
+        let _ = upstream_write.shutdown().await;
+        Ok::<_, String>(())
+    };
+    let receiving = async {
+        pipe(&mut upstream_read, &mut client_write, &activity).await?;
+        let _ = client_write.shutdown().await;
+        Ok::<_, String>(())
+    };
+    let _ = tokio::try_join!(sending, receiving);
 }
 
 async fn reply(stream: &mut TcpStream, code: u16, why: &str) -> std::io::Result<()> {
@@ -831,6 +860,43 @@ mod tests {
         ] {
             assert!(parse_head(bad).is_err(), "{}", String::from_utf8_lossy(bad));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_direction_ends_when_nothing_moves() {
+        // Nothing to read, and no one reading what is written.
+        let (_quiet, mut from) = tokio::io::duplex(64);
+        let (_deaf, mut to) = tokio::io::duplex(64);
+        let activity = Activity::new();
+        assert_eq!(
+            pipe(&mut from, &mut to, &activity).await,
+            Err("idle".to_string())
+        );
+        let (mut sender, mut from) = tokio::io::duplex(1024);
+        sender.write_all(&[0_u8; 1024]).await.unwrap();
+        let (_deaf, mut to) = tokio::io::duplex(64);
+        let stalled = pipe(&mut from, &mut to, &Activity::new()).await;
+        assert_eq!(stalled, Err("the other end stopped reading".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_direction_waits_while_the_other_moves() {
+        let activity = Activity::new();
+        let (_quiet, mut from) = tokio::io::duplex(64);
+        let (_deaf, mut to) = tokio::io::duplex(64);
+        let busy = async {
+            for _ in 0..4 {
+                tokio::time::sleep(IDLE_TIMEOUT / 2).await;
+                activity.touch();
+            }
+        };
+        let quiet = pipe(&mut from, &mut to, &activity);
+        tokio::pin!(quiet);
+        tokio::select! {
+            () = busy => {}
+            ended = &mut quiet => panic!("ended while the other direction moved: {ended:?}"),
+        }
+        assert_eq!(quiet.await, Err("idle".to_string()));
     }
 
     #[test]
