@@ -159,15 +159,17 @@ pub async fn list() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The gateway running on the CLI's database, when one does.
-pub fn gateway_on_db() -> Option<String> {
-    crate::gateway::lock_holder(&resolve_db_path().ok()?)
+/// The lock of the CLI's database (see [`crate::gateway::lock_db`]).
+pub fn lock_db() -> anyhow::Result<Result<Option<std::fs::File>, crate::gateway::DbLocked>> {
+    Ok(crate::gateway::lock_db(&resolve_db_path()?))
 }
 
 pub async fn delete(id: &str) -> anyhow::Result<()> {
     let user_id = parse_user_id(id)?;
     let pool = open_db().await?;
-    let gateway = gateway_on_db();
+    // Held until the delete is committed, so no gateway starts the user's
+    // agents in between.
+    let lock = lock_db()?;
     // Hard-delete. FK cascades on agents.owner_id wipe the user's
     // agents, on credentials they take their credentials, on
     // credential_usages the usage rows, and the user's audit rows go too.
@@ -186,11 +188,11 @@ pub async fn delete(id: &str) -> anyhow::Result<()> {
     // it would leave their sandboxes running, unknown to it, and hand
     // their links to new agents.
     if agents > 0
-        && let Some(gateway) = gateway
+        && let Err(locked) = &lock
     {
         anyhow::bail!(
-            "user {user_id} owns {agents} agent(s) and the gateway ({gateway}) is running: \
-             delete the agents first (dashboard or `havn agent delete`), or stop the gateway"
+            "user {user_id} owns {agents} agent(s) and {locked}: delete the agents first \
+             (dashboard or `havn agent delete`), or stop the gateway"
         );
     }
     let res = sqlx::query("DELETE FROM users WHERE id = ?1")
@@ -202,6 +204,7 @@ pub async fn delete(id: &str) -> anyhow::Result<()> {
         anyhow::bail!("no user with id {user_id}");
     }
     tx.commit().await.context("deleting user")?;
+    drop(lock);
     println!("deleted user {user_id} (and all owned agents / credentials)");
     Ok(())
 }

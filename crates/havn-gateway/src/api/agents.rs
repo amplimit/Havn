@@ -680,8 +680,8 @@ pub async fn delete(
     if state.spawner.lingers(id).await {
         warn!(agent_id = %id, "agent processes survived the stop; agent kept");
         return Err(ApiError::Internal(format!(
-            "agent {id} was not deleted: processes of its sandbox still run. Try again, or \
-             restart the gateway"
+            "agent {id} was not deleted: processes of its sandbox still run. Try again in a \
+             moment, or restart the gateway"
         )));
     }
 
