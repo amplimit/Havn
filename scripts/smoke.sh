@@ -170,15 +170,17 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
                 || die "the agent has no /etc/ssl/certs"
             [ "$(ls -A "/proc/$pid/root/etc/ssl")" = "certs" ] \
                 || die "the agent sees more of /etc/ssl than certs: $(ls -A "/proc/$pid/root/etc/ssl" | paste -sd' ')"
-            # HOME is a directory of the agent's own in its workspace.
-            tr '\0' '\n' < "/proc/$pid/environ" | grep -qx "HOME=$workspace/.havn/home" \
-                || die "the agent's HOME is not $workspace/.havn/home"
+            # Tools get a home of the agent's own in its workspace; the
+            # runtime, whose environment MCP servers inherit, does not.
             [ "$(stat -c %u "$workspace/.havn/home")" = "$uid" ] \
-                || die "the agent does not own its home directory $workspace/.havn/home"
+                || die "the agent has no home directory of its own at $workspace/.havn/home"
+            if tr '\0' '\n' < "/proc/$pid/environ" | grep -q "^HOME=$workspace"; then
+                die "the runtime's HOME is in the workspace, where tools can write"
+            fi
             # The host's tool directories are visible, read-only.
             if [ -d /etc/alternatives ]; then
-                [ -d "/proc/$pid/root/etc/alternatives" ] \
-                    || die "the agent has no /etc/alternatives"
+                [ "$(awk '$5 == "/etc/alternatives" {split($6, o, ","); print o[1]}' "/proc/$pid/mountinfo")" = "ro" ] \
+                    || die "/etc/alternatives is not bound read-only in the agent"
             fi
         done
         for pid in $RUNTIME_PIDS; do
@@ -207,10 +209,7 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
             fi
             if [ -e /etc/alternatives/awk ]; then
                 as_tool awk 'BEGIN { exit 0 }' \
-                    || die "a tool in the agent cannot run awk, a link through /etc/alternatives"
-                if as_tool touch /etc/alternatives/havn-smoke 2>/dev/null; then
-                    die "a tool in the agent can write /etc/alternatives"
-                fi
+                    || die "a process in the agent cannot run awk, a link through /etc/alternatives"
             fi
         done
         ok "every runtime thread is under seccomp with no_new_privs"

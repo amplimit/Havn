@@ -132,8 +132,10 @@ pub struct AgentSocketCtx {
     pub verify_peer_cgroup: bool,
     /// Operator-declared extra bind-mounts shipped to each runtime in
     /// Welcome so it can add Landlock entries (spec §4.1 v0.7). Cloned
-    /// from `GatewayConfig::extra_mounts` at startup; same list the
-    /// spawner already used to set `HAVN_EXTRA_MOUNTS`.
+    /// from `GatewayConfig::extra_mounts` at startup. The namespace
+    /// spawner binds these and the host's tool directories
+    /// (`havn_spawner::agent_mounts`) and has havn-init apply the Landlock
+    /// rules for both itself.
     pub extra_mounts: Vec<havn_spawner::ExtraMount>,
     /// Operator-declared in-namespace tmpfs mounts (spec §16.2). The
     /// runtime needs the paths in the Welcome frame so it can add them

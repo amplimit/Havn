@@ -10,10 +10,6 @@ pub mod message;
 pub mod policy;
 
 pub use error::{Error, Result};
-
-/// The agent's home directory, relative to its workspace: `HOME` for the
-/// runtime, its tools and MCP servers.
-pub const AGENT_HOME_DIR: &str = ".havn/home";
 pub use ids::{
     AgentId, ChannelBindingId, CredentialId, CronJobId, RoleId, SkillId, TeamId, UserId,
 };

@@ -348,11 +348,10 @@ impl AgentSpawner for NamespaceSpawner {
         let mut cmd = Command::new(init_binary);
         // The agent never reads the terminal the gateway runs in.
         cmd.stdin(std::process::Stdio::null());
-        cmd.env_clear().envs(crate::agent_environment(
-            &config.env_passthrough,
-            &config.workspace_dir,
-            |name| std::env::var_os(name),
-        ));
+        cmd.env_clear()
+            .envs(crate::agent_environment(&config.env_passthrough, |name| {
+                std::env::var_os(name)
+            }));
         // Operator opt-out for kernels without Landlock; the runtime
         // refuses to start without Landlock otherwise. Forwarded on its
         // own because HAVN_* variables are never passed through.
@@ -360,7 +359,7 @@ impl AgentSpawner for NamespaceSpawner {
         {
             cmd.env("HAVN_ALLOW_NO_LANDLOCK", "1");
         }
-        let extra_mounts = crate::agent_mounts(&config.extra_mounts);
+        let extra_mounts = crate::agent_mounts(Path::new("/"), &config.extra_mounts);
         // Landlock rules havn-init applies right before exec'ing the runtime,
         // so every runtime thread and every tool process is confined.
         let (landlock_rw, landlock_ro) = crate::filesystem_rules::allowlist(

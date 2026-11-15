@@ -839,7 +839,7 @@ pub unsafe fn pivot_root_into_minimal_rootfs(
         for mount in extra_mounts {
             if !host.contains(&mount.path) {
                 eprintln!(
-                    "havn-init: extra_mounts entry {} cannot be opened on the host — skipping",
+                    "havn-init: mount {} cannot be opened on the host — skipping",
                     mount.path.display()
                 );
                 continue;
