@@ -426,7 +426,8 @@ export default function ChatPage({
   // the screen, and stays stored on its own branch.
   function editMessage(idx: number, turn: string, text: string) {
     if (!text.trim() || !chatRef.current || wsState !== "open") return;
-    setBubbles((prev) => prev.slice(0, idx));
+    // Memory notes stay: what the replies changed is still in memory.
+    setBubbles((prev) => [...prev.slice(0, idx), ...prev.slice(idx).filter((b) => b.memory)]);
     pushBubble("you", text);
     chatRef.current.send(text, chatIdRef.current ?? undefined, turn);
     setWaiting((n) => n + 1);
@@ -435,7 +436,8 @@ export default function ChatPage({
   // Another reply in place of the one at `idx`.
   function regenerate(idx: number, turn: string) {
     if (!chatRef.current || wsState !== "open") return;
-    setBubbles((prev) => prev.slice(0, idx));
+    // Memory notes stay: what the replies changed is still in memory.
+    setBubbles((prev) => [...prev.slice(0, idx), ...prev.slice(idx).filter((b) => b.memory)]);
     chatRef.current.regenerate(chatIdRef.current ?? undefined, turn);
     setWaiting((n) => n + 1);
   }

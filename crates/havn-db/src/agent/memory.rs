@@ -545,6 +545,16 @@ pub async fn undo(
     if active.as_deref() != after {
         return Ok(false);
     }
+    // An expired entry keeps its key: one written since holds it too.
+    let others: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM memory WHERE key = ?1 AND id IS NOT ?2")
+            .bind(key)
+            .bind(after)
+            .fetch_one(&mut *tx)
+            .await?;
+    if others > 0 {
+        return Ok(false);
+    }
     if let Some(before) = before {
         let archived: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM memory WHERE id = ?1 AND archived_at IS NOT NULL \
@@ -1401,6 +1411,39 @@ mod tests {
                 .expect("undo")
         );
         assert!(get(&pool, "pref.font").await.expect("get").is_none());
+
+        // Forgotten, then saved again and expired since: the key changed.
+        let a = remember(
+            &pool,
+            NewEntry {
+                key: "pref.lang",
+                ..entry("Rust")
+            },
+        )
+        .await
+        .expect("a");
+        assert!(forget(&pool, "pref.lang").await.expect("forget"));
+        let b = remember(
+            &pool,
+            NewEntry {
+                key: "pref.lang",
+                ttl_days: Some(1),
+                ..entry("Go")
+            },
+        )
+        .await
+        .expect("b");
+        sqlx::query("UPDATE memory SET updated_at = '2000-01-01T00:00:00.000Z' WHERE id = ?1")
+            .bind(&b)
+            .execute(&pool)
+            .await
+            .expect("age");
+        assert_eq!(age_expired(&pool).await.expect("expire"), 1);
+        assert!(
+            !undo(&pool, "pref.lang", None, Some(&a))
+                .await
+                .expect("refused, not an error")
+        );
     }
 
     #[tokio::test]
