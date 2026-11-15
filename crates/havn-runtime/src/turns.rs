@@ -4,12 +4,18 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use havn_core::InboundMessage;
 use tokio_util::sync::CancellationToken;
 
 /// Messages queued in one conversation, at most.
 pub const MAX_QUEUED: usize = 20;
+
+/// A stop that arrives this soon after a queued turn started was most
+/// likely meant for the turn before it, whose reply crossed the stop on
+/// the way; it is ignored.
+const STOP_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Default)]
 pub struct Turns {
@@ -20,6 +26,8 @@ pub struct Turns {
 struct Running {
     stop: CancellationToken,
     queue: VecDeque<InboundMessage>,
+    /// When the running turn came off the queue, if it did.
+    dequeued_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -34,7 +42,7 @@ pub enum Admitted {
         ahead: usize,
     },
     /// The queue is full; the message was dropped.
-    Full { channel_id: String, channel: String },
+    Full { channel_id: String },
 }
 
 impl Turns {
@@ -43,7 +51,6 @@ impl Turns {
         match running.get_mut(&msg.channel_id) {
             Some(turn) if turn.queue.len() >= MAX_QUEUED => Admitted::Full {
                 channel_id: msg.channel_id,
-                channel: msg.channel,
             },
             Some(turn) => {
                 let (channel_id, channel) = (msg.channel_id.clone(), msg.channel.clone());
@@ -61,6 +68,7 @@ impl Turns {
                     Running {
                         stop: stop.clone(),
                         queue: VecDeque::new(),
+                        dequeued_at: None,
                     },
                 );
                 Admitted::Start(msg, stop)
@@ -76,6 +84,7 @@ impl Turns {
         match turn.queue.pop_front() {
             Some(msg) => {
                 turn.stop = CancellationToken::new();
+                turn.dequeued_at = Some(Instant::now());
                 Some((msg, turn.stop.clone()))
             }
             None => {
@@ -85,16 +94,38 @@ impl Turns {
         }
     }
 
-    /// Stop the running turn of `channel_id`; false when none runs.
+    /// Stop the running turn of `channel_id`; false when none runs or the
+    /// stop came within [`STOP_GRACE`] of a queued turn starting.
     pub fn stop(&self, channel_id: &str) -> bool {
+        self.stop_at(channel_id, Instant::now())
+    }
+
+    fn stop_at(&self, channel_id: &str, now: Instant) -> bool {
         let running = self.lock();
         match running.get(channel_id) {
+            Some(turn)
+                if turn
+                    .dequeued_at
+                    .is_some_and(|at| now.saturating_duration_since(at) < STOP_GRACE) =>
+            {
+                false
+            }
             Some(turn) => {
                 turn.stop.cancel();
                 true
             }
             None => false,
         }
+    }
+
+    /// Take every queued message out, leaving running turns to finish; for
+    /// a runtime that is about to stop.
+    pub fn take_queued(&self) -> Vec<InboundMessage> {
+        let mut running = self.lock();
+        running
+            .values_mut()
+            .flat_map(|turn| turn.queue.drain(..))
+            .collect()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Running>> {
@@ -154,6 +185,13 @@ mod tests {
         let (second, stop2) = turns.next("a").expect("queued message");
         assert_eq!(text(&second), "2");
         assert!(!stop2.is_cancelled(), "a new turn gets a fresh token");
+        assert!(
+            !turns.stop("a"),
+            "a stop right after a queued turn starts is ignored"
+        );
+        assert!(!stop2.is_cancelled());
+        assert!(turns.stop_at("a", Instant::now() + STOP_GRACE));
+        assert!(stop2.is_cancelled());
         let (third, _) = turns.next("a").expect("queued message");
         assert_eq!(text(&third), "3");
         assert!(turns.next("a").is_none());
@@ -175,5 +213,10 @@ mod tests {
             turns.admit(msg("a", "late")),
             Admitted::Full { .. }
         ));
+        assert_eq!(turns.take_queued().len(), MAX_QUEUED);
+        assert!(
+            turns.next("a").is_none(),
+            "the running turn ends with nothing queued"
+        );
     }
 }

@@ -18,7 +18,9 @@ pub use codec::{FrameError, read_frame, write_frame};
 /// 0.2.0: `CronTick`/`CronResult` carry `run_id`.
 /// 0.3.0: models are `provider:model`; an empty `LlmRequest.model` asks
 /// for the gateway's default model.
-pub const PROTOCOL_VERSION: &str = "0.3.0";
+/// 0.4.0: `StopTurn`, which an older runtime cannot parse and would exit
+/// on; the version check refuses the mix instead.
+pub const PROTOCOL_VERSION: &str = "0.4.0";
 
 /// How often a runtime sends [`AgentToGateway::LivenessPing`] once it is
 /// up. The gateway restarts an agent that stays connected but silent for

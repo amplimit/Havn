@@ -953,7 +953,7 @@ where
                         info!(%channel_id, ahead, "message queued behind a running turn");
                         // The dashboard shows queued messages itself.
                         if channel != "webchat" {
-                            send_text(&ctx, channel_id, queued_notice(ahead)).await;
+                            send_text(&ctx, channel_id, queued_notice(ahead));
                         }
                     }
                     turns::Admitted::Full { channel_id, .. } => {
@@ -962,11 +962,11 @@ where
                             &ctx,
                             channel_id,
                             format!(
-                                "(Too many messages are waiting ({}); this one was dropped.                                  Send it again once I have answered, or /stop.)",
+                                "(Too many messages are waiting ({}); this one was dropped. \
+                                 Send it again once I have answered, or /stop.)",
                                 turns::MAX_QUEUED
                             ),
-                        )
-                        .await;
+                        );
                     }
                 }
             }
@@ -1047,6 +1047,11 @@ where
                 );
                 draining = true;
                 work.close();
+                // Queued messages would wait past the drain limit; tell
+                // their senders instead of losing them quietly.
+                for queued in ctx.turns.take_queued() {
+                    send_text(&ctx, queued.channel_id, RESTART_NOTICE.to_string());
+                }
             }
             other => {
                 warn!(?other, "unknown gateway frame — ignoring");
@@ -1404,6 +1409,9 @@ async fn run_conversation(
     }
 }
 
+const RESTART_NOTICE: &str = "(The agent is restarting, so a message you sent while it was \
+     replying was not answered. Please send it again in a moment.)";
+
 fn queued_notice(ahead: usize) -> String {
     if ahead <= 1 {
         "(Queued: I will answer this after the reply I am working on. Send /stop to stop that reply.)"
@@ -1416,16 +1424,17 @@ fn queued_notice(ahead: usize) -> String {
     }
 }
 
-async fn send_text(ctx: &Ctx, channel_id: String, text: String) {
+fn send_text(ctx: &Ctx, channel_id: String, text: String) {
     let outbound = OutboundMessage {
         channel_id,
         content: MessageContent::Text { text },
         reply_to: None,
     };
+    // Never wait on a full writer queue: the reader loop calls this, and
+    // replies it must route would stall behind it.
     if let Err(e) = ctx
         .writer_tx
-        .send(AgentToGateway::OutboundMessage(outbound))
-        .await
+        .try_send(AgentToGateway::OutboundMessage(outbound))
     {
         warn!(error = %e, "could not send a notice");
     }
@@ -1444,6 +1453,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     if let Err(e) = conversations::record(&ctx.pool, &msg.channel_id, Role::User, &user_text).await
     {
         error!(error = %e, "could not persist user turn");
+        send_text(&ctx, msg.channel_id, format!("(internal error: {e})"));
         return;
     }
 
@@ -1451,6 +1461,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         Ok(h) => h,
         Err(e) => {
             error!(error = %e, "could not load conversation history");
+            send_text(&ctx, msg.channel_id, format!("(internal error: {e})"));
             return;
         }
     };

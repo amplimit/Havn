@@ -1058,9 +1058,11 @@ fn is_stop_command(content: &MessageContent) -> bool {
     };
     let text = text.trim();
     text.eq_ignore_ascii_case("/stop")
-        || text
-            .split_once('@')
-            .is_some_and(|(cmd, bot)| cmd.eq_ignore_ascii_case("/stop") && !bot.contains(' '))
+        || text.split_once('@').is_some_and(|(cmd, bot)| {
+            cmd.eq_ignore_ascii_case("/stop")
+                && !bot.is_empty()
+                && bot.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
 }
 
 #[cfg(test)]
@@ -1075,6 +1077,8 @@ mod tests {
         assert!(is_stop_command(&text("/stop@havn_bot")));
         assert!(!is_stop_command(&text("/stop now please")));
         assert!(!is_stop_command(&text("please /stop")));
+        assert!(!is_stop_command(&text("/stop@bot\nplease do X")));
+        assert!(!is_stop_command(&text("/stop@")));
         assert!(!is_stop_command(&MessageContent::Image {
             url: "u".into(),
             caption: Some("/stop".into())

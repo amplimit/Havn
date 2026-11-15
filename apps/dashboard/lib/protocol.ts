@@ -6,5 +6,6 @@
 export type ClientMessage = { type: "send"; content: string } | { type: "stop" };
 
 export type ServerMessage =
-  | { type: "agent_message"; content: string }
+  /** `broadcast`: sent on its own (heartbeat, cron), not a reply. */
+  | { type: "agent_message"; content: string; broadcast?: boolean }
   | { type: "error"; message: string };

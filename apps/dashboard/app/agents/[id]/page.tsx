@@ -209,7 +209,7 @@ export default function ChatPage({
           // A reply answers the oldest message waiting; a soft error
           // (agent gone) ends the wait for all of them.
           if (msg.type === "agent_message") {
-            setWaiting((n) => Math.max(0, n - 1));
+            if (!msg.broadcast) setWaiting((n) => Math.max(0, n - 1));
           } else {
             setWaiting(0);
           }
