@@ -392,13 +392,10 @@ impl ToolRegistry {
             // The snapshot guard is not held across the approval wait.
             let verdict = {
                 let snapshot = hooks.load();
-                (!snapshot.is_empty()).then(|| {
-                    let flat = flatten_input_for_hook(name, &input);
-                    let veto = snapshot.veto(name, &flat);
-                    (flat, veto)
-                })
+                (!snapshot.is_empty())
+                    .then(|| snapshot.veto(name, &flatten_input_for_hook(name, &input)))
             };
-            if let Some((flat, veto)) = verdict {
+            if let Some(veto) = verdict {
                 match veto {
                     crate::hooks::Veto::Allow => {}
                     crate::hooks::Veto::Deny { reason } => {
