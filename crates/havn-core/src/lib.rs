@@ -4,6 +4,7 @@
 //! describe agents, messages, or policy without pulling in async runtime
 //! or networking dependencies.
 
+pub mod calendar;
 pub mod error;
 pub mod ids;
 pub mod message;

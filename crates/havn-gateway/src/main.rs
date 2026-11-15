@@ -23,6 +23,7 @@ mod query_broker;
 mod reload;
 mod secret_ref;
 mod supervisor;
+mod timezone;
 mod web_fetch;
 mod web_search;
 mod webchat;
@@ -592,6 +593,9 @@ async fn serve() -> anyhow::Result<()> {
         fetch: Arc::new(
             web_fetch::WebFetch::new(cfg.fetch.clone()).context("building the web_fetch client")?,
         ),
+        timezone_rate: Arc::new(web_search::UserRate::new(
+            timezone::TOOL_PER_USER_PER_MINUTE,
+        )),
     };
     let socket_path = cfg.agent_socket_path.clone();
     let socket_task = tokio::spawn(async move {
@@ -625,6 +629,10 @@ async fn serve() -> anyhow::Result<()> {
         .route("/healthz", get(healthz))
         .route("/auth/info", get(auth::info))
         .route("/me", get(api::me::get))
+        .route(
+            "/me/timezone",
+            get(api::me::timezone_get).put(api::me::timezone_put),
+        )
         .route("/me/audit-log", get(api::audit::list_for_self))
         .route(
             "/me/domains",

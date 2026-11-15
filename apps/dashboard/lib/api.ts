@@ -376,8 +376,22 @@ function qs(params: Record<string, string | number | undefined>): string {
   return `?${usp.toString()}`;
 }
 
+/** `/me/timezone`: the zone the caller's agents tell the time in. */
+export type TimezoneView = {
+  timezone: string;
+  /** The caller chose it; otherwise it is the gateway host's. */
+  chosen: boolean;
+  host: string;
+};
+
 export const api = {
   me: () => request<MeView>("/me"),
+  timezone: () => request<TimezoneView>("/me/timezone"),
+  setTimezone: (timezone: string | null) =>
+    request<TimezoneView>("/me/timezone", {
+      method: "PUT",
+      body: JSON.stringify({ timezone }),
+    }),
   authInfo: () => request<AuthInfo>("/auth/info"),
   /** System-level embedding/hybrid retrieval config (spec §9.4 v0.7). */
   embedding: () => request<EmbeddingStatus>("/embedding"),

@@ -158,6 +158,8 @@ pub struct AgentSocketCtx {
     /// Rate limit, page cache and answer model of the `web_fetch` gateway
     /// tool.
     pub fetch: Arc<crate::web_fetch::WebFetch>,
+    /// Rate of the `set_timezone` gateway tool, per owner.
+    pub timezone_rate: Arc<crate::web_search::UserRate>,
 }
 
 /// Bind the Unix-socket listener and accept agent connections forever.
@@ -688,6 +690,7 @@ async fn handle_connection(
             .collect(),
         seccomp_allow_extra: ctx.seccomp_allow_extra.clone(),
         gateway_tools,
+        timezone: Some(crate::timezone::for_agent(&ctx.db, agent_id).await),
     };
     let write_welcome = write_frame(&mut write, &welcome);
     let sent = match tokio::time::timeout(AGENT_WRITE_TIMEOUT, write_welcome).await {
@@ -1212,7 +1215,8 @@ async fn gateway_tools_for(
     agent: &havn_db::repo::agents::Agent,
     policy: &Policy,
 ) -> Vec<GatewayToolSpec> {
-    let mut tools = Vec::new();
+    // Every agent may set its owner's time zone.
+    let mut tools = vec![crate::timezone::spec()];
     if policy.permissions.can_search_web {
         match ctx
             .search
@@ -1259,10 +1263,32 @@ async fn run_gateway_tool(
     ctx: &AgentSocketCtx,
 ) -> Result<String, String> {
     match call.name.as_str() {
+        crate::timezone::TOOL_NAME => run_set_timezone(agent_id, call, ctx).await,
         crate::web_search::TOOL_NAME => run_web_search(agent_id, call, ctx).await,
         crate::web_fetch::TOOL_NAME => run_web_fetch(agent_id, call, ctx).await,
         other => Err(format!("the gateway has no tool named {other:?}")),
     }
+}
+
+async fn run_set_timezone(
+    agent_id: AgentId,
+    call: &GatewayToolCall,
+    ctx: &AgentSocketCtx,
+) -> Result<String, String> {
+    let owner = match agents_repo::find_by_id(&ctx.db, agent_id).await {
+        Ok(Some(agent)) => agent.owner_id,
+        Ok(None) => return Err(format!("agent {agent_id} not found")),
+        Err(e) => return Err(format!("agent lookup failed: {e}")),
+    };
+    crate::timezone::run_tool(
+        &ctx.db,
+        &ctx.registry,
+        &ctx.timezone_rate,
+        owner,
+        agent_id,
+        &call.input,
+    )
+    .await
 }
 
 async fn run_web_fetch(
@@ -2194,6 +2220,9 @@ mod tests {
                 crate::web_fetch::WebFetch::new(crate::config::FetchConfig::default())
                     .expect("fetch client"),
             ),
+            timezone_rate: Arc::new(crate::web_search::UserRate::new(
+                crate::timezone::TOOL_PER_USER_PER_MINUTE,
+            )),
         }
     }
 
@@ -2326,15 +2355,19 @@ mod tests {
 
         assert_eq!(
             tools_of(agent).await,
-            vec!["web_fetch".to_string()],
+            ["set_timezone", "web_fetch"],
             "no search backend yet"
         );
         add_openrouter_key(&ctx, owner).await;
         assert_eq!(
             tools_of(agent).await,
-            vec!["web_search".to_string(), "web_fetch".to_string()]
+            ["set_timezone", "web_search", "web_fetch"]
         );
-        assert!(tools_of(denied).await.is_empty(), "policy denies both");
+        assert_eq!(
+            tools_of(denied).await,
+            ["set_timezone"],
+            "policy denies search and fetch"
+        );
     }
 
     #[tokio::test]

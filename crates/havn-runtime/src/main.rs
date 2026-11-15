@@ -162,6 +162,9 @@ struct Ctx {
     /// separate from `tools` is the recursion guard for cross-agent
     /// queries — a query handler can't issue another query.
     incoming_query_registry: ToolRegistry,
+    /// The owner's time zone, in which the agent tells the time; the
+    /// gateway updates it when the owner changes it.
+    timezone: Arc<std::sync::RwLock<chrono_tz::Tz>>,
     /// Conversations with a turn running, for stop and queueing.
     turns: Arc<turns::Turns>,
 }
@@ -282,6 +285,7 @@ async fn main() -> anyhow::Result<()> {
         tmpfs_mounts,
         seccomp_allow_extra,
         gateway_tools,
+        timezone,
     ): (
         Arc<Policy>,
         Option<String>,
@@ -292,6 +296,7 @@ async fn main() -> anyhow::Result<()> {
         Vec<std::path::PathBuf>,
         Vec<String>,
         Vec<havn_proto::GatewayToolSpec>,
+        Option<String>,
     ) = match first_frame {
         Some(GatewayToAgent::Welcome {
             session_token: _,
@@ -304,6 +309,7 @@ async fn main() -> anyhow::Result<()> {
             tmpfs_mounts: tmpfs_mounts_wire,
             seccomp_allow_extra: seccomp_allow_extra_list,
             gateway_tools,
+            timezone,
         }) => {
             // Materialise the embedding provider from the
             // gateway-shipped JSON. Absent / null / "disabled"
@@ -393,6 +399,7 @@ async fn main() -> anyhow::Result<()> {
                 tmpfs_paths,
                 seccomp_allow_extra_list,
                 gateway_tools,
+                timezone,
             )
         }
         Some(other) => return Err(anyhow!("expected Welcome, got {other:?}")),
@@ -732,7 +739,9 @@ async fn main() -> anyhow::Result<()> {
         child_handle: LoopHandle {
             writer_tx: writer_tx.clone(),
             pending: Arc::clone(&pending),
-            registry: base_registry.clone(),
+            // The user's settings are for the agent's own turns, not for a
+            // subagent's task or another agent's query.
+            registry: base_registry.clone().without("set_timezone"),
             tool_env: tool_env.clone(),
             max_iterations: subagent_tool::SUBAGENT_MAX_ITERATIONS,
             // Subagents do not republish their own state, and recursion
@@ -755,7 +764,7 @@ async fn main() -> anyhow::Result<()> {
     // subagent_spawn, no agent_query — handed to the temp loop that
     // answers IncomingQuery frames. Combined with the gateway's
     // same-owner + caller-self check, that makes the call graph depth-1.
-    let incoming_query_registry = base_registry.clone();
+    let incoming_query_registry = base_registry.clone().without("set_timezone");
 
     let parent_registry = base_registry
         .with_subagent(Arc::clone(&bridge))
@@ -795,6 +804,7 @@ async fn main() -> anyhow::Result<()> {
         agent_query_pending,
         gateway_pending,
         incoming_query_registry,
+        timezone: Arc::new(std::sync::RwLock::new(zone_or_utc(timezone.as_deref()))),
         turns: Arc::new(turns::Turns::default()),
     };
     let dispatch = run_reader_loop(&mut reader, ctx).await;
@@ -925,6 +935,13 @@ where
         match frame {
             GatewayToAgent::Welcome { .. } => {
                 warn!("unexpected duplicate Welcome");
+            }
+            GatewayToAgent::TimezoneUpdate(update) => {
+                let zone = zone_or_utc(Some(&update.timezone));
+                info!(timezone = %zone, "time zone updated");
+                *ctx.timezone
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = zone;
             }
             GatewayToAgent::InboundMessage(msg) => {
                 // Bump the curator scheduler's idle anchor — fresh
@@ -1536,8 +1553,28 @@ async fn run_tool_loop(
     tool_loop::run(&handle, context, messages, system_prompt).await
 }
 
-/// Build a per-turn system prompt by appending two sections to the frozen
-/// base (per-call only — the base stays untouched per spec §9.4):
+/// The zone named `name`, or UTC when there is none or it is unknown.
+fn zone_or_utc(name: Option<&str>) -> chrono_tz::Tz {
+    name.and_then(|n| n.parse().ok())
+        .unwrap_or(chrono_tz::Tz::UTC)
+}
+
+/// The prompt section that tells the model the current time in `zone`.
+fn time_section(now: chrono::DateTime<chrono::Utc>, zone: chrono_tz::Tz) -> String {
+    let local = now.with_timezone(&zone);
+    format!(
+        "## Current time\n\nIt is {} in the user's time zone, {} (UTC{}); {} UTC. Read \
+         \"today\", \"tomorrow\", \"at 9\" and other times the user gives in this zone unless \
+         they say otherwise. If they say they are elsewhere, set their zone with set_timezone.",
+        local.format("%A, %Y-%m-%d %H:%M"),
+        zone.name(),
+        local.format("%:z"),
+        now.format("%Y-%m-%d %H:%M"),
+    )
+}
+
+/// Build a per-turn system prompt by appending sections to the frozen base
+/// (per-call only — the base stays untouched per spec §9.4):
 ///
 /// 1. **Recent events (last 7 days)** — auto-loaded from typed memory
 ///    (kind = event), so the agent knows what just happened without
@@ -1546,8 +1583,9 @@ async fn run_tool_loop(
 /// 2. **Skills relevant to this turn** — FTS5-retrieved from the skill
 ///    index based on `user_text`.
 ///
-/// Either section is omitted when empty. Order: events first (most
-/// volatile content), skills second.
+/// 3. **Current time** in the owner's time zone, always, and last.
+///
+/// The first two are omitted when empty.
 async fn augment_with_skills(ctx: &Ctx, base: &SystemPrompt, user_text: &str) -> SystemPrompt {
     let mut augmented = base.clone();
 
@@ -1598,6 +1636,13 @@ async fn augment_with_skills(ctx: &Ctx, base: &SystemPrompt, user_text: &str) ->
         Err(e) => warn!(error = %e, "skill retrieval failed; skipping section"),
     }
 
+    // Section 3: the current time, last, as it changes every minute: what
+    // comes before it, the frozen base above all, keeps its prompt cache.
+    let zone = *ctx
+        .timezone
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    augmented = augmented.augmented(&time_section(chrono::Utc::now(), zone));
     augmented
 }
 
@@ -1941,6 +1986,23 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_time_is_told_in_the_users_zone() {
+        use chrono::TimeZone as _;
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 15, 23, 30, 0)
+            .unwrap();
+        let shanghai = time_section(now, zone_or_utc(Some("Asia/Shanghai")));
+        assert!(shanghai.contains("Monday, 2026-11-16 07:30"), "{shanghai}");
+        assert!(shanghai.contains("Asia/Shanghai (UTC+08:00)"), "{shanghai}");
+        assert!(shanghai.contains("2026-11-15 23:30 UTC"), "{shanghai}");
+        let summer = chrono::Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+        assert!(time_section(summer, zone_or_utc(Some("Europe/Berlin"))).contains("UTC+02:00"));
+        assert!(time_section(now, zone_or_utc(Some("Europe/Berlin"))).contains("UTC+01:00"));
+        assert_eq!(zone_or_utc(Some("nowhere")), chrono_tz::Tz::UTC);
+        assert_eq!(zone_or_utc(None), chrono_tz::Tz::UTC);
+    }
 
     #[tokio::test]
     async fn handshake_retries_a_connection_closed_before_welcome() {

@@ -303,6 +303,12 @@ Allowed and blocked domains are set at several levels and only add up: an agent 
 
 An entry is a domain such as `example.com` (covering its subdomains) or `*.example.com`, in ASCII (punycode for international names), with at least one dot; a list holds at most 500. Lists apply to `web_fetch` at once: the gateway resolves them on every call. If a user's own lists cannot be read, that user's agents cannot use `web_fetch` until they can.
 
+### Time zones
+
+Agents are told the current date, time and weekday in each turn, in their owner's time zone, so "today", "tomorrow at 9" and weekdays come out right. A user without a zone gets the gateway host's (`TZ`, `/etc/timezone` or `/etc/localtime`, else UTC). Users set theirs on an agent's settings page or with `PUT /me/timezone` (`{"timezone": "Asia/Shanghai"}`, or `null` for the host's), and an agent can set it with its `set_timezone` tool when the user says where they are. A change reaches the owner's running agents at once.
+
+Cron jobs (`POST /agents/{id}/cron`) can also run on calendar times in a time zone, with a five-field cron expression or in words: `{"cron": "0 8 * * 1-5"}`, or `{"every": "daily 08:00"}` (also `weekdays`, `weekends`, `weekly mon 10:00`, `monthly 1 09:00`, `hourly :15`). The zone is `timezone` when given, else the owner's at the time the job is created; the job keeps it. Times stay local across daylight-saving changes: a time a change skips runs right after the change, and one it repeats runs once. A job that was due while the gateway was down runs once when it is back; the runs it missed before that are skipped. An agent's `set_timezone` calls are audited as `user.timezone.updated` and limited to 3 per minute per user; subagents and cross-agent queries do not get the tool.
+
 Config edits are picked up live: `allowed_origins`, `[llm] default_model` and `[[llm.models]]` apply in place, while every other change (`listen`, `db_path`, paths, `[[bindings]]`, `[[channels]]`, ...) is logged as needing a `havn gateway restart` to apply — the gateway never restarts itself. Per-agent resource limits come from the agent's role policy, not a global config block.
 
 For non-loopback exposure, configure a reverse proxy and enable trust-header mode:

@@ -18,8 +18,8 @@ pub use codec::{FrameError, read_frame, write_frame};
 /// 0.2.0: `CronTick`/`CronResult` carry `run_id`.
 /// 0.3.0: models are `provider:model`; an empty `LlmRequest.model` asks
 /// for the gateway's default model.
-/// 0.4.0: `StopTurn`, which an older runtime cannot parse and would exit
-/// on; the version check refuses the mix instead.
+/// 0.4.0: `StopTurn` and `TimezoneUpdate`, which an older runtime cannot
+/// parse and would exit on; the version check refuses the mix instead.
 pub const PROTOCOL_VERSION: &str = "0.4.0";
 
 /// How often a runtime sends [`AgentToGateway::LivenessPing`] once it is
@@ -72,6 +72,13 @@ pub enum AgentToGateway {
     /// and answers with [`GatewayToAgent::GatewayToolResult`] carrying the
     /// same `request_id`.
     GatewayToolCall(GatewayToolCall),
+}
+
+/// See [`GatewayToAgent::TimezoneUpdate`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TimezoneUpdate {
+    /// IANA name, such as `Asia/Shanghai`.
+    pub timezone: String,
 }
 
 /// See [`GatewayToAgent::StopTurn`].
@@ -157,9 +164,15 @@ pub enum GatewayToAgent {
         /// calls as [`AgentToGateway::GatewayToolCall`].
         #[serde(default)]
         gateway_tools: Vec<GatewayToolSpec>,
+        /// IANA time zone of the agent's owner, in which the agent tells
+        /// the time. Absent from older gateways: the runtime uses UTC.
+        #[serde(default)]
+        timezone: Option<String>,
     },
     /// Inbound message from a channel adapter.
     InboundMessage(InboundMessage),
+    /// The owner's time zone changed.
+    TimezoneUpdate(TimezoneUpdate),
     /// Stop the turn running in a conversation (the user pressed stop or
     /// sent `/stop`). Messages queued behind it still run.
     StopTurn(StopTurn),
@@ -587,6 +600,7 @@ mod tests {
             tmpfs_mounts: Vec::new(),
             seccomp_allow_extra: Vec::new(),
             gateway_tools: Vec::new(),
+            timezone: None,
         };
         let line = serde_json::to_string(&frame).expect("serialize");
         assert!(line.contains("\"type\":\"welcome\""));
@@ -622,6 +636,7 @@ mod tests {
             tmpfs_mounts: Vec::new(),
             seccomp_allow_extra: Vec::new(),
             gateway_tools: Vec::new(),
+            timezone: None,
         };
         let line = serde_json::to_string(&frame).expect("serialize");
         let parsed: GatewayToAgent = serde_json::from_str(&line).expect("parse");
