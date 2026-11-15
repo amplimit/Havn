@@ -25,6 +25,12 @@ const MAX_INPUT_BYTES: usize = 64 * 1024;
 
 pub type PendingGatewayCalls = Arc<Mutex<HashMap<String, oneshot::Sender<GatewayToolResult>>>>;
 
+tokio::task_local! {
+    /// The conversation a turn answers, set around a user turn's tool
+    /// loop; gateway tool calls made in it carry it.
+    pub static CONVERSATION: String;
+}
+
 pub struct GatewayTool {
     spec: GatewayToolSpec,
     pending: PendingGatewayCalls,
@@ -85,6 +91,7 @@ impl Tool for GatewayTool {
             request_id: request_id.clone(),
             name: self.spec.name.clone(),
             input,
+            conversation: CONVERSATION.try_with(Clone::clone).ok(),
         });
         if self.writer_tx.send(frame).await.is_err() {
             return ToolResult::Error("the gateway connection is closed".into());

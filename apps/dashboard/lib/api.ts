@@ -361,9 +361,31 @@ export type TimezoneView = {
   host: string;
 };
 
+/** A scheduled task (cron job) of an agent. */
+export type CronJobView = {
+  id: string;
+  name: string;
+  prompt: string;
+  summary: string;
+  next_run_at: string;
+  deliver: string;
+  enabled: boolean;
+  last_run?: { started_at: string; error: string | null };
+};
+
 export const api = {
   me: () => request<MeView>("/me"),
   timezone: () => request<TimezoneView>("/me/timezone"),
+  cron: {
+    list: (agentId: string) => request<CronJobView[]>(`/agents/${agentId}/cron`),
+    setEnabled: (agentId: string, jobId: string, enabled: boolean) =>
+      request<CronJobView>(`/agents/${agentId}/cron/${jobId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled }),
+      }),
+    remove: (agentId: string, jobId: string) =>
+      request<void>(`/agents/${agentId}/cron/${jobId}`, { method: "DELETE" }),
+  },
   setTimezone: (timezone: string | null) =>
     request<TimezoneView>("/me/timezone", {
       method: "PUT",

@@ -25,7 +25,7 @@ use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use havn_core::{AgentId, UserId};
+use havn_core::{AgentId, OutboundMessage, UserId};
 use havn_proto::codec::MAX_FRAME_BYTES;
 use havn_proto::{
     AgentQuery, AgentQueryOutcome, AgentQueryResponse, AgentQueryResult, AgentToGateway,
@@ -952,136 +952,7 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
         AgentToGateway::Hello { .. } => {
             warn!(%agent_id, "duplicate Hello after handshake — ignoring");
         }
-        AgentToGateway::OutboundMessage(msg) => {
-            // Three dispatch cases by channel_id shape:
-            //  1. "broadcast" sentinel — fan out to all open WebChat
-            //     sessions for this agent (heartbeat/cron output).
-            //  2. `ch|<channel>|<account>|<sender>` — channel adapter
-            //     codec (spec §3, channel_id_codec). Decode +
-            //     deliver via channel_router to the right WS.
-            //  3. Anything else — assumed to be a WebChat session
-            //     UUID; route via webchat_router.
-            if msg.channel_id == "broadcast" {
-                let n = ctx.webchat_router.broadcast(agent_id, msg).await;
-                debug!(%agent_id, sessions = n, "broadcast outbound delivered");
-            } else if let Some((channel, account_id, sender_id)) =
-                crate::channel_id_codec::decode(&msg.channel_id)
-            {
-                use crate::channel_router::OutboundRefusal;
-                let refusal = match crate::channel_router::outbound_permitted(
-                    &ctx.bindings,
-                    &ctx.channels,
-                    agent_id,
-                    channel,
-                    account_id,
-                    sender_id,
-                ) {
-                    Ok(()) => None,
-                    // Senders admitted by invite code live in the DB.
-                    Err(OutboundRefusal::RecipientNotAllowed) => {
-                        match havn_db::repo::channel_access::is_allowed(
-                            &ctx.db, channel, account_id, sender_id,
-                        )
-                        .await
-                        {
-                            Ok(true) => None,
-                            Ok(false) => Some(OutboundRefusal::RecipientNotAllowed),
-                            Err(e) => {
-                                warn!(%agent_id, error = %e, "channel allowlist lookup failed");
-                                Some(OutboundRefusal::RecipientNotAllowed)
-                            }
-                        }
-                    }
-                    Err(refusal) => Some(refusal),
-                };
-                if let Some(refusal) = refusal {
-                    warn!(
-                        %agent_id,
-                        channel,
-                        account = account_id,
-                        reason = refusal.as_str(),
-                        "dropping channel-adapter outbound"
-                    );
-                    return;
-                }
-                // Channel-adapter outbound. Translate havn-core's
-                // MessageContent into havn-proto's
-                // ChannelMessageContent and push via the router.
-                use havn_core::MessageContent;
-                use havn_proto::channel::ChannelMessageContent;
-                let translated = match msg.content {
-                    MessageContent::Text { text } => Some(ChannelMessageContent::Text { text }),
-                    MessageContent::Image { url, caption } => {
-                        Some(ChannelMessageContent::Image { url, caption })
-                    }
-                    MessageContent::File { url, filename } => {
-                        Some(ChannelMessageContent::File { url, filename })
-                    }
-                    // Agents rarely emit Audio / Location / Contact
-                    // outbound — these are user-input shapes. When
-                    // they DO emit one (e.g., an agent skill that
-                    // shares a location), we flatten to Text so the
-                    // adapter doesn't need a per-platform "send
-                    // location" pathway. Future Layer when needed.
-                    MessageContent::Audio { transcript, .. } => {
-                        Some(ChannelMessageContent::Text { text: transcript })
-                    }
-                    MessageContent::Location {
-                        latitude,
-                        longitude,
-                        name,
-                        ..
-                    } => {
-                        let label = name.unwrap_or_default();
-                        let coords = format!("{latitude:.6},{longitude:.6}");
-                        let text = if label.is_empty() {
-                            format!("[location: {coords}]")
-                        } else {
-                            format!("[location: {coords} ({label})]")
-                        };
-                        Some(ChannelMessageContent::Text { text })
-                    }
-                    MessageContent::Contact {
-                        display_name,
-                        phone_number,
-                        ..
-                    } => {
-                        let text = match phone_number {
-                            Some(ph) => format!("[contact: {display_name} {ph}]"),
-                            None => format!("[contact: {display_name}]"),
-                        };
-                        Some(ChannelMessageContent::Text { text })
-                    }
-                    // MessageContent is non_exhaustive in havn-core;
-                    // future variants without a channel counterpart
-                    // are dropped with a warn (we can't surface them
-                    // through this path).
-                    _ => None,
-                };
-                match translated {
-                    Some(content) => {
-                        if let Err(e) = ctx
-                            .channel_router
-                            .deliver(channel, account_id, sender_id, msg.reply_to, content)
-                            .await
-                        {
-                            warn!(
-                                %agent_id,
-                                channel,
-                                account = account_id,
-                                error = %e,
-                                "could not deliver outbound to channel adapter (offline?)"
-                            );
-                        }
-                    }
-                    None => {
-                        warn!(%agent_id, "dropping channel-adapter outbound: unsupported MessageContent variant")
-                    }
-                }
-            } else if let Err(e) = ctx.webchat_router.deliver(agent_id, msg).await {
-                warn!(%agent_id, error = %e, "could not deliver outbound to webchat");
-            }
-        }
+        AgentToGateway::OutboundMessage(msg) => route_outbound(agent_id, msg, ctx).await,
         AgentToGateway::LlmRequest(req) => {
             if req.request_id.len() > MAX_REQUEST_ID_BYTES {
                 warn!(%agent_id, len = req.request_id.len(), "dropping LlmRequest with an oversized request_id");
@@ -1113,7 +984,8 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
         AgentToGateway::CronResult(result) => {
             let job_id = result.job_id.clone();
             match ctx.cron_scheduler.record_result(agent_id, result).await {
-                Ok(()) => {}
+                Ok(Some(message)) => route_outbound(agent_id, message, ctx).await,
+                Ok(None) => {}
                 Err(e @ crate::cron::CronError::NotPending(_)) => {
                     warn!(%agent_id, %job_id, error = %e, "rejecting unsolicited CronResult");
                 }
@@ -1207,6 +1079,139 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
     }
 }
 
+/// Send `msg` from `agent_id` where its channel id points, with the checks
+/// every agent message gets.
+async fn route_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSocketCtx) {
+    // Three dispatch cases by channel_id shape:
+    //  1. "broadcast" sentinel — fan out to all open WebChat
+    //     sessions for this agent (heartbeat/cron output).
+    //  2. `ch|<channel>|<account>|<sender>` — channel adapter
+    //     codec (spec §3, channel_id_codec). Decode +
+    //     deliver via channel_router to the right WS.
+    //  3. Anything else — assumed to be a WebChat session
+    //     UUID; route via webchat_router.
+    if msg.channel_id == "broadcast" {
+        let n = ctx.webchat_router.broadcast(agent_id, msg).await;
+        debug!(%agent_id, sessions = n, "broadcast outbound delivered");
+    } else if let Some((channel, account_id, sender_id)) =
+        crate::channel_id_codec::decode(&msg.channel_id)
+    {
+        use crate::channel_router::OutboundRefusal;
+        let refusal = match crate::channel_router::outbound_permitted(
+            &ctx.bindings,
+            &ctx.channels,
+            agent_id,
+            channel,
+            account_id,
+            sender_id,
+        ) {
+            Ok(()) => None,
+            // Senders admitted by invite code live in the DB.
+            Err(OutboundRefusal::RecipientNotAllowed) => {
+                match havn_db::repo::channel_access::is_allowed(
+                    &ctx.db, channel, account_id, sender_id,
+                )
+                .await
+                {
+                    Ok(true) => None,
+                    Ok(false) => Some(OutboundRefusal::RecipientNotAllowed),
+                    Err(e) => {
+                        warn!(%agent_id, error = %e, "channel allowlist lookup failed");
+                        Some(OutboundRefusal::RecipientNotAllowed)
+                    }
+                }
+            }
+            Err(refusal) => Some(refusal),
+        };
+        if let Some(refusal) = refusal {
+            warn!(
+                %agent_id,
+                channel,
+                account = account_id,
+                reason = refusal.as_str(),
+                "dropping channel-adapter outbound"
+            );
+            return;
+        }
+        // Channel-adapter outbound. Translate havn-core's
+        // MessageContent into havn-proto's
+        // ChannelMessageContent and push via the router.
+        use havn_core::MessageContent;
+        use havn_proto::channel::ChannelMessageContent;
+        let translated = match msg.content {
+            MessageContent::Text { text } => Some(ChannelMessageContent::Text { text }),
+            MessageContent::Image { url, caption } => {
+                Some(ChannelMessageContent::Image { url, caption })
+            }
+            MessageContent::File { url, filename } => {
+                Some(ChannelMessageContent::File { url, filename })
+            }
+            // Agents rarely emit Audio / Location / Contact
+            // outbound — these are user-input shapes. When
+            // they DO emit one (e.g., an agent skill that
+            // shares a location), we flatten to Text so the
+            // adapter doesn't need a per-platform "send
+            // location" pathway. Future Layer when needed.
+            MessageContent::Audio { transcript, .. } => {
+                Some(ChannelMessageContent::Text { text: transcript })
+            }
+            MessageContent::Location {
+                latitude,
+                longitude,
+                name,
+                ..
+            } => {
+                let label = name.unwrap_or_default();
+                let coords = format!("{latitude:.6},{longitude:.6}");
+                let text = if label.is_empty() {
+                    format!("[location: {coords}]")
+                } else {
+                    format!("[location: {coords} ({label})]")
+                };
+                Some(ChannelMessageContent::Text { text })
+            }
+            MessageContent::Contact {
+                display_name,
+                phone_number,
+                ..
+            } => {
+                let text = match phone_number {
+                    Some(ph) => format!("[contact: {display_name} {ph}]"),
+                    None => format!("[contact: {display_name}]"),
+                };
+                Some(ChannelMessageContent::Text { text })
+            }
+            // MessageContent is non_exhaustive in havn-core;
+            // future variants without a channel counterpart
+            // are dropped with a warn (we can't surface them
+            // through this path).
+            _ => None,
+        };
+        match translated {
+            Some(content) => {
+                if let Err(e) = ctx
+                    .channel_router
+                    .deliver(channel, account_id, sender_id, msg.reply_to, content)
+                    .await
+                {
+                    warn!(
+                        %agent_id,
+                        channel,
+                        account = account_id,
+                        error = %e,
+                        "could not deliver outbound to channel adapter (offline?)"
+                    );
+                }
+            }
+            None => {
+                warn!(%agent_id, "dropping channel-adapter outbound: unsupported MessageContent variant")
+            }
+        }
+    } else if let Err(e) = ctx.webchat_router.deliver(agent_id, msg).await {
+        warn!(%agent_id, error = %e, "could not deliver outbound to webchat");
+    }
+}
+
 /// The gateway-run tools `agent` may use: `web_search` when its policy
 /// allows it and its owner has a search backend, `web_fetch` when its
 /// policy allows it.
@@ -1236,6 +1241,9 @@ async fn gateway_tools_for(
     if policy.permissions.can_fetch_web {
         tools.push(ctx.fetch.spec());
     }
+    if policy.permissions.can_schedule_cron {
+        tools.push(crate::schedule::spec());
+    }
     tools
 }
 
@@ -1264,6 +1272,7 @@ async fn run_gateway_tool(
 ) -> Result<String, String> {
     match call.name.as_str() {
         crate::timezone::TOOL_NAME => run_set_timezone(agent_id, call, ctx).await,
+        crate::schedule::TOOL_NAME => run_schedule(agent_id, call, ctx).await,
         crate::web_search::TOOL_NAME => run_web_search(agent_id, call, ctx).await,
         crate::web_fetch::TOOL_NAME => run_web_fetch(agent_id, call, ctx).await,
         other => Err(format!("the gateway has no tool named {other:?}")),
@@ -1289,6 +1298,52 @@ async fn run_set_timezone(
         &call.input,
     )
     .await
+}
+
+async fn run_schedule(
+    agent_id: AgentId,
+    call: &GatewayToolCall,
+    ctx: &AgentSocketCtx,
+) -> Result<String, String> {
+    let agent = match agents_repo::find_by_id(&ctx.db, agent_id).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => return Err(format!("agent {agent_id} not found")),
+        Err(e) => return Err(format!("agent lookup failed: {e}")),
+    };
+    // The same check as creating a job over HTTP: the owner's policy.
+    let policy = policy_resolver::for_owner(&ctx.db, &agent).await;
+    if !policy.permissions.can_schedule_cron {
+        return Err("this agent's policy does not allow scheduled tasks".into());
+    }
+    let result = crate::schedule::run(
+        &ctx.db,
+        agent.owner_id,
+        agent_id,
+        call.conversation.as_deref(),
+        &call.input,
+    )
+    .await;
+    let action = call
+        .input
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if action != "list" {
+        let details = match &result {
+            Ok(_) => serde_json::json!({ "action": action, "input": call.input }),
+            Err(message) => serde_json::json!({ "action": action, "error": message }),
+        };
+        crate::audit::record(
+            &ctx.db,
+            agent.owner_id,
+            agent.team_id,
+            Some(agent_id),
+            "agent.schedule",
+            details,
+        )
+        .await;
+    }
+    result
 }
 
 async fn run_web_fetch(
@@ -2355,17 +2410,17 @@ mod tests {
 
         assert_eq!(
             tools_of(agent).await,
-            ["set_timezone", "web_fetch"],
+            ["set_timezone", "web_fetch", "schedule"],
             "no search backend yet"
         );
         add_openrouter_key(&ctx, owner).await;
         assert_eq!(
             tools_of(agent).await,
-            ["set_timezone", "web_search", "web_fetch"]
+            ["set_timezone", "web_search", "web_fetch", "schedule"]
         );
         assert_eq!(
             tools_of(denied).await,
-            ["set_timezone"],
+            ["set_timezone", "schedule"],
             "policy denies search and fetch"
         );
     }
@@ -2383,6 +2438,7 @@ mod tests {
             request_id: "f1".into(),
             name: "web_fetch".into(),
             input: serde_json::json!({"url": url, "prompt": "what is it"}),
+            conversation: None,
         };
 
         let refused = run_gateway_tool(denied, &call("https://example.com/"), &ctx).await;
@@ -2414,6 +2470,7 @@ mod tests {
             request_id: "t1".into(),
             name: name.into(),
             input: serde_json::json!({"query": "havn"}),
+            conversation: None,
         };
 
         let unknown = run_gateway_tool(agent, &call("shell"), &ctx).await;

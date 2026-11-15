@@ -94,7 +94,13 @@ pub struct CronScheduler {
     allow_unisolated_wakecheck: bool,
     /// Runs sent to an agent and not yet answered, keyed by `run_id`.
     pending: Arc<Mutex<HashMap<String, PendingRun>>>,
+    /// The day each job last told its conversation that a run failed.
+    failure_notices: Arc<Mutex<HashMap<CronJobId, chrono::NaiveDate>>>,
 }
+
+/// `deliver` of a job whose output goes to one conversation: this prefix
+/// and the conversation's channel id.
+pub const DELIVER_CONVERSATION: &str = "conversation:";
 
 impl CronScheduler {
     pub fn new(
@@ -130,6 +136,7 @@ impl CronScheduler {
             wakecheck_creds,
             allow_unisolated_wakecheck,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            failure_notices: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -420,13 +427,16 @@ impl CronScheduler {
     /// Called by the agent socket handler when the runtime returns a
     /// `CronResult` frame. Accepts it only for a run dispatched to
     /// `agent_id` that is still pending, then persists the output (capped at
-    /// [`CRON_OUTPUT_CAP`]) to disk, records a `cron_runs` row, and (unless
-    /// `silent`) broadcasts the output to the agent's open WebChat sessions.
+    /// [`CRON_OUTPUT_CAP`]) to disk and records a `cron_runs` row. Unless
+    /// `silent`, a `webchat` job's output is broadcast to the agent's open
+    /// WebChat sessions; a `conversation:` job's output, and once a day a
+    /// note that a run failed, is returned for the caller to send to that
+    /// conversation like the agent's own messages. `local` jobs only store.
     pub async fn record_result(
         &self,
         agent_id: AgentId,
         mut result: havn_proto::CronResult,
-    ) -> Result<(), CronError> {
+    ) -> Result<Option<OutboundMessage>, CronError> {
         use std::str::FromStr as _;
         let job_id = CronJobId::from_str(&result.job_id)
             .map_err(|_| CronError::InvalidJobId(result.job_id.clone()))?;
@@ -485,19 +495,50 @@ impl CronScheduler {
         )
         .await?;
 
-        if !result.silent && outcome == RunOutcome::Success {
-            let outbound = OutboundMessage {
-                channel_id: "broadcast".into(),
-                content: MessageContent::Text {
-                    text: result.output,
-                },
+        let conversation = job.deliver.strip_prefix(DELIVER_CONVERSATION);
+        let text = |text: String| MessageContent::Text { text };
+        match (&outcome, conversation) {
+            (RunOutcome::Success, _) if result.silent => Ok(None),
+            (RunOutcome::Success, Some(channel_id)) => Ok(Some(OutboundMessage {
+                channel_id: channel_id.to_string(),
+                content: text(result.output),
                 reply_to: None,
-            };
-            let n = self.webchat_router.broadcast(agent_id, outbound).await;
-            debug!(%job_id, sessions = n, "cron output broadcast");
+            })),
+            (RunOutcome::Success, None) if job.deliver == "webchat" => {
+                let outbound = OutboundMessage {
+                    channel_id: "broadcast".into(),
+                    content: text(result.output),
+                    reply_to: None,
+                };
+                let n = self.webchat_router.broadcast(agent_id, outbound).await;
+                debug!(%job_id, sessions = n, "cron output broadcast");
+                Ok(None)
+            }
+            (RunOutcome::Error, Some(channel_id)) if self.first_failure_today(job_id, now) => {
+                Ok(Some(OutboundMessage {
+                    channel_id: channel_id.to_string(),
+                    content: text(format!(
+                        "(The scheduled task \"{}\" failed: {}. I will not report it again \
+                         today.)",
+                        job.name,
+                        error_text.as_deref().unwrap_or("unknown error")
+                    )),
+                    reply_to: None,
+                }))
+            }
+            _ => Ok(None),
         }
+    }
 
-        Ok(())
+    /// True the first time `job` fails on `now`'s UTC day.
+    fn first_failure_today(&self, job: CronJobId, now: DateTime<Utc>) -> bool {
+        let today = now.date_naive();
+        let mut notices = self
+            .failure_notices
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        notices.retain(|_, day| *day == today);
+        notices.insert(job, today) != Some(today)
     }
 }
 
@@ -522,10 +563,6 @@ pub enum CronError {
     Db(#[from] DbError),
 }
 
-#[allow(
-    dead_code,
-    reason = "exposed for the schedule-help text in dashboard responses"
-)]
 pub fn describe_schedule(s: &Schedule) -> String {
     match s {
         Schedule::Interval { seconds } => format!("every {seconds}s"),

@@ -21,6 +21,7 @@ mod perm;
 mod policy_resolver;
 mod query_broker;
 mod reload;
+mod schedule;
 mod secret_ref;
 mod supervisor;
 mod timezone;

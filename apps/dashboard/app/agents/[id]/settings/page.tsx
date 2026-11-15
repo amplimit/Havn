@@ -26,6 +26,7 @@ import {
   type McpServerConfig,
   type McpView,
   type ModelsView,
+  type CronJobView,
   type TimezoneView,
 } from "@/lib/api";
 
@@ -294,6 +295,7 @@ export default function SettingsPage({
 
       <WebAccessEditor agentId={id} />
       <TimezoneEditor />
+      <ScheduledTasks agentId={id} />
 
       <McpEditor agentId={id} />
 
@@ -520,6 +522,99 @@ function BootstrapFileEditor({
         )}
       </div>
     </div>
+  );
+}
+
+/**
+ * The agent's scheduled tasks: the ones it made from chat with its
+ * `schedule` tool and the ones created over the API. Pause, resume or
+ * delete them here.
+ */
+function ScheduledTasks({ agentId }: { agentId: string }) {
+  const [jobs, setJobs] = useState<CronJobView[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(() => {
+    api.cron.list(agentId).then(setJobs, (e: unknown) =>
+      setError(e instanceof Error ? e.message : String(e)),
+    );
+  }, [agentId]);
+  useEffect(load, [load]);
+  async function act(work: () => Promise<unknown>) {
+    setBusy(true);
+    setError(null);
+    try {
+      await work();
+      load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  if (!jobs) return error ? <p className="mt-10 text-sm" role="alert">{error}</p> : null;
+  return (
+    <section className="mt-10 card px-4 py-4" aria-labelledby="tasks-title">
+      <h2 id="tasks-title" className="display-h3 mb-2">
+        scheduled tasks
+      </h2>
+      <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
+        Reminders and recurring jobs. Ask the agent in chat to create one, such as
+        &quot;remind me at 17:00 to call Anna&quot; or &quot;every weekday at 9, summarise
+        the news&quot;.
+      </p>
+      {error && (
+        <p className="mb-2 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
+          {error}
+        </p>
+      )}
+      {jobs.length === 0 ? (
+        <p className="text-sm" style={{ color: "var(--color-body)" }}>
+          No scheduled tasks.
+        </p>
+      ) : (
+        <ul className="grid gap-3 text-sm">
+          {jobs.map((job) => (
+            <li key={job.id} className="flex flex-wrap items-start justify-between gap-2">
+              <div className="min-w-0">
+                <strong>{job.name}</strong>{" "}
+                <span style={{ color: "var(--color-body)" }}>{job.summary}</span>
+                <div className="text-xs" style={{ color: "var(--color-body)" }}>
+                  {job.enabled
+                    ? `next ${new Date(job.next_run_at).toLocaleString()}`
+                    : "paused"}
+                  {job.last_run &&
+                    (job.last_run.error
+                      ? `; last run failed: ${job.last_run.error}`
+                      : `; last run ${new Date(job.last_run.started_at).toLocaleString()}`)}
+                </div>
+                <div className="truncate text-xs" title={job.prompt}>
+                  {job.prompt}
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  disabled={busy}
+                  onClick={() => act(() => api.cron.setEnabled(agentId, job.id, !job.enabled))}
+                >
+                  {job.enabled ? "pause" : "resume"}
+                </button>
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  disabled={busy}
+                  onClick={() => act(() => api.cron.remove(agentId, job.id))}
+                >
+                  delete
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   );
 }
 
