@@ -1582,6 +1582,7 @@ mod tests {
             let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
             assert_ne!(flags & libc::O_PATH, 0, "{}", path.display());
         }
+        let _ = std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
