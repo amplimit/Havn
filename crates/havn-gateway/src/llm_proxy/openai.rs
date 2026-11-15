@@ -235,7 +235,10 @@ fn translate_message_to_openai(m: &AnthropicMessage, out: &mut Vec<Value>) -> Re
                     "content": content,
                 }));
             }
-            "image" if block.pointer("/source/type").and_then(Value::as_str) == Some("base64") => {
+            "image"
+                if m.role == "user"
+                    && block.pointer("/source/type").and_then(Value::as_str) == Some("base64") =>
+            {
                 let media = block
                     .pointer("/source/media_type")
                     .and_then(Value::as_str)

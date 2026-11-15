@@ -591,23 +591,35 @@ async fn warn_over_agent_budget(
     }
 }
 
-/// Largest image shown to a model, in bytes: what providers take.
-pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+/// Largest image shown to a model, in bytes: base64 makes it a third
+/// larger, and providers take 5 MB of that.
+pub const MAX_IMAGE_BYTES: u64 = 3_750_000;
+/// Images one request shows at most, and their bytes in all (Gemini takes
+/// 20 MB of base64 in a request).
+pub const MAX_REQUEST_IMAGES: usize = 5;
+pub const MAX_REQUEST_IMAGE_BYTES: u64 = 14_000_000;
+/// Largest side of an image shown, in pixels: providers refuse larger.
+pub const MAX_IMAGE_SIDE: u32 = 8000;
 
 /// Put the images an agent's turn refers to in `request` (issue #106).
 /// The runtime names a file of its inbox (`{"type": "image", "source":
 /// {"type": "workspace", "path": "inbox/<name>"}}`) rather than sending
 /// its bytes, which would not fit a frame; the gateway reads it here,
 /// through [`crate::agent_files`] so nothing the agent controls is
-/// followed. A model without `vision`, a file that is not a PNG, JPEG,
-/// GIF or WebP image by its first bytes, too large or missing, gets a
-/// line saying so instead. Blocking: it reads files.
+/// followed. At most [`MAX_REQUEST_IMAGES`] of them, of at most
+/// [`MAX_REQUEST_IMAGE_BYTES`] together, each read once, are shown, and
+/// only to a model with `vision`; every other one (not a PNG, JPEG, GIF or
+/// WebP by its first bytes, too large, missing, outside the inbox, one
+/// too many) becomes a line saying why. Blocking: it reads files.
 pub fn resolve_workspace_images(
     request: &mut AnthropicRequest,
     workspace: &std::path::Path,
     vision: bool,
 ) {
     let mut inbox: Option<std::io::Result<Option<crate::agent_files::WorkspaceDir>>> = None;
+    let mut shown: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    let mut total: u64 = 0;
     for message in &mut request.messages {
         let Some(blocks) = message.content.as_array_mut() else {
             continue;
@@ -626,16 +638,28 @@ pub fn resolve_workspace_images(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let shown = if vision {
+            let result = if !vision {
+                Err("this model cannot see images".to_string())
+            } else if let Some(image) = shown.get(&path) {
+                Ok(image.clone())
+            } else if shown.len() >= MAX_REQUEST_IMAGES {
+                Err(format!(
+                    "a message shows at most {MAX_REQUEST_IMAGES} images"
+                ))
+            } else {
                 let dir = inbox.get_or_insert_with(|| {
                     crate::agent_files::WorkspaceDir::open(workspace)
                         .and_then(|root| root.subdir(havn_core::INBOX_DIR))
                 });
-                image_block(dir, &path)
-            } else {
-                Err("this model cannot see images".to_string())
+                image_block(dir, &path, MAX_REQUEST_IMAGE_BYTES.saturating_sub(total)).map(
+                    |(image, size)| {
+                        total += size;
+                        shown.insert(path.clone(), image.clone());
+                        image
+                    },
+                )
             };
-            *block = match shown {
+            *block = match result {
                 Ok(image) => image,
                 Err(why) => serde_json::json!({
                     "type": "text",
@@ -646,10 +670,13 @@ pub fn resolve_workspace_images(
     }
 }
 
+/// The image at `path` as a block, and its size, if it is at most
+/// `room` bytes.
 fn image_block(
     inbox: &std::io::Result<Option<crate::agent_files::WorkspaceDir>>,
     path: &str,
-) -> Result<serde_json::Value, String> {
+    room: u64,
+) -> Result<(serde_json::Value, u64), String> {
     if !havn_core::Attachment::in_inbox(path) {
         return Err("it is not a file of the inbox".into());
     }
@@ -659,16 +686,83 @@ fn image_block(
         Ok(None) => return Err("the inbox is gone".into()),
         Err(e) => return Err(format!("the inbox cannot be read ({e})")),
     };
-    let bytes = match dir.read_bytes(name, MAX_IMAGE_BYTES) {
+    let limit = MAX_IMAGE_BYTES.min(room);
+    let bytes = match dir.read_bytes(name, limit) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return Err("it is not there any more".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData && limit < MAX_IMAGE_BYTES => {
+            return Err("the images of this message are too large together".into());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(format!("it is over {MAX_IMAGE_BYTES} bytes"));
+        }
         Err(e) => return Err(format!("it cannot be read ({e})")),
     };
     let media_type = image_type(&bytes).ok_or("it is not a PNG, JPEG, GIF or WebP image")?;
-    Ok(serde_json::json!({
-        "type": "image",
-        "source": {"type": "base64", "media_type": media_type, "data": base64(&bytes)},
-    }))
+    if let Some((width, height)) = image_size(&bytes)
+        && width.max(height) > MAX_IMAGE_SIDE
+    {
+        return Err(format!(
+            "it is {width}x{height} pixels, over {MAX_IMAGE_SIDE} on a side"
+        ));
+    }
+    let size = bytes.len() as u64;
+    Ok((
+        serde_json::json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": base64(&bytes)},
+        }),
+        size,
+    ))
+}
+
+/// Width and height of the image `bytes` hold, when its header says.
+fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let be = |at: usize| -> Option<u32> {
+        Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+    };
+    let le16 = |at: usize| -> Option<u32> {
+        Some(u32::from(u16::from_le_bytes(
+            bytes.get(at..at + 2)?.try_into().ok()?,
+        )))
+    };
+    let le24 = |at: usize| -> Option<u32> {
+        let b = bytes.get(at..at + 3)?;
+        Some(u32::from(b[0]) | (u32::from(b[1]) << 8) | (u32::from(b[2]) << 16))
+    };
+    match image_type(bytes)? {
+        "image/png" => Some((be(16)?, be(20)?)),
+        "image/gif" => Some((le16(6)?, le16(8)?)),
+        "image/webp" => match bytes.get(12..16)? {
+            b"VP8X" => Some((le24(24)? + 1, le24(27)? + 1)),
+            b"VP8 " => Some((le16(26)? & 0x3fff, le16(28)? & 0x3fff)),
+            b"VP8L" => {
+                let b = bytes.get(21..25)?;
+                let bits = u32::from_le_bytes(b.try_into().ok()?);
+                Some(((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1))
+            }
+            _ => None,
+        },
+        "image/jpeg" => {
+            // The first start-of-frame marker holds the size.
+            let mut at = 2;
+            while at + 9 < bytes.len() {
+                if bytes[at] != 0xff {
+                    return None;
+                }
+                let marker = bytes[at + 1];
+                let len = usize::from(u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]));
+                if matches!(marker, 0xc0..=0xcf) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
+                    let height = u32::from(u16::from_be_bytes([bytes[at + 5], bytes[at + 6]]));
+                    let width = u32::from(u16::from_be_bytes([bytes[at + 7], bytes[at + 8]]));
+                    return Some((width, height));
+                }
+                at += 2 + len;
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// The image type `bytes` start like.
@@ -951,6 +1045,76 @@ pub fn model_allowed(allowed_models: &[String], model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_shows_a_few_images_each_read_once() {
+        let ws = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir(ws.path().join("inbox")).expect("inbox");
+        let png = |w: u32, h: u32| {
+            let mut b = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+            b.extend(w.to_be_bytes());
+            b.extend(h.to_be_bytes());
+            b
+        };
+        std::fs::write(ws.path().join("inbox/a.png"), png(10, 10)).expect("a");
+        std::fs::write(ws.path().join("inbox/wide.png"), png(9000, 10)).expect("wide");
+        for n in 0..6 {
+            std::fs::write(ws.path().join(format!("inbox/{n}.png")), png(10, 10)).expect("n");
+        }
+        let refer = |path: String| serde_json::json!({"type": "image", "source": {"type": "workspace", "path": path}});
+        let mut blocks: Vec<serde_json::Value> =
+            (0..1000).map(|_| refer("inbox/a.png".into())).collect();
+        blocks.push(refer("inbox/wide.png".into()));
+        blocks.extend((0..6).map(|n| refer(format!("inbox/{n}.png"))));
+        let mut request = AnthropicRequest {
+            model: "m".into(),
+            max_tokens: 10,
+            messages: vec![AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::Value::Array(blocks),
+            }],
+            system: None,
+            temperature: None,
+            tools: None,
+        };
+        resolve_workspace_images(&mut request, ws.path(), true);
+        let blocks = request.messages[0].content.as_array().expect("blocks");
+        // The same image a thousand times is one image, read once.
+        assert!(blocks[..1000].iter().all(|b| b["type"] == "image"));
+        assert!(
+            blocks[1000]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("9000x10")
+        );
+        let images = blocks[1001..]
+            .iter()
+            .filter(|b| b["type"] == "image")
+            .count();
+        assert_eq!(images, MAX_REQUEST_IMAGES - 1, "a.png counts as one");
+        assert!(
+            blocks.last().unwrap()["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("at most")
+        );
+    }
+
+    #[test]
+    fn image_sizes_are_read_from_their_headers() {
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend([0x40, 0x1f, 0x10, 0x00]);
+        assert_eq!(image_size(&gif), Some((8000, 16)));
+        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x00, 0x00];
+        jpeg.extend([
+            0xff, 0xc0, 0x00, 0x11, 0x08, 0x02, 0x58, 0x03, 0x20, 0, 0, 0,
+        ]);
+        assert_eq!(image_size(&jpeg), Some((800, 600)));
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8X".to_vec();
+        webp.extend([0; 8]);
+        webp.extend([0x1f, 0x03, 0x00, 0x57, 0x02, 0x00]);
+        assert_eq!(image_size(&webp), Some((800, 600)));
+    }
 
     #[test]
     fn base64_matches_the_standard_vectors() {
