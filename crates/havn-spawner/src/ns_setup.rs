@@ -51,8 +51,10 @@
 //! root from the host's `/` to a freshly-built tmpfs that exposes only:
 //! `/usr` (ro bind), `/lib`/`/lib64`/`/bin`/`/sbin` (symlinks → `/usr/*`),
 //! `/proc` (PID-ns view), `/tmp` (tmpfs), `/dev/{null,urandom,zero,random}`,
-//! `/etc/ssl/certs` (ro), `/etc/resolv.conf` (when network allowed), and the agent's
-//! workspace mirror-bound at its host path. Everything else (`/var`,
+//! `/etc/ssl/certs` (ro), `/etc/resolv.conf` (when network allowed), the
+//! extra mounts (the host's tool directories, [`crate::tool_mounts`], and
+//! the operator's), and the agent's workspace mirror-bound at its host
+//! path. Everything else (the rest of `/var`,
 //! `/home`, `/root`, `/srv`, `/sys`, `/etc/{shadow,passwd,...}`) is
 //! invisible to the agent — Landlock no longer the only thing keeping
 //! the host fs out of view.
@@ -837,7 +839,7 @@ pub unsafe fn pivot_root_into_minimal_rootfs(
         for mount in extra_mounts {
             if !host.contains(&mount.path) {
                 eprintln!(
-                    "havn-init: extra_mounts entry {} cannot be opened on the host — skipping",
+                    "havn-init: mount {} cannot be opened on the host — skipping",
                     mount.path.display()
                 );
                 continue;

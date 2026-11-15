@@ -249,6 +249,32 @@ fn rebuild_or_die() -> CreatedRuleset {
 /// [`create_tool_domain`] has made it.
 static TOOL_DOMAIN: OnceLock<OwnedFd> = OnceLock::new();
 
+/// `HOME` for tool processes, a directory in the workspace. Only tools get
+/// it: MCP servers get [`MCP_HOME`], so nothing a tool leaves in its home
+/// (a Python `.pth`, an `.npmrc`, a `.gitconfig`) runs in the runtime's
+/// domain.
+static TOOL_HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// `HOME` of MCP servers once tools have a home of their own: a path that
+/// does not exist and that nothing in the agent can create.
+pub const MCP_HOME: &str = "/nonexistent";
+
+/// Give the processes [`confine_tool`] prepares `home` as `HOME`.
+pub fn set_tool_home(home: std::path::PathBuf) {
+    let _ = TOOL_HOME.set(home);
+}
+
+/// Whether tool processes have a home of their own.
+pub fn has_tool_home() -> bool {
+    TOOL_HOME.get().is_some()
+}
+
+fn apply_tool_home(command: &mut tokio::process::Command, home: Option<&std::path::Path>) {
+    if let Some(home) = home {
+        command.env("HOME", home).env_remove("XDG_CACHE_HOME");
+    }
+}
+
 /// `LANDLOCK_ACCESS_FS_MAKE_BLOCK`.
 const ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
 /// `LANDLOCK_ACCESS_FS_REFER` (ABI 2): moving or linking a file into
@@ -353,8 +379,10 @@ pub fn create_tool_domain() -> std::io::Result<()> {
 /// Have the process `command` starts enter the tools' domain before it
 /// execs, once [`create_tool_domain`] has made it; the spawn fails if it
 /// cannot. Sets `no_new_privs`, which Landlock requires and the runtime's
-/// seccomp filter has already set.
+/// seccomp filter has already set. Gives it the tools' `HOME` once
+/// [`set_tool_home`] has set one.
 pub fn confine_tool(command: &mut tokio::process::Command) {
+    apply_tool_home(command, TOOL_HOME.get().map(std::path::PathBuf::as_path));
     let Some(ruleset) = TOOL_DOMAIN.get() else {
         return;
     };
@@ -376,6 +404,20 @@ pub fn confine_tool(command: &mut tokio::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tool_processes_get_the_tools_home() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("printf '%s|%s' \"$HOME\" \"${XDG_CACHE_HOME-unset}\"")
+            .env("XDG_CACHE_HOME", "/root/.cache");
+        apply_tool_home(&mut cmd, Some(Path::new("/agent/workspace/.havn/home")));
+        let out = cmd.output().await.unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "/agent/workspace/.havn/home|unset"
+        );
+    }
 
     #[test]
     fn system_read_paths_cover_dynamic_loader_dependencies() {
