@@ -90,9 +90,26 @@ pub async fn delete(id: &str) -> anyhow::Result<()> {
     let team_id = TeamId::from_str(id)
         .map_err(|_| anyhow::anyhow!("team id must be a UUID v7 (got {id:?})"))?;
     let pool = open_db_pub().await?;
+    // The gateway stops a team's agents when it deletes the team; under a
+    // running one they would keep the team's policy until restarted.
+    let lock = crate::user::lock_db()?;
+    if let Err(locked) = &lock {
+        let (agents,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agents WHERE team_id = ?1")
+            .bind(team_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .context("counting the team's agents")?;
+        if agents > 0 {
+            anyhow::bail!(
+                "team {team_id} has {agents} agent(s) and {locked}: delete the team in the \
+                 dashboard, which stops its agents, or stop the gateway"
+            );
+        }
+    }
     teams::delete(&pool, team_id)
         .await
         .with_context(|| format!("deleting team {team_id}"))?;
+    drop(lock);
     println!("deleted team {team_id} (members and team-scoped roles cascaded)");
     Ok(())
 }

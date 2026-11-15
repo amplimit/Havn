@@ -675,6 +675,15 @@ pub async fn delete(
     {
         warn!(agent_id = %id, error = %e, "spawner.stop during delete failed");
     }
+    // Kept while its sandbox still runs, so no process is left running
+    // unknown to the gateway with its link handed to another agent.
+    if state.spawner.lingers(id).await {
+        warn!(agent_id = %id, "agent processes survived the stop; agent kept");
+        return Err(ApiError::Internal(format!(
+            "agent {id} was not deleted: processes of its sandbox still run. Try again in a \
+             moment, or restart the gateway"
+        )));
+    }
 
     // Audit BEFORE delete so the FK SET NULL on agent_id doesn't lose
     // the breadcrumb. (We still pass `Some(id)` — the FK rewrites to

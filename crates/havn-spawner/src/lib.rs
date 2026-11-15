@@ -590,6 +590,12 @@ pub trait AgentSpawner: Send + Sync + std::fmt::Debug {
     /// later spawn).
     async fn wait(&self, handle: &AgentHandle) -> Result<AgentExit>;
 
+    /// Whether processes of `agent_id` may still run: it is tracked, or a
+    /// stop left processes behind (the cleanup is tried again first).
+    async fn lingers(&self, _agent_id: AgentId) -> bool {
+        false
+    }
+
     /// Kill agent processes left behind by a previous gateway run; returns
     /// how many agents were found. Called once at gateway startup.
     async fn reap_orphans(&self) -> Result<usize> {

@@ -38,24 +38,62 @@ pub fn start(detach: bool) -> anyhow::Result<()> {
 // gateway the pid file does not know, such as the systemd unit's; otherwise
 // a detached start would report success for a gateway that exits at once.
 fn running_gateway(cfg: &paths::CliConfig) -> Option<String> {
-    use std::io::Read as _;
     let db = cfg
         .db_path
         .clone()
         .unwrap_or_else(|| paths::data_dir(cfg).join("havn.db"));
-    let mut name = db.file_name()?.to_os_string();
+    match lock_db(&db) {
+        Err(DbLocked::Gateway(holder)) => Some(holder),
+        _ => None,
+    }
+}
+
+/// Why the lock of a database could not be taken.
+#[derive(Debug)]
+pub enum DbLocked {
+    /// A gateway runs on it.
+    Gateway(String),
+    /// It could not be checked.
+    Unknown(String),
+}
+
+impl std::fmt::Display for DbLocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gateway(holder) => write!(f, "the gateway ({holder}) is running"),
+            Self::Unknown(why) => write!(f, "whether a gateway runs is unknown ({why})"),
+        }
+    }
+}
+
+/// Take the lock a gateway holds on database `db` while it runs, so none
+/// starts while it is held: `None` when no gateway has made the lock file.
+pub fn lock_db(db: &std::path::Path) -> Result<Option<std::fs::File>, DbLocked> {
+    use std::io::Read as _;
+    let mut name = db
+        .file_name()
+        .ok_or_else(|| DbLocked::Unknown(format!("{} names no file", db.display())))?
+        .to_os_string();
     name.push(".lock");
-    let mut file = std::fs::File::open(db.with_file_name(name)).ok()?;
+    let path = db.with_file_name(name);
+    let mut file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(DbLocked::Unknown(format!("{}: {e}", path.display()))),
+    };
     match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
         Err(std::fs::TryLockError::WouldBlock) => {
             let mut pid = String::new();
             let _ = file.read_to_string(&mut pid);
-            Some(match pid.trim() {
+            Err(DbLocked::Gateway(match pid.trim() {
                 "" => "unknown pid".to_string(),
                 pid => format!("pid {pid}"),
-            })
+            }))
         }
-        _ => None,
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(DbLocked::Unknown(format!("{}: {e}", path.display())))
+        }
     }
 }
 

@@ -159,24 +159,52 @@ pub async fn list() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The lock of the CLI's database (see [`crate::gateway::lock_db`]).
+pub fn lock_db() -> anyhow::Result<Result<Option<std::fs::File>, crate::gateway::DbLocked>> {
+    Ok(crate::gateway::lock_db(&resolve_db_path()?))
+}
+
 pub async fn delete(id: &str) -> anyhow::Result<()> {
     let user_id = parse_user_id(id)?;
     let pool = open_db().await?;
+    // Held until the delete is committed, so no gateway starts the user's
+    // agents in between.
+    let lock = lock_db()?;
     // Hard-delete. FK cascades on agents.owner_id wipe the user's
     // agents, on credentials they take their credentials, on
-    // credential_usages the usage rows. audit_log SETs NULL on the
-    // user_id (caller of long-gone records). team_memberships go too.
-    //
-    // This is destructive — the operator presumably intends it. The
-    // caller printed-warning is the only confirmation.
+    // credential_usages the usage rows, and the user's audit rows go too.
+    // team_memberships go too. Counted and deleted in one transaction, so
+    // no agent is created in between.
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .context("opening a transaction")?;
+    let (agents,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agents WHERE owner_id = ?1")
+        .bind(user_id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .context("counting the user's agents")?;
+    // A running gateway may have them running: deleting their rows under
+    // it would leave their sandboxes running, unknown to it, and hand
+    // their links to new agents.
+    if agents > 0
+        && let Err(locked) = &lock
+    {
+        anyhow::bail!(
+            "user {user_id} owns {agents} agent(s) and {locked}: delete the agents first \
+             (dashboard or `havn agent delete`), or stop the gateway"
+        );
+    }
     let res = sqlx::query("DELETE FROM users WHERE id = ?1")
         .bind(user_id.to_string())
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .context("deleting user")?;
     if res.rows_affected() == 0 {
         anyhow::bail!("no user with id {user_id}");
     }
+    tx.commit().await.context("deleting user")?;
+    drop(lock);
     println!("deleted user {user_id} (and all owned agents / credentials)");
     Ok(())
 }
