@@ -17,6 +17,11 @@ pub struct InboundMessage {
     pub channel: String,
     pub content: MessageContent,
     pub timestamp: DateTime<Utc>,
+    /// The chat of `channel_id` it continues (issue #126): one the
+    /// dashboard chose, or, when absent, the active one. The runtime sets
+    /// it to the chat it resolved before running the turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
     /// Original platform payload, preserved verbatim for adapter-specific features.
     #[serde(default)]
     pub raw: serde_json::Value,
@@ -28,6 +33,9 @@ pub struct OutboundMessage {
     pub content: MessageContent,
     /// Optional message ID to thread / reply to.
     pub reply_to: Option<String>,
+    /// The chat a reply belongs to, when it answers one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

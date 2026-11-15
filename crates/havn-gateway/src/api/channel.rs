@@ -783,6 +783,7 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
     // reaching the agent as a message.
     if is_stop_command(&content) {
         let stop = GatewayToAgent::StopTurn(havn_proto::StopTurn {
+            conversation: None,
             channel_id: encoded_channel_id,
         });
         if let Err(e) = state.registry.send(agent_id, stop).await {
@@ -790,7 +791,12 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
         }
         return;
     }
+    // `/new` starts a new chat with the agent; the old one is kept.
+    // `/new` starts a new chat; the runtime confirms. It goes the way of
+    // a message, in order with the ones after it.
+    let new_chat = is_command_message(&content, "/new");
     let msg = InboundMessage {
+        conversation: None,
         channel_id: encoded_channel_id,
         sender_id: inb.sender_id.clone(),
         channel: channel.to_string(),
@@ -869,11 +875,14 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
         }
     }
 
-    if let Err(e) = state
-        .registry
-        .send(agent_id, GatewayToAgent::InboundMessage(msg))
-        .await
-    {
+    let frame = if new_chat {
+        GatewayToAgent::NewChat(havn_proto::NewChat {
+            channel_id: msg.channel_id,
+        })
+    } else {
+        GatewayToAgent::InboundMessage(msg)
+    };
+    if let Err(e) = state.registry.send(agent_id, frame).await {
         warn!(
             channel,
             account = %inb.account_id,
@@ -1064,10 +1073,15 @@ fn is_command(text: &str, name: &str) -> bool {
 
 /// A text message that is only `/stop`.
 fn is_stop_command(content: &MessageContent) -> bool {
+    is_command_message(content, "/stop")
+}
+
+/// A text message that is only the command `name`.
+fn is_command_message(content: &MessageContent, name: &str) -> bool {
     let MessageContent::Text { text } = content else {
         return false;
     };
-    is_command(text.trim(), "/stop")
+    is_command(text.trim(), name)
 }
 
 #[cfg(test)]

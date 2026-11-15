@@ -4,13 +4,14 @@
  */
 
 export type ClientMessage =
-  | { type: "send"; content: string }
-  | { type: "stop" }
+  /** `conversation`: the chat it continues, a new one when the id is new. */
+  | { type: "send"; content: string; conversation?: string }
+  | { type: "stop"; conversation?: string }
   | { type: "decide"; id: string; approve: boolean; remember: boolean };
 
 export type ServerMessage =
-  /** `broadcast`: sent on its own (heartbeat, cron), not a reply. */
-  | { type: "agent_message"; content: string; broadcast?: boolean }
+  /** `broadcast`: sent on its own (heartbeat, cron), not a reply; `conversation`: the chat it answers. */
+  | { type: "agent_message"; content: string; broadcast?: boolean; conversation?: string }
   | { type: "error"; message: string }
   /** A tool call waits for the owner's approval; `conversation` when it came from a channel. */
   | {

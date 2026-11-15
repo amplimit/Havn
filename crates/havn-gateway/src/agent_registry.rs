@@ -516,6 +516,7 @@ mod tests {
 
     fn inbound(content: havn_core::MessageContent) -> GatewayToAgent {
         GatewayToAgent::InboundMessage(havn_core::InboundMessage {
+            conversation: None,
             channel_id: "c".into(),
             sender_id: "s".into(),
             channel: "webchat".into(),

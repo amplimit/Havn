@@ -27,7 +27,6 @@ use havn_proto::GatewayToAgent;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
-use uuid::Uuid;
 
 use crate::AppState;
 use crate::agent_registry::AgentRegistry;
@@ -90,6 +89,11 @@ pub async fn handler(
     Ok(ws.on_upgrade(move |socket| handle_session(socket, state, agent_id, sender_id)))
 }
 
+/// A chat id a tab named, when it is short enough to be one.
+fn chat_id(conversation: Option<String>) -> Option<String> {
+    conversation.filter(|c| !c.is_empty() && c.len() <= crate::webchat::MAX_CONVERSATION_ID)
+}
+
 async fn handle_session(socket: WebSocket, state: AppState, agent_id: AgentId, sender_id: String) {
     // Stable session_id per (user, agent) pair, derived deterministically
     // via UUIDv5 over a fixed namespace. Reasoning: each WS reconnect (page
@@ -101,10 +105,7 @@ async fn handle_session(socket: WebSocket, state: AppState, agent_id: AgentId, s
     //
     // Two browser tabs for the same agent share one session; each is its
     // own tab in the router and gets every reply.
-    let session_id: SessionId = Uuid::new_v5(
-        &Uuid::NAMESPACE_OID,
-        format!("havn-webchat:{sender_id}:{agent_id}").as_bytes(),
-    );
+    let session_id: SessionId = crate::webchat::session_for(&sender_id, agent_id);
     info!(%agent_id, %session_id, "webchat session opened");
 
     let (ws_sink, ws_stream) = socket.split();
@@ -211,8 +212,11 @@ async fn serve_session<Si, St, E>(
                 continue;
             }
         };
-        let user_text = match parsed {
-            ClientMessage::Send { content } => content,
+        let (user_text, conversation) = match parsed {
+            ClientMessage::Send {
+                content,
+                conversation,
+            } => (content, chat_id(conversation)),
             ClientMessage::Decide {
                 id,
                 approve,
@@ -224,8 +228,9 @@ async fn serve_session<Si, St, E>(
                 .await;
                 continue;
             }
-            ClientMessage::Stop => {
+            ClientMessage::Stop { conversation } => {
                 let stop = GatewayToAgent::StopTurn(havn_proto::StopTurn {
+                    conversation: chat_id(conversation),
                     channel_id: session_id.to_string(),
                 });
                 if let Err(e) = registry.send(agent_id, stop).await {
@@ -236,6 +241,7 @@ async fn serve_session<Si, St, E>(
         };
 
         let inbound = InboundMessage {
+            conversation,
             channel_id: session_id.to_string(),
             sender_id: sender_id.to_string(),
             channel: "webchat".into(),
@@ -297,6 +303,7 @@ mod tests {
 
     use super::*;
     use std::time::Duration;
+    use uuid::Uuid;
 
     fn reading_sink() -> (
         impl Sink<Message, Error = ()> + Unpin + Send + 'static,
@@ -372,6 +379,7 @@ mod tests {
                 .deliver(
                     agent_id,
                     havn_core::OutboundMessage {
+                        conversation: None,
                         channel_id: session_id.to_string(),
                         content: MessageContent::Text {
                             text: format!("m{i}"),

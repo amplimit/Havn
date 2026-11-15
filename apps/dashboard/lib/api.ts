@@ -135,8 +135,20 @@ export type ConversationTurn = {
 export type ConversationResponse = {
   agent_id: string;
   channel_id: string;
+  /** The chat the turns are of; `null` when there is no active one yet. */
+  conversation: string | null;
   turns: ConversationTurn[];
   uninitialised: boolean;
+};
+
+/** One of the caller's chats with an agent. */
+export type ChatSummary = {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  /** New messages without a chosen chat continue this one. */
+  active: boolean;
 };
 
 export type CuratorReportFile = {
@@ -510,10 +522,25 @@ export const api = {
      * with `agentId`. Newest at the end. Empty when the agent has
      * never been started (`uninitialised: true`) or when this is the
      * user's first chat with this agent. */
-    list: (agentId: string, limit = 100) =>
+    list: (agentId: string, limit = 100, conversation?: string) =>
       request<ConversationResponse>(
-        `/agents/${agentId}/conversation?limit=${limit}`,
+        `/agents/${agentId}/conversation?limit=${limit}` +
+          (conversation ? `&conversation=${encodeURIComponent(conversation)}` : ""),
       ),
+  },
+
+  chats: {
+    /** The caller's chats with `agentId`, most recently used first. */
+    list: (agentId: string) => request<ChatSummary[]>(`/agents/${agentId}/chats`),
+    rename: (agentId: string, chat: string, title: string) =>
+      request<void>(`/agents/${agentId}/chats/${encodeURIComponent(chat)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ title }),
+      }),
+    delete: (agentId: string, chat: string) =>
+      request<void>(`/agents/${agentId}/chats/${encodeURIComponent(chat)}`, {
+        method: "DELETE",
+      }),
   },
 
   bootstrap: {

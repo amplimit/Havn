@@ -29,6 +29,9 @@ tokio::task_local! {
     /// The conversation a turn answers, set around a user turn's tool
     /// loop; gateway tool calls made in it carry it.
     pub static CONVERSATION: String;
+    /// The chat of [`CONVERSATION`] the turn runs in; what "for this
+    /// conversation" approvals are remembered for.
+    pub static CHAT: String;
 }
 
 pub struct GatewayTool {
@@ -92,6 +95,7 @@ impl Tool for GatewayTool {
             name: self.spec.name.clone(),
             input,
             conversation: CONVERSATION.try_with(Clone::clone).ok(),
+            chat: CHAT.try_with(Clone::clone).ok(),
         });
         if self.writer_tx.send(frame).await.is_err() {
             return ToolResult::Error("the gateway connection is closed".into());

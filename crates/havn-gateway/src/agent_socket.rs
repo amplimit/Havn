@@ -880,6 +880,7 @@ async fn oversized_reply(
                     .deliver(
                         agent_id,
                         havn_core::OutboundMessage {
+                            conversation: msg.conversation,
                             channel_id: msg.channel_id,
                             content: havn_core::MessageContent::Text { text: notice },
                             reply_to: None,
@@ -1160,6 +1161,7 @@ async fn ask_for_approval(
     }
     if crate::channel_id_codec::decode(&request.channel_id).is_some() {
         let message = OutboundMessage {
+            conversation: None,
             channel_id: request.channel_id,
             content: havn_core::MessageContent::Text {
                 text: "(A step of this reply waits for the agent owner's approval.)".into(),
@@ -1482,6 +1484,7 @@ async fn run_schedule(
         agent.owner_id,
         agent_id,
         call.conversation.as_deref(),
+        call.chat.as_deref(),
         &call.input,
     )
     .await;
@@ -2616,6 +2619,7 @@ mod tests {
             name: "web_fetch".into(),
             input: serde_json::json!({"url": url, "prompt": "what is it"}),
             conversation: None,
+            chat: None,
         };
 
         let refused = run_gateway_tool(denied, &call("https://example.com/"), &ctx).await;
@@ -2648,6 +2652,7 @@ mod tests {
             name: name.into(),
             input: serde_json::json!({"query": "havn"}),
             conversation: None,
+            chat: None,
         };
 
         let unknown = run_gateway_tool(agent, &call("shell"), &ctx).await;
@@ -3507,6 +3512,7 @@ mod tests {
         let (conn, _conn_rx) = mpsc::channel(1);
         let outbound_to = |sender: &str| {
             AgentToGateway::OutboundMessage(havn_core::OutboundMessage {
+                conversation: None,
                 channel_id: crate::channel_id_codec::encode("telegram", "bot", sender),
                 content: havn_core::MessageContent::Text { text: "hi".into() },
                 reply_to: None,

@@ -288,6 +288,7 @@ pub async fn create(
     let job = cron::create(
         &state.db,
         NewCronJob {
+            chat: None,
             agent_id,
             name: req.name.trim(),
             prompt: req.prompt.trim(),

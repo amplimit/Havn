@@ -692,6 +692,11 @@ async fn serve() -> anyhow::Result<()> {
         )
         .route("/agents/{id}/cron/{job_id}/runs", get(api::cron::list_runs))
         .route("/agents/{id}/conversation", get(api::conversation::list))
+        .route("/agents/{id}/chats", get(api::conversation::chats))
+        .route(
+            "/agents/{id}/chats/{chat}",
+            patch(api::conversation::chat_patch).delete(api::conversation::chat_delete),
+        )
         .route(
             "/agents/{id}/bootstrap",
             get(api::bootstrap::get).put(api::bootstrap::put),

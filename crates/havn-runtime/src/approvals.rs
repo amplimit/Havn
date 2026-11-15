@@ -21,6 +21,8 @@ const MAX_SHOWN_INPUT: usize = 4000;
 #[derive(Debug)]
 struct Waiting {
     channel_id: String,
+    /// The chat a remembered approval holds for.
+    chat: String,
     tool: String,
     input: String,
     reply: oneshot::Sender<bool>,
@@ -31,8 +33,8 @@ pub struct Approvals {
     writer_tx: mpsc::Sender<AgentToGateway>,
     /// Requests waiting, oldest first.
     waiting: Mutex<Vec<(String, Waiting)>>,
-    /// (conversation, tool, input) approved for the rest of a conversation,
-    /// until the agent restarts.
+    /// (chat, tool, input) approved for the rest of a chat, until the agent
+    /// restarts.
     remembered: Mutex<HashSet<(String, String, String)>>,
 }
 
@@ -47,11 +49,12 @@ impl Approvals {
     }
 
     /// Wait for the owner to approve calling `tool` with `input` (the whole
-    /// input as JSON) in `conversation`. `Err` says why the call may not
-    /// run.
+    /// input as JSON) in `conversation`, in its chat `chat`. `Err` says why
+    /// the call may not run.
     pub async fn ask(
         &self,
         conversation: Option<&str>,
+        chat: Option<&str>,
         tool: &str,
         input: &str,
         reason: &str,
@@ -69,7 +72,8 @@ impl Approvals {
                  characters that can be shown for it"
             ));
         }
-        let key = (channel_id.to_string(), tool.to_string(), input.to_string());
+        let chat = chat.unwrap_or(channel_id);
+        let key = (chat.to_string(), tool.to_string(), input.to_string());
         if self.lock_remembered().contains(&key) {
             return Ok(());
         }
@@ -79,6 +83,7 @@ impl Approvals {
             request_id.clone(),
             Waiting {
                 channel_id: channel_id.to_string(),
+                chat: chat.to_string(),
                 tool: tool.to_string(),
                 input: input.to_string(),
                 reply: tx,
@@ -125,7 +130,7 @@ impl Approvals {
         };
         if decision.approve && decision.remember {
             self.lock_remembered()
-                .insert((waiting.channel_id, waiting.tool, waiting.input));
+                .insert((waiting.chat, waiting.tool, waiting.input));
         }
         let _ = waiting.reply.send(decision.approve);
         true
@@ -198,7 +203,7 @@ mod tests {
         let call = tokio::spawn({
             let a = Arc::clone(&approvals);
             async move {
-                a.ask(Some("c1"), "shell", r#"{"command":"deploy"}"#, "rule")
+                a.ask(Some("c1"), None, "shell", r#"{"command":"deploy"}"#, "rule")
                     .await
             }
         });
@@ -216,14 +221,32 @@ mod tests {
         assert_eq!(call.await.unwrap(), Ok(()));
 
         // Remembered for this conversation: no second question.
-        let again = approvals.ask(Some("c1"), "shell", r#"{"command":"deploy"}"#, "rule");
+        let again = approvals.ask(Some("c1"), None, "shell", r#"{"command":"deploy"}"#, "rule");
         assert_eq!(again.await, Ok(()));
         assert!(rx.try_recv().is_err());
+
+        // Not in a new chat of the same conversation, though.
+        let fresh = tokio::spawn({
+            let a = Arc::clone(&approvals);
+            async move {
+                a.ask(
+                    Some("c1"),
+                    Some("chat-2"),
+                    "shell",
+                    r#"{"command":"deploy"}"#,
+                    "rule",
+                )
+                .await
+            }
+        });
+        let request = next_request(&mut rx).await;
+        assert!(approvals.decide(&decision("c1", &request.request_id, true, false)));
+        assert_eq!(fresh.await.unwrap(), Ok(()));
 
         let denied = tokio::spawn({
             let a = Arc::clone(&approvals);
             async move {
-                a.ask(Some("c1"), "shell", r#"{"command":"rm"}"#, "rule")
+                a.ask(Some("c1"), None, "shell", r#"{"command":"rm"}"#, "rule")
                     .await
             }
         });
@@ -241,17 +264,20 @@ mod tests {
     async fn without_a_conversation_a_short_input_or_an_answer_calls_are_refused() {
         let (tx, mut rx) = mpsc::channel(8);
         let approvals = Approvals::new(tx);
-        let none = approvals.ask(None, "shell", "x", "rule").await.unwrap_err();
+        let none = approvals
+            .ask(None, None, "shell", "x", "rule")
+            .await
+            .unwrap_err();
         assert!(none.contains("scheduled run"), "{none}");
         let long = "x".repeat(MAX_SHOWN_INPUT + 1);
         let too_long = approvals
-            .ask(Some("c1"), "shell", &long, "rule")
+            .ask(Some("c1"), None, "shell", &long, "rule")
             .await
             .unwrap_err();
         assert!(too_long.contains("longer"), "{too_long}");
 
         tokio::time::pause();
-        let wait = approvals.ask(Some("c1"), "shell", "x", "rule");
+        let wait = approvals.ask(Some("c1"), None, "shell", "x", "rule");
         tokio::pin!(wait);
         tokio::select! {
             _ = &mut wait => panic!("answered without a decision"),

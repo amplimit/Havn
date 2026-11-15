@@ -408,13 +408,20 @@ impl ToolRegistry {
                         let conversation = crate::tools::gateway::CONVERSATION
                             .try_with(Clone::clone)
                             .ok();
+                        let chat = crate::tools::gateway::CHAT.try_with(Clone::clone).ok();
                         let decided = match &self.approvals {
                             Some(approvals) => {
                                 // The whole input: what is approved, and
                                 // what "for this conversation" remembers.
                                 let whole = input.to_string();
                                 approvals
-                                    .ask(conversation.as_deref(), name, &whole, &reason)
+                                    .ask(
+                                        conversation.as_deref(),
+                                        chat.as_deref(),
+                                        name,
+                                        &whole,
+                                        &reason,
+                                    )
                                     .await
                             }
                             None => Err("it needs approval, which is not set up here".to_string()),
