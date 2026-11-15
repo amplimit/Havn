@@ -758,8 +758,10 @@ pub struct DueSummary {
 }
 
 /// Turns walked at most when looking for a chat's last summary before
-/// folding; a branch with more since then keeps the older gap out.
-const SUMMARY_SCAN: u32 = 2000;
+/// folding. A chat longer than this when it is first summarised (one
+/// from before summaries) is summarised from this far back, so upgrading
+/// does not cost a pass per 40 turns of every old chat.
+const SUMMARY_SCAN: u32 = 200;
 /// Turns walked at most when looking for an older summary.
 const SUMMARY_WALK: u32 = 100_000;
 

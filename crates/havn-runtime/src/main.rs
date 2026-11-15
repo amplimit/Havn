@@ -112,6 +112,10 @@ const SUMMARY_BATCH: u32 = 20;
 const MAX_SUMMARY_CHARS: usize = 6000;
 /// Characters of each turn the summariser reads.
 const SUMMARY_TURN_CHARS: usize = 4000;
+/// Characters of turns one summary pass reads at most, so one batch of
+/// long turns does not exceed a small model's context; the rest wait
+/// for the next pass.
+const MAX_SUMMARY_INPUT_CHARS: usize = 60_000;
 /// Lasting facts one summary pass may save to memory.
 const MAX_FLUSHED_FACTS: usize = 5;
 /// Hard cap on the number of LLM ↔ tool round trips per inbound message.
@@ -2046,9 +2050,18 @@ async fn summarize(ctx: &Ctx, chat: &str, flush: bool) -> anyhow::Result<bool> {
         writeln!(transcript, "Summary so far:\n{previous}\n")?;
     }
     transcript.push_str("Turns to add:\n");
-    for turn in &due.turns {
+    // The turns read, and the last of them: what the summary covers.
+    let mut read = 0;
+    let mut through = due.through.clone();
+    for (n, turn) in due.turns.iter().enumerate() {
+        let text: String = turn.content.chars().take(SUMMARY_TURN_CHARS).collect();
+        let chars = text.chars().count();
+        if n > 0 && read + chars > MAX_SUMMARY_INPUT_CHARS {
+            break;
+        }
+        through.clone_from(&turn.id);
+        read += chars;
         if matches!(turn.role, Role::User | Role::Assistant) {
-            let text: String = turn.content.chars().take(SUMMARY_TURN_CHARS).collect();
             writeln!(
                 transcript,
                 "\n[{}] {}:\n{text}",
@@ -2074,7 +2087,7 @@ async fn summarize(ctx: &Ctx, chat: &str, flush: bool) -> anyhow::Result<bool> {
     if summary.is_empty() {
         return Err(anyhow!("the summary was empty"));
     }
-    if !conversations::save_summary(&ctx.pool, chat, &due.through, &summary).await? {
+    if !conversations::save_summary(&ctx.pool, chat, &through, &summary).await? {
         // Deleted meanwhile: neither the summary nor its facts are kept.
         return Ok(false);
     }
@@ -2083,12 +2096,14 @@ async fn summarize(ctx: &Ctx, chat: &str, flush: bool) -> anyhow::Result<bool> {
         return Ok(true);
     }
     // The memory flush: what should outlast the turns that leave the
-    // window is saved as they do. A key already in memory is left alone:
+    // window is saved as they do. A key memory has or had is left alone:
     // what the summariser read is older than what may have replaced it.
     for (key, value, kind) in facts.into_iter().take(MAX_FLUSHED_FACTS) {
-        match havn_db::agent::memory::get(&ctx.pool, &key).await {
-            Ok(None) => {}
-            Ok(Some(_)) => continue,
+        // Forgotten or expired keys too: the user may have removed it
+        // after the turns the summariser read.
+        match havn_db::agent::memory::key_known(&ctx.pool, &key).await {
+            Ok(false) => {}
+            Ok(true) => continue,
             Err(e) => {
                 warn!(%key, error = %e, "could not look up a fact from the chat summary");
                 continue;
