@@ -273,7 +273,6 @@ struct PathBeneathAttr {
 ///
 /// Fails with `ENOSYS` or `EOPNOTSUPP` on a kernel without Landlock.
 pub fn create_tool_domain() -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt as _;
     // SAFETY: the version query takes no attribute.
     let abi = unsafe {
         libc::syscall(
@@ -307,10 +306,22 @@ pub fn create_tool_domain() -> std::io::Result<()> {
     // nothing else owns it.
     let ruleset = unsafe { OwnedFd::from_raw_fd(fd) };
     if refer != 0 {
-        let root = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
-            .open("/")?;
+        // Not through `OpenOptions`: std masks `O_ACCMODE` out of custom
+        // flags, and musl's `O_ACCMODE` holds `O_PATH`. A plain open of `/`
+        // needs read permission, which the agent's uid lacks.
+        // SAFETY: a NUL-terminated path; O_PATH opens without reading.
+        let fd = unsafe {
+            libc::open(
+                c"/".as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the kernel just returned this descriptor, and nothing
+        // else owns it.
+        let root = unsafe { OwnedFd::from_raw_fd(fd) };
         let rule = PathBeneathAttr {
             allowed_access: refer,
             parent_fd: root.as_raw_fd(),
