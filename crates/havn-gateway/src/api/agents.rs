@@ -735,6 +735,13 @@ pub async fn delete(
     {
         warn!(agent_id = %id, error = %e, "workspace removal failed");
     }
+    // The files it sent go with it.
+    let outbox = crate::outbox::dir(&state.workspace_root, id);
+    if let Err(e) = tokio::fs::remove_dir_all(&outbox).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(agent_id = %id, error = %e, "outbox removal failed");
+    }
 
     info!(agent_id = %id, "agent deleted");
     Ok(StatusCode::NO_CONTENT)

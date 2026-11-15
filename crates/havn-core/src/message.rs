@@ -109,6 +109,9 @@ pub enum MessageContent {
     File {
         url: String,
         filename: String,
+        /// A line to go with it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
     },
     /// Voice / audio. The transcript is what the agent's LLM reads;
     /// runtime renders it with a `[voice, Ns]:` marker so the model

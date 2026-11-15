@@ -118,6 +118,9 @@ pub enum ChannelMessageContent {
     File {
         url: String,
         filename: String,
+        /// A line to go with it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
     },
     /// Voice / audio message. The adapter is responsible for STT (the
     /// gateway / runtime / agent never sees raw audio bytes) — by the

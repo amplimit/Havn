@@ -29,6 +29,8 @@ export type ServerMessage =
     }
   /** The approval request was decided elsewhere or ended. */
   | { type: "approval_closed"; id: string }
+  /** A file the agent sent; `url` is under the gateway's API. */
+  | { type: "file"; url: string; name: string; caption?: string; conversation?: string }
   /** What the reply just sent saved to or forgot from memory. */
   | { type: "memory"; conversation?: string; turn?: string; changes: MemoryChange[] };
 

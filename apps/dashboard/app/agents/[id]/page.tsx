@@ -9,6 +9,7 @@ import {
   type ConversationTurn,
   type EmbeddingStatus,
   type MeView,
+  type SentFile,
 } from "@/lib/api";
 import { openChat, type ChatHandle } from "@/lib/websocket";
 import { Markdown } from "@/components/Markdown";
@@ -43,6 +44,8 @@ type Bubble = {
   /** The stored turn it shows, with its versions; absent until stored. */
   turn?: string;
   versions?: string[];
+  /** A file the agent sent, to download. */
+  file?: { url: string; name: string; caption?: string };
   /** A note of what a reply saved to or forgot from memory, and that
    * reply's stored turn, which it stays under. */
   memory?: MemoryChange[];
@@ -98,6 +101,36 @@ const CLOCK_SKEW_MS = 60_000;
 // The stored conversation, fetched from `since` on, replaces what is on
 // screen, except notices (they exist only in this tab) and live bubbles
 // newer than the fetch that it does not have yet.
+// `prev` with a card for each of `files` it does not show yet.
+function withFiles(
+  prev: Bubble[],
+  files: { url: string; name: string; caption?: string; ts: number }[],
+  nextId: () => number,
+): Bubble[] {
+  const fresh = files.filter((f) => !prev.some((b) => b.file?.url === f.url));
+  if (fresh.length === 0) return prev;
+  const cards: Bubble[] = fresh.map((f) => ({
+    id: nextId(),
+    role: "system",
+    content: "",
+    ts: f.ts,
+    file: { url: f.url, name: f.name, caption: f.caption },
+  }));
+  return [...prev, ...cards].sort((a, b) => a.ts - b.ts);
+}
+
+function sentFiles(
+  agentId: string,
+  sent: SentFile[],
+): { url: string; name: string; caption?: string; ts: number }[] {
+  return sent.map((f) => ({
+    url: `/agents/${agentId}/outbox/${f.id}`,
+    name: f.name,
+    caption: f.caption,
+    ts: new Date(f.created_at).getTime(),
+  }));
+}
+
 function mergeStored(prev: Bubble[], fetched: Bubble[], since: number): Bubble[] {
   // A turn already on screen keeps its bubble (and an editor open on it).
   const shown = new Map(prev.flatMap((b) => (b.turn ? [[b.turn, b.id] as const] : [])));
@@ -246,6 +279,17 @@ export default function ChatPage({
         if (r.turns.length === 0) return;
         const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
         setBubbles((prev) => mergeStored(prev, stored, since));
+        // The files sent in it, which its stored turns do not hold.
+        const shown = r.conversation ?? chat ?? undefined;
+        if (shown) {
+          api.outbox
+            .list(id, shown)
+            .then((sent) => {
+              if (cancelled) return;
+              setBubbles((prev) => withFiles(prev, sentFiles(id, sent), () => bubbleIdRef.current++));
+            })
+            .catch(() => {});
+        }
       } catch (e) {
         // Not fatal — chat works fine without history (just won't show
         // past turns). Surface the error so we know if it's persistent.
@@ -307,6 +351,13 @@ export default function ChatPage({
         if (!asked && r.conversation) selectChat(r.conversation);
         const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
         setBubbles((prev) => mergeStored(prev, stored, since));
+        const shown = r.conversation ?? asked ?? undefined;
+        if (shown) {
+          const sent = await api.outbox.list(id, shown).catch(() => []);
+          if (!cancelled && chatIdRef.current === asked) {
+            setBubbles((prev) => withFiles(prev, sentFiles(id, sent), () => bubbleIdRef.current++));
+          }
+        }
       } catch (e) {
         console.warn("[chat] history reload failed", e);
       }
@@ -333,6 +384,12 @@ export default function ChatPage({
           }
           if (msg.type === "approval_closed") {
             setApprovals((prev) => prev.filter((a) => a.id !== msg.id));
+            return;
+          }
+          if (msg.type === "file") {
+            const current = chatIdRef.current;
+            if (msg.conversation && current && msg.conversation !== current) return;
+            addFile(msg.url, msg.name, msg.caption, Date.now());
             return;
           }
           if (msg.type === "memory") {
@@ -421,6 +478,11 @@ export default function ChatPage({
       behavior: reduce ? "auto" : "smooth",
     });
   }, [bubbles.length, pending]);
+
+  // A file card, once per file.
+  function addFile(url: string, name: string, caption: string | undefined, ts: number) {
+    setBubbles((prev) => withFiles(prev, [{ url, name, caption, ts }], () => bubbleIdRef.current++));
+  }
 
   function pushBubble(role: Bubble["role"], content: string) {
     setBubbles((prev) => [
@@ -709,7 +771,9 @@ export default function ChatPage({
               </div>
             )}
             {bubbles.map((b, idx) =>
-              b.memory ? (
+              b.file ? (
+                <FileCard key={b.id} url={b.file.url} name={b.file.name} caption={b.file.caption} />
+              ) : b.memory ? (
                 <MemoryNote key={b.id} agentId={id} changes={b.memory} />
               ) : (
               <Bubble
@@ -1033,6 +1097,28 @@ function Bubble({
           )}
         </ActionRow>
       )}
+    </div>
+  );
+}
+
+/** A file the agent sent, as a download. */
+function FileCard({ url, name, caption }: { url: string; name: string; caption?: string }) {
+  return (
+    <div className="flex flex-col items-start gap-1 self-start">
+      {caption && (
+        <p className="text-sm" style={{ whiteSpace: "pre-wrap" }}>
+          {caption}
+        </p>
+      )}
+      <a
+        href={`/api${url}`}
+        download={name}
+        className="card inline-flex items-center gap-2 px-3 py-2 text-sm"
+        title="Download the file the agent sent"
+      >
+        <Paperclip size={14} className="shrink-0" aria-hidden="true" />
+        <span className="wrap-anywhere">{name}</span>
+      </a>
     </div>
   );
 }

@@ -156,6 +156,16 @@ pub enum ServerMessage {
     },
     /// The approval request `id` was decided or ended; stop showing it.
     ApprovalClosed { id: String },
+    /// A file the agent sent, to download from `url` (relative to the
+    /// gateway's API).
+    File {
+        url: String,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        conversation: Option<String>,
+    },
     /// What the reply just sent saved to or forgot from memory.
     Memory {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -339,7 +349,16 @@ impl WebChatRouter {
                 broadcast: false,
                 conversation,
             },
-            // Phase 1 webchat is text-only. Stub other variants with a placeholder.
+            MessageContent::File {
+                url,
+                filename,
+                caption,
+            } => ServerMessage::File {
+                url,
+                name: filename,
+                caption,
+                conversation,
+            },
             other => ServerMessage::AgentMessage {
                 content: format!("(unsupported content variant: {other:?})"),
                 broadcast: false,
@@ -690,7 +709,8 @@ mod tests {
             ServerMessage::Error { .. }
             | ServerMessage::Approval { .. }
             | ServerMessage::ApprovalClosed { .. }
-            | ServerMessage::Memory { .. } => {
+            | ServerMessage::Memory { .. }
+            | ServerMessage::File { .. } => {
                 panic!("expected AgentMessage, got Error")
             }
         }
@@ -782,7 +802,8 @@ mod tests {
                 ServerMessage::Error { .. }
                 | ServerMessage::Approval { .. }
                 | ServerMessage::ApprovalClosed { .. }
-                | ServerMessage::Memory { .. } => {
+                | ServerMessage::Memory { .. }
+                | ServerMessage::File { .. } => {
                     panic!("unexpected Error")
                 }
             }
@@ -824,7 +845,8 @@ mod tests {
                 ServerMessage::Error { .. }
                 | ServerMessage::Approval { .. }
                 | ServerMessage::ApprovalClosed { .. }
-                | ServerMessage::Memory { .. } => {
+                | ServerMessage::Memory { .. }
+                | ServerMessage::File { .. } => {
                     panic!("unexpected Error")
                 }
             }

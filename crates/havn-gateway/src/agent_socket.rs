@@ -1310,9 +1310,15 @@ async fn route_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSock
             MessageContent::Image { url, caption } => {
                 Some(ChannelMessageContent::Image { url, caption })
             }
-            MessageContent::File { url, filename } => {
-                Some(ChannelMessageContent::File { url, filename })
-            }
+            MessageContent::File {
+                url,
+                filename,
+                caption,
+            } => Some(ChannelMessageContent::File {
+                url,
+                filename,
+                caption,
+            }),
             // Agents rarely emit Audio / Location / Contact
             // outbound — these are user-input shapes. When
             // they DO emit one (e.g., an agent skill that
@@ -1399,8 +1405,9 @@ async fn gateway_tools_for(
     agent: &havn_db::repo::agents::Agent,
     policy: &Policy,
 ) -> Vec<GatewayToolSpec> {
-    // Every agent may set its owner's time zone.
-    let mut tools = vec![crate::timezone::spec()];
+    // Every agent may set its owner's time zone and send files to the
+    // conversation it answers.
+    let mut tools = vec![crate::timezone::spec(), crate::outbox::spec()];
     if policy.permissions.can_search_web {
         match ctx
             .search
@@ -1454,8 +1461,89 @@ async fn run_gateway_tool(
         crate::schedule::TOOL_NAME => run_schedule(agent_id, call, ctx).await,
         crate::web_search::TOOL_NAME => run_web_search(agent_id, call, ctx).await,
         crate::web_fetch::TOOL_NAME => run_web_fetch(agent_id, call, ctx).await,
+        crate::outbox::TOOL_NAME => run_send_file(agent_id, call, ctx).await,
         other => Err(format!("the gateway has no tool named {other:?}")),
     }
+}
+
+/// `send_file`: copy the file into the agent's outbox and send its
+/// conversation a [`havn_core::MessageContent::File`] naming where to get
+/// it. A channel adapter fetches it with its token; the dashboard shows a
+/// download.
+async fn run_send_file(
+    agent_id: AgentId,
+    call: &GatewayToolCall,
+    ctx: &AgentSocketCtx,
+) -> Result<String, String> {
+    let channel_id = call
+        .conversation
+        .clone()
+        .ok_or("send_file works only while answering someone's message")?;
+    let path = call
+        .input
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing required field: path")?
+        .to_string();
+    let caption = call
+        .input
+        .get("caption")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let workspace = ctx
+        .workspace_root
+        .join(agent_id.to_string())
+        .join("workspace");
+    let outbox = crate::outbox::dir(&ctx.workspace_root, agent_id);
+    let chat = call.chat.clone();
+    let to = channel_id.clone();
+    let sent = tokio::task::spawn_blocking(move || {
+        crate::outbox::send(
+            &workspace,
+            &outbox,
+            &path,
+            caption.as_deref(),
+            &to,
+            chat.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| format!("sending the file failed: {e}"))??;
+    // Where the conversation's channel gets it.
+    let url = if crate::channel_id_codec::decode(&channel_id).is_some() {
+        format!("/api/v1/channel/files/{agent_id}/{}", sent.id)
+    } else {
+        format!("/agents/{agent_id}/outbox/{}", sent.id)
+    };
+    route_outbound(
+        agent_id,
+        OutboundMessage {
+            conversation: call.chat.clone(),
+            channel_id,
+            content: havn_core::MessageContent::File {
+                url,
+                filename: sent.name.clone(),
+                caption: sent.caption.clone(),
+            },
+            reply_to: None,
+        },
+        ctx,
+    )
+    .await;
+    if let Ok(Some(agent)) = agents_repo::find_by_id(&ctx.db, agent_id).await {
+        crate::audit::record_agent_action(
+            &ctx.db,
+            agent.owner_id,
+            agent_id,
+            "file.sent",
+            serde_json::json!({"id": sent.id, "name": sent.name, "size": sent.size}),
+        )
+        .await;
+    }
+    Ok(format!(
+        "sent {:?} ({} bytes) to the conversation",
+        sent.name, sent.size
+    ))
 }
 
 async fn run_set_timezone(
@@ -2639,17 +2727,23 @@ mod tests {
 
         assert_eq!(
             tools_of(agent).await,
-            ["set_timezone", "web_fetch", "schedule"],
+            ["set_timezone", "send_file", "web_fetch", "schedule"],
             "no search backend yet"
         );
         add_openrouter_key(&ctx, owner).await;
         assert_eq!(
             tools_of(agent).await,
-            ["set_timezone", "web_search", "web_fetch", "schedule"]
+            [
+                "set_timezone",
+                "send_file",
+                "web_search",
+                "web_fetch",
+                "schedule"
+            ]
         );
         assert_eq!(
             tools_of(denied).await,
-            ["set_timezone", "schedule"],
+            ["set_timezone", "send_file", "schedule"],
             "policy denies search and fetch"
         );
     }
