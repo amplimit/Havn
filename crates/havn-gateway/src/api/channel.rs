@@ -795,8 +795,13 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
     // `/new` starts a new chat; the runtime confirms. It goes the way of
     // a message, in order with the ones after it.
     let new_chat = is_command_message(&content, "/new");
+    // `/retry` answers the last message again, as a new version of the
+    // reply.
+    let branch = is_command_message(&content, "/retry")
+        .then_some(havn_core::Branch::Regenerate { turn: None });
     let msg = InboundMessage {
         conversation: None,
+        branch,
         channel_id: encoded_channel_id,
         sender_id: inb.sender_id.clone(),
         channel: channel.to_string(),

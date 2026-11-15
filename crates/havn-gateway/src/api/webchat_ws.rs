@@ -212,11 +212,47 @@ async fn serve_session<Si, St, E>(
                 continue;
             }
         };
-        let (user_text, conversation) = match parsed {
+        let (user_text, conversation, branch) = match parsed {
             ClientMessage::Send {
                 content,
                 conversation,
-            } => (content, chat_id(conversation)),
+                edit,
+            } => match (edit.is_some(), chat_id(edit)) {
+                (true, None) => {
+                    let _ = router
+                        .error(
+                            agent_id,
+                            session_id,
+                            "That message cannot be edited.".into(),
+                        )
+                        .await;
+                    continue;
+                }
+                (_, edit) => (
+                    content,
+                    chat_id(conversation),
+                    edit.map(|turn| havn_core::Branch::Edit { turn }),
+                ),
+            },
+            ClientMessage::Regenerate { conversation, turn } => {
+                match (turn.is_some(), chat_id(turn)) {
+                    (true, None) => {
+                        let _ = router
+                            .error(
+                                agent_id,
+                                session_id,
+                                "That reply cannot be regenerated.".into(),
+                            )
+                            .await;
+                        continue;
+                    }
+                    (_, turn) => (
+                        String::new(),
+                        chat_id(conversation),
+                        Some(havn_core::Branch::Regenerate { turn }),
+                    ),
+                }
+            }
             ClientMessage::Decide {
                 id,
                 approve,
@@ -242,6 +278,7 @@ async fn serve_session<Si, St, E>(
 
         let inbound = InboundMessage {
             conversation,
+            branch,
             channel_id: session_id.to_string(),
             sender_id: sender_id.to_string(),
             channel: "webchat".into(),

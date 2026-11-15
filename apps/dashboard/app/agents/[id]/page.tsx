@@ -21,7 +21,10 @@ import {
   Layers,
   MessageSquarePlus,
   MessagesSquare,
+  ChevronLeft,
+  ChevronRight,
   Pencil,
+  RefreshCw,
   RotateCcw,
   Search,
   Settings,
@@ -35,6 +38,9 @@ type Bubble = {
   role: "you" | "agent" | "system";
   content: string;
   ts: number;
+  /** The stored turn it shows, with its versions; absent until stored. */
+  turn?: string;
+  versions?: string[];
 };
 
 const AGENT_POLL_MS = 5000;
@@ -49,6 +55,8 @@ function turnBubbles(turns: ConversationTurn[], nextId: () => number): Bubble[] 
       role: t.role === "user" ? "you" : "agent",
       content: t.content,
       ts: new Date(t.created_at).getTime(),
+      turn: t.id,
+      versions: t.versions,
     }));
 }
 
@@ -68,7 +76,10 @@ const CLOCK_SKEW_MS = 60_000;
 // The stored conversation, fetched from `since` on, replaces what is on
 // screen, except notices (they exist only in this tab) and live bubbles
 // newer than the fetch that it does not have yet.
-function mergeStored(prev: Bubble[], stored: Bubble[], since: number): Bubble[] {
+function mergeStored(prev: Bubble[], fetched: Bubble[], since: number): Bubble[] {
+  // A turn already on screen keeps its bubble (and an editor open on it).
+  const shown = new Map(prev.flatMap((b) => (b.turn ? [[b.turn, b.id] as const] : [])));
+  const stored = fetched.map((s) => (s.turn && shown.has(s.turn) ? { ...s, id: shown.get(s.turn)! } : s));
   const recent = stored.filter((s) => s.ts >= since - CLOCK_SKEW_MS);
   const kept = prev.filter(
     (b) =>
@@ -307,6 +318,10 @@ export default function ChatPage({
             // task's result does not choose the chat on screen.
             if (!current && !msg.broadcast) selectChat(msg.conversation);
           }
+          if (msg.type === "agent_message" && msg.conversation && !msg.broadcast) {
+            // The stored turns, with their ids, for editing and versions.
+            void catchUp();
+          }
           if (msg.type === "agent_message") {
             if (!msg.broadcast) setWaiting((n) => Math.max(0, n - 1));
           } else {
@@ -375,6 +390,39 @@ export default function ChatPage({
 
   function stopReply() {
     chatRef.current?.stop(chatIdRef.current ?? undefined);
+  }
+
+  // A new version of the user turn at `idx`: what came after it leaves
+  // the screen, and stays stored on its own branch.
+  function editMessage(idx: number, turn: string, text: string) {
+    if (!text.trim() || !chatRef.current || wsState !== "open") return;
+    setBubbles((prev) => prev.slice(0, idx));
+    pushBubble("you", text);
+    chatRef.current.send(text, chatIdRef.current ?? undefined, turn);
+    setWaiting((n) => n + 1);
+  }
+
+  // Another reply in place of the one at `idx`.
+  function regenerate(idx: number, turn: string) {
+    if (!chatRef.current || wsState !== "open") return;
+    setBubbles((prev) => prev.slice(0, idx));
+    chatRef.current.regenerate(chatIdRef.current ?? undefined, turn);
+    setWaiting((n) => n + 1);
+  }
+
+  // Show the branch of version `turn`.
+  async function showVersion(turn: string) {
+    const current = chatIdRef.current;
+    if (!current) return;
+    try {
+      await api.chats.branch(id, current, turn);
+      const r = await api.conversation.list(id, HISTORY_LIMIT, current);
+      if (chatIdRef.current !== current) return;
+      const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
+      setBubbles((prev) => [...stored, ...prev.filter((b) => b.role === "system")].sort((a, b) => a.ts - b.ts));
+    } catch (e) {
+      pushBubble("system", `error: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   // Show chat `next`, or a new one. Approvals stay: they are the agent's,
@@ -553,8 +601,18 @@ export default function ChatPage({
               <Bubble
                 key={b.id}
                 bubble={b}
+                busy={pending || wsState !== "open"}
+                onEdit={
+                  b.role === "you" && b.turn
+                    ? (text) => editMessage(idx, b.turn!, text)
+                    : undefined
+                }
+                onRegenerate={
+                  b.role === "agent" && b.turn ? () => regenerate(idx, b.turn!) : undefined
+                }
+                onVersion={(turn) => void showVersion(turn)}
                 onRetry={
-                  b.role === "agent"
+                  b.role === "agent" && !b.turn
                     ? () => {
                         // Find the most recent user bubble before this
                         // agent reply and re-send its content. Both the
@@ -738,11 +796,22 @@ function ChatList({
 
 function Bubble({
   bubble,
+  busy,
   onRetry,
+  onEdit,
+  onRegenerate,
+  onVersion,
 }: {
   bubble: Bubble;
+  /** A reply is due: branching waits for it. */
+  busy: boolean;
   onRetry?: () => void;
+  onEdit?: (text: string) => void;
+  onRegenerate?: () => void;
+  onVersion: (turn: string) => void;
 }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(bubble.content);
   const align =
     bubble.role === "you" ? "items-end" : "items-start";
   // System bubbles stay plain — markdown renderer is overkill for
@@ -777,20 +846,140 @@ function Bubble({
                 }),
         }}
       >
-        {isSystem ? (
+        {editing ? (
+          <form
+            className="flex flex-col gap-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              setEditing(false);
+              onEdit?.(draft);
+            }}
+          >
+            <textarea
+              className="input min-h-20 w-full text-sm"
+              style={{ color: "var(--color-deep-navy)", minWidth: "min(60vw, 480px)" }}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              aria-label="edit message"
+              autoFocus
+            />
+            <div className="flex justify-end gap-2">
+              <button type="button" className="btn-ghost" onClick={() => setEditing(false)}>
+                cancel
+              </button>
+              <button type="submit" className="btn-primary" disabled={!draft.trim() || busy}>
+                send
+              </button>
+            </div>
+          </form>
+        ) : isSystem ? (
           <span style={{ whiteSpace: "pre-wrap" }}>{bubble.content}</span>
         ) : (
           <Markdown>{bubble.content}</Markdown>
         )}
       </div>
-      {!isSystem && (
+      {!isSystem && !editing && (
         <ActionRow
           text={bubble.content}
           onRetry={onRetry}
           align={bubble.role === "you" ? "end" : "start"}
-        />
+        >
+          {onEdit && (
+            <RowButton
+              onClick={() => {
+                setDraft(bubble.content);
+                setEditing(true);
+              }}
+              disabled={busy}
+              title="Edit and send again; the messages after it stay on their own branch. What tools already did (files written, messages sent) is not undone."
+              label="edit"
+            >
+              <Pencil size={12} className="shrink-0" aria-hidden="true" />
+              edit
+            </RowButton>
+          )}
+          {onRegenerate && (
+            <RowButton
+              onClick={onRegenerate}
+              disabled={busy}
+              title="Answer your last message before this reply again; this reply stays as another version. What tools already did is not undone."
+              label="regenerate"
+            >
+              <RefreshCw size={12} className="shrink-0" aria-hidden="true" />
+              regenerate
+            </RowButton>
+          )}
+          {bubble.turn && bubble.versions && bubble.versions.length > 1 && (
+            <Versions turn={bubble.turn} versions={bubble.versions} busy={busy} onVersion={onVersion} />
+          )}
+        </ActionRow>
       )}
     </div>
+  );
+}
+
+function Versions({
+  turn,
+  versions,
+  busy,
+  onVersion,
+}: {
+  turn: string;
+  versions: string[];
+  busy: boolean;
+  onVersion: (turn: string) => void;
+}) {
+  const at = versions.indexOf(turn);
+  return (
+    <span className="inline-flex items-center gap-0.5" aria-label="versions">
+      <RowButton
+        onClick={() => onVersion(versions[at - 1])}
+        disabled={busy || at <= 0}
+        title="previous version"
+        label="previous version"
+      >
+        <ChevronLeft size={12} className="shrink-0" aria-hidden="true" />
+      </RowButton>
+      <span>
+        {at + 1}/{versions.length}
+      </span>
+      <RowButton
+        onClick={() => onVersion(versions[at + 1])}
+        disabled={busy || at >= versions.length - 1}
+        title="next version"
+        label="next version"
+      >
+        <ChevronRight size={12} className="shrink-0" aria-hidden="true" />
+      </RowButton>
+    </span>
+  );
+}
+
+function RowButton({
+  onClick,
+  disabled,
+  title,
+  label,
+  children,
+}: {
+  onClick: () => void;
+  disabled?: boolean;
+  title: string;
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      aria-label={label}
+      className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 transition-colors disabled:opacity-40"
+      style={{ background: "transparent" }}
+    >
+      {children}
+    </button>
   );
 }
 
@@ -802,10 +991,12 @@ function ActionRow({
   text,
   onRetry,
   align,
+  children,
 }: {
   text: string;
   onRetry?: () => void;
   align: "start" | "end";
+  children?: React.ReactNode;
 }) {
   const [copied, setCopied] = useState(false);
 
@@ -877,6 +1068,7 @@ function ActionRow({
           </span>
         </button>
       )}
+      {children}
     </div>
   );
 }

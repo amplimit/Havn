@@ -698,6 +698,10 @@ async fn serve() -> anyhow::Result<()> {
             patch(api::conversation::chat_patch).delete(api::conversation::chat_delete),
         )
         .route(
+            "/agents/{id}/chats/{chat}/branch",
+            post(api::conversation::chat_branch),
+        )
+        .route(
             "/agents/{id}/bootstrap",
             get(api::bootstrap::get).put(api::bootstrap::put),
         )

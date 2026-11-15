@@ -22,9 +22,26 @@ pub struct InboundMessage {
     /// it to the chat it resolved before running the turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
+    /// Where it branches off its chat instead of continuing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<Branch>,
     /// Original platform payload, preserved verbatim for adapter-specific features.
     #[serde(default)]
     pub raw: serde_json::Value,
+}
+
+/// Where a message branches off its chat (issue #129).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Branch {
+    /// A new version of user turn `turn`, with the message's content.
+    Edit { turn: String },
+    /// Another reply in place of assistant turn `turn`, or of the last
+    /// reply when absent; the message's content is not a turn.
+    Regenerate {
+        #[serde(default)]
+        turn: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

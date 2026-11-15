@@ -14,7 +14,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
-use havn_db::agent::conversations::{self, Chat, Role};
+use havn_db::agent::conversations::{BranchTurn, Chat, Role};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
@@ -34,9 +34,13 @@ pub struct ConversationQuery {
 
 #[derive(Debug, Serialize)]
 pub struct TurnView {
+    pub id: String,
     pub role: String,
     pub content: String,
     pub created_at: DateTime<Utc>,
+    /// Its versions (issue #129): the turns in its place on other
+    /// branches, itself included, oldest first.
+    pub versions: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,12 +61,17 @@ pub struct ConversationResponse {
 #[derive(Debug, Deserialize)]
 struct ConversationRows {
     conversation: Option<String>,
-    turns: Vec<conversations::TurnWithChannel>,
+    turns: Vec<BranchTurn>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Found {
     found: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BranchSwitch {
+    pub turn: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,9 +119,11 @@ pub async fn list(
         .turns
         .into_iter()
         .map(|t| TurnView {
+            id: t.id,
             role: role_str(t.role).into(),
             content: t.content,
             created_at: t.created_at,
+            versions: t.versions,
         })
         .collect();
     Ok(Json(ConversationResponse {
@@ -171,6 +182,33 @@ pub async fn chat_patch(
     )
     .await?;
     if !renamed.found {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /agents/:id/chats/:chat/branch`: continue one of the caller's
+/// chats from the branch of `turn`, at its newest turn.
+pub async fn chat_branch(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path((id, chat)): Path<(String, String)>,
+    Json(req): Json<BranchSwitch>,
+) -> Result<StatusCode, ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let switched: Found = crate::api::agents::agent_data(
+        &state,
+        user.id,
+        agent.id,
+        havn_proto::DataQuery::SwitchBranch {
+            channel_id: session(&user, agent.id),
+            conversation: chat_param(Some(chat))?.unwrap_or_default(),
+            turn: chat_param(Some(req.turn))?.unwrap_or_default(),
+        },
+        true,
+    )
+    .await?;
+    if !switched.found {
         return Err(ApiError::NotFound);
     }
     Ok(StatusCode::NO_CONTENT)

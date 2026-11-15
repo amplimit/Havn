@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, anyhow};
 use clap::Parser;
-use havn_core::{InboundMessage, MessageContent, OutboundMessage, Policy};
+use havn_core::{Branch, InboundMessage, MessageContent, OutboundMessage, Policy};
 use havn_db::agent::conversations::{self as conversations, Role};
 use havn_proto::{
     AdminOutcome, AgentQueryOutcome, AgentQueryResponse, AgentToGateway, CronOutcome, CronResult,
@@ -971,17 +971,38 @@ where
                 // user input means "don't fire a curator pass right
                 // now even if 7 days have elapsed".
                 curator_scheduler::record_inbound(&ctx.last_inbound).await;
-                // The chat it continues, which its turn runs in.
+                // The chat it continues, which its turn runs in. A message
+                // that branches off one needs the chat to exist.
                 let text = render_content_for_llm(&msg.content).unwrap_or_default();
-                match conversations::chat_for(
-                    &ctx.pool,
-                    &msg.channel_id,
-                    msg.conversation.as_deref(),
-                    &text,
-                )
-                .await
-                {
-                    Ok(chat) => msg.conversation = Some(chat),
+                let chat = if msg.branch.is_some() {
+                    conversations::existing_chat(
+                        &ctx.pool,
+                        &msg.channel_id,
+                        msg.conversation.as_deref(),
+                    )
+                    .await
+                    .map(|chat| chat.ok_or(()))
+                } else {
+                    conversations::chat_for(
+                        &ctx.pool,
+                        &msg.channel_id,
+                        msg.conversation.as_deref(),
+                        &text,
+                    )
+                    .await
+                    .map(Ok)
+                };
+                match chat {
+                    Ok(Ok(chat)) => msg.conversation = Some(chat),
+                    Ok(Err(())) => {
+                        send_text(
+                            &ctx,
+                            msg.channel_id,
+                            msg.conversation,
+                            "(There is no message here to answer again or edit.)".into(),
+                        );
+                        continue;
+                    }
                     Err(e) => {
                         error!(error = %e, "could not find the message's chat");
                         send_text(&ctx, msg.channel_id, None, format!("(internal error: {e})"));
@@ -1567,13 +1588,40 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
 
     // The chat's history; replies go to `channel_id`.
     let chat = turns::key(&msg);
-    // Persist user turn before LLM call so a crash doesn't lose it.
-    match conversations::record_in_chat(&ctx.pool, &chat, Role::User, &user_text).await {
-        Ok(true) => {}
-        // Deleted while the message waited.
-        Ok(false) => return,
+    // The user turn the reply answers: the message, recorded before the
+    // LLM call so a crash doesn't lose it, or for an edit or a regenerated
+    // reply the turn the chat branches off at.
+    let answered = match &msg.branch {
+        None => conversations::record_in_chat(&ctx.pool, &chat, Role::User, &user_text).await,
+        Some(branch) => {
+            let rewind = match branch {
+                Branch::Edit { turn } => conversations::Rewind::Edit {
+                    turn,
+                    text: &user_text,
+                },
+                Branch::Regenerate { turn } => conversations::Rewind::Regenerate(turn.as_deref()),
+            };
+            conversations::rewind(&ctx.pool, &chat, rewind).await
+        }
+    };
+    let answered = match answered {
+        Ok(Some(turn)) => turn,
+        // Deleted while the message waited, or nothing there to branch off.
+        Ok(None) => {
+            if msg.branch.is_some() {
+                send_text(
+                    &ctx,
+                    msg.channel_id,
+                    Some(chat),
+                    "(That message is not in this chat, so it cannot be edited or answered \
+                     again.)"
+                        .into(),
+                );
+            }
+            return;
+        }
         Err(e) => {
-            error!(error = %e, "could not persist user turn");
+            error!(error = %e, "could not record the user turn");
             send_text(
                 &ctx,
                 msg.channel_id,
@@ -1582,9 +1630,9 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
             );
             return;
         }
-    }
+    };
 
-    let history = match conversations::recent(&ctx.pool, &chat, HISTORY_WINDOW).await {
+    let history = match conversations::branch(&ctx.pool, &chat, HISTORY_WINDOW).await {
         Ok(h) => h,
         Err(e) => {
             error!(error = %e, "could not load conversation history");
@@ -1611,6 +1659,17 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
             Role::System | Role::Tool => None,
         })
         .collect();
+
+    // A regenerated reply answers the user turn its branch ends with.
+    let user_text = match &msg.branch {
+        Some(Branch::Regenerate { .. }) => history
+            .iter()
+            .rev()
+            .find(|t| t.role == Role::User)
+            .map(|t| t.content.clone())
+            .unwrap_or_default(),
+        _ => user_text,
+    };
 
     // Tool-use loop.
     // Augment the frozen system prompt with FTS-retrieved skills relevant
@@ -1642,10 +1701,12 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
 
     // Persist assistant turn (visible reply only — intermediate tool turns
     // exist only in-memory for this iteration).
-    match conversations::record_in_chat(&ctx.pool, &chat, Role::Assistant, &final_text).await {
-        Ok(true) => {}
+    // Under the turn it answers, also when the user moved to another
+    // branch meanwhile.
+    match conversations::record_reply(&ctx.pool, &chat, &answered, &final_text).await {
+        Ok(Some(_)) => {}
         // The chat was deleted while it ran: its reply goes nowhere.
-        Ok(false) => return,
+        Ok(None) => return,
         Err(e) => warn!(error = %e, "could not persist assistant turn"),
     }
 
@@ -1889,13 +1950,15 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                         .await
                         .map_err(|e| e.to_string())?;
                 let turns = match &chat {
-                    Some(chat) => conversations::recent_with_channel(
-                        &ctx.pool,
-                        chat,
-                        limit.min(MAX_DATA_ROWS),
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?,
+                    Some(chat) => {
+                        let turns =
+                            conversations::branch(&ctx.pool, chat, limit.min(MAX_DATA_ROWS))
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        conversations::with_versions(&ctx.pool, chat, turns)
+                            .await
+                            .map_err(|e| e.to_string())?
+                    }
                     None => Vec::new(),
                 };
                 Ok(serde_json::json!({
@@ -1923,6 +1986,23 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                     conversations::rename_chat(&ctx.pool, &channel_id, &conversation, &title)
                         .await
                         .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({ "found": found }))
+            }
+            DataQuery::SwitchBranch {
+                channel_id,
+                conversation,
+                turn,
+            } => {
+                let found =
+                    match conversations::existing_chat(&ctx.pool, &channel_id, Some(&conversation))
+                        .await
+                        .map_err(|e| e.to_string())?
+                    {
+                        Some(chat) => conversations::switch_branch(&ctx.pool, &chat, &turn)
+                            .await
+                            .map_err(|e| e.to_string())?,
+                        None => false,
+                    };
                 Ok(serde_json::json!({ "found": found }))
             }
             DataQuery::DeleteChat {

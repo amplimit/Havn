@@ -188,6 +188,7 @@ mod tests {
     fn msg(channel_id: &str, text: &str) -> InboundMessage {
         InboundMessage {
             conversation: None,
+            branch: None,
             channel_id: channel_id.into(),
             sender_id: "u".into(),
             channel: "telegram".into(),

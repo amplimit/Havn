@@ -90,11 +90,21 @@ pub struct Registration {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     /// User-typed message, in chat `conversation` (a new one when the id
-    /// is new), or the active chat when absent.
+    /// is new), or the active chat when absent; with `edit`, a new
+    /// version of that user turn of the chat.
     Send {
         content: String,
         #[serde(default)]
         conversation: Option<String>,
+        #[serde(default)]
+        edit: Option<String>,
+    },
+    /// Another reply in place of reply `turn` of the chat, or of its last.
+    Regenerate {
+        #[serde(default)]
+        conversation: Option<String>,
+        #[serde(default)]
+        turn: Option<String>,
     },
     /// Stop the reply the agent is working on in a chat of this session.
     Stop {

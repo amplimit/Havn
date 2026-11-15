@@ -24,8 +24,11 @@ export type ChatHandlers = {
 };
 
 export type ChatHandle = {
-  /** Send `text` in chat `conversation`, or the active chat. */
-  send: (text: string, conversation?: string) => void;
+  /** Send `text` in chat `conversation`, or the active chat; with `edit`,
+   * as a new version of that user turn. */
+  send: (text: string, conversation?: string, edit?: string) => void;
+  /** Ask for another reply in place of reply `turn`. */
+  regenerate: (conversation: string | undefined, turn: string) => void;
   /** Stop the reply the agent is working on in a chat; queued messages still run. */
   stop: (conversation?: string) => void;
   /** Answer an approval request. */
@@ -71,8 +74,12 @@ export function openChat(
   ws.addEventListener("close", (ev) => handlers.onClose?.(ev));
 
   return {
-    send: (text: string, conversation?: string) => {
-      const frame: ClientMessage = { type: "send", content: text, conversation };
+    send: (text: string, conversation?: string, edit?: string) => {
+      const frame: ClientMessage = { type: "send", content: text, conversation, edit };
+      ws.send(JSON.stringify(frame));
+    },
+    regenerate: (conversation, turn) => {
+      const frame: ClientMessage = { type: "regenerate", conversation, turn };
       ws.send(JSON.stringify(frame));
     },
     stop: (conversation?: string) => {

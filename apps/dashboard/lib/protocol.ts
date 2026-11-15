@@ -4,8 +4,11 @@
  */
 
 export type ClientMessage =
-  /** `conversation`: the chat it continues, a new one when the id is new. */
-  | { type: "send"; content: string; conversation?: string }
+  /** `conversation`: the chat it continues, a new one when the id is new;
+   * `edit`: a user turn this is a new version of. */
+  | { type: "send"; content: string; conversation?: string; edit?: string }
+  /** Another reply in place of reply `turn`, or of the last one. */
+  | { type: "regenerate"; conversation?: string; turn?: string }
   | { type: "stop"; conversation?: string }
   | { type: "decide"; id: string; approve: boolean; remember: boolean };
 
