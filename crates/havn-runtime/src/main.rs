@@ -1175,6 +1175,7 @@ async fn handle_heartbeat(ctx: Ctx) {
         crate::tools::context::HEARTBEAT,
         &mut messages,
         &augmented,
+        None,
     )
     .await
     {
@@ -1843,6 +1844,7 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
         // override; the gateway resolves credentials and bills usage
         // against `billing_user_id` instead of this agent's owner.
         billing_user_id: Some(query.billing_user_id.clone()),
+        stop: None,
     };
 
     // Use the typed runner so degraded outcomes (LLM error, iteration
