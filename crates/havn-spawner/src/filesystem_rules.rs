@@ -11,8 +11,7 @@ use std::path::{Path, PathBuf};
 
 use havn_core::Policy;
 use landlock::{
-    ABI, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
-    RulesetStatus,
+    ABI, Access, AccessFs, PathBeneath, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
 };
 
 use crate::{ExtraMount, MountMode, TmpfsMount};
@@ -119,7 +118,7 @@ pub fn apply(rw: &[PathBuf], ro: &[PathBuf]) -> Result<Enforcement, String> {
         .map(|p| (p, AccessFs::from_all(abi)))
         .chain(ro.iter().map(|p| (p, AccessFs::from_read(abi))));
     for (path, access) in rules {
-        let Ok(fd) = PathFd::new(path) else {
+        let Ok(fd) = crate::ns_setup::open_path(path) else {
             continue;
         };
         // Rules on a non-directory may only carry file rights.

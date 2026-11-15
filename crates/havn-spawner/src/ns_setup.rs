@@ -383,18 +383,14 @@ impl HostPaths {
     pub fn open<'a>(paths: impl IntoIterator<Item = &'a Path>) -> io::Result<Self> {
         let mut opened = Vec::new();
         for path in paths {
-            let c_path = CString::new(path.as_os_str().as_bytes()).map_err(io_invalid)?;
-            // SAFETY: a valid C string; O_PATH opens without reading.
-            let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
-            if fd < 0 {
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::ENOENT) {
-                    eprintln!("havn-init: cannot open {}: {err}", path.display());
+            match open_path(path) {
+                Ok(fd) => opened.push((path.to_path_buf(), fd)),
+                Err(err) => {
+                    if err.raw_os_error() != Some(libc::ENOENT) {
+                        eprintln!("havn-init: cannot open {}: {err}", path.display());
+                    }
                 }
-                continue;
             }
-            // SAFETY: `fd` was just opened and nothing else owns it.
-            opened.push((path.to_path_buf(), unsafe { OwnedFd::from_raw_fd(fd) }));
         }
         Ok(Self { opened })
     }
@@ -1229,6 +1225,22 @@ unsafe fn check(rc: libc::c_int) -> io::Result<()> {
     }
 }
 
+/// Open `path` with `O_PATH`, following symlinks: without reading it, so
+/// without read permission and without a FIFO or device's open side
+/// effects. Not through `OpenOptions` (nor landlock's `PathFd`, which uses
+/// it): std masks `O_ACCMODE` out of custom flags, and musl's `O_ACCMODE`
+/// holds `O_PATH`.
+pub(crate) fn open_path(path: &Path) -> io::Result<OwnedFd> {
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(io_invalid)?;
+    // SAFETY: a valid C string; O_PATH opens without reading.
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just opened and nothing else owns it.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 fn io_invalid<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
 }
@@ -1550,6 +1562,28 @@ unsafe fn write_proc_file(path: &CStr, data: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paths_open_without_reading() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("havn-open-path-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&dir).expect("dir");
+        let fifo = dir.join("fifo");
+        let c_fifo = CString::new(fifo.as_os_str().as_bytes()).expect("path");
+        // SAFETY: a valid C string.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        let sealed = dir.join("sealed");
+        std::fs::create_dir(&sealed).expect("sealed");
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        // A FIFO without a writer would block a reading open.
+        for path in [&fifo, &sealed] {
+            let fd = open_path(path).expect("open");
+            // SAFETY: a descriptor this test owns.
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+            assert_ne!(flags & libc::O_PATH, 0, "{}", path.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn child_is_killed_when_the_thread_that_spawned_it_exits() {

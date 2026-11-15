@@ -32,13 +32,15 @@
 
 #![cfg(target_os = "linux")]
 
+use std::ffi::CString;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::sync::OnceLock;
 
 use landlock::{
-    ABI, Access as _, AccessFs, BitFlags, PathBeneath, PathFd, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus,
+    ABI, Access as _, AccessFs, BitFlags, PathBeneath, Ruleset, RulesetAttr, RulesetCreatedAttr,
+    RulesetStatus,
 };
 use thiserror::Error;
 use tracing::{info, warn};
@@ -166,6 +168,22 @@ pub fn restrict_filesystem(
     Ok(())
 }
 
+/// Open `path` with `O_PATH`, following symlinks: without reading it, so
+/// without read permission or the READ_DIR right. Not through
+/// `OpenOptions` (nor landlock's `PathFd`, which uses it): std masks
+/// `O_ACCMODE` out of custom flags, and musl's `O_ACCMODE` holds `O_PATH`.
+fn open_path(path: &Path) -> std::io::Result<OwnedFd> {
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+    // SAFETY: a valid C string; O_PATH opens without reading.
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the kernel just returned this descriptor, and nothing else
+    // owns it.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 type CreatedRuleset = landlock::RulesetCreated;
 type AccessFlags = BitFlags<AccessFs>;
 
@@ -174,7 +192,7 @@ fn add_path_beneath(
     path: &Path,
     access: AccessFlags,
 ) -> Result<CreatedRuleset, String> {
-    let fd = PathFd::new(path).map_err(|e| format!("PathFd::new({}): {e}", path.display()))?;
+    let fd = open_path(path).map_err(|e| format!("open({}): {e}", path.display()))?;
     ruleset
         .add_rule(PathBeneath::new(fd, access))
         .map_err(|e| format!("add_rule({}): {e}", path.display()))
@@ -198,10 +216,10 @@ fn add_path_beneath_optional(
     path: &Path,
     access: AccessFlags,
 ) -> Result<CreatedRuleset, OptionalRuleError> {
-    let Ok(fd) = PathFd::new(path) else {
+    let Ok(fd) = open_path(path) else {
         return Err(OptionalRuleError {
             ruleset,
-            inner: format!("PathFd::new({}): missing", path.display()),
+            inner: format!("open({}): missing", path.display()),
         });
     };
     ruleset
@@ -306,22 +324,8 @@ pub fn create_tool_domain() -> std::io::Result<()> {
     // nothing else owns it.
     let ruleset = unsafe { OwnedFd::from_raw_fd(fd) };
     if refer != 0 {
-        // Not through `OpenOptions`: std masks `O_ACCMODE` out of custom
-        // flags, and musl's `O_ACCMODE` holds `O_PATH`. A plain open of `/`
-        // needs read permission, which the agent's uid lacks.
-        // SAFETY: a NUL-terminated path; O_PATH opens without reading.
-        let fd = unsafe {
-            libc::open(
-                c"/".as_ptr(),
-                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: the kernel just returned this descriptor, and nothing
-        // else owns it.
-        let root = unsafe { OwnedFd::from_raw_fd(fd) };
+        // The runtime's own domain refuses READ_DIR on `/`.
+        let root = open_path(Path::new("/"))?;
         let rule = PathBeneathAttr {
             allowed_access: refer,
             parent_fd: root.as_raw_fd(),
