@@ -33,7 +33,7 @@ const DECISION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// How long "allow" (not "always") lets a domain through, and how long a
 /// denial holds before the owner is asked again.
 const DECIDED_FOR: Duration = Duration::from_secs(10 * 60);
-/// Open connections one agent may have through the proxy.
+/// Open connections one agent link may have through the proxy.
 const MAX_CONNECTIONS_PER_AGENT: usize = 64;
 /// New questions one agent may raise per minute; past that, domains on
 /// neither list are refused without asking.
@@ -102,11 +102,13 @@ struct State {
     /// allowed or denied, and when.
     decided: HashMap<(AgentId, String), (bool, Instant)>,
     /// Questions waiting, per agent and first host of the group, with the
-    /// connections waiting on them.
-    asking: HashMap<(AgentId, String), Vec<oneshot::Sender<bool>>>,
+    /// connections waiting on them: the owner's answer, `None` when there
+    /// was none.
+    asking: HashMap<(AgentId, String), Vec<oneshot::Sender<Option<bool>>>>,
     /// When each agent's recent questions were asked.
     asked: HashMap<AgentId, Vec<Instant>>,
-    connections: HashMap<AgentId, usize>,
+    /// Open connections per agent address.
+    connections: HashMap<Ipv4Addr, usize>,
 }
 
 #[derive(Debug)]
@@ -120,19 +122,19 @@ pub struct EgressProxy {
     saving: Mutex<()>,
 }
 
-/// An agent's open connection, counted until dropped.
+/// An agent link's open connection, counted until dropped.
 struct Slot {
     proxy: Arc<EgressProxy>,
-    agent: AgentId,
+    peer: Ipv4Addr,
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
         let mut state = self.proxy.lock();
-        if let Some(n) = state.connections.get_mut(&self.agent) {
+        if let Some(n) = state.connections.get_mut(&self.peer) {
             *n = n.saturating_sub(1);
             if *n == 0 {
-                state.connections.remove(&self.agent);
+                state.connections.remove(&self.peer);
             }
         }
     }
@@ -200,17 +202,25 @@ impl EgressProxy {
         }
     }
 
-    /// The running agent whose link `peer` came from to `local`, if
-    /// exactly one is. Addresses outside the agent pool are refused
-    /// before any lookup.
-    async fn agent_at(&self, peer: IpAddr, local: IpAddr) -> Option<havn_db::repo::agents::Agent> {
-        let (IpAddr::V4(peer), IpAddr::V4(local)) = (peer, local) else {
+    /// `peer` when it is an address of the agent pool.
+    fn in_pool(&self, peer: IpAddr) -> Option<Ipv4Addr> {
+        let IpAddr::V4(peer) = peer else {
             return None;
         };
         let [a, b, ..] = peer.octets();
-        if (a, b) != (self.pool.first_octet, self.pool.second_octet) {
+        ((a, b) == (self.pool.first_octet, self.pool.second_octet)).then_some(peer)
+    }
+
+    /// The running agent whose link `peer` came from to `local`, if
+    /// exactly one is.
+    async fn agent_at(
+        &self,
+        peer: Ipv4Addr,
+        local: IpAddr,
+    ) -> Option<havn_db::repo::agents::Agent> {
+        let IpAddr::V4(local) = local else {
             return None;
-        }
+        };
         let running = havn_db::repo::agents::list_with_status(
             &self.db,
             havn_db::repo::agents::AgentStatus::Running,
@@ -231,12 +241,14 @@ impl EgressProxy {
         peer: SocketAddr,
     ) -> Result<(), String> {
         let local = client.local_addr().map_err(|e| e.to_string())?;
-        let Some(agent) = self.agent_at(peer.ip(), local.ip()).await else {
+        let Some(peer) = self.in_pool(peer.ip()) else {
             return Err("not an agent's link".into());
         };
+        // Counted before any lookup, so a connect loop costs no queries
+        // past the cap.
         let full = {
             let mut state = self.lock();
-            let open = state.connections.entry(agent.id).or_insert(0);
+            let open = state.connections.entry(peer).or_insert(0);
             let full = *open >= MAX_CONNECTIONS_PER_AGENT;
             if !full {
                 *open += 1;
@@ -249,7 +261,10 @@ impl EgressProxy {
         }
         let _slot = Slot {
             proxy: Arc::clone(&self),
-            agent: agent.id,
+            peer,
+        };
+        let Some(agent) = self.agent_at(peer, local.ip()).await else {
+            return Err("not an agent's link".into());
         };
         let (head, rest) = tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut client))
             .await
@@ -348,9 +363,12 @@ impl EgressProxy {
             self.ask(agent, host, &group, source, key).await;
         }
         match tokio::time::timeout(DECISION_TIMEOUT, rx).await {
-            Ok(Ok(true)) => Ok(()),
-            Ok(Ok(false)) => Err((403, format!("the owner did not allow {host}"))),
-            _ => Err((403, format!("{host} was not allowed in time"))),
+            Ok(Ok(Some(true))) => Ok(()),
+            Ok(Ok(Some(false))) => Err((403, format!("the owner did not allow {host}"))),
+            _ => Err((
+                403,
+                format!("the owner did not answer about {host}; ask them to allow it"),
+            )),
         }
     }
 
@@ -376,7 +394,9 @@ impl EgressProxy {
             input,
             reason: format!("{host} is not on the agent's allowed domains"),
         };
-        let answer = match self.router.ask_gateway_approval(agent.id, request).await {
+        let posted = self.router.ask_gateway_approval(agent.id, request).await;
+        let asked = posted.is_some();
+        let answer = match posted {
             Some(rx) => match tokio::time::timeout(DECISION_TIMEOUT, rx).await {
                 Ok(Ok(answer)) => Some(answer),
                 _ => {
@@ -387,7 +407,7 @@ impl EgressProxy {
             },
             None => None,
         };
-        let asked = answer.is_some();
+        let answered = answer.is_some();
         let (allow, always, decided_by) = answer.unwrap_or((false, false, String::new()));
         if allow && always {
             if let Err(e) = self.add_allowed(agent.id, group).await {
@@ -403,6 +423,7 @@ impl EgressProxy {
                 "egress.domain",
                 serde_json::json!({
                     "hosts": group,
+                    "answered": answered,
                     "allowed": allow,
                     "always": always,
                     "decided_by": decided_by,
@@ -411,9 +432,12 @@ impl EgressProxy {
             .await;
         }
         let mut state = self.lock();
-        state.decided.insert(key.clone(), (allow, Instant::now()));
+        // Only an answer holds; an unanswered question is asked again.
+        if answered {
+            state.decided.insert(key.clone(), (allow, Instant::now()));
+        }
         for tx in state.asking.remove(&key).unwrap_or_default() {
-            let _ = tx.send(allow);
+            let _ = tx.send(answered.then_some(allow));
         }
     }
 
@@ -473,7 +497,8 @@ struct Request {
     /// Header lines kept for a plain HTTP request: not Host, not proxy or
     /// connection ones.
     headers: Vec<String>,
-    content_length: u64,
+    /// The body length of a plain HTTP request, when it has one.
+    content_length: Option<u64>,
 }
 
 /// The head of a request up to its blank line, and what came after it.
@@ -544,12 +569,17 @@ fn parse_head(head: &[u8]) -> Result<Request, String> {
                 if content_length.is_some() {
                     return Err("more than one Content-Length".into());
                 }
+                let digits = value.trim_matches([' ', '\t']);
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err("bad Content-Length".into());
+                }
                 content_length = Some(
-                    value
-                        .trim()
+                    digits
                         .parse()
                         .map_err(|_| "bad Content-Length".to_string())?,
                 );
+                // Written again from the parsed value.
+                continue;
             }
             "transfer-encoding" => {
                 return Err("Transfer-Encoding is not accepted; send a Content-Length".into());
@@ -564,7 +594,6 @@ fn parse_head(head: &[u8]) -> Result<Request, String> {
             headers.push(header.to_string());
         }
     }
-    let content_length = content_length.unwrap_or(0);
     if method == "CONNECT" {
         let (host, port) = split_host_port(target, 443)?;
         if port != 443 {
@@ -669,12 +698,15 @@ async fn forward_plain(
         head.push_str(header);
         head.push_str("\r\n");
     }
+    if let Some(length) = request.content_length {
+        head.push_str(&format!("Content-Length: {length}\r\n"));
+    }
     head.push_str("Connection: close\r\n\r\n");
     upstream
         .write_all(head.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
-    let mut remaining = request.content_length;
+    let mut remaining = request.content_length.unwrap_or(0);
     let first = usize::try_from(remaining)
         .unwrap_or(usize::MAX)
         .min(already.len());
@@ -752,6 +784,7 @@ mod tests {
             b"SSH-2.0-OpenSSH\r\n\r\n",
             b"POST http://deb.debian.org/ HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
             b"POST http://deb.debian.org/ HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+            b"POST http://deb.debian.org/ HTTP/1.1\r\nContent-Length: +5\r\n\r\n",
             b"GET http://deb.debian.org/ HTTP/1.1\r\nX: a\nHost: evil\r\n\r\n",
             b"GET http://deb.debian.org/ HTTP/1.1\r\nHost : evil\r\n\r\n",
             b"GET http://deb.debian.org/ HTTP/1.1\r\nX: a\r\n folded\r\n\r\n",

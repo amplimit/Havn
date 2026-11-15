@@ -958,10 +958,13 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
         AgentToGateway::OutboundMessage(msg) => route_outbound(agent_id, msg, ctx).await,
         AgentToGateway::ApprovalRequest(request) => ask_for_approval(agent_id, request, ctx).await,
         AgentToGateway::ApprovalClosed { request_id } => {
-            let _ = ctx
-                .webchat_router
-                .close_approval(agent_id, &request_id)
-                .await;
+            // The egress proxy's questions are closed by the proxy only.
+            if !request_id.starts_with(crate::egress_proxy::REQUEST_PREFIX) {
+                let _ = ctx
+                    .webchat_router
+                    .close_approval(agent_id, &request_id)
+                    .await;
+            }
         }
         AgentToGateway::LlmRequest(req) => {
             if req.request_id.len() > MAX_REQUEST_ID_BYTES {

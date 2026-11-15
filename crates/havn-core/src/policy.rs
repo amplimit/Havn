@@ -625,8 +625,8 @@ impl Policy {
                     || other.network_policy.egress_allowed,
                 // Only a role that allows egress says how it goes.
                 egress_proxy: match (
-                    self.network_policy.egress_allowed,
-                    other.network_policy.egress_allowed,
+                    a.can_access_network && self.network_policy.egress_allowed,
+                    b.can_access_network && other.network_policy.egress_allowed,
                 ) {
                     (true, true) => {
                         self.network_policy.egress_proxy && other.network_policy.egress_proxy
@@ -935,6 +935,10 @@ mod tests {
             route(&role(false, true), &role(false, false)),
             (false, true)
         );
+        // Nor does one without network access.
+        let mut offline = role(true, false);
+        offline.permissions.can_access_network = false;
+        assert_eq!(route(&offline, &role(true, true)), (true, true));
     }
 
     #[test]

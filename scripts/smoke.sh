@@ -238,6 +238,12 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
             [ "$code" = 200 ] || { tail -30 "$GATEWAY_LOG" >&2; die "an allowed domain through the proxy gave $code"; }
             code=$(nsenter -t "$pid" -n curl -s -o /dev/null -w '%{http_connect}' --max-time 20                 -x "http://$host_ip:$proxy_port" https://example.org/ || true)
             [ "$code" = 403 ] || die "a blocked domain through the proxy gave $code"
+            # Even with a route added (root can, the agent cannot), nothing
+            # from its link gets past the host.
+            nsenter -t "$pid" -n ip route add default via "$host_ip" || die "cannot add a route in the agent's namespace"
+            if nsenter -t "$pid" -n timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then
+                die "an agent whose network goes through the proxy gets past the host with a route"
+            fi
             ok "the agent reaches the internet only through the egress proxy"
         else
             log "the agent has no network link (no iptables?); egress proxy not checked"

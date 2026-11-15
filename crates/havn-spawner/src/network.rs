@@ -628,17 +628,8 @@ pub fn configure_agent_network(
                 .into(),
         ));
     }
-    remove_proxied_rule(&net.host_iface)?;
-    if !default_route {
-        // Without a route the agent sends nothing past the host; this
-        // also drops what it might address past it anyway.
-        let mut ins = vec!["-t", "mangle", "-I", EGRESS_CHAIN, "1"];
-        ins.extend(proxied_rule(&net.host_iface));
-        ins.push("DROP");
-        run_iptables(&ins)?;
-    }
-
-    // Host side
+    // Host side. This fails when another agent's link has the name, before
+    // anything of that agent is touched.
     run_ip(&[
         "link",
         "add",
@@ -649,6 +640,17 @@ pub fn configure_agent_network(
         "name",
         &net.ns_iface,
     ])?;
+    let owner = link_owner(agent_id);
+    run_ip(&["link", "set", &net.host_iface, "alias", &owner])?;
+    remove_proxied_rule(&net.host_iface, &owner)?;
+    if !default_route {
+        // Without a route the agent sends nothing past the host; this
+        // also drops what it might address past it anyway.
+        let mut ins = vec!["-t", "mangle", "-I", EGRESS_CHAIN, "1"];
+        ins.extend(proxied_rule(&net.host_iface, &owner));
+        ins.push("DROP");
+        run_iptables(&ins)?;
+    }
     run_ip(&[
         "addr",
         "add",
@@ -711,13 +713,29 @@ pub fn configure_agent_network(
 /// belt-and-braces path for cases where it doesn't.
 pub fn teardown_agent_network(agent_id: AgentId, pool: &AgentSubnetPool) {
     let net = network_for(agent_id, *pool);
-    let _ = run_ip_silent(&["link", "del", &net.host_iface]);
-    let _ = remove_proxied_rule(&net.host_iface);
+    let owner = link_owner(agent_id);
+    // Only a link of this agent: another one may hold the name.
+    if link_alias(&net.host_iface).as_deref() == Some(owner.as_str()) {
+        let _ = run_ip_silent(&["link", "del", &net.host_iface]);
+    }
+    let _ = remove_proxied_rule(&net.host_iface, &owner);
+}
+
+/// The alias of `agent_id`'s host-side veth, and the comment of its rule.
+fn link_owner(agent_id: AgentId) -> String {
+    format!("havn-agent:{}", agent_id.as_uuid())
+}
+
+fn link_alias(iface: &str) -> Option<String> {
+    let path = format!("/sys/class/net/{iface}/ifalias");
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|alias| alias.trim().to_string())
 }
 
 /// The match of an agent whose network goes through the egress proxy:
 /// what comes from its link to an address not of the host.
-fn proxied_rule(host_iface: &str) -> [&str; 8] {
+fn proxied_rule<'a>(host_iface: &'a str, owner: &'a str) -> [&'a str; 12] {
     [
         "-i",
         host_iface,
@@ -726,14 +744,18 @@ fn proxied_rule(host_iface: &str) -> [&str; 8] {
         "!",
         "--dst-type",
         "LOCAL",
+        "-m",
+        "comment",
+        "--comment",
+        owner,
         "-j",
     ]
 }
 
-fn remove_proxied_rule(host_iface: &str) -> Result<()> {
+fn remove_proxied_rule(host_iface: &str, owner: &str) -> Result<()> {
     loop {
         let mut del = vec!["-t", "mangle", "-D", EGRESS_CHAIN];
-        del.extend(proxied_rule(host_iface));
+        del.extend(proxied_rule(host_iface, owner));
         del.push("DROP");
         if !iptables()?.args(&del).output()?.status.success() {
             return Ok(());

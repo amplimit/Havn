@@ -304,6 +304,12 @@ pub async fn upgrade_stored_overrides(db: &SqlitePool) -> anyhow::Result<()> {
 /// agent's team, if any), with the owner's own domain lists and the
 /// operator's blocked domains added.
 pub async fn for_owner(db: &SqlitePool, agent: &Agent) -> Policy {
+    owner_policy(db, agent).await.0
+}
+
+/// [`for_owner`], and whether the owner's domain lists could be read.
+async fn owner_policy(db: &SqlitePool, agent: &Agent) -> (Policy, bool) {
+    let mut lists_read = true;
     let mut policy = match agent.team_id {
         Some(team_id) => for_team_member(db, agent.owner_id, team_id).await,
         None => for_user(db, agent.owner_id).await,
@@ -314,8 +320,8 @@ pub async fn for_owner(db: &SqlitePool, agent: &Agent) -> Policy {
             // Without the user's blocked domains, reading the web and
             // network egress are off rather than unguarded.
             warn!(user_id = %agent.owner_id, error = %e, "domain list lookup failed; turning web_fetch and egress off");
-            policy.permissions.can_fetch_web = false;
-            policy.network_policy.egress_allowed = false;
+            lists_read = false;
+            unguarded(&mut policy);
             havn_db::repo::users::UserDomains::default()
         }
     };
@@ -325,7 +331,14 @@ pub async fn for_owner(db: &SqlitePool, agent: &Agent) -> Policy {
         &union(&net.blocked_domains, &personal.blocked_domains),
         operator_blocked_domains(),
     );
-    policy
+    (policy, lists_read)
+}
+
+/// Reading the web and network egress off, for a policy whose domain
+/// lists are missing.
+fn unguarded(policy: &mut Policy) {
+    policy.permissions.can_fetch_web = false;
+    policy.network_policy.egress_allowed = false;
 }
 
 /// Full per-session resolution chain (spec §6.3): the owner's policy
@@ -342,8 +355,8 @@ pub async fn for_owner(db: &SqlitePool, agent: &Agent) -> Policy {
 /// registry but their cgroup was still capped at the system default
 /// 512 MiB. Drift fix.
 pub async fn for_session(db: &SqlitePool, agent: &Agent, multi_user: bool) -> Policy {
-    let owner = for_owner(db, agent).await;
-    match override_for(agent, &owner) {
+    let (owner, lists_read) = owner_policy(db, agent).await;
+    let mut policy = match override_for(agent, &owner) {
         Some(p) if multi_user => p.clamp_to(&owner),
         Some(mut p) => {
             p.hooks = p.hooks.union(&owner.hooks);
@@ -354,7 +367,12 @@ pub async fn for_session(db: &SqlitePool, agent: &Agent, multi_user: bool) -> Po
             p
         }
         None => owner,
+    };
+    // An unclamped override must not turn them back on.
+    if !lists_read {
+        unguarded(&mut policy);
     }
+    policy
 }
 
 #[cfg(test)]
