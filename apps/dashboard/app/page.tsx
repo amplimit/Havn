@@ -109,7 +109,7 @@ export default function HomePage() {
                   >
                     {a.name}
                   </Link>
-                  <StatusPill status={a.status} connected={a.connected} />
+                  <StatusPill status={a.status} connected={a.connected} failure={a.failure} />
                 </div>
                 <p
                   className="mt-1 font-mono text-xs"
@@ -152,9 +152,11 @@ export default function HomePage() {
 function StatusPill({
   status,
   connected,
+  failure,
 }: {
   status: AgentView["status"];
   connected: boolean;
+  failure: string | null;
 }) {
   if (status === "running" && connected) {
     return <span className="pill pill-running">live</span>;
@@ -163,7 +165,11 @@ function StatusPill({
     return <span className="pill pill-stopped">starting…</span>;
   }
   if (status === "error") {
-    return <span className="pill pill-error">error</span>;
+    return (
+      <span className="pill pill-error" title={failure ?? undefined}>
+        error
+      </span>
+    );
   }
   return <span className="pill pill-stopped">{status}</span>;
 }

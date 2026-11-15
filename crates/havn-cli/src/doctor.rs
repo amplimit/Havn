@@ -16,6 +16,8 @@
 //!   outbound network.
 //! - Stale PID file → `havn gateway start --detach` refuses.
 //! - Database schema out of sync (migration didn't run).
+//! - An agent the gateway gave up restarting, with what its runtime
+//!   printed before it exited.
 //! - Gateway is up but no listen socket (rare, but happens when the
 //!   OS denies bind).
 
@@ -86,6 +88,8 @@ pub async fn run() -> anyhow::Result<()> {
     let v = check_network_tools();
     mark!(v);
     let v = check_db(&cfg).await;
+    mark!(v);
+    let v = check_failed_agents(&cfg).await;
     mark!(v);
     let v = check_gateway_reachable(&cfg).await;
     mark!(v);
@@ -554,11 +558,90 @@ fn check_network_tools() -> Verdict {
     v
 }
 
-async fn check_db(cfg: &CliConfig) -> Verdict {
-    let db_path = match cfg.db_path.clone() {
+fn db_file(cfg: &CliConfig) -> PathBuf {
+    match cfg.db_path.clone() {
         Some(p) => p,
         None => paths::data_dir(cfg).join("havn.db"),
+    }
+}
+
+/// An agent the gateway gave up restarting, and the last lines its
+/// runtime wrote to stderr then.
+#[derive(Debug)]
+struct FailedAgent {
+    id: String,
+    name: String,
+    stderr: Vec<String>,
+}
+
+/// Agents in `error` status: the supervisor gave up on them. What their
+/// runtime said comes from the audit entry it wrote then.
+async fn check_failed_agents(cfg: &CliConfig) -> Verdict {
+    let db_path = db_file(cfg);
+    if !db_path.exists() {
+        // `database` above says so.
+        return Verdict::Ok;
+    }
+    let opts = SqliteConnectOptions::new()
+        .filename(&db_path)
+        .read_only(true);
+    let Ok(pool) = SqlitePool::connect_with(opts).await else {
+        return Verdict::Ok;
     };
+    let rows: Result<Vec<(String, String, Option<String>)>, _> = sqlx::query_as(
+        r"SELECT a.id, a.name,
+                 (SELECT l.details FROM audit_log l
+                  WHERE l.agent_id = a.id AND l.action = 'agent.restart_abandoned'
+                  ORDER BY l.created_at DESC LIMIT 1)
+          FROM agents a WHERE a.status = 'error' ORDER BY a.name",
+    )
+    .fetch_all(&pool)
+    .await;
+    pool.close().await;
+    let Ok(rows) = rows else {
+        return Verdict::Ok;
+    };
+    let failed: Vec<FailedAgent> = rows
+        .into_iter()
+        .map(|(id, name, details)| FailedAgent {
+            id,
+            name,
+            stderr: details
+                .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok())
+                .and_then(|d| serde_json::from_value(d["stderr"].clone()).ok())
+                .unwrap_or_default(),
+        })
+        .collect();
+    let (v, msg) = failed_agents_verdict(&failed);
+    line(v, "agents", &msg);
+    v
+}
+
+fn failed_agents_verdict(failed: &[FailedAgent]) -> (Verdict, String) {
+    if failed.is_empty() {
+        return (Verdict::Ok, "none given up on".into());
+    }
+    let mut msg = format!(
+        "{} agent(s) kept failing and are not restarted until started again:",
+        failed.len()
+    );
+    for agent in failed {
+        msg.push_str(&format!("\n{:22}{} ({})", "", agent.name, agent.id));
+        if agent.stderr.is_empty() {
+            msg.push_str(&format!(
+                "\n{:24}its runtime printed nothing; see `journalctl -u havn | grep {}`",
+                "", agent.id
+            ));
+        }
+        for text in &agent.stderr {
+            msg.push_str(&format!("\n{:24}| {text}", ""));
+        }
+    }
+    (Verdict::Warn, msg)
+}
+
+async fn check_db(cfg: &CliConfig) -> Verdict {
+    let db_path = db_file(cfg);
     if !db_path.exists() {
         line(
             Verdict::Warn,
@@ -764,6 +847,32 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn failed_agents_are_listed_with_what_their_runtime_said() {
+        assert!(matches!(failed_agents_verdict(&[]).0, Verdict::Ok));
+        let failed = [
+            FailedAgent {
+                id: "a1".into(),
+                name: "alpha".into(),
+                stderr: vec![
+                    "Error: opening agent.db".into(),
+                    "    migrate: migration 8 was previously applied but has been modified".into(),
+                ],
+            },
+            FailedAgent {
+                id: "b2".into(),
+                name: "beta".into(),
+                stderr: Vec::new(),
+            },
+        ];
+        let (v, msg) = failed_agents_verdict(&failed);
+        assert!(matches!(v, Verdict::Warn));
+        assert!(msg.contains("alpha (a1)"), "{msg}");
+        assert!(msg.contains("| Error: opening agent.db"), "{msg}");
+        assert!(msg.contains("migration 8 was previously applied"), "{msg}");
+        assert!(msg.contains("journalctl -u havn | grep b2"), "{msg}");
+    }
 
     fn view(ids: &[&str]) -> crate::model::ModelsView {
         crate::model::ModelsView {

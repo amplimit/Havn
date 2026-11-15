@@ -578,6 +578,21 @@ export default function ChatPage({
           </div>
         </div>
 
+        {agent.failure && wsState !== "open" && (
+          <div
+            role="alert"
+            className="border-b px-4 py-3 text-sm sm:px-8"
+            style={{
+              borderColor: "rgba(234, 34, 97, 0.3)",
+              backgroundColor: "rgba(234, 34, 97, 0.06)",
+              color: "var(--color-ruby)",
+            }}
+          >
+            <p className="mb-1 font-medium">The agent exited before it was ready. Its runtime said:</p>
+            <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-xs">{agent.failure}</pre>
+          </div>
+        )}
+
         {/* Conversation */}
         <div
           ref={scrollRef}
