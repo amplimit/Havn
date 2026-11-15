@@ -295,6 +295,7 @@ pub fn ensure_global_nat(
     pool: &AgentSubnetPool,
     dns: &[String],
     reachable: &[String],
+    proxy_port: Option<u16>,
 ) -> Result<String> {
     probe_tooling()?;
     let primary = detect_primary_iface()?;
@@ -303,7 +304,7 @@ pub fn ensure_global_nat(
     // Isolation first: if it cannot be applied, return the error before
     // NAT exists, so agents get no outbound network rather than
     // unrestricted outbound network.
-    apply_isolation(&pool_cidr, dns, reachable)?;
+    apply_isolation(&pool_cidr, dns, reachable, proxy_port)?;
 
     // /proc/sys/net/ipv4/ip_forward — idempotent write.
     if let Err(e) = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1\n") {
@@ -380,7 +381,14 @@ pub fn parse_ipv4_net(value: &str) -> Option<(std::net::Ipv4Addr, u8)> {
 /// `dns` servers stay reachable on port 53 only (also when they run on the
 /// gateway host); `reachable` entries are reachable entirely. Both must be
 /// IPv4 (validated by the caller).
-fn isolation_rules(pool_cidr: &str, dns: &[String], reachable: &[String]) -> Vec<Vec<String>> {
+/// `proxy_port`, the gateway's egress proxy, is the one port of the
+/// gateway host agents reach.
+fn isolation_rules(
+    pool_cidr: &str,
+    dns: &[String],
+    reachable: &[String],
+    proxy_port: Option<u16>,
+) -> Vec<Vec<String>> {
     let mut rules: Vec<Vec<String>> = Vec::new();
     let rule = |parts: &[&str]| parts.iter().map(|p| (*p).to_string()).collect::<Vec<_>>();
     rules.push(rule(&[
@@ -407,6 +415,23 @@ fn isolation_rules(pool_cidr: &str, dns: &[String], reachable: &[String]) -> Vec
                 "RETURN",
             ]));
         }
+    }
+    if let Some(port) = proxy_port {
+        let port = port.to_string();
+        rules.push(rule(&[
+            "-A",
+            EGRESS_CHAIN,
+            "-p",
+            "tcp",
+            "--dport",
+            &port,
+            "-m",
+            "addrtype",
+            "--dst-type",
+            "LOCAL",
+            "-j",
+            "RETURN",
+        ]));
     }
     // The host itself, broadcast and other agents stay unreachable even
     // when an operator exception (below) covers their addresses.
@@ -456,13 +481,18 @@ fn iptables() -> Result<Command> {
 
 /// Rebuild [`EGRESS_CHAIN`] and make sure the only jump to it from each
 /// of [`HOOK_CHAINS`] is that chain's first rule.
-fn apply_isolation(pool_cidr: &str, dns: &[String], reachable: &[String]) -> Result<()> {
+fn apply_isolation(
+    pool_cidr: &str,
+    dns: &[String],
+    reachable: &[String],
+    proxy_port: Option<u16>,
+) -> Result<()> {
     // -N fails if the chain exists; -F then empties it either way.
     let _ = iptables()?
         .args(["-t", "mangle", "-N", EGRESS_CHAIN])
         .output()?;
     run_iptables(&["-t", "mangle", "-F", EGRESS_CHAIN])?;
-    for rule in isolation_rules(pool_cidr, dns, reachable) {
+    for rule in isolation_rules(pool_cidr, dns, reachable, proxy_port) {
         let mut args: Vec<&str> = vec!["-t", "mangle"];
         args.extend(rule.iter().map(String::as_str));
         run_iptables(&args)?;
@@ -579,10 +609,15 @@ fn run_iptables(args: &[&str]) -> Result<()> {
 /// any agent that doesn't need outbound — the only surface that breaks
 /// is shell downloads / packs / network-needing MCP servers, all of which
 /// surface their own clear errors at tool-use time.
+/// Give the agent's namespace its veth. With `default_route` it reaches
+/// the public internet; without, only the gateway host's end of the link,
+/// where the egress proxy listens: an agent holds no `CAP_NET_ADMIN` to
+/// add a route itself.
 pub fn configure_agent_network(
     child_pid: i32,
     agent_id: AgentId,
     pool: &AgentSubnetPool,
+    default_route: bool,
 ) -> Result<AgentNetwork> {
     let net = network_for(agent_id, *pool);
     let pid = child_pid.to_string();
@@ -652,10 +687,12 @@ pub fn configure_agent_network(
     run_nsenter(&pid, &["link", "set", &net.ns_iface, "addrgenmode", "none"])?;
     run_nsenter(&pid, &["link", "set", &net.ns_iface, "up"])?;
     run_nsenter(&pid, &["link", "set", "lo", "up"])?;
-    run_nsenter(
-        &pid,
-        &["route", "add", "default", "via", &net.host_ip.to_string()],
-    )?;
+    if default_route {
+        run_nsenter(
+            &pid,
+            &["route", "add", "default", "via", &net.host_ip.to_string()],
+        )?;
+    }
 
     Ok(net)
 }
@@ -713,7 +750,9 @@ pub fn gc_orphaned_veth() -> Result<usize> {
 /// Compute the per-agent network from the agent's UUID. Deterministic
 /// (a restart picks the same /30) and collision-resistant up to a few
 /// hundred concurrent agents.
-fn network_for(agent_id: AgentId, pool: AgentSubnetPool) -> AgentNetwork {
+/// The addresses and interface names of `agent_id`'s link in `pool`.
+#[must_use]
+pub fn network_for(agent_id: AgentId, pool: AgentSubnetPool) -> AgentNetwork {
     let bytes = agent_id.as_uuid().as_bytes();
     // 14-bit index → 16384 /30s.
     let idx = ((u32::from(bytes[6]) << 8) | u32::from(bytes[7])) & 0x3FFF;
@@ -916,6 +955,7 @@ mod tests {
             "10.42.0.0/16",
             &["192.168.1.53".into()],
             &["10.0.5.20".into()],
+            Some(3128),
         );
         let flat: Vec<String> = rules.iter().map(|r| r.join(" ")).collect();
         let pos = |needle: &str| {
@@ -931,6 +971,8 @@ mod tests {
         let dns_tcp = pos("-d 192.168.1.53 -p tcp --dport 53 -j RETURN");
         let exception = pos("-d 10.0.5.20 -j RETURN");
         let local = pos("--dst-type LOCAL -j DROP");
+        let proxy = pos("-p tcp --dport 3128 -m addrtype --dst-type LOCAL -j RETURN");
+        assert!(proxy < local, "the proxy port of the host stays reachable");
         let pool = pos("-d 10.42.0.0/16 -j DROP");
         let private = pos("-d 10.0.0.0/8 -j DROP");
         assert!(dns_udp < local && dns_tcp < local);

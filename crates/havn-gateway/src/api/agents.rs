@@ -167,7 +167,9 @@ pub async fn create(
             owner_id: user.id,
             team_id,
             name: req.name.trim(),
-            config: req.config.unwrap_or_else(|| serde_json::json!({})),
+            config: policy_resolver::with_default_egress(
+                req.config.unwrap_or_else(|| serde_json::json!({})),
+            ),
         },
         user_policy.max_agents,
         max_in_team,

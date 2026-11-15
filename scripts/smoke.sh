@@ -212,6 +212,32 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
                     || die "a process in the agent cannot run awk, a link through /etc/alternatives"
             fi
         done
+        # New agents' network goes through the egress proxy: no route out
+        # but to it, and it lets allowed domains through, not blocked ones.
+        pid=$(echo "$RUNTIME_PIDS" | head -1)
+        ns_ip=""
+        for _ in $(seq 1 20); do
+            ns_ip=$(nsenter -t "$pid" -n ip -4 -o addr show scope global 2>/dev/null                 | awk '{print $4}' | cut -d/ -f1 | head -1)
+            [ -n "$ns_ip" ] && break
+            sleep 0.5
+        done
+        if [ -n "$ns_ip" ]; then
+            if nsenter -t "$pid" -n ip route | grep -q '^default'; then
+                die "an agent whose network goes through the proxy has a default route"
+            fi
+            if nsenter -t "$pid" -n timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then
+                die "an agent whose network goes through the proxy reaches the internet directly"
+            fi
+            host_ip="${ns_ip%.*}.$(( ${ns_ip##*.} - 1 ))"
+            curl -fs -X PATCH "$GATEWAY_URL/agents/$AGENT_ID/web" -H 'Content-Type: application/json'                 -d '{"allowed_domains":["example.com"],"blocked_domains":["example.org"]}' -o /dev/null                 || die "cannot set the agent's domain lists"
+            code=$(nsenter -t "$pid" -n curl -s -o /dev/null -w '%{http_code}' --max-time 20                 -x "http://$host_ip:3128" https://example.com/ || true)
+            [ "$code" = 200 ] || { tail -30 "$GATEWAY_LOG" >&2; die "an allowed domain through the proxy gave $code"; }
+            code=$(nsenter -t "$pid" -n curl -s -o /dev/null -w '%{http_connect}' --max-time 20                 -x "http://$host_ip:3128" https://example.org/ || true)
+            [ "$code" = 403 ] || die "a blocked domain through the proxy gave $code"
+            ok "the agent reaches the internet only through the egress proxy"
+        else
+            log "the agent has no network link (no iptables?); egress proxy not checked"
+        fi
         ok "every runtime thread is under seccomp with no_new_privs"
         ok "the agent runs as host ids of its own and owns its workspace"
         ok "the agent runtime holds no capabilities, and its tools cannot read its memory"

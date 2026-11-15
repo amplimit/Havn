@@ -31,6 +31,51 @@ pub fn set_operator_blocked_domains(domains: Vec<String>) {
     let _ = OPERATOR_BLOCKED_DOMAINS.set(domains);
 }
 
+/// The operator's `[network] default_egress`.
+static DEFAULT_EGRESS: OnceLock<String> = OnceLock::new();
+
+pub fn set_default_egress(mode: String) {
+    let _ = DEFAULT_EGRESS.set(mode);
+}
+
+/// `config` of a new agent with the operator's default network access
+/// set in its policy override, unless the config sets egress itself.
+#[must_use]
+pub fn with_default_egress(config: serde_json::Value) -> serde_json::Value {
+    with_egress_mode(config, DEFAULT_EGRESS.get().map_or("off", String::as_str))
+}
+
+fn with_egress_mode(mut config: serde_json::Value, mode: &str) -> serde_json::Value {
+    if config
+        .pointer("/policy/network_policy/egress_allowed")
+        .is_some()
+    {
+        return config;
+    }
+    let (allowed, proxy) = match mode {
+        "allowlist" => (true, true),
+        "all" => (true, false),
+        _ => return config,
+    };
+    if !config.is_object() {
+        config = serde_json::json!({});
+    }
+    let network = config
+        .as_object_mut()
+        .map(|c| c.entry("policy").or_insert_with(|| serde_json::json!({})))
+        .and_then(serde_json::Value::as_object_mut)
+        .map(|p| {
+            p.entry("network_policy")
+                .or_insert_with(|| serde_json::json!({}))
+        })
+        .and_then(serde_json::Value::as_object_mut);
+    if let Some(network) = network {
+        network.insert("egress_allowed".into(), serde_json::Value::Bool(allowed));
+        network.insert("egress_proxy".into(), serde_json::Value::Bool(proxy));
+    }
+    config
+}
+
 #[must_use]
 pub fn operator_blocked_domains() -> &'static [String] {
     OPERATOR_BLOCKED_DOMAINS.get().map_or(&[], Vec::as_slice)
@@ -732,6 +777,16 @@ mod tests {
         assert!(p.permissions.can_spawn_subagents);
         assert!(p.permissions.can_use_mcp);
         assert_eq!(p.resource_limits.memory_mb, 4096);
+    }
+
+    #[test]
+    fn new_agents_get_the_default_egress_unless_their_config_sets_it() {
+        let fresh = with_egress_mode(json!({"model": "m"}), "allowlist");
+        assert_eq!(fresh["policy"]["network_policy"]["egress_allowed"], true);
+        assert_eq!(fresh["policy"]["network_policy"]["egress_proxy"], true);
+        let chosen = json!({"policy": {"network_policy": {"egress_allowed": false}}});
+        assert_eq!(with_egress_mode(chosen.clone(), "allowlist"), chosen);
+        assert_eq!(with_egress_mode(json!({}), "off"), json!({}));
     }
 
     #[tokio::test]

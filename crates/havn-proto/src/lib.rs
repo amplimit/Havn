@@ -200,6 +200,10 @@ pub enum GatewayToAgent {
         /// the time. Absent from older gateways: the runtime uses UTC.
         #[serde(default)]
         timezone: Option<String>,
+        /// The egress proxy the agent's tools use (`http://host:port`),
+        /// when its network goes through it.
+        #[serde(default)]
+        egress_proxy: Option<String>,
     },
     /// Inbound message from a channel adapter.
     InboundMessage(InboundMessage),
@@ -640,6 +644,7 @@ mod tests {
             seccomp_allow_extra: Vec::new(),
             gateway_tools: Vec::new(),
             timezone: None,
+            egress_proxy: None,
         };
         let line = serde_json::to_string(&frame).expect("serialize");
         assert!(line.contains("\"type\":\"welcome\""));
@@ -677,6 +682,7 @@ mod tests {
             seccomp_allow_extra: Vec::new(),
             gateway_tools: Vec::new(),
             timezone: None,
+            egress_proxy: None,
         };
         let line = serde_json::to_string(&frame).expect("serialize");
         let parsed: GatewayToAgent = serde_json::from_str(&line).expect("parse");

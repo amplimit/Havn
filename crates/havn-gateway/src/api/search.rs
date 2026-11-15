@@ -56,6 +56,9 @@ pub struct AgentWebView {
     pub can_fetch_web: bool,
     /// The agent's sandbox has network egress (from its next start).
     pub egress_allowed: bool,
+    /// That egress goes through the egress proxy, which asks about new
+    /// domains.
+    pub egress_proxy: bool,
     /// What the owner's policy permits. With `trust_header` on, the
     /// agent's own settings cannot go beyond it.
     pub search_permitted: bool,
@@ -79,6 +82,7 @@ pub struct AgentWebPatch {
     pub can_search_web: Option<bool>,
     pub can_fetch_web: Option<bool>,
     pub egress_allowed: Option<bool>,
+    pub egress_proxy: Option<bool>,
     /// Replace the agent's own lists.
     pub allowed_domains: Option<Vec<String>>,
     pub blocked_domains: Option<Vec<String>>,
@@ -89,6 +93,7 @@ impl AgentWebPatch {
         self.can_search_web.is_none()
             && self.can_fetch_web.is_none()
             && self.egress_allowed.is_none()
+            && self.egress_proxy.is_none()
             && self.allowed_domains.is_none()
             && self.blocked_domains.is_none()
     }
@@ -146,6 +151,7 @@ async fn view(state: &AppState, agent: &Agent) -> Result<AgentWebView, ApiError>
         can_search_web: policy.permissions.can_search_web,
         can_fetch_web: policy.permissions.can_fetch_web,
         egress_allowed: egress(&policy),
+        egress_proxy: policy.network_policy.egress_proxy,
         search_permitted: !multi_user || owner.permissions.can_search_web,
         fetch_permitted: !multi_user || owner.permissions.can_fetch_web,
         egress_permitted: !multi_user || egress(&owner),
@@ -194,6 +200,7 @@ pub async fn agent_patch(
             "can_search_web": req.can_search_web,
             "can_fetch_web": req.can_fetch_web,
             "egress_allowed": req.egress_allowed,
+            "egress_proxy": req.egress_proxy,
             "allowed_domains": req.allowed_domains.as_deref().map(tidy_domains),
             "blocked_domains": req.blocked_domains.as_deref().map(tidy_domains),
         }),
@@ -239,6 +246,9 @@ fn with_web_access(config: &Value, patch: &AgentWebPatch) -> Value {
             "blocked_domains",
             tidy_domains(list).into(),
         );
+    }
+    if let Some(on) = patch.egress_proxy {
+        set("network_policy", "egress_proxy", Value::Bool(on));
     }
     if let Some(on) = patch.egress_allowed {
         set("network_policy", "egress_allowed", Value::Bool(on));

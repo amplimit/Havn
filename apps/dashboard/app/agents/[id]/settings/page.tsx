@@ -935,20 +935,32 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
               {!view.fetch_permitted && " Your role does not allow it."}
             </span>
           </label>
-          <label className="flex items-start gap-3 text-sm">
-            <input
-              type="checkbox"
-              className={`mt-1 h-4 w-4 shrink-0 ${egressLocked ? "cursor-not-allowed" : "cursor-pointer"}`}
-              checked={view.egress_allowed}
-              disabled={egressLocked}
-              onChange={(e) => save({ egress_allowed: e.target.checked })}
-            />
+          <label className="grid gap-1 text-sm">
             <span>
-              <strong>network access</strong>: the agent&apos;s shell tools reach the
-              public internet from its sandbox, so they can download and upload. Private,
-              link-local and gateway-host addresses stay blocked.
+              <strong>network access</strong> of the agent&apos;s shell tools (pip, npm, git,
+              curl). Private, link-local and gateway-host addresses stay blocked.
               {!view.egress_permitted && " Your role does not allow it."}
             </span>
+            <select
+              className="input"
+              value={!view.egress_allowed ? "off" : view.egress_proxy ? "allowlist" : "all"}
+              disabled={egressLocked}
+              onChange={(e) => {
+                const mode = e.target.value;
+                save(
+                  mode === "off"
+                    ? { egress_allowed: false }
+                    : { egress_allowed: true, egress_proxy: mode === "allowlist" },
+                );
+              }}
+              style={{ maxWidth: 420 }}
+            >
+              <option value="off">off</option>
+              <option value="allowlist">
+                allowed domains; ask me about each new one
+              </option>
+              <option value="all">every public address</option>
+            </select>
           </label>
           <DomainLists
             key={`${view.allowed_domains.join(",")}|${view.blocked_domains.join(",")}`}

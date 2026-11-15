@@ -312,6 +312,13 @@ pub struct NetworkConfig {
     /// users, team admins and agents cannot remove them. An entry
     /// matches its subdomains.
     pub blocked_domains: Vec<String>,
+    /// Port of the egress proxy on the gateway host, reachable only from
+    /// agents (see `network_policy.egress_proxy`).
+    pub egress_proxy_port: u16,
+    /// Network access of agents created from now on, unless their config
+    /// sets one: `off`, `allowlist` (through the egress proxy, asking the
+    /// owner about each new domain) or `all` (every public address).
+    pub default_egress: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -467,6 +474,8 @@ impl Default for NetworkConfig {
             agent_pool_cidr: "10.42.0.0/16".into(),
             agent_private_access: Vec::new(),
             blocked_domains: Vec::new(),
+            egress_proxy_port: 3128,
+            default_egress: "allowlist".into(),
         }
     }
 }
@@ -591,6 +600,15 @@ impl GatewayConfig {
         parsed.validate_channel_ids()?;
         parsed.validate_llm()?;
         parsed.validate_search()?;
+        if !matches!(
+            parsed.network.default_egress.as_str(),
+            "off" | "allowlist" | "all"
+        ) {
+            anyhow::bail!(
+                "[network] default_egress = {:?} must be off, allowlist or all",
+                parsed.network.default_egress
+            );
+        }
         havn_core::policy::validate_domains(
             "[network] blocked_domains",
             &parsed.network.blocked_domains,

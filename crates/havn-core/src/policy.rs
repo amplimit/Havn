@@ -364,6 +364,11 @@ pub enum ChannelAllowance {
 #[serde(default)]
 pub struct NetworkPolicy {
     pub egress_allowed: bool,
+    /// With `egress_allowed`, the sandbox reaches the internet only
+    /// through the gateway's egress proxy: allowed domains go through, a
+    /// new one waits for the owner's approval, blocked ones never do.
+    /// Without it, egress reaches every public address.
+    pub egress_proxy: bool,
     /// Domains the agent may reach without further checks. An entry
     /// matches the domain and its subdomains; a leading `*.` is ignored.
     pub allowed_domains: Vec<String>,
@@ -536,6 +541,10 @@ impl Policy {
             network_policy: NetworkPolicy {
                 egress_allowed: self.network_policy.egress_allowed
                     && ceiling.network_policy.egress_allowed,
+                // A ceiling that sends egress through the proxy keeps it
+                // there.
+                egress_proxy: self.network_policy.egress_proxy
+                    || ceiling.network_policy.egress_proxy,
                 // Both lists only add: allowed domains are trust the agent
                 // may add, blocked domains are restrictions it may add.
                 allowed_domains: union(
@@ -614,6 +623,7 @@ impl Policy {
             network_policy: NetworkPolicy {
                 egress_allowed: self.network_policy.egress_allowed
                     || other.network_policy.egress_allowed,
+                egress_proxy: self.network_policy.egress_proxy && other.network_policy.egress_proxy,
                 // Every role's blocked domains hold, as its hook rules do:
                 // a second role does not lift an admin's block.
                 allowed_domains: union(
@@ -846,6 +856,7 @@ mod tests {
         assert!(!domain_listed(&[String::new(), " ".into()], "example.com"));
         let net = NetworkPolicy {
             egress_allowed: false,
+            egress_proxy: false,
             allowed_domains: vec!["example.com".into()],
             blocked_domains: vec!["secret.example.com".into()],
         };

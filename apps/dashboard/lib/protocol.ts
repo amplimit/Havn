@@ -20,6 +20,8 @@ export type ServerMessage =
       input: string;
       reason: string;
       conversation?: string;
+      /** `network`: a question of the egress proxy about a domain. */
+      kind?: string;
     }
   /** The approval request was decided elsewhere or ended. */
   | { type: "approval_closed"; id: string };
