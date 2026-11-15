@@ -78,6 +78,10 @@ struct Args {
     is_subagent: bool,
 }
 
+/// `HOME` of the agent's tool processes, relative to its workspace.
+#[cfg(target_os = "linux")]
+const TOOL_HOME_DIR: &str = ".havn/home";
+
 const OUTBOUND_QUEUE_CAPACITY: usize = 64;
 /// Backstop bound on the shutdown writer flush. When the reader loop ends the
 /// writer is signalled to drain its queue and exit, so it normally finishes in
@@ -503,6 +507,29 @@ async fn main() -> anyhow::Result<()> {
                 warn!("no Landlock: tool processes can read the environment of MCP servers")
             }
             Err(e) => return Err(anyhow!("creating the tools' Landlock domain failed: {e}")),
+        }
+    }
+
+    // Isolated, the gateway's home (`/root`) is not in the agent's rootfs:
+    // tool processes get one in the workspace, ignored by git so that a
+    // `git add -A` leaves caches and installed packages out. Created after
+    // Landlock, as the agent's uid.
+    #[cfg(target_os = "linux")]
+    if init::is_pid_one() {
+        let home = args.workspace.join(TOOL_HOME_DIR);
+        let made = std::fs::create_dir_all(&home).and_then(|()| {
+            let ignore = home.join(".gitignore");
+            if ignore.exists() {
+                Ok(())
+            } else {
+                std::fs::write(ignore, "*\n")
+            }
+        });
+        match made {
+            Ok(()) => sandbox::set_tool_home(home),
+            Err(e) => {
+                warn!(home = %home.display(), error = %e, "cannot create the tools' home directory; tools keep the gateway's HOME")
+            }
         }
     }
 

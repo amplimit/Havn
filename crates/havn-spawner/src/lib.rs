@@ -15,7 +15,7 @@
 //! Firecracker) can be added without touching the gateway.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use havn_core::{AgentId, Policy};
@@ -147,6 +147,74 @@ where
         .into_iter()
         .filter_map(|name| source(name).map(|value| (name.to_string(), value)))
         .collect()
+}
+
+/// Host directories that installed programs read at run time and that
+/// hold no secrets: Debian's `/etc/alternatives` (the links behind `java`,
+/// `cc`, `awk`, `which` and others in `/usr/bin`), and configuration or
+/// generated data of common toolchains (fontconfig, groff, LibreOffice,
+/// Perl, TeX Live, Ghostscript).
+const TOOL_DIRS: &[&str] = &[
+    "/etc/alternatives",
+    "/etc/fonts",
+    "/etc/groff",
+    "/etc/libreoffice",
+    "/etc/perl",
+    "/etc/python3",
+    "/etc/texmf",
+    "/var/lib/ghostscript",
+    "/var/lib/texmf",
+];
+
+/// Versioned directories directly under `/etc` bound the same way:
+/// `java-21-openjdk`, `ImageMagick-6`, `python3.12`.
+const TOOL_ETC_PREFIXES: &[&str] = &["java-", "ImageMagick-", "python3."];
+
+/// The `TOOL_DIRS` and `TOOL_ETC_PREFIXES` directories present under
+/// `root` (`/` on a real host), as read-only mounts at their paths below
+/// `root`. Only real directories: a symlink is not followed to wherever
+/// it points. Names with a `,`, which separates entries in
+/// `HAVN_EXTRA_MOUNTS`, are left out.
+#[must_use]
+pub fn tool_mounts(root: &Path) -> Vec<ExtraMount> {
+    let is_dir = |path: &Path| {
+        std::fs::symlink_metadata(root.join(path.strip_prefix("/").unwrap_or(path)))
+            .is_ok_and(|m| m.is_dir())
+    };
+    let mut paths: Vec<PathBuf> = TOOL_DIRS
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| is_dir(p))
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(root.join("etc")) {
+        let mut versioned: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|name| TOOL_ETC_PREFIXES.iter().any(|p| name.starts_with(p)))
+            .filter(|name| !name.contains(','))
+            .map(|name| Path::new("/etc").join(name))
+            .filter(|p| is_dir(p))
+            .collect();
+        versioned.sort();
+        paths.extend(versioned);
+    }
+    paths
+        .into_iter()
+        .map(|path| ExtraMount {
+            path,
+            mode: MountMode::Ro,
+        })
+        .collect()
+}
+
+/// The mounts an agent gets: [`tool_mounts`] of `root` (`/` on a real
+/// host), then the operator's `extra_mounts`, which win where both name a
+/// path.
+#[must_use]
+pub fn agent_mounts(root: &Path, extra_mounts: &[ExtraMount]) -> Vec<ExtraMount> {
+    let mut mounts = tool_mounts(root);
+    mounts.retain(|m| !extra_mounts.iter().any(|e| e.path == m.path));
+    mounts.extend(extra_mounts.iter().cloned());
+    mounts
 }
 
 /// One operator-declared tmpfs mount carried into the agent namespace
@@ -567,6 +635,68 @@ mod tests {
         let env = agent_environment(&[], gateway_env);
         let names: Vec<&str> = env.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(names, ["PATH", "RUST_LOG"]);
+    }
+
+    #[test]
+    fn tool_mounts_are_present_directories_only() {
+        let root = tempfile::tempdir().unwrap();
+        for dir in [
+            "etc/alternatives",
+            "etc/java-25-openjdk",
+            "etc/python3",
+            "etc/python3.12",
+            "etc/python3-app",
+            "etc/java-a,b",
+            "etc/ssl/private",
+            "var/lib/texmf",
+        ] {
+            std::fs::create_dir_all(root.path().join(dir)).unwrap();
+        }
+        std::fs::write(root.path().join("etc/python3-file"), "").unwrap();
+        std::os::unix::fs::symlink(root.path().join("etc/ssl"), root.path().join("etc/fonts"))
+            .unwrap();
+        let mounts = tool_mounts(root.path());
+        let paths: Vec<&Path> = mounts.iter().map(|m| m.path.as_path()).collect();
+        assert_eq!(
+            paths,
+            [
+                Path::new("/etc/alternatives"),
+                Path::new("/etc/python3"),
+                Path::new("/var/lib/texmf"),
+                Path::new("/etc/java-25-openjdk"),
+                Path::new("/etc/python3.12"),
+            ]
+        );
+        assert!(mounts.iter().all(|m| m.mode == MountMode::Ro));
+    }
+
+    #[test]
+    fn operator_mounts_win_over_tool_mounts() {
+        let root = tempfile::tempdir().unwrap();
+        for dir in ["etc/alternatives", "etc/fonts"] {
+            std::fs::create_dir_all(root.path().join(dir)).unwrap();
+        }
+        let operator = [
+            ExtraMount {
+                path: PathBuf::from("/etc/alternatives"),
+                mode: MountMode::Rw,
+            },
+            ExtraMount {
+                path: PathBuf::from("/opt/havn/pack"),
+                mode: MountMode::Ro,
+            },
+        ];
+        let mounts = agent_mounts(root.path(), &operator);
+        let listed: Vec<(&Path, MountMode)> =
+            mounts.iter().map(|m| (m.path.as_path(), m.mode)).collect();
+        assert_eq!(
+            listed,
+            [
+                (Path::new("/etc/fonts"), MountMode::Ro),
+                (Path::new("/etc/alternatives"), MountMode::Rw),
+                (Path::new("/opt/havn/pack"), MountMode::Ro),
+            ]
+        );
     }
 
     #[test]

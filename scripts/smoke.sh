@@ -170,6 +170,18 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
                 || die "the agent has no /etc/ssl/certs"
             [ "$(ls -A "/proc/$pid/root/etc/ssl")" = "certs" ] \
                 || die "the agent sees more of /etc/ssl than certs: $(ls -A "/proc/$pid/root/etc/ssl" | paste -sd' ')"
+            # Tools get a home of the agent's own in its workspace; the
+            # runtime, whose environment MCP servers inherit, does not.
+            [ "$(stat -c %u "$workspace/.havn/home")" = "$uid" ] \
+                || die "the agent has no home directory of its own at $workspace/.havn/home"
+            if tr '\0' '\n' < "/proc/$pid/environ" | grep -q "^HOME=$workspace"; then
+                die "the runtime's HOME is in the workspace, where tools can write"
+            fi
+            # The host's tool directories are visible, read-only.
+            if [ -d /etc/alternatives ]; then
+                [ "$(awk '$5 == "/etc/alternatives" {split($6, o, ","); print o[1]}' "/proc/$pid/mountinfo")" = "ro" ] \
+                    || die "/etc/alternatives is not bound read-only in the agent"
+            fi
         done
         for pid in $RUNTIME_PIDS; do
             # Without capabilities the agent can still ping and bind low
@@ -195,11 +207,16 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
                 as_tool python3 -c 'import socket; socket.socket().bind(("127.0.0.1", 80))' \
                     || die "a process without capabilities in the agent cannot bind port 80"
             fi
+            if [ -e /etc/alternatives/awk ]; then
+                as_tool awk 'BEGIN { exit 0 }' \
+                    || die "a process in the agent cannot run awk, a link through /etc/alternatives"
+            fi
         done
         ok "every runtime thread is under seccomp with no_new_privs"
         ok "the agent runs as host ids of its own and owns its workspace"
         ok "the agent runtime holds no capabilities, and its tools cannot read its memory"
         ok "the agent sees only the CA certificates of /etc/ssl"
+        ok "the agent has a home of its own, and the host's tool directories read-only"
         ok "tools without capabilities can use localhost, ping and ports below 1024"
         ok "NamespaceSpawner isolation: memory.max=$(cat "$CGROUP/memory.max") pids.max=$(cat "$CGROUP/pids.max")"
         ;;
