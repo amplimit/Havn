@@ -109,6 +109,11 @@ pub struct AgentSpawnConfig {
     /// it.
     #[serde(default)]
     pub host_id_slot: Option<u32>,
+    /// The agent's link in the agent subnet pool
+    /// ([`network::network_for`]), assigned by the gateway and held by no
+    /// other agent. Without one, [`network::preferred_slot`].
+    #[serde(default)]
+    pub link_slot: Option<u16>,
 }
 
 const AGENT_BASE_ENV: &[&str] = &[

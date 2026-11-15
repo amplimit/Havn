@@ -1367,10 +1367,11 @@ async fn route_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSock
 async fn egress_proxy_for(ctx: &AgentSocketCtx, agent_id: AgentId) -> Option<String> {
     let (pool, port) = ctx.egress_proxy?;
     let agent = agents_repo::find_by_id(&ctx.db, agent_id).await.ok()??;
+    let slot = agents_repo::link_slot_of(&ctx.db, agent_id).await.ok()??;
     let policy = policy_resolver::for_session(&ctx.db, &agent, ctx.multi_user).await;
     let net = &policy.network_policy;
     (policy.permissions.can_access_network && net.egress_allowed && net.egress_proxy)
-        .then(|| crate::egress_proxy::EgressProxy::url_for(pool, agent_id, port))
+        .then(|| crate::egress_proxy::EgressProxy::url_for(pool, slot, port))
 }
 
 /// The gateway-run tools `agent` may use: `web_search` when its policy

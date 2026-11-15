@@ -86,6 +86,7 @@ pub struct NamespaceSpawner {
 struct AgentState {
     child: ChildWatch,
     cgroup_path: PathBuf,
+    link_slot: u16,
 }
 
 impl NamespaceSpawner {
@@ -223,7 +224,11 @@ impl NamespaceSpawner {
     /// Stop one instance: SIGTERM through the reaper, `cgroup.kill` for
     /// whatever the reaper cannot see, then remove its cgroup and network.
     async fn terminate(&self, agent_id: AgentId, state: AgentState) {
-        let AgentState { child, cgroup_path } = state;
+        let AgentState {
+            child,
+            cgroup_path,
+            link_slot,
+        } = state;
 
         // 1. Graceful SIGTERM first. The child is the OUTER reaper (in the
         //    host PID ns); its signal handler forwards SIGTERM to the inner
@@ -274,7 +279,7 @@ impl NamespaceSpawner {
         //    it exits, which the cgroup.kill above ensures); this `ip
         //    link del` is the belt-and-braces path for the rare case
         //    where the host-side end lingers.
-        crate::network::teardown_agent_network(agent_id, &self.pool);
+        crate::network::teardown_agent_network(agent_id, link_slot, &self.pool);
     }
 }
 
@@ -531,6 +536,9 @@ impl AgentSpawner for NamespaceSpawner {
         //
         //    Failure is non-fatal: tools needing outbound surface
         //    their own clear errors at tool-use time.
+        let link_slot = config
+            .link_slot
+            .unwrap_or_else(|| crate::network::preferred_slot(config.agent_id));
         if policy.network_policy.egress_allowed && !self.network_ready {
             warn!(
                 agent_id = %config.agent_id,
@@ -542,12 +550,14 @@ impl AgentSpawner for NamespaceSpawner {
             let net_pid = i32::try_from(pid).unwrap_or(0);
             let net_agent_id = config.agent_id;
             let net_pool = self.pool;
+            let net_slot = link_slot;
             // Through the egress proxy only: no route past the host.
             let default_route = !policy.network_policy.egress_proxy;
             tokio::task::spawn_blocking(move || {
                 match crate::network::configure_agent_network(
                     net_pid,
                     net_agent_id,
+                    net_slot,
                     &net_pool,
                     default_route,
                 ) {
@@ -589,6 +599,7 @@ impl AgentSpawner for NamespaceSpawner {
             AgentState {
                 child: ChildWatch::start(child, &handle),
                 cgroup_path,
+                link_slot,
             },
         );
         Ok(handle)
@@ -1124,6 +1135,7 @@ mod tests {
             seccomp_allow_extra: Vec::new(),
             agent_dns: Vec::new(),
             env_passthrough: Vec::new(),
+            link_slot: None,
             host_id_slot: Some(0),
         };
         let policy = Policy::default();
@@ -1168,6 +1180,7 @@ mod tests {
             seccomp_allow_extra: Vec::new(),
             agent_dns: Vec::new(),
             env_passthrough: Vec::new(),
+            link_slot: None,
             host_id_slot: Some(0),
         };
         let err = spawner

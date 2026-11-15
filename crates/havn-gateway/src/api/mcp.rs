@@ -108,28 +108,29 @@ pub async fn patch(
     // Splice only `policy.permissions.can_use_mcp` + `policy.mcp_servers`
     // into agent.config; leave every other policy key untouched. Build
     // the new config object by surgical mutation.
-    let mut config = agent.config.as_object().cloned().unwrap_or_default();
-    let mut policy = config
-        .get("policy")
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
-    if let Some(can) = req.can_use_mcp {
-        let mut perms = policy
-            .get("permissions")
+    let updated = havn_db::repo::agents::update_config(&state.db, id, None, |current| {
+        let mut config = current.as_object().cloned().unwrap_or_default();
+        let mut policy = config
+            .get("policy")
             .and_then(|v| v.as_object().cloned())
             .unwrap_or_default();
-        perms.insert("can_use_mcp".into(), serde_json::Value::Bool(can));
-        policy.insert("permissions".into(), serde_json::Value::Object(perms));
-    }
-    if let Some(servers) = &req.servers {
-        let v = serde_json::to_value(servers)
-            .map_err(|e| ApiError::Internal(format!("serialize servers: {e}")))?;
-        policy.insert("mcp_servers".into(), v);
-    }
-    config.insert("policy".into(), serde_json::Value::Object(policy));
-    let new_config = serde_json::Value::Object(config);
-
-    let updated = havn_db::repo::agents::patch(&state.db, id, None, Some(&new_config)).await?;
+        if let Some(can) = req.can_use_mcp {
+            let mut perms = policy
+                .get("permissions")
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+            perms.insert("can_use_mcp".into(), serde_json::Value::Bool(can));
+            policy.insert("permissions".into(), serde_json::Value::Object(perms));
+        }
+        if let Some(servers) = &req.servers {
+            let v = serde_json::to_value(servers)
+                .map_err(|e| ApiError::Internal(format!("serialize servers: {e}")))?;
+            policy.insert("mcp_servers".into(), v);
+        }
+        config.insert("policy".into(), serde_json::Value::Object(policy));
+        Ok::<_, ApiError>(serde_json::Value::Object(config))
+    })
+    .await??;
     audit::record_agent_action(
         &state.db,
         user.id,

@@ -616,10 +616,11 @@ fn run_iptables(args: &[&str]) -> Result<()> {
 pub fn configure_agent_network(
     child_pid: i32,
     agent_id: AgentId,
+    slot: u16,
     pool: &AgentSubnetPool,
     default_route: bool,
 ) -> Result<AgentNetwork> {
-    let net = network_for(agent_id, *pool);
+    let net = network_for(slot, *pool);
     let pid = child_pid.to_string();
     if !isolation_in_place()? {
         return Err(NetworkError::CommandFailed(
@@ -711,8 +712,8 @@ pub fn configure_agent_network(
 /// Best-effort cleanup of the host-side veth. The kernel normally
 /// reaps the pair when the agent's netns goes away; this is the
 /// belt-and-braces path for cases where it doesn't.
-pub fn teardown_agent_network(agent_id: AgentId, pool: &AgentSubnetPool) {
-    let net = network_for(agent_id, *pool);
+pub fn teardown_agent_network(agent_id: AgentId, slot: u16, pool: &AgentSubnetPool) {
+    let net = network_for(slot, *pool);
     let owner = link_owner(agent_id);
     // Only a link of this agent: another one may hold the name.
     if link_alias(&net.host_iface).as_deref() == Some(owner.as_str()) {
@@ -805,11 +806,14 @@ pub fn gc_orphaned_veth() -> Result<usize> {
     Ok(count)
 }
 
-/// The addresses and interface names of `agent_id`'s link in `pool`:
-/// deterministic, so a restart picks the same /30, from a hash of the
-/// whole id (time-ordered ids share their leading bytes).
+/// Links in an agent subnet pool: /30s of a /16.
+pub const LINK_SLOTS: u16 = 1 << 14;
+
+/// The link slot `agent_id` gets when it is free: a hash of the whole id
+/// (time-ordered ids share their leading bytes), so links stay where
+/// they were before slots were assigned.
 #[must_use]
-pub fn network_for(agent_id: AgentId, pool: AgentSubnetPool) -> AgentNetwork {
+pub fn preferred_slot(agent_id: AgentId) -> u16 {
     // FNV-1a.
     let hash = agent_id
         .as_uuid()
@@ -818,8 +822,24 @@ pub fn network_for(agent_id: AgentId, pool: AgentSubnetPool) -> AgentNetwork {
         .fold(0x811c_9dc5_u32, |h, b| {
             (h ^ u32::from(*b)).wrapping_mul(0x0100_0193)
         });
-    // 14-bit index → 16384 /30s.
-    let idx = hash & 0x3FFF;
+    u16::try_from(hash % u32::from(LINK_SLOTS)).unwrap_or(0)
+}
+
+/// The slot of the link whose agent end is `ns_ip`, when it is one.
+#[must_use]
+pub fn slot_of(ns_ip: Ipv4Addr, pool: AgentSubnetPool) -> Option<u16> {
+    let [a, b, c, d] = ns_ip.octets();
+    if (a, b) != (pool.first_octet, pool.second_octet) || d % 4 != 2 {
+        return None;
+    }
+    Some((u16::from(c) << 6) | u16::from(d / 4))
+}
+
+/// The addresses and interface names of link `slot` in `pool`. The
+/// gateway gives each agent a slot of its own.
+#[must_use]
+pub fn network_for(slot: u16, pool: AgentSubnetPool) -> AgentNetwork {
+    let idx = u32::from(slot % LINK_SLOTS);
     // Each /30 is 4 IPs apart starting at <pool>.0.0.
     let base = idx * 4;
     let third = u8::try_from((base >> 8) & 0xFF).unwrap_or(0);
@@ -1069,12 +1089,9 @@ mod tests {
     }
 
     #[test]
-    fn network_for_returns_distinct_ranges_for_distinct_uuids() {
+    fn links_have_the_shape_of_a_slash_30() {
         let pool = default_pool();
-        let a = network_for(AgentId::new(), pool);
-        let b = network_for(AgentId::new(), pool);
-        // Birthday paradox: 16384 buckets, 2 draws → collision <0.01%.
-        // Pin the structural invariants regardless.
+        let a = network_for(preferred_slot(AgentId::new()), pool);
         assert_eq!(a.host_ip.octets()[0], 10);
         assert_eq!(a.host_ip.octets()[1], 42);
         assert_eq!(a.host_ip.octets()[3] & 0x3, 1, "host is .1 of /30");
@@ -1082,60 +1099,33 @@ mod tests {
         assert!(a.host_iface.starts_with("veth-h-"));
         assert!(a.ns_iface.starts_with("veth-a-"));
         assert!(a.host_iface.len() <= 15, "IFNAMSIZ");
-        // Different UUIDs almost certainly hash to different /30s.
-        assert!(a.host_iface != b.host_iface || a.network == b.network);
     }
 
     #[test]
-    fn ids_sharing_their_leading_bytes_get_their_own_links() {
-        let pool = default_pool();
+    fn ids_sharing_their_leading_bytes_prefer_their_own_slots() {
         let base = AgentId::new().as_uuid().into_bytes();
         let mut seen = std::collections::HashSet::new();
         for last in 0..=255_u8 {
             let mut bytes = base;
             bytes[15] = last;
             let id = AgentId::from_uuid(uuid::Uuid::from_bytes(bytes));
-            assert!(seen.insert(network_for(id, pool).host_ip));
+            assert!(seen.insert(preferred_slot(id)));
         }
     }
 
     #[test]
-    fn network_for_is_deterministic() {
+    fn every_slot_is_a_distinct_link_inside_the_pool() {
         let pool = default_pool();
-        let id = AgentId::new();
-        let a = network_for(id, pool);
-        let b = network_for(id, pool);
-        assert_eq!(a.host_ip, b.host_ip);
-        assert_eq!(a.host_iface, b.host_iface);
-    }
-
-    #[test]
-    fn network_for_packs_inside_pool() {
-        let pool = default_pool();
-        for raw in [0_u32, 1, 100, 16382, 16383] {
-            let bytes = u16::try_from(raw).unwrap().to_be_bytes();
-            let mut uuid_bytes = [0u8; 16];
-            uuid_bytes[6] = bytes[0];
-            uuid_bytes[7] = bytes[1];
-            let id = AgentId::from_uuid(uuid::Uuid::from_bytes(uuid_bytes));
-            let net = network_for(id, pool);
+        let mut seen = std::collections::HashSet::new();
+        for slot in 0..LINK_SLOTS {
+            let net = network_for(slot, pool);
             assert_eq!(net.host_ip.octets()[0], DEFAULT_POOL_FIRST_OCTET);
             assert_eq!(net.host_ip.octets()[1], DEFAULT_POOL_SECOND_OCTET);
+            assert!(net.host_iface.len() <= 15 && net.ns_iface.len() <= 15);
+            assert_eq!(slot_of(net.ns_ip, pool), Some(slot));
+            assert_eq!(slot_of(net.host_ip, pool), None, "the host end is no agent");
+            assert!(seen.insert(net.host_iface));
         }
-    }
-
-    #[test]
-    fn iface_names_fit_ifnamsiz() {
-        // IFNAMSIZ on Linux is 16 (with null terminator); usable len is 15.
-        // Worst case: idx = 0x3FFF → "veth-h-003fff" → 13 chars. Pin it.
-        let pool = default_pool();
-        let mut bytes = [0u8; 16];
-        bytes[6] = 0x3F;
-        bytes[7] = 0xFF;
-        let id = AgentId::from_uuid(uuid::Uuid::from_bytes(bytes));
-        let net = network_for(id, pool);
-        assert!(net.host_iface.len() <= 15);
-        assert!(net.ns_iface.len() <= 15);
     }
 
     #[test]

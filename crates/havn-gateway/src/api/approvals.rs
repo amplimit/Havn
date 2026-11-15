@@ -112,39 +112,40 @@ pub async fn put(
     if tools.len() > MAX_TOOLS {
         return Err(ApiError::BadRequest(format!("more than {MAX_TOOLS} tools")));
     }
-    let mut rules: Vec<ToolHookRule> = override_rules(&agent.config)?
-        .into_iter()
-        .filter(|r| !asks_every_call(r))
-        .collect();
-    rules.extend(tools.iter().map(|tool| ToolHookRule {
-        tool: tool.clone(),
-        deny: Vec::new(),
-        ask: vec![ASK_EVERY_CALL.to_string()],
-    }));
-    let mut config = agent.config.as_object().cloned().unwrap_or_default();
-    let mut policy = config
-        .get("policy")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let mut hooks = policy
-        .get("hooks")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    hooks.insert(
-        "pre_tool_use".into(),
-        serde_json::to_value(&rules).map_err(|e| ApiError::BadRequest(e.to_string()))?,
-    );
-    policy.insert("hooks".into(), Value::Object(hooks));
-    let policy = Value::Object(policy);
-    serde_json::from_value::<Policy>(policy.clone())
-        .map_err(|e| ApiError::BadRequest(format!("config.policy: {e}")))?
-        .validate()?;
-    config.insert("policy".into(), policy);
-    let updated =
-        havn_db::repo::agents::patch(&state.db, agent.id, None, Some(&Value::Object(config)))
-            .await?;
+    let updated = havn_db::repo::agents::update_config(&state.db, agent.id, None, |current| {
+        let mut rules: Vec<ToolHookRule> = override_rules(current)?
+            .into_iter()
+            .filter(|r| !asks_every_call(r))
+            .collect();
+        rules.extend(tools.iter().map(|tool| ToolHookRule {
+            tool: tool.clone(),
+            deny: Vec::new(),
+            ask: vec![ASK_EVERY_CALL.to_string()],
+        }));
+        let mut config = current.as_object().cloned().unwrap_or_default();
+        let mut policy = config
+            .get("policy")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut hooks = policy
+            .get("hooks")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        hooks.insert(
+            "pre_tool_use".into(),
+            serde_json::to_value(&rules).map_err(|e| ApiError::BadRequest(e.to_string()))?,
+        );
+        policy.insert("hooks".into(), Value::Object(hooks));
+        let policy = Value::Object(policy);
+        serde_json::from_value::<Policy>(policy.clone())
+            .map_err(|e| ApiError::BadRequest(format!("config.policy: {e}")))?
+            .validate()?;
+        config.insert("policy".into(), policy);
+        Ok::<_, ApiError>(Value::Object(config))
+    })
+    .await??;
     audit::record_agent_action(
         &state.db,
         user.id,

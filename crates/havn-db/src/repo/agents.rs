@@ -297,6 +297,108 @@ pub async fn host_id_slot(pool: &SqlitePool, id: AgentId) -> Result<u32> {
     })
 }
 
+/// The agent's link slot, assigned on first use: `preferred` when it is
+/// free, otherwise the next free one of the `count` slots. Kept until the
+/// agent is deleted.
+pub async fn link_slot(pool: &SqlitePool, id: AgentId, preferred: u16, count: u16) -> Result<u16> {
+    for step in 0..count {
+        if let Some(slot) = link_slot_of(pool, id).await? {
+            return Ok(slot);
+        }
+        let slot = (u32::from(preferred) + u32::from(step)) % u32::from(count);
+        sqlx::query(
+            "INSERT INTO agent_links (slot, agent_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+        )
+        .bind(i64::from(slot))
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
+    }
+    link_slot_of(pool, id).await?.ok_or(DbError::InvalidValue {
+        column: "agent_links.slot",
+        message: "every link slot is taken".into(),
+    })
+}
+
+/// The agent's link slot, when it has one.
+pub async fn link_slot_of(pool: &SqlitePool, id: AgentId) -> Result<Option<u16>> {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT slot FROM agent_links WHERE agent_id = ?1")
+        .bind(id.to_string())
+        .fetch_optional(pool)
+        .await?;
+    row.map(|(slot,)| {
+        u16::try_from(slot).map_err(|e| DbError::InvalidValue {
+            column: "agent_links.slot",
+            message: e.to_string(),
+        })
+    })
+    .transpose()
+}
+
+/// The agent holding link `slot`.
+pub async fn at_link(pool: &SqlitePool, slot: u16) -> Result<Option<Agent>> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT agent_id FROM agent_links WHERE slot = ?1")
+        .bind(i64::from(slot))
+        .fetch_optional(pool)
+        .await?;
+    let Some((id,)) = row else {
+        return Ok(None);
+    };
+    let id: AgentId = id
+        .parse()
+        .map_err(|e: havn_core::Error| DbError::InvalidValue {
+            column: "agent_links.agent_id",
+            message: e.to_string(),
+        })?;
+    find_by_id(pool, id).await
+}
+
+/// Replace the agent's config with `change` of its current one, with no
+/// other write in between: `Ok(Err(_))` when `change` refused. `name`,
+/// when given, is set too.
+pub async fn update_config<E>(
+    pool: &SqlitePool,
+    id: AgentId,
+    name: Option<&str>,
+    change: impl FnOnce(&serde_json::Value) -> std::result::Result<serde_json::Value, E>,
+) -> Result<std::result::Result<Agent, E>> {
+    // Dropped without a commit, the transaction rolls back.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let row: Option<(String,)> = sqlx::query_as("SELECT config FROM agents WHERE id = ?1")
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+    let (text,) = row.ok_or(DbError::NotFound)?;
+    let current: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| DbError::InvalidValue {
+            column: "agents.config",
+            message: e.to_string(),
+        })?;
+    let new = match change(&current) {
+        Ok(new) => new,
+        Err(e) => return Ok(Err(e)),
+    };
+    let new = serde_json::to_string(&new).map_err(|e| DbError::InvalidValue {
+        column: "agents.config",
+        message: e.to_string(),
+    })?;
+    sqlx::query(
+        "UPDATE agents \
+         SET name       = COALESCE(?1, name), \
+             config     = ?2, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE id = ?3",
+    )
+    .bind(name)
+    .bind(new)
+    .bind(id.to_string())
+    .execute(&mut *tx)
+    .await
+    .map_err(map_unique("agents.(owner_id,name)"))?;
+    tx.commit().await?;
+    Ok(Ok(find_by_id(pool, id).await?.ok_or(DbError::NotFound)?))
+}
+
 pub async fn delete(pool: &SqlitePool, id: AgentId) -> Result<()> {
     let result = sqlx::query("DELETE FROM agents WHERE id = ?1")
         .bind(id.to_string())
@@ -411,6 +513,93 @@ mod tests {
             host_id_slot(&pool, c).await.expect("slot"),
             3,
             "a deleted agent's slot is not handed out again"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_slots_are_unique_and_kept() {
+        let pool = connect_in_memory().await.expect("connect");
+        let owner = make_user(&pool, "links").await;
+        let mut ids = Vec::new();
+        for name in ["a", "b", "c"] {
+            let agent = create(
+                &pool,
+                NewAgent {
+                    owner_id: owner,
+                    team_id: None,
+                    name,
+                    config: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("agent");
+            ids.push(agent.id);
+        }
+        // All three prefer slot 7 of 8: they get 7, then 0, then 1.
+        let slots: Vec<u16> = slots_of(&pool, &ids).await;
+        assert_eq!(slots, [7, 0, 1]);
+        assert_eq!(
+            link_slot(&pool, ids[0], 3, 8).await.expect("slot"),
+            7,
+            "kept"
+        );
+        assert_eq!(
+            at_link(&pool, 0).await.expect("lookup").map(|a| a.id),
+            Some(ids[1])
+        );
+        delete(&pool, ids[1]).await.expect("delete");
+        assert!(at_link(&pool, 0).await.expect("lookup").is_none(), "freed");
+    }
+
+    async fn slots_of(pool: &SqlitePool, ids: &[AgentId]) -> Vec<u16> {
+        let mut slots = Vec::new();
+        for id in ids {
+            slots.push(link_slot(pool, *id, 7, 8).await.expect("slot"));
+        }
+        slots
+    }
+
+    #[tokio::test]
+    async fn config_updates_see_the_config_as_it_is() {
+        let pool = connect_in_memory().await.expect("connect");
+        let owner = make_user(&pool, "cas").await;
+        let agent = create(
+            &pool,
+            NewAgent {
+                owner_id: owner,
+                team_id: None,
+                name: "a",
+                config: serde_json::json!({"n": 0}),
+            },
+        )
+        .await
+        .expect("agent");
+        let bump = |current: &serde_json::Value| {
+            let n = current["n"].as_i64().unwrap_or_default();
+            Ok::<_, String>(serde_json::json!({"n": n + 1}))
+        };
+        let (a, b) = tokio::join!(
+            update_config(&pool, agent.id, None, bump),
+            update_config(&pool, agent.id, None, bump)
+        );
+        a.expect("db").expect("change");
+        b.expect("db").expect("change");
+        let now = find_by_id(&pool, agent.id)
+            .await
+            .expect("db")
+            .expect("agent");
+        assert_eq!(now.config["n"], 2, "neither update is lost");
+        let refused = update_config(&pool, agent.id, Some("b"), |_| Err("no"))
+            .await
+            .expect("db");
+        assert_eq!(refused.err(), Some("no"));
+        let kept = find_by_id(&pool, agent.id)
+            .await
+            .expect("db")
+            .expect("agent");
+        assert_eq!(
+            (kept.name.as_str(), kept.config["n"].as_i64()),
+            ("a", Some(2))
         );
     }
 
