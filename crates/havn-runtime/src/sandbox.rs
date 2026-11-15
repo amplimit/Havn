@@ -480,7 +480,15 @@ mod tests {
             }
             cmd.output()
         };
-        let outside = read(false).await.expect("cat");
+        // Until the child has exec'd, its environ is the test's own.
+        let mut outside = read(false).await.expect("cat");
+        for _ in 0..100 {
+            if String::from_utf8_lossy(&outside.stdout).contains("MCP_SECRET=s3cret") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            outside = read(false).await.expect("cat");
+        }
         assert!(String::from_utf8_lossy(&outside.stdout).contains("MCP_SECRET=s3cret"));
         let tool = read(true).await.expect("cat");
         assert!(!tool.status.success(), "{tool:?}");
