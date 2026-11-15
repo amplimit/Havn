@@ -217,6 +217,18 @@ An agent workspace can also contain `.havn/hooks.yaml` with the same `pre_tool_u
 
 Hooks are guardrails against model mistakes, not a security boundary. A pattern matches text, and an agent that wants to can run the same action in a form no pattern matches (`rm  -rf`, `cd / && rm -rf`, a script file). To actually prevent an action, use the policy permissions (`can_use_shell`, `can_access_network`), `network_policy`, the mounts an agent gets, and the sandbox described above.
 
+
+A rule can also `ask` instead of `deny`: a call whose flattened input matches an `ask` pattern (and no `deny` pattern) waits until the agent's owner approves it. Every tab of the agent's dashboard chat shows the tool and its whole input with approve, approve for this conversation (the same tool and input, until the agent restarts) and deny, also tabs opened or reloaded while it waits; a channel conversation it came from is told it waits, since a channel's sender (a customer, say) must not approve the agent's actions. A call nobody answers within 10 minutes is refused, and so is one whose input is longer than 4000 characters, and one in a scheduled run, a heartbeat or another agent's query, where nobody can be asked. An `ask` pattern in `.havn/hooks.yaml` that does not compile asks about every call of its tool. `tool` may end in `*` to cover a prefix, such as every tool of one MCP server:
+
+```yaml
+pre_tool_use:
+  - tool: mcp__github__*
+    ask: ["(?s).*"]
+  - tool: shell
+    ask: ["\\bdeploy\\b", "^git push"]
+```
+
+The agent settings page keeps a list of tools whose every call needs approval (`GET` and `PUT /agents/{id}/approvals`). Requests and decisions are audited as `tool.approval.requested` and `tool.approval.decided`, with who decided. Like `deny`, `ask` guards against model mistakes on matching inputs; the sandbox and permissions stay the enforcement.
 ## Configuration
 
 Gateway config lives at `~/.config/havn/config.toml`:

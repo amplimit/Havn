@@ -29,7 +29,22 @@ pub type TabId = Uuid;
 #[derive(Debug, Clone, Default)]
 pub struct WebChatRouter {
     inner: Arc<Mutex<HashMap<TabId, Tab>>>,
+    /// Tool calls waiting for the owner's approval, by request id; shown
+    /// to every tab of the agent, also ones opened later.
+    approvals: Arc<std::sync::Mutex<HashMap<String, PendingApproval>>>,
 }
+
+#[derive(Debug, Clone)]
+struct PendingApproval {
+    agent_id: AgentId,
+    request: havn_proto::ApprovalRequest,
+    since: std::time::Instant,
+}
+
+/// Approval requests one agent may have waiting.
+pub const MAX_PENDING_APPROVALS: usize = 16;
+/// Longer than the runtime waits, which then closes the request itself.
+const APPROVAL_KEPT: std::time::Duration = std::time::Duration::from_secs(11 * 60);
 
 #[derive(Debug)]
 struct Tab {
@@ -57,6 +72,13 @@ pub enum ClientMessage {
     Send { content: String },
     /// Stop the reply the agent is working on in this session.
     Stop,
+    /// Answer a [`ServerMessage::Approval`].
+    Decide {
+        id: String,
+        approve: bool,
+        #[serde(default)]
+        remember: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +94,19 @@ pub enum ServerMessage {
     },
     /// Soft error visible to the user (e.g. agent disconnected).
     Error { message: String },
+    /// A tool call waits for the owner's approval.
+    Approval {
+        id: String,
+        tool: String,
+        /// The whole input, as JSON.
+        input: String,
+        reason: String,
+        /// The conversation it came from, when not this chat.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        conversation: Option<String>,
+    },
+    /// The approval request `id` was decided or ended; stop showing it.
+    ApprovalClosed { id: String },
 }
 
 #[derive(Debug, Error)]
@@ -103,6 +138,10 @@ impl WebChatRouter {
     ) -> Registration {
         let tab = Uuid::now_v7();
         let closed = Arc::new(Notify::new());
+        // Approvals already waiting reach a tab opened later, or reloaded.
+        for request in self.pending_approvals(agent_id) {
+            let _ = tx.try_send(approval_message(&request));
+        }
         self.inner.lock().await.insert(
             tab,
             Tab {
@@ -113,6 +152,73 @@ impl WebChatRouter {
             },
         );
         Registration { tab, closed }
+    }
+
+    fn lock_approvals(&self) -> std::sync::MutexGuard<'_, HashMap<String, PendingApproval>> {
+        self.approvals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn pending_approvals(&self, agent_id: AgentId) -> Vec<havn_proto::ApprovalRequest> {
+        let mut pending = self.lock_approvals();
+        pending.retain(|_, p| p.since.elapsed() < APPROVAL_KEPT);
+        pending
+            .values()
+            .filter(|p| p.agent_id == agent_id)
+            .map(|p| p.request.clone())
+            .collect()
+    }
+
+    /// Keep `request` and show it to every tab of `agent_id`. False, and
+    /// not kept, when the agent already has [`MAX_PENDING_APPROVALS`]
+    /// waiting or the id is taken.
+    pub async fn ask_approval(
+        &self,
+        agent_id: AgentId,
+        request: havn_proto::ApprovalRequest,
+    ) -> bool {
+        {
+            let mut pending = self.lock_approvals();
+            pending.retain(|_, p| p.since.elapsed() < APPROVAL_KEPT);
+            let waiting = pending.values().filter(|p| p.agent_id == agent_id).count();
+            if waiting >= MAX_PENDING_APPROVALS || pending.contains_key(&request.request_id) {
+                return false;
+            }
+            pending.insert(
+                request.request_id.clone(),
+                PendingApproval {
+                    agent_id,
+                    request: request.clone(),
+                    since: std::time::Instant::now(),
+                },
+            );
+        }
+        self.fan_out(agent_id, approval_message(&request)).await;
+        true
+    }
+
+    /// Take the request `id` of `agent_id` out, and close it in every tab.
+    pub async fn close_approval(
+        &self,
+        agent_id: AgentId,
+        id: &str,
+    ) -> Option<havn_proto::ApprovalRequest> {
+        let taken = {
+            let mut pending = self.lock_approvals();
+            match pending.get(id) {
+                Some(p) if p.agent_id == agent_id => pending.remove(id).map(|p| p.request),
+                _ => None,
+            }
+        };
+        if taken.is_some() {
+            self.fan_out(
+                agent_id,
+                ServerMessage::ApprovalClosed { id: id.to_string() },
+            )
+            .await;
+        }
+        taken
     }
 
     pub async fn unregister(&self, tab: TabId) {
@@ -278,11 +384,84 @@ impl WebChatRouter {
     }
 }
 
+fn approval_message(request: &havn_proto::ApprovalRequest) -> ServerMessage {
+    ServerMessage::Approval {
+        id: request.request_id.clone(),
+        tool: request.tool.clone(),
+        input: request.input.clone(),
+        reason: request.reason.clone(),
+        conversation: request
+            .channel_id
+            .parse::<SessionId>()
+            .is_err()
+            .then(|| request.channel_id.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    fn approval_request(id: &str) -> havn_proto::ApprovalRequest {
+        havn_proto::ApprovalRequest {
+            request_id: id.into(),
+            channel_id: "ch|telegram|bot|42".into(),
+            tool: "shell".into(),
+            input: "{}".into(),
+            reason: "rule".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn approvals_reach_every_tab_and_later_ones_until_closed() {
+        let router = WebChatRouter::new();
+        let agent = AgentId::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let _tab = router.register(Uuid::now_v7(), agent, tx).await;
+        assert!(router.ask_approval(agent, approval_request("r1")).await);
+        assert!(
+            !router.ask_approval(agent, approval_request("r1")).await,
+            "the id is taken"
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(ServerMessage::Approval { ref id, ref conversation, .. })
+                if id == "r1" && conversation.as_deref() == Some("ch|telegram|bot|42")
+        ));
+        // A tab opened later gets what still waits.
+        let (tx2, mut rx2) = mpsc::channel(8);
+        let _late = router.register(Uuid::now_v7(), agent, tx2).await;
+        assert!(
+            matches!(rx2.recv().await, Some(ServerMessage::Approval { ref id, .. }) if id == "r1")
+        );
+
+        assert!(
+            router.close_approval(AgentId::new(), "r1").await.is_none(),
+            "another agent"
+        );
+        assert!(router.close_approval(agent, "r1").await.is_some());
+        assert!(
+            router.close_approval(agent, "r1").await.is_none(),
+            "closed once"
+        );
+        assert!(
+            matches!(rx.recv().await, Some(ServerMessage::ApprovalClosed { ref id }) if id == "r1")
+        );
+
+        for i in 0..MAX_PENDING_APPROVALS {
+            assert!(
+                router
+                    .ask_approval(agent, approval_request(&format!("p{i}")))
+                    .await
+            );
+        }
+        assert!(
+            !router.ask_approval(agent, approval_request("over")).await,
+            "capped"
+        );
+    }
 
     #[tokio::test]
     async fn deliver_routes_outbound_to_matching_session() {
@@ -303,7 +482,11 @@ mod tests {
         let received = rx.recv().await.expect("recv");
         match received {
             ServerMessage::AgentMessage { content, .. } => assert_eq!(content, "hi"),
-            ServerMessage::Error { .. } => panic!("expected AgentMessage, got Error"),
+            ServerMessage::Error { .. }
+            | ServerMessage::Approval { .. }
+            | ServerMessage::ApprovalClosed { .. } => {
+                panic!("expected AgentMessage, got Error")
+            }
         }
     }
 
@@ -386,7 +569,11 @@ mod tests {
         for rx in [&mut rx_a, &mut rx_b] {
             match rx.recv().await.expect("frame") {
                 ServerMessage::AgentMessage { content, .. } => assert_eq!(content, "hello"),
-                ServerMessage::Error { .. } => panic!("unexpected Error"),
+                ServerMessage::Error { .. }
+                | ServerMessage::Approval { .. }
+                | ServerMessage::ApprovalClosed { .. } => {
+                    panic!("unexpected Error")
+                }
             }
         }
         // The unrelated agent's session must NOT have received it.
@@ -422,7 +609,11 @@ mod tests {
         for expected in ["one", "two"] {
             match healthy_rx.try_recv().expect("frame") {
                 ServerMessage::AgentMessage { content, .. } => assert_eq!(content, expected),
-                ServerMessage::Error { .. } => panic!("unexpected Error"),
+                ServerMessage::Error { .. }
+                | ServerMessage::Approval { .. }
+                | ServerMessage::ApprovalClosed { .. } => {
+                    panic!("unexpected Error")
+                }
             }
         }
         assert!(

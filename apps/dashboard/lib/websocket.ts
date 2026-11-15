@@ -27,6 +27,8 @@ export type ChatHandle = {
   send: (text: string) => void;
   /** Stop the reply the agent is working on; queued messages still run. */
   stop: () => void;
+  /** Answer an approval request. */
+  decide: (id: string, approve: boolean, remember: boolean) => void;
   close: () => void;
 };
 
@@ -74,6 +76,10 @@ export function openChat(
     },
     stop: () => {
       const frame: ClientMessage = { type: "stop" };
+      ws.send(JSON.stringify(frame));
+    },
+    decide: (id, approve, remember) => {
+      const frame: ClientMessage = { type: "decide", id, approve, remember };
       ws.send(JSON.stringify(frame));
     },
     close: () => ws.close(),

@@ -3,9 +3,23 @@
  * Keep aligned by hand: this file is the only client-side authority.
  */
 
-export type ClientMessage = { type: "send"; content: string } | { type: "stop" };
+export type ClientMessage =
+  | { type: "send"; content: string }
+  | { type: "stop" }
+  | { type: "decide"; id: string; approve: boolean; remember: boolean };
 
 export type ServerMessage =
   /** `broadcast`: sent on its own (heartbeat, cron), not a reply. */
   | { type: "agent_message"; content: string; broadcast?: boolean }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  /** A tool call waits for the owner's approval; `conversation` when it came from a channel. */
+  | {
+      type: "approval";
+      id: string;
+      tool: string;
+      input: string;
+      reason: string;
+      conversation?: string;
+    }
+  /** The approval request was decided elsewhere or ended. */
+  | { type: "approval_closed"; id: string };

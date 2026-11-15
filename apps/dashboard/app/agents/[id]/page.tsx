@@ -11,7 +11,10 @@ import {
 } from "@/lib/api";
 import { openChat, type ChatHandle } from "@/lib/websocket";
 import { Markdown } from "@/components/Markdown";
+import type { ServerMessage } from "@/lib/protocol";
 import { BookOpen, Brain, Check, Copy, Layers, RotateCcw, Search, Settings } from "lucide-react";
+
+type ApprovalRequest = Extract<ServerMessage, { type: "approval" }>;
 
 type Bubble = {
   id: number;
@@ -76,6 +79,8 @@ export default function ChatPage({
   // the rest queued behind it in the agent.
   const [waiting, setWaiting] = useState(0);
   const pending = waiting > 0;
+  // Tool calls of the running reply that wait for the user.
+  const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
 
   const chatRef = useRef<ChatHandle | null>(null);
   const bubbleIdRef = useRef(0);
@@ -203,11 +208,23 @@ export default function ChatPage({
       const handle = openChat(id, me!.ws_token, {
         onOpen: () => {
           setWsState("open");
+          // The gateway sends what still waits to every new connection.
+          setApprovals([]);
           void catchUp();
         },
         onMessage: (msg) => {
           // A reply answers the oldest message waiting; a soft error
           // (agent gone) ends the wait for all of them.
+          if (msg.type === "approval") {
+            // The reply still runs; it waits for this answer. Requests are
+            // sent again to a reconnecting tab, so keep one card per id.
+            setApprovals((prev) => (prev.some((a) => a.id === msg.id) ? prev : [...prev, msg]));
+            return;
+          }
+          if (msg.type === "approval_closed") {
+            setApprovals((prev) => prev.filter((a) => a.id !== msg.id));
+            return;
+          }
           if (msg.type === "agent_message") {
             if (!msg.broadcast) setWaiting((n) => Math.max(0, n - 1));
           } else {
@@ -276,6 +293,12 @@ export default function ChatPage({
 
   function stopReply() {
     chatRef.current?.stop();
+  }
+
+  function decide(id: string, approve: boolean, remember: boolean) {
+    // The gateway closes the card in every tab once it took the answer.
+    if (!chatRef.current || wsState !== "open") return;
+    chatRef.current.decide(id, approve, remember);
   }
 
   function onSubmit(e: React.FormEvent) {
@@ -395,6 +418,58 @@ export default function ChatPage({
                   : undefined
               }
             />
+          ))}
+          {approvals.map((a) => (
+            <div
+              key={a.id}
+              className="card px-4 py-3 text-sm"
+              role="alertdialog"
+              aria-label={`approve ${a.tool}`}
+            >
+              <p className="mb-1">
+                <strong>Approve this tool call?</strong>{" "}
+                <span className="font-mono">{a.tool}</span>
+                {a.conversation && (
+                  <span style={{ color: "var(--color-body)" }}>
+                    {" "}
+                    (in the conversation {a.conversation})
+                  </span>
+                )}
+              </p>
+              <pre
+                className="mb-2 overflow-x-auto whitespace-pre-wrap text-xs font-mono"
+                style={{ color: "var(--color-body)" }}
+              >
+                {a.input}
+              </pre>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  className="btn-primary"
+                  disabled={wsState !== "open"}
+                  onClick={() => decide(a.id, true, false)}
+                >
+                  approve
+                </button>
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  disabled={wsState !== "open"}
+                  onClick={() => decide(a.id, true, true)}
+                  title="Approve this tool with this exact input for the rest of the conversation, until the agent restarts"
+                >
+                  approve for this conversation
+                </button>
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  disabled={wsState !== "open"}
+                  onClick={() => decide(a.id, false, false)}
+                >
+                  deny
+                </button>
+              </div>
+            </div>
           ))}
           {pending && <TypingBubble />}
         </div>

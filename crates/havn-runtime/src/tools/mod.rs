@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use havn_core::Policy;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use tracing::warn;
+use tracing::{info, warn};
 
 pub mod agent_query;
 pub mod files;
@@ -125,6 +125,8 @@ pub struct ToolRegistry {
     /// `Hooks` so a future hot-reload (spec §8.4) can swap the rules
     /// without locking the dispatch path.
     hooks: Option<crate::hooks::Hooks>,
+    /// Asks the user about calls a hook's `ask` rule matches.
+    approvals: Option<Arc<crate::approvals::Approvals>>,
 }
 
 impl ToolRegistry {
@@ -164,6 +166,7 @@ impl ToolRegistry {
             tools,
             policy: Arc::clone(policy),
             hooks: None,
+            approvals: None,
         }
     }
 
@@ -266,6 +269,14 @@ impl ToolRegistry {
     /// startup; subagents inherit the parent's hooks.
     pub fn with_hooks(mut self, hooks: crate::hooks::Hooks) -> Self {
         self.hooks = Some(hooks);
+        self
+    }
+
+    /// Ask the user, through `approvals`, before calls a hook's `ask`
+    /// rule matches.
+    #[must_use]
+    pub fn with_approvals(mut self, approvals: Arc<crate::approvals::Approvals>) -> Self {
+        self.approvals = Some(approvals);
         self
     }
 
@@ -372,23 +383,51 @@ impl ToolRegistry {
         // registry-find so a denied call doesn't even pay the lookup
         // cost; surface a structured error so the LLM sees the deny
         // and adapts its plan.
-        if let Some(hooks) = &self.hooks {
-            let snapshot = hooks.load();
-            if !snapshot.is_empty() {
-                let flat = flatten_input_for_hook(name, &input);
-                if let crate::hooks::Veto::Deny { reason } = snapshot.veto(name, &flat) {
-                    warn!(name, context, "PreToolUse hook denied dispatch");
-                    return ToolResult::Error(format!(
-                        "tool {name:?} dispatch denied by hook: {reason}"
-                    ));
-                }
-            }
-        }
-
+        // An unknown tool is refused before any hook asks about it.
         let Some(tool) = self.tools.iter().find(|t| t.name() == name) else {
             warn!(name, "tool dispatch failed: unknown tool");
             return ToolResult::Error(format!("unknown tool: {name}"));
         };
+        if let Some(hooks) = &self.hooks {
+            // The snapshot guard is not held across the approval wait.
+            let verdict = {
+                let snapshot = hooks.load();
+                (!snapshot.is_empty())
+                    .then(|| snapshot.veto(name, &flatten_input_for_hook(name, &input)))
+            };
+            if let Some(veto) = verdict {
+                match veto {
+                    crate::hooks::Veto::Allow => {}
+                    crate::hooks::Veto::Deny { reason } => {
+                        warn!(name, context, "PreToolUse hook denied dispatch");
+                        return ToolResult::Error(format!(
+                            "tool {name:?} dispatch denied by hook: {reason}"
+                        ));
+                    }
+                    crate::hooks::Veto::Ask { reason } => {
+                        let conversation = crate::tools::gateway::CONVERSATION
+                            .try_with(Clone::clone)
+                            .ok();
+                        let decided = match &self.approvals {
+                            Some(approvals) => {
+                                // The whole input: what is approved, and
+                                // what "for this conversation" remembers.
+                                let whole = input.to_string();
+                                approvals
+                                    .ask(conversation.as_deref(), name, &whole, &reason)
+                                    .await
+                            }
+                            None => Err("it needs approval, which is not set up here".to_string()),
+                        };
+                        if let Err(why) = decided {
+                            info!(name, context, why = %why, "tool call not approved");
+                            return ToolResult::Error(format!("tool {name:?} was not run: {why}"));
+                        }
+                    }
+                }
+            }
+        }
+
         tool.execute(ctx, input).await
     }
 }
@@ -561,12 +600,31 @@ mod tests {
         policy.hooks.pre_tool_use.push(havn_core::ToolHookRule {
             tool: "mcp__fs__write_file".into(),
             deny: vec!["/etc/".into()],
+            ask: Vec::new(),
         });
         let dir = tempfile::tempdir().expect("tempdir");
         let set = crate::hooks::load(&policy.hooks, dir.path())
             .await
             .expect("hooks");
-        let reg = registry(policy).with_hooks(crate::hooks::handle(set));
+        // Stands in for the MCP server's tool, which the hook must guard.
+        struct McpWrite;
+        #[async_trait]
+        impl Tool for McpWrite {
+            fn name(&self) -> &str {
+                "mcp__fs__write_file"
+            }
+            fn description(&self) -> &str {
+                "write"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _ctx: &ToolCtx, _input: serde_json::Value) -> ToolResult {
+                ToolResult::Ok("written".into())
+            }
+        }
+        let mut reg = registry(policy).with_hooks(crate::hooks::handle(set));
+        reg.tools.push(Arc::new(McpWrite));
         let env = ToolCtx {
             workspace_dir: dir.path().to_path_buf(),
             agent_db: dummy_pool().await,

@@ -953,6 +953,13 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
             warn!(%agent_id, "duplicate Hello after handshake — ignoring");
         }
         AgentToGateway::OutboundMessage(msg) => route_outbound(agent_id, msg, ctx).await,
+        AgentToGateway::ApprovalRequest(request) => ask_for_approval(agent_id, request, ctx).await,
+        AgentToGateway::ApprovalClosed { request_id } => {
+            let _ = ctx
+                .webchat_router
+                .close_approval(agent_id, &request_id)
+                .await;
+        }
         AgentToGateway::LlmRequest(req) => {
             if req.request_id.len() > MAX_REQUEST_ID_BYTES {
                 warn!(%agent_id, len = req.request_id.len(), "dropping LlmRequest with an oversized request_id");
@@ -1076,6 +1083,128 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
         other => {
             warn!(%agent_id, ?other, "unknown frame variant — ignoring");
         }
+    }
+}
+
+/// Longest conversation id of an approval request.
+const MAX_APPROVAL_CONVERSATION: usize = 512;
+/// Longest input an approval request may show, as the runtime allows.
+const MAX_APPROVAL_INPUT: usize = 4000;
+
+/// Ask the agent's owner to approve a tool call: every tab of the agent's
+/// dashboard chat shows it, also tabs opened later, and a channel
+/// conversation it came from is told it waits. Only the owner opens the
+/// dashboard chat, so a channel's sender (a customer, say) cannot approve
+/// the agent's actions. Audited as `tool.approval.requested`.
+async fn ask_for_approval(
+    agent_id: AgentId,
+    mut request: havn_proto::ApprovalRequest,
+    ctx: &AgentSocketCtx,
+) {
+    if request.request_id.len() > MAX_REQUEST_ID_BYTES
+        || request.channel_id.len() > MAX_APPROVAL_CONVERSATION
+    {
+        warn!(%agent_id, "dropping an approval request with oversized ids");
+        return;
+    }
+    let refuse = |request: &havn_proto::ApprovalRequest| {
+        GatewayToAgent::ApprovalDecision(havn_proto::ApprovalDecision {
+            channel_id: request.channel_id.clone(),
+            request_id: request.request_id.clone(),
+            approve: false,
+            remember: false,
+        })
+    };
+    request.tool = request.tool.chars().take(200).collect();
+    request.reason = request.reason.chars().take(300).collect();
+    if request.input.chars().count() > MAX_APPROVAL_INPUT
+        || !ctx
+            .webchat_router
+            .ask_approval(agent_id, request.clone())
+            .await
+    {
+        warn!(%agent_id, "refusing an approval request: too long, or too many waiting");
+        let _ = ctx.registry.send(agent_id, refuse(&request)).await;
+        return;
+    }
+    if let Ok(Some(agent)) = agents_repo::find_by_id(&ctx.db, agent_id).await {
+        crate::audit::record(
+            &ctx.db,
+            agent.owner_id,
+            agent.team_id,
+            Some(agent_id),
+            "tool.approval.requested",
+            serde_json::json!({
+                "request_id": request.request_id,
+                "tool": request.tool,
+                "input": request.input,
+                "conversation": request.channel_id,
+            }),
+        )
+        .await;
+    }
+    if crate::channel_id_codec::decode(&request.channel_id).is_some() {
+        let message = OutboundMessage {
+            channel_id: request.channel_id,
+            content: havn_core::MessageContent::Text {
+                text: "(A step of this reply waits for the agent owner's approval.)".into(),
+            },
+            reply_to: None,
+        };
+        route_outbound(agent_id, message, ctx).await;
+    }
+}
+
+/// The owner's answer to approval request `id` of `agent_id`: sent to the
+/// agent for the request's conversation, closed in every tab, and audited
+/// as `tool.approval.decided` with who decided. A request no longer
+/// waiting is ignored.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one call site; a parameter struct would only rename them"
+)]
+pub async fn forward_decision(
+    registry: &AgentRegistry,
+    db: &SqlitePool,
+    router: &WebChatRouter,
+    agent_id: AgentId,
+    decided_by: &str,
+    id: &str,
+    approve: bool,
+    remember: bool,
+) {
+    let Some(request) = router.close_approval(agent_id, id).await else {
+        return;
+    };
+    if let Ok(Some(agent)) = agents_repo::find_by_id(db, agent_id).await {
+        crate::audit::record(
+            db,
+            agent.owner_id,
+            agent.team_id,
+            Some(agent_id),
+            "tool.approval.decided",
+            serde_json::json!({
+                "request_id": id,
+                "tool": request.tool,
+                "approve": approve,
+                "remember": remember,
+                "decided_by": decided_by,
+                "conversation": request.channel_id,
+            }),
+        )
+        .await;
+    }
+    let decision = havn_proto::ApprovalDecision {
+        channel_id: request.channel_id,
+        request_id: request.request_id,
+        approve,
+        remember,
+    };
+    if let Err(e) = registry
+        .send(agent_id, GatewayToAgent::ApprovalDecision(decision))
+        .await
+    {
+        warn!(%agent_id, error = ?e, "failed to forward an approval decision");
     }
 }
 

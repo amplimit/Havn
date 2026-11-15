@@ -1051,18 +1051,23 @@ async fn sender_access(
     SenderAccess::Admitted
 }
 
-/// A text message that is only `/stop` (Telegram adds `@botname`).
+/// Whether `text` is the command `name`, alone or with Telegram's
+/// `@botname`.
+fn is_command(text: &str, name: &str) -> bool {
+    text.eq_ignore_ascii_case(name)
+        || text.split_once('@').is_some_and(|(cmd, bot)| {
+            cmd.eq_ignore_ascii_case(name)
+                && !bot.is_empty()
+                && bot.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
+/// A text message that is only `/stop`.
 fn is_stop_command(content: &MessageContent) -> bool {
     let MessageContent::Text { text } = content else {
         return false;
     };
-    let text = text.trim();
-    text.eq_ignore_ascii_case("/stop")
-        || text.split_once('@').is_some_and(|(cmd, bot)| {
-            cmd.eq_ignore_ascii_case("/stop")
-                && !bot.is_empty()
-                && bot.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        })
+    is_command(text.trim(), "/stop")
 }
 
 #[cfg(test)]

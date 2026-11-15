@@ -18,8 +18,9 @@ pub use codec::{FrameError, read_frame, write_frame};
 /// 0.2.0: `CronTick`/`CronResult` carry `run_id`.
 /// 0.3.0: models are `provider:model`; an empty `LlmRequest.model` asks
 /// for the gateway's default model.
-/// 0.4.0: `StopTurn` and `TimezoneUpdate`, which an older runtime cannot
-/// parse and would exit on; the version check refuses the mix instead.
+/// 0.4.0: `StopTurn`, `TimezoneUpdate`, `ApprovalRequest` and
+/// `ApprovalDecision`, which an older peer cannot parse and would exit on;
+/// the version check refuses the mix instead.
 pub const PROTOCOL_VERSION: &str = "0.4.0";
 
 /// How often a runtime sends [`AgentToGateway::LivenessPing`] once it is
@@ -72,6 +73,12 @@ pub enum AgentToGateway {
     /// and answers with [`GatewayToAgent::GatewayToolResult`] carrying the
     /// same `request_id`.
     GatewayToolCall(GatewayToolCall),
+    /// A tool call that a hook's `ask` rule matched waits for the user;
+    /// the gateway asks them in the conversation.
+    ApprovalRequest(ApprovalRequest),
+    /// An approval request ended without a decision (timed out, or its
+    /// turn was stopped); the gateway stops showing it.
+    ApprovalClosed { request_id: String },
 }
 
 /// See [`GatewayToAgent::TimezoneUpdate`].
@@ -86,6 +93,31 @@ pub struct TimezoneUpdate {
 pub struct StopTurn {
     /// The conversation, as in [`InboundMessage::channel_id`].
     pub channel_id: String,
+}
+
+/// See [`AgentToGateway::ApprovalRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalRequest {
+    pub request_id: String,
+    /// The conversation to ask in.
+    pub channel_id: String,
+    pub tool: String,
+    /// The call's whole input as JSON, which is what an approval covers.
+    pub input: String,
+    /// Which rule asked.
+    pub reason: String,
+}
+
+/// See [`GatewayToAgent::ApprovalDecision`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalDecision {
+    pub channel_id: String,
+    /// The request answered.
+    pub request_id: String,
+    pub approve: bool,
+    /// Approve the same tool and input for the rest of the conversation.
+    #[serde(default)]
+    pub remember: bool,
 }
 
 /// Frames sent from the gateway to the agent runtime.
@@ -229,6 +261,8 @@ pub enum GatewayToAgent {
     AgentQueryResult(AgentQueryResult),
     /// Reply to an [`AgentToGateway::GatewayToolCall`].
     GatewayToolResult(GatewayToolResult),
+    /// The user's answer to an [`AgentToGateway::ApprovalRequest`].
+    ApprovalDecision(ApprovalDecision),
 }
 
 /// A tool the gateway runs, described the way the model sees it.
@@ -628,6 +662,7 @@ mod tests {
         policy.hooks.pre_tool_use.push(havn_core::ToolHookRule {
             tool: "shell".into(),
             deny: vec!["^echo".into()],
+            ask: Vec::new(),
         });
 
         let frame = GatewayToAgent::Welcome {

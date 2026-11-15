@@ -58,15 +58,22 @@ pub struct HookPolicy {
     pub pre_tool_use: Vec<ToolHookRule>,
 }
 
-/// Deny rule for one tool: the call is refused when any `deny` regex
-/// matches.
+/// Rule for one tool: the call is refused when any `deny` regex matches
+/// its flattened input, and otherwise waits for the user's approval when
+/// any `ask` regex does (`(?s).*` asks for every call). `tool` is a tool
+/// name, or a prefix ending in `*` such as `mcp__github__*`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolHookRule {
     pub tool: String,
     #[serde(default)]
     pub deny: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ask: Vec<String>,
 }
+
+/// The `ask` pattern that matches every call.
+pub const ASK_EVERY_CALL: &str = "(?s).*";
 
 pub const MAX_HOOK_RULES: usize = 64;
 pub const MAX_HOOK_PATTERNS: usize = 256;
@@ -165,20 +172,24 @@ impl HookPolicy {
                 "hooks: more than {MAX_HOOK_RULES} pre_tool_use rules"
             ));
         }
-        let patterns: usize = self.pre_tool_use.iter().map(|r| r.deny.len()).sum();
+        let patterns: usize = self
+            .pre_tool_use
+            .iter()
+            .map(|r| r.deny.len() + r.ask.len())
+            .sum();
         if patterns > MAX_HOOK_PATTERNS {
             return invalid(format!(
-                "hooks: more than {MAX_HOOK_PATTERNS} deny patterns"
+                "hooks: more than {MAX_HOOK_PATTERNS} deny and ask patterns"
             ));
         }
         for rule in &self.pre_tool_use {
             if rule.tool.trim().is_empty() {
                 return invalid("hooks: a pre_tool_use rule has an empty tool".into());
             }
-            for pattern in &rule.deny {
+            for pattern in rule.deny.iter().chain(&rule.ask) {
                 if pattern.len() > MAX_HOOK_PATTERN_LEN {
                     return invalid(format!(
-                        "hooks: a {} deny pattern is longer than {MAX_HOOK_PATTERN_LEN} bytes",
+                        "hooks: a {} pattern is longer than {MAX_HOOK_PATTERN_LEN} bytes",
                         rule.tool
                     ));
                 }
@@ -194,26 +205,32 @@ impl HookPolicy {
     pub fn union(&self, other: &HookPolicy) -> HookPolicy {
         let mut merged = self.clone();
         for rule in &other.pre_tool_use {
-            let missing: Vec<String> = rule
-                .deny
-                .iter()
-                .filter(|p| !merged.denies(&rule.tool, p))
-                .cloned()
-                .collect();
-            if !missing.is_empty() {
+            let missing = |patterns: &[String], ask: bool| -> Vec<String> {
+                patterns
+                    .iter()
+                    .filter(|p| !merged.has(&rule.tool, p, ask))
+                    .cloned()
+                    .collect()
+            };
+            let (deny, ask) = (missing(&rule.deny, false), missing(&rule.ask, true));
+            if !deny.is_empty() || !ask.is_empty() {
                 merged.pre_tool_use.push(ToolHookRule {
                     tool: rule.tool.clone(),
-                    deny: missing,
+                    deny,
+                    ask,
                 });
             }
         }
         merged
     }
 
-    fn denies(&self, tool: &str, pattern: &str) -> bool {
-        self.pre_tool_use
-            .iter()
-            .any(|r| r.tool == tool && r.deny.iter().any(|p| p == pattern))
+    fn has(&self, tool: &str, pattern: &str, ask: bool) -> bool {
+        self.pre_tool_use.iter().any(|r| {
+            r.tool == tool
+                && if ask { &r.ask } else { &r.deny }
+                    .iter()
+                    .any(|p| p == pattern)
+        })
     }
 }
 
@@ -1014,6 +1031,7 @@ mod tests {
         let rule = |n: usize| ToolHookRule {
             tool: "shell".into(),
             deny: (0..n).map(|i| format!("^p{i}")).collect(),
+            ask: Vec::new(),
         };
         let too_many_rules = HookPolicy {
             pre_tool_use: (0..=MAX_HOOK_RULES).map(|_| rule(1)).collect(),
@@ -1043,6 +1061,7 @@ mod tests {
             pre_tool_use: vec![ToolHookRule {
                 tool: tool.into(),
                 deny: deny.iter().map(|p| (*p).to_string()).collect(),
+                ask: Vec::new(),
             }],
         }
     }
@@ -1068,8 +1087,26 @@ mod tests {
             Policy::default()
                 .clamp_to(&cap)
                 .hooks
-                .denies("shell", "^rm -rf")
+                .has("shell", "^rm -rf", false)
         );
+    }
+
+    #[test]
+    fn ask_rules_merge_validate_and_match_prefixes() {
+        let ask = |tool: &str, p: &str| HookPolicy {
+            pre_tool_use: vec![ToolHookRule {
+                tool: tool.into(),
+                deny: Vec::new(),
+                ask: vec![p.into()],
+            }],
+        };
+        let merged = ask("mcp__github__*", ASK_EVERY_CALL).union(&ask("shell", "deploy"));
+        assert_eq!(merged.pre_tool_use.len(), 2);
+        assert!(merged.has("shell", "deploy", true));
+        assert!(!merged.has("shell", "deploy", false));
+        assert_eq!(merged.union(&ask("shell", "deploy")), merged, "no repeats");
+        assert!(merged.validate().is_ok());
+        assert!(ask("shell", "(").validate().is_err());
     }
 
     #[test]

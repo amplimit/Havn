@@ -396,9 +396,20 @@ export type CronJobView = {
   last_run?: { started_at: string; error: string | null };
 };
 
+/** `/agents/{id}/approvals`: tools whose every call waits for approval. */
+export type ApprovalsView = { tools: string[]; inherited: string[] };
+
 export const api = {
   me: () => request<MeView>("/me"),
   timezone: () => request<TimezoneView>("/me/timezone"),
+  approvals: {
+    get: (agentId: string) => request<ApprovalsView>(`/agents/${agentId}/approvals`),
+    put: (agentId: string, tools: string[]) =>
+      request<ApprovalsView>(`/agents/${agentId}/approvals`, {
+        method: "PUT",
+        body: JSON.stringify({ tools }),
+      }),
+  },
   cron: {
     list: (agentId: string) => request<CronJobView[]>(`/agents/${agentId}/cron`),
     setEnabled: (agentId: string, jobId: string, enabled: boolean) =>
