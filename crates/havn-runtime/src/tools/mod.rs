@@ -57,7 +57,7 @@ pub mod context {
 /// Per-call execution context shared across all tools in a single tool call.
 #[derive(Clone)]
 pub struct ToolCtx {
-    /// Agent's writable workspace root. `file_read` / `file_write` are scoped here.
+    /// Agent's writable workspace root. The file tools are scoped here.
     pub workspace_dir: PathBuf,
     /// Per-agent `SQLite` pool for memory / conversation queries.
     pub agent_db: SqlitePool,
@@ -159,6 +159,7 @@ impl ToolRegistry {
             Arc::new(memory::MemoryForgetTool),
             Arc::new(files::FileReadTool),
             Arc::new(files::FileWriteTool),
+            Arc::new(files::FileEditTool),
         ];
         if policy.permissions.can_access_network && policy.network_policy.egress_allowed {
             tools.push(Arc::new(network::WebFetchTool));
@@ -396,7 +397,7 @@ impl ToolRegistry {
 /// |------|-----------|
 /// | `shell` | `command` |
 /// | `web_fetch` | `url` |
-/// | `file_read` / `file_write` | `path` |
+/// | `file_read` / `file_write` / `file_edit` | `path` |
 /// | `memory_search` | `query` |
 /// | other | concatenated values, lossy fallback |
 ///
@@ -412,7 +413,7 @@ fn flatten_input_for_hook(tool: &str, input: &serde_json::Value) -> String {
     match tool {
         "shell" => pick("command"),
         "web_fetch" => pick("url"),
-        "file_read" | "file_write" => pick("path"),
+        "file_read" | "file_write" | "file_edit" => pick("path"),
         "memory_search" => pick("query"),
         "memory_remember" | "memory_forget" => pick("key"),
         "subagent_spawn" => pick("task"),
@@ -470,6 +471,7 @@ mod tests {
             "memory_forget",
             "file_read",
             "file_write",
+            "file_edit",
             "web_fetch",
             "shell",
             "skill_manage",
@@ -609,6 +611,7 @@ mod tests {
             "memory_forget",
             "file_read",
             "file_write",
+            "file_edit",
             "web_fetch",
             "shell",
             "skill_manage",
