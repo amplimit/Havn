@@ -902,7 +902,7 @@ function Bubble({
             <RowButton
               onClick={onRegenerate}
               disabled={busy}
-              title="Answer again; this reply stays as another version. What tools already did is not undone."
+              title="Answer your last message before this reply again; this reply stays as another version. What tools already did is not undone."
               label="regenerate"
             >
               <RefreshCw size={12} className="shrink-0" aria-hidden="true" />

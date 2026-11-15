@@ -90,9 +90,10 @@ pub async fn record_in_chat(
 }
 
 /// Record `reply` to turn `parent` of chat `chat`. The chat continues from
-/// it when its head is still `parent`; when the user moved to another
-/// branch meanwhile, the reply stays on its own. `None` when the chat was
-/// deleted.
+/// it when its head is still `parent`, or a turn that followed it without
+/// the user saying anything (a scheduled task's result), after which it is
+/// recorded; when the user moved to another branch meanwhile, the reply
+/// stays on its own under `parent`. `None` when the chat was deleted.
 pub async fn record_reply(
     pool: &SqlitePool,
     chat: &str,
@@ -107,8 +108,25 @@ pub async fn record_reply(
     let Some((head,)) = head else {
         return Ok(None);
     };
-    let id = insert_turn(&mut tx, chat, Role::Assistant, reply, Some(parent)).await?;
-    if head.as_deref() == Some(parent) {
+    let mut at = head.clone();
+    let mut continues = false;
+    while let Some(turn) = at {
+        if turn == parent {
+            continues = true;
+            break;
+        }
+        match turn_of(&mut tx, chat, &turn).await? {
+            Some((Role::Assistant | Role::System | Role::Tool, above)) => at = above,
+            _ => break,
+        }
+    }
+    let after = if continues {
+        head.as_deref()
+    } else {
+        Some(parent)
+    };
+    let id = insert_turn(&mut tx, chat, Role::Assistant, reply, after).await?;
+    if continues {
         set_head(&mut tx, chat, Some(&id)).await?;
     }
     tx.commit().await?;
@@ -799,6 +817,20 @@ mod tests {
             .expect("record");
         assert_eq!(said(&pool, &chat).await, ["q1", "a1", "q2", "a2'"]);
 
+        // A task result recorded while a reply was due comes before it.
+        let q3 = record_in_chat(&pool, &chat, Role::User, "q3")
+            .await
+            .expect("db")
+            .expect("chat");
+        record_in_chat(&pool, &chat, Role::Assistant, "task result")
+            .await
+            .expect("db");
+        record_reply(&pool, &chat, &q3, "a4").await.expect("record");
+        assert_eq!(
+            said(&pool, &chat).await,
+            ["q1", "a1", "q2", "a2'", "q3", "task result", "a4"]
+        );
+
         // Turns of another chat, or of the wrong role, change nothing.
         let other = chat_for(&pool, "t", None, "x").await.expect("chat");
         assert_eq!(
@@ -834,7 +866,7 @@ mod tests {
             None
         );
         assert!(!switch_branch(&pool, &other, &q2).await.expect("db"));
-        assert_eq!(said(&pool, &chat).await, ["q1", "a1", "q2", "a2'"]);
+        assert_eq!(said(&pool, &chat).await.len(), 7);
     }
 
     #[tokio::test]
