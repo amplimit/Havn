@@ -222,6 +222,10 @@ impl McpServers {
 async fn spawn_one(name: &str, cfg: &McpServerConfig) -> anyhow::Result<McpClient> {
     let bin_path = format!("{MCP_SERVERS_DIR}/{}", cfg.binary);
     let mut command = Command::new(&bin_path);
+    #[cfg(target_os = "linux")]
+    if crate::sandbox::has_tool_home() {
+        command.env("HOME", crate::sandbox::MCP_HOME);
+    }
     for arg in &cfg.args {
         command.arg(arg);
     }

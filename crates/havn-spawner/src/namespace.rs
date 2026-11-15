@@ -359,11 +359,12 @@ impl AgentSpawner for NamespaceSpawner {
         {
             cmd.env("HAVN_ALLOW_NO_LANDLOCK", "1");
         }
+        let extra_mounts = crate::agent_mounts(Path::new("/"), &config.extra_mounts);
         // Landlock rules havn-init applies right before exec'ing the runtime,
         // so every runtime thread and every tool process is confined.
         let (landlock_rw, landlock_ro) = crate::filesystem_rules::allowlist(
             &config.workspace_dir,
-            &config.extra_mounts,
+            &extra_mounts,
             &config.tmpfs_mounts,
             policy,
             &config.runtime_binary,
@@ -386,14 +387,15 @@ impl AgentSpawner for NamespaceSpawner {
         if config.is_subagent {
             cmd.arg("--is-subagent");
         }
-        // Operator-declared extra bind-mounts (spec §4.1 v0.7). Encoded
-        // as `path:mode,path:mode,...` so havn-init can parse without
-        // serde_json (it has no logging stack — diagnostics go to
-        // stderr). Empty list → empty string → havn-init no-ops.
-        if !config.extra_mounts.is_empty() {
+        // The host's tool directories and the operator-declared extra
+        // bind-mounts (spec §4.1 v0.7). Encoded as `path:mode,path:mode,...`
+        // so havn-init can parse without serde_json (it has no logging
+        // stack — diagnostics go to stderr). Empty list → empty string →
+        // havn-init no-ops.
+        if !extra_mounts.is_empty() {
             cmd.env(
                 "HAVN_EXTRA_MOUNTS",
-                crate::encode_extra_mounts(&config.extra_mounts),
+                crate::encode_extra_mounts(&extra_mounts),
             );
         }
         // Operator-declared in-namespace tmpfs mounts (spec §16.2).
