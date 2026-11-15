@@ -1,7 +1,8 @@
 # How often an agent saves to memory without being asked (issue #105).
 # Usage: python3 scripts/memory_eval.py http://127.0.0.1:8080 <agent id> [rounds]
-# Use a throwaway agent: every case leaves a chat in its history. What a
-# case saves is undone afterwards, putting back what it replaced.
+# Use a throwaway agent: every case leaves a chat in its history, and any
+# approval request it sees is denied. What a case saves is undone
+# afterwards, putting back what it replaced.
 
 import asyncio
 import json
@@ -65,7 +66,7 @@ async def run_case(gateway: str, agent: str, text: str) -> tuple[str, list[dict[
         while time.monotonic() < deadline:
             try:
                 raw = await asyncio.wait_for(ws.recv(), deadline - time.monotonic())
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 break
             msg: dict[str, object] = json.loads(raw)
             kind = msg.get("type")
@@ -87,6 +88,9 @@ async def run_case(gateway: str, agent: str, text: str) -> tuple[str, list[dict[
             if kind == "agent_message":
                 outcome = "replied"
                 deadline = time.monotonic() + NOTE_SECONDS
+        if outcome == "timeout":
+            # Its turn would go on, and could save after the cleanup.
+            await ws.send(json.dumps({"type": "stop", "conversation": chat}))
     return outcome, changes
 
 

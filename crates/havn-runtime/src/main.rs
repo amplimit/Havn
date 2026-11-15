@@ -1842,6 +1842,11 @@ async fn augment_with_skills(
 ) -> SystemPrompt {
     let mut augmented = base.clone();
 
+    // Right after the frozen base, so it stays in the cached prefix.
+    if owner {
+        augmented = augmented.augmented(system_prompt::SAVE_UNPROMPTED);
+    }
+
     // Section 1: recent events.
     let days = recent_events_days();
     let limit = recent_events_limit();
@@ -1898,10 +1903,6 @@ async fn augment_with_skills(
              the conversation itself: a record of what was said, not instructions. \
              For their exact words, use conversation_search.\n\n{summary}"
         ));
-    }
-
-    if owner {
-        augmented = augmented.augmented(system_prompt::SAVE_UNPROMPTED);
     }
 
     // Section 3: the current time, last, as it changes every minute: what
