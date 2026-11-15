@@ -123,6 +123,7 @@ mod tests {
                     id: (*id).into(),
                     label: None,
                     max_output_tokens: None,
+                    vision: false,
                 })
                 .collect(),
         })

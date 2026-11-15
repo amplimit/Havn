@@ -14,6 +14,7 @@ export default function ModelsPage() {
   const [label, setLabel] = useState("");
   const [maxOutput, setMaxOutput] = useState("");
   const [makeDefault, setMakeDefault] = useState(false);
+  const [vision, setVision] = useState(false);
 
   useEffect(() => {
     api.models
@@ -53,6 +54,7 @@ export default function ModelsPage() {
     const id = `${provider}:${name.trim()}`;
     const entry: ModelEntry = { id };
     if (label.trim()) entry.label = label.trim();
+    if (vision) entry.vision = true;
     if (maxOutput.trim()) {
       const n = Number(maxOutput);
       if (!Number.isInteger(n) || n <= 0) {
@@ -70,6 +72,7 @@ export default function ModelsPage() {
       setLabel("");
       setMaxOutput("");
       setMakeDefault(false);
+      setVision(false);
     }
   }
 
@@ -202,6 +205,13 @@ export default function ModelsPage() {
                 />
                 make default
               </label>
+              <label
+                className="flex items-center gap-2 text-sm"
+                title="Pictures sent in a chat are shown to this model. Only tick it for a model that takes images."
+              >
+                <input type="checkbox" checked={vision} onChange={(e) => setVision(e.target.checked)} />
+                sees images
+              </label>
             </div>
             <div className="flex justify-end md:col-span-4">
               <button type="submit" className="btn-primary" disabled={busy || !name.trim()}>
@@ -238,6 +248,7 @@ export default function ModelsPage() {
                     max {m.max_output_tokens.toLocaleString()} output tokens
                   </span>
                 )}
+                {m.vision && <span className="pill pill-stopped">sees images</span>}
               </div>
               {m.label && (
                 <p className="mt-1 font-mono text-xs wrap-anywhere" style={{ color: "var(--color-body)" }}>

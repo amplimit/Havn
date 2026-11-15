@@ -193,6 +193,14 @@ fn translate_message_to_gemini(m: &AnthropicMessage) -> Result<Value, String> {
                     "functionResponse": {"name": name, "response": content}
                 }));
             }
+            "image" if block.pointer("/source/type").and_then(Value::as_str) == Some("base64") => {
+                parts.push(json!({
+                    "inline_data": {
+                        "mime_type": block.pointer("/source/media_type").and_then(Value::as_str).unwrap_or("image/png"),
+                        "data": block.pointer("/source/data").and_then(Value::as_str).unwrap_or_default(),
+                    }
+                }));
+            }
             other => {
                 if let Some(t) = block.get("text").and_then(Value::as_str) {
                     parts.push(json!({"text": t}));

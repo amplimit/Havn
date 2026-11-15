@@ -235,6 +235,8 @@ export type ModelEntry = {
   id: string;
   label?: string;
   max_output_tokens?: number;
+  /** It takes images: pictures sent in a chat are shown to it. */
+  vision?: boolean;
 };
 
 export type ModelsView = {

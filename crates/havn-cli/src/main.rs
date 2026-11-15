@@ -359,6 +359,9 @@ enum ModelAction {
         /// Upper bound on the output tokens of one call.
         #[arg(long)]
         max_output_tokens: Option<u32>,
+        /// It takes images: pictures sent in a chat are shown to it.
+        #[arg(long)]
+        vision: bool,
         /// Make it the model of agents that do not set one.
         #[arg(long)]
         default: bool,
@@ -540,8 +543,9 @@ async fn run_model(action: ModelAction) -> anyhow::Result<()> {
             id,
             label,
             max_output_tokens,
+            vision,
             default,
-        } => model::add(&id, label.as_deref(), max_output_tokens, default).await,
+        } => model::add(&id, label.as_deref(), max_output_tokens, vision, default).await,
         ModelAction::Remove { id } => model::remove(&id).await,
         ModelAction::Default { id } => model::set_default(&id).await,
     }

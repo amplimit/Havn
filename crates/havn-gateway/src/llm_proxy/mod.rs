@@ -591,6 +591,228 @@ async fn warn_over_agent_budget(
     }
 }
 
+/// Largest image shown to a model, in bytes: base64 makes it a third
+/// larger, and providers take 5 MB of that.
+pub const MAX_IMAGE_BYTES: u64 = 3_750_000;
+/// Images one request shows at most, and their bytes in all (Gemini takes
+/// 20 MB of base64 in a request).
+pub const MAX_REQUEST_IMAGES: usize = 5;
+pub const MAX_REQUEST_IMAGE_BYTES: u64 = 12_000_000;
+/// Largest side of an image shown, in pixels: providers refuse larger.
+pub const MAX_IMAGE_SIDE: u32 = 8000;
+
+/// Put the images an agent's turn refers to in `request` (issue #106).
+/// The runtime names a file of its inbox (`{"type": "image", "source":
+/// {"type": "workspace", "path": "inbox/<name>"}}`) rather than sending
+/// its bytes, which would not fit a frame; the gateway reads it here,
+/// through [`crate::agent_files`] so nothing the agent controls is
+/// followed. At most [`MAX_REQUEST_IMAGES`] of them, of at most
+/// [`MAX_REQUEST_IMAGE_BYTES`] together, each read once, are shown, and
+/// only to a model with `vision`; every other one (not a PNG, JPEG, GIF or
+/// WebP by its first bytes, too large, missing, outside the inbox, one
+/// too many) becomes a line saying why. Blocking: it reads files.
+pub fn resolve_workspace_images(
+    request: &mut AnthropicRequest,
+    workspace: &std::path::Path,
+    vision: bool,
+) {
+    let mut inbox: Option<std::io::Result<Option<crate::agent_files::WorkspaceDir>>> = None;
+    // What each path gave, so a path named again is not read again.
+    let mut seen: std::collections::HashMap<String, Result<(serde_json::Value, u64), String>> =
+        std::collections::HashMap::new();
+    let (mut count, mut total) = (0_usize, 0_u64);
+    for message in &mut request.messages {
+        let Some(blocks) = message.content.as_array_mut() else {
+            continue;
+        };
+        for block in blocks {
+            let is_ref = block.get("type").and_then(serde_json::Value::as_str) == Some("image")
+                && block
+                    .pointer("/source/type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("workspace");
+            if !is_ref {
+                continue;
+            }
+            let path = block
+                .pointer("/source/path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            // Every block counts, a repeat of one shown too: each is a copy
+            // of its bytes in the request.
+            let result = if !vision {
+                Err("this model cannot see images".to_string())
+            } else if let Some(Err(why)) = seen.get(&path) {
+                Err(why.clone())
+            } else if count >= MAX_REQUEST_IMAGES {
+                Err(format!(
+                    "a message shows at most {MAX_REQUEST_IMAGES} images"
+                ))
+            } else if let Some(Ok((image, size))) = seen.get(&path) {
+                if total + size > MAX_REQUEST_IMAGE_BYTES {
+                    Err("the images of this message are too large together".to_string())
+                } else {
+                    total += size;
+                    count += 1;
+                    Ok(image.clone())
+                }
+            } else {
+                let dir = inbox.get_or_insert_with(|| {
+                    crate::agent_files::WorkspaceDir::open(workspace)
+                        .and_then(|root| root.subdir(havn_core::INBOX_DIR))
+                });
+                let read = image_block(dir, &path, MAX_REQUEST_IMAGE_BYTES.saturating_sub(total));
+                seen.insert(path.clone(), read.clone());
+                read.map(|(image, size)| {
+                    total += size;
+                    count += 1;
+                    image
+                })
+            };
+            *block = match result {
+                Ok(image) => image,
+                Err(why) => serde_json::json!({
+                    "type": "text",
+                    "text": format!("(The image {} is not shown: {why}.)", serde_json::Value::String(path)),
+                }),
+            };
+        }
+    }
+}
+
+/// The image at `path` as a block, and its size, if it is at most
+/// `room` bytes.
+fn image_block(
+    inbox: &std::io::Result<Option<crate::agent_files::WorkspaceDir>>,
+    path: &str,
+    room: u64,
+) -> Result<(serde_json::Value, u64), String> {
+    if !havn_core::Attachment::in_inbox(path) {
+        return Err("it is not a file of the inbox".into());
+    }
+    let name = &path[havn_core::INBOX_DIR.len() + 1..];
+    let dir = match inbox {
+        Ok(Some(dir)) => dir,
+        Ok(None) => return Err("the inbox is gone".into()),
+        Err(e) => return Err(format!("the inbox cannot be read ({e})")),
+    };
+    let limit = MAX_IMAGE_BYTES.min(room);
+    let bytes = match dir.read_bytes(name, limit) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Err("it is not there any more".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData && limit < MAX_IMAGE_BYTES => {
+            return Err("the images of this message are too large together".into());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(format!("it is over {MAX_IMAGE_BYTES} bytes"));
+        }
+        Err(e) => return Err(format!("it cannot be read ({e})")),
+    };
+    let media_type = image_type(&bytes).ok_or("it is not a PNG, JPEG, GIF or WebP image")?;
+    if let Some((width, height)) = image_size(&bytes)
+        && width.max(height) > MAX_IMAGE_SIDE
+    {
+        return Err(format!(
+            "it is {width}x{height} pixels, over {MAX_IMAGE_SIDE} on a side"
+        ));
+    }
+    let size = bytes.len() as u64;
+    Ok((
+        serde_json::json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": base64(&bytes)},
+        }),
+        size,
+    ))
+}
+
+/// Width and height of the image `bytes` hold, when its header says.
+fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let be = |at: usize| -> Option<u32> {
+        Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+    };
+    let le16 = |at: usize| -> Option<u32> {
+        Some(u32::from(u16::from_le_bytes(
+            bytes.get(at..at + 2)?.try_into().ok()?,
+        )))
+    };
+    let le24 = |at: usize| -> Option<u32> {
+        let b = bytes.get(at..at + 3)?;
+        Some(u32::from(b[0]) | (u32::from(b[1]) << 8) | (u32::from(b[2]) << 16))
+    };
+    match image_type(bytes)? {
+        "image/png" => Some((be(16)?, be(20)?)),
+        "image/gif" => Some((le16(6)?, le16(8)?)),
+        "image/webp" => match bytes.get(12..16)? {
+            b"VP8X" => Some((le24(24)? + 1, le24(27)? + 1)),
+            b"VP8 " => Some((le16(26)? & 0x3fff, le16(28)? & 0x3fff)),
+            b"VP8L" => {
+                let b = bytes.get(21..25)?;
+                let bits = u32::from_le_bytes(b.try_into().ok()?);
+                Some(((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1))
+            }
+            _ => None,
+        },
+        "image/jpeg" => {
+            // The first start-of-frame marker holds the size.
+            let mut at = 2;
+            while at + 9 < bytes.len() {
+                if bytes[at] != 0xff {
+                    return None;
+                }
+                let marker = bytes[at + 1];
+                let len = usize::from(u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]));
+                if matches!(marker, 0xc0..=0xcf) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
+                    let height = u32::from(u16::from_be_bytes([bytes[at + 5], bytes[at + 6]]));
+                    let width = u32::from(u16::from_be_bytes([bytes[at + 7], bytes[at + 8]]));
+                    return Some((width, height));
+                }
+                at += 2 + len;
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// The image type `bytes` start like.
+fn image_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Standard base64 with padding.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 /// Upper estimate of a request's input tokens (system prompt, messages,
 /// tool definitions), text counted as [`ASCII_BYTES_PER_TOKEN`] describes.
 /// An image block counts as at least [`IMAGE_TOKENS`] whatever its source,
@@ -834,6 +1056,149 @@ pub fn model_allowed(allowed_models: &[String], model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_shows_a_few_images_each_read_once() {
+        let ws = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir(ws.path().join("inbox")).expect("inbox");
+        let png = |w: u32, h: u32| {
+            let mut b = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+            b.extend(w.to_be_bytes());
+            b.extend(h.to_be_bytes());
+            b
+        };
+        std::fs::write(ws.path().join("inbox/a.png"), png(10, 10)).expect("a");
+        std::fs::write(ws.path().join("inbox/wide.png"), png(9000, 10)).expect("wide");
+        for n in 0..6 {
+            std::fs::write(ws.path().join(format!("inbox/{n}.png")), png(10, 10)).expect("n");
+        }
+        let refer = |path: String| serde_json::json!({"type": "image", "source": {"type": "workspace", "path": path}});
+        let mut blocks: Vec<serde_json::Value> =
+            (0..1000).map(|_| refer("inbox/a.png".into())).collect();
+        blocks.push(refer("inbox/wide.png".into()));
+        blocks.extend((0..6).map(|n| refer(format!("inbox/{n}.png"))));
+        let mut request = AnthropicRequest {
+            model: "m".into(),
+            max_tokens: 10,
+            messages: vec![AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::Value::Array(blocks),
+            }],
+            system: None,
+            temperature: None,
+            tools: None,
+        };
+        resolve_workspace_images(&mut request, ws.path(), true);
+        let blocks = request.messages[0].content.as_array().expect("blocks");
+        // Every block counts, a repeat too: the same image a thousand
+        // times is shown five times.
+        let images = blocks.iter().filter(|b| b["type"] == "image").count();
+        assert_eq!(images, MAX_REQUEST_IMAGES);
+        assert!(
+            blocks[..MAX_REQUEST_IMAGES]
+                .iter()
+                .all(|b| b["type"] == "image")
+        );
+        assert!(
+            blocks[MAX_REQUEST_IMAGES]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("at most")
+        );
+    }
+
+    #[test]
+    fn image_sizes_are_read_from_their_headers() {
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend([0x40, 0x1f, 0x10, 0x00]);
+        assert_eq!(image_size(&gif), Some((8000, 16)));
+        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x00, 0x00];
+        jpeg.extend([
+            0xff, 0xc0, 0x00, 0x11, 0x08, 0x02, 0x58, 0x03, 0x20, 0, 0, 0,
+        ]);
+        assert_eq!(image_size(&jpeg), Some((800, 600)));
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8X".to_vec();
+        webp.extend([0; 8]);
+        webp.extend([0x1f, 0x03, 0x00, 0x57, 0x02, 0x00]);
+        assert_eq!(image_size(&webp), Some((800, 600)));
+    }
+
+    #[test]
+    fn base64_matches_the_standard_vectors() {
+        for (input, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(input.as_bytes()), expected, "{input}");
+        }
+        assert_eq!(base64(&[0xff, 0xfe, 0xfd]), "//79");
+    }
+
+    #[test]
+    fn workspace_images_are_inlined_for_vision_models_only() {
+        let ws = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir(ws.path().join("inbox")).expect("inbox");
+        let png = b"\x89PNG\r\n\x1a\nrest".to_vec();
+        std::fs::write(ws.path().join("inbox/a.png"), &png).expect("png");
+        std::fs::write(ws.path().join("inbox/fake.png"), b"<svg/>").expect("fake");
+        let outside = tempfile::tempdir().expect("tmp");
+        std::fs::write(outside.path().join("secret.png"), &png).expect("secret");
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.png"),
+            ws.path().join("inbox/link.png"),
+        )
+        .expect("link");
+        let refer = |path: &str| serde_json::json!({"type": "image", "source": {"type": "workspace", "path": path}});
+        let request = || AnthropicRequest {
+            model: "m".into(),
+            max_tokens: 10,
+            messages: vec![AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "look"},
+                    refer("inbox/a.png"),
+                    refer("inbox/fake.png"),
+                    refer("inbox/link.png"),
+                    refer("inbox/../agent.db"),
+                    refer("inbox/gone.png"),
+                ]),
+            }],
+            system: None,
+            temperature: None,
+            tools: None,
+        };
+
+        let mut seen = request();
+        resolve_workspace_images(&mut seen, ws.path(), true);
+        let blocks = seen.messages[0].content.as_array().expect("blocks").clone();
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], base64(&png));
+        for (n, why) in [
+            (2, "not a PNG"),
+            (3, "cannot be read"),
+            (4, "not a file of the inbox"),
+            (5, "not there"),
+        ] {
+            let text = blocks[n]["text"].as_str().unwrap_or_default();
+            assert!(text.contains(why), "{n}: {text}");
+        }
+
+        let mut blind = request();
+        resolve_workspace_images(&mut blind, ws.path(), false);
+        let blocks = blind.messages[0].content.as_array().expect("blocks");
+        assert!(
+            blocks[1]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cannot see images")
+        );
+    }
     use serde_json::json;
 
     fn request(content: serde_json::Value, tools: Option<serde_json::Value>) -> AnthropicRequest {
