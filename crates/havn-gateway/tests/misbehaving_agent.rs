@@ -540,6 +540,7 @@ fn may_query_other_agents() -> Value {
 
 fn outbound(channel_id: &str, text: &str) -> AgentToGateway {
     AgentToGateway::OutboundMessage(OutboundMessage {
+        conversation: None,
         channel_id: channel_id.into(),
         content: MessageContent::Text { text: text.into() },
         reply_to: None,

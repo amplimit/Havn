@@ -966,13 +966,30 @@ where
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = zone;
             }
-            GatewayToAgent::InboundMessage(msg) => {
+            GatewayToAgent::InboundMessage(mut msg) => {
                 // Bump the curator scheduler's idle anchor — fresh
                 // user input means "don't fire a curator pass right
                 // now even if 7 days have elapsed".
                 curator_scheduler::record_inbound(&ctx.last_inbound).await;
-                // One turn at a time per conversation; later messages wait
-                // their turn.
+                // The chat it continues, which its turn runs in.
+                let text = render_content_for_llm(&msg.content).unwrap_or_default();
+                match conversations::chat_for(
+                    &ctx.pool,
+                    &msg.channel_id,
+                    msg.conversation.as_deref(),
+                    &text,
+                )
+                .await
+                {
+                    Ok(chat) => msg.conversation = Some(chat),
+                    Err(e) => {
+                        error!(error = %e, "could not find the message's chat");
+                        send_text(&ctx, msg.channel_id, format!("(internal error: {e})"));
+                        continue;
+                    }
+                }
+                // One turn at a time per chat; later messages wait their
+                // turn.
                 match ctx.turns.admit(msg) {
                     turns::Admitted::Start(msg, stop) => {
                         let ctx = ctx.clone();
@@ -1011,7 +1028,16 @@ where
                 }
             }
             GatewayToAgent::StopTurn(stop) => {
-                if ctx.turns.stop(&stop.channel_id) {
+                let chat = conversations::existing_chat(
+                    &ctx.pool,
+                    &stop.channel_id,
+                    stop.conversation.as_deref(),
+                )
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| stop.channel_id.clone());
+                if ctx.turns.stop(&chat) {
                     info!(channel_id = %stop.channel_id, "turn stopped by the user");
                 }
             }
@@ -1243,6 +1269,7 @@ async fn handle_heartbeat(ctx: Ctx) {
     }
 
     let outbound = OutboundMessage {
+        conversation: None,
         // Sentinel — gateway's agent_socket fans this out to every WebChat
         // session bound to this agent.
         channel_id: "broadcast".into(),
@@ -1437,9 +1464,9 @@ async fn run_conversation(
     ctx: Ctx,
 ) {
     loop {
-        let channel_id = msg.channel_id.clone();
+        let chat = turns::key(&msg);
         handle_inbound(msg, stop, ctx.clone()).await;
-        match ctx.turns.next(&channel_id) {
+        match ctx.turns.next(&chat) {
             Some((queued, token)) => {
                 msg = queued;
                 stop = token;
@@ -1466,6 +1493,7 @@ fn queued_notice(ahead: usize) -> String {
 
 fn send_text(ctx: &Ctx, channel_id: String, text: String) {
     let outbound = OutboundMessage {
+        conversation: None,
         channel_id,
         content: MessageContent::Text { text },
         reply_to: None,
@@ -1489,15 +1517,16 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         }
     };
 
+    // The chat's history; replies go to `channel_id`.
+    let chat = turns::key(&msg);
     // Persist user turn before LLM call so a crash doesn't lose it.
-    if let Err(e) = conversations::record(&ctx.pool, &msg.channel_id, Role::User, &user_text).await
-    {
+    if let Err(e) = conversations::record(&ctx.pool, &chat, Role::User, &user_text).await {
         error!(error = %e, "could not persist user turn");
         send_text(&ctx, msg.channel_id, format!("(internal error: {e})"));
         return;
     }
 
-    let history = match conversations::recent(&ctx.pool, &msg.channel_id, HISTORY_WINDOW).await {
+    let history = match conversations::recent(&ctx.pool, &chat, HISTORY_WINDOW).await {
         Ok(h) => h,
         Err(e) => {
             error!(error = %e, "could not load conversation history");
@@ -1528,12 +1557,15 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     let final_text = match tools::gateway::CONVERSATION
         .scope(
             msg.channel_id.clone(),
-            run_tool_loop(
-                &ctx,
-                crate::tools::context::WEBCHAT,
-                &mut messages,
-                &augmented,
-                Some(stop),
+            tools::gateway::CHAT.scope(
+                chat.clone(),
+                run_tool_loop(
+                    &ctx,
+                    crate::tools::context::WEBCHAT,
+                    &mut messages,
+                    &augmented,
+                    Some(stop),
+                ),
             ),
         )
         .await
@@ -1547,13 +1579,12 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
 
     // Persist assistant turn (visible reply only — intermediate tool turns
     // exist only in-memory for this iteration).
-    if let Err(e) =
-        conversations::record(&ctx.pool, &msg.channel_id, Role::Assistant, &final_text).await
-    {
+    if let Err(e) = conversations::record(&ctx.pool, &chat, Role::Assistant, &final_text).await {
         warn!(error = %e, "could not persist assistant turn");
     }
 
     let outbound = OutboundMessage {
+        conversation: Some(chat),
         channel_id: msg.channel_id,
         content: MessageContent::Text { text: final_text },
         reply_to: None,
@@ -1782,19 +1813,74 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                     "archived": rows_within_budget(archived, half, false)?,
                 }))
             }
-            DataQuery::Conversation { channel_id, limit } => {
-                let turns = conversations::recent_with_channel(
-                    &ctx.pool,
-                    &channel_id,
-                    limit.min(MAX_DATA_ROWS),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
+            DataQuery::Conversation {
+                channel_id,
+                conversation,
+                limit,
+            } => {
+                let chat =
+                    conversations::existing_chat(&ctx.pool, &channel_id, conversation.as_deref())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                let turns = match &chat {
+                    Some(chat) => conversations::recent_with_channel(
+                        &ctx.pool,
+                        chat,
+                        limit.min(MAX_DATA_ROWS),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?,
+                    None => Vec::new(),
+                };
+                Ok(serde_json::json!({
+                    "conversation": chat,
+                    "turns": rows_within_budget(turns, MAX_DATA_REPLY_BYTES, true)?,
+                }))
+            }
+            DataQuery::Chats { channel_id, limit } => {
+                let chats = conversations::chats(&ctx.pool, &channel_id, limit.min(MAX_DATA_ROWS))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                // Newest first: the oldest go when the reply is too long.
                 Ok(serde_json::Value::Array(rows_within_budget(
-                    turns,
+                    chats,
                     MAX_DATA_REPLY_BYTES,
-                    true,
+                    false,
                 )?))
+            }
+            DataQuery::RenameChat {
+                channel_id,
+                conversation,
+                title,
+            } => {
+                let renamed =
+                    conversations::rename_chat(&ctx.pool, &channel_id, &conversation, &title)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                if renamed {
+                    Ok(serde_json::Value::Null)
+                } else {
+                    Err(format!("no chat {conversation}"))
+                }
+            }
+            DataQuery::DeleteChat {
+                channel_id,
+                conversation,
+            } => {
+                let deleted = conversations::delete_chat(&ctx.pool, &channel_id, &conversation)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if deleted {
+                    Ok(serde_json::Value::Null)
+                } else {
+                    Err(format!("no chat {conversation}"))
+                }
+            }
+            DataQuery::LeaveChat { channel_id } => {
+                conversations::leave_active(&ctx.pool, &channel_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::Value::Null)
             }
         }
     }

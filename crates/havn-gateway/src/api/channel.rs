@@ -783,6 +783,7 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
     // reaching the agent as a message.
     if is_stop_command(&content) {
         let stop = GatewayToAgent::StopTurn(havn_proto::StopTurn {
+            conversation: None,
             channel_id: encoded_channel_id,
         });
         if let Err(e) = state.registry.send(agent_id, stop).await {
@@ -790,7 +791,28 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
         }
         return;
     }
+    // `/new` starts a new chat with the agent; the old one is kept.
+    if is_command_message(&content, "/new") {
+        let reply = match new_chat(state, agent_id, &encoded_channel_id).await {
+            Ok(()) => NEW_CHAT_MESSAGE,
+            Err(e) => {
+                warn!(channel, %agent_id, error = ?e, "could not start a new chat");
+                NEW_CHAT_FAILED_MESSAGE
+            }
+        };
+        tell_sender(
+            state,
+            channel,
+            &inb.account_id,
+            &inb.sender_id,
+            &inb.channel_message_id,
+            reply,
+        )
+        .await;
+        return;
+    }
     let msg = InboundMessage {
+        conversation: None,
         channel_id: encoded_channel_id,
         sender_id: inb.sender_id.clone(),
         channel: channel.to_string(),
@@ -1064,10 +1086,44 @@ fn is_command(text: &str, name: &str) -> bool {
 
 /// A text message that is only `/stop`.
 fn is_stop_command(content: &MessageContent) -> bool {
+    is_command_message(content, "/stop")
+}
+
+/// A text message that is only the command `name`.
+fn is_command_message(content: &MessageContent, name: &str) -> bool {
     let MessageContent::Text { text } = content else {
         return false;
     };
-    is_command(text.trim(), "/stop")
+    is_command(text.trim(), name)
+}
+
+const NEW_CHAT_MESSAGE: &str = "(Started a new conversation. The earlier one is kept, and the agent still remembers what \
+     it saved to memory.)";
+const NEW_CHAT_FAILED_MESSAGE: &str =
+    "(Could not start a new conversation right now; please try /new again in a moment.)";
+
+/// End the active chat of `scope` with `agent_id`, starting the agent if
+/// it is stopped: the next message starts a new one.
+async fn new_chat(
+    state: &AppState,
+    agent_id: havn_core::AgentId,
+    scope: &str,
+) -> Result<(), crate::api::ApiError> {
+    let owner = agent_repo::find_by_id(&state.db, agent_id)
+        .await?
+        .ok_or(crate::api::ApiError::NotFound)?
+        .owner_id;
+    crate::api::agents::agent_data::<serde_json::Value>(
+        state,
+        owner,
+        agent_id,
+        havn_proto::DataQuery::LeaveChat {
+            channel_id: scope.to_string(),
+        },
+        true,
+    )
+    .await
+    .map(|_| ())
 }
 
 #[cfg(test)]

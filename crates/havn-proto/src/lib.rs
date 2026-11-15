@@ -21,7 +21,7 @@ pub use codec::{FrameError, read_frame, write_frame};
 /// 0.4.0: `StopTurn`, `TimezoneUpdate`, `ApprovalRequest` and
 /// `ApprovalDecision`, which an older peer cannot parse and would exit on;
 /// the version check refuses the mix instead.
-pub const PROTOCOL_VERSION: &str = "0.4.0";
+pub const PROTOCOL_VERSION: &str = "0.5.0";
 
 /// How often a runtime sends [`AgentToGateway::LivenessPing`] once it is
 /// up. The gateway restarts an agent that stays connected but silent for
@@ -93,6 +93,10 @@ pub struct TimezoneUpdate {
 pub struct StopTurn {
     /// The conversation, as in [`InboundMessage::channel_id`].
     pub channel_id: String,
+    /// Its chat, as in [`InboundMessage::conversation`]; the active one
+    /// when absent.
+    #[serde(default)]
+    pub conversation: Option<String>,
 }
 
 /// See [`AgentToGateway::ApprovalRequest`].
@@ -336,8 +340,9 @@ pub struct DataRequest {
     pub query: DataQuery,
 }
 
-/// Rows the dashboard reads from an agent's database. Results come back
-/// as JSON in [`AdminOutcome::Ok`]'s `details`.
+/// Rows the dashboard reads from an agent's database, and the chats it
+/// changes there. Results come back as JSON in [`AdminOutcome::Ok`]'s
+/// `details`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DataQuery {
@@ -349,8 +354,29 @@ pub enum DataQuery {
     },
     /// `{"active": [...], "archived": [...]}` skill rows.
     Skills { limit: u32 },
-    /// The newest turns of one conversation channel.
-    Conversation { channel_id: String, limit: u32 },
+    /// `{"conversation": id | null, "turns": [...]}`: the newest turns of
+    /// chat `conversation` of `channel_id`, or of its active chat.
+    Conversation {
+        channel_id: String,
+        #[serde(default)]
+        conversation: Option<String>,
+        limit: u32,
+    },
+    /// The chats of `channel_id`, most recently used first.
+    Chats { channel_id: String, limit: u32 },
+    /// Rename chat `conversation` of `channel_id`.
+    RenameChat {
+        channel_id: String,
+        conversation: String,
+        title: String,
+    },
+    /// Delete chat `conversation` of `channel_id` and its history.
+    DeleteChat {
+        channel_id: String,
+        conversation: String,
+    },
+    /// The next message of `channel_id` starts a new chat (`/new`).
+    LeaveChat { channel_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

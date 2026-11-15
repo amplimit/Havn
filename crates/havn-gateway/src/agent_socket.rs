@@ -880,6 +880,7 @@ async fn oversized_reply(
                     .deliver(
                         agent_id,
                         havn_core::OutboundMessage {
+                            conversation: None,
                             channel_id: msg.channel_id,
                             content: havn_core::MessageContent::Text { text: notice },
                             reply_to: None,
@@ -1160,6 +1161,7 @@ async fn ask_for_approval(
     }
     if crate::channel_id_codec::decode(&request.channel_id).is_some() {
         let message = OutboundMessage {
+            conversation: None,
             channel_id: request.channel_id,
             content: havn_core::MessageContent::Text {
                 text: "(A step of this reply waits for the agent owner's approval.)".into(),
@@ -3507,6 +3509,7 @@ mod tests {
         let (conn, _conn_rx) = mpsc::channel(1);
         let outbound_to = |sender: &str| {
             AgentToGateway::OutboundMessage(havn_core::OutboundMessage {
+                conversation: None,
                 channel_id: crate::channel_id_codec::encode("telegram", "bot", sender),
                 content: havn_core::MessageContent::Text { text: "hi".into() },
                 reply_to: None,

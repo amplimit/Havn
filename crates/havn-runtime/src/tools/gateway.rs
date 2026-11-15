@@ -29,6 +29,9 @@ tokio::task_local! {
     /// The conversation a turn answers, set around a user turn's tool
     /// loop; gateway tool calls made in it carry it.
     pub static CONVERSATION: String;
+    /// The chat of [`CONVERSATION`] the turn runs in; what "for this
+    /// conversation" approvals are remembered for.
+    pub static CHAT: String;
 }
 
 pub struct GatewayTool {

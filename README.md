@@ -467,6 +467,8 @@ An agent can only send through the channel accounts that `[[bindings]]` binds to
 
 An agent answers one message at a time per conversation. A message sent while it is still replying waits and is answered after that reply, in order (up to 20 waiting; channel users are told it was queued). The dashboard chat has a stop button while a reply runs, and in a channel conversation `/stop` (or `/stop@botname`) stops it: the agent ends the model call or tool call in progress, kills the processes a running shell command started, and keeps what it had said so far, marked `(stopped)`. Waiting messages are answered after it.
 
+Each user has several chats with an agent. The dashboard chat lists them next to the conversation, most recent first, titled after their first message: "new chat" starts another, and a chat can be renamed or deleted (with its messages). In a channel conversation, `/new` (or `/new@botname`) starts a new chat; the earlier one is kept. Chats keep their own history, queue, stop button and "approve for this conversation" approvals; the agent's memory is shared by all of them, and `memory_search` finds past messages of every chat. History from before chats existed became each conversation's first chat.
+
 ### Invite codes
 
 Instead of adding every team member to `allow_from` and restarting the gateway, an operator can hand out one-time invite codes for an `allowlist` account:

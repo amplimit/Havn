@@ -26,6 +26,19 @@ pub type SessionId = Uuid;
 /// One open `WebSocket`.
 pub type TabId = Uuid;
 
+/// Longest chat id a tab may name.
+pub const MAX_CONVERSATION_ID: usize = 64;
+
+/// The dashboard session of user `sender_id` with `agent_id`: the same on
+/// every reconnect, so its chats stay reachable.
+#[must_use]
+pub fn session_for(sender_id: &str, agent_id: AgentId) -> SessionId {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_OID,
+        format!("havn-webchat:{sender_id}:{agent_id}").as_bytes(),
+    )
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct WebChatRouter {
     inner: Arc<Mutex<HashMap<TabId, Tab>>>,
@@ -76,10 +89,18 @@ pub struct Registration {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
-    /// User-typed message.
-    Send { content: String },
-    /// Stop the reply the agent is working on in this session.
-    Stop,
+    /// User-typed message, in chat `conversation` (a new one when the id
+    /// is new), or the active chat when absent.
+    Send {
+        content: String,
+        #[serde(default)]
+        conversation: Option<String>,
+    },
+    /// Stop the reply the agent is working on in a chat of this session.
+    Stop {
+        #[serde(default)]
+        conversation: Option<String>,
+    },
     /// Answer a [`ServerMessage::Approval`].
     Decide {
         id: String,
@@ -99,6 +120,9 @@ pub enum ServerMessage {
         /// a message: the dashboard does not count it as one.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         broadcast: bool,
+        /// The chat it answers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<String>,
     },
     /// Soft error visible to the user (e.g. agent disconnected).
     Error { message: String },
@@ -286,15 +310,18 @@ impl WebChatRouter {
             .channel_id
             .parse()
             .map_err(|_| DeliverError::InvalidChannelId(msg.channel_id.clone()))?;
+        let conversation = msg.conversation;
         let server_msg = match msg.content {
             MessageContent::Text { text } => ServerMessage::AgentMessage {
                 content: text,
                 broadcast: false,
+                conversation,
             },
             // Phase 1 webchat is text-only. Stub other variants with a placeholder.
             other => ServerMessage::AgentMessage {
                 content: format!("(unsupported content variant: {other:?})"),
                 broadcast: false,
+                conversation,
             },
         };
         self.send_to_session(agent_id, session_id, server_msg).await
@@ -392,10 +419,12 @@ impl WebChatRouter {
             MessageContent::Text { text } => ServerMessage::AgentMessage {
                 content: text,
                 broadcast: true,
+                conversation: None,
             },
             other => ServerMessage::AgentMessage {
                 content: format!("(unsupported content variant: {other:?})"),
                 broadcast: true,
+                conversation: None,
             },
         };
         self.fan_out(agent_id, server_msg).await
@@ -522,6 +551,7 @@ mod tests {
         router.register(session_id, agent_id, tx).await;
 
         let outbound = OutboundMessage {
+            conversation: None,
             channel_id: session_id.to_string(),
             content: MessageContent::Text { text: "hi".into() },
             reply_to: None,
@@ -548,6 +578,7 @@ mod tests {
         router.register(session_id, owner, tx).await;
 
         let outbound = OutboundMessage {
+            conversation: None,
             channel_id: session_id.to_string(),
             content: MessageContent::Text {
                 text: "injected".into(),
@@ -566,6 +597,7 @@ mod tests {
     async fn deliver_to_unknown_session_errors() {
         let router = WebChatRouter::new();
         let outbound = OutboundMessage {
+            conversation: None,
             channel_id: Uuid::now_v7().to_string(),
             content: MessageContent::Text { text: "hi".into() },
             reply_to: None,
@@ -581,6 +613,7 @@ mod tests {
     async fn deliver_with_invalid_channel_id_errors() {
         let router = WebChatRouter::new();
         let outbound = OutboundMessage {
+            conversation: None,
             channel_id: "not-a-uuid".into(),
             content: MessageContent::Text { text: "hi".into() },
             reply_to: None,
@@ -606,6 +639,7 @@ mod tests {
         router.register(Uuid::now_v7(), other_agent, tx_other).await;
 
         let outbound = OutboundMessage {
+            conversation: None,
             channel_id: "broadcast".into(),
             content: MessageContent::Text {
                 text: "hello".into(),
@@ -631,6 +665,7 @@ mod tests {
 
     fn text(t: &str) -> OutboundMessage {
         OutboundMessage {
+            conversation: None,
             channel_id: "broadcast".into(),
             content: MessageContent::Text { text: t.into() },
             reply_to: None,
@@ -685,6 +720,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<ServerMessage>(1);
         router.register(session_id, agent_id, tx).await;
         let to_session = |t: &str| OutboundMessage {
+            conversation: None,
             channel_id: session_id.to_string(),
             ..text(t)
         };
@@ -724,6 +760,7 @@ mod tests {
         let (second, mut second_rx) = mpsc::channel::<ServerMessage>(8);
         router.register(session_id, agent_id, second).await;
         let reply = |t: &str| OutboundMessage {
+            conversation: None,
             channel_id: session_id.to_string(),
             ..text(t)
         };

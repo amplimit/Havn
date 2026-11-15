@@ -45,10 +45,19 @@ pub enum Admitted {
     Full { channel_id: String },
 }
 
+/// The turn queue `msg` belongs to: its chat, or its conversation when it
+/// has none.
+#[must_use]
+pub fn key(msg: &InboundMessage) -> String {
+    msg.conversation
+        .clone()
+        .unwrap_or_else(|| msg.channel_id.clone())
+}
+
 impl Turns {
     pub fn admit(&self, msg: InboundMessage) -> Admitted {
         let mut running = self.lock();
-        match running.get_mut(&msg.channel_id) {
+        match running.get_mut(&key(&msg)) {
             Some(turn) if turn.queue.len() >= MAX_QUEUED => Admitted::Full {
                 channel_id: msg.channel_id,
             },
@@ -64,7 +73,7 @@ impl Turns {
             None => {
                 let stop = CancellationToken::new();
                 running.insert(
-                    msg.channel_id.clone(),
+                    key(&msg),
                     Running {
                         stop: stop.clone(),
                         queue: VecDeque::new(),
@@ -144,6 +153,7 @@ mod tests {
 
     fn msg(channel_id: &str, text: &str) -> InboundMessage {
         InboundMessage {
+            conversation: None,
             channel_id: channel_id.into(),
             sender_id: "u".into(),
             channel: "telegram".into(),
@@ -158,6 +168,19 @@ mod tests {
             MessageContent::Text { text } => text,
             _ => "",
         }
+    }
+
+    #[test]
+    fn chats_of_one_conversation_run_side_by_side() {
+        let turns = Turns::default();
+        let mut a = msg("c", "a");
+        a.conversation = Some("chat-a".into());
+        let mut b = msg("c", "b");
+        b.conversation = Some("chat-b".into());
+        assert!(matches!(turns.admit(a), Admitted::Start(..)));
+        assert!(matches!(turns.admit(b), Admitted::Start(..)));
+        assert!(turns.stop("chat-a"));
+        assert!(!turns.stop("c"), "the conversation itself runs nothing");
     }
 
     #[test]

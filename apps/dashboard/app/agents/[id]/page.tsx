@@ -1,10 +1,11 @@
 "use client";
 
-import { use, useEffect, useRef, useState } from "react";
+import { use, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   api,
   type AgentView,
+  type ChatSummary,
   type ConversationTurn,
   type EmbeddingStatus,
   type MeView,
@@ -12,7 +13,20 @@ import {
 import { openChat, type ChatHandle } from "@/lib/websocket";
 import { Markdown } from "@/components/Markdown";
 import type { ServerMessage } from "@/lib/protocol";
-import { BookOpen, Brain, Check, Copy, Layers, RotateCcw, Search, Settings } from "lucide-react";
+import {
+  BookOpen,
+  Brain,
+  Check,
+  Copy,
+  Layers,
+  MessageSquarePlus,
+  MessagesSquare,
+  Pencil,
+  RotateCcw,
+  Search,
+  Settings,
+  Trash2,
+} from "lucide-react";
 
 type ApprovalRequest = Extract<ServerMessage, { type: "approval" }>;
 
@@ -36,6 +50,16 @@ function turnBubbles(turns: ConversationTurn[], nextId: () => number): Bubble[] 
       content: t.content,
       ts: new Date(t.created_at).getTime(),
     }));
+}
+
+// The id of a new chat: a random UUID, also where `crypto.randomUUID` is
+// missing (pages served over plain http to another host).
+function newChatId(): string {
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 
 // Allowance for the gap between the gateway's clock and this browser's.
@@ -81,6 +105,42 @@ export default function ChatPage({
   const pending = waiting > 0;
   // Tool calls of the running reply that wait for the user.
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
+  // The chat on screen; `null` until the active one is known (or when
+  // there is none, and the next message starts one). The ref is what the
+  // socket handlers read.
+  const [chat, setChat] = useState<string | null>(null);
+  const chatIdRef = useRef<string | null>(null);
+  const [chats, setChats] = useState<ChatSummary[]>([]);
+  // The chat list on narrow screens, where it replaces the chat.
+  const [showChats, setShowChats] = useState(false);
+
+  function selectChat(next: string | null) {
+    chatIdRef.current = next;
+    setChat(next);
+  }
+
+  const refreshChats = useCallback(async () => {
+    try {
+      setChats(await api.chats.list(id));
+    } catch (e) {
+      console.warn("[chat] chat list load failed", e);
+    }
+  }, [id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const list = await api.chats.list(id);
+        if (!cancelled) setChats(list);
+      } catch (e) {
+        console.warn("[chat] chat list load failed", e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
 
   const chatRef = useRef<ChatHandle | null>(null);
   const bubbleIdRef = useRef(0);
@@ -124,18 +184,20 @@ export default function ChatPage({
     };
   }, []);
 
-  // Load past conversation from agent.db on mount. The WS opens
-  // afterwards and only appends NEW messages — the history seeded
-  // here is the single source of truth for "what we said before".
-  // Conversations are scoped to a stable per-(user, agent) channel
-  // server-side, so navigating away and back picks up where we left.
+  // Load the chat's history from agent.db, the active chat's at first.
+  // The WS only appends NEW messages — the history seeded here is the
+  // single source of truth for "what we said before". Chats are scoped
+  // to a stable per-(user, agent) session server-side, so navigating
+  // away and back picks up where we left.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
         const since = Date.now();
-        const r = await api.conversation.list(id, HISTORY_LIMIT);
-        if (cancelled || r.turns.length === 0) return;
+        const r = await api.conversation.list(id, HISTORY_LIMIT, chat ?? undefined);
+        if (cancelled) return;
+        if (!chatIdRef.current && r.conversation) selectChat(r.conversation);
+        if (r.turns.length === 0) return;
         const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
         setBubbles((prev) => mergeStored(prev, stored, since));
       } catch (e) {
@@ -148,7 +210,7 @@ export default function ChatPage({
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [id, chat]);
 
   // Poll the agent row for status / connected — used for the stop
   // button and the header pill. Doesn't gate the WS (auto-spawn does
@@ -193,8 +255,10 @@ export default function ChatPage({
     async function catchUp() {
       try {
         const since = Date.now();
-        const r = await api.conversation.list(id, HISTORY_LIMIT);
-        if (cancelled) return;
+        const asked = chatIdRef.current;
+        const r = await api.conversation.list(id, HISTORY_LIMIT, asked ?? undefined);
+        if (cancelled || chatIdRef.current !== asked) return;
+        if (!asked && r.conversation) selectChat(r.conversation);
         const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
         setBubbles((prev) => mergeStored(prev, stored, since));
       } catch (e) {
@@ -224,6 +288,13 @@ export default function ChatPage({
           if (msg.type === "approval_closed") {
             setApprovals((prev) => prev.filter((a) => a.id !== msg.id));
             return;
+          }
+          if (msg.type === "agent_message" && msg.conversation) {
+            void refreshChats();
+            const current = chatIdRef.current;
+            // A reply in another chat shows there.
+            if (current && msg.conversation !== current) return;
+            if (!current) selectChat(msg.conversation);
           }
           if (msg.type === "agent_message") {
             if (!msg.broadcast) setWaiting((n) => Math.max(0, n - 1));
@@ -287,12 +358,49 @@ export default function ChatPage({
   function sendText(text: string) {
     if (!text.trim() || !chatRef.current || wsState !== "open") return;
     pushBubble("you", text);
-    chatRef.current.send(text);
+    chatRef.current.send(text, chatIdRef.current ?? undefined);
     setWaiting((n) => n + 1);
   }
 
   function stopReply() {
-    chatRef.current?.stop();
+    chatRef.current?.stop(chatIdRef.current ?? undefined);
+  }
+
+  // Show chat `next`, or a new one: its replies and approvals start over.
+  function openChatById(next: string | null) {
+    setShowChats(false);
+    if (next !== null && next === chatIdRef.current) return;
+    selectChat(next ?? newChatId());
+    setBubbles([]);
+    setWaiting(0);
+  }
+
+  async function renameChat(c: ChatSummary) {
+    const title = prompt("Rename this chat", c.title)?.trim();
+    if (!title || title === c.title) return;
+    try {
+      await api.chats.rename(id, c.id, title);
+    } catch (e) {
+      pushBubble("system", `error: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    void refreshChats();
+  }
+
+  async function deleteChat(c: ChatSummary) {
+    if (!confirm(`Delete the chat "${c.title || "untitled"}" and its messages?`)) return;
+    try {
+      await api.chats.delete(id, c.id);
+    } catch (e) {
+      pushBubble("system", `error: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    if (c.id === chatIdRef.current) {
+      // The next message starts a new chat.
+      selectChat(null);
+      setBubbles([]);
+      setWaiting(0);
+    }
+    void refreshChats();
   }
 
   function decide(id: string, approve: boolean, remember: boolean) {
@@ -332,165 +440,280 @@ export default function ChatPage({
   if (!agent) return null;
 
   return (
-    <div className="flex h-[calc(100dvh-(--spacing(15)))] flex-col md:h-dvh">
-      {/* Header */}
-      <div
-        className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-4 sm:px-8"
-        style={{ borderColor: "var(--color-border-default)" }}
-      >
-        <div>
-          <h1 className="display-h3">{agent.name}</h1>
-          <p
-            className="font-mono text-xs"
-            style={{ color: "var(--color-body)" }}
-          >
-            {agent.id}
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-          <Link
-            href={`/agents/${agent.id}/memory`}
-            className="btn-ghost inline-flex items-center gap-1.5"
-            title="See what the agent remembers about you"
-          >
-            <Brain size={16} className="shrink-0" aria-hidden="true" />
-            memory
-          </Link>
-          <Link
-            href={`/agents/${agent.id}/skills`}
-            className="btn-ghost inline-flex items-center gap-1.5"
-            title="Installed skills + curator log"
-          >
-            <BookOpen size={16} className="shrink-0" aria-hidden="true" />
-            skills
-          </Link>
-          <Link
-            href={`/agents/${agent.id}/settings`}
-            className="btn-ghost inline-flex items-center gap-1.5"
-            title="Rename, change model, edit policy"
-          >
-            <Settings size={16} className="shrink-0" aria-hidden="true" />
-            settings
-          </Link>
-          <MemoryPill embedding={embedding} />
-          <ConnectionPill state={wsState} agent={agent} />
-        </div>
-      </div>
-
-      {/* Conversation */}
-      <div
-        ref={scrollRef}
-        className="flex-1 overflow-y-auto px-4 py-6 sm:px-8"
-        style={{ backgroundColor: "var(--color-surface-muted)" }}
-      >
-        <div className="mx-auto flex max-w-3xl flex-col gap-3">
-          {bubbles.length === 0 && (
-            <div
-              className="card px-5 py-12 text-center"
+    <div className="flex h-[calc(100dvh-(--spacing(15)))] md:h-dvh">
+      <ChatList
+        chats={chats}
+        current={chat}
+        onOpen={openChatById}
+        onRename={renameChat}
+        onDelete={deleteChat}
+        className={showChats ? "flex w-full" : "hidden"}
+      />
+      <div className={`${showChats ? "hidden" : "flex"} min-w-0 flex-1 flex-col md:flex`}>
+        {/* Header */}
+        <div
+          className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-4 sm:px-8"
+          style={{ borderColor: "var(--color-border-default)" }}
+        >
+          <div>
+            <h1 className="display-h3">{agent.name}</h1>
+            <p
+              className="font-mono text-xs"
               style={{ color: "var(--color-body)" }}
             >
-              {wsState === "connecting"
-                ? "starting agent…"
-                : wsState === "error" || wsState === "closed"
-                  ? "reconnecting…"
-                  : "send a message to start the conversation"}
-            </div>
-          )}
-          {bubbles.map((b, idx) => (
-            <Bubble
-              key={b.id}
-              bubble={b}
-              onRetry={
-                b.role === "agent"
-                  ? () => {
-                      // Find the most recent user bubble before this
-                      // agent reply and re-send its content. Both the
-                      // original and the retry stay in history — the
-                      // agent then has both attempts in context, which
-                      // is correct (it can see what didn't work).
-                      for (let i = idx - 1; i >= 0; i--) {
-                        if (bubbles[i].role === "you") {
-                          sendText(bubbles[i].content);
-                          return;
-                        }
-                      }
-                    }
-                  : undefined
-              }
-            />
-          ))}
-          {approvals.map((a) => (
-            <div
-              key={a.id}
-              className="card px-4 py-3 text-sm"
-              role="alertdialog"
-              aria-label={`approve ${a.tool}`}
+              {agent.id}
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+            <button
+              type="button"
+              className="btn-ghost inline-flex items-center gap-1.5 md:hidden"
+              onClick={() => setShowChats(true)}
             >
-              <p className="mb-1">
-                <strong>
-                  {a.kind === "network" ? "Allow this network access?" : "Approve this tool call?"}
-                </strong>{" "}
-                <span className="font-mono">{a.tool}</span>
-                {a.conversation && (
-                  <span style={{ color: "var(--color-body)" }}>
-                    {" "}
-                    (in the conversation {a.conversation})
-                  </span>
-                )}
-              </p>
-              <pre
-                className="mb-2 overflow-x-auto whitespace-pre-wrap text-xs font-mono"
+              <MessagesSquare size={16} className="shrink-0" aria-hidden="true" />
+              chats
+            </button>
+            <button
+              type="button"
+              className="btn-ghost inline-flex items-center gap-1.5"
+              onClick={() => openChatById(null)}
+              title="Start a new chat; this one stays in the list"
+            >
+              <MessageSquarePlus size={16} className="shrink-0" aria-hidden="true" />
+              new chat
+            </button>
+            <Link
+              href={`/agents/${agent.id}/memory`}
+              className="btn-ghost inline-flex items-center gap-1.5"
+              title="See what the agent remembers about you"
+            >
+              <Brain size={16} className="shrink-0" aria-hidden="true" />
+              memory
+            </Link>
+            <Link
+              href={`/agents/${agent.id}/skills`}
+              className="btn-ghost inline-flex items-center gap-1.5"
+              title="Installed skills + curator log"
+            >
+              <BookOpen size={16} className="shrink-0" aria-hidden="true" />
+              skills
+            </Link>
+            <Link
+              href={`/agents/${agent.id}/settings`}
+              className="btn-ghost inline-flex items-center gap-1.5"
+              title="Rename, change model, edit policy"
+            >
+              <Settings size={16} className="shrink-0" aria-hidden="true" />
+              settings
+            </Link>
+            <MemoryPill embedding={embedding} />
+            <ConnectionPill state={wsState} agent={agent} />
+          </div>
+        </div>
+
+        {/* Conversation */}
+        <div
+          ref={scrollRef}
+          className="flex-1 overflow-y-auto px-4 py-6 sm:px-8"
+          style={{ backgroundColor: "var(--color-surface-muted)" }}
+        >
+          <div className="mx-auto flex max-w-3xl flex-col gap-3">
+            {bubbles.length === 0 && (
+              <div
+                className="card px-5 py-12 text-center"
                 style={{ color: "var(--color-body)" }}
               >
-                {a.input}
-              </pre>
-              <div className="flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  className="btn-primary"
-                  disabled={wsState !== "open"}
-                  onClick={() => decide(a.id, true, false)}
-                >
-                  {a.kind === "network" ? "allow for 10 minutes" : "approve"}
-                </button>
-                <button
-                  type="button"
-                  className="btn-ghost"
-                  disabled={wsState !== "open"}
-                  onClick={() => decide(a.id, true, true)}
-                  title={
-                    a.kind === "network"
-                      ? "Add these domains to the agent's allowed domains"
-                      : "Approve this tool with this exact input for the rest of the conversation, until the agent restarts"
-                  }
-                >
-                  {a.kind === "network" ? "always allow" : "approve for this conversation"}
-                </button>
-                <button
-                  type="button"
-                  className="btn-ghost"
-                  disabled={wsState !== "open"}
-                  onClick={() => decide(a.id, false, false)}
-                >
-                  deny
-                </button>
+                {wsState === "connecting"
+                  ? "starting agent…"
+                  : wsState === "error" || wsState === "closed"
+                    ? "reconnecting…"
+                    : "send a message to start the conversation"}
               </div>
-            </div>
-          ))}
-          {pending && <TypingBubble />}
+            )}
+            {bubbles.map((b, idx) => (
+              <Bubble
+                key={b.id}
+                bubble={b}
+                onRetry={
+                  b.role === "agent"
+                    ? () => {
+                        // Find the most recent user bubble before this
+                        // agent reply and re-send its content. Both the
+                        // original and the retry stay in history — the
+                        // agent then has both attempts in context, which
+                        // is correct (it can see what didn't work).
+                        for (let i = idx - 1; i >= 0; i--) {
+                          if (bubbles[i].role === "you") {
+                            sendText(bubbles[i].content);
+                            return;
+                          }
+                        }
+                      }
+                    : undefined
+                }
+              />
+            ))}
+            {approvals.map((a) => (
+              <div
+                key={a.id}
+                className="card px-4 py-3 text-sm"
+                role="alertdialog"
+                aria-label={`approve ${a.tool}`}
+              >
+                <p className="mb-1">
+                  <strong>
+                    {a.kind === "network" ? "Allow this network access?" : "Approve this tool call?"}
+                  </strong>{" "}
+                  <span className="font-mono">{a.tool}</span>
+                  {a.conversation && (
+                    <span style={{ color: "var(--color-body)" }}>
+                      {" "}
+                      (in the conversation {a.conversation})
+                    </span>
+                  )}
+                </p>
+                <pre
+                  className="mb-2 overflow-x-auto whitespace-pre-wrap text-xs font-mono"
+                  style={{ color: "var(--color-body)" }}
+                >
+                  {a.input}
+                </pre>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    className="btn-primary"
+                    disabled={wsState !== "open"}
+                    onClick={() => decide(a.id, true, false)}
+                  >
+                    {a.kind === "network" ? "allow for 10 minutes" : "approve"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    disabled={wsState !== "open"}
+                    onClick={() => decide(a.id, true, true)}
+                    title={
+                      a.kind === "network"
+                        ? "Add these domains to the agent's allowed domains"
+                        : "Approve this tool with this exact input for the rest of the conversation, until the agent restarts"
+                    }
+                  >
+                    {a.kind === "network" ? "always allow" : "approve for this conversation"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    disabled={wsState !== "open"}
+                    onClick={() => decide(a.id, false, false)}
+                  >
+                    deny
+                  </button>
+                </div>
+              </div>
+            ))}
+            {pending && <TypingBubble />}
+          </div>
         </div>
-      </div>
 
-      {/* Composer */}
-      <Composer
-        wsState={wsState}
-        waiting={waiting}
-        onStop={stopReply}
-        draft={draft}
-        setDraft={setDraft}
-        onSubmit={onSubmit}
-      />
+        {/* Composer */}
+        <Composer
+          wsState={wsState}
+          waiting={waiting}
+          onStop={stopReply}
+          draft={draft}
+          setDraft={setDraft}
+          onSubmit={onSubmit}
+        />
+      </div>
     </div>
+  );
+}
+
+function ChatList({
+  chats,
+  current,
+  onOpen,
+  onRename,
+  onDelete,
+  className,
+}: {
+  chats: ChatSummary[];
+  current: string | null;
+  onOpen: (chat: string | null) => void;
+  onRename: (chat: ChatSummary) => void;
+  onDelete: (chat: ChatSummary) => void;
+  className: string;
+}) {
+  const fresh = current !== null && !chats.some((c) => c.id === current);
+  const itemStyle = (on: boolean) =>
+    on ? { backgroundColor: "var(--color-surface-muted)" } : undefined;
+  return (
+    <aside
+      className={`${className} shrink-0 flex-col border-r md:flex md:w-64`}
+      style={{ borderColor: "var(--color-border-default)" }}
+    >
+      <div className="p-3">
+        <button
+          type="button"
+          className="btn-primary inline-flex w-full items-center justify-center gap-1.5"
+          onClick={() => onOpen(null)}
+        >
+          <MessageSquarePlus size={16} className="shrink-0" aria-hidden="true" />
+          new chat
+        </button>
+      </div>
+      <nav aria-label="chats" className="flex-1 overflow-y-auto px-2 pb-3">
+        <ul className="flex flex-col gap-0.5">
+          {fresh && (
+            <li className="rounded px-2 py-1.5 text-sm" style={itemStyle(true)} aria-current="true">
+              new chat
+            </li>
+          )}
+          {chats.map((c) => {
+            const on = c.id === current;
+            const title = c.title || "untitled";
+            return (
+              <li key={c.id} className="flex items-center gap-0.5 rounded" style={itemStyle(on)}>
+                <button
+                  type="button"
+                  className="min-w-0 flex-1 truncate px-2 py-1.5 text-left text-sm"
+                  onClick={() => onOpen(c.id)}
+                  aria-current={on ? "true" : undefined}
+                  title={title}
+                >
+                  {title}
+                </button>
+                <button
+                  type="button"
+                  className="shrink-0 p-1.5"
+                  style={{ color: "var(--color-body)" }}
+                  onClick={() => onRename(c)}
+                  aria-label={`rename ${title}`}
+                  title="rename"
+                >
+                  <Pencil size={14} aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  className="shrink-0 p-1.5"
+                  style={{ color: "var(--color-body)" }}
+                  onClick={() => onDelete(c)}
+                  aria-label={`delete ${title}`}
+                  title="delete"
+                >
+                  <Trash2 size={14} aria-hidden="true" />
+                </button>
+              </li>
+            );
+          })}
+          {chats.length === 0 && !fresh && (
+            <li className="px-2 py-1.5 text-xs" style={{ color: "var(--color-body)" }}>
+              no chats yet
+            </li>
+          )}
+        </ul>
+      </nav>
+    </aside>
   );
 }
 

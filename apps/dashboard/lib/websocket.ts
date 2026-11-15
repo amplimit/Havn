@@ -24,9 +24,10 @@ export type ChatHandlers = {
 };
 
 export type ChatHandle = {
-  send: (text: string) => void;
-  /** Stop the reply the agent is working on; queued messages still run. */
-  stop: () => void;
+  /** Send `text` in chat `conversation`, or the active chat. */
+  send: (text: string, conversation?: string) => void;
+  /** Stop the reply the agent is working on in a chat; queued messages still run. */
+  stop: (conversation?: string) => void;
   /** Answer an approval request. */
   decide: (id: string, approve: boolean, remember: boolean) => void;
   close: () => void;
@@ -70,12 +71,12 @@ export function openChat(
   ws.addEventListener("close", (ev) => handlers.onClose?.(ev));
 
   return {
-    send: (text: string) => {
-      const frame: ClientMessage = { type: "send", content: text };
+    send: (text: string, conversation?: string) => {
+      const frame: ClientMessage = { type: "send", content: text, conversation };
       ws.send(JSON.stringify(frame));
     },
-    stop: () => {
-      const frame: ClientMessage = { type: "stop" };
+    stop: (conversation?: string) => {
+      const frame: ClientMessage = { type: "stop", conversation };
       ws.send(JSON.stringify(frame));
     },
     decide: (id, approve, remember) => {
