@@ -72,6 +72,13 @@ pub enum AgentToGateway {
     GatewayToolCall(GatewayToolCall),
 }
 
+/// See [`GatewayToAgent::StopTurn`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StopTurn {
+    /// The conversation, as in [`InboundMessage::channel_id`].
+    pub channel_id: String,
+}
+
 /// Frames sent from the gateway to the agent runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -151,6 +158,9 @@ pub enum GatewayToAgent {
     },
     /// Inbound message from a channel adapter.
     InboundMessage(InboundMessage),
+    /// Stop the turn running in a conversation (the user pressed stop or
+    /// sent `/stop`). Messages queued behind it still run.
+    StopTurn(StopTurn),
     /// LLM call has completed (success or error). Phase 1 is non-streaming;
     /// streaming chunks land in a follow-up vertical (separate frame variant).
     LlmResponse(LlmResponse),

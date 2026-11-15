@@ -72,7 +72,10 @@ export default function ChatPage({
   // state and a small typing-dots ghost bubble so the user sees the
   // model is working — Anthropic calls take 1–3s and dead air feels
   // broken.
-  const [pending, setPending] = useState(false);
+  // Replies still due: one per message sent, the running one first and
+  // the rest queued behind it in the agent.
+  const [waiting, setWaiting] = useState(0);
+  const pending = waiting > 0;
 
   const chatRef = useRef<ChatHandle | null>(null);
   const bubbleIdRef = useRef(0);
@@ -203,9 +206,13 @@ export default function ChatPage({
           void catchUp();
         },
         onMessage: (msg) => {
-          // Either a real reply or a soft error closes the "replying…"
-          // state — the user gets feedback either way.
-          setPending(false);
+          // A reply answers the oldest message waiting; a soft error
+          // (agent gone) ends the wait for all of them.
+          if (msg.type === "agent_message") {
+            setWaiting((n) => Math.max(0, n - 1));
+          } else {
+            setWaiting(0);
+          }
           if (msg.type === "agent_message") {
             pushBubble("agent", msg.content);
           } else {
@@ -213,7 +220,7 @@ export default function ChatPage({
           }
         },
         onError: () => {
-          setPending(false);
+          setWaiting(0);
           setWsState("error");
         },
         onClose: () => {
@@ -221,7 +228,7 @@ export default function ChatPage({
           if (cancelled) return;
           setWsState("closed");
           // A reply still due arrives through the reload on reconnect.
-          setPending(false);
+          setWaiting(0);
           reconnectTimer = setTimeout(() => {
             if (!cancelled && !chatRef.current) connect();
           }, RECONNECT_MS);
@@ -264,7 +271,11 @@ export default function ChatPage({
     if (!text.trim() || !chatRef.current || wsState !== "open") return;
     pushBubble("you", text);
     chatRef.current.send(text);
-    setPending(true);
+    setWaiting((n) => n + 1);
+  }
+
+  function stopReply() {
+    chatRef.current?.stop();
   }
 
   function onSubmit(e: React.FormEvent) {
@@ -392,7 +403,8 @@ export default function ChatPage({
       {/* Composer */}
       <Composer
         wsState={wsState}
-        pending={pending}
+        waiting={waiting}
+        onStop={stopReply}
         draft={draft}
         setDraft={setDraft}
         onSubmit={onSubmit}
@@ -614,23 +626,24 @@ function Dot({ delayMs }: { delayMs: number }) {
 // optional) keeps the input ergonomic for code blocks and longer prompts.
 function Composer({
   wsState,
-  pending,
+  waiting,
+  onStop,
   draft,
   setDraft,
   onSubmit,
 }: {
   wsState: "idle" | "connecting" | "open" | "closed" | "error";
-  pending: boolean;
+  waiting: number;
+  onStop: () => void;
   draft: string;
   setDraft: (s: string) => void;
   onSubmit: (e: React.FormEvent) => void;
 }) {
   const [tab, setTab] = useState<"write" | "preview">("write");
-  // The composer is "ready" when the WS is up AND we're not still
-  // waiting on the agent's previous reply. Disabling input while
-  // pending prevents the user from queueing a second prompt that the
-  // agent would interleave with the first response — confusing.
-  const ready = wsState === "open" && !pending;
+  // The composer is ready whenever the WS is up. A message sent while a
+  // reply runs waits in the agent and is answered after it, in order.
+  const ready = wsState === "open";
+  const pending = waiting > 0;
   return (
     <form
       onSubmit={onSubmit}
@@ -722,20 +735,35 @@ function Composer({
         )}
 
         {/* Action row */}
-        <div className="mt-2 flex justify-end">
+        <div className="mt-2 flex items-center justify-end gap-3">
+          {pending && (
+            <span
+              className="flex items-center gap-2 text-sm"
+              style={{ color: "var(--color-body)" }}
+              role="status"
+            >
+              <Spinner /> replying
+              {waiting > 1 && `, ${waiting - 1} queued`}
+            </span>
+          )}
+          {pending && (
+            <button
+              type="button"
+              className="btn-ghost"
+              onClick={onStop}
+              disabled={wsState !== "open"}
+              title="Stop the reply in progress; queued messages still get answered"
+            >
+              stop
+            </button>
+          )}
           <button
             type="submit"
             className="btn-primary"
             disabled={!ready || !draft.trim()}
             style={{ minWidth: 110 }}
           >
-            {pending ? (
-              <span className="flex items-center justify-center gap-2">
-                <Spinner /> replying…
-              </span>
-            ) : (
-              "send"
-            )}
+            {pending ? "queue" : "send"}
           </button>
         </div>
       </div>

@@ -207,6 +207,15 @@ async fn serve_session<Si, St, E>(
         };
         let user_text = match parsed {
             ClientMessage::Send { content } => content,
+            ClientMessage::Stop => {
+                let stop = GatewayToAgent::StopTurn(havn_proto::StopTurn {
+                    channel_id: session_id.to_string(),
+                });
+                if let Err(e) = registry.send(agent_id, stop).await {
+                    warn!(%agent_id, error = ?e, "failed to forward StopTurn");
+                }
+                continue;
+            }
         };
 
         let inbound = InboundMessage {

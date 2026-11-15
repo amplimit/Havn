@@ -55,6 +55,8 @@ pub struct Registration {
 pub enum ClientMessage {
     /// User-typed message.
     Send { content: String },
+    /// Stop the reply the agent is working on in this session.
+    Stop,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

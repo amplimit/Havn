@@ -3,7 +3,7 @@
  * Keep aligned by hand: this file is the only client-side authority.
  */
 
-export type ClientMessage = { type: "send"; content: string };
+export type ClientMessage = { type: "send"; content: string } | { type: "stop" };
 
 export type ServerMessage =
   | { type: "agent_message"; content: string }

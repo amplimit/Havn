@@ -69,6 +69,9 @@ pub struct LoopHandle {
     /// also handed to subagent loops spawned within (caller pays
     /// recursively).
     pub billing_user_id: Option<String>,
+    /// Cancelled when the user stops the turn: the loop ends at once,
+    /// dropping the model call or tool call in flight.
+    pub stop: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Default output-token budget for an agent LLM call when the agent's
@@ -129,11 +132,15 @@ pub enum RunError {
     /// contract that bare infra failures terminate the loop with an
     /// `Err` rather than getting smuggled into the success channel.
     Infra(anyhow::Error),
+    /// The user stopped the turn; `partial_text` is the assistant text
+    /// so far.
+    Stopped { partial_text: String },
 }
 
 impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Stopped { .. } => write!(f, "stopped by the user"),
             Self::Llm(msg) => write!(f, "LLM error: {msg}"),
             Self::IterationCap { cap, .. } => {
                 write!(
@@ -166,13 +173,20 @@ pub async fn run_typed(
     system_prompt: &SystemPrompt,
 ) -> Result<String, RunError> {
     let mut last_text = String::new();
+    let stopped = |text: &str| RunError::Stopped {
+        partial_text: text.to_string(),
+    };
     for iteration in 0..handle.max_iterations {
         if let Some(mirror) = &handle.messages_mirror {
             *mirror.write().await = messages.clone();
         }
-        let response = call_llm(handle, context, messages, system_prompt)
-            .await
-            .map_err(RunError::Infra)?;
+        let response = unless_stopped(
+            handle.stop.as_ref(),
+            call_llm(handle, context, messages, system_prompt),
+        )
+        .await
+        .ok_or_else(|| stopped(&last_text))?
+        .map_err(RunError::Infra)?;
         let provider_response = match response.outcome {
             LlmOutcome::Ok => response.provider_response,
             LlmOutcome::Error { message } => return Err(RunError::Llm(message)),
@@ -196,7 +210,12 @@ pub async fn run_typed(
             return Ok(last_text);
         }
 
-        let tool_results = execute_tool_uses(handle, context, &content).await;
+        let tool_results = unless_stopped(
+            handle.stop.as_ref(),
+            execute_tool_uses(handle, context, &content),
+        )
+        .await
+        .ok_or_else(|| stopped(&last_text))?;
         if tool_results.is_empty() {
             warn!(iteration, "stop_reason=tool_use but no tool_use blocks");
             return Ok(last_text);
@@ -240,6 +259,34 @@ pub async fn run(
         // Smuggling them into the success channel would silence genuine
         // bug reports.
         Err(RunError::Infra(e)) => Err(e),
+        Err(RunError::Stopped { partial_text }) => Ok(stopped_reply(&partial_text)),
+    }
+}
+
+/// What a stopped turn leaves as its reply: the text so far, marked.
+#[must_use]
+pub fn stopped_reply(partial_text: &str) -> String {
+    let partial = partial_text.trim();
+    if partial.is_empty() {
+        "(stopped)".to_string()
+    } else {
+        format!("{partial}\n\n(stopped)")
+    }
+}
+
+/// `work`, unless `stop` is cancelled first: then `None`, and `work` is
+/// dropped, which ends a running shell command and abandons a model call.
+async fn unless_stopped<T>(
+    stop: Option<&tokio_util::sync::CancellationToken>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    match stop {
+        Some(stop) => tokio::select! {
+            biased;
+            () = stop.cancelled() => None,
+            out = work => Some(out),
+        },
+        None => Some(work.await),
     }
 }
 
@@ -550,6 +597,27 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn stopped_replies_keep_the_text_so_far() {
+        assert_eq!(stopped_reply("  "), "(stopped)");
+        assert_eq!(
+            stopped_reply("half an answer"),
+            "half an answer
+
+(stopped)"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_drops_the_work_in_flight() {
+        let stop = tokio_util::sync::CancellationToken::new();
+        assert_eq!(unless_stopped(Some(&stop), async { 1 }).await, Some(1));
+        stop.cancel();
+        let never = std::future::pending::<u8>();
+        assert_eq!(unless_stopped(Some(&stop), never).await, None);
+        assert_eq!(unless_stopped(None, async { 2 }).await, Some(2));
+    }
 
     fn request(request_id: &str) -> LlmRequest {
         LlmRequest {
