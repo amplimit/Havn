@@ -877,7 +877,7 @@ impl Resolve for PublicResolver {
                 tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
             let public: Vec<SocketAddr> = found.into_iter().filter(|a| is_public(a.ip())).collect();
             if public.is_empty() {
-                return Err(format!("{host} does not resolve to a public address").into());
+                return Err(format!("{host} resolves only to private, reserved or this gateway host's own addresses, which web_fetch does not read").into());
             }
             let addrs: Addrs = Box::new(public.into_iter());
             Ok(addrs)
@@ -928,7 +928,9 @@ fn refuse_private_literal(url: &Url) -> Result<(), String> {
         Some(url::Host::Domain(name)) => {
             let name = name.trim_end_matches('.').to_ascii_lowercase();
             if name == "localhost" || name.ends_with(".localhost") || !name.contains('.') {
-                return Err(format!("{name} is not a public host"));
+                return Err(format!(
+                    "{name} is a local name, which web_fetch does not read"
+                ));
             }
             return Ok(());
         }
@@ -937,7 +939,9 @@ fn refuse_private_literal(url: &Url) -> Result<(), String> {
     if is_public(ip) {
         Ok(())
     } else {
-        Err(format!("{ip} is not a public address"))
+        Err(format!(
+            "{ip} is a private, reserved or this gateway host's own address, which web_fetch              does not read"
+        ))
     }
 }
 
@@ -1775,7 +1779,7 @@ mod tests {
             let Err(message) = f.fetch(&url(target), &policy).await else {
                 panic!("{target} was fetched");
             };
-            assert!(message.contains("public"), "{target}: {message}");
+            assert!(message.contains("does not read"), "{target}: {message}");
         }
     }
 
