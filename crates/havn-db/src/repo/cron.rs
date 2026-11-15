@@ -6,6 +6,9 @@
 //! - `interval:<N>` — recurring every N seconds.
 //! - `at:<RFC 3339 timestamp>` — one-shot at the given instant; the job
 //!   self-disables once it runs.
+//! - `cron:<IANA zone> <five-field expression>` — calendar schedule in a
+//!   time zone (see [`havn_core::calendar`]), such as
+//!   `cron:Asia/Shanghai 0 8 * * *` for 08:00 Shanghai time every day.
 //!
 //! After every run [`advance_after_run`] computes the next `next_run_at`
 //! (or disables the job for the one-shot case), so the scheduler only ever
@@ -25,6 +28,8 @@ pub enum Schedule {
     Interval { seconds: i64 },
     /// One-shot at the given instant. `enabled` is cleared once it fires.
     At { instant: DateTime<Utc> },
+    /// Calendar times in a time zone.
+    Calendar(havn_core::calendar::Calendar),
 }
 
 impl Schedule {
@@ -32,6 +37,7 @@ impl Schedule {
         match self {
             Self::Interval { seconds } => format!("interval:{seconds}"),
             Self::At { instant } => format!("at:{}", instant.to_rfc3339()),
+            Self::Calendar(c) => format!("cron:{} {}", c.zone(), c.expr()),
         }
     }
 
@@ -57,6 +63,15 @@ impl Schedule {
                 })?
                 .with_timezone(&Utc);
             return Ok(Self::At { instant });
+        }
+        if let Some(rest) = raw.strip_prefix("cron:") {
+            let (zone, expr) = rest.split_once(' ').unwrap_or((rest, ""));
+            return havn_core::calendar::Calendar::parse(zone, expr)
+                .map(Self::Calendar)
+                .map_err(|message| DbError::InvalidValue {
+                    column: "cron_jobs.schedule",
+                    message,
+                });
         }
         Err(DbError::InvalidValue {
             column: "cron_jobs.schedule",
@@ -85,6 +100,8 @@ impl Schedule {
                 scheduled.checked_add_signed(step)
             }
             Self::At { .. } => None,
+            // Runs missed while the gateway was down are skipped.
+            Self::Calendar(c) => c.next_after(now.max(scheduled)),
         }
     }
 }
@@ -366,6 +383,26 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn calendar_schedules_round_trip_and_advance() {
+        let raw = "cron:Asia/Shanghai 0 8 * * *";
+        let s = Schedule::parse(raw).expect("parse");
+        assert_eq!(s.encode(), raw);
+        let at = |t: &str| t.parse::<DateTime<Utc>>().unwrap();
+        // Due 08:00 local (00:00 UTC), fired late: the next run is tomorrow.
+        assert_eq!(
+            s.advance_from(at("2026-11-15T00:00:00Z"), at("2026-11-15T00:03:00Z")),
+            Some(at("2026-11-16T00:00:00Z"))
+        );
+        // Down for two days: the missed runs are skipped.
+        assert_eq!(
+            s.advance_from(at("2026-11-15T00:00:00Z"), at("2026-11-17T05:00:00Z")),
+            Some(at("2026-11-18T00:00:00Z"))
+        );
+        assert!(Schedule::parse("cron:Nowhere 0 8 * * *").is_err());
+        assert!(Schedule::parse("cron:UTC 0 8 * *").is_err());
+    }
     use crate::connect_in_memory;
     use crate::repo::agents::{NewAgent, create as create_agent};
     use crate::repo::users::{NewUser, create as create_user};

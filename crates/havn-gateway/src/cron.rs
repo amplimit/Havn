@@ -530,6 +530,7 @@ pub fn describe_schedule(s: &Schedule) -> String {
     match s {
         Schedule::Interval { seconds } => format!("every {seconds}s"),
         Schedule::At { instant } => format!("once at {}", instant.to_rfc3339()),
+        Schedule::Calendar(c) => format!("cron {} in {}", c.expr(), c.zone()),
     }
 }
 

@@ -1700,6 +1700,7 @@ name = "havn-core"
 version = "0.1.9"
 dependencies = [
  "chrono",
+ "chrono-tz",
  "regex",
  "serde",
  "serde_json",

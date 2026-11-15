@@ -19,7 +19,9 @@ use crate::auth::AuthedUser;
 pub struct CreateCronRequest {
     pub name: String,
     pub prompt: String,
-    /// Either `{"interval_seconds": N}` or `{"at": "<RFC3339>"}`.
+    /// `{"interval_seconds": N}`, `{"at": "<RFC3339>"}`, `{"cron": "0 8 * *
+    /// *"}` or `{"every": "daily 08:00"}`; the last two in `timezone`, by
+    /// default the owner's.
     pub schedule: ScheduleInput,
     /// Optional first-run override; when absent, schedules immediately for
     /// `interval` jobs and uses `at` for one-shot.
@@ -58,8 +60,38 @@ fn validate_deliver(s: &str) -> Option<String> {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum ScheduleInput {
-    Interval { interval_seconds: i64 },
-    At { at: DateTime<Utc> },
+    Interval {
+        interval_seconds: i64,
+    },
+    At {
+        at: DateTime<Utc>,
+    },
+    Calendar {
+        cron: String,
+        #[serde(default)]
+        timezone: Option<String>,
+    },
+    Words {
+        every: String,
+        #[serde(default)]
+        timezone: Option<String>,
+    },
+}
+
+/// A calendar schedule from a cron expression or words, in `timezone`
+/// or else `owner`'s zone.
+pub async fn calendar_schedule(
+    db: &sqlx::SqlitePool,
+    owner: havn_core::UserId,
+    expr: &str,
+    timezone: Option<&str>,
+) -> Result<havn_core::calendar::Calendar, String> {
+    let expr = havn_core::calendar::Calendar::from_words(expr).unwrap_or_else(|| expr.to_string());
+    let zone = match timezone {
+        Some(name) => crate::timezone::canonical(name)?,
+        None => crate::timezone::for_user(db, owner).await,
+    };
+    havn_core::calendar::Calendar::parse(&zone, &expr)
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +114,7 @@ pub struct CronJobView {
 pub enum ScheduleView {
     Interval { seconds: i64 },
     At { instant: DateTime<Utc> },
+    Calendar { cron: String, timezone: String },
 }
 
 impl From<CronJob> for CronJobView {
@@ -89,6 +122,10 @@ impl From<CronJob> for CronJobView {
         let schedule = match j.schedule {
             Schedule::Interval { seconds } => ScheduleView::Interval { seconds },
             Schedule::At { instant } => ScheduleView::At { instant },
+            Schedule::Calendar(c) => ScheduleView::Calendar {
+                cron: c.expr().to_string(),
+                timezone: c.zone().to_string(),
+            },
         };
         Self {
             id: j.id.to_string(),
@@ -184,6 +221,19 @@ pub async fn create(
             )
         }
         ScheduleInput::At { at } => (Schedule::At { instant: at }, at),
+        ScheduleInput::Calendar { cron, timezone }
+        | ScheduleInput::Words {
+            every: cron,
+            timezone,
+        } => {
+            let c = calendar_schedule(&state.db, agent.owner_id, &cron, timezone.as_deref())
+                .await
+                .map_err(ApiError::BadRequest)?;
+            let first = c
+                .next_after(now)
+                .ok_or_else(|| ApiError::BadRequest(format!("{:?} never runs", c.expr())))?;
+            (Schedule::Calendar(c), first)
+        }
     };
     let next_run_at = req.next_run_at.unwrap_or(default_next);
 
