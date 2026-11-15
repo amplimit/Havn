@@ -597,7 +597,7 @@ pub const MAX_IMAGE_BYTES: u64 = 3_750_000;
 /// Images one request shows at most, and their bytes in all (Gemini takes
 /// 20 MB of base64 in a request).
 pub const MAX_REQUEST_IMAGES: usize = 5;
-pub const MAX_REQUEST_IMAGE_BYTES: u64 = 14_000_000;
+pub const MAX_REQUEST_IMAGE_BYTES: u64 = 12_000_000;
 /// Largest side of an image shown, in pixels: providers refuse larger.
 pub const MAX_IMAGE_SIDE: u32 = 8000;
 
@@ -617,9 +617,10 @@ pub fn resolve_workspace_images(
     vision: bool,
 ) {
     let mut inbox: Option<std::io::Result<Option<crate::agent_files::WorkspaceDir>>> = None;
-    let mut shown: std::collections::HashMap<String, serde_json::Value> =
+    // What each path gave, so a path named again is not read again.
+    let mut seen: std::collections::HashMap<String, Result<(serde_json::Value, u64), String>> =
         std::collections::HashMap::new();
-    let mut total: u64 = 0;
+    let (mut count, mut total) = (0_usize, 0_u64);
     for message in &mut request.messages {
         let Some(blocks) = message.content.as_array_mut() else {
             continue;
@@ -638,26 +639,36 @@ pub fn resolve_workspace_images(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            // Every block counts, a repeat of one shown too: each is a copy
+            // of its bytes in the request.
             let result = if !vision {
                 Err("this model cannot see images".to_string())
-            } else if let Some(image) = shown.get(&path) {
-                Ok(image.clone())
-            } else if shown.len() >= MAX_REQUEST_IMAGES {
+            } else if let Some(Err(why)) = seen.get(&path) {
+                Err(why.clone())
+            } else if count >= MAX_REQUEST_IMAGES {
                 Err(format!(
                     "a message shows at most {MAX_REQUEST_IMAGES} images"
                 ))
+            } else if let Some(Ok((image, size))) = seen.get(&path) {
+                if total + size > MAX_REQUEST_IMAGE_BYTES {
+                    Err("the images of this message are too large together".to_string())
+                } else {
+                    total += size;
+                    count += 1;
+                    Ok(image.clone())
+                }
             } else {
                 let dir = inbox.get_or_insert_with(|| {
                     crate::agent_files::WorkspaceDir::open(workspace)
                         .and_then(|root| root.subdir(havn_core::INBOX_DIR))
                 });
-                image_block(dir, &path, MAX_REQUEST_IMAGE_BYTES.saturating_sub(total)).map(
-                    |(image, size)| {
-                        total += size;
-                        shown.insert(path.clone(), image.clone());
-                        image
-                    },
-                )
+                let read = image_block(dir, &path, MAX_REQUEST_IMAGE_BYTES.saturating_sub(total));
+                seen.insert(path.clone(), read.clone());
+                read.map(|(image, size)| {
+                    total += size;
+                    count += 1;
+                    image
+                })
             };
             *block = match result {
                 Ok(image) => image,
@@ -1079,21 +1090,17 @@ mod tests {
         };
         resolve_workspace_images(&mut request, ws.path(), true);
         let blocks = request.messages[0].content.as_array().expect("blocks");
-        // The same image a thousand times is one image, read once.
-        assert!(blocks[..1000].iter().all(|b| b["type"] == "image"));
+        // Every block counts, a repeat too: the same image a thousand
+        // times is shown five times.
+        let images = blocks.iter().filter(|b| b["type"] == "image").count();
+        assert_eq!(images, MAX_REQUEST_IMAGES);
         assert!(
-            blocks[1000]["text"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("9000x10")
+            blocks[..MAX_REQUEST_IMAGES]
+                .iter()
+                .all(|b| b["type"] == "image")
         );
-        let images = blocks[1001..]
-            .iter()
-            .filter(|b| b["type"] == "image")
-            .count();
-        assert_eq!(images, MAX_REQUEST_IMAGES - 1, "a.png counts as one");
         assert!(
-            blocks.last().unwrap()["text"]
+            blocks[MAX_REQUEST_IMAGES]["text"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("at most")
