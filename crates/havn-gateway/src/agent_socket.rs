@@ -685,6 +685,7 @@ async fn handle_connection(
             .collect(),
         seccomp_allow_extra: ctx.seccomp_allow_extra.clone(),
         gateway_tools,
+        timezone: Some(crate::timezone::for_agent(&ctx.db, agent_id).await),
     };
     let write_welcome = write_frame(&mut write, &welcome);
     let sent = match tokio::time::timeout(AGENT_WRITE_TIMEOUT, write_welcome).await {
@@ -1208,8 +1209,10 @@ async fn gateway_tools_for(
     agent: &havn_db::repo::agents::Agent,
     policy: &Policy,
 ) -> Vec<GatewayToolSpec> {
+    // Every agent may set its owner's time zone.
+    let mut tools = vec![crate::timezone::spec()];
     if !policy.permissions.can_search_web {
-        return Vec::new();
+        return tools;
     }
     match ctx
         .search
@@ -1218,14 +1221,14 @@ async fn gateway_tools_for(
     {
         Ok(Some(backend)) => {
             debug!(agent_id = %agent.id, backend = backend.name(), "offering web_search");
-            vec![ctx.search.spec()]
+            tools.push(ctx.search.spec());
         }
-        Ok(None) => Vec::new(),
+        Ok(None) => {}
         Err(e) => {
             warn!(agent_id = %agent.id, error = %e, "search credential lookup failed; not offering web_search");
-            Vec::new()
         }
     }
+    tools
 }
 
 async fn handle_gateway_tool_call(agent_id: AgentId, call: GatewayToolCall, ctx: AgentSocketCtx) {
@@ -1251,6 +1254,14 @@ async fn run_gateway_tool(
     call: &GatewayToolCall,
     ctx: &AgentSocketCtx,
 ) -> Result<String, String> {
+    if call.name == crate::timezone::TOOL_NAME {
+        let owner = match agents_repo::find_by_id(&ctx.db, agent_id).await {
+            Ok(Some(agent)) => agent.owner_id,
+            Ok(None) => return Err(format!("agent {agent_id} not found")),
+            Err(e) => return Err(format!("agent lookup failed: {e}")),
+        };
+        return crate::timezone::run_tool(&ctx.db, &ctx.registry, owner, &call.input).await;
+    }
     if call.name != crate::web_search::TOOL_NAME {
         return Err(format!("the gateway has no tool named {:?}", call.name));
     }
@@ -2206,10 +2217,14 @@ mod tests {
             }
         };
 
-        assert!(tools_of(agent).await.is_empty(), "no backend yet");
+        assert_eq!(tools_of(agent).await, ["set_timezone"], "no backend yet");
         add_openrouter_key(&ctx, owner).await;
-        assert_eq!(tools_of(agent).await, vec!["web_search".to_string()]);
-        assert!(tools_of(denied).await.is_empty(), "policy denies search");
+        assert_eq!(tools_of(agent).await, ["set_timezone", "web_search"]);
+        assert_eq!(
+            tools_of(denied).await,
+            ["set_timezone"],
+            "policy denies search"
+        );
     }
 
     #[tokio::test]

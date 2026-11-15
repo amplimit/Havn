@@ -23,6 +23,7 @@ mod query_broker;
 mod reload;
 mod secret_ref;
 mod supervisor;
+mod timezone;
 mod web_search;
 mod webchat;
 mod workspace;
@@ -596,6 +597,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/healthz", get(healthz))
         .route("/auth/info", get(auth::info))
         .route("/me", get(api::me::get))
+        .route(
+            "/me/timezone",
+            get(api::me::timezone_get).put(api::me::timezone_put),
+        )
         .route("/me/audit-log", get(api::audit::list_for_self))
         .route(
             "/embedding",

@@ -39,6 +39,7 @@ reqwest.workspace = true
 serde_norway.workspace = true
 regex.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 arc-swap.workspace = true
 bytemuck.workspace = true
 rmcp.workspace = true

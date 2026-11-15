@@ -277,6 +277,10 @@ per_user_per_minute = 20     # 0 lifts the limit
 brave = "https://search-proxy.internal.example"
 ```
 
+### Time zones
+
+Agents are told the current date, time and weekday in each turn, in their owner's time zone, so "today", "tomorrow at 9" and weekdays come out right. A user without a zone gets the gateway host's (`TZ`, `/etc/timezone` or `/etc/localtime`, else UTC). Users set theirs on an agent's settings page or with `PUT /me/timezone` (`{"timezone": "Asia/Shanghai"}`, or `null` for the host's), and an agent can set it with its `set_timezone` tool when the user says where they are. A change reaches the owner's running agents at once.
+
 Config edits are picked up live: `allowed_origins`, `[llm] default_model` and `[[llm.models]]` apply in place, while every other change (`listen`, `db_path`, paths, `[[bindings]]`, `[[channels]]`, ...) is logged as needing a `havn gateway restart` to apply — the gateway never restarts itself. Per-agent resource limits come from the agent's role policy, not a global config block.
 
 For non-loopback exposure, configure a reverse proxy and enable trust-header mode:

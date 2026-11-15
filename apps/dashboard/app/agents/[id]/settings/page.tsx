@@ -26,6 +26,7 @@ import {
   type McpServerConfig,
   type McpView,
   type ModelsView,
+  type TimezoneView,
 } from "@/lib/api";
 
 function useFlash(ms = 4000): [boolean, () => void] {
@@ -292,6 +293,7 @@ export default function SettingsPage({
       <BootstrapEditor agentId={id} />
 
       <WebAccessEditor agentId={id} />
+      <TimezoneEditor />
 
       <McpEditor agentId={id} />
 
@@ -518,6 +520,113 @@ function BootstrapFileEditor({
         )}
       </div>
     </div>
+  );
+}
+
+/** The caller's time zone, which all their agents tell the time in. */
+function TimezoneEditor() {
+  const [view, setView] = useState<TimezoneView | null>(null);
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const zones = useState<string[]>(() => {
+    try {
+      return Intl.supportedValuesOf("timeZone");
+    } catch {
+      return [];
+    }
+  })[0];
+  const browser = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  useEffect(() => {
+    let cancelled = false;
+    api.timezone().then(
+      (v) => {
+        if (cancelled) return;
+        setView(v);
+        setDraft(v.timezone);
+      },
+      (e: unknown) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  async function save(timezone: string | null) {
+    setSaving(true);
+    setError(null);
+    try {
+      const v = await api.setTimezone(timezone);
+      setView(v);
+      setDraft(v.timezone);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+  if (!view) return error ? <p className="mt-10 text-sm" role="alert">{error}</p> : null;
+  return (
+    <section className="mt-10 card px-4 py-4" aria-labelledby="timezone-title">
+      <h2 id="timezone-title" className="display-h3 mb-2">
+        your time zone
+      </h2>
+      <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
+        All your agents tell the time in it, and read &quot;tomorrow at 9&quot; in it. It
+        applies at once.{" "}
+        {view.chosen ? "" : `Not set: the gateway's zone, ${view.host}, is used.`}
+      </p>
+      {error && (
+        <p className="mb-2 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
+          {error}
+        </p>
+      )}
+      <div className="flex flex-wrap items-center gap-2 text-sm">
+        <input
+          className="input font-mono"
+          list="timezone-names"
+          value={draft}
+          disabled={saving}
+          onChange={(e) => setDraft(e.target.value)}
+          aria-label="time zone"
+          style={{ minWidth: 240 }}
+        />
+        <datalist id="timezone-names">
+          {zones.map((z) => (
+            <option key={z} value={z} />
+          ))}
+        </datalist>
+        <button
+          type="button"
+          className="btn-primary"
+          disabled={saving || !draft.trim() || draft === view.timezone}
+          onClick={() => save(draft.trim())}
+        >
+          save
+        </button>
+        {browser && browser !== view.timezone && (
+          <button
+            type="button"
+            className="btn-ghost"
+            disabled={saving}
+            onClick={() => save(browser)}
+          >
+            use this browser&apos;s ({browser})
+          </button>
+        )}
+        {view.chosen && (
+          <button
+            type="button"
+            className="btn-ghost"
+            disabled={saving}
+            onClick={() => save(null)}
+          >
+            use the gateway&apos;s
+          </button>
+        )}
+      </div>
+    </section>
   );
 }
 

@@ -72,6 +72,13 @@ pub enum AgentToGateway {
     GatewayToolCall(GatewayToolCall),
 }
 
+/// See [`GatewayToAgent::TimezoneUpdate`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TimezoneUpdate {
+    /// IANA name, such as `Asia/Shanghai`.
+    pub timezone: String,
+}
+
 /// Frames sent from the gateway to the agent runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -148,9 +155,15 @@ pub enum GatewayToAgent {
         /// calls as [`AgentToGateway::GatewayToolCall`].
         #[serde(default)]
         gateway_tools: Vec<GatewayToolSpec>,
+        /// IANA time zone of the agent's owner, in which the agent tells
+        /// the time. Absent from older gateways: the runtime uses UTC.
+        #[serde(default)]
+        timezone: Option<String>,
     },
     /// Inbound message from a channel adapter.
     InboundMessage(InboundMessage),
+    /// The owner's time zone changed.
+    TimezoneUpdate(TimezoneUpdate),
     /// LLM call has completed (success or error). Phase 1 is non-streaming;
     /// streaming chunks land in a follow-up vertical (separate frame variant).
     LlmResponse(LlmResponse),
@@ -575,6 +588,7 @@ mod tests {
             tmpfs_mounts: Vec::new(),
             seccomp_allow_extra: Vec::new(),
             gateway_tools: Vec::new(),
+            timezone: None,
         };
         let line = serde_json::to_string(&frame).expect("serialize");
         assert!(line.contains("\"type\":\"welcome\""));
@@ -610,6 +624,7 @@ mod tests {
             tmpfs_mounts: Vec::new(),
             seccomp_allow_extra: Vec::new(),
             gateway_tools: Vec::new(),
+            timezone: None,
         };
         let line = serde_json::to_string(&frame).expect("serialize");
         let parsed: GatewayToAgent = serde_json::from_str(&line).expect("parse");
