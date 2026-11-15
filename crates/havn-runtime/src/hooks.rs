@@ -311,7 +311,7 @@ mod tests {
         let set = set_with(
             "pre_tool_use:
   - tool: file_write
-    deny: [\"^\\.git/\"]
+    deny: ['^\\.git/']
 ",
         );
         assert!(matches!(
