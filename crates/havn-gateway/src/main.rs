@@ -719,9 +719,9 @@ async fn serve() -> anyhow::Result<()> {
         )
         .route(
             "/agents/{id}/files",
-            post(api::files::upload).layer(axum::extract::DefaultBodyLimit::max(
-                api::files::MAX_UPLOAD_BYTES,
-            )),
+            // The handler reads the body itself, up to its limit, once it
+            // knows who is sending.
+            post(api::files::upload),
         )
         .route("/agents/{id}/memory", get(api::memory::list))
         .route(

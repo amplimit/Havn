@@ -453,12 +453,14 @@ export default function ChatPage({
     if (picked.length > room) {
       pushBubble("system", `error: a message carries up to ${MAX_ATTACHMENTS} files`);
     }
-    for (const file of picked.slice(0, Math.max(0, room))) {
-      if (file.size > MAX_UPLOAD_BYTES) {
-        pushBubble("system", `error: ${file.name} is over ${MAX_UPLOAD_BYTES / (1024 * 1024)} MB`);
-        continue;
-      }
-      setUploading((n) => n + 1);
+    const batch = picked.slice(0, Math.max(0, room)).filter((file) => {
+      if (file.size <= MAX_UPLOAD_BYTES) return true;
+      pushBubble("system", `error: ${file.name} is over ${MAX_UPLOAD_BYTES / (1024 * 1024)} MB`);
+      return false;
+    });
+    // The whole batch counts at once, so a second pick cannot pass the limit.
+    setUploading((n) => n + batch.length);
+    for (const file of batch) {
       try {
         const uploaded = await api.files.upload(id, file);
         setAttached((prev) => [...prev, uploaded]);

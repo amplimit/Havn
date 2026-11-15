@@ -37,8 +37,50 @@ const MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
 /// cannot post files here in the owner's name.
 pub const UPLOAD_HEADER: &str = "x-havn-upload";
 
-/// Uploads read and saved at once, across all agents, and PDFs read.
+/// Uploads read and saved at once, across all agents.
 static UPLOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+/// Uploads of one user at once, so one user cannot hold all of them.
+const PER_USER_UPLOADS: usize = 2;
+/// How long an upload's body may take to arrive.
+const UPLOAD_SECONDS: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// One of a user's [`PER_USER_UPLOADS`], given back when dropped.
+struct UserUploads(havn_core::UserId);
+
+impl UserUploads {
+    fn running() -> &'static std::sync::Mutex<std::collections::HashMap<havn_core::UserId, usize>> {
+        static RUNNING: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<havn_core::UserId, usize>>,
+        > = std::sync::OnceLock::new();
+        RUNNING.get_or_init(Default::default)
+    }
+
+    fn take(user: havn_core::UserId) -> Option<Self> {
+        let mut running = Self::running()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let n = running.entry(user).or_insert(0);
+        if *n >= PER_USER_UPLOADS {
+            return None;
+        }
+        *n += 1;
+        Some(Self(user))
+    }
+}
+
+impl Drop for UserUploads {
+    fn drop(&mut self) {
+        let mut running = Self::running()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = running.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                running.remove(&self.0);
+            }
+        }
+    }
+}
 /// One check-and-write at a time, so concurrent uploads cannot each find
 /// room the others then take.
 static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -65,18 +107,34 @@ pub async fn upload(
     // Before the body is read: whoever may not send files here does not
     // get 25 MB buffered.
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
-    let _slot = UPLOADS
+    let Some(_mine) = UserUploads::take(user.id) else {
+        return Err(ApiError::Conflict(format!(
+            "{PER_USER_UPLOADS} uploads of yours are still running; wait for one"
+        )));
+    };
+    let slot = UPLOADS
         .acquire()
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let body = axum::body::to_bytes(body, MAX_UPLOAD_BYTES)
-        .await
-        .map_err(|_| {
-            ApiError::BadRequest(format!(
-                "a file is at most {} MB",
-                MAX_UPLOAD_BYTES / (1024 * 1024)
-            ))
-        })?;
+    // A body sent slowly gives its slot up after a while.
+    let body =
+        match tokio::time::timeout(UPLOAD_SECONDS, axum::body::to_bytes(body, MAX_UPLOAD_BYTES))
+            .await
+        {
+            Ok(Ok(body)) => body,
+            Ok(Err(_)) => {
+                return Err(ApiError::BadRequest(format!(
+                    "the upload broke off, or the file is over {} MB",
+                    MAX_UPLOAD_BYTES / (1024 * 1024)
+                )));
+            }
+            Err(_) => {
+                return Err(ApiError::BadRequest(format!(
+                    "the upload took longer than {}s",
+                    UPLOAD_SECONDS.as_secs()
+                )));
+            }
+        };
     if body.is_empty() {
         return Err(ApiError::BadRequest("the file is empty".into()));
     }
@@ -99,6 +157,8 @@ pub async fn upload(
         tokio::task::spawn_blocking(move || save(&workspace, &stamp, &file, &bytes, reserve))
             .await
             .map_err(|e| ApiError::Internal(format!("saving the file: {e}")))??;
+    // Saved: reading a PDF waits for its own converters, not for this.
+    drop(slot);
 
     // A PDF's text, for the agent to read with file_read. A file whose
     // text cannot be read still arrives.
@@ -253,7 +313,12 @@ fn media_type(headers: &HeaderMap, name: &str) -> String {
                 .trim()
                 .to_ascii_lowercase()
         })
-        .filter(|v| !v.is_empty() && v != "application/octet-stream" && v.len() <= 100);
+        .filter(|v| {
+            !v.is_empty()
+                && v != "application/octet-stream"
+                && v.len() <= 100
+                && v.bytes().all(|b| b.is_ascii_graphic())
+        });
     if let Some(sent) = sent {
         return sent;
     }
@@ -325,6 +390,25 @@ mod tests {
             "Text/CSV; charset=utf-8".parse().unwrap(),
         );
         assert_eq!(media_type(&headers, "a.bin"), "text/csv");
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "text/\tplain".parse().unwrap(),
+        );
+        assert_eq!(media_type(&headers, "a.md"), "text/markdown");
+    }
+
+    #[test]
+    fn a_user_runs_a_few_uploads_at_once() {
+        let user = havn_core::UserId::new();
+        let first = UserUploads::take(user).expect("first");
+        let _second = UserUploads::take(user).expect("second");
+        assert!(UserUploads::take(user).is_none());
+        assert!(
+            UserUploads::take(havn_core::UserId::new()).is_some(),
+            "others are not held up"
+        );
+        drop(first);
+        assert!(UserUploads::take(user).is_some());
     }
 
     #[test]
