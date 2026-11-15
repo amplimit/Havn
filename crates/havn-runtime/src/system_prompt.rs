@@ -79,6 +79,10 @@ pub fn platform_context(agent_name: &str, agent_id: &str, tool_names: &[String])
          \u{2014} things you use stay; things you forget fade. The user can see and delete \
          your memories via the dashboard.\n\
          \n\
+         Past chats: only the latest turns of this chat are in front of you. When the \
+         person refers to something said earlier, in this chat or another one, look it \
+         up with conversation_search instead of guessing.\n\
+         \n\
          Skills: When you solve a complex task successfully, use skill_manage to save the \
          procedure as a reusable skill. Skills are retrieved automatically when relevant to \
          future conversations.\n\
@@ -409,6 +413,7 @@ mod tests {
         assert!(ctx.contains("- memory_search"));
         assert!(ctx.contains("- shell"));
         assert!(ctx.contains("memory_remember, memory_search, and memory_forget"));
+        assert!(ctx.contains("conversation_search"));
         assert!(ctx.contains("skill_manage"));
         assert!(ctx.contains("SOUL.md"));
     }
