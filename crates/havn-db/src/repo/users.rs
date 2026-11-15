@@ -440,3 +440,84 @@ pub async fn set_timezone(pool: &SqlitePool, user: UserId, zone: Option<&str>) -
     }
     Ok(())
 }
+
+/// A user's own domain lists, added to the policy of every agent they
+/// own (migration 0014).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UserDomains {
+    pub allowed_domains: Vec<String>,
+    pub blocked_domains: Vec<String>,
+}
+
+/// `user`'s domain lists; empty when they never set any.
+pub async fn domains(pool: &SqlitePool, user: UserId) -> Result<UserDomains> {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT allowed, blocked FROM user_domains WHERE user_id = ?1")
+            .bind(user.to_string())
+            .fetch_optional(pool)
+            .await?;
+    let Some((allowed, blocked)) = row else {
+        return Ok(UserDomains::default());
+    };
+    let parse = |column: &'static str, raw: &str| {
+        serde_json::from_str::<Vec<String>>(raw).map_err(|e| DbError::InvalidValue {
+            column,
+            message: e.to_string(),
+        })
+    };
+    Ok(UserDomains {
+        allowed_domains: parse("user_domains.allowed", &allowed)?,
+        blocked_domains: parse("user_domains.blocked", &blocked)?,
+    })
+}
+
+pub async fn set_domains(pool: &SqlitePool, user: UserId, lists: &UserDomains) -> Result<()> {
+    let json = |list: &[String]| serde_json::to_string(list).unwrap_or_else(|_| "[]".into());
+    sqlx::query(
+        "INSERT INTO user_domains (user_id, allowed, blocked) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(user_id) DO UPDATE SET allowed = excluded.allowed, blocked = excluded.blocked",
+    )
+    .bind(user.to_string())
+    .bind(json(&lists.allowed_domains))
+    .bind(json(&lists.blocked_domains))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod domain_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+
+    #[tokio::test]
+    async fn domain_lists_round_trip_and_go_with_the_user() {
+        let pool = crate::connect_in_memory().await.expect("db");
+        let user = create(&pool, NewUser { display_name: "u" })
+            .await
+            .expect("user")
+            .id;
+        assert_eq!(
+            domains(&pool, user).await.expect("read"),
+            UserDomains::default()
+        );
+        let lists = UserDomains {
+            allowed_domains: vec!["docs.rs".into()],
+            blocked_domains: vec!["ads.example".into()],
+        };
+        set_domains(&pool, user, &lists).await.expect("set");
+        set_domains(&pool, user, &lists).await.expect("set again");
+        assert_eq!(domains(&pool, user).await.expect("read"), lists);
+        sqlx::query("DELETE FROM users WHERE id = ?1")
+            .bind(user.to_string())
+            .execute(&pool)
+            .await
+            .expect("delete");
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_domains")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(left, 0);
+    }
+}

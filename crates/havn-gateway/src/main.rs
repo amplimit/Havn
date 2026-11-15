@@ -224,6 +224,7 @@ async fn serve() -> anyhow::Result<()> {
     init_tracing();
 
     let mut cfg = GatewayConfig::load().context("loading gateway config")?;
+    policy_resolver::set_operator_blocked_domains(cfg.network.blocked_domains.clone());
     info!(
         version = env!("CARGO_PKG_VERSION"),
         listen = %cfg.listen,
@@ -634,6 +635,10 @@ async fn serve() -> anyhow::Result<()> {
             get(api::me::timezone_get).put(api::me::timezone_put),
         )
         .route("/me/audit-log", get(api::audit::list_for_self))
+        .route(
+            "/me/domains",
+            get(api::search::me_get).put(api::search::me_put),
+        )
         .route(
             "/embedding",
             get(api::embedding::status).patch(api::embedding::patch),

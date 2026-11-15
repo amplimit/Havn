@@ -20,6 +20,7 @@ import {
   ApiError,
   api,
   type AgentView,
+  type AgentWebPatch,
   type AgentWebView,
   type BootstrapView,
   type EmbeddingStatus,
@@ -27,6 +28,7 @@ import {
   type McpView,
   type ModelsView,
   type CronJobView,
+  type MyDomainsView,
   type TimezoneView,
 } from "@/lib/api";
 
@@ -751,11 +753,7 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
     };
   }, [agentId]);
 
-  async function save(patch: {
-    can_search_web?: boolean;
-    can_fetch_web?: boolean;
-    egress_allowed?: boolean;
-  }) {
+  async function save(patch: AgentWebPatch) {
     setSaving(true);
     setError(null);
     try {
@@ -859,9 +857,173 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
               {!view.egress_permitted && " Your role does not allow it."}
             </span>
           </label>
+          <DomainLists
+            key={`${view.allowed_domains.join(",")}|${view.blocked_domains.join(",")}`}
+            title="this agent"
+            allowed={view.allowed_domains}
+            blocked={view.blocked_domains}
+            inheritedAllowed={view.inherited_allowed_domains}
+            inheritedBlocked={view.inherited_blocked_domains}
+            inheritedLabel="from you, your role and the operator"
+            saving={saving}
+            onSave={(allowed_domains, blocked_domains) =>
+              save({ allowed_domains, blocked_domains })
+            }
+          />
+          <MyDomainsEditor
+            onSaved={() => {
+              // The agent's inherited lines include the user's lists.
+              void api.search.agent(agentId).then(setView, () => undefined);
+            }}
+          />
         </div>
       )}
     </section>
+  );
+}
+
+function parseDomains(text: string): string[] {
+  return text
+    .split(/[\s,]+/)
+    .map((d) => d.trim().toLowerCase().replace(/\.$/, ""))
+    .filter((d) => d.length > 0);
+}
+
+/**
+ * Allowed and blocked domains at one level. Allowed domains can be read
+ * by web_fetch without appearing in the conversation first; blocked ones
+ * are never read and win over allowed ones. Inherited lists are shown
+ * read-only: this level can add to them, not remove them. Callers key it
+ * by the saved lists, so a save resets the text.
+ */
+function DomainLists({
+  title,
+  allowed,
+  blocked,
+  inheritedAllowed,
+  inheritedBlocked,
+  inheritedLabel,
+  saving,
+  onSave,
+}: {
+  title: string;
+  allowed: string[];
+  blocked: string[];
+  inheritedAllowed: string[];
+  inheritedBlocked: string[];
+  inheritedLabel: string;
+  saving: boolean;
+  onSave: (allowed: string[], blocked: string[]) => void | Promise<void>;
+}) {
+  const [allowedText, setAllowedText] = useState(allowed.join("\n"));
+  const [blockedText, setBlockedText] = useState(blocked.join("\n"));
+  const changed =
+    parseDomains(allowedText).join("\n") !== allowed.join("\n") ||
+    parseDomains(blockedText).join("\n") !== blocked.join("\n");
+  const inherited = (list: string[]) =>
+    list.length > 0 && (
+      <p className="mt-1 text-xs" style={{ color: "var(--color-body)" }}>
+        Also, {inheritedLabel}: <span className="font-mono">{list.join(", ")}</span>
+      </p>
+    );
+  return (
+    <fieldset className="grid gap-2 text-sm">
+      <legend className="mb-1">
+        <strong>domains for {title}</strong>: one per line; a domain covers its
+        subdomains. Allowed domains can be read without appearing in the
+        conversation first; blocked domains are never read, even when allowed.
+      </legend>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <label className="grid gap-1">
+          <span>allowed</span>
+          <textarea
+            className="input font-mono text-xs"
+            rows={4}
+            value={allowedText}
+            disabled={saving}
+            onChange={(e) => setAllowedText(e.target.value)}
+            placeholder="docs.example.com"
+          />
+          {inherited(inheritedAllowed)}
+        </label>
+        <label className="grid gap-1">
+          <span>blocked</span>
+          <textarea
+            className="input font-mono text-xs"
+            rows={4}
+            value={blockedText}
+            disabled={saving}
+            onChange={(e) => setBlockedText(e.target.value)}
+            placeholder="ads.example.com"
+          />
+          {inherited(inheritedBlocked)}
+        </label>
+      </div>
+      <div>
+        <button
+          type="button"
+          className="btn-ghost"
+          disabled={saving || !changed}
+          onClick={() => onSave(parseDomains(allowedText), parseDomains(blockedText))}
+        >
+          save domains
+        </button>
+      </div>
+    </fieldset>
+  );
+}
+
+/** The caller's own domain lists, added to every agent they own. */
+function MyDomainsEditor({ onSaved }: { onSaved: () => void }) {
+  const [view, setView] = useState<MyDomainsView | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    api.search.myDomains().then(
+      (v) => {
+        if (!cancelled) setView(v);
+      },
+      (e: unknown) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  async function save(allowed_domains: string[], blocked_domains: string[]) {
+    setSaving(true);
+    setError(null);
+    try {
+      setView(await api.search.putMyDomains({ allowed_domains, blocked_domains }));
+      onSaved();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+  if (!view) return error ? <p className="text-sm" role="alert">{error}</p> : null;
+  return (
+    <div className="grid gap-2">
+      {error && (
+        <p className="text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
+          {error}
+        </p>
+      )}
+      <DomainLists
+        key={`${view.allowed_domains.join(",")}|${view.blocked_domains.join(",")}`}
+        title="all your agents"
+        allowed={view.allowed_domains}
+        blocked={view.blocked_domains}
+        inheritedAllowed={view.admin_allowed_domains}
+        inheritedBlocked={view.admin_blocked_domains}
+        inheritedLabel="from your role and the operator"
+        saving={saving}
+        onSave={save}
+      />
+    </div>
   );
 }
 

@@ -14,10 +14,27 @@
 //! sandbox. Gateway-side checks on each request (queries, LLM calls)
 //! resolve the policy again and therefore see edits immediately.
 
+use std::sync::OnceLock;
+
+use havn_core::policy::union;
 use havn_core::{Policy, TeamId, UserId};
 use havn_db::repo::agents::Agent;
 use sqlx::SqlitePool;
 use tracing::{info, warn};
+
+/// The operator's `[network] blocked_domains`.
+static OPERATOR_BLOCKED_DOMAINS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Add `domains` to every agent's blocked domains, where no user, role or
+/// override can remove them. Set once, at startup.
+pub fn set_operator_blocked_domains(domains: Vec<String>) {
+    let _ = OPERATOR_BLOCKED_DOMAINS.set(domains);
+}
+
+#[must_use]
+pub fn operator_blocked_domains() -> &'static [String] {
+    OPERATOR_BLOCKED_DOMAINS.get().map_or(&[], Vec::as_slice)
+}
 
 /// Resolve the effective policy for a user (independent of any one
 /// agent — used to enforce `max_agents`, `can_bind_channels`,
@@ -236,13 +253,31 @@ pub async fn upgrade_stored_overrides(db: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The owner's policy as it applies to `agent`: their role in the agent's
-/// team for a team agent, else [`for_user`].
+/// The policy `agent` gets from its owner: their role policy (in the
+/// agent's team, if any), with the owner's own domain lists and the
+/// operator's blocked domains added.
 pub async fn for_owner(db: &SqlitePool, agent: &Agent) -> Policy {
-    match agent.team_id {
+    let mut policy = match agent.team_id {
         Some(team_id) => for_team_member(db, agent.owner_id, team_id).await,
         None => for_user(db, agent.owner_id).await,
-    }
+    };
+    let personal = match havn_db::repo::users::domains(db, agent.owner_id).await {
+        Ok(lists) => lists,
+        Err(e) => {
+            // Without the user's blocked domains, reading the web is off
+            // rather than unguarded.
+            warn!(user_id = %agent.owner_id, error = %e, "domain list lookup failed; turning web_fetch off");
+            policy.permissions.can_fetch_web = false;
+            havn_db::repo::users::UserDomains::default()
+        }
+    };
+    let net = &mut policy.network_policy;
+    net.allowed_domains = union(&net.allowed_domains, &personal.allowed_domains);
+    net.blocked_domains = union(
+        &union(&net.blocked_domains, &personal.blocked_domains),
+        operator_blocked_domains(),
+    );
+    policy
 }
 
 /// Full per-session resolution chain (spec §6.3): the owner's policy
@@ -264,6 +299,10 @@ pub async fn for_session(db: &SqlitePool, agent: &Agent, multi_user: bool) -> Po
         Some(p) if multi_user => p.clamp_to(&owner),
         Some(mut p) => {
             p.hooks = p.hooks.union(&owner.hooks);
+            // An override's lists add to the owner's, as when clamped.
+            let (net, own) = (&mut p.network_policy, &owner.network_policy);
+            net.allowed_domains = union(&net.allowed_domains, &own.allowed_domains);
+            net.blocked_domains = union(&net.blocked_domains, &own.blocked_domains);
             p
         }
         None => owner,
@@ -692,5 +731,48 @@ mod tests {
         assert!(p.permissions.can_spawn_subagents);
         assert!(p.permissions.can_use_mcp);
         assert_eq!(p.resource_limits.memory_mb, 4096);
+    }
+
+    #[tokio::test]
+    async fn domain_lists_add_up_from_owner_and_override() {
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let owner =
+            havn_db::repo::users::create(&db, havn_db::repo::users::NewUser { display_name: "o" })
+                .await
+                .expect("user")
+                .id;
+        havn_db::repo::users::set_domains(
+            &db,
+            owner,
+            &havn_db::repo::users::UserDomains {
+                allowed_domains: vec!["mine.example".into()],
+                blocked_domains: vec!["noisy.example".into()],
+            },
+        )
+        .await
+        .expect("set");
+        let mut agent = agent_with(json!({
+            "policy": {"network_policy": {
+                "allowed_domains": ["agent.example"],
+                "blocked_domains": []
+            }}
+        }));
+        agent.owner_id = owner;
+        for multi_user in [false, true] {
+            let p = for_session(&db, &agent, multi_user).await;
+            let net = &p.network_policy;
+            assert!(
+                net.allowed_domains.contains(&"agent.example".to_string()),
+                "{multi_user}"
+            );
+            assert!(
+                net.allowed_domains.contains(&"mine.example".to_string()),
+                "{multi_user}"
+            );
+            assert!(
+                net.blocked_domains.contains(&"noisy.example".to_string()),
+                "an override's empty list does not remove the owner's ({multi_user})"
+            );
+        }
     }
 }
