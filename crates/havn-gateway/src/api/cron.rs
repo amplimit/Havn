@@ -139,6 +139,11 @@ pub struct CronJobView {
     pub enabled_toolsets: Vec<String>,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
+    /// The schedule in words, such as `cron 0 8 * * * in Asia/Shanghai`.
+    pub summary: String,
+    /// The latest run, in listings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<CronRunView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -151,6 +156,7 @@ pub enum ScheduleView {
 
 impl From<CronJob> for CronJobView {
     fn from(j: CronJob) -> Self {
+        let summary = crate::cron::describe_schedule(&j.schedule);
         let schedule = match j.schedule {
             Schedule::Interval { seconds } => ScheduleView::Interval { seconds },
             Schedule::At { instant } => ScheduleView::At { instant },
@@ -162,6 +168,7 @@ impl From<CronJob> for CronJobView {
         Self {
             id: j.id.to_string(),
             agent_id: j.agent_id.to_string(),
+            summary,
             name: j.name,
             prompt: j.prompt,
             schedule,
@@ -171,6 +178,7 @@ impl From<CronJob> for CronJobView {
             enabled_toolsets: j.enabled_toolsets,
             enabled: j.enabled,
             created_at: j.created_at,
+            last_run: None,
         }
     }
 }
@@ -206,7 +214,18 @@ pub async fn list(
     let agent = crate::api::agents::resolve_agent(&agent_id, &user, &state).await?;
     let agent_id = agent.id;
     let jobs = cron::list_for_agent(&state.db, agent_id).await?;
-    Ok(Json(jobs.into_iter().map(CronJobView::from).collect()))
+    let mut views = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let id = job.id;
+        let mut view = CronJobView::from(job);
+        view.last_run = cron::list_runs_for_job(&state.db, id, 1)
+            .await?
+            .into_iter()
+            .next()
+            .map(CronRunView::from);
+        views.push(view);
+    }
+    Ok(Json(views))
 }
 
 pub async fn create(

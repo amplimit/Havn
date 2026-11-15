@@ -741,7 +741,10 @@ async fn main() -> anyhow::Result<()> {
             pending: Arc::clone(&pending),
             // The user's settings are for the agent's own turns, not for a
             // subagent's task or another agent's query.
-            registry: base_registry.clone().without("set_timezone"),
+            registry: base_registry
+                .clone()
+                .without("set_timezone")
+                .without("schedule"),
             tool_env: tool_env.clone(),
             max_iterations: subagent_tool::SUBAGENT_MAX_ITERATIONS,
             // Subagents do not republish their own state, and recursion
@@ -764,7 +767,10 @@ async fn main() -> anyhow::Result<()> {
     // subagent_spawn, no agent_query — handed to the temp loop that
     // answers IncomingQuery frames. Combined with the gateway's
     // same-owner + caller-self check, that makes the call graph depth-1.
-    let incoming_query_registry = base_registry.clone().without("set_timezone");
+    let incoming_query_registry = base_registry
+        .clone()
+        .without("set_timezone")
+        .without("schedule");
 
     let parent_registry = base_registry
         .with_subagent(Arc::clone(&bridge))
@@ -1497,14 +1503,18 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     // to the user's turn (spec §9.3). Per-call only; base stays frozen.
     let augmented = augment_with_skills(&ctx, &ctx.system_prompt, &user_text).await;
 
-    let final_text = match run_tool_loop(
-        &ctx,
-        crate::tools::context::WEBCHAT,
-        &mut messages,
-        &augmented,
-        Some(stop),
-    )
-    .await
+    let final_text = match tools::gateway::CONVERSATION
+        .scope(
+            msg.channel_id.clone(),
+            run_tool_loop(
+                &ctx,
+                crate::tools::context::WEBCHAT,
+                &mut messages,
+                &augmented,
+                Some(stop),
+            ),
+        )
+        .await
     {
         Ok(text) => text,
         Err(e) => {

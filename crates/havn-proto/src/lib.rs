@@ -244,6 +244,11 @@ pub struct GatewayToolCall {
     pub request_id: String,
     pub name: String,
     pub input: serde_json::Value,
+    /// The conversation the call came from (an [`InboundMessage`]'s
+    /// `channel_id`), for tools whose results go back to it later, such
+    /// as `schedule`. `None` outside a user's conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
