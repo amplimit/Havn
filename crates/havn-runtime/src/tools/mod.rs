@@ -298,6 +298,16 @@ impl ToolRegistry {
     /// Disabling `file_write` disables `file_edit` too: both change files,
     /// and a policy written before `file_edit` existed means both.
     fn disabled_in(&self, context: &str, tool_name: &str) -> bool {
+        // Scheduled runs, heartbeats and other agents' queries answer no
+        // one's chat message: there are no past chats of theirs to search.
+        if tool_name == "conversation_search"
+            && matches!(
+                context,
+                context::CRON | context::HEARTBEAT | context::AGENT_QUERY
+            )
+        {
+            return true;
+        }
         self.policy
             .context_toolsets
             .0
@@ -559,6 +569,23 @@ mod tests {
             },
         );
         policy
+    }
+
+    #[test]
+    fn conversation_search_is_offered_only_where_a_chat_message_is_answered() {
+        let reg = registry(Policy::default());
+        for hidden in [context::CRON, context::HEARTBEAT, context::AGENT_QUERY] {
+            assert!(
+                !names_in(&reg.schemas_for(hidden)).contains(&"conversation_search".into()),
+                "{hidden}"
+            );
+        }
+        for shown in [context::WEBCHAT, context::SUBAGENT] {
+            assert!(
+                names_in(&reg.schemas_for(shown)).contains(&"conversation_search".into()),
+                "{shown}"
+            );
+        }
     }
 
     #[test]

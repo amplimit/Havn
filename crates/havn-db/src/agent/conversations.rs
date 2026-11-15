@@ -510,10 +510,11 @@ pub async fn around(
              WHERE up.depth < ?2 * 4 \
          ) \
          {SELECT} JOIN up ON up.id = c.id \
-         WHERE c.role IN ('user', 'assistant') ORDER BY up.depth LIMIT ?2"
+         WHERE c.role IN ('user', 'assistant') AND c.channel_id = ?3 ORDER BY up.depth LIMIT ?2"
     ))
     .bind(turn)
     .bind(context)
+    .bind(&found.chat)
     .fetch_all(pool)
     .await?;
     let mut after = Vec::new();
@@ -524,9 +525,10 @@ pub async fn around(
             break;
         }
         let next: Option<ChatTurnRow> = sqlx::query_as(&format!(
-            "{SELECT} WHERE c.parent_id = ?1 ORDER BY c.created_at DESC, c.rowid DESC LIMIT 1"
+            "{SELECT} WHERE c.parent_id = ?1 AND c.channel_id = ?2              ORDER BY c.created_at DESC, c.rowid DESC LIMIT 1"
         ))
         .bind(&at)
+        .bind(&found.chat)
         .fetch_optional(pool)
         .await?;
         let Some(next) = next else {
