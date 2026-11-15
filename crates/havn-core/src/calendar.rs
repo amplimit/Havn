@@ -108,8 +108,8 @@ impl Calendar {
         &self.expr
     }
 
-    /// The first run strictly after `after`, if there is one within
-    /// [`SEARCH_DAYS`].
+    /// The first run strictly after `after`, if there is one within four
+    /// years.
     #[must_use]
     pub fn next_after(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
         let start = after.with_timezone(&self.zone).date_naive();
