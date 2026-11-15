@@ -30,6 +30,7 @@ mod skills;
 mod system_prompt;
 mod tool_loop;
 mod tools;
+mod turns;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -161,6 +162,8 @@ struct Ctx {
     /// separate from `tools` is the recursion guard for cross-agent
     /// queries — a query handler can't issue another query.
     incoming_query_registry: ToolRegistry,
+    /// Conversations with a turn running, for stop and queueing.
+    turns: Arc<turns::Turns>,
 }
 
 impl Ctx {
@@ -179,6 +182,7 @@ impl Ctx {
             model: Arc::clone(&self.model),
             max_tokens: self.max_tokens,
             billing_user_id: None,
+            stop: None,
         }
     }
 }
@@ -740,6 +744,7 @@ async fn main() -> anyhow::Result<()> {
             // Subagents inherit the billing context per call (set when
             // the parent's loop is itself running an IncomingQuery).
             billing_user_id: None,
+            stop: None,
         },
         parent_messages: Arc::clone(&parent_messages),
         semaphore: Arc::new(Semaphore::new(subagent_tool::SUBAGENT_MAX_CONCURRENT)),
@@ -790,6 +795,7 @@ async fn main() -> anyhow::Result<()> {
         agent_query_pending,
         gateway_pending,
         incoming_query_registry,
+        turns: Arc::new(turns::Turns::default()),
     };
     let dispatch = run_reader_loop(&mut reader, ctx).await;
 
@@ -925,10 +931,44 @@ where
                 // user input means "don't fire a curator pass right
                 // now even if 7 days have elapsed".
                 curator_scheduler::record_inbound(&ctx.last_inbound).await;
-                let ctx = ctx.clone();
-                work.spawn(async move {
-                    handle_inbound(msg, ctx).await;
-                });
+                // One turn at a time per conversation; later messages wait
+                // their turn.
+                match ctx.turns.admit(msg) {
+                    turns::Admitted::Start(msg, stop) => {
+                        let ctx = ctx.clone();
+                        work.spawn(async move {
+                            run_conversation(msg, stop, ctx).await;
+                        });
+                    }
+                    turns::Admitted::Queued {
+                        channel_id,
+                        channel,
+                        ahead,
+                    } => {
+                        info!(%channel_id, ahead, "message queued behind a running turn");
+                        // The dashboard shows queued messages itself.
+                        if channel != "webchat" {
+                            send_text(&ctx, channel_id, queued_notice(ahead));
+                        }
+                    }
+                    turns::Admitted::Full { channel_id, .. } => {
+                        warn!(%channel_id, "conversation queue full; dropping a message");
+                        send_text(
+                            &ctx,
+                            channel_id,
+                            format!(
+                                "(Too many messages are waiting ({}); this one was dropped. \
+                                 Send it again once I have answered, or /stop.)",
+                                turns::MAX_QUEUED
+                            ),
+                        );
+                    }
+                }
+            }
+            GatewayToAgent::StopTurn(stop) => {
+                if ctx.turns.stop(&stop.channel_id) {
+                    info!(channel_id = %stop.channel_id, "turn stopped by the user");
+                }
             }
             GatewayToAgent::LlmResponse(resp) => {
                 let mut map = ctx.pending.lock().await;
@@ -1002,6 +1042,11 @@ where
                 );
                 draining = true;
                 work.close();
+                // Queued messages would wait past the drain limit; tell
+                // their senders instead of losing them quietly.
+                for queued in ctx.turns.take_queued() {
+                    send_text(&ctx, queued.channel_id, RESTART_NOTICE.to_string());
+                }
             }
             other => {
                 warn!(?other, "unknown gateway frame — ignoring");
@@ -1130,6 +1175,7 @@ async fn handle_heartbeat(ctx: Ctx) {
         crate::tools::context::HEARTBEAT,
         &mut messages,
         &augmented,
+        None,
     )
     .await
     {
@@ -1338,7 +1384,58 @@ fn json_escape(s: &str) -> String {
     serde_json::to_string(s).expect("serde_json::to_string is infallible for &str")
 }
 
-async fn handle_inbound(msg: InboundMessage, ctx: Ctx) {
+/// Run `msg`'s turn, then the messages queued behind it in the same
+/// conversation, one after another.
+async fn run_conversation(
+    mut msg: InboundMessage,
+    mut stop: tokio_util::sync::CancellationToken,
+    ctx: Ctx,
+) {
+    loop {
+        let channel_id = msg.channel_id.clone();
+        handle_inbound(msg, stop, ctx.clone()).await;
+        match ctx.turns.next(&channel_id) {
+            Some((queued, token)) => {
+                msg = queued;
+                stop = token;
+            }
+            None => break,
+        }
+    }
+}
+
+const RESTART_NOTICE: &str = "(The agent is restarting, so a message you sent while it was \
+     replying was not answered. Please send it again in a moment.)";
+
+fn queued_notice(ahead: usize) -> String {
+    if ahead <= 1 {
+        "(Queued: I will answer this after the reply I am working on. Send /stop to stop that reply.)"
+            .to_string()
+    } else {
+        format!(
+            "(Queued behind {ahead} messages: I will answer in order. Send /stop to stop the \
+             current reply.)"
+        )
+    }
+}
+
+fn send_text(ctx: &Ctx, channel_id: String, text: String) {
+    let outbound = OutboundMessage {
+        channel_id,
+        content: MessageContent::Text { text },
+        reply_to: None,
+    };
+    // Never wait on a full writer queue: the reader loop calls this, and
+    // replies it must route would stall behind it.
+    if let Err(e) = ctx
+        .writer_tx
+        .try_send(AgentToGateway::OutboundMessage(outbound))
+    {
+        warn!(error = %e, "could not send a notice");
+    }
+}
+
+async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::CancellationToken, ctx: Ctx) {
     let user_text = match render_content_for_llm(&msg.content) {
         Some(t) => t,
         None => {
@@ -1351,6 +1448,7 @@ async fn handle_inbound(msg: InboundMessage, ctx: Ctx) {
     if let Err(e) = conversations::record(&ctx.pool, &msg.channel_id, Role::User, &user_text).await
     {
         error!(error = %e, "could not persist user turn");
+        send_text(&ctx, msg.channel_id, format!("(internal error: {e})"));
         return;
     }
 
@@ -1358,6 +1456,7 @@ async fn handle_inbound(msg: InboundMessage, ctx: Ctx) {
         Ok(h) => h,
         Err(e) => {
             error!(error = %e, "could not load conversation history");
+            send_text(&ctx, msg.channel_id, format!("(internal error: {e})"));
             return;
         }
     };
@@ -1386,6 +1485,7 @@ async fn handle_inbound(msg: InboundMessage, ctx: Ctx) {
         crate::tools::context::WEBCHAT,
         &mut messages,
         &augmented,
+        Some(stop),
     )
     .await
     {
@@ -1429,8 +1529,10 @@ async fn run_tool_loop(
     context: &'static str,
     messages: &mut Vec<serde_json::Value>,
     system_prompt: &SystemPrompt,
+    stop: Option<tokio_util::sync::CancellationToken>,
 ) -> anyhow::Result<String> {
-    let handle = ctx.parent_handle();
+    let mut handle = ctx.parent_handle();
+    handle.stop = stop;
     tool_loop::run(&handle, context, messages, system_prompt).await
 }
 
@@ -1748,6 +1850,7 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
         // override; the gateway resolves credentials and bills usage
         // against `billing_user_id` instead of this agent's owner.
         billing_user_id: Some(query.billing_user_id.clone()),
+        stop: None,
     };
 
     // Use the typed runner so degraded outcomes (LLM error, iteration
@@ -1788,6 +1891,12 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
                 partial_text,
             )
         }
+        Err(tool_loop::RunError::Stopped { partial_text }) => (
+            AgentQueryOutcome::Error {
+                message: "the turn was stopped".into(),
+            },
+            partial_text,
+        ),
         Err(tool_loop::RunError::Infra(e)) => {
             // Infrastructure failure inside the temp loop — the LLM
             // proxy never spoke. Surface to the caller as Error; the

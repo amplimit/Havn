@@ -436,6 +436,8 @@ Havn ships a stable HTTP + WebSocket protocol at `/api/v1/channel` for external 
 
 An agent can only send through the channel accounts that `[[bindings]]` binds to it. With an account's `dm_policy = "allowlist"` (the default) it can only message senders in `allow_from` or admitted with an invite code (below); with `dm_policy = "open"` it can message anyone the bot can reach on that platform, so use `open` only for bots meant to be public.
 
+An agent answers one message at a time per conversation. A message sent while it is still replying waits and is answered after that reply, in order (up to 20 waiting; channel users are told it was queued). The dashboard chat has a stop button while a reply runs, and in a channel conversation `/stop` (or `/stop@botname`) stops it: the agent ends the model call or tool call in progress, kills the processes a running shell command started, and keeps what it had said so far, marked `(stopped)`. Waiting messages are answered after it.
+
 ### Invite codes
 
 Instead of adding every team member to `allow_from` and restarting the gateway, an operator can hand out one-time invite codes for an `allowlist` account:

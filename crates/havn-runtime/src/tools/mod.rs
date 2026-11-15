@@ -56,7 +56,7 @@ pub mod context {
 /// Per-call execution context shared across all tools in a single tool call.
 #[derive(Clone)]
 pub struct ToolCtx {
-    /// Agent's writable workspace root. `file_read` / `file_write` are scoped here.
+    /// Agent's writable workspace root. The file tools are scoped here.
     pub workspace_dir: PathBuf,
     /// Per-agent `SQLite` pool for memory / conversation queries.
     pub agent_db: SqlitePool,
@@ -152,6 +152,7 @@ impl ToolRegistry {
             Arc::new(memory::MemoryForgetTool),
             Arc::new(files::FileReadTool),
             Arc::new(files::FileWriteTool),
+            Arc::new(files::FileEditTool),
         ];
         if policy.permissions.can_use_shell {
             tools.push(Arc::new(shell::ShellTool));
@@ -275,12 +276,19 @@ impl ToolRegistry {
 
     /// True iff the named tool is disabled in this execution context by
     /// `policy.context_toolsets[context].disabled`.
+    /// Disabling `file_write` disables `file_edit` too: both change files,
+    /// and a policy written before `file_edit` existed means both.
     fn disabled_in(&self, context: &str, tool_name: &str) -> bool {
         self.policy
             .context_toolsets
             .0
             .get(context)
-            .is_some_and(|entry| entry.disabled.iter().any(|d| d == tool_name))
+            .is_some_and(|entry| {
+                entry
+                    .disabled
+                    .iter()
+                    .any(|d| d == tool_name || (d == "file_write" && tool_name == "file_edit"))
+            })
     }
 
     /// JSON array of tool descriptors in the shape Anthropic's `/v1/messages`
@@ -386,7 +394,7 @@ impl ToolRegistry {
 /// |------|-----------|
 /// | `shell` | `command` |
 /// | `web_fetch` | `url` |
-/// | `file_read` / `file_write` | `path` |
+/// | `file_read` / `file_write` / `file_edit` | `path` |
 /// | `memory_search` | `query` |
 /// | other | concatenated values, lossy fallback |
 ///
@@ -402,7 +410,7 @@ fn flatten_input_for_hook(tool: &str, input: &serde_json::Value) -> String {
     match tool {
         "shell" => pick("command"),
         "web_fetch" => pick("url"),
-        "file_read" | "file_write" => pick("path"),
+        "file_read" | "file_write" | "file_edit" => pick("path"),
         "memory_search" => pick("query"),
         "memory_remember" | "memory_forget" => pick("key"),
         "subagent_spawn" => pick("task"),
@@ -458,6 +466,7 @@ mod tests {
             "memory_forget",
             "file_read",
             "file_write",
+            "file_edit",
             "shell",
             "skill_manage",
         ] {
@@ -589,6 +598,7 @@ mod tests {
             "memory_forget",
             "file_read",
             "file_write",
+            "file_edit",
             "shell",
             "skill_manage",
         ]));
