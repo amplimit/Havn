@@ -35,6 +35,9 @@ pub struct AgentRegistry {
     registered: Arc<Notify>,
     /// Set while the gateway stops: agents get no new work.
     draining: Arc<AtomicBool>,
+    /// URLs in the messages users sent each agent, which its `web_fetch`
+    /// may read.
+    known_urls: Arc<crate::web_fetch::KnownUrls>,
 }
 
 #[derive(Debug)]
@@ -383,6 +386,31 @@ impl AgentRegistry {
             .collect()
     }
 
+    /// URLs users sent, and pages and search results showed, to each
+    /// agent: what its `web_fetch` may read.
+    #[must_use]
+    pub fn known_urls(&self) -> &crate::web_fetch::KnownUrls {
+        &self.known_urls
+    }
+
+    /// Record the URLs in a message a user sent, so the agent can read
+    /// them. Text the agent's model wrote never passes here.
+    fn note_urls(&self, agent_id: AgentId, frame: &GatewayToAgent) {
+        let GatewayToAgent::InboundMessage(message) = frame else {
+            return;
+        };
+        let text = match &message.content {
+            havn_core::MessageContent::Text { text } => text.as_str(),
+            havn_core::MessageContent::Image {
+                caption: Some(caption),
+                ..
+            } => caption.as_str(),
+            havn_core::MessageContent::Audio { transcript, .. } => transcript.as_str(),
+            _ => return,
+        };
+        self.known_urls.record_text(agent_id, text);
+    }
+
     /// Stop handing agents new work: from now on [`Self::send`] and
     /// [`Self::try_send`] refuse frames that start it. Frames serving work
     /// already in flight still go through.
@@ -416,6 +444,7 @@ impl AgentRegistry {
             return Err(SendError::Draining);
         }
         let tx = self.sender(agent_id).await?;
+        self.note_urls(agent_id, &frame);
         match tx.send_timeout(frame, SEND_TIMEOUT).await {
             Ok(()) => Ok(()),
             Err(mpsc::error::SendTimeoutError::Closed(_)) => Err(SendError::ChannelClosed),
@@ -438,6 +467,7 @@ impl AgentRegistry {
             return Err(SendError::Draining);
         }
         let tx = self.sender(agent_id).await?;
+        self.note_urls(agent_id, &frame);
         tx.try_send(frame).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => SendError::Stalled(agent_id),
             mpsc::error::TrySendError::Closed(_) => SendError::ChannelClosed,
@@ -482,6 +512,56 @@ mod tests {
 
     fn fake_handle() -> AgentHandle {
         AgentHandle::new(AgentId::new(), 12345)
+    }
+
+    fn inbound(content: havn_core::MessageContent) -> GatewayToAgent {
+        GatewayToAgent::InboundMessage(havn_core::InboundMessage {
+            channel_id: "c".into(),
+            sender_id: "s".into(),
+            channel: "webchat".into(),
+            content,
+            timestamp: chrono::Utc::now(),
+            raw: serde_json::Value::Null,
+        })
+    }
+
+    #[tokio::test]
+    async fn urls_users_send_become_readable_by_that_agent() {
+        let reg = AgentRegistry::new();
+        let handle = fake_handle();
+        let id = handle.agent_id;
+        reg.register(handle).await;
+        let (tx, mut rx) = mpsc::channel::<GatewayToAgent>(8);
+        reg.attach(id, tx).await.expect("attach");
+        let url = |s: &str| crate::web_fetch::normalize(s).expect("url");
+
+        assert!(!reg.known_urls().contains(id, &url("https://example.com/a")));
+        reg.send(
+            id,
+            inbound(havn_core::MessageContent::Text {
+                text: "please read https://example.com/a".into(),
+            }),
+        )
+        .await
+        .expect("send");
+        assert!(rx.recv().await.is_some());
+        assert!(reg.known_urls().contains(id, &url("https://example.com/a")));
+        assert!(
+            !reg.known_urls()
+                .contains(AgentId::new(), &url("https://example.com/a"))
+        );
+
+        reg.try_send(
+            id,
+            inbound(havn_core::MessageContent::Audio {
+                transcript: "go to www.example.org/b".into(),
+                duration_seconds: None,
+                url: None,
+            }),
+        )
+        .await
+        .expect("try_send");
+        assert!(reg.known_urls().contains(id, &url("https://example.org/b")));
     }
 
     #[tokio::test]

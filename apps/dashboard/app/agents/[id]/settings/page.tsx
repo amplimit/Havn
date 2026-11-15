@@ -547,7 +547,11 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
     };
   }, [agentId]);
 
-  async function save(patch: { can_search_web?: boolean; egress_allowed?: boolean }) {
+  async function save(patch: {
+    can_search_web?: boolean;
+    can_fetch_web?: boolean;
+    egress_allowed?: boolean;
+  }) {
     setSaving(true);
     setError(null);
     try {
@@ -562,6 +566,7 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
 
   if (unsupported) return null;
   const searchLocked = saving || (view !== null && !view.search_permitted && !view.can_search_web);
+  const fetchLocked = saving || (view !== null && !view.fetch_permitted && !view.can_fetch_web);
   const egressLocked = saving || (view !== null && !view.egress_permitted && !view.egress_allowed);
 
   return (
@@ -622,16 +627,31 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
           <label className="flex items-start gap-3 text-sm">
             <input
               type="checkbox"
+              className={`mt-1 h-4 w-4 shrink-0 ${fetchLocked ? "cursor-not-allowed" : "cursor-pointer"}`}
+              checked={view.can_fetch_web}
+              disabled={fetchLocked}
+              onChange={(e) => save({ can_fetch_web: e.target.checked })}
+            />
+            <span>
+              <strong>read web pages</strong>: the gateway reads a page or PDF for the
+              agent and answers its question about it with a model call, so it works
+              without network access. The agent can read only links you sent it, search
+              results and links on pages it read.
+              {!view.fetch_permitted && " Your role does not allow it."}
+            </span>
+          </label>
+          <label className="flex items-start gap-3 text-sm">
+            <input
+              type="checkbox"
               className={`mt-1 h-4 w-4 shrink-0 ${egressLocked ? "cursor-not-allowed" : "cursor-pointer"}`}
               checked={view.egress_allowed}
               disabled={egressLocked}
               onChange={(e) => save({ egress_allowed: e.target.checked })}
             />
             <span>
-              <strong>network access</strong>: the agent reaches the public internet
-              from its sandbox and gets <code className="font-mono">web_fetch</code>;
-              its shell tools can download and upload too. Private, link-local and
-              gateway-host addresses stay blocked.
+              <strong>network access</strong>: the agent&apos;s shell tools reach the
+              public internet from its sandbox, so they can download and upload. Private,
+              link-local and gateway-host addresses stay blocked.
               {!view.egress_permitted && " Your role does not allow it."}
             </span>
           </label>

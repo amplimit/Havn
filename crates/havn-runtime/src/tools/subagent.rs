@@ -269,7 +269,6 @@ mod tests {
         let env = ToolCtx {
             workspace_dir: std::path::PathBuf::from("/tmp"),
             agent_db: pool,
-            http: reqwest::Client::new(),
             policy: Arc::clone(&policy),
             embedder: None,
         };

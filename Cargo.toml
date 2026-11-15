@@ -67,6 +67,13 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 # HTTP client (rustls — no OpenSSL dep).
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json", "stream", "http2"] }
 
+# `web_fetch` page conversion (gateway, in a child process): HTML to
+# Markdown, PDF to text, legacy charsets to UTF-8. All pure Rust.
+htmd = "0.5"
+pdf-extract = "0.12"
+encoding_rs = "0.8"
+url = "2"
+
 # Filesystem watch + atomic Arc swap for hot config reload (spec §8.4).
 notify = "8"
 arc-swap = "1"
