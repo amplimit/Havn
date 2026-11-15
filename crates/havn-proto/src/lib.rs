@@ -18,7 +18,9 @@ pub use codec::{FrameError, read_frame, write_frame};
 /// 0.2.0: `CronTick`/`CronResult` carry `run_id`.
 /// 0.3.0: models are `provider:model`; an empty `LlmRequest.model` asks
 /// for the gateway's default model.
-pub const PROTOCOL_VERSION: &str = "0.3.0";
+/// 0.4.0: `StopTurn` and `TimezoneUpdate`, which an older runtime cannot
+/// parse and would exit on; the version check refuses the mix instead.
+pub const PROTOCOL_VERSION: &str = "0.4.0";
 
 /// How often a runtime sends [`AgentToGateway::LivenessPing`] once it is
 /// up. The gateway restarts an agent that stays connected but silent for
@@ -77,6 +79,13 @@ pub enum AgentToGateway {
 pub struct TimezoneUpdate {
     /// IANA name, such as `Asia/Shanghai`.
     pub timezone: String,
+}
+
+/// See [`GatewayToAgent::StopTurn`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StopTurn {
+    /// The conversation, as in [`InboundMessage::channel_id`].
+    pub channel_id: String,
 }
 
 /// Frames sent from the gateway to the agent runtime.
@@ -164,6 +173,9 @@ pub enum GatewayToAgent {
     InboundMessage(InboundMessage),
     /// The owner's time zone changed.
     TimezoneUpdate(TimezoneUpdate),
+    /// Stop the turn running in a conversation (the user pressed stop or
+    /// sent `/stop`). Messages queued behind it still run.
+    StopTurn(StopTurn),
     /// LLM call has completed (success or error). Phase 1 is non-streaming;
     /// streaming chunks land in a follow-up vertical (separate frame variant).
     LlmResponse(LlmResponse),

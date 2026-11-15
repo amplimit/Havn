@@ -779,6 +779,17 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
             return;
         }
     };
+    // `/stop` stops the reply running in this conversation instead of
+    // reaching the agent as a message.
+    if is_stop_command(&content) {
+        let stop = GatewayToAgent::StopTurn(havn_proto::StopTurn {
+            channel_id: encoded_channel_id,
+        });
+        if let Err(e) = state.registry.send(agent_id, stop).await {
+            warn!(channel, %agent_id, error = ?e, "failed to forward StopTurn");
+        }
+        return;
+    }
     let msg = InboundMessage {
         channel_id: encoded_channel_id,
         sender_id: inb.sender_id.clone(),
@@ -1040,9 +1051,39 @@ async fn sender_access(
     SenderAccess::Admitted
 }
 
+/// A text message that is only `/stop` (Telegram adds `@botname`).
+fn is_stop_command(content: &MessageContent) -> bool {
+    let MessageContent::Text { text } = content else {
+        return false;
+    };
+    let text = text.trim();
+    text.eq_ignore_ascii_case("/stop")
+        || text.split_once('@').is_some_and(|(cmd, bot)| {
+            cmd.eq_ignore_ascii_case("/stop")
+                && !bot.is_empty()
+                && bot.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_commands_are_recognised() {
+        let text = |t: &str| MessageContent::Text { text: t.into() };
+        assert!(is_stop_command(&text("/stop")));
+        assert!(is_stop_command(&text("  /STOP ")));
+        assert!(is_stop_command(&text("/stop@havn_bot")));
+        assert!(!is_stop_command(&text("/stop now please")));
+        assert!(!is_stop_command(&text("please /stop")));
+        assert!(!is_stop_command(&text("/stop@bot\nplease do X")));
+        assert!(!is_stop_command(&text("/stop@")));
+        assert!(!is_stop_command(&MessageContent::Image {
+            url: "u".into(),
+            caption: Some("/stop".into())
+        }));
+    }
 
     #[test]
     fn tokens_match_constant_time_basic() {
