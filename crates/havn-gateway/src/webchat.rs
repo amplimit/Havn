@@ -153,6 +153,15 @@ pub enum ServerMessage {
     },
     /// The approval request `id` was decided or ended; stop showing it.
     ApprovalClosed { id: String },
+    /// What the reply just sent saved to or forgot from memory.
+    Memory {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        conversation: Option<String>,
+        /// The reply's stored turn: the note goes under it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn: Option<String>,
+        changes: Vec<havn_proto::MemoryChange>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -335,6 +344,57 @@ impl WebChatRouter {
             },
         };
         self.send_to_session(agent_id, session_id, server_msg).await
+    }
+
+    /// Show the tabs of the session a reply went to what its turn changed
+    /// in memory. Ignored for conversations that are not webchat sessions
+    /// (a channel's sender).
+    pub async fn memory_changed(
+        &self,
+        agent_id: AgentId,
+        changed: havn_proto::MemoryChanged,
+    ) -> Result<(), DeliverError> {
+        let session_id: SessionId = changed
+            .channel_id
+            .parse()
+            .map_err(|_| DeliverError::InvalidChannelId(changed.channel_id.clone()))?;
+        let changes = changed
+            .changes
+            .into_iter()
+            .take(havn_proto::MAX_MEMORY_CHANGES)
+            .map(|mut change| {
+                change.key = change
+                    .key
+                    .chars()
+                    .take(havn_proto::MAX_MEMORY_KEY_CHARS)
+                    .collect();
+                change.value = change
+                    .value
+                    .chars()
+                    .take(havn_proto::MAX_MEMORY_CHANGE_CHARS)
+                    .collect();
+                change.kind = change.kind.chars().take(32).collect();
+                // Row ids are UUIDs; anything else cannot be undone.
+                let row = |id: Option<String>| id.filter(|id| id.len() <= 64);
+                change.before = row(change.before);
+                change.after = row(change.after);
+                change
+            })
+            .collect();
+        let turn = changed.turn.filter(|t| t.len() <= 64);
+        let conversation = changed
+            .conversation
+            .filter(|c| c.len() <= MAX_CONVERSATION_ID);
+        self.send_to_session(
+            agent_id,
+            session_id,
+            ServerMessage::Memory {
+                conversation,
+                turn,
+                changes,
+            },
+        )
+        .await
     }
 
     /// Show `message` as an error in every open tab of `session_id`.
@@ -553,6 +613,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_changes_reach_the_session_cut_to_size() {
+        let router = WebChatRouter::new();
+        let agent_id = AgentId::new();
+        let session_id: SessionId = Uuid::now_v7();
+        let (tx, mut rx) = mpsc::channel::<ServerMessage>(8);
+        router.register(session_id, agent_id, tx).await;
+
+        let change = |n: usize| havn_proto::MemoryChange {
+            action: havn_proto::MemoryAction::Saved,
+            key: format!("k{n}"),
+            value: "v".repeat(2000),
+            kind: "preference".into(),
+            before: None,
+            after: Some(format!("row{n}")),
+        };
+        let changed = havn_proto::MemoryChanged {
+            channel_id: session_id.to_string(),
+            conversation: Some("c".repeat(65)),
+            turn: Some("t".into()),
+            changes: (0..30).map(change).collect(),
+        };
+        router
+            .memory_changed(agent_id, changed.clone())
+            .await
+            .expect("shown");
+        match rx.recv().await.expect("frame") {
+            ServerMessage::Memory {
+                conversation,
+                turn,
+                changes,
+            } => {
+                assert_eq!(turn.as_deref(), Some("t"));
+                assert_eq!(changes[3].after.as_deref(), Some("row3"));
+                assert!(conversation.is_none(), "an oversized chat id is dropped");
+                assert_eq!(changes.len(), havn_proto::MAX_MEMORY_CHANGES);
+                assert_eq!(
+                    changes[0].value.chars().count(),
+                    havn_proto::MAX_MEMORY_CHANGE_CHARS
+                );
+            }
+            other => panic!("expected Memory, got {other:?}"),
+        }
+        // Another agent's session is not shown them.
+        assert!(
+            router
+                .memory_changed(AgentId::new(), changed)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn deliver_routes_outbound_to_matching_session() {
         let router = WebChatRouter::new();
         let agent_id = AgentId::new();
@@ -574,7 +686,8 @@ mod tests {
             ServerMessage::AgentMessage { content, .. } => assert_eq!(content, "hi"),
             ServerMessage::Error { .. }
             | ServerMessage::Approval { .. }
-            | ServerMessage::ApprovalClosed { .. } => {
+            | ServerMessage::ApprovalClosed { .. }
+            | ServerMessage::Memory { .. } => {
                 panic!("expected AgentMessage, got Error")
             }
         }
@@ -665,7 +778,8 @@ mod tests {
                 ServerMessage::AgentMessage { content, .. } => assert_eq!(content, "hello"),
                 ServerMessage::Error { .. }
                 | ServerMessage::Approval { .. }
-                | ServerMessage::ApprovalClosed { .. } => {
+                | ServerMessage::ApprovalClosed { .. }
+                | ServerMessage::Memory { .. } => {
                     panic!("unexpected Error")
                 }
             }
@@ -706,7 +820,8 @@ mod tests {
                 ServerMessage::AgentMessage { content, .. } => assert_eq!(content, expected),
                 ServerMessage::Error { .. }
                 | ServerMessage::Approval { .. }
-                | ServerMessage::ApprovalClosed { .. } => {
+                | ServerMessage::ApprovalClosed { .. }
+                | ServerMessage::Memory { .. } => {
                     panic!("unexpected Error")
                 }
             }

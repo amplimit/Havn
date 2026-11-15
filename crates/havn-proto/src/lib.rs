@@ -79,7 +79,51 @@ pub enum AgentToGateway {
     /// An approval request ended without a decision (timed out, or its
     /// turn was stopped); the gateway stops showing it.
     ApprovalClosed { request_id: String },
+    /// What a reply's turn saved to or forgot from the agent's memory,
+    /// sent after the reply, for the dashboard to show under it.
+    MemoryChanged(MemoryChanged),
 }
+
+/// See [`AgentToGateway::MemoryChanged`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryChanged {
+    /// The conversation the turn answered.
+    pub channel_id: String,
+    /// Its chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
+    /// The reply's stored turn, which the changes are shown under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<String>,
+    pub changes: Vec<MemoryChange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryChange {
+    pub action: MemoryAction,
+    pub key: String,
+    /// What was saved, or what the forgotten entry said.
+    pub value: String,
+    pub kind: String,
+    /// The turn's net change to `key`, by row: the entry it replaced or
+    /// forgot, and the one it left active. What undoing it puts back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryAction {
+    Saved,
+    Forgot,
+}
+
+/// Changes one [`MemoryChanged`] carries at most.
+pub const MAX_MEMORY_CHANGES: usize = 20;
+/// Characters of a changed entry's value shown.
+pub const MAX_MEMORY_CHANGE_CHARS: usize = 500;
 
 /// See [`GatewayToAgent::TimezoneUpdate`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -408,6 +452,16 @@ pub enum DataQuery {
         #[serde(default)]
         expiry: MemoryExpiry,
     },
+    /// Undo a change to `key` shown in a chat: take entry `after` out and
+    /// bring entry `before` back (row ids from its [`MemoryChange`]):
+    /// `{"undone": bool}`, false when the key changed since.
+    UndoMemory {
+        key: String,
+        #[serde(default)]
+        before: Option<String>,
+        #[serde(default)]
+        after: Option<String>,
+    },
 }
 
 /// Longest memory key the dashboard can save.
@@ -422,16 +476,7 @@ pub const MAX_MEMORY_DAYS: u32 = 3650;
 /// The gateway answers with it before asking the agent, which checks
 /// again.
 pub fn check_memory(key: &str, value: &str, expiry: MemoryExpiry) -> Result<(), String> {
-    // A key of dots would be a dot segment in the entry's URL.
-    if key.trim().trim_matches('.').is_empty()
-        || key.chars().count() > MAX_MEMORY_KEY_CHARS
-        || key.chars().any(char::is_control)
-    {
-        return Err(format!(
-            "a memory key has 1 to {MAX_MEMORY_KEY_CHARS} characters, none of them control \
-             characters"
-        ));
-    }
+    check_memory_key(key)?;
     if value.trim().is_empty() {
         return Err("the memory has no text".into());
     }
@@ -446,6 +491,22 @@ pub fn check_memory(key: &str, value: &str, expiry: MemoryExpiry) -> Result<(), 
     {
         return Err(format!(
             "a memory is kept for 1 to {MAX_MEMORY_DAYS} days unused"
+        ));
+    }
+    Ok(())
+}
+
+/// Why `key` cannot name a memory entry, if it cannot: the agent's keys
+/// too must be ones the dashboard can address.
+pub fn check_memory_key(key: &str) -> Result<(), String> {
+    // A key of dots would be a dot segment in the entry's URL.
+    if key.trim().trim_matches('.').is_empty()
+        || key.chars().count() > MAX_MEMORY_KEY_CHARS
+        || key.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "a memory key has 1 to {MAX_MEMORY_KEY_CHARS} characters, none of them control \
+             characters"
         ));
     }
     Ok(())

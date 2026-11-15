@@ -12,7 +12,7 @@ import {
 } from "@/lib/api";
 import { openChat, type ChatHandle } from "@/lib/websocket";
 import { Markdown } from "@/components/Markdown";
-import type { ServerMessage } from "@/lib/protocol";
+import type { MemoryChange, ServerMessage } from "@/lib/protocol";
 import {
   BookOpen,
   Brain,
@@ -41,6 +41,10 @@ type Bubble = {
   /** The stored turn it shows, with its versions; absent until stored. */
   turn?: string;
   versions?: string[];
+  /** A note of what a reply saved to or forgot from memory, and that
+   * reply's stored turn, which it stays under. */
+  memory?: MemoryChange[];
+  anchor?: string;
 };
 
 const AGENT_POLL_MS = 5000;
@@ -81,12 +85,21 @@ function mergeStored(prev: Bubble[], fetched: Bubble[], since: number): Bubble[]
   const shown = new Map(prev.flatMap((b) => (b.turn ? [[b.turn, b.id] as const] : [])));
   const stored = fetched.map((s) => (s.turn && shown.has(s.turn) ? { ...s, id: shown.get(s.turn)! } : s));
   const recent = stored.filter((s) => s.ts >= since - CLOCK_SKEW_MS);
-  const kept = prev.filter(
-    (b) =>
-      b.role === "system" ||
-      (b.ts >= since && !recent.some((s) => s.role === b.role && s.content === b.content)),
-  );
+  const kept = prev
+    .filter(
+      (b) =>
+        b.role === "system" ||
+        (b.ts >= since && !recent.some((s) => s.role === b.role && s.content === b.content)),
+    )
+    .map((b) => underAnchor(b, stored));
   return [...stored, ...kept].sort((a, b) => a.ts - b.ts);
+}
+
+// A memory note goes right under the reply it came with, whatever the
+// browser's clock says.
+function underAnchor(b: Bubble, stored: Bubble[]): Bubble {
+  const reply = b.anchor ? stored.find((s) => s.turn === b.anchor) : undefined;
+  return reply ? { ...b, ts: reply.ts + 0.5 } : b;
 }
 
 export default function ChatPage({
@@ -304,6 +317,23 @@ export default function ChatPage({
             setApprovals((prev) => prev.filter((a) => a.id !== msg.id));
             return;
           }
+          if (msg.type === "memory") {
+            // Under the reply it came with, in the chat on screen only.
+            const current = chatIdRef.current;
+            if (msg.conversation && current && msg.conversation !== current) return;
+            setBubbles((prev) => [
+              ...prev,
+              {
+                id: bubbleIdRef.current++,
+                role: "system",
+                content: "",
+                ts: Date.now(),
+                memory: msg.changes,
+                anchor: msg.turn,
+              },
+            ]);
+            return;
+          }
           if (msg.type === "agent_message" && msg.conversation) {
             if (deletedChats.current.has(msg.conversation)) return;
             void refreshChats();
@@ -396,7 +426,8 @@ export default function ChatPage({
   // the screen, and stays stored on its own branch.
   function editMessage(idx: number, turn: string, text: string) {
     if (!text.trim() || !chatRef.current || wsState !== "open") return;
-    setBubbles((prev) => prev.slice(0, idx));
+    // Memory notes stay: what the replies changed is still in memory.
+    setBubbles((prev) => [...prev.slice(0, idx), ...prev.slice(idx).filter((b) => b.memory)]);
     pushBubble("you", text);
     chatRef.current.send(text, chatIdRef.current ?? undefined, turn);
     setWaiting((n) => n + 1);
@@ -405,7 +436,8 @@ export default function ChatPage({
   // Another reply in place of the one at `idx`.
   function regenerate(idx: number, turn: string) {
     if (!chatRef.current || wsState !== "open") return;
-    setBubbles((prev) => prev.slice(0, idx));
+    // Memory notes stay: what the replies changed is still in memory.
+    setBubbles((prev) => [...prev.slice(0, idx), ...prev.slice(idx).filter((b) => b.memory)]);
     chatRef.current.regenerate(chatIdRef.current ?? undefined, turn);
     setWaiting((n) => n + 1);
   }
@@ -419,7 +451,15 @@ export default function ChatPage({
       const r = await api.conversation.list(id, HISTORY_LIMIT, current);
       if (chatIdRef.current !== current) return;
       const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
-      setBubbles((prev) => [...stored, ...prev.filter((b) => b.role === "system")].sort((a, b) => a.ts - b.ts));
+      // Notes of replies on other branches stay with them.
+      setBubbles((prev) =>
+        [
+          ...stored,
+          ...prev
+            .filter((b) => b.role === "system" && (!b.anchor || stored.some((s) => s.turn === b.anchor)))
+            .map((b) => underAnchor(b, stored)),
+        ].sort((a, b) => a.ts - b.ts),
+      );
     } catch (e) {
       pushBubble("system", `error: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -612,7 +652,10 @@ export default function ChatPage({
                     : "send a message to start the conversation"}
               </div>
             )}
-            {bubbles.map((b, idx) => (
+            {bubbles.map((b, idx) =>
+              b.memory ? (
+                <MemoryNote key={b.id} agentId={id} changes={b.memory} />
+              ) : (
               <Bubble
                 key={b.id}
                 bubble={b}
@@ -644,7 +687,8 @@ export default function ChatPage({
                     : undefined
                 }
               />
-            ))}
+              ),
+            )}
             {approvals.map((a) => (
               <div
                 key={a.id}
@@ -928,6 +972,78 @@ function Bubble({
             <Versions turn={bubble.turn} versions={bubble.versions} busy={busy} onVersion={onVersion} />
           )}
         </ActionRow>
+      )}
+    </div>
+  );
+}
+
+/** What a reply saved to or forgot from memory, each with an undo. */
+function MemoryNote({ agentId, changes }: { agentId: string; changes: MemoryChange[] }) {
+  return (
+    <div
+      className="self-start rounded px-3 py-2 text-xs"
+      role="status"
+      style={{ background: "rgba(83, 58, 253, 0.06)", color: "var(--color-body)" }}
+    >
+      {changes.map((c, i) => (
+        <MemoryChangeLine key={`${c.key}-${i}`} agentId={agentId} change={c} />
+      ))}
+    </div>
+  );
+}
+
+function MemoryChangeLine({ agentId, change }: { agentId: string; change: MemoryChange }) {
+  const [state, setState] = useState<"shown" | "undoing" | "undone">("shown");
+  const [error, setError] = useState<string | null>(null);
+  const saved = change.action === "saved";
+
+  async function undo() {
+    setState("undoing");
+    setError(null);
+    try {
+      // By row: the entry as it was comes back, and only if nothing
+      // changed the key since.
+      await api.memory.undo(agentId, change.key, change.before, change.after);
+      setState("undone");
+    } catch (e) {
+      setState("shown");
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  return (
+    <div className="flex flex-wrap items-baseline gap-x-2">
+      <Brain size={12} className="shrink-0 self-center" aria-hidden="true" />
+      <span>
+        {saved ? "Saved to memory" : "Forgot"} <code className="font-mono">{change.key}</code>
+        {": "}
+        <span style={{ textDecoration: state === "undone" ? "line-through" : undefined }}>
+          {change.value}
+        </span>
+      </span>
+      {state === "undone" ? (
+        <span>(undone)</span>
+      ) : (
+        <button
+          type="button"
+          className="underline disabled:opacity-40"
+          onClick={() => void undo()}
+          disabled={state === "undoing"}
+          title={
+            saved
+              ? change.before
+                ? "Put back what it replaced"
+                : "Forget this memory"
+              : "Bring it back as it was"
+          }
+        >
+          {state === "undoing" ? "undoing…" : "undo"}
+        </button>
+      )}
+      {error && (
+        <span role="alert" style={{ color: "var(--color-ruby)" }}>
+          {error}
+        </span>
       )}
     </div>
   );

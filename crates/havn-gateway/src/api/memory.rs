@@ -167,6 +167,62 @@ pub async fn save(
     Ok(Json(MemoryEntryView::from(entry)))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UndoRequest {
+    #[serde(default)]
+    pub before: Option<String>,
+    #[serde(default)]
+    pub after: Option<String>,
+}
+
+/// `POST /agents/:id/memory/:key/undo` — undo a change a chat showed:
+/// entry `after` is taken out and entry `before` brought back, as they
+/// were (row ids from the change). 204, or 409 when the key changed since
+/// (a later save, or the change already undone). The running agent does
+/// it, like the other writes.
+pub async fn undo(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path((id, key)): Path<(String, String)>,
+    Json(body): Json<UndoRequest>,
+) -> Result<StatusCode, ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let agent_id = agent.id;
+    if body.before.is_none() && body.after.is_none() {
+        return Err(ApiError::BadRequest("nothing to undo".into()));
+    }
+    #[derive(Deserialize)]
+    struct Undone {
+        undone: bool,
+    }
+    let reply: Undone = crate::api::agents::agent_data(
+        &state,
+        user.id,
+        agent_id,
+        havn_proto::DataQuery::UndoMemory {
+            key: key.clone(),
+            before: body.before.clone(),
+            after: body.after.clone(),
+        },
+        false,
+    )
+    .await?;
+    if !reply.undone {
+        return Err(ApiError::Conflict(
+            "this memory changed since; see the memory page".into(),
+        ));
+    }
+    audit::record_agent_action(
+        &state.db,
+        user.id,
+        agent_id,
+        "memory.undone",
+        serde_json::json!({"key": key, "before": body.before, "after": body.after}),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `DELETE /agents/:id/memory/:key` — soft-delete a memory row via
 /// the agent socket (spec §5.2 single-writer invariant). The runtime's
 /// `memory::forget` archives the row and suffixes the key with

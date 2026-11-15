@@ -19,6 +19,78 @@ use serde_json::{Value, json};
 
 use super::{Tool, ToolCtx, ToolResult};
 
+tokio::task_local! {
+    /// What the memory tools change in a reply's turn, for the dashboard
+    /// to show under the reply (issue #105). Set around a user turn.
+    pub static MEMORY_CHANGES: std::sync::Arc<std::sync::Mutex<Vec<Noted>>>;
+}
+
+/// A turn's net change to one key: the entry before its first change
+/// and the one after its last.
+#[derive(Debug, Clone)]
+pub struct Noted {
+    key: String,
+    /// Row id, value and kind.
+    before: Option<(String, String, Kind)>,
+    after: Option<(String, String, Kind)>,
+}
+
+/// Note a change to `key` from `before` to `after` (row id, value, kind).
+fn note_change(
+    key: &str,
+    before: Option<(String, String, Kind)>,
+    after: Option<(String, String, Kind)>,
+) {
+    let _ = MEMORY_CHANGES.try_with(|changes| {
+        let mut changes = changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(noted) = changes.iter_mut().find(|n| n.key == key) {
+            noted.after = after;
+        } else if changes.len() < havn_proto::MAX_MEMORY_CHANGES {
+            changes.push(Noted {
+                key: key.to_string(),
+                before,
+                after,
+            });
+        }
+    });
+}
+
+/// What `noted` changed, as the dashboard shows it: a key left as it was
+/// (an entry repeated, or saved then forgotten) is not shown.
+pub fn changes(noted: Vec<Noted>) -> Vec<havn_proto::MemoryChange> {
+    noted
+        .into_iter()
+        .filter_map(|n| {
+            let same = match (&n.before, &n.after) {
+                (Some(b), Some(a)) => b.0 == a.0,
+                (None, None) => true,
+                _ => false,
+            };
+            if same {
+                return None;
+            }
+            let (action, value, kind) = match (&n.after, &n.before) {
+                (Some((_, value, kind)), _) => (havn_proto::MemoryAction::Saved, value, kind),
+                (None, Some((_, value, kind))) => (havn_proto::MemoryAction::Forgot, value, kind),
+                (None, None) => return None,
+            };
+            Some(havn_proto::MemoryChange {
+                action,
+                key: n.key.clone(),
+                value: value
+                    .chars()
+                    .take(havn_proto::MAX_MEMORY_CHANGE_CHARS)
+                    .collect(),
+                kind: kind.as_str().to_string(),
+                before: n.before.as_ref().map(|b| b.0.clone()),
+                after: n.after.as_ref().map(|a| a.0.clone()),
+            })
+        })
+        .collect()
+}
+
 const SEARCH_LIMIT: u32 = 10;
 
 /// Cap on `value` length per row. 4 KB is generous for a single fact and
@@ -101,8 +173,8 @@ impl Tool for MemoryRememberTool {
             });
         let ttl_days = input.get("ttl_days").and_then(Value::as_i64);
 
-        if key.is_empty() {
-            return ToolResult::Error("key must be non-empty".into());
+        if let Err(why) = havn_proto::check_memory_key(key) {
+            return ToolResult::Error(why);
         }
 
         let (_, truncated) = match save(
@@ -158,6 +230,12 @@ pub async fn save(
         (new.value.to_string(), false)
     };
     let key = new.key;
+    // The entry it replaces, if any, for the chat's note of the change.
+    let before = memory::get(&ctx.agent_db, key)
+        .await
+        .ok()
+        .flatten()
+        .map(|e| (e.id, e.value, e.kind));
     let entry = NewEntry {
         key,
         value: &stored_value,
@@ -170,6 +248,13 @@ pub async fn save(
     } else {
         memory::remember(&ctx.agent_db, entry).await?
     };
+    // Noted as soon as it is written: a turn stopped while it embeds
+    // keeps the entry, and shows it.
+    note_change(
+        key,
+        before,
+        Some((row_id.clone(), stored_value.clone(), new.kind)),
+    );
 
     // Hybrid retrieval (spec §9.4 v0.7): embed `"<key>: <value>"`, pinned
     // to the row id so a concurrent write to the same key cannot get this
@@ -465,8 +550,15 @@ impl Tool for MemoryForgetTool {
         let Some(key) = input.get("key").and_then(Value::as_str) else {
             return ToolResult::Error("missing required field: key".into());
         };
+        // What it said, for the dashboard to offer it back.
+        let before = memory::get(&ctx.agent_db, key).await.ok().flatten();
         match memory::forget(&ctx.agent_db, key).await {
-            Ok(true) => ToolResult::Ok(format!("forgot {key:?}")),
+            Ok(true) => {
+                if let Some(entry) = before {
+                    note_change(key, Some((entry.id, entry.value, entry.kind)), None);
+                }
+                ToolResult::Ok(format!("forgot {key:?}"))
+            }
             Ok(false) => ToolResult::Ok(format!(
                 "no active entry for {key:?} (already archived or never existed)"
             )),
@@ -736,6 +828,69 @@ mod tests {
             .expect("row");
         assert_eq!(row.value, fits);
         assert_eq!(row.ttl_days, None);
+    }
+
+    #[tokio::test]
+    async fn a_turn_notes_its_net_change_to_each_key() {
+        let ctx = ctx().await;
+        let noted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let remember = |key: &'static str, value: &'static str| {
+            let ctx = &ctx;
+            async move {
+                MemoryRememberTool
+                    .execute(
+                        ctx,
+                        json!({"key": key, "value": value, "kind": "preference"}),
+                    )
+                    .await
+            }
+        };
+        // Before the turn: an entry the turn repeats, and one it replaces.
+        remember("user.name", "Ana").await;
+        remember("pref.editor", "vim").await;
+        let vim = memory::get(&ctx.agent_db, "pref.editor")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        MEMORY_CHANGES
+            .scope(std::sync::Arc::clone(&noted), async {
+                remember("user.name", "Ana").await;
+                remember("pref.editor", "emacs").await;
+                remember("pref.editor", "helix").await;
+                remember("pref.font", "Iosevka").await;
+                MemoryForgetTool
+                    .execute(&ctx, json!({"key": "pref.font"}))
+                    .await;
+                remember("pref.theme", "dark").await;
+                MemoryForgetTool
+                    .execute(&ctx, json!({"key": "pref.theme"}))
+                    .await;
+                MemoryForgetTool
+                    .execute(&ctx, json!({"key": "user.name"}))
+                    .await;
+            })
+            .await;
+        let shown = changes(std::mem::take(&mut *noted.lock().unwrap()));
+        let by_key = |k: &str| shown.iter().find(|c| c.key == k).cloned();
+        let editor = by_key("pref.editor").expect("editor");
+        assert_eq!(editor.action, havn_proto::MemoryAction::Saved);
+        assert_eq!(editor.value, "helix");
+        assert_eq!(editor.before.as_deref(), Some(vim.as_str()));
+        let name = by_key("user.name").expect("name");
+        assert_eq!(name.action, havn_proto::MemoryAction::Forgot);
+        assert_eq!(name.value, "Ana");
+        assert!(name.after.is_none());
+        assert!(
+            by_key("pref.font").is_none(),
+            "saved then forgotten: {shown:?}"
+        );
+        assert!(
+            by_key("pref.theme").is_none(),
+            "saved then forgotten: {shown:?}"
+        );
+        assert_eq!(shown.len(), 2, "{shown:?}");
+        assert!(remember("..", "x").await.is_error());
     }
 
     #[test]
