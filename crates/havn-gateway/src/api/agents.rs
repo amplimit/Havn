@@ -673,12 +673,15 @@ pub async fn delete(
     if let Some(handle) = state.registry.remove(id).await
         && let Err(e) = state.spawner.stop(&handle).await
     {
-        // Kept, so its sandbox is not left running unknown to the
-        // gateway with its link handed to another agent.
-        warn!(agent_id = %id, error = %e, "spawner.stop during delete failed; agent kept");
-        repo::set_status(&state.db, id, AgentStatus::Error).await?;
+        warn!(agent_id = %id, error = %e, "spawner.stop during delete failed");
+    }
+    // Kept while its sandbox still runs, so no process is left running
+    // unknown to the gateway with its link handed to another agent.
+    if state.spawner.lingers(id).await {
+        warn!(agent_id = %id, "agent processes survived the stop; agent kept");
         return Err(ApiError::Internal(format!(
-            "agent {id} could not be stopped, so it was not deleted: {e}"
+            "agent {id} was not deleted: processes of its sandbox still run. Try again, or \
+             restart the gateway"
         )));
     }
 

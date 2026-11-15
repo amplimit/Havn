@@ -38,11 +38,16 @@ pub fn start(detach: bool) -> anyhow::Result<()> {
 // gateway the pid file does not know, such as the systemd unit's; otherwise
 // a detached start would report success for a gateway that exits at once.
 fn running_gateway(cfg: &paths::CliConfig) -> Option<String> {
-    use std::io::Read as _;
     let db = cfg
         .db_path
         .clone()
         .unwrap_or_else(|| paths::data_dir(cfg).join("havn.db"));
+    lock_holder(&db)
+}
+
+/// The gateway holding the lock of database `db`, when one runs.
+pub fn lock_holder(db: &std::path::Path) -> Option<String> {
+    use std::io::Read as _;
     let mut name = db.file_name()?.to_os_string();
     name.push(".lock");
     let mut file = std::fs::File::open(db.with_file_name(name)).ok()?;
@@ -268,17 +273,6 @@ pub fn status() -> anyhow::Result<()> {
 /// Best-effort TCP connect probe. We're not validating that the gateway
 /// actually answered — just that *something* accepts on the port. The
 /// caller chases the API endpoint for richer health if needed.
-/// Whether the configured gateway runs: its pid file names a live
-/// process, or something answers on its listen address.
-pub fn running() -> bool {
-    let cfg = paths::load_config().unwrap_or_default();
-    let alive = paths::read_pid(&paths::pid_file(&cfg))
-        .ok()
-        .flatten()
-        .is_some_and(paths::pid_alive);
-    alive || tcp_probe(&paths::listen_addr(&cfg))
-}
-
 fn tcp_probe(addr: &str) -> bool {
     match std::net::ToSocketAddrs::to_socket_addrs(&addr) {
         Ok(mut iter) => iter.any(|sa| {

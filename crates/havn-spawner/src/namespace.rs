@@ -634,6 +634,20 @@ impl AgentSpawner for NamespaceSpawner {
         Ok(child.exited().await)
     }
 
+    async fn lingers(&self, agent_id: AgentId) -> bool {
+        if self.state.lock().await.contains_key(&agent_id) {
+            return true;
+        }
+        let cgroup = self.cgroup.agent_path(&agent_id.to_string());
+        if !cgroup.exists() {
+            return false;
+        }
+        if let Err(e) = self.clear_cgroup(&cgroup).await {
+            warn!(cgroup = %cgroup.display(), error = %e, "cgroup cleanup failed again");
+        }
+        self.cgroup.is_populated(&cgroup)
+    }
+
     async fn reap_orphans(&self) -> Result<usize> {
         let tracked: Vec<PathBuf> = self
             .state
