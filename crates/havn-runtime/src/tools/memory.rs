@@ -19,6 +19,31 @@ use serde_json::{Value, json};
 
 use super::{Tool, ToolCtx, ToolResult};
 
+tokio::task_local! {
+    /// What the memory tools change in a reply's turn, for the dashboard
+    /// to show under the reply (issue #105). Set around a user turn.
+    pub static MEMORY_CHANGES: std::sync::Arc<std::sync::Mutex<Vec<havn_proto::MemoryChange>>>;
+}
+
+fn note_change(action: havn_proto::MemoryAction, key: &str, value: &str, kind: Kind) {
+    let _ = MEMORY_CHANGES.try_with(|changes| {
+        let mut changes = changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if changes.len() < havn_proto::MAX_MEMORY_CHANGES {
+            changes.push(havn_proto::MemoryChange {
+                action,
+                key: key.to_string(),
+                value: value
+                    .chars()
+                    .take(havn_proto::MAX_MEMORY_CHANGE_CHARS)
+                    .collect(),
+                kind: kind.as_str().to_string(),
+            });
+        }
+    });
+}
+
 const SEARCH_LIMIT: u32 = 10;
 
 /// Cap on `value` length per row. 4 KB is generous for a single fact and
@@ -127,6 +152,7 @@ impl Tool for MemoryRememberTool {
         } else {
             ""
         };
+        note_change(havn_proto::MemoryAction::Saved, key, value, kind);
         ToolResult::Ok(format!("remembered {key:?} as {}{suffix}", kind.as_str()))
     }
 }
@@ -465,8 +491,20 @@ impl Tool for MemoryForgetTool {
         let Some(key) = input.get("key").and_then(Value::as_str) else {
             return ToolResult::Error("missing required field: key".into());
         };
+        // What it said, for the dashboard to offer it back.
+        let before = memory::get(&ctx.agent_db, key).await.ok().flatten();
         match memory::forget(&ctx.agent_db, key).await {
-            Ok(true) => ToolResult::Ok(format!("forgot {key:?}")),
+            Ok(true) => {
+                if let Some(entry) = before {
+                    note_change(
+                        havn_proto::MemoryAction::Forgot,
+                        key,
+                        &entry.value,
+                        entry.kind,
+                    );
+                }
+                ToolResult::Ok(format!("forgot {key:?}"))
+            }
             Ok(false) => ToolResult::Ok(format!(
                 "no active entry for {key:?} (already archived or never existed)"
             )),

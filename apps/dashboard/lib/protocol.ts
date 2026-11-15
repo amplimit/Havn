@@ -28,4 +28,14 @@ export type ServerMessage =
       kind?: string;
     }
   /** The approval request was decided elsewhere or ended. */
-  | { type: "approval_closed"; id: string };
+  | { type: "approval_closed"; id: string }
+  /** What the reply just sent saved to or forgot from memory. */
+  | { type: "memory"; conversation?: string; changes: MemoryChange[] };
+
+export type MemoryChange = {
+  action: "saved" | "forgot";
+  key: string;
+  /** What was saved, or what the forgotten entry said. */
+  value: string;
+  kind: string;
+};

@@ -79,7 +79,42 @@ pub enum AgentToGateway {
     /// An approval request ended without a decision (timed out, or its
     /// turn was stopped); the gateway stops showing it.
     ApprovalClosed { request_id: String },
+    /// What a reply's turn saved to or forgot from the agent's memory,
+    /// sent after the reply, for the dashboard to show under it.
+    MemoryChanged(MemoryChanged),
 }
+
+/// See [`AgentToGateway::MemoryChanged`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryChanged {
+    /// The conversation the turn answered.
+    pub channel_id: String,
+    /// Its chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
+    pub changes: Vec<MemoryChange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryChange {
+    pub action: MemoryAction,
+    pub key: String,
+    /// What was saved, or what the forgotten entry said.
+    pub value: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryAction {
+    Saved,
+    Forgot,
+}
+
+/// Changes one [`MemoryChanged`] carries at most.
+pub const MAX_MEMORY_CHANGES: usize = 20;
+/// Characters of a changed entry's value shown.
+pub const MAX_MEMORY_CHANGE_CHARS: usize = 500;
 
 /// See [`GatewayToAgent::TimezoneUpdate`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

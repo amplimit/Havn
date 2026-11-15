@@ -1693,17 +1693,21 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     let augmented =
         augment_with_skills(&ctx, &ctx.system_prompt, &user_text, summary.as_deref()).await;
 
+    let memory_changes = Arc::new(std::sync::Mutex::new(Vec::new()));
     let final_text = match tools::gateway::CONVERSATION
         .scope(
             msg.channel_id.clone(),
             tools::gateway::CHAT.scope(
                 chat.clone(),
-                run_tool_loop(
-                    &ctx,
-                    crate::tools::context::WEBCHAT,
-                    &mut messages,
-                    &augmented,
-                    Some(stop),
+                tools::memory::MEMORY_CHANGES.scope(
+                    Arc::clone(&memory_changes),
+                    run_tool_loop(
+                        &ctx,
+                        crate::tools::context::WEBCHAT,
+                        &mut messages,
+                        &augmented,
+                        Some(stop),
+                    ),
                 ),
             ),
         )
@@ -1730,8 +1734,8 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     }
 
     let outbound = OutboundMessage {
-        conversation: Some(chat),
-        channel_id: msg.channel_id,
+        conversation: Some(chat.clone()),
+        channel_id: msg.channel_id.clone(),
         content: MessageContent::Text { text: final_text },
         reply_to: None,
     };
@@ -1741,6 +1745,21 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         .await
     {
         error!(error = ?e, "failed to enqueue OutboundMessage");
+    }
+    let changes = std::mem::take(
+        &mut *memory_changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    if !changes.is_empty() {
+        let frame = AgentToGateway::MemoryChanged(havn_proto::MemoryChanged {
+            channel_id: msg.channel_id,
+            conversation: Some(chat),
+            changes,
+        });
+        if let Err(e) = ctx.writer_tx.send(frame).await {
+            warn!(error = ?e, "failed to enqueue MemoryChanged");
+        }
     }
 }
 

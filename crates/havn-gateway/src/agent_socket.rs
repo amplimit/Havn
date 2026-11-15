@@ -958,6 +958,18 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
         }
         AgentToGateway::OutboundMessage(msg) => route_outbound(agent_id, msg, ctx).await,
         AgentToGateway::ApprovalRequest(request) => ask_for_approval(agent_id, request, ctx).await,
+        AgentToGateway::MemoryChanged(changed) => {
+            // Only a dashboard session shows it; a channel's sender is not
+            // told what the agent remembers.
+            if changed
+                .channel_id
+                .parse::<crate::webchat::SessionId>()
+                .is_ok()
+                && let Err(e) = ctx.webchat_router.memory_changed(agent_id, changed).await
+            {
+                debug!(%agent_id, error = %e, "memory changes not shown");
+            }
+        }
         AgentToGateway::ApprovalClosed { request_id } => {
             // The egress proxy's questions are closed by the proxy only.
             if !request_id.starts_with(crate::egress_proxy::REQUEST_PREFIX) {
