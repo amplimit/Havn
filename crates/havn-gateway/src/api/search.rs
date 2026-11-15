@@ -47,12 +47,14 @@ pub async fn status(
 pub struct AgentWebView {
     /// The agent's policy allows `web_search` (from its next start).
     pub can_search_web: bool,
-    /// The agent has network egress, and with it the in-sandbox
-    /// `web_fetch` (from its next start).
+    /// The agent's policy allows `web_fetch` (from its next start).
+    pub can_fetch_web: bool,
+    /// The agent's sandbox has network egress (from its next start).
     pub egress_allowed: bool,
     /// What the owner's policy permits. With `trust_header` on, the
     /// agent's own settings cannot go beyond it.
     pub search_permitted: bool,
+    pub fetch_permitted: bool,
     pub egress_permitted: bool,
     /// The backend this agent's searches would use, or `None` when its
     /// owner has none set up.
@@ -63,6 +65,7 @@ pub struct AgentWebView {
 #[serde(deny_unknown_fields)]
 pub struct AgentWebPatch {
     pub can_search_web: Option<bool>,
+    pub can_fetch_web: Option<bool>,
     pub egress_allowed: Option<bool>,
 }
 
@@ -89,8 +92,10 @@ async fn view(state: &AppState, agent: &Agent) -> Result<AgentWebView, ApiError>
         |p: &havn_core::Policy| p.permissions.can_access_network && p.network_policy.egress_allowed;
     Ok(AgentWebView {
         can_search_web: policy.permissions.can_search_web,
+        can_fetch_web: policy.permissions.can_fetch_web,
         egress_allowed: egress(&policy),
         search_permitted: !multi_user || owner.permissions.can_search_web,
+        fetch_permitted: !multi_user || owner.permissions.can_fetch_web,
         egress_permitted: !multi_user || egress(&owner),
         search_backend: backend.map(crate::web_search::Backend::name),
     })
@@ -114,7 +119,7 @@ pub async fn agent_patch(
     Json(req): Json<AgentWebPatch>,
 ) -> Result<Json<AgentWebView>, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
-    if req.can_search_web.is_none() && req.egress_allowed.is_none() {
+    if req.can_search_web.is_none() && req.can_fetch_web.is_none() && req.egress_allowed.is_none() {
         return Ok(Json(view(&state, &agent).await?));
     }
     let config = with_web_access(&agent.config, &req);
@@ -131,6 +136,7 @@ pub async fn agent_patch(
         "agent.web.updated",
         serde_json::json!({
             "can_search_web": req.can_search_web,
+            "can_fetch_web": req.can_fetch_web,
             "egress_allowed": req.egress_allowed,
         }),
     )
@@ -158,6 +164,9 @@ fn with_web_access(config: &Value, patch: &AgentWebPatch) -> Value {
     };
     if let Some(on) = patch.can_search_web {
         set("permissions", "can_search_web", on);
+    }
+    if let Some(on) = patch.can_fetch_web {
+        set("permissions", "can_fetch_web", on);
     }
     if let Some(on) = patch.egress_allowed {
         set("network_policy", "egress_allowed", on);
@@ -191,6 +200,7 @@ mod tests {
             &config,
             &AgentWebPatch {
                 can_search_web: Some(false),
+                can_fetch_web: Some(false),
                 egress_allowed: Some(true),
             },
         );
@@ -202,7 +212,8 @@ mod tests {
                     "permissions": {
                         "can_use_shell": false,
                         "can_access_network": true,
-                        "can_search_web": false
+                        "can_search_web": false,
+                        "can_fetch_web": false
                     },
                     "network_policy": {
                         "blocked_domains": ["example.com"],
@@ -214,6 +225,7 @@ mod tests {
         let policy: havn_core::Policy =
             serde_json::from_value(patched["policy"].clone()).expect("policy");
         assert!(!policy.permissions.can_search_web);
+        assert!(!policy.permissions.can_fetch_web);
         assert!(policy.network_policy.egress_allowed);
         assert!(!policy.permissions.can_use_shell);
 
@@ -221,6 +233,7 @@ mod tests {
             &json!({}),
             &AgentWebPatch {
                 can_search_web: None,
+                can_fetch_web: None,
                 egress_allowed: Some(false),
             },
         );

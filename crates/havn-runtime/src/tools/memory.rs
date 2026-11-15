@@ -343,13 +343,11 @@ mod tests {
 
     async fn ctx() -> ToolCtx {
         let pool = connect_in_memory().await.expect("agent db");
-        let http = reqwest::Client::new();
         let workspace = std::env::temp_dir().join(format!("havn-tools-{}", uuid::Uuid::now_v7()));
         tokio::fs::create_dir_all(&workspace).await.expect("ws");
         ToolCtx {
             workspace_dir: workspace,
             agent_db: pool,
-            http,
             policy: Arc::new(Policy::default()),
             embedder: None,
         }

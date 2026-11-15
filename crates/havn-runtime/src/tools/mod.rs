@@ -23,7 +23,6 @@ pub mod agent_query;
 pub mod files;
 pub mod gateway;
 pub mod memory;
-pub mod network;
 pub mod shell;
 pub mod skill_manage;
 pub mod subagent;
@@ -61,15 +60,8 @@ pub struct ToolCtx {
     pub workspace_dir: PathBuf,
     /// Per-agent `SQLite` pool for memory / conversation queries.
     pub agent_db: SqlitePool,
-    /// Shared HTTP client for `web_fetch`.
-    pub http: reqwest::Client,
-    /// Active policy snapshot. Phase 1 only consults `permissions` at registry
-    /// build time, but tools that need finer-grained checks (e.g. domain
-    /// allowlist for `web_fetch`) read this directly.
-    #[allow(
-        dead_code,
-        reason = "consumed by per-tool runtime checks in next vertical"
-    )]
+    /// Active policy snapshot. Registry building consults `permissions`;
+    /// the tool loop reads the domain lists for `web_fetch`.
     pub policy: Arc<Policy>,
     /// Hybrid-retrieval embedding provider (spec §9.4 v0.7). `None`
     /// when the operator hasn't enabled embeddings — `memory_remember`
@@ -138,10 +130,10 @@ impl ToolRegistry {
     /// Build the standard tool set with two-layer policy enforcement (spec §6):
     ///
     /// 1. **Capability layer (here, build time)** — drop tools whose
-    ///    underlying capability is forbidden outright (`can_use_shell`;
-    ///    `can_access_network` plus `network_policy.egress_allowed` for
-    ///    `web_fetch`). The LLM never sees these even with no
-    ///    context filter.
+    ///    underlying capability is forbidden outright (`can_use_shell`,
+    ///    `can_install_skills`). The LLM never sees these even with no
+    ///    context filter. Tools the gateway runs (`web_search`,
+    ///    `web_fetch`) are added by [`Self::with_gateway_tools`].
     /// 2. **Context layer (per call, see [`Self::schemas_for`] /
     ///    [`Self::execute_for`])** — within an allowed capability set,
     ///    further hide tools based on `policy.context_toolsets[<ctx>].
@@ -160,9 +152,6 @@ impl ToolRegistry {
             Arc::new(files::FileReadTool),
             Arc::new(files::FileWriteTool),
         ];
-        if policy.permissions.can_access_network && policy.network_policy.egress_allowed {
-            tools.push(Arc::new(network::WebFetchTool));
-        }
         if policy.permissions.can_use_shell {
             tools.push(Arc::new(shell::ShellTool));
         }
@@ -457,10 +446,8 @@ mod tests {
     // ---- capability layer (build time) ------------------------------------
 
     #[test]
-    fn standard_includes_network_and_shell_when_allowed() {
-        let mut policy = Policy::default();
-        policy.network_policy.egress_allowed = true;
-        assert!(policy.permissions.can_access_network);
+    fn standard_includes_shell_and_skills_when_allowed() {
+        let policy = Policy::default();
         assert!(policy.permissions.can_use_shell);
 
         let names = names_in(&registry(policy).schemas());
@@ -470,12 +457,15 @@ mod tests {
             "memory_forget",
             "file_read",
             "file_write",
-            "web_fetch",
             "shell",
             "skill_manage",
         ] {
             assert!(names.contains(&expected.into()), "missing: {expected}");
         }
+        assert!(
+            !names.contains(&"web_fetch".into()),
+            "web_fetch comes from the gateway"
+        );
     }
 
     #[test]
@@ -486,20 +476,11 @@ mod tests {
         policy.permissions.can_install_skills = false;
         let names = names_in(&registry(policy).schemas());
 
-        assert!(!names.contains(&"web_fetch".into()));
         assert!(!names.contains(&"shell".into()));
         assert!(!names.contains(&"skill_manage".into()));
         // Always-on tools still present.
         assert!(names.contains(&"memory_remember".into()));
         assert!(names.contains(&"file_read".into()));
-    }
-
-    #[test]
-    fn web_fetch_requires_network_egress() {
-        let policy = Policy::default();
-        assert!(policy.permissions.can_access_network);
-        assert!(!policy.network_policy.egress_allowed);
-        assert!(!names_in(&registry(policy).schemas()).contains(&"web_fetch".into()));
     }
 
     // ---- context layer (per call) -----------------------------------------
@@ -520,15 +501,15 @@ mod tests {
     fn context_layer_hides_tool_in_one_context_only() {
         // Spec §6.2 example: cron jobs run unattended; disable interactive
         // tools. Webchat should still see the full set.
-        let reg = registry(policy_with_cron_disabled(&["shell", "web_fetch"]));
+        let reg = registry(policy_with_cron_disabled(&["shell", "file_write"]));
 
         let cron = names_in(&reg.schemas_for(context::CRON));
         let web = names_in(&reg.schemas_for(context::WEBCHAT));
 
         assert!(!cron.contains(&"shell".into()));
-        assert!(!cron.contains(&"web_fetch".into()));
+        assert!(!cron.contains(&"file_write".into()));
         assert!(web.contains(&"shell".into()));
-        assert!(web.contains(&"web_fetch".into()));
+        assert!(web.contains(&"file_write".into()));
     }
 
     #[tokio::test]
@@ -541,7 +522,6 @@ mod tests {
         let env = ToolCtx {
             workspace_dir: std::path::PathBuf::from("/tmp"),
             agent_db: dummy_pool().await,
-            http: reqwest::Client::new(),
             policy: Arc::clone(&reg.policy),
             embedder: None,
         };
@@ -573,7 +553,6 @@ mod tests {
         let env = ToolCtx {
             workspace_dir: dir.path().to_path_buf(),
             agent_db: dummy_pool().await,
-            http: reqwest::Client::new(),
             policy: Arc::clone(&reg.policy),
             embedder: None,
         };
@@ -609,7 +588,6 @@ mod tests {
             "memory_forget",
             "file_read",
             "file_write",
-            "web_fetch",
             "shell",
             "skill_manage",
         ]));

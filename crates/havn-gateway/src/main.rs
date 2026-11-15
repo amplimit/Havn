@@ -23,6 +23,7 @@ mod query_broker;
 mod reload;
 mod secret_ref;
 mod supervisor;
+mod web_fetch;
 mod web_search;
 mod webchat;
 mod workspace;
@@ -191,6 +192,13 @@ async fn main() -> anyhow::Result<()> {
                     env!("CARGO_PKG_VERSION")
                 )?;
                 return Ok(());
+            }
+            Some(web_fetch::CONVERT_ARG) => {
+                let args: Vec<String> = std::env::args().skip(2).collect();
+                if web_fetch::convert_main(&args) {
+                    return Ok(());
+                }
+                std::process::exit(1);
             }
             Some("--help" | "-h") => {
                 writeln!(
@@ -563,6 +571,7 @@ async fn main() -> anyhow::Result<()> {
         seccomp_allow_extra: cfg.seccomp.allow_extra.clone(),
         keyring: keyring.clone(),
         search,
+        fetch: Arc::new(web_fetch::WebFetch::new(cfg.fetch.clone())),
     };
     let socket_path = cfg.agent_socket_path.clone();
     let socket_task = tokio::spawn(async move {
@@ -1001,7 +1010,7 @@ fn select_spawner(
                             fix = nat_failure_hint(&e),
                             "global NAT setup failed; EVERY agent will spawn WITHOUT outbound \
                              network until the gateway restarts with this fixed. Tools needing \
-                             the internet (web_fetch, browser pack, network MCP) will surface \
+                             the internet (shell downloads, browser pack, network MCP) will surface \
                              their own errors at use time."
                         );
                     }

@@ -570,14 +570,9 @@ async fn main() -> anyhow::Result<()> {
         .with_hooks(Arc::clone(&hooks))
         .with_gateway_tools(gateway_tools, &gateway_pending, &writer_tx)
         .with_mcp(&mcp_servers);
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .context("building tool HTTP client")?;
     let tool_env = ToolCtx {
         workspace_dir: args.workspace.clone(),
         agent_db: pool.clone(),
-        http,
         policy: Arc::clone(&policy),
         embedder: embedder.clone(),
     };

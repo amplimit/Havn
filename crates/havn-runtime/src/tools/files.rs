@@ -261,7 +261,6 @@ mod tests {
         ToolCtx {
             workspace_dir: workspace,
             agent_db: pool,
-            http: reqwest::Client::new(),
             policy: Arc::new(Policy::default()),
             embedder: None,
         }

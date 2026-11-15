@@ -126,7 +126,6 @@ mod tests {
         ToolCtx {
             workspace_dir: std::env::temp_dir(),
             agent_db: havn_db::agent::connect_in_memory().await.expect("agent db"),
-            http: reqwest::Client::new(),
             policy: Arc::new(havn_core::Policy::default()),
             embedder: None,
         }

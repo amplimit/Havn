@@ -2,7 +2,7 @@
 //!
 //! Agents are launched in a fresh `CLONE_NEWNET` namespace, which by
 //! default contains nothing but `lo` (down). To give agents outbound
-//! network — needed for `web_fetch`, browser packs, MCP servers that
+//! network — needed for shell downloads, browser packs, MCP servers that
 //! reach the internet — the spawner sets up a per-agent veth pair:
 //!
 //! ```text
@@ -41,7 +41,7 @@
 //! gateway typically runs as root; if not, [`ensure_global_nat`] returns
 //! `NetworkUnavailable` and per-agent setup degrades to a warning + empty
 //! agent netns (same behaviour as v0.6). Agents that don't need outbound
-//! still work — only `web_fetch` and packs degrade.
+//! still work — only shell downloads and packs degrade.
 //!
 //! Cleanup: when the agent's netns is destroyed (last process exit), the
 //! kernel removes both veth ends automatically. [`teardown_agent_network`]
@@ -577,7 +577,7 @@ fn run_iptables(args: &[&str]) -> Result<()> {
 ///
 /// On failure the agent ends up with an empty netns, which is fine for
 /// any agent that doesn't need outbound — the only surface that breaks
-/// is `web_fetch` / packs / network-needing MCP servers, all of which
+/// is shell downloads / packs / network-needing MCP servers, all of which
 /// surface their own clear errors at tool-use time.
 pub fn configure_agent_network(
     child_pid: i32,

@@ -258,6 +258,11 @@ pub struct Permissions {
     /// Needs no egress: the agent sees results, never the network. Queries
     /// leave the host, so turn it off for agents whose data must not.
     pub can_search_web: bool,
+    /// `web_fetch`, run by the gateway: it reads a page and answers a
+    /// question about it. Needs no egress. The URL leaves the host, so the
+    /// runtime fetches only URLs from the conversation or on
+    /// `network_policy.allowed_domains`.
+    pub can_fetch_web: bool,
 }
 
 impl Default for Permissions {
@@ -274,6 +279,7 @@ impl Default for Permissions {
             can_use_mcp: false,
             can_query_other_agents: false,
             can_search_web: true,
+            can_fetch_web: true,
         }
     }
 }
@@ -290,8 +296,42 @@ pub enum ChannelAllowance {
 #[serde(default)]
 pub struct NetworkPolicy {
     pub egress_allowed: bool,
+    /// Domains the agent may reach without further checks. An entry
+    /// matches the domain and its subdomains; a leading `*.` is ignored.
     pub allowed_domains: Vec<String>,
+    /// Domains the agent may never reach, matched like `allowed_domains`.
+    /// They win over `allowed_domains`.
     pub blocked_domains: Vec<String>,
+}
+
+impl NetworkPolicy {
+    #[must_use]
+    pub fn is_blocked(&self, host: &str) -> bool {
+        domain_listed(&self.blocked_domains, host)
+    }
+
+    /// `host` is on `allowed_domains` and not blocked.
+    #[must_use]
+    pub fn is_allowed(&self, host: &str) -> bool {
+        !self.is_blocked(host) && domain_listed(&self.allowed_domains, host)
+    }
+}
+
+/// Whether `host` is one of `domains` or a subdomain of one. Case and a
+/// trailing dot do not matter; a leading `*.` on an entry is ignored.
+#[must_use]
+pub fn domain_listed(domains: &[String], host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    domains.iter().any(|entry| {
+        let entry = entry.trim();
+        let entry = entry.strip_prefix("*.").unwrap_or(entry);
+        let entry = entry.trim_end_matches('.').to_ascii_lowercase();
+        !entry.is_empty()
+            && (host == entry
+                || host
+                    .strip_suffix(entry.as_str())
+                    .is_some_and(|rest| rest.ends_with('.')))
+    })
 }
 
 /// One MCP server allowed to run as an agent-runtime child process
@@ -423,6 +463,7 @@ impl Policy {
                 can_use_mcp: own.can_use_mcp && cap.can_use_mcp,
                 can_query_other_agents: own.can_query_other_agents && cap.can_query_other_agents,
                 can_search_web: own.can_search_web && cap.can_search_web,
+                can_fetch_web: own.can_fetch_web && cap.can_fetch_web,
             },
             network_policy: NetworkPolicy {
                 egress_allowed: self.network_policy.egress_allowed
@@ -498,6 +539,7 @@ impl Policy {
                 can_use_mcp: a.can_use_mcp || b.can_use_mcp,
                 can_query_other_agents: a.can_query_other_agents || b.can_query_other_agents,
                 can_search_web: a.can_search_web || b.can_search_web,
+                can_fetch_web: a.can_fetch_web || b.can_fetch_web,
             },
             network_policy: NetworkPolicy {
                 egress_allowed: self.network_policy.egress_allowed
@@ -674,11 +716,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn domains_match_themselves_and_their_subdomains() {
+        let list = vec!["Example.com".to_string(), "*.docs.rs".to_string()];
+        assert!(domain_listed(&list, "example.com"));
+        assert!(domain_listed(&list, "www.EXAMPLE.com."));
+        assert!(domain_listed(&list, "docs.rs"));
+        assert!(domain_listed(&list, "a.b.docs.rs"));
+        assert!(!domain_listed(&list, "notexample.com"));
+        assert!(!domain_listed(&list, "example.com.evil.net"));
+        assert!(!domain_listed(&[String::new(), " ".into()], "example.com"));
+        let net = NetworkPolicy {
+            egress_allowed: false,
+            allowed_domains: vec!["example.com".into()],
+            blocked_domains: vec!["secret.example.com".into()],
+        };
+        assert!(net.is_allowed("www.example.com"));
+        assert!(!net.is_allowed("secret.example.com"));
+        assert!(net.is_blocked("a.secret.example.com"));
+        assert!(!net.is_allowed("other.org"));
+    }
+
+    #[test]
     fn clamp_never_widens_permissions_or_limits() {
         let mut cap = Policy::default();
         cap.permissions.can_use_shell = false;
         cap.permissions.can_use_mcp = false;
         cap.permissions.can_search_web = false;
+        cap.permissions.can_fetch_web = false;
         cap.resource_limits.memory_mb = 256;
         cap.resource_limits.pids_max = 32;
         cap.budget.max_tokens_per_day = 10_000;
@@ -696,6 +760,7 @@ mod tests {
         assert!(!p.permissions.can_use_mcp);
         assert!(!p.permissions.can_spawn_subagents);
         assert!(!p.permissions.can_search_web);
+        assert!(!p.permissions.can_fetch_web);
         assert!(!p.network_policy.egress_allowed);
         assert_eq!(p.resource_limits.memory_mb, 256);
         assert_eq!(p.resource_limits.pids_max, 32);
