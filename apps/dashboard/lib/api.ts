@@ -106,6 +106,9 @@ export type MemoryEntry = {
   supersedes_id: string | null;
 };
 
+/** How long a memory the user saves is kept once unused. */
+export type MemoryExpiry = "kind_default" | "never" | { days: number };
+
 export type MemoryListResponse = {
   agent_id: string;
   entries: MemoryEntry[];
@@ -597,10 +600,14 @@ export const api = {
   },
 
   memory: {
-    list: (agentId: string, kind?: MemoryKind) =>
-      request<MemoryListResponse>(
-        `/agents/${agentId}/memory${kind ? `?kind=${kind}` : ""}`,
-      ),
+    /** Active entries, at most `limit` (the gateway's default 200, up to 1000). */
+    list: (agentId: string, kind?: MemoryKind, limit?: number) => {
+      const params = new URLSearchParams();
+      if (kind) params.set("kind", kind);
+      if (limit) params.set("limit", String(limit));
+      const query = params.toString();
+      return request<MemoryListResponse>(`/agents/${agentId}/memory${query ? `?${query}` : ""}`);
+    },
     /**
      * DELETE the memory row for `key`. Routes through the agent socket
      * (spec §5.2 — agent.db is single-writer). The runtime must be
@@ -611,6 +618,16 @@ export const api = {
         `/agents/${agentId}/memory/${encodeURIComponent(key)}`,
         { method: "DELETE" },
       ),
+    /** Add or edit the memory under `key`, as something the user said. */
+    save: (
+      agentId: string,
+      key: string,
+      entry: { value: string; kind: MemoryKind; expiry: MemoryExpiry },
+    ) =>
+      request<MemoryEntry>(`/agents/${agentId}/memory/${encodeURIComponent(key)}`, {
+        method: "PUT",
+        body: JSON.stringify(entry),
+      }),
   },
 
   skills: {

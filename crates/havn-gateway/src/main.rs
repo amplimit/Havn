@@ -720,7 +720,7 @@ async fn serve() -> anyhow::Result<()> {
         .route("/agents/{id}/memory", get(api::memory::list))
         .route(
             "/agents/{id}/memory/{key}",
-            axum::routing::delete(api::memory::forget),
+            axum::routing::delete(api::memory::forget).put(api::memory::save),
         )
         .route("/agents/{id}/skills", get(api::skills::list))
         .route("/agents/{id}/skills/{name}/pin", post(api::skills::pin))
