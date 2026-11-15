@@ -208,14 +208,21 @@ export default function ChatPage({
       const handle = openChat(id, me!.ws_token, {
         onOpen: () => {
           setWsState("open");
+          // The gateway sends what still waits to every new connection.
+          setApprovals([]);
           void catchUp();
         },
         onMessage: (msg) => {
           // A reply answers the oldest message waiting; a soft error
           // (agent gone) ends the wait for all of them.
           if (msg.type === "approval") {
-            // The reply still runs; it waits for this answer.
-            setApprovals((prev) => [...prev, msg]);
+            // The reply still runs; it waits for this answer. Requests are
+            // sent again to a reconnecting tab, so keep one card per id.
+            setApprovals((prev) => (prev.some((a) => a.id === msg.id) ? prev : [...prev, msg]));
+            return;
+          }
+          if (msg.type === "approval_closed") {
+            setApprovals((prev) => prev.filter((a) => a.id !== msg.id));
             return;
           }
           if (msg.type === "agent_message") {
@@ -289,8 +296,9 @@ export default function ChatPage({
   }
 
   function decide(id: string, approve: boolean, remember: boolean) {
-    chatRef.current?.decide(id, approve, remember);
-    setApprovals((prev) => prev.filter((a) => a.id !== id));
+    // The gateway closes the card in every tab once it took the answer.
+    if (!chatRef.current || wsState !== "open") return;
+    chatRef.current.decide(id, approve, remember);
   }
 
   function onSubmit(e: React.FormEvent) {
@@ -421,6 +429,12 @@ export default function ChatPage({
               <p className="mb-1">
                 <strong>Approve this tool call?</strong>{" "}
                 <span className="font-mono">{a.tool}</span>
+                {a.conversation && (
+                  <span style={{ color: "var(--color-body)" }}>
+                    {" "}
+                    (in the conversation {a.conversation})
+                  </span>
+                )}
               </p>
               <pre
                 className="mb-2 overflow-x-auto whitespace-pre-wrap text-xs font-mono"
@@ -429,13 +443,29 @@ export default function ChatPage({
                 {a.input}
               </pre>
               <div className="flex flex-wrap gap-2">
-                <button type="button" className="btn-primary" onClick={() => decide(a.id, true, false)}>
+                <button
+                  type="button"
+                  className="btn-primary"
+                  disabled={wsState !== "open"}
+                  onClick={() => decide(a.id, true, false)}
+                >
                   approve
                 </button>
-                <button type="button" className="btn-ghost" onClick={() => decide(a.id, true, true)}>
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  disabled={wsState !== "open"}
+                  onClick={() => decide(a.id, true, true)}
+                  title="Approve this tool with this exact input for the rest of the conversation, until the agent restarts"
+                >
                   approve for this conversation
                 </button>
-                <button type="button" className="btn-ghost" onClick={() => decide(a.id, false, false)}>
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  disabled={wsState !== "open"}
+                  onClick={() => decide(a.id, false, false)}
+                >
                   deny
                 </button>
               </div>

@@ -779,25 +779,6 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
             return;
         }
     };
-    // `/approve` and `/deny` answer a tool call waiting in this
-    // conversation instead of reaching the agent as a message.
-    if let Some((approve, remember)) = approval_command(&content) {
-        let decision = havn_proto::ApprovalDecision {
-            channel_id: encoded_channel_id,
-            request_id: None,
-            approve,
-            remember,
-        };
-        crate::agent_socket::forward_decision(
-            &state.registry,
-            &state.db,
-            agent_id,
-            &format!("{channel}:{}", inb.sender_id),
-            decision,
-        )
-        .await;
-        return;
-    }
     // `/stop` stops the reply running in this conversation instead of
     // reaching the agent as a message.
     if is_stop_command(&content) {
@@ -1089,42 +1070,9 @@ fn is_stop_command(content: &MessageContent) -> bool {
     is_command(text.trim(), "/stop")
 }
 
-/// `/approve`, `/approve always` or `/deny`, as (approve, remember).
-fn approval_command(content: &MessageContent) -> Option<(bool, bool)> {
-    let MessageContent::Text { text } = content else {
-        return None;
-    };
-    let text = text.trim();
-    let (command, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
-    match (rest.trim().to_ascii_lowercase().as_str(), command) {
-        ("", c) if is_command(c, "/approve") => Some((true, false)),
-        ("always", c) if is_command(c, "/approve") => Some((true, true)),
-        ("", c) if is_command(c, "/deny") => Some((false, false)),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn approval_commands_are_recognised() {
-        let text = |t: &str| MessageContent::Text { text: t.into() };
-        assert_eq!(approval_command(&text("/approve")), Some((true, false)));
-        assert_eq!(
-            approval_command(&text(" /approve  always ")),
-            Some((true, true))
-        );
-        assert_eq!(
-            approval_command(&text("/approve@havn_bot")),
-            Some((true, false))
-        );
-        assert_eq!(approval_command(&text("/DENY")), Some((false, false)));
-        assert_eq!(approval_command(&text("/deny always")), None);
-        assert_eq!(approval_command(&text("/approve the plan please")), None);
-        assert_eq!(approval_command(&text("approve")), None);
-    }
 
     #[test]
     fn stop_commands_are_recognised() {

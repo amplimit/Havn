@@ -76,6 +76,9 @@ pub enum AgentToGateway {
     /// A tool call that a hook's `ask` rule matched waits for the user;
     /// the gateway asks them in the conversation.
     ApprovalRequest(ApprovalRequest),
+    /// An approval request ended without a decision (timed out, or its
+    /// turn was stopped); the gateway stops showing it.
+    ApprovalClosed { request_id: String },
 }
 
 /// See [`GatewayToAgent::TimezoneUpdate`].
@@ -99,7 +102,7 @@ pub struct ApprovalRequest {
     /// The conversation to ask in.
     pub channel_id: String,
     pub tool: String,
-    /// The call's flattened input, as the hook saw it (shortened).
+    /// The call's whole input as JSON, which is what an approval covers.
     pub input: String,
     /// Which rule asked.
     pub reason: String,
@@ -109,10 +112,8 @@ pub struct ApprovalRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApprovalDecision {
     pub channel_id: String,
-    /// The request answered; `None` for the latest one waiting in the
-    /// conversation (`/approve` in a channel).
-    #[serde(default)]
-    pub request_id: Option<String>,
+    /// The request answered.
+    pub request_id: String,
     pub approve: bool,
     /// Approve the same tool and input for the rest of the conversation.
     #[serde(default)]

@@ -72,17 +72,6 @@ pub struct ToolHookRule {
     pub ask: Vec<String>,
 }
 
-impl ToolHookRule {
-    /// Whether the rule is about `tool`.
-    #[must_use]
-    pub fn covers(&self, tool: &str) -> bool {
-        match self.tool.strip_suffix('*') {
-            Some(prefix) => tool.starts_with(prefix),
-            None => self.tool == tool,
-        }
-    }
-}
-
 /// The `ask` pattern that matches every call.
 pub const ASK_EVERY_CALL: &str = "(?s).*";
 
@@ -1118,10 +1107,6 @@ mod tests {
         assert_eq!(merged.union(&ask("shell", "deploy")), merged, "no repeats");
         assert!(merged.validate().is_ok());
         assert!(ask("shell", "(").validate().is_err());
-        assert!(merged.pre_tool_use[0].covers("mcp__github__create_issue"));
-        assert!(!merged.pre_tool_use[0].covers("mcp__gitlab__x"));
-        assert!(merged.pre_tool_use[1].covers("shell"));
-        assert!(!merged.pre_tool_use[1].covers("shell2"));
     }
 
     #[test]

@@ -218,14 +218,10 @@ async fn serve_session<Si, St, E>(
                 approve,
                 remember,
             } => {
-                let decision = havn_proto::ApprovalDecision {
-                    channel_id: session_id.to_string(),
-                    request_id: Some(id),
-                    approve,
-                    remember,
-                };
-                crate::agent_socket::forward_decision(registry, db, agent_id, sender_id, decision)
-                    .await;
+                crate::agent_socket::forward_decision(
+                    registry, db, router, agent_id, sender_id, &id, approve, remember,
+                )
+                .await;
                 continue;
             }
             ClientMessage::Stop => {

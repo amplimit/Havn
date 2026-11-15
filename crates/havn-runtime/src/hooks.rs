@@ -188,14 +188,28 @@ fn parse(yaml: &str) -> Result<HookSet, String> {
                 });
                 break 'rules;
             }
-            if pattern.len() > MAX_HOOK_PATTERN_LEN {
-                warn!(tool = %rule.tool, "hooks.yaml pattern longer than {MAX_HOOK_PATTERN_LEN} bytes ignored");
-                continue;
-            }
-            match havn_core::compile_hook_pattern(pattern, COMPILE_SIZE_LIMIT) {
+            let re = if pattern.len() > MAX_HOOK_PATTERN_LEN {
+                Err(format!("longer than {MAX_HOOK_PATTERN_LEN} bytes"))
+            } else {
+                havn_core::compile_hook_pattern(pattern, COMPILE_SIZE_LIMIT)
+                    .map_err(|e| e.to_string())
+            };
+            match re {
                 Ok(re) => {
                     compiled[kind].push(re);
                     patterns_left -= 1;
+                }
+                // An ask pattern that cannot be used asks about every call
+                // of the tool rather than none.
+                Err(e) if kind == 1 => {
+                    warn!(tool = %rule.tool, error = %e, "hooks.yaml ask pattern unusable; asking about every call");
+                    if let Ok(every) = havn_core::compile_hook_pattern(
+                        havn_core::policy::ASK_EVERY_CALL,
+                        COMPILE_SIZE_LIMIT,
+                    ) {
+                        compiled[1].push(every);
+                        patterns_left -= 1;
+                    }
                 }
                 Err(e) => warn!(tool = %rule.tool, error = %e, "hooks.yaml pattern ignored"),
             }

@@ -50,23 +50,28 @@ fn always_asked(policy: &Policy) -> Vec<String> {
 }
 
 /// The override's hook rules, from `config.policy.hooks`.
-fn override_rules(config: &Value) -> Vec<ToolHookRule> {
-    config
-        .pointer("/policy/hooks/pre_tool_use")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default()
+fn override_rules(config: &Value) -> Result<Vec<ToolHookRule>, ApiError> {
+    match config.pointer("/policy/hooks/pre_tool_use") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+            ApiError::BadRequest(format!("the agent's stored hook rules do not parse: {e}"))
+        }),
+    }
 }
 
-async fn view(state: &AppState, agent: &havn_db::repo::agents::Agent) -> ApprovalsView {
+async fn view(
+    state: &AppState,
+    agent: &havn_db::repo::agents::Agent,
+) -> Result<ApprovalsView, ApiError> {
     let owner = policy_resolver::for_owner(&state.db, agent).await;
     let inherited = always_asked(&owner);
-    let tools = override_rules(&agent.config)
+    let tools = override_rules(&agent.config)?
         .into_iter()
         .filter(asks_every_call)
         .map(|r| r.tool)
         .filter(|t| !inherited.contains(t))
         .collect();
-    ApprovalsView { tools, inherited }
+    Ok(ApprovalsView { tools, inherited })
 }
 
 pub async fn get(
@@ -75,7 +80,7 @@ pub async fn get(
     Path(id): Path<String>,
 ) -> Result<Json<ApprovalsView>, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
-    Ok(Json(view(&state, &agent).await))
+    Ok(Json(view(&state, &agent).await?))
 }
 
 /// Replace the agent's list.
@@ -107,7 +112,7 @@ pub async fn put(
     if tools.len() > MAX_TOOLS {
         return Err(ApiError::BadRequest(format!("more than {MAX_TOOLS} tools")));
     }
-    let mut rules: Vec<ToolHookRule> = override_rules(&agent.config)
+    let mut rules: Vec<ToolHookRule> = override_rules(&agent.config)?
         .into_iter()
         .filter(|r| !asks_every_call(r))
         .collect();
@@ -148,7 +153,7 @@ pub async fn put(
         serde_json::json!({ "tools": tools }),
     )
     .await;
-    Ok(Json(view(&state, &updated).await))
+    Ok(Json(view(&state, &updated).await?))
 }
 
 #[cfg(test)]
@@ -165,13 +170,15 @@ mod tests {
             {"tool": "shell", "ask": [ASK_EVERY_CALL]},
             {"tool": "shell", "deny": ["^rm"]},
             {"tool": "web_fetch", "ask": ["internal"]}
-        ]}}}));
+        ]}}}))
+        .unwrap();
         let counted: Vec<&str> = rules
             .iter()
             .filter(|r| asks_every_call(r))
             .map(|r| r.tool.as_str())
             .collect();
         assert_eq!(counted, ["shell"]);
-        assert!(override_rules(&json!({})).is_empty());
+        assert!(override_rules(&json!({})).unwrap().is_empty());
+        assert!(override_rules(&json!({"policy": {"hooks": {"pre_tool_use": "x"}}})).is_err());
     }
 }

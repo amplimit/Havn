@@ -383,6 +383,11 @@ impl ToolRegistry {
         // registry-find so a denied call doesn't even pay the lookup
         // cost; surface a structured error so the LLM sees the deny
         // and adapts its plan.
+        // An unknown tool is refused before any hook asks about it.
+        let Some(tool) = self.tools.iter().find(|t| t.name() == name) else {
+            warn!(name, "tool dispatch failed: unknown tool");
+            return ToolResult::Error(format!("unknown tool: {name}"));
+        };
         if let Some(hooks) = &self.hooks {
             // The snapshot guard is not held across the approval wait.
             let verdict = {
@@ -408,12 +413,14 @@ impl ToolRegistry {
                             .ok();
                         let decided = match &self.approvals {
                             Some(approvals) => {
+                                // The whole input: what is approved, and
+                                // what "for this conversation" remembers.
+                                let whole = input.to_string();
                                 approvals
-                                    .ask(conversation.as_deref(), name, &flat, &reason)
+                                    .ask(conversation.as_deref(), name, &whole, &reason)
                                     .await
                             }
-                            None => Err("it needs the user's approval, which is not set up here"
-                                .to_string()),
+                            None => Err("it needs approval, which is not set up here".to_string()),
                         };
                         if let Err(why) = decided {
                             info!(name, context, why = %why, "tool call not approved");
@@ -424,10 +431,6 @@ impl ToolRegistry {
             }
         }
 
-        let Some(tool) = self.tools.iter().find(|t| t.name() == name) else {
-            warn!(name, "tool dispatch failed: unknown tool");
-            return ToolResult::Error(format!("unknown tool: {name}"));
-        };
         tool.execute(ctx, input).await
     }
 }
