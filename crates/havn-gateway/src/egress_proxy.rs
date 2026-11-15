@@ -721,14 +721,14 @@ where
 
 /// When a connection last carried anything, shared by its directions.
 struct Activity {
-    start: Instant,
+    start: tokio::time::Instant,
     last_ms: std::sync::atomic::AtomicU64,
 }
 
 impl Activity {
     fn new() -> Self {
         Self {
-            start: Instant::now(),
+            start: tokio::time::Instant::now(),
             last_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
