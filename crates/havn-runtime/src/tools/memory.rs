@@ -105,27 +105,11 @@ impl Tool for MemoryRememberTool {
             return ToolResult::Error("key must be non-empty".into());
         }
 
-        // Truncate-with-marker rather than reject. Audit feedback: hard
-        // rejection of a 4097-byte value is a worse UX than silently
-        // capping with a sentinel — the agent can still write the
-        // important prefix and the LLM will see in the result that it
-        // got truncated.
-        let (stored_value, truncated) = if value.len() > MAX_VALUE_BYTES {
-            let mut head: String = value
-                .chars()
-                .take(MAX_VALUE_BYTES.saturating_sub(64))
-                .collect();
-            head.push_str("\n…(truncated to fit memory entry size cap)");
-            (head, true)
-        } else {
-            (value.to_string(), false)
-        };
-
-        let row_id = match memory::remember(
-            &ctx.agent_db,
+        let (_, truncated) = match save(
+            ctx,
             NewEntry {
                 key,
-                value: &stored_value,
+                value,
                 kind,
                 source,
                 ttl_days,
@@ -133,43 +117,9 @@ impl Tool for MemoryRememberTool {
         )
         .await
         {
-            Ok(id) => id,
+            Ok(saved) => saved,
             Err(e) => return ToolResult::Error(format!("memory_remember failed: {e}")),
         };
-
-        // Hybrid retrieval (spec §9.4 v0.7): if an embedder is wired,
-        // compute the vector for the value and persist it pinned to
-        // the id we just got back. By-id (not by-key) avoids the
-        // race where a concurrent remember(same_key, different_value)
-        // would archive our row + insert a new one between here and
-        // the UPDATE — audit-fix from the v0.7 review.
-        //
-        // We embed `"<key>: <value>"` so the key contributes to the
-        // semantic signature — "user.editor" + "vim" together is more
-        // distinguishable than just "vim".
-        //
-        // Failure here is non-fatal: the row is already persisted,
-        // so worst case the row gets BM25 only. Logged at warn level
-        // so operators see persistent provider issues. The startup
-        // backfill (`embedding::backfill`) heals any rows that miss
-        // the live embed path.
-        if let Some(emb) = &ctx.embedder {
-            if !row_id.is_empty() {
-                let embed_text = format!("{key}: {stored_value}");
-                match emb.embed(&embed_text).await {
-                    Ok(vec) => {
-                        if let Err(e) =
-                            memory::set_embedding_by_id(&ctx.agent_db, &row_id, &vec).await
-                        {
-                            tracing::warn!(key, error = %e, "set_embedding_by_id failed; row stored without vector");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(key, error = %e, "embedder failed; row stored without vector");
-                    }
-                }
-            }
-        }
 
         let suffix = if truncated {
             " (value was truncated to the memory entry size cap)"
@@ -178,6 +128,58 @@ impl Tool for MemoryRememberTool {
         };
         ToolResult::Ok(format!("remembered {key:?} as {}{suffix}", kind.as_str()))
     }
+}
+
+/// Save `new` as the active entry for its key, cutting a value over
+/// [`MAX_VALUE_BYTES`] with a marker, and embed it when an embedder is
+/// wired: the row's id, and whether the value was cut. What the
+/// `memory_remember` tool and the dashboard save go through.
+pub async fn save(ctx: &ToolCtx, new: NewEntry<'_>) -> havn_db::Result<(String, bool)> {
+    // Truncate-with-marker rather than reject: the agent can still write
+    // the important prefix and sees in the result that it was cut.
+    let (stored_value, truncated) = if new.value.len() > MAX_VALUE_BYTES {
+        let mut head: String = new
+            .value
+            .chars()
+            .take(MAX_VALUE_BYTES.saturating_sub(64))
+            .collect();
+        head.push_str("\n…(truncated to fit memory entry size cap)");
+        (head, true)
+    } else {
+        (new.value.to_string(), false)
+    };
+    let key = new.key;
+    let row_id = memory::remember(
+        &ctx.agent_db,
+        NewEntry {
+            key,
+            value: &stored_value,
+            kind: new.kind,
+            source: new.source,
+            ttl_days: new.ttl_days,
+        },
+    )
+    .await?;
+
+    // Hybrid retrieval (spec §9.4 v0.7): embed `"<key>: <value>"`, pinned
+    // to the row id so a concurrent write to the same key cannot get this
+    // vector. A failure leaves the row BM25-only until the startup
+    // backfill heals it.
+    if let Some(emb) = &ctx.embedder
+        && !row_id.is_empty()
+    {
+        match emb.embed(&format!("{key}: {stored_value}")).await {
+            Ok(vec) => {
+                if let Err(e) = memory::set_embedding_by_id(&ctx.agent_db, &row_id, &vec).await {
+                    tracing::warn!(key, error = %e, "set_embedding_by_id failed; row stored without vector");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(key, error = %e, "embedder failed; row stored without vector");
+            }
+        }
+    }
+    Ok((row_id, truncated))
 }
 
 pub struct MemorySearchTool;

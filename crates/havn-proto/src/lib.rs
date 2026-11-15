@@ -398,6 +398,59 @@ pub enum DataQuery {
         channel_id: String,
         conversation: String,
     },
+    /// Save `value` under `key` as something the user said (added or
+    /// edited in the dashboard): the saved entry. An entry with another
+    /// value or kind is kept as the one this supersedes.
+    Remember {
+        key: String,
+        value: String,
+        memory_kind: String,
+        #[serde(default)]
+        expiry: MemoryExpiry,
+    },
+}
+
+/// Longest memory key the dashboard can save.
+pub const MAX_MEMORY_KEY_CHARS: usize = 120;
+/// Longest a memory saved in the dashboard is kept unused, in days.
+pub const MAX_MEMORY_DAYS: u32 = 3650;
+
+/// Why a memory the user saves cannot be kept as given, if it cannot.
+/// The gateway answers with it before asking the agent, which checks
+/// again.
+pub fn check_memory(key: &str, value: &str, expiry: MemoryExpiry) -> Result<(), String> {
+    let key = key.trim();
+    if key.is_empty()
+        || key.chars().count() > MAX_MEMORY_KEY_CHARS
+        || key.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "a memory key has 1 to {MAX_MEMORY_KEY_CHARS} characters, none of them control \
+             characters"
+        ));
+    }
+    if value.trim().is_empty() {
+        return Err("the memory has no text".into());
+    }
+    if let MemoryExpiry::Days(days) = expiry
+        && !(1..=MAX_MEMORY_DAYS).contains(&days)
+    {
+        return Err(format!(
+            "a memory is kept for 1 to {MAX_MEMORY_DAYS} days unused"
+        ));
+    }
+    Ok(())
+}
+
+/// How long a memory entry the user saved is kept once it goes unused.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryExpiry {
+    /// What its kind keeps a fact the user said for.
+    #[default]
+    KindDefault,
+    Never,
+    Days(u32),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -662,6 +715,26 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn a_memory_the_user_saves_is_checked() {
+        assert!(check_memory("user.name", "Ada", MemoryExpiry::KindDefault).is_ok());
+        assert!(check_memory("  ", "Ada", MemoryExpiry::Never).is_err());
+        assert!(check_memory(&"k".repeat(121), "Ada", MemoryExpiry::Never).is_err());
+        assert!(check_memory("a\nb", "Ada", MemoryExpiry::Never).is_err());
+        assert!(check_memory("k", " \n", MemoryExpiry::Never).is_err());
+        assert!(check_memory("k", "v", MemoryExpiry::Days(0)).is_err());
+        assert!(check_memory("k", "v", MemoryExpiry::Days(3650)).is_ok());
+        assert!(check_memory("k", "v", MemoryExpiry::Days(3651)).is_err());
+        assert_eq!(
+            serde_json::from_str::<MemoryExpiry>(r#"{"days":30}"#).unwrap(),
+            MemoryExpiry::Days(30)
+        );
+        assert_eq!(
+            serde_json::from_str::<MemoryExpiry>(r#""never""#).unwrap(),
+            MemoryExpiry::Never
+        );
+    }
 
     #[test]
     fn agent_hello_round_trips_through_json() {

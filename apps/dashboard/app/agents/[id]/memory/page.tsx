@@ -2,7 +2,13 @@
 
 import { use, useEffect, useState } from "react";
 import Link from "next/link";
-import { ApiError, api, type MemoryEntry, type MemoryKind } from "@/lib/api";
+import {
+  ApiError,
+  api,
+  type MemoryEntry,
+  type MemoryExpiry,
+  type MemoryKind,
+} from "@/lib/api";
 
 const KIND_ORDER: MemoryKind[] = ["identity", "preference", "project", "event"];
 
@@ -21,8 +27,12 @@ const KIND_HINT: Record<MemoryKind, string> = {
     "Discrete things that happened. Auto-expire after a month unless cited recently.",
 };
 
+/** Longest memory key the gateway accepts. */
+const MAX_KEY_CHARS = 120;
+
 /**
- * `/agents/[id]/memory` — view + prune what the agent remembers.
+ * `/agents/[id]/memory` — view, edit, add and export what the agent
+ * remembers.
  * Reads are answered by the running agent from its own agent.db (409
  * when it is stopped). Delete buttons route through the agent socket as
  * `MemoryForgetRequest` frames so agent.db stays single-writer
@@ -41,6 +51,11 @@ export default function MemoryPage({
   const [error, setError] = useState<string | null>(null);
   const [pendingForget, setPendingForget] = useState<string | null>(null);
   const [forgetError, setForgetError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [kindFilter, setKindFilter] = useState<MemoryKind | "all">("all");
+  const [sourceFilter, setSourceFilter] = useState<MemoryEntry["source"] | "all">("all");
+  const [editing, setEditing] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
 
   async function load() {
     try {
@@ -104,7 +119,33 @@ export default function MemoryPage({
     }
   }
 
-  const grouped = groupByKind(entries ?? []);
+  // Save an added or edited memory; the error, if any, for the form.
+  async function onSave(
+    key: string,
+    entry: { value: string; kind: MemoryKind; expiry: MemoryExpiry },
+  ): Promise<string | null> {
+    try {
+      await api.memory.save(id, key, entry);
+      await load();
+      setEditing(null);
+      setAdding(false);
+      return null;
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        return "Start the agent before changing memory — agent.db is single-writer.";
+      }
+      return e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  const needle = query.trim().toLowerCase();
+  const shown = (entries ?? []).filter(
+    (e) =>
+      (kindFilter === "all" || e.kind === kindFilter) &&
+      (sourceFilter === "all" || e.source === sourceFilter) &&
+      (!needle || e.key.toLowerCase().includes(needle) || e.value.toLowerCase().includes(needle)),
+  );
+  const grouped = groupByKind(shown);
 
   return (
     <div className="mx-auto max-w-5xl px-4 py-8 sm:px-8 sm:py-12">
@@ -123,9 +164,73 @@ export default function MemoryPage({
         >
           Everything below was written by the agent or you, grouped by kind.
           Values are exactly what the agent sees on its next turn — no
-          summary, no transformation.
+          summary, no transformation. What you add or edit here counts as
+          something you said.
         </p>
       </header>
+
+      {entries !== null && !uninitialised && (
+        <div className="mb-6 flex flex-wrap items-center gap-2">
+          <input
+            type="search"
+            className="input min-w-0 flex-1"
+            placeholder="search memory"
+            aria-label="search memory"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+          <select
+            className="input w-auto"
+            aria-label="kind"
+            value={kindFilter}
+            onChange={(e) => setKindFilter(e.target.value as MemoryKind | "all")}
+          >
+            <option value="all">all kinds</option>
+            {KIND_ORDER.map((k) => (
+              <option key={k} value={k}>
+                {KIND_LABEL[k]}
+              </option>
+            ))}
+          </select>
+          <select
+            className="input w-auto"
+            aria-label="source"
+            value={sourceFilter}
+            onChange={(e) => setSourceFilter(e.target.value as MemoryEntry["source"] | "all")}
+          >
+            <option value="all">anyone</option>
+            <option value="user_told">you said</option>
+            <option value="agent_inferred">inferred</option>
+          </select>
+          <button type="button" className="btn-primary" onClick={() => setAdding(true)} disabled={adding}>
+            add memory
+          </button>
+          <button
+            type="button"
+            className="btn-ghost"
+            onClick={() => download(`memory-${id}.json`, "application/json", JSON.stringify(entries, null, 2))}
+            disabled={entries.length === 0}
+            title="Every active memory, as JSON"
+          >
+            export JSON
+          </button>
+          <button
+            type="button"
+            className="btn-ghost"
+            onClick={() => download(`memory-${id}.md`, "text/markdown", asMarkdown(entries))}
+            disabled={entries.length === 0}
+            title="Every active memory, as Markdown"
+          >
+            export Markdown
+          </button>
+        </div>
+      )}
+
+      {adding && (
+        <div className="card mb-6 px-4 py-4">
+          <MemoryForm onSave={onSave} onCancel={() => setAdding(false)} />
+        </div>
+      )}
 
       {error && (
         <div
@@ -182,7 +287,13 @@ export default function MemoryPage({
         </div>
       )}
 
-      {entries !== null && !uninitialised && entries.length > 0 && (
+      {entries !== null && !uninitialised && entries.length > 0 && shown.length === 0 && (
+        <p className="text-sm" style={{ color: "var(--color-body)" }}>
+          Nothing matches.
+        </p>
+      )}
+
+      {entries !== null && !uninitialised && shown.length > 0 && (
         <div className="grid gap-8">
           {KIND_ORDER.map((kind) => {
             const rows = grouped[kind] ?? [];
@@ -197,7 +308,12 @@ export default function MemoryPage({
                   {KIND_HINT[kind]}
                 </p>
                 <ul className="grid gap-2">
-                  {rows.map((e) => (
+                  {rows.map((e) =>
+                    editing === e.key ? (
+                      <li key={e.key} className="card px-4 py-4">
+                        <MemoryForm entry={e} onSave={onSave} onCancel={() => setEditing(null)} />
+                      </li>
+                    ) : (
                     <li key={e.key} className="card px-4 py-3">
                       <div className="flex items-start justify-between gap-4">
                         <div className="min-w-0 flex-1">
@@ -207,7 +323,12 @@ export default function MemoryPage({
                           >
                             {e.key}
                           </code>
-                          <p className="mt-1">{e.value}</p>
+                          <p className="mt-1" style={{ whiteSpace: "pre-wrap" }}>
+                            {e.value}
+                          </p>
+                          <p className="mt-1 text-xs" style={{ color: "var(--color-body)" }}>
+                            {lifetime(e)}
+                          </p>
                         </div>
                         <div className="shrink-0 text-right text-xs">
                           <SourcePill source={e.source} />
@@ -227,10 +348,20 @@ export default function MemoryPage({
                           >
                             {pendingForget === e.key ? "forgetting…" : "forget"}
                           </button>
+                          <button
+                            type="button"
+                            onClick={() => setEditing(e.key)}
+                            className="mt-2 ml-3 text-xs underline"
+                            style={{ color: "var(--color-purple)" }}
+                            title="Change its text, kind or how long it is kept. The old version is kept in the audit chain."
+                          >
+                            edit
+                          </button>
                         </div>
                       </div>
                     </li>
-                  ))}
+                    ),
+                  )}
                 </ul>
               </section>
             );
@@ -239,6 +370,151 @@ export default function MemoryPage({
       )}
     </div>
   );
+}
+
+/** How long `e` is kept, in words. */
+function lifetime(e: MemoryEntry): string {
+  if (e.ttl_days === null) return "kept until forgotten";
+  return `forgotten after ${e.ttl_days} day${e.ttl_days === 1 ? "" : "s"} unused`;
+}
+
+function expiryOf(e: MemoryEntry | undefined): { mode: "kind_default" | "never" | "days"; days: number } {
+  if (!e) return { mode: "kind_default", days: 30 };
+  if (e.ttl_days === null) return { mode: "never", days: 30 };
+  return { mode: "days", days: e.ttl_days };
+}
+
+function MemoryForm({
+  entry,
+  onSave,
+  onCancel,
+}: {
+  /** The memory edited; absent when adding one. */
+  entry?: MemoryEntry;
+  onSave: (
+    key: string,
+    entry: { value: string; kind: MemoryKind; expiry: MemoryExpiry },
+  ) => Promise<string | null>;
+  onCancel: () => void;
+}) {
+  const initial = expiryOf(entry);
+  const [key, setKey] = useState(entry?.key ?? "");
+  const [value, setValue] = useState(entry?.value ?? "");
+  const [kind, setKind] = useState<MemoryKind>(entry?.kind ?? "preference");
+  const [mode, setMode] = useState(initial.mode);
+  const [days, setDays] = useState(initial.days);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(ev: React.FormEvent) {
+    ev.preventDefault();
+    setSaving(true);
+    const expiry: MemoryExpiry = mode === "days" ? { days } : mode;
+    // A new memory without a key gets one; the agent finds memories by
+    // what they say, not by key.
+    const chosen = key.trim() || `note.${crypto.getRandomValues(new Uint32Array(1))[0].toString(16)}`;
+    const failed = await onSave(chosen, { value, kind, expiry });
+    setSaving(false);
+    setError(failed);
+  }
+
+  return (
+    <form className="grid gap-3" onSubmit={submit}>
+      {entry ? (
+        <code className="font-mono text-xs" style={{ color: "var(--color-body)" }}>
+          {entry.key}
+        </code>
+      ) : (
+        <input
+          className="input font-mono text-sm"
+          placeholder="key, e.g. user.editor (optional)"
+          aria-label="key"
+          maxLength={MAX_KEY_CHARS}
+          value={key}
+          onChange={(e) => setKey(e.target.value)}
+        />
+      )}
+      <textarea
+        className="input min-h-20 text-sm"
+        placeholder="what the agent should remember"
+        aria-label="memory"
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        autoFocus
+      />
+      <div className="flex flex-wrap items-center gap-2 text-sm">
+        <select
+          className="input w-auto"
+          aria-label="kind"
+          value={kind}
+          onChange={(e) => setKind(e.target.value as MemoryKind)}
+        >
+          {KIND_ORDER.map((k) => (
+            <option key={k} value={k}>
+              {KIND_LABEL[k]}
+            </option>
+          ))}
+        </select>
+        <select
+          className="input w-auto"
+          aria-label="kept for"
+          value={mode}
+          onChange={(e) => setMode(e.target.value as typeof mode)}
+        >
+          <option value="kind_default">kept as long as its kind keeps it</option>
+          <option value="never">kept until forgotten</option>
+          <option value="days">forgotten after days unused…</option>
+        </select>
+        {mode === "days" && (
+          <input
+            type="number"
+            className="input w-24"
+            aria-label="days"
+            min={1}
+            max={3650}
+            value={days}
+            onChange={(e) => setDays(Math.max(1, Math.min(3650, Number(e.target.value) || 1)))}
+          />
+        )}
+      </div>
+      {error && (
+        <p className="text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
+          {error}
+        </p>
+      )}
+      <div className="flex justify-end gap-2">
+        <button type="button" className="btn-ghost" onClick={onCancel}>
+          cancel
+        </button>
+        <button type="submit" className="btn-primary" disabled={saving || !value.trim()}>
+          {saving ? "saving…" : "save"}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function download(name: string, type: string, text: string) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function asMarkdown(entries: MemoryEntry[]): string {
+  const grouped = groupByKind(entries);
+  let out = "# Memory\n";
+  for (const kind of KIND_ORDER) {
+    if (grouped[kind].length === 0) continue;
+    out += `\n## ${KIND_LABEL[kind]}\n\n`;
+    for (const e of grouped[kind]) {
+      const who = e.source === "user_told" ? "you said" : "inferred";
+      out += `- **${e.key}**: ${e.value.replace(/\n/g, " ")} (${who}; ${lifetime(e)})\n`;
+    }
+  }
+  return out;
 }
 
 function groupByKind(entries: MemoryEntry[]): Record<MemoryKind, MemoryEntry[]> {

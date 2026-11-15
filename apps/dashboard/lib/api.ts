@@ -106,6 +106,9 @@ export type MemoryEntry = {
   supersedes_id: string | null;
 };
 
+/** How long a memory the user saves is kept once unused. */
+export type MemoryExpiry = "kind_default" | "never" | { days: number };
+
 export type MemoryListResponse = {
   agent_id: string;
   entries: MemoryEntry[];
@@ -611,6 +614,16 @@ export const api = {
         `/agents/${agentId}/memory/${encodeURIComponent(key)}`,
         { method: "DELETE" },
       ),
+    /** Add or edit the memory under `key`, as something the user said. */
+    save: (
+      agentId: string,
+      key: string,
+      entry: { value: string; kind: MemoryKind; expiry: MemoryExpiry },
+    ) =>
+      request<MemoryEntry>(`/agents/${agentId}/memory/${encodeURIComponent(key)}`, {
+        method: "PUT",
+        body: JSON.stringify(entry),
+      }),
   },
 
   skills: {

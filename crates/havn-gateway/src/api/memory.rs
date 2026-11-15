@@ -10,7 +10,8 @@
 //! `DELETE /agents/:id/memory/:key` routes the request through the
 //! agent socket as a [`havn_proto::MemoryForgetRequest`] frame —
 //! agent.db remains single-writer (spec §5.2). Requires the agent to
-//! be running; offline deletes return 409.
+//! be running; offline deletes return 409. `PUT` saves an entry the
+//! user added or edited the same way, as a data request.
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -111,6 +112,59 @@ pub async fn list(
         entries: views,
         uninitialised: false,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SaveRequest {
+    pub value: String,
+    pub kind: String,
+    #[serde(default)]
+    pub expiry: havn_proto::MemoryExpiry,
+}
+
+/// `PUT /agents/:id/memory/:key` — save `value` under `key` as something
+/// the user said, added or edited in the dashboard. The running agent
+/// writes it (409 when it is stopped); an entry with another value or
+/// kind is kept, archived, as the one the new one supersedes. Answers
+/// with the saved entry.
+pub async fn save(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path((id, key)): Path<(String, String)>,
+    Json(body): Json<SaveRequest>,
+) -> Result<Json<MemoryEntryView>, ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let agent_id = agent.id;
+    havn_proto::check_memory(&key, &body.value, body.expiry).map_err(ApiError::BadRequest)?;
+    if memory::Kind::parse(&body.kind).is_none() {
+        return Err(ApiError::BadRequest(format!(
+            "kind is identity, preference, project or event, not {:?}",
+            body.kind
+        )));
+    }
+    let kind = body.kind.clone();
+    let entry: memory::Entry = crate::api::agents::agent_data(
+        &state,
+        user.id,
+        agent_id,
+        havn_proto::DataQuery::Remember {
+            key,
+            value: body.value,
+            memory_kind: body.kind,
+            expiry: body.expiry,
+        },
+        false,
+    )
+    .await?;
+    audit::record_agent_action(
+        &state.db,
+        user.id,
+        agent_id,
+        "memory.saved",
+        serde_json::json!({"key": entry.key, "kind": kind}),
+    )
+    .await;
+    Ok(Json(MemoryEntryView::from(entry)))
 }
 
 /// `DELETE /agents/:id/memory/:key` — soft-delete a memory row via

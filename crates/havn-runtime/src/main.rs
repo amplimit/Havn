@@ -2017,6 +2017,43 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                 }
                 Ok(serde_json::json!({ "found": found }))
             }
+            DataQuery::Remember {
+                key,
+                value,
+                memory_kind,
+                expiry,
+            } => {
+                havn_proto::check_memory(&key, &value, expiry)?;
+                let key = key.trim();
+                let kind = memory::Kind::parse(&memory_kind)
+                    .ok_or_else(|| format!("unknown memory kind {memory_kind:?}"))?;
+                let ttl_days = match expiry {
+                    havn_proto::MemoryExpiry::Days(days) => Some(i64::from(days)),
+                    havn_proto::MemoryExpiry::KindDefault | havn_proto::MemoryExpiry::Never => None,
+                };
+                let (id, _) = tools::memory::save(
+                    &ctx.tool_env,
+                    memory::NewEntry {
+                        key,
+                        value: &value,
+                        kind,
+                        source: memory::Source::UserTold,
+                        ttl_days,
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                if expiry == havn_proto::MemoryExpiry::Never {
+                    memory::set_ttl_by_id(&ctx.pool, &id, None)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                let entry = memory::fetch_by_id(&ctx.pool, &id)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or("the memory was replaced while it was saved")?;
+                serde_json::to_value(entry).map_err(|e| e.to_string())
+            }
         }
     }
     .await;

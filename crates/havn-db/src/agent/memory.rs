@@ -278,6 +278,17 @@ async fn insert_new(
     Ok(())
 }
 
+/// Set how many days active row `id` is kept once unused; `None` keeps
+/// it until it is forgotten. False when there is no such active row.
+pub async fn set_ttl_by_id(pool: &SqlitePool, id: &str, ttl_days: Option<i64>) -> Result<bool> {
+    let res = sqlx::query("UPDATE memory SET ttl_days = ?2 WHERE id = ?1 AND archived_at IS NULL")
+        .bind(id)
+        .bind(ttl_days)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// Persist an embedding vector for a specific row id. Pin-by-id
 /// avoids the race the audit found: with key-only matching, a
 /// concurrent `remember(same_key, new_value)` could archive row A,
