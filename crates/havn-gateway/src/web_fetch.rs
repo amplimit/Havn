@@ -110,7 +110,7 @@ impl KnownUrls {
     /// Record the http(s) URLs written in `text`, at most
     /// [`MAX_LINKS_PER_TEXT`] of them.
     pub fn record_text(&self, agent: AgentId, text: &str) {
-        let keys: Vec<String> = urls_in(text)
+        let keys: Vec<String> = urls_in(&unescape(text))
             .iter()
             .filter_map(|raw| normalize(raw).ok())
             .map(|url| url_key(&url))
@@ -132,10 +132,25 @@ impl KnownUrls {
             .agents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        agents.retain(|id, seen| {
+            *id == agent
+                || seen
+                    .order
+                    .back()
+                    .is_some_and(|(_, t)| now.saturating_duration_since(*t) < KNOWN_TTL)
+        });
         let seen = agents.entry(agent).or_default();
         for key in keys {
             seen.at.insert(key.clone(), now);
             seen.order.push_back((key, now));
+        }
+        // Refreshed keys leave stale entries behind; rebuild the order
+        // from the map before they outgrow it.
+        if seen.order.len() > 2 * seen.at.len() + 64 {
+            let mut fresh: Vec<(String, Instant)> =
+                seen.at.iter().map(|(k, t)| (k.clone(), *t)).collect();
+            fresh.sort_by_key(|(_, t)| *t);
+            seen.order = fresh.into();
         }
         while seen.at.len() > MAX_KNOWN_PER_AGENT
             || seen
@@ -201,24 +216,36 @@ pub fn urls_in(text: &str) -> Vec<String> {
             && text[..at]
                 .chars()
                 .next_back()
-                .is_none_or(|c| !(c.is_alphanumeric() || matches!(c, '.' | '-' | '/' | '@')));
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '/' | '@')));
         if !scheme && !bare {
             from = at + 1;
             continue;
         }
         let end = url_end(rest);
-        let found = rest[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', '*', '_', '~']);
+        let found =
+            rest[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', '*', '_', '~', '\'']);
         let prefix = if scheme {
             "https://".len()
         } else {
             "www.".len()
         };
         if found.len() > prefix {
-            out.push(if bare {
-                format!("https://{found}")
-            } else {
-                found.to_string()
-            });
+            let full = |s: &str| {
+                if bare {
+                    format!("https://{s}")
+                } else {
+                    s.to_string()
+                }
+            };
+            out.push(full(found));
+            // Chinese text often runs straight on from a URL: also take
+            // the URL up to its first non-ASCII letter.
+            if let Some(cut) = found.find(|c: char| !c.is_ascii()) {
+                let ascii = found[..cut].trim_end_matches(['.', ',', ';', ':', '!', '?', '-']);
+                if ascii.len() > prefix {
+                    out.push(full(ascii));
+                }
+            }
         }
         from = at + end.max(1);
     }
@@ -232,7 +259,7 @@ fn url_end(s: &str) -> usize {
             || c.is_control()
             || matches!(
                 c,
-                '<' | '>' | '"' | '\'' | '`' | '[' | ']' | '{' | '}' | '|' | '\\' | '^'
+                '<' | '>' | '"' | '`' | '[' | ']' | '{' | '}' | '|' | '\\' | '^'
             )
             || CJK_PUNCTUATION.contains(&c)
             || (c == ')' && depth == 0);
@@ -518,14 +545,20 @@ impl WebFetch {
         let url = normalize(raw_url)?;
         refuse_blocked(&url, call.policy)?;
         let host = url.host_str().unwrap_or("");
-        if !call.policy.network_policy.is_allowed(host) && !call.known.contains(agent, &url) {
+        // A URL read only because its domain is allowed may carry anything
+        // the model chose, and a page can echo it or redirect on it: its
+        // links and redirect do not become readable.
+        let known = call.known.contains(agent, &url);
+        if !known && !call.policy.network_policy.is_allowed(host) {
             return Err(NOT_KNOWN.into());
         }
         let page = match self.cached(agent, &url).await {
             Some(page) => page,
             None => match self.fetch(&url, call.policy).await? {
                 Fetched::Elsewhere { from, to } => {
-                    call.known.record(agent, &to);
+                    if known {
+                        call.known.record(agent, &to);
+                    }
                     return Ok(Answer {
                         url: from.to_string(),
                         text: format!(
@@ -537,7 +570,9 @@ impl WebFetch {
                     });
                 }
                 Fetched::Page(page) => {
-                    call.known.record_text(agent, &page.text);
+                    if known {
+                        call.known.record_text(agent, &page.text);
+                    }
                     let page = Arc::new(page);
                     self.remember(agent, &url, Arc::clone(&page)).await;
                     page
@@ -724,6 +759,20 @@ impl WebFetch {
     }
 }
 
+/// Convert a small page in a converter child, as web_fetch would. Run
+/// at startup, so a host where the converter cannot start (no user
+/// namespaces for a non-root gateway, a container without `unshare`) says
+/// so in the log instead of in every call.
+pub async fn self_test() -> Result<(), String> {
+    let url = Url::parse("https://example.com/").map_err(|e| e.to_string())?;
+    let (text, _) = convert_in_child(Kind::Html, b"<p>converter ok</p>", &url).await?;
+    if text.contains("converter ok") {
+        Ok(())
+    } else {
+        Err(format!("unexpected converter output {text:?}"))
+    }
+}
+
 /// Up to [`PAGE_CHARS`] characters and [`PAGE_BYTES`] bytes of `text` from
 /// character `offset`.
 fn excerpt(text: &str, offset: usize) -> String {
@@ -745,7 +794,11 @@ async fn answer(
     prompt: &str,
 ) -> Result<(String, String), String> {
     // The page cannot end its own delimiter.
-    let excerpt = excerpt.replace("</page", "<\\/page");
+    static CLOSE: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    let excerpt = match CLOSE.get_or_init(|| regex::Regex::new(r"(?i)<\s*/\s*page").ok()) {
+        Some(close) => close.replace_all(excerpt, "<\\/page").into_owned(),
+        None => excerpt.replace('<', "&lt;"),
+    };
     let mut request = AnthropicRequest {
         model: String::new(),
         max_tokens: ANSWER_MAX_TOKENS,
@@ -943,6 +996,8 @@ fn public_v6(ip: Ipv6Addr) -> bool {
         || (s[0] == 0x2001 && s[1] == 0)
         // Local-use NAT64, which a DNS64 resolver may map anywhere.
         || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 1)
+        // IPv4-translated (SIIT).
+        || (s[..4] == [0, 0, 0, 0] && s[4] == 0xffff && s[5] == 0)
         || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0))
 }
 
@@ -1117,11 +1172,10 @@ async fn convert_in_child(kind: Kind, input: &[u8], url: &Url) -> Result<(String
         };
         let read_err = async {
             let mut err = Vec::new();
-            (&mut stderr)
-                .take(4096)
-                .read_to_end(&mut err)
-                .await
-                .map(|_| err)
+            (&mut stderr).take(4096).read_to_end(&mut err).await?;
+            // Drain the rest, so a chatty parser cannot block on a full pipe.
+            tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await?;
+            Ok::<_, std::io::Error>(err)
         };
         let (_, out, err) = tokio::join!(write, read, read_err);
         let status = child.wait().await;
@@ -1169,14 +1223,14 @@ fn confine_converter(command: &mut tokio::process::Command) {
             };
             // No network: a parser bug cannot reach the gateway's API,
             // other local services or cloud metadata. A root gateway then
-            // drops to nobody; an unprivileged one tries a user namespace,
-            // which some hosts do not allow.
+            // drops to nobody; an unprivileged one needs a user namespace
+            // for this, and without one web_fetch is unavailable.
             #[cfg(target_os = "linux")]
             {
                 if root {
                     check(libc::unshare(libc::CLONE_NEWNET))?;
                 } else {
-                    let _ = libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET);
+                    check(libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET))?;
                 }
             }
             if root {
@@ -1198,7 +1252,13 @@ fn confine_converter(command: &mut tokio::process::Command) {
             limit(libc::RLIMIT_NOFILE, 16)?;
             #[cfg(target_os = "linux")]
             {
-                check(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))?;
+                check(libc::prctl(
+                    libc::PR_SET_NO_NEW_PRIVS,
+                    1_u64,
+                    0_u64,
+                    0_u64,
+                    0_u64,
+                ))?;
             }
             Ok(())
         });
@@ -1234,10 +1294,26 @@ pub fn convert_main(args: &[String]) -> bool {
     else {
         return fail("the page came with an invalid URL");
     };
+    // The text goes to a copy of stdout; stdout itself then points at
+    // stderr, so whatever a parser prints cannot corrupt the answer.
+    #[cfg(unix)]
+    let mut out = {
+        use std::os::fd::FromRawFd as _;
+        // SAFETY: dup and dup2 on the process's own standard descriptors;
+        // the duplicate is owned by the File alone.
+        unsafe {
+            let copy = libc::dup(1);
+            if copy < 0 || libc::dup2(2, 1) < 0 {
+                return fail("cannot set up the output");
+            }
+            std::fs::File::from_raw_fd(copy)
+        }
+    };
+    #[cfg(not(unix))]
+    let mut out = std::io::stdout();
     match convert(kind, &input[newline + 1..], &url) {
         Ok(text) => {
             let (text, cut) = cap_text(text);
-            let mut out = std::io::stdout().lock();
             let written = out
                 .write_all(if cut { b"cut\n" } else { b"full\n" })
                 .and_then(|()| out.write_all(text.as_bytes()))
@@ -1391,6 +1467,7 @@ mod tests {
                 "https://docs.rs/serde/",
                 "http://x.org/p?q=1",
                 "https://example.cn/页面",
+                "https://example.cn/",
                 "https://www.rust-lang.org/learn",
             ]
         );
@@ -1413,6 +1490,37 @@ mod tests {
         assert!(!known.contains(a, &normalize("https://example.com/docs?leak=1").unwrap()));
         assert!(!known.contains(a, &normalize("https://example.com/other").unwrap()));
         assert!(!known.contains(b, &normalize("https://example.com/docs").unwrap()));
+    }
+
+    #[test]
+    fn cjk_text_and_escapes_around_urls() {
+        assert_eq!(
+            urls_in("看看https://github.com/a/b这个项目，访问www.example.com"),
+            vec![
+                "https://github.com/a/b这个项目",
+                "https://github.com/a/b",
+                "https://www.example.com",
+            ]
+        );
+        assert_eq!(
+            urls_in("https://en.wikipedia.org/wiki/Ender's_Game's"),
+            vec!["https://en.wikipedia.org/wiki/Ender's_Game's"]
+        );
+        let known = KnownUrls::default();
+        let agent = AgentId::new();
+        known.record_text(agent, r"see https://example.com/foo\_bar");
+        assert!(known.contains(agent, &url("https://example.com/foo_bar")));
+    }
+
+    #[test]
+    fn refreshed_keys_do_not_grow_the_order() {
+        let known = KnownUrls::default();
+        let agent = AgentId::new();
+        for _ in 0..1000 {
+            known.record(agent, &url("https://example.com/same"));
+        }
+        let agents = known.agents.lock().unwrap();
+        assert!(agents.get(&agent).unwrap().order.len() <= 2 + 64);
     }
 
     #[test]
@@ -1455,6 +1563,7 @@ mod tests {
             "::ffff:169.254.169.254",
             "64:ff9b::a9fe:a9fe",
             "64:ff9b:1::1",
+            "::ffff:0:a9fe:a9fe",
             "2001:0:4136:e378::1",
             "2002:7f00:1::",
             "2001:db8::1",

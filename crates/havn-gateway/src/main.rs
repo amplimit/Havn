@@ -557,6 +557,16 @@ async fn serve() -> anyhow::Result<()> {
     // This is what makes multi-user havn correct: agent A's calls
     // bill agent A's owner regardless of which HTTP user happens to
     // be online.
+    tokio::spawn(async {
+        match web_fetch::self_test().await {
+            Ok(()) => info!("web_fetch page converter ready"),
+            Err(e) => warn!(
+                error = %e,
+                "web_fetch page converter cannot run; every web_fetch will fail. A gateway not \
+                 running as root needs user namespaces for it"
+            ),
+        }
+    });
     let socket_ctx = AgentSocketCtx {
         registry: registry.clone(),
         db: db.clone(),

@@ -260,8 +260,8 @@ pub struct Permissions {
     pub can_search_web: bool,
     /// `web_fetch`, run by the gateway: it reads a page and answers a
     /// question about it. Needs no egress. The URL leaves the host, so the
-    /// runtime fetches only URLs from the conversation or on
-    /// `network_policy.allowed_domains`.
+    /// gateway reads only URLs users sent, search results and links on
+    /// pages it read, or `network_policy.allowed_domains`.
     pub can_fetch_web: bool,
 }
 
