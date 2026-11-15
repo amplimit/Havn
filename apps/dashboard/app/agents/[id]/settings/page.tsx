@@ -634,9 +634,9 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
             />
             <span>
               <strong>read web pages</strong>: the gateway reads a page or PDF for the
-              agent and answers its question about it with the agent&apos;s model, so it
-              works without network access. The agent can read only links from the
-              conversation (yours, or from search results and pages it read).
+              agent and answers its question about it with a model call, so it works
+              without network access. The agent can read only links you sent it, search
+              results and links on pages it read.
               {!view.fetch_permitted && " Your role does not allow it."}
             </span>
           </label>

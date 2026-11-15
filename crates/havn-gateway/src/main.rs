@@ -174,14 +174,28 @@ struct AppState {
     pub search: Arc<web_search::WebSearch>,
 }
 
-#[tokio::main]
+fn main() -> anyhow::Result<()> {
+    // The page converter of web_fetch runs before any async runtime: it is
+    // one thread, under a tight address-space limit.
+    if std::env::args().nth(1).as_deref() == Some(web_fetch::CONVERT_ARG) {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(i32::from(!web_fetch::convert_main(&args)));
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?
+        .block_on(serve())
+}
+
 #[allow(
     clippy::too_many_lines,
-    reason = "main wires every subsystem; extracting helpers obscures the startup path"
+    reason = "serve wires every subsystem; extracting helpers obscures the startup path"
 )]
-async fn main() -> anyhow::Result<()> {
+async fn serve() -> anyhow::Result<()> {
     // The gateway takes no arguments (config comes from the file and env);
-    // only `--version` and `--help` are answered, matching the other binaries.
+    // only `--version` and `--help` are answered, matching the other
+    // binaries. `--convert-page` is internal and handled in `main`.
     {
         use std::io::Write as _;
         match std::env::args().nth(1).as_deref() {
@@ -192,13 +206,6 @@ async fn main() -> anyhow::Result<()> {
                     env!("CARGO_PKG_VERSION")
                 )?;
                 return Ok(());
-            }
-            Some(web_fetch::CONVERT_ARG) => {
-                let args: Vec<String> = std::env::args().skip(2).collect();
-                if web_fetch::convert_main(&args) {
-                    return Ok(());
-                }
-                std::process::exit(1);
             }
             Some("--help" | "-h") => {
                 writeln!(
@@ -571,7 +578,9 @@ async fn main() -> anyhow::Result<()> {
         seccomp_allow_extra: cfg.seccomp.allow_extra.clone(),
         keyring: keyring.clone(),
         search,
-        fetch: Arc::new(web_fetch::WebFetch::new(cfg.fetch.clone())),
+        fetch: Arc::new(
+            web_fetch::WebFetch::new(cfg.fetch.clone()).context("building the web_fetch client")?,
+        ),
     };
     let socket_path = cfg.agent_socket_path.clone();
     let socket_task = tokio::spawn(async move {

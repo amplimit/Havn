@@ -61,7 +61,8 @@ pub struct ToolCtx {
     /// Per-agent `SQLite` pool for memory / conversation queries.
     pub agent_db: SqlitePool,
     /// Active policy snapshot. Registry building consults `permissions`;
-    /// the tool loop reads the domain lists for `web_fetch`.
+    /// tools may read it for finer checks.
+    #[allow(dead_code, reason = "no tool reads it yet")]
     pub policy: Arc<Policy>,
     /// Hybrid-retrieval embedding provider (spec §9.4 v0.7). `None`
     /// when the operator hasn't enabled embeddings — `memory_remember`

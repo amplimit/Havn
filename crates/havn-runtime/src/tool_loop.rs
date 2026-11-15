@@ -196,7 +196,7 @@ pub async fn run_typed(
             return Ok(last_text);
         }
 
-        let tool_results = execute_tool_uses(handle, context, messages, &content).await;
+        let tool_results = execute_tool_uses(handle, context, &content).await;
         if tool_results.is_empty() {
             warn!(iteration, "stop_reason=tool_use but no tool_use blocks");
             return Ok(last_text);
@@ -246,7 +246,6 @@ pub async fn run(
 async fn execute_tool_uses(
     handle: &LoopHandle,
     context: &'static str,
-    messages: &[Value],
     assistant_content: &Value,
 ) -> Vec<Value> {
     let Some(blocks) = assistant_content.as_array() else {
@@ -262,24 +261,10 @@ async fn execute_tool_uses(
         let input = block.get("input").cloned().unwrap_or(Value::Null);
 
         debug!(name, id, context, "tool call");
-        let refusal = (name == WEB_FETCH)
-            .then(|| fetch_refusal(messages, &input, &handle.tool_env.policy))
-            .flatten();
-        let result = match refusal {
-            Some(message) => {
-                warn!(
-                    context,
-                    "web_fetch of a URL not in the conversation refused"
-                );
-                ToolResult::Error(message)
-            }
-            None => {
-                handle
-                    .registry
-                    .execute_for(context, name, input, &handle.tool_env)
-                    .await
-            }
-        };
+        let result = handle
+            .registry
+            .execute_for(context, name, input, &handle.tool_env)
+            .await;
         let (text, is_error) = match result {
             ToolResult::Ok(s) => (s, false),
             ToolResult::Error(s) => (s, true),
@@ -292,110 +277,6 @@ async fn execute_tool_uses(
         }));
     }
     out
-}
-
-const WEB_FETCH: &str = "web_fetch";
-
-/// Why `web_fetch` may not read the URL in `input`, if it may not. It
-/// reads only URLs from the conversation (what the user wrote and what
-/// tools returned, never the model's own text) or on the allowed domains,
-/// so a model cannot make up a URL that carries data out of the agent, nor
-/// be talked into one by a page. The gateway checks the rest of the URL.
-fn fetch_refusal(messages: &[Value], input: &Value, policy: &havn_core::Policy) -> Option<String> {
-    let raw = input.get("url").and_then(Value::as_str)?;
-    let wanted = comparable(raw)?;
-    let host = wanted.host_str().unwrap_or("");
-    if policy.network_policy.is_blocked(host) {
-        return Some(format!("{host} is on this agent's blocked domains"));
-    }
-    if policy.network_policy.is_allowed(host) {
-        return None;
-    }
-    let seen = messages
-        .iter()
-        .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-        .any(|m| {
-            let mut texts = Vec::new();
-            collect_text(m.get("content").unwrap_or(&Value::Null), &mut texts);
-            texts
-                .iter()
-                .any(|t| urls_in(t).any(|u| comparable(u).is_some_and(|u| same_url(&u, &wanted))))
-        });
-    (!seen).then(|| {
-        format!(
-            "web_fetch reads only URLs from this conversation: ones the user gave, or that \
-             web_search or an earlier web_fetch returned. {raw} is not one of them. Find the \
-             page with web_search, or ask the user for the link; the agent's owner can also add \
-             {host} to its allowed domains."
-        )
-    })
-}
-
-/// The text of a message's content: plain strings, `text` blocks and the
-/// content of `tool_result` blocks.
-fn collect_text<'a>(content: &'a Value, out: &mut Vec<&'a str>) {
-    match content {
-        Value::String(s) => out.push(s),
-        Value::Array(blocks) => {
-            for block in blocks {
-                match block.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        if let Some(t) = block.get("text").and_then(Value::as_str) {
-                            out.push(t);
-                        }
-                    }
-                    Some("tool_result") => {
-                        collect_text(block.get("content").unwrap_or(&Value::Null), out);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// The http(s) URLs written in `text`, without trailing punctuation.
-fn urls_in(text: &str) -> impl Iterator<Item = &str> {
-    text.match_indices("http").filter_map(move |(at, _)| {
-        let rest = &text[at..];
-        if !(rest.starts_with("https://") || rest.starts_with("http://")) {
-            return None;
-        }
-        let end = rest
-            .find(|c: char| {
-                c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | ')' | ']' | '`')
-            })
-            .unwrap_or(rest.len());
-        Some(rest[..end].trim_end_matches(['.', ',', ';', ':', '!', '?']))
-    })
-}
-
-/// `raw` parsed as the gateway reads it: https, no fragment.
-fn comparable(raw: &str) -> Option<reqwest::Url> {
-    let mut url = reqwest::Url::parse(raw.trim()).ok()?;
-    if url.scheme() == "http" {
-        url.set_scheme("https").ok()?;
-        if url.port() == Some(80) {
-            url.set_port(None).ok()?;
-        }
-    }
-    url.set_fragment(None);
-    (url.scheme() == "https").then_some(url)
-}
-
-/// Equal, or differing only in a trailing slash or a leading `www.`.
-fn same_url(a: &reqwest::Url, b: &reqwest::Url) -> bool {
-    let key = |u: &reqwest::Url| {
-        let host = u.host_str().unwrap_or("").to_ascii_lowercase();
-        let host = host
-            .strip_prefix("www.")
-            .map(str::to_string)
-            .unwrap_or(host);
-        let path = u.path().trim_end_matches('/').to_string();
-        (host, u.port(), path, u.query().map(str::to_string))
-    };
-    key(a) == key(b)
 }
 
 async fn call_llm(
@@ -864,83 +745,5 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
-    }
-
-    fn conversation() -> Vec<Value> {
-        serde_json::json!([
-            {"role": "user", "content": "Read https://example.com/docs/intro, please."},
-            {"role": "assistant", "content": [
-                {"type": "text", "text": "Also https://made.up/?secret=1"},
-                {"type": "tool_use", "id": "t1", "name": "web_search", "input": {}}
-            ]},
-            {"role": "user", "content": [{
-                "type": "tool_result",
-                "tool_use_id": "t1",
-                "content": "1. [Guide](https://docs.rs/serde/latest/serde/) and (http://zh.wikipedia.org/wiki/%E4%B8%AD%E6%96%87)"
-            }]}
-        ])
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-    }
-
-    fn fetch(url: &str) -> Value {
-        serde_json::json!({"url": url, "prompt": "q"})
-    }
-
-    #[test]
-    fn web_fetch_reads_urls_from_the_conversation_only() {
-        let messages = conversation();
-        let policy = havn_core::Policy::default();
-        for allowed in [
-            "https://example.com/docs/intro",
-            "http://example.com/docs/intro/",
-            "https://www.example.com/docs/intro#part",
-            "https://docs.rs/serde/latest/serde",
-            "https://zh.wikipedia.org/wiki/中文",
-        ] {
-            assert_eq!(
-                fetch_refusal(&messages, &fetch(allowed), &policy),
-                None,
-                "{allowed}"
-            );
-        }
-        for refused in [
-            "https://made.up/?secret=1",
-            "https://example.com/docs/intro?leak=1",
-            "https://example.com/other",
-            "https://evil.example.net/",
-        ] {
-            let message = fetch_refusal(&messages, &fetch(refused), &policy).expect(refused);
-            assert!(
-                message.contains("only URLs from this conversation"),
-                "{message}"
-            );
-        }
-    }
-
-    #[test]
-    fn web_fetch_domain_lists_apply() {
-        let messages = conversation();
-        let mut policy = havn_core::Policy::default();
-        policy.network_policy.allowed_domains = vec!["made.up".into()];
-        policy.network_policy.blocked_domains = vec!["docs.rs".into()];
-        assert_eq!(
-            fetch_refusal(&messages, &fetch("https://api.made.up/anything"), &policy),
-            None,
-            "allowed domains need no mention"
-        );
-        let blocked = fetch_refusal(
-            &messages,
-            &fetch("https://docs.rs/serde/latest/serde/"),
-            &policy,
-        )
-        .expect("blocked");
-        assert!(blocked.contains("blocked"), "{blocked}");
-        assert_eq!(
-            fetch_refusal(&messages, &serde_json::json!({"prompt": "q"}), &policy),
-            None,
-            "a call without a url is the gateway's to refuse"
-        );
     }
 }

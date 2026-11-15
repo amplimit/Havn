@@ -1296,24 +1296,32 @@ async fn run_web_fetch(
         agent_team: agent.team_id,
         budget: policy.budget.clone(),
     };
-    let result = match ctx
+    // No request leaves the host unless an answer is possible.
+    let ready = ctx
         .fetch
-        .answer_model(&ctx.models.load(), agent_model, &policy)
-    {
-        Ok(model) => ctx
-            .fetch
-            .run(
-                &ctx.db,
-                &ctx.http,
-                ctx.keyring.as_ref(),
-                &ctx.llm,
-                &billing,
-                &model,
-                &policy,
-                &call.input,
-            )
-            .await
-            .map(|answer| (answer, model.id)),
+        .answer_models(&ctx.models.load(), agent_model, &policy)
+        .and_then(|models| match ctx.keyring.as_ref() {
+            Some(ring) => Ok((models, ring)),
+            None => Err(
+                "credential encryption is not configured: set HAVN_AGE_KEY and \
+                         restart the gateway"
+                    .to_string(),
+            ),
+        });
+    let result = match ready {
+        Ok((models, keyring)) => {
+            let run = crate::web_fetch::Call {
+                db: &ctx.db,
+                http: &ctx.http,
+                keyring,
+                llm: &ctx.llm,
+                billing: &billing,
+                models: &models,
+                policy: &policy,
+                known: ctx.registry.known_urls(),
+            };
+            ctx.fetch.run(&run, &call.input).await
+        }
         Err(message) => Err(message),
     };
     let url: String = call
@@ -1325,11 +1333,11 @@ async fn run_web_fetch(
         .take(2048)
         .collect();
     let details = match &result {
-        Ok((answer, model)) => serde_json::json!({
+        Ok(answer) => serde_json::json!({
             "url": url,
             "read": answer.url,
             "chars": answer.chars,
-            "model": model,
+            "model": answer.model,
         }),
         Err(message) => serde_json::json!({ "url": url, "error": message }),
     };
@@ -1342,7 +1350,7 @@ async fn run_web_fetch(
         details,
     )
     .await;
-    result.map(|(answer, _)| answer.text)
+    result.map(|answer| answer.text)
 }
 
 async fn run_web_search(
@@ -1411,6 +1419,15 @@ async fn run_web_search(
         details,
     )
     .await;
+    if let Ok(report) = &result {
+        // Result links come from the search backend, not the model, so the
+        // agent may read them.
+        for hit in &report.hits {
+            if let Ok(url) = crate::web_fetch::normalize(&hit.url) {
+                ctx.registry.known_urls().record(agent_id, &url);
+            }
+        }
+    }
     result.map(|report| crate::web_search::render(&report, chrono::Utc::now()))
 }
 
@@ -2173,9 +2190,10 @@ mod tests {
                 crate::config::SearchConfig::default(),
                 &crate::config::LlmConfig::default(),
             )),
-            fetch: Arc::new(crate::web_fetch::WebFetch::new(
-                crate::config::FetchConfig::default(),
-            )),
+            fetch: Arc::new(
+                crate::web_fetch::WebFetch::new(crate::config::FetchConfig::default())
+                    .expect("fetch client"),
+            ),
         }
     }
 
