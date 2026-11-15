@@ -286,12 +286,19 @@ impl ToolRegistry {
 
     /// True iff the named tool is disabled in this execution context by
     /// `policy.context_toolsets[context].disabled`.
+    /// Disabling `file_write` disables `file_edit` too: both change files,
+    /// and a policy written before `file_edit` existed means both.
     fn disabled_in(&self, context: &str, tool_name: &str) -> bool {
         self.policy
             .context_toolsets
             .0
             .get(context)
-            .is_some_and(|entry| entry.disabled.iter().any(|d| d == tool_name))
+            .is_some_and(|entry| {
+                entry
+                    .disabled
+                    .iter()
+                    .any(|d| d == tool_name || (d == "file_write" && tool_name == "file_edit"))
+            })
     }
 
     /// JSON array of tool descriptors in the shape Anthropic's `/v1/messages`

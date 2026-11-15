@@ -223,7 +223,9 @@ impl HookSet {
     /// the empty string, which is rare by design.
     pub fn veto(&self, tool: &str, flat_input: &str) -> Veto {
         for rule in &self.rules {
-            if rule.tool != tool {
+            // A `file_write` rule guards `file_edit` too, which changes
+            // the same files.
+            if rule.tool != tool && !(rule.tool == "file_write" && tool == "file_edit") {
                 continue;
             }
             for pat in &rule.deny {
@@ -302,6 +304,28 @@ mod tests {
             Veto::Deny { .. }
         ));
         assert!(matches!(set.veto("shell", "ls -la"), Veto::Allow));
+    }
+
+    #[test]
+    fn file_write_rules_guard_file_edit() {
+        let set = set_with(
+            "pre_tool_use:
+  - tool: file_write
+    deny: [\"^\\.git/\"]
+",
+        );
+        assert!(matches!(
+            set.veto("file_edit", ".git/config"),
+            Veto::Deny { .. }
+        ));
+        assert!(matches!(set.veto("file_edit", "notes.md"), Veto::Allow));
+        let edit_only = set_with(
+            "pre_tool_use:
+  - tool: file_edit
+    deny: [\"x\"]
+",
+        );
+        assert!(matches!(edit_only.veto("file_write", "x"), Veto::Allow));
     }
 
     #[test]

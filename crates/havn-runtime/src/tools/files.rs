@@ -207,6 +207,17 @@ impl Tool for FileEditTool {
             Ok(p) => p,
             Err(e) => return ToolResult::Error(e),
         };
+        if let Ok(meta) = tokio::fs::metadata(&resolved).await {
+            if meta.is_dir() {
+                return ToolResult::Error(format!("{path} is a directory"));
+            }
+            if meta.len() > MAX_FILE_BYTES as u64 {
+                return ToolResult::Error(format!(
+                    "file is {} bytes (cap {MAX_FILE_BYTES})",
+                    meta.len()
+                ));
+            }
+        }
         let bytes = match tokio::fs::read(&resolved).await {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -229,12 +240,6 @@ impl Tool for FileEditTool {
             Ok(done) => done,
             Err(e) => return ToolResult::Error(format!("{path}: {e}; the file was not changed")),
         };
-        if edited.len() > MAX_FILE_BYTES {
-            return ToolResult::Error(format!(
-                "the edited file would be {} bytes (cap {MAX_FILE_BYTES}); the file was not changed",
-                edited.len()
-            ));
-        }
         if let Err(e) = tokio::fs::write(&resolved, &edited).await {
             return ToolResult::Error(format!("write failed: {e}"));
         }
@@ -257,28 +262,34 @@ struct Edit {
 }
 
 /// The replacements in a `file_edit` input: `edits`, or one given by
-/// `old_string` and `new_string`.
+/// `old_string` and `new_string`. A `null` field counts as absent.
 fn edits_of(input: &Value) -> Result<Vec<Edit>, String> {
+    let field = |v: &Value, key: &str| v.get(key).filter(|x| !x.is_null()).cloned();
     let one = |v: &Value, which: &str| -> Result<Edit, String> {
         let text = |key: &str| {
-            v.get(key)
-                .and_then(Value::as_str)
-                .map(str::to_string)
+            field(v, key)
+                .and_then(|x| x.as_str().map(str::to_string))
                 .ok_or_else(|| format!("{which}missing required field: {key}"))
         };
         Ok(Edit {
             old: text("old_string")?,
             new: text("new_string")?,
-            all: v
-                .get("replace_all")
-                .and_then(Value::as_bool)
+            all: field(v, "replace_all")
+                .and_then(|x| x.as_bool())
                 .unwrap_or(false),
         })
     };
-    let edits = match input.get("edits") {
+    let edits = match field(input, "edits") {
         Some(Value::Array(list)) => {
-            if input.get("old_string").is_some() {
-                return Err("give either edits or old_string and new_string, not both".into());
+            if ["old_string", "new_string", "replace_all"]
+                .iter()
+                .any(|key| field(input, key).is_some())
+            {
+                return Err(
+                    "give either edits or old_string and new_string, not both; with edits, \
+                     each edit has its own replace_all"
+                        .into(),
+                );
             }
             if list.len() > MAX_EDITS {
                 return Err(format!("more than {MAX_EDITS} edits in one call"));
@@ -297,13 +308,27 @@ fn edits_of(input: &Value) -> Result<Vec<Edit>, String> {
     Ok(edits)
 }
 
-/// `text` with `edits` applied in order, and a summary; an error names the
-/// first edit that cannot apply. A file with CRLF line ends is matched
-/// with the edits' line ends converted when they do not match as given.
+/// `text` with every line end CRLF.
+fn crlf(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+/// Lines (from 1) where `needle` starts in `text`, the first few of them.
+fn lines_of(text: &str, needle: &str) -> Vec<usize> {
+    text.match_indices(needle)
+        .take(5)
+        .map(|(at, _)| text[..at].matches('\n').count() + 1)
+        .collect()
+}
+
+/// `text` with `edits` applied in order, each to the result of the one
+/// before, and a summary; an error names the first edit that cannot apply
+/// and leaves the result unbuilt. In a file whose line ends are all CRLF,
+/// `old_string` written with LF also matches, and `new_string` gets CRLF.
 fn apply_edits(text: &str, edits: &[Edit]) -> Result<(String, String), String> {
     let mut text = text.to_string();
-    let crlf = text.contains("\r\n");
-    let mut lines = Vec::new();
+    let is_crlf = text.contains("\r\n") && !text.replace("\r\n", "").contains('\n');
+    let mut notes = Vec::new();
     let mut total = 0;
     for (i, edit) in edits.iter().enumerate() {
         let which = if edits.len() > 1 {
@@ -314,21 +339,32 @@ fn apply_edits(text: &str, edits: &[Edit]) -> Result<(String, String), String> {
         if edit.old.is_empty() {
             return Err(format!("{which}old_string is empty"));
         }
-        if edit.old == edit.new {
+        let (old, new) = if is_crlf {
+            let old = if text.contains(&edit.old) {
+                edit.old.clone()
+            } else {
+                crlf(&edit.old)
+            };
+            (old, crlf(&edit.new))
+        } else {
+            (edit.old.clone(), edit.new.clone())
+        };
+        if old == new {
             return Err(format!("{which}old_string and new_string are the same"));
-        }
-        let (mut old, mut new) = (edit.old.clone(), edit.new.clone());
-        if crlf && !text.contains(&old) && !old.contains("\r\n") && old.contains('\n') {
-            old = old.replace('\n', "\r\n");
-            new = new.replace("\r\n", "\n").replace('\n', "\r\n");
         }
         let count = text.matches(old.as_str()).count();
         match count {
             0 => {
+                let order = if i > 0 {
+                    " Edits apply in order: this one is matched against the text after \
+                     the edits before it."
+                } else {
+                    ""
+                };
                 return Err(format!(
                     "{which}old_string was not found; it must match the file exactly, \
                      white space and indentation included (read the file again to see \
-                     its current text)"
+                     its current text).{order}"
                 ));
             }
             n if n > 1 && !edit.all => {
@@ -339,9 +375,23 @@ fn apply_edits(text: &str, edits: &[Edit]) -> Result<(String, String), String> {
             }
             _ => {}
         }
-        if let Some(at) = text.find(old.as_str()) {
-            lines.push(text[..at].matches('\n').count() + 1);
+        let size = (text.len() - count * old.len()).saturating_add(count.saturating_mul(new.len()));
+        if size > MAX_FILE_BYTES {
+            return Err(format!(
+                "{which}the edited file would be {size} bytes (cap {MAX_FILE_BYTES})"
+            ));
         }
+        let lines = lines_of(&text, &old)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = if count > 5 { ", ..." } else { "" };
+        notes.push(if edits.len() > 1 {
+            format!("edit {}: line {lines}{more}", i + 1)
+        } else {
+            format!("line {lines}{more}")
+        });
         text = if edit.all {
             text.replace(old.as_str(), &new)
         } else {
@@ -349,13 +399,16 @@ fn apply_edits(text: &str, edits: &[Edit]) -> Result<(String, String), String> {
         };
         total += count;
     }
-    let at = lines
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
+    let where_ = if edits.len() > 1 {
+        format!(
+            "{}; each edit's lines are counted before it applied",
+            notes.join("; ")
+        )
+    } else {
+        notes.join("")
+    };
     let report = format!(
-        "{total} replacement{} (at line {at})",
+        "{total} replacement{} (at {where_})",
         if total == 1 { "" } else { "s" }
     );
     Ok((text, report))
@@ -570,7 +623,7 @@ mod tests {
         tokio::fs::create_dir_all(&ws).await.expect("ws");
         let p = ws.join("a.txt");
         tokio::fs::write(&p, "hi").await.expect("write");
-        let result = try_auto_commit(&ws, &p, "a.txt").await;
+        let result = try_auto_commit(&ws, &p, "a.txt", "file_write").await;
         assert!(result.is_none(), "no .git → no commit hash");
     }
 
@@ -608,10 +661,10 @@ mod tests {
         }
         let p = ws.join("a.txt");
         tokio::fs::write(&p, "first").await.expect("write");
-        let h = try_auto_commit(&ws, &p, "a.txt").await;
+        let h = try_auto_commit(&ws, &p, "a.txt", "file_write").await;
         assert!(h.is_some(), "expected a commit hash on first write");
         // Identical re-write → "nothing to commit" → returns None.
-        let h2 = try_auto_commit(&ws, &p, "a.txt").await;
+        let h2 = try_auto_commit(&ws, &p, "a.txt", "file_write").await;
         assert!(h2.is_none(), "no-op re-commit should return None");
     }
 
@@ -708,6 +761,56 @@ mod tests {
         assert_eq!(
             tokio::fs::read_to_string(&file).await.unwrap(),
             "ALPHA\nBETA\n"
+        );
+    }
+
+    #[test]
+    fn crlf_files_stay_crlf_and_growth_is_capped() {
+        let one = |old: &str, new: &str| Edit {
+            old: old.into(),
+            new: new.into(),
+            all: false,
+        };
+        let (out, _) = apply_edits("a\r\nb\r\n", &[one("a", "a\nx")]).unwrap();
+        assert_eq!(out, "a\r\nx\r\nb\r\n");
+        assert!(apply_edits("a\r\nb\r\n", &[one("a\nb", "a\r\nb")]).is_err());
+        let (mixed, _) = apply_edits("a\r\nb\nc", &[one("b\nc", "B\nC")]).unwrap();
+        assert_eq!(mixed, "a\r\nB\nC", "a mixed file is matched as given");
+        let all = Edit {
+            old: "a".into(),
+            new: "x".repeat(10_000),
+            all: true,
+        };
+        let err = apply_edits(&"a".repeat(100_000), &[all]).unwrap_err();
+        assert!(err.contains("would be"), "{err}");
+        let (_, report) = apply_edits(
+            "x\nfoo\nx\n",
+            &[Edit {
+                old: "x".into(),
+                new: "y".into(),
+                all: true,
+            }],
+        )
+        .unwrap();
+        assert_eq!(report, "2 replacements (at line 1, 3)");
+    }
+
+    #[test]
+    fn null_fields_count_as_absent() {
+        let edits =
+            edits_of(&json!({"edits": null, "old_string": "a", "new_string": "b"})).unwrap();
+        assert_eq!(edits.len(), 1);
+        assert!(
+            edits_of(
+                &json!({"edits": [{"old_string": "a", "new_string": "b"}], "old_string": null})
+            )
+            .is_ok()
+        );
+        assert!(
+            edits_of(
+                &json!({"edits": [{"old_string": "a", "new_string": "b"}], "replace_all": true})
+            )
+            .is_err()
         );
     }
 
