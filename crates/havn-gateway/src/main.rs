@@ -578,16 +578,13 @@ async fn serve() -> anyhow::Result<()> {
             cfg.trust_header.enabled,
             pool,
         );
+        // Bound before any agent starts, so no other program holds the
+        // one host port agents are let through to.
         let port = cfg.network.egress_proxy_port;
-        tokio::spawn(async move {
-            if let Err(e) = proxy.serve(port).await {
-                tracing::error!(
-                    port,
-                    error = %e,
-                    "the egress proxy cannot listen; agents whose network goes through it have none"
-                );
-            }
-        });
+        let listener = egress_proxy::EgressProxy::bind(port)
+            .await
+            .with_context(|| format!("the egress proxy cannot listen on port {port}"))?;
+        tokio::spawn(proxy.serve(listener));
     }
     let socket_ctx = AgentSocketCtx {
         registry: registry.clone(),

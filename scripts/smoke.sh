@@ -222,17 +222,21 @@ case "${HAVN_SMOKE_EXPECT_SPAWNER:-}" in
             sleep 0.5
         done
         if [ -n "$ns_ip" ]; then
-            if nsenter -t "$pid" -n ip route | grep -q '^default'; then
+            if [ -n "$(nsenter -t "$pid" -n ip route show default)" ]; then
                 die "an agent whose network goes through the proxy has a default route"
             fi
             if nsenter -t "$pid" -n timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then
                 die "an agent whose network goes through the proxy reaches the internet directly"
             fi
             host_ip="${ns_ip%.*}.$(( ${ns_ip##*.} - 1 ))"
+            proxy_port=913
+            if nsenter -t "$pid" -n timeout 5 bash -c "exec 3<>/dev/tcp/$host_ip/22" 2>/dev/null; then
+                die "an agent whose network goes through the proxy reaches another port of the host"
+            fi
             curl -fs -X PATCH "$GATEWAY_URL/agents/$AGENT_ID/web" -H 'Content-Type: application/json'                 -d '{"allowed_domains":["example.com"],"blocked_domains":["example.org"]}' -o /dev/null                 || die "cannot set the agent's domain lists"
-            code=$(nsenter -t "$pid" -n curl -s -o /dev/null -w '%{http_code}' --max-time 20                 -x "http://$host_ip:3128" https://example.com/ || true)
+            code=$(nsenter -t "$pid" -n curl -s -o /dev/null -w '%{http_code}' --max-time 20                 -x "http://$host_ip:$proxy_port" https://example.com/ || true)
             [ "$code" = 200 ] || { tail -30 "$GATEWAY_LOG" >&2; die "an allowed domain through the proxy gave $code"; }
-            code=$(nsenter -t "$pid" -n curl -s -o /dev/null -w '%{http_connect}' --max-time 20                 -x "http://$host_ip:3128" https://example.org/ || true)
+            code=$(nsenter -t "$pid" -n curl -s -o /dev/null -w '%{http_connect}' --max-time 20                 -x "http://$host_ip:$proxy_port" https://example.org/ || true)
             [ "$code" = 403 ] || die "a blocked domain through the proxy gave $code"
             ok "the agent reaches the internet only through the egress proxy"
         else

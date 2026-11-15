@@ -33,10 +33,14 @@ pub struct WebChatRouter {
     /// to every tab of the agent, also ones opened later.
     approvals: Arc<std::sync::Mutex<HashMap<String, PendingApproval>>>,
     /// Requests the gateway itself asked (the egress proxy), answered
-    /// here instead of by an agent: (allow, always).
+    /// here instead of by an agent.
     gateway_waiters:
-        Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<(bool, bool)>>>>,
+        Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<GatewayAnswer>>>>,
 }
+
+/// The owner's answer to a question of the gateway's own: allow, always,
+/// and who decided.
+pub type GatewayAnswer = (bool, bool, String);
 
 #[derive(Debug, Clone)]
 struct PendingApproval {
@@ -212,7 +216,7 @@ impl WebChatRouter {
         &self,
         agent_id: AgentId,
         request: havn_proto::ApprovalRequest,
-    ) -> Option<tokio::sync::oneshot::Receiver<(bool, bool)>> {
+    ) -> Option<tokio::sync::oneshot::Receiver<GatewayAnswer>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let id = request.request_id.clone();
         self.lock_waiters().insert(id.clone(), tx);
@@ -228,13 +232,13 @@ impl WebChatRouter {
     pub fn take_gateway_waiter(
         &self,
         id: &str,
-    ) -> Option<tokio::sync::oneshot::Sender<(bool, bool)>> {
+    ) -> Option<tokio::sync::oneshot::Sender<GatewayAnswer>> {
         self.lock_waiters().remove(id)
     }
 
     fn lock_waiters(
         &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<String, tokio::sync::oneshot::Sender<(bool, bool)>>>
+    ) -> std::sync::MutexGuard<'_, HashMap<String, tokio::sync::oneshot::Sender<GatewayAnswer>>>
     {
         self.gateway_waiters
             .lock()

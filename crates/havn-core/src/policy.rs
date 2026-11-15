@@ -623,7 +623,20 @@ impl Policy {
             network_policy: NetworkPolicy {
                 egress_allowed: self.network_policy.egress_allowed
                     || other.network_policy.egress_allowed,
-                egress_proxy: self.network_policy.egress_proxy && other.network_policy.egress_proxy,
+                // Only a role that allows egress says how it goes.
+                egress_proxy: match (
+                    self.network_policy.egress_allowed,
+                    other.network_policy.egress_allowed,
+                ) {
+                    (true, true) => {
+                        self.network_policy.egress_proxy && other.network_policy.egress_proxy
+                    }
+                    (true, false) => self.network_policy.egress_proxy,
+                    (false, true) => other.network_policy.egress_proxy,
+                    (false, false) => {
+                        self.network_policy.egress_proxy || other.network_policy.egress_proxy
+                    }
+                },
                 // Every role's blocked domains hold, as its hook rules do:
                 // a second role does not lift an admin's block.
                 allowed_domains: union(
@@ -895,6 +908,33 @@ mod tests {
         assert_eq!(p.resource_limits.memory_mb, 256);
         assert_eq!(p.resource_limits.pids_max, 32);
         assert_eq!(p.budget.max_tokens_per_day, 10_000);
+    }
+
+    #[test]
+    fn widen_takes_the_egress_route_of_roles_that_allow_egress() {
+        let role = |allowed: bool, proxy: bool| {
+            let mut p = Policy::default();
+            p.network_policy.egress_allowed = allowed;
+            p.network_policy.egress_proxy = proxy;
+            p
+        };
+        let route = |a: &Policy, b: &Policy| {
+            let p = a.widen_with(b);
+            (
+                p.network_policy.egress_allowed,
+                p.network_policy.egress_proxy,
+            )
+        };
+        // A role without egress does not lift another's proxy.
+        assert_eq!(route(&role(true, true), &role(false, false)), (true, true));
+        assert_eq!(route(&role(false, false), &role(true, true)), (true, true));
+        assert_eq!(route(&role(true, false), &role(false, true)), (true, false));
+        assert_eq!(route(&role(true, true), &role(true, false)), (true, false));
+        assert_eq!(route(&role(true, true), &role(true, true)), (true, true));
+        assert_eq!(
+            route(&role(false, true), &role(false, false)),
+            (false, true)
+        );
     }
 
     #[test]

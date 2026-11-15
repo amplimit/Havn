@@ -628,6 +628,15 @@ pub fn configure_agent_network(
                 .into(),
         ));
     }
+    remove_proxied_rule(&net.host_iface)?;
+    if !default_route {
+        // Without a route the agent sends nothing past the host; this
+        // also drops what it might address past it anyway.
+        let mut ins = vec!["-t", "mangle", "-I", EGRESS_CHAIN, "1"];
+        ins.extend(proxied_rule(&net.host_iface));
+        ins.push("DROP");
+        run_iptables(&ins)?;
+    }
 
     // Host side
     run_ip(&[
@@ -703,6 +712,33 @@ pub fn configure_agent_network(
 pub fn teardown_agent_network(agent_id: AgentId, pool: &AgentSubnetPool) {
     let net = network_for(agent_id, *pool);
     let _ = run_ip_silent(&["link", "del", &net.host_iface]);
+    let _ = remove_proxied_rule(&net.host_iface);
+}
+
+/// The match of an agent whose network goes through the egress proxy:
+/// what comes from its link to an address not of the host.
+fn proxied_rule(host_iface: &str) -> [&str; 8] {
+    [
+        "-i",
+        host_iface,
+        "-m",
+        "addrtype",
+        "!",
+        "--dst-type",
+        "LOCAL",
+        "-j",
+    ]
+}
+
+fn remove_proxied_rule(host_iface: &str) -> Result<()> {
+    loop {
+        let mut del = vec!["-t", "mangle", "-D", EGRESS_CHAIN];
+        del.extend(proxied_rule(host_iface));
+        del.push("DROP");
+        if !iptables()?.args(&del).output()?.status.success() {
+            return Ok(());
+        }
+    }
 }
 
 /// Garbage-collect orphaned host-side veth interfaces left behind by
@@ -747,15 +783,21 @@ pub fn gc_orphaned_veth() -> Result<usize> {
     Ok(count)
 }
 
-/// Compute the per-agent network from the agent's UUID. Deterministic
-/// (a restart picks the same /30) and collision-resistant up to a few
-/// hundred concurrent agents.
-/// The addresses and interface names of `agent_id`'s link in `pool`.
+/// The addresses and interface names of `agent_id`'s link in `pool`:
+/// deterministic, so a restart picks the same /30, from a hash of the
+/// whole id (time-ordered ids share their leading bytes).
 #[must_use]
 pub fn network_for(agent_id: AgentId, pool: AgentSubnetPool) -> AgentNetwork {
-    let bytes = agent_id.as_uuid().as_bytes();
+    // FNV-1a.
+    let hash = agent_id
+        .as_uuid()
+        .as_bytes()
+        .iter()
+        .fold(0x811c_9dc5_u32, |h, b| {
+            (h ^ u32::from(*b)).wrapping_mul(0x0100_0193)
+        });
     // 14-bit index → 16384 /30s.
-    let idx = ((u32::from(bytes[6]) << 8) | u32::from(bytes[7])) & 0x3FFF;
+    let idx = hash & 0x3FFF;
     // Each /30 is 4 IPs apart starting at <pool>.0.0.
     let base = idx * 4;
     let third = u8::try_from((base >> 8) & 0xFF).unwrap_or(0);
@@ -1020,6 +1062,19 @@ mod tests {
         assert!(a.host_iface.len() <= 15, "IFNAMSIZ");
         // Different UUIDs almost certainly hash to different /30s.
         assert!(a.host_iface != b.host_iface || a.network == b.network);
+    }
+
+    #[test]
+    fn ids_sharing_their_leading_bytes_get_their_own_links() {
+        let pool = default_pool();
+        let base = AgentId::new().as_uuid().into_bytes();
+        let mut seen = std::collections::HashSet::new();
+        for last in 0..=255_u8 {
+            let mut bytes = base;
+            bytes[15] = last;
+            let id = AgentId::from_uuid(uuid::Uuid::from_bytes(bytes));
+            assert!(seen.insert(network_for(id, pool).host_ip));
+        }
     }
 
     #[test]

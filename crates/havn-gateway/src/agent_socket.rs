@@ -1110,6 +1110,15 @@ async fn ask_for_approval(
         warn!(%agent_id, "dropping an approval request with oversized ids");
         return;
     }
+    // The egress proxy's questions carry this prefix; an agent's must not
+    // pass for one.
+    if request
+        .request_id
+        .starts_with(crate::egress_proxy::REQUEST_PREFIX)
+    {
+        warn!(%agent_id, "dropping an approval request with a reserved id");
+        return;
+    }
     let refuse = |request: &havn_proto::ApprovalRequest| {
         GatewayToAgent::ApprovalDecision(havn_proto::ApprovalDecision {
             channel_id: request.channel_id.clone(),
@@ -1182,7 +1191,7 @@ pub async fn forward_decision(
     // The gateway's own question (the egress proxy) is answered here and
     // audited where it was asked.
     if let Some(waiter) = router.take_gateway_waiter(id) {
-        let _ = waiter.send((approve, remember));
+        let _ = waiter.send((approve, remember, decided_by.to_string()));
         return;
     }
     if let Ok(Some(agent)) = agents_repo::find_by_id(db, agent_id).await {

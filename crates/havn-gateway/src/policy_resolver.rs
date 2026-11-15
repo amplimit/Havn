@@ -71,7 +71,9 @@ fn with_egress_mode(mut config: serde_json::Value, mode: &str) -> serde_json::Va
         .and_then(serde_json::Value::as_object_mut);
     if let Some(network) = network {
         network.insert("egress_allowed".into(), serde_json::Value::Bool(allowed));
-        network.insert("egress_proxy".into(), serde_json::Value::Bool(proxy));
+        network
+            .entry("egress_proxy")
+            .or_insert(serde_json::Value::Bool(proxy));
     }
     config
 }
@@ -309,10 +311,11 @@ pub async fn for_owner(db: &SqlitePool, agent: &Agent) -> Policy {
     let personal = match havn_db::repo::users::domains(db, agent.owner_id).await {
         Ok(lists) => lists,
         Err(e) => {
-            // Without the user's blocked domains, reading the web is off
-            // rather than unguarded.
-            warn!(user_id = %agent.owner_id, error = %e, "domain list lookup failed; turning web_fetch off");
+            // Without the user's blocked domains, reading the web and
+            // network egress are off rather than unguarded.
+            warn!(user_id = %agent.owner_id, error = %e, "domain list lookup failed; turning web_fetch and egress off");
             policy.permissions.can_fetch_web = false;
+            policy.network_policy.egress_allowed = false;
             havn_db::repo::users::UserDomains::default()
         }
     };
@@ -787,6 +790,10 @@ mod tests {
         let chosen = json!({"policy": {"network_policy": {"egress_allowed": false}}});
         assert_eq!(with_egress_mode(chosen.clone(), "allowlist"), chosen);
         assert_eq!(with_egress_mode(json!({}), "off"), json!({}));
+        let direct = json!({"policy": {"network_policy": {"egress_proxy": false}}});
+        let expanded = with_egress_mode(direct, "allowlist");
+        assert_eq!(expanded["policy"]["network_policy"]["egress_allowed"], true);
+        assert_eq!(expanded["policy"]["network_policy"]["egress_proxy"], false);
     }
 
     #[tokio::test]

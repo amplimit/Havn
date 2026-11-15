@@ -313,7 +313,8 @@ pub struct NetworkConfig {
     /// matches its subdomains.
     pub blocked_domains: Vec<String>,
     /// Port of the egress proxy on the gateway host, reachable only from
-    /// agents (see `network_policy.egress_proxy`).
+    /// agents (see `network_policy.egress_proxy`). Below 1024 by default,
+    /// so only root can take it before the gateway does.
     pub egress_proxy_port: u16,
     /// Network access of agents created from now on, unless their config
     /// sets one: `off`, `allowlist` (through the egress proxy, asking the
@@ -474,7 +475,7 @@ impl Default for NetworkConfig {
             agent_pool_cidr: "10.42.0.0/16".into(),
             agent_private_access: Vec::new(),
             blocked_domains: Vec::new(),
-            egress_proxy_port: 3128,
+            egress_proxy_port: 913,
             default_egress: "allowlist".into(),
         }
     }
@@ -607,6 +608,17 @@ impl GatewayConfig {
             anyhow::bail!(
                 "[network] default_egress = {:?} must be off, allowlist or all",
                 parsed.network.default_egress
+            );
+        }
+        let port = parsed.network.egress_proxy_port;
+        let listen_port = parsed
+            .listen
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok());
+        if port == 0 || listen_port == Some(port) {
+            anyhow::bail!(
+                "[network] egress_proxy_port = {port} must be a port of its own, not 0 or the \
+                 gateway's listen port"
             );
         }
         havn_core::policy::validate_domains(
