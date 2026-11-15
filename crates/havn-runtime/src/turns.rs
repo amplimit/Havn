@@ -35,7 +35,7 @@ struct Running {
 #[derive(Debug)]
 pub enum Admitted {
     /// Run this turn now; cancelling the token stops it.
-    Start(InboundMessage, CancellationToken),
+    Start(Box<InboundMessage>, CancellationToken),
     /// Queued behind the running turn, with `ahead` turns before it
     /// (the running one included).
     Queued {
@@ -90,7 +90,7 @@ impl Turns {
                         dequeued_at: None,
                     },
                 );
-                Admitted::Start(msg, stop)
+                Admitted::Start(Box::new(msg), stop)
             }
         }
     }
@@ -194,6 +194,7 @@ mod tests {
             channel: "telegram".into(),
             content: MessageContent::Text { text: text.into() },
             timestamp: chrono::Utc::now(),
+            attachments: Vec::new(),
             raw: serde_json::Value::Null,
         }
     }

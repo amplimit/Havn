@@ -717,6 +717,12 @@ async fn serve() -> anyhow::Result<()> {
             "/agents/{id}/approvals",
             get(api::approvals::get).put(api::approvals::put),
         )
+        .route(
+            "/agents/{id}/files",
+            // The handler reads the body itself, up to its limit, once it
+            // knows who is sending.
+            post(api::files::upload),
+        )
         .route("/agents/{id}/memory", get(api::memory::list))
         .route(
             "/agents/{id}/memory/{key}",

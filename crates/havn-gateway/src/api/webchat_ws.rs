@@ -89,6 +89,23 @@ pub async fn handler(
     Ok(ws.on_upgrade(move |socket| handle_session(socket, state, agent_id, sender_id)))
 }
 
+/// Files one message carries at most.
+const MAX_ATTACHMENTS: usize = 10;
+
+/// Whether `a` names files in the inbox, with a name and type of a
+/// sensible length: what the upload answered with.
+fn attachment_ok(a: &havn_core::Attachment) -> bool {
+    havn_core::Attachment::in_inbox(&a.path)
+        && a.text_path
+            .as_deref()
+            .is_none_or(havn_core::Attachment::in_inbox)
+        && !a.name.is_empty()
+        && a.name.chars().count() <= 255
+        && !a.name.chars().any(char::is_control)
+        && a.media_type.len() <= 100
+        && !a.media_type.chars().any(char::is_control)
+}
+
 /// A chat id a tab named, when it is short enough to be one.
 fn chat_id(conversation: Option<String>) -> Option<String> {
     conversation.filter(|c| !c.is_empty() && c.len() <= crate::webchat::MAX_CONVERSATION_ID)
@@ -212,12 +229,27 @@ async fn serve_session<Si, St, E>(
                 continue;
             }
         };
+        let mut attachments = Vec::new();
         let (user_text, conversation, branch) = match parsed {
             ClientMessage::Send {
                 content,
                 conversation,
                 edit,
+                attachments: sent,
             } => match (edit.is_some(), chat_id(edit)) {
+                _ if sent.len() > MAX_ATTACHMENTS || sent.iter().any(|a| !attachment_ok(a)) => {
+                    let _ = router
+                        .error(
+                            agent_id,
+                            session_id,
+                            format!(
+                                "A message carries up to {MAX_ATTACHMENTS} files uploaded to the \
+                                 agent's inbox."
+                            ),
+                        )
+                        .await;
+                    continue;
+                }
                 (true, None) => {
                     let _ = router
                         .error(
@@ -228,11 +260,14 @@ async fn serve_session<Si, St, E>(
                         .await;
                     continue;
                 }
-                (_, edit) => (
-                    content,
-                    chat_id(conversation),
-                    edit.map(|turn| havn_core::Branch::Edit { turn }),
-                ),
+                (_, edit) => {
+                    attachments = sent;
+                    (
+                        content,
+                        chat_id(conversation),
+                        edit.map(|turn| havn_core::Branch::Edit { turn }),
+                    )
+                }
             },
             ClientMessage::Regenerate { conversation, turn } => {
                 match (turn.is_some(), chat_id(turn)) {
@@ -284,6 +319,7 @@ async fn serve_session<Si, St, E>(
             channel: "webchat".into(),
             content: MessageContent::Text { text: user_text },
             timestamp: Utc::now(),
+            attachments,
             raw: serde_json::Value::Null,
         };
 

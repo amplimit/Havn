@@ -1119,6 +1119,21 @@ fn error_chain(e: &dyn std::error::Error) -> String {
     out
 }
 
+/// The text of PDF `input` (issue #106: a file sent in a chat), read in a
+/// converter child under the same limits as a fetched page, and whether
+/// it was cut.
+pub async fn pdf_text(input: &[u8]) -> Result<(String, bool), String> {
+    // Converters of uploads, apart from the tool's: each may take
+    // [`CONVERT_MEMORY_BYTES`].
+    static UPLOAD_CONVERSIONS: Semaphore = Semaphore::const_new(2);
+    let _slot = UPLOAD_CONVERSIONS
+        .acquire()
+        .await
+        .map_err(|e| e.to_string())?;
+    let url = Url::parse("https://upload.invalid/").map_err(|e| e.to_string())?;
+    convert_in_child(Kind::Pdf, input, &url).await
+}
+
 /// The gateway binary, for the converter. `/proc/self/exe` still runs
 /// after an upgrade replaced the file.
 fn converter_program() -> PathBuf {

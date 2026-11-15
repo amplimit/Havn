@@ -807,6 +807,7 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
         channel: channel.to_string(),
         content,
         timestamp: inb.timestamp,
+        attachments: Vec::new(),
         raw: inb.raw.unwrap_or(serde_json::Value::Null),
     };
 
