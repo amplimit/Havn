@@ -13,6 +13,7 @@ mod channel_router;
 mod config;
 mod credential_resolver;
 mod cron;
+mod egress_proxy;
 mod heartbeat;
 mod keyring;
 mod llm_proxy;
@@ -225,6 +226,7 @@ async fn serve() -> anyhow::Result<()> {
 
     let mut cfg = GatewayConfig::load().context("loading gateway config")?;
     policy_resolver::set_operator_blocked_domains(cfg.network.blocked_domains.clone());
+    policy_resolver::set_default_egress(cfg.network.default_egress.clone());
     info!(
         version = env!("CARGO_PKG_VERSION"),
         listen = %cfg.listen,
@@ -431,8 +433,7 @@ async fn serve() -> anyhow::Result<()> {
         webchat_router.clone(),
         cfg.workspace_root.clone(),
     );
-    let (spawner, isolated_agent_pool): (Arc<dyn AgentSpawner>, Option<String>) =
-        select_spawner(&cfg.network)?;
+    let (spawner, isolated_agent_pool, egress_proxy_pool) = select_spawner(&cfg.network)?;
     if let Some(proxies) = trusted_proxies.as_deref() {
         match &isolated_agent_pool {
             Some(pool) => {
@@ -570,6 +571,21 @@ async fn serve() -> anyhow::Result<()> {
             ),
         }
     });
+    if let Some(pool) = egress_proxy_pool {
+        let proxy = egress_proxy::EgressProxy::new(
+            db.clone(),
+            webchat_router.clone(),
+            cfg.trust_header.enabled,
+            pool,
+        );
+        // Bound before any agent starts, so no other program holds the
+        // one host port agents are let through to.
+        let port = cfg.network.egress_proxy_port;
+        let listener = egress_proxy::EgressProxy::bind(port)
+            .await
+            .with_context(|| format!("the egress proxy cannot listen on port {port}"))?;
+        tokio::spawn(proxy.serve(listener));
+    }
     let socket_ctx = AgentSocketCtx {
         registry: registry.clone(),
         db: db.clone(),
@@ -597,6 +613,7 @@ async fn serve() -> anyhow::Result<()> {
         timezone_rate: Arc::new(web_search::UserRate::new(
             timezone::TOOL_PER_USER_PER_MINUTE,
         )),
+        egress_proxy: egress_proxy_pool.map(|pool| (pool, cfg.network.egress_proxy_port)),
     };
     let socket_path = cfg.agent_socket_path.clone();
     let socket_task = tokio::spawn(async move {
@@ -971,15 +988,21 @@ fn nat_failure_hint(e: &havn_spawner::network::NetworkError) -> &'static str {
     }
 }
 
-fn select_spawner(
-    network: &config::NetworkConfig,
-) -> anyhow::Result<(Arc<dyn AgentSpawner>, Option<String>)> {
+/// The spawner, the agent pool when agents are isolated, and the pool
+/// again when agent networking (and so the egress proxy) is in place.
+type Spawning = (
+    Arc<dyn AgentSpawner>,
+    Option<String>,
+    Option<havn_spawner::network::AgentSubnetPool>,
+);
+
+fn select_spawner(network: &config::NetworkConfig) -> anyhow::Result<Spawning> {
     if matches!(std::env::var("HAVN_SPAWNER").as_deref(), Ok("subprocess")) {
         warn!(
             "agent spawner: SubprocessSpawner (forced via HAVN_SPAWNER=subprocess); agents run \
              WITHOUT namespace, Landlock-at-spawn or cgroup isolation"
         );
-        return Ok((Arc::new(SubprocessSpawner::new()), None));
+        return Ok((Arc::new(SubprocessSpawner::new()), None, None));
     }
 
     #[cfg(target_os = "linux")]
@@ -1027,6 +1050,7 @@ fn select_spawner(
             );
             std::process::exit(2);
         }
+        let mut egress_proxy_pool = None;
         match NamespaceSpawner::try_init_with_pool(pool) {
             Ok(mut s) => {
                 info!(pool_cidr = %pool.cidr(), "agent spawner: NamespaceSpawner (cgroup v2 isolation)");
@@ -1036,9 +1060,15 @@ fn select_spawner(
                 // configured pool. Failure is non-fatal — agents that
                 // don't need outbound still work.
                 let (dns, reachable) = isolation_exceptions(network)?;
-                match havn_spawner::network::ensure_global_nat(&pool, &dns, &reachable) {
+                match havn_spawner::network::ensure_global_nat(
+                    &pool,
+                    &dns,
+                    &reachable,
+                    Some(network.egress_proxy_port),
+                ) {
                     Ok(primary) => {
                         s.set_network_ready();
+                        egress_proxy_pool = Some(pool);
                         info!(primary_iface = %primary, pool_cidr = %pool.cidr(), "per-agent NAT ready");
                     }
                     Err(e) => {
@@ -1065,7 +1095,7 @@ fn select_spawner(
                     ),
                     Err(e) => tracing::warn!(error = %e, "veth GC failed; orphans will accumulate"),
                 }
-                Ok((Arc::new(s), Some(pool.cidr())))
+                Ok((Arc::new(s), Some(pool.cidr()), egress_proxy_pool))
             }
             Err(e) => Err(anyhow::anyhow!(
                 "agent isolation is unavailable: {e}. Run the gateway as root (directly or via \

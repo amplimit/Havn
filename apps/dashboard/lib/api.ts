@@ -53,6 +53,8 @@ export type AgentWebView = {
   can_fetch_web: boolean;
   /** Network egress from the agent's sandbox. */
   egress_allowed: boolean;
+  /** That egress goes through the gateway's proxy, which asks about new domains. */
+  egress_proxy: boolean;
   /** What the owner's policy permits; false only in multi-user mode. */
   search_permitted: boolean;
   fetch_permitted: boolean;
@@ -80,6 +82,7 @@ export type AgentWebPatch = {
   can_search_web?: boolean;
   can_fetch_web?: boolean;
   egress_allowed?: boolean;
+  egress_proxy?: boolean;
   allowed_domains?: string[];
   blocked_domains?: string[];
 };

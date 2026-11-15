@@ -542,13 +542,21 @@ impl AgentSpawner for NamespaceSpawner {
             let net_pid = i32::try_from(pid).unwrap_or(0);
             let net_agent_id = config.agent_id;
             let net_pool = self.pool;
+            // Through the egress proxy only: no route past the host.
+            let default_route = !policy.network_policy.egress_proxy;
             tokio::task::spawn_blocking(move || {
-                match crate::network::configure_agent_network(net_pid, net_agent_id, &net_pool) {
+                match crate::network::configure_agent_network(
+                    net_pid,
+                    net_agent_id,
+                    &net_pool,
+                    default_route,
+                ) {
                     Ok(net) => {
                         info!(
                             agent_id = %net_agent_id,
                             host_iface = %net.host_iface,
                             ns_ip = %net.ns_ip,
+                            default_route,
                             "agent veth configured (egress_allowed=true)"
                         );
                     }

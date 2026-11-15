@@ -31,6 +31,53 @@ pub fn set_operator_blocked_domains(domains: Vec<String>) {
     let _ = OPERATOR_BLOCKED_DOMAINS.set(domains);
 }
 
+/// The operator's `[network] default_egress`.
+static DEFAULT_EGRESS: OnceLock<String> = OnceLock::new();
+
+pub fn set_default_egress(mode: String) {
+    let _ = DEFAULT_EGRESS.set(mode);
+}
+
+/// `config` of a new agent with the operator's default network access
+/// set in its policy override, unless the config sets egress itself.
+#[must_use]
+pub fn with_default_egress(config: serde_json::Value) -> serde_json::Value {
+    with_egress_mode(config, DEFAULT_EGRESS.get().map_or("off", String::as_str))
+}
+
+fn with_egress_mode(mut config: serde_json::Value, mode: &str) -> serde_json::Value {
+    if config
+        .pointer("/policy/network_policy/egress_allowed")
+        .is_some()
+    {
+        return config;
+    }
+    let (allowed, proxy) = match mode {
+        "allowlist" => (true, true),
+        "all" => (true, false),
+        _ => return config,
+    };
+    if !config.is_object() {
+        config = serde_json::json!({});
+    }
+    let network = config
+        .as_object_mut()
+        .map(|c| c.entry("policy").or_insert_with(|| serde_json::json!({})))
+        .and_then(serde_json::Value::as_object_mut)
+        .map(|p| {
+            p.entry("network_policy")
+                .or_insert_with(|| serde_json::json!({}))
+        })
+        .and_then(serde_json::Value::as_object_mut);
+    if let Some(network) = network {
+        network.insert("egress_allowed".into(), serde_json::Value::Bool(allowed));
+        network
+            .entry("egress_proxy")
+            .or_insert(serde_json::Value::Bool(proxy));
+    }
+    config
+}
+
 #[must_use]
 pub fn operator_blocked_domains() -> &'static [String] {
     OPERATOR_BLOCKED_DOMAINS.get().map_or(&[], Vec::as_slice)
@@ -257,6 +304,12 @@ pub async fn upgrade_stored_overrides(db: &SqlitePool) -> anyhow::Result<()> {
 /// agent's team, if any), with the owner's own domain lists and the
 /// operator's blocked domains added.
 pub async fn for_owner(db: &SqlitePool, agent: &Agent) -> Policy {
+    owner_policy(db, agent).await.0
+}
+
+/// [`for_owner`], and whether the owner's domain lists could be read.
+async fn owner_policy(db: &SqlitePool, agent: &Agent) -> (Policy, bool) {
+    let mut lists_read = true;
     let mut policy = match agent.team_id {
         Some(team_id) => for_team_member(db, agent.owner_id, team_id).await,
         None => for_user(db, agent.owner_id).await,
@@ -264,10 +317,11 @@ pub async fn for_owner(db: &SqlitePool, agent: &Agent) -> Policy {
     let personal = match havn_db::repo::users::domains(db, agent.owner_id).await {
         Ok(lists) => lists,
         Err(e) => {
-            // Without the user's blocked domains, reading the web is off
-            // rather than unguarded.
-            warn!(user_id = %agent.owner_id, error = %e, "domain list lookup failed; turning web_fetch off");
-            policy.permissions.can_fetch_web = false;
+            // Without the user's blocked domains, reading the web and
+            // network egress are off rather than unguarded.
+            warn!(user_id = %agent.owner_id, error = %e, "domain list lookup failed; turning web_fetch and egress off");
+            lists_read = false;
+            unguarded(&mut policy);
             havn_db::repo::users::UserDomains::default()
         }
     };
@@ -277,7 +331,14 @@ pub async fn for_owner(db: &SqlitePool, agent: &Agent) -> Policy {
         &union(&net.blocked_domains, &personal.blocked_domains),
         operator_blocked_domains(),
     );
-    policy
+    (policy, lists_read)
+}
+
+/// Reading the web and network egress off, for a policy whose domain
+/// lists are missing.
+fn unguarded(policy: &mut Policy) {
+    policy.permissions.can_fetch_web = false;
+    policy.network_policy.egress_allowed = false;
 }
 
 /// Full per-session resolution chain (spec §6.3): the owner's policy
@@ -294,8 +355,8 @@ pub async fn for_owner(db: &SqlitePool, agent: &Agent) -> Policy {
 /// registry but their cgroup was still capped at the system default
 /// 512 MiB. Drift fix.
 pub async fn for_session(db: &SqlitePool, agent: &Agent, multi_user: bool) -> Policy {
-    let owner = for_owner(db, agent).await;
-    match override_for(agent, &owner) {
+    let (owner, lists_read) = owner_policy(db, agent).await;
+    let mut policy = match override_for(agent, &owner) {
         Some(p) if multi_user => p.clamp_to(&owner),
         Some(mut p) => {
             p.hooks = p.hooks.union(&owner.hooks);
@@ -306,7 +367,12 @@ pub async fn for_session(db: &SqlitePool, agent: &Agent, multi_user: bool) -> Po
             p
         }
         None => owner,
+    };
+    // An unclamped override must not turn them back on.
+    if !lists_read {
+        unguarded(&mut policy);
     }
+    policy
 }
 
 #[cfg(test)]
@@ -732,6 +798,20 @@ mod tests {
         assert!(p.permissions.can_spawn_subagents);
         assert!(p.permissions.can_use_mcp);
         assert_eq!(p.resource_limits.memory_mb, 4096);
+    }
+
+    #[test]
+    fn new_agents_get_the_default_egress_unless_their_config_sets_it() {
+        let fresh = with_egress_mode(json!({"model": "m"}), "allowlist");
+        assert_eq!(fresh["policy"]["network_policy"]["egress_allowed"], true);
+        assert_eq!(fresh["policy"]["network_policy"]["egress_proxy"], true);
+        let chosen = json!({"policy": {"network_policy": {"egress_allowed": false}}});
+        assert_eq!(with_egress_mode(chosen.clone(), "allowlist"), chosen);
+        assert_eq!(with_egress_mode(json!({}), "off"), json!({}));
+        let direct = json!({"policy": {"network_policy": {"egress_proxy": false}}});
+        let expanded = with_egress_mode(direct, "allowlist");
+        assert_eq!(expanded["policy"]["network_policy"]["egress_allowed"], true);
+        assert_eq!(expanded["policy"]["network_policy"]["egress_proxy"], false);
     }
 
     #[tokio::test]

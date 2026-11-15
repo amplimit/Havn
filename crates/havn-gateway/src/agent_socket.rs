@@ -158,6 +158,8 @@ pub struct AgentSocketCtx {
     /// Rate limit, page cache and answer model of the `web_fetch` gateway
     /// tool.
     pub fetch: Arc<crate::web_fetch::WebFetch>,
+    /// The agent subnet pool and port of the egress proxy, when it runs.
+    pub egress_proxy: Option<(havn_spawner::network::AgentSubnetPool, u16)>,
     /// Rate of the `set_timezone` gateway tool, per owner.
     pub timezone_rate: Arc<crate::web_search::UserRate>,
 }
@@ -689,6 +691,7 @@ async fn handle_connection(
             })
             .collect(),
         seccomp_allow_extra: ctx.seccomp_allow_extra.clone(),
+        egress_proxy: egress_proxy_for(&ctx, agent_id).await,
         gateway_tools,
         timezone: Some(crate::timezone::for_agent(&ctx.db, agent_id).await),
     };
@@ -955,10 +958,13 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
         AgentToGateway::OutboundMessage(msg) => route_outbound(agent_id, msg, ctx).await,
         AgentToGateway::ApprovalRequest(request) => ask_for_approval(agent_id, request, ctx).await,
         AgentToGateway::ApprovalClosed { request_id } => {
-            let _ = ctx
-                .webchat_router
-                .close_approval(agent_id, &request_id)
-                .await;
+            // The egress proxy's questions are closed by the proxy only.
+            if !request_id.starts_with(crate::egress_proxy::REQUEST_PREFIX) {
+                let _ = ctx
+                    .webchat_router
+                    .close_approval(agent_id, &request_id)
+                    .await;
+            }
         }
         AgentToGateway::LlmRequest(req) => {
             if req.request_id.len() > MAX_REQUEST_ID_BYTES {
@@ -1107,6 +1113,15 @@ async fn ask_for_approval(
         warn!(%agent_id, "dropping an approval request with oversized ids");
         return;
     }
+    // The egress proxy's questions carry this prefix; an agent's must not
+    // pass for one.
+    if request
+        .request_id
+        .starts_with(crate::egress_proxy::REQUEST_PREFIX)
+    {
+        warn!(%agent_id, "dropping an approval request with a reserved id");
+        return;
+    }
     let refuse = |request: &havn_proto::ApprovalRequest| {
         GatewayToAgent::ApprovalDecision(havn_proto::ApprovalDecision {
             channel_id: request.channel_id.clone(),
@@ -1176,6 +1191,12 @@ pub async fn forward_decision(
     let Some(request) = router.close_approval(agent_id, id).await else {
         return;
     };
+    // The gateway's own question (the egress proxy) is answered here and
+    // audited where it was asked.
+    if let Some(waiter) = router.take_gateway_waiter(id) {
+        let _ = waiter.send((approve, remember, decided_by.to_string()));
+        return;
+    }
     if let Ok(Some(agent)) = agents_repo::find_by_id(db, agent_id).await {
         crate::audit::record(
             db,
@@ -1339,6 +1360,17 @@ async fn route_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSock
     } else if let Err(e) = ctx.webchat_router.deliver(agent_id, msg).await {
         warn!(%agent_id, error = %e, "could not deliver outbound to webchat");
     }
+}
+
+/// The proxy URL for `agent_id`'s tools, when its policy sends egress
+/// through the egress proxy and the proxy runs.
+async fn egress_proxy_for(ctx: &AgentSocketCtx, agent_id: AgentId) -> Option<String> {
+    let (pool, port) = ctx.egress_proxy?;
+    let agent = agents_repo::find_by_id(&ctx.db, agent_id).await.ok()??;
+    let policy = policy_resolver::for_session(&ctx.db, &agent, ctx.multi_user).await;
+    let net = &policy.network_policy;
+    (policy.permissions.can_access_network && net.egress_allowed && net.egress_proxy)
+        .then(|| crate::egress_proxy::EgressProxy::url_for(pool, agent_id, port))
 }
 
 /// The gateway-run tools `agent` may use: `web_search` when its policy
@@ -2421,6 +2453,7 @@ mod tests {
             timezone_rate: Arc::new(crate::web_search::UserRate::new(
                 crate::timezone::TOOL_PER_USER_PER_MINUTE,
             )),
+            egress_proxy: None,
         }
     }
 

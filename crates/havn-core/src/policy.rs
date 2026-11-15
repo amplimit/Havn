@@ -364,6 +364,11 @@ pub enum ChannelAllowance {
 #[serde(default)]
 pub struct NetworkPolicy {
     pub egress_allowed: bool,
+    /// With `egress_allowed`, the sandbox reaches the internet only
+    /// through the gateway's egress proxy: allowed domains go through, a
+    /// new one waits for the owner's approval, blocked ones never do.
+    /// Without it, egress reaches every public address.
+    pub egress_proxy: bool,
     /// Domains the agent may reach without further checks. An entry
     /// matches the domain and its subdomains; a leading `*.` is ignored.
     pub allowed_domains: Vec<String>,
@@ -536,6 +541,10 @@ impl Policy {
             network_policy: NetworkPolicy {
                 egress_allowed: self.network_policy.egress_allowed
                     && ceiling.network_policy.egress_allowed,
+                // A ceiling that sends egress through the proxy keeps it
+                // there.
+                egress_proxy: self.network_policy.egress_proxy
+                    || ceiling.network_policy.egress_proxy,
                 // Both lists only add: allowed domains are trust the agent
                 // may add, blocked domains are restrictions it may add.
                 allowed_domains: union(
@@ -614,6 +623,20 @@ impl Policy {
             network_policy: NetworkPolicy {
                 egress_allowed: self.network_policy.egress_allowed
                     || other.network_policy.egress_allowed,
+                // Only a role that allows egress says how it goes.
+                egress_proxy: match (
+                    a.can_access_network && self.network_policy.egress_allowed,
+                    b.can_access_network && other.network_policy.egress_allowed,
+                ) {
+                    (true, true) => {
+                        self.network_policy.egress_proxy && other.network_policy.egress_proxy
+                    }
+                    (true, false) => self.network_policy.egress_proxy,
+                    (false, true) => other.network_policy.egress_proxy,
+                    (false, false) => {
+                        self.network_policy.egress_proxy || other.network_policy.egress_proxy
+                    }
+                },
                 // Every role's blocked domains hold, as its hook rules do:
                 // a second role does not lift an admin's block.
                 allowed_domains: union(
@@ -846,6 +869,7 @@ mod tests {
         assert!(!domain_listed(&[String::new(), " ".into()], "example.com"));
         let net = NetworkPolicy {
             egress_allowed: false,
+            egress_proxy: false,
             allowed_domains: vec!["example.com".into()],
             blocked_domains: vec!["secret.example.com".into()],
         };
@@ -884,6 +908,37 @@ mod tests {
         assert_eq!(p.resource_limits.memory_mb, 256);
         assert_eq!(p.resource_limits.pids_max, 32);
         assert_eq!(p.budget.max_tokens_per_day, 10_000);
+    }
+
+    #[test]
+    fn widen_takes_the_egress_route_of_roles_that_allow_egress() {
+        let role = |allowed: bool, proxy: bool| {
+            let mut p = Policy::default();
+            p.network_policy.egress_allowed = allowed;
+            p.network_policy.egress_proxy = proxy;
+            p
+        };
+        let route = |a: &Policy, b: &Policy| {
+            let p = a.widen_with(b);
+            (
+                p.network_policy.egress_allowed,
+                p.network_policy.egress_proxy,
+            )
+        };
+        // A role without egress does not lift another's proxy.
+        assert_eq!(route(&role(true, true), &role(false, false)), (true, true));
+        assert_eq!(route(&role(false, false), &role(true, true)), (true, true));
+        assert_eq!(route(&role(true, false), &role(false, true)), (true, false));
+        assert_eq!(route(&role(true, true), &role(true, false)), (true, false));
+        assert_eq!(route(&role(true, true), &role(true, true)), (true, true));
+        assert_eq!(
+            route(&role(false, true), &role(false, false)),
+            (false, true)
+        );
+        // Nor does one without network access.
+        let mut offline = role(true, false);
+        offline.permissions.can_access_network = false;
+        assert_eq!(route(&offline, &role(true, true)), (true, true));
     }
 
     #[test]

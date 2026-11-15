@@ -427,7 +427,9 @@ export default function ChatPage({
               aria-label={`approve ${a.tool}`}
             >
               <p className="mb-1">
-                <strong>Approve this tool call?</strong>{" "}
+                <strong>
+                  {a.kind === "network" ? "Allow this network access?" : "Approve this tool call?"}
+                </strong>{" "}
                 <span className="font-mono">{a.tool}</span>
                 {a.conversation && (
                   <span style={{ color: "var(--color-body)" }}>
@@ -449,16 +451,20 @@ export default function ChatPage({
                   disabled={wsState !== "open"}
                   onClick={() => decide(a.id, true, false)}
                 >
-                  approve
+                  {a.kind === "network" ? "allow for 10 minutes" : "approve"}
                 </button>
                 <button
                   type="button"
                   className="btn-ghost"
                   disabled={wsState !== "open"}
                   onClick={() => decide(a.id, true, true)}
-                  title="Approve this tool with this exact input for the rest of the conversation, until the agent restarts"
+                  title={
+                    a.kind === "network"
+                      ? "Add these domains to the agent's allowed domains"
+                      : "Approve this tool with this exact input for the rest of the conversation, until the agent restarts"
+                  }
                 >
-                  approve for this conversation
+                  {a.kind === "network" ? "always allow" : "approve for this conversation"}
                 </button>
                 <button
                   type="button"

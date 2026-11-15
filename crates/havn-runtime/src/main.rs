@@ -289,6 +289,7 @@ async fn main() -> anyhow::Result<()> {
         seccomp_allow_extra,
         gateway_tools,
         timezone,
+        egress_proxy,
     ): (
         Arc<Policy>,
         Option<String>,
@@ -299,6 +300,7 @@ async fn main() -> anyhow::Result<()> {
         Vec<std::path::PathBuf>,
         Vec<String>,
         Vec<havn_proto::GatewayToolSpec>,
+        Option<String>,
         Option<String>,
     ) = match first_frame {
         Some(GatewayToAgent::Welcome {
@@ -313,6 +315,7 @@ async fn main() -> anyhow::Result<()> {
             seccomp_allow_extra: seccomp_allow_extra_list,
             gateway_tools,
             timezone,
+            egress_proxy,
         }) => {
             // Materialise the embedding provider from the
             // gateway-shipped JSON. Absent / null / "disabled"
@@ -403,6 +406,7 @@ async fn main() -> anyhow::Result<()> {
                 seccomp_allow_extra_list,
                 gateway_tools,
                 timezone,
+                egress_proxy,
             )
         }
         Some(other) => return Err(anyhow!("expected Welcome, got {other:?}")),
@@ -545,6 +549,13 @@ async fn main() -> anyhow::Result<()> {
                 warn!(home = %home.display(), error = %e, "cannot create the tools' home directory; tools keep the gateway's HOME")
             }
         }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = egress_proxy;
+    #[cfg(target_os = "linux")]
+    if let Some(url) = egress_proxy {
+        info!(proxy = %url, "network goes through the gateway's egress proxy");
+        sandbox::set_tool_proxy(url);
     }
 
     // 4. Load PreToolUse hooks: the policy's rules plus any rules the

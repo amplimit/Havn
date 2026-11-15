@@ -269,6 +269,28 @@ pub fn has_tool_home() -> bool {
     TOOL_HOME.get().is_some()
 }
 
+/// The egress proxy tools and MCP servers use, when the agent's network
+/// goes through it.
+static TOOL_PROXY: OnceLock<String> = OnceLock::new();
+
+/// Point tool processes and MCP servers at the egress proxy `url`.
+pub fn set_tool_proxy(url: String) {
+    let _ = TOOL_PROXY.set(url);
+}
+
+/// Set the proxy variables common tools read (pip, npm, git, curl) on
+/// `command`, when there is a proxy.
+pub fn apply_tool_proxy(command: &mut tokio::process::Command) {
+    if let Some(url) = TOOL_PROXY.get() {
+        for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            command.env(name, url);
+        }
+        command
+            .env("NO_PROXY", "localhost,127.0.0.1,::1")
+            .env("no_proxy", "localhost,127.0.0.1,::1");
+    }
+}
+
 fn apply_tool_home(command: &mut tokio::process::Command, home: Option<&std::path::Path>) {
     if let Some(home) = home {
         command.env("HOME", home).env_remove("XDG_CACHE_HOME");
@@ -383,6 +405,7 @@ pub fn create_tool_domain() -> std::io::Result<()> {
 /// [`set_tool_home`] has set one.
 pub fn confine_tool(command: &mut tokio::process::Command) {
     apply_tool_home(command, TOOL_HOME.get().map(std::path::PathBuf::as_path));
+    apply_tool_proxy(command);
     let Some(ruleset) = TOOL_DOMAIN.get() else {
         return;
     };

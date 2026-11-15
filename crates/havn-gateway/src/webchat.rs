@@ -32,7 +32,15 @@ pub struct WebChatRouter {
     /// Tool calls waiting for the owner's approval, by request id; shown
     /// to every tab of the agent, also ones opened later.
     approvals: Arc<std::sync::Mutex<HashMap<String, PendingApproval>>>,
+    /// Requests the gateway itself asked (the egress proxy), answered
+    /// here instead of by an agent.
+    gateway_waiters:
+        Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<GatewayAnswer>>>>,
 }
+
+/// The owner's answer to a question of the gateway's own: allow, always,
+/// and who decided.
+pub type GatewayAnswer = (bool, bool, String);
 
 #[derive(Debug, Clone)]
 struct PendingApproval {
@@ -104,6 +112,10 @@ pub enum ServerMessage {
         /// The conversation it came from, when not this chat.
         #[serde(skip_serializing_if = "Option::is_none")]
         conversation: Option<String>,
+        /// `network` for the egress proxy's questions about a domain:
+        /// "always" then adds it to the agent's allowed domains.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
     },
     /// The approval request `id` was decided or ended; stop showing it.
     ApprovalClosed { id: String },
@@ -196,6 +208,41 @@ impl WebChatRouter {
         }
         self.fan_out(agent_id, approval_message(&request)).await;
         true
+    }
+
+    /// Ask the owner a question of the gateway's own; the answer comes on
+    /// the receiver. `None` when it cannot be asked (too many waiting).
+    pub async fn ask_gateway_approval(
+        &self,
+        agent_id: AgentId,
+        request: havn_proto::ApprovalRequest,
+    ) -> Option<tokio::sync::oneshot::Receiver<GatewayAnswer>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let id = request.request_id.clone();
+        self.lock_waiters().insert(id.clone(), tx);
+        if self.ask_approval(agent_id, request).await {
+            Some(rx)
+        } else {
+            self.lock_waiters().remove(&id);
+            None
+        }
+    }
+
+    /// The gateway's own waiter for request `id`, if it asked it.
+    pub fn take_gateway_waiter(
+        &self,
+        id: &str,
+    ) -> Option<tokio::sync::oneshot::Sender<GatewayAnswer>> {
+        self.lock_waiters().remove(id)
+    }
+
+    fn lock_waiters(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, tokio::sync::oneshot::Sender<GatewayAnswer>>>
+    {
+        self.gateway_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Take the request `id` of `agent_id` out, and close it in every tab.
@@ -390,11 +437,13 @@ fn approval_message(request: &havn_proto::ApprovalRequest) -> ServerMessage {
         tool: request.tool.clone(),
         input: request.input.clone(),
         reason: request.reason.clone(),
-        conversation: request
-            .channel_id
-            .parse::<SessionId>()
-            .is_err()
-            .then(|| request.channel_id.clone()),
+        conversation: (!request.channel_id.is_empty()
+            && request.channel_id.parse::<SessionId>().is_err())
+        .then(|| request.channel_id.clone()),
+        kind: request
+            .request_id
+            .starts_with(crate::egress_proxy::REQUEST_PREFIX)
+            .then(|| "network".to_string()),
     }
 }
 

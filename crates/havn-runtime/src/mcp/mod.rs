@@ -226,6 +226,8 @@ async fn spawn_one(name: &str, cfg: &McpServerConfig) -> anyhow::Result<McpClien
     if crate::sandbox::has_tool_home() {
         command.env("HOME", crate::sandbox::MCP_HOME);
     }
+    #[cfg(target_os = "linux")]
+    crate::sandbox::apply_tool_proxy(&mut command);
     for arg in &cfg.args {
         command.arg(arg);
     }
