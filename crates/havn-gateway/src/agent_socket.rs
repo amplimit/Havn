@@ -1310,8 +1310,8 @@ async fn run_schedule(
         Ok(None) => return Err(format!("agent {agent_id} not found")),
         Err(e) => return Err(format!("agent lookup failed: {e}")),
     };
-    // The same check as creating a job over HTTP: the owner's policy.
-    let policy = policy_resolver::for_owner(&ctx.db, &agent).await;
+    // The policy the tool was offered under, checked again per call.
+    let policy = policy_resolver::for_session(&ctx.db, &agent, ctx.multi_user).await;
     if !policy.permissions.can_schedule_cron {
         return Err("this agent's policy does not allow scheduled tasks".into());
     }
@@ -1329,10 +1329,24 @@ async fn run_schedule(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     if action != "list" {
-        let details = match &result {
-            Ok(_) => serde_json::json!({ "action": action, "input": call.input }),
-            Err(message) => serde_json::json!({ "action": action, "error": message }),
+        let field = |key: &str| {
+            call.input
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.chars().take(200).collect::<String>())
         };
+        let mut details = serde_json::json!({
+            "action": action,
+            "id": field("id"),
+            "name": field("name"),
+            "at": field("at"),
+            "every": field("every"),
+            "cron": field("cron"),
+            "in_minutes": call.input.get("in_minutes").cloned(),
+        });
+        if let Err(message) = &result {
+            details["error"] = serde_json::Value::String(message.clone());
+        }
         crate::audit::record(
             &ctx.db,
             agent.owner_id,

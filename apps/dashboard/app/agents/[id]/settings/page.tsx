@@ -584,7 +584,9 @@ function ScheduledTasks({ agentId }: { agentId: string }) {
                 <div className="text-xs" style={{ color: "var(--color-body)" }}>
                   {job.enabled
                     ? `next ${new Date(job.next_run_at).toLocaleString()}`
-                    : "paused"}
+                    : job.summary.startsWith("once") && new Date(job.next_run_at) <= new Date()
+                      ? "done"
+                      : "paused"}
                   {job.last_run &&
                     (job.last_run.error
                       ? `; last run failed: ${job.last_run.error}`

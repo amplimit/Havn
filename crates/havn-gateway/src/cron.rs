@@ -514,17 +514,31 @@ impl CronScheduler {
                 debug!(%job_id, sessions = n, "cron output broadcast");
                 Ok(None)
             }
-            (RunOutcome::Error, Some(channel_id)) if self.first_failure_today(job_id, now) => {
-                Ok(Some(OutboundMessage {
-                    channel_id: channel_id.to_string(),
+            (RunOutcome::Error, target)
+                if (target.is_some() || job.deliver == "webchat")
+                    && self.first_failure_today(job_id, now) =>
+            {
+                let reason: String = error_text
+                    .as_deref()
+                    .unwrap_or("unknown error")
+                    .chars()
+                    .take(200)
+                    .collect();
+                let notice = OutboundMessage {
+                    channel_id: target.unwrap_or("broadcast").to_string(),
                     content: text(format!(
-                        "(The scheduled task \"{}\" failed: {}. I will not report it again \
-                         today.)",
-                        job.name,
-                        error_text.as_deref().unwrap_or("unknown error")
+                        "(The scheduled task \"{}\" failed: {reason}. I will not report it \
+                         again today.)",
+                        job.name
                     )),
                     reply_to: None,
-                }))
+                };
+                if target.is_some() {
+                    Ok(Some(notice))
+                } else {
+                    self.webchat_router.broadcast(agent_id, notice).await;
+                    Ok(None)
+                }
             }
             _ => Ok(None),
         }
