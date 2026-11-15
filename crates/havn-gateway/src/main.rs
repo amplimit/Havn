@@ -24,6 +24,7 @@ mod reload;
 mod secret_ref;
 mod supervisor;
 mod timezone;
+mod web_fetch;
 mod web_search;
 mod webchat;
 mod workspace;
@@ -174,14 +175,28 @@ struct AppState {
     pub search: Arc<web_search::WebSearch>,
 }
 
-#[tokio::main]
+fn main() -> anyhow::Result<()> {
+    // The page converter of web_fetch runs before any async runtime: it is
+    // one thread, under a tight address-space limit.
+    if std::env::args().nth(1).as_deref() == Some(web_fetch::CONVERT_ARG) {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(i32::from(!web_fetch::convert_main(&args)));
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?
+        .block_on(serve())
+}
+
 #[allow(
     clippy::too_many_lines,
-    reason = "main wires every subsystem; extracting helpers obscures the startup path"
+    reason = "serve wires every subsystem; extracting helpers obscures the startup path"
 )]
-async fn main() -> anyhow::Result<()> {
+async fn serve() -> anyhow::Result<()> {
     // The gateway takes no arguments (config comes from the file and env);
-    // only `--version` and `--help` are answered, matching the other binaries.
+    // only `--version` and `--help` are answered, matching the other
+    // binaries. `--convert-page` is internal and handled in `main`.
     {
         use std::io::Write as _;
         match std::env::args().nth(1).as_deref() {
@@ -543,6 +558,16 @@ async fn main() -> anyhow::Result<()> {
     // This is what makes multi-user havn correct: agent A's calls
     // bill agent A's owner regardless of which HTTP user happens to
     // be online.
+    tokio::spawn(async {
+        match web_fetch::self_test().await {
+            Ok(()) => info!("web_fetch page converter ready"),
+            Err(e) => warn!(
+                error = %e,
+                "web_fetch page converter cannot run; every web_fetch will fail. A gateway not \
+                 running as root needs user namespaces for it"
+            ),
+        }
+    });
     let socket_ctx = AgentSocketCtx {
         registry: registry.clone(),
         db: db.clone(),
@@ -564,6 +589,9 @@ async fn main() -> anyhow::Result<()> {
         seccomp_allow_extra: cfg.seccomp.allow_extra.clone(),
         keyring: keyring.clone(),
         search,
+        fetch: Arc::new(
+            web_fetch::WebFetch::new(cfg.fetch.clone()).context("building the web_fetch client")?,
+        ),
     };
     let socket_path = cfg.agent_socket_path.clone();
     let socket_task = tokio::spawn(async move {
@@ -1006,7 +1034,7 @@ fn select_spawner(
                             fix = nat_failure_hint(&e),
                             "global NAT setup failed; EVERY agent will spawn WITHOUT outbound \
                              network until the gateway restarts with this fixed. Tools needing \
-                             the internet (web_fetch, browser pack, network MCP) will surface \
+                             the internet (shell downloads, browser pack, network MCP) will surface \
                              their own errors at use time."
                         );
                     }

@@ -29,6 +29,11 @@ ignore = [
     # Tracked in a repository security advisory; remove once sqlx allows
     # libsqlite3-sys >= 0.39.
     "RUSTSEC-2026-0459",
+    # ttf-parser is unmaintained with no safe upgrade (RUSTSEC-2026-0192); pdf-extract
+    # uses it for fonts embedded in PDFs. It runs only in the gateway's page converter
+    # child (`--convert-page`: nobody, no new privileges, memory, CPU and time limits),
+    # never in the gateway. Re-evaluate when pdf-extract moves to skrifa.
+    "RUSTSEC-2026-0192",
 ]
 
 [licenses]

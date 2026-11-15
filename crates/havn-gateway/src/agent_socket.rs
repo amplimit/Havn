@@ -155,6 +155,9 @@ pub struct AgentSocketCtx {
     pub keyring: Option<crate::keyring::KeyRing>,
     /// Backend selection and rate limit of the `web_search` gateway tool.
     pub search: Arc<crate::web_search::WebSearch>,
+    /// Rate limit, page cache and answer model of the `web_fetch` gateway
+    /// tool.
+    pub fetch: Arc<crate::web_fetch::WebFetch>,
 }
 
 /// Bind the Unix-socket listener and accept agent connections forever.
@@ -1203,7 +1206,8 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
 }
 
 /// The gateway-run tools `agent` may use: `web_search` when its policy
-/// allows it and its owner has a search backend.
+/// allows it and its owner has a search backend, `web_fetch` when its
+/// policy allows it.
 async fn gateway_tools_for(
     ctx: &AgentSocketCtx,
     agent: &havn_db::repo::agents::Agent,
@@ -1211,22 +1215,24 @@ async fn gateway_tools_for(
 ) -> Vec<GatewayToolSpec> {
     // Every agent may set its owner's time zone.
     let mut tools = vec![crate::timezone::spec()];
-    if !policy.permissions.can_search_web {
-        return tools;
+    if policy.permissions.can_search_web {
+        match ctx
+            .search
+            .backend_for(&ctx.db, agent.owner_id, agent.team_id, &ctx.models.load())
+            .await
+        {
+            Ok(Some(backend)) => {
+                debug!(agent_id = %agent.id, backend = backend.name(), "offering web_search");
+                tools.push(ctx.search.spec());
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(agent_id = %agent.id, error = %e, "search credential lookup failed; not offering web_search");
+            }
+        }
     }
-    match ctx
-        .search
-        .backend_for(&ctx.db, agent.owner_id, agent.team_id, &ctx.models.load())
-        .await
-    {
-        Ok(Some(backend)) => {
-            debug!(agent_id = %agent.id, backend = backend.name(), "offering web_search");
-            tools.push(ctx.search.spec());
-        }
-        Ok(None) => {}
-        Err(e) => {
-            warn!(agent_id = %agent.id, error = %e, "search credential lookup failed; not offering web_search");
-        }
+    if policy.permissions.can_fetch_web {
+        tools.push(ctx.fetch.spec());
     }
     tools
 }
@@ -1254,17 +1260,120 @@ async fn run_gateway_tool(
     call: &GatewayToolCall,
     ctx: &AgentSocketCtx,
 ) -> Result<String, String> {
-    if call.name == crate::timezone::TOOL_NAME {
-        let owner = match agents_repo::find_by_id(&ctx.db, agent_id).await {
-            Ok(Some(agent)) => agent.owner_id,
-            Ok(None) => return Err(format!("agent {agent_id} not found")),
-            Err(e) => return Err(format!("agent lookup failed: {e}")),
-        };
-        return crate::timezone::run_tool(&ctx.db, &ctx.registry, owner, &call.input).await;
+    match call.name.as_str() {
+        crate::timezone::TOOL_NAME => run_set_timezone(agent_id, call, ctx).await,
+        crate::web_search::TOOL_NAME => run_web_search(agent_id, call, ctx).await,
+        crate::web_fetch::TOOL_NAME => run_web_fetch(agent_id, call, ctx).await,
+        other => Err(format!("the gateway has no tool named {other:?}")),
     }
-    if call.name != crate::web_search::TOOL_NAME {
-        return Err(format!("the gateway has no tool named {:?}", call.name));
+}
+
+async fn run_set_timezone(
+    agent_id: AgentId,
+    call: &GatewayToolCall,
+    ctx: &AgentSocketCtx,
+) -> Result<String, String> {
+    let owner = match agents_repo::find_by_id(&ctx.db, agent_id).await {
+        Ok(Some(agent)) => agent.owner_id,
+        Ok(None) => return Err(format!("agent {agent_id} not found")),
+        Err(e) => return Err(format!("agent lookup failed: {e}")),
+    };
+    crate::timezone::run_tool(&ctx.db, &ctx.registry, owner, &call.input).await
+}
+
+async fn run_web_fetch(
+    agent_id: AgentId,
+    call: &GatewayToolCall,
+    ctx: &AgentSocketCtx,
+) -> Result<String, String> {
+    let agent = match agents_repo::find_by_id(&ctx.db, agent_id).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => return Err(format!("agent {agent_id} not found")),
+        Err(e) => return Err(format!("agent lookup failed: {e}")),
+    };
+    // Counted before any other work, as for web_search.
+    if !ctx.fetch.admit(agent.owner_id).await {
+        return Err(format!(
+            "this user's agents have read {} pages with web_fetch in the last minute; wait and retry",
+            ctx.fetch.per_user_per_minute()
+        ));
     }
+    let policy = policy_resolver::for_session(&ctx.db, &agent, ctx.multi_user).await;
+    if !policy.permissions.can_fetch_web {
+        return Err("this agent's policy does not allow reading web pages".into());
+    }
+    let agent_model = agent
+        .config
+        .get("model")
+        .and_then(serde_json::Value::as_str);
+    let billing = llm_proxy::Billing {
+        user_id: agent.owner_id,
+        agent_id: Some(agent_id),
+        agent_team: agent.team_id,
+        budget: policy.budget.clone(),
+    };
+    // No request leaves the host unless an answer is possible.
+    let ready = ctx
+        .fetch
+        .answer_models(&ctx.models.load(), agent_model, &policy)
+        .and_then(|models| match ctx.keyring.as_ref() {
+            Some(ring) => Ok((models, ring)),
+            None => Err(
+                "credential encryption is not configured: set HAVN_AGE_KEY and \
+                         restart the gateway"
+                    .to_string(),
+            ),
+        });
+    let result = match ready {
+        Ok((models, keyring)) => {
+            let run = crate::web_fetch::Call {
+                db: &ctx.db,
+                http: &ctx.http,
+                keyring,
+                llm: &ctx.llm,
+                billing: &billing,
+                models: &models,
+                policy: &policy,
+                known: ctx.registry.known_urls(),
+            };
+            ctx.fetch.run(&run, &call.input).await
+        }
+        Err(message) => Err(message),
+    };
+    let url: String = call
+        .input
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .chars()
+        .take(2048)
+        .collect();
+    let details = match &result {
+        Ok(answer) => serde_json::json!({
+            "url": url,
+            "read": answer.url,
+            "chars": answer.chars,
+            "model": answer.model,
+        }),
+        Err(message) => serde_json::json!({ "url": url, "error": message }),
+    };
+    crate::audit::record(
+        &ctx.db,
+        agent.owner_id,
+        agent.team_id,
+        Some(agent_id),
+        "web.fetch",
+        details,
+    )
+    .await;
+    result.map(|answer| answer.text)
+}
+
+async fn run_web_search(
+    agent_id: AgentId,
+    call: &GatewayToolCall,
+    ctx: &AgentSocketCtx,
+) -> Result<String, String> {
     let agent = match agents_repo::find_by_id(&ctx.db, agent_id).await {
         Ok(Some(agent)) => agent,
         Ok(None) => return Err(format!("agent {agent_id} not found")),
@@ -1326,6 +1435,15 @@ async fn run_gateway_tool(
         details,
     )
     .await;
+    if let Ok(report) = &result {
+        // Result links come from the search backend, not the model, so the
+        // agent may read them.
+        for hit in &report.hits {
+            if let Ok(url) = crate::web_fetch::normalize(&hit.url) {
+                ctx.registry.known_urls().record(agent_id, &url);
+            }
+        }
+    }
     result.map(|report| crate::web_search::render(&report, chrono::Utc::now()))
 }
 
@@ -2088,6 +2206,10 @@ mod tests {
                 crate::config::SearchConfig::default(),
                 &crate::config::LlmConfig::default(),
             )),
+            fetch: Arc::new(
+                crate::web_fetch::WebFetch::new(crate::config::FetchConfig::default())
+                    .expect("fetch client"),
+            ),
         }
     }
 
@@ -2189,6 +2311,7 @@ mod tests {
     fn policy_without_search() -> serde_json::Value {
         let mut p = Policy::default();
         p.permissions.can_search_web = false;
+        p.permissions.can_fetch_web = false;
         serde_json::json!({ "policy": p })
     }
 
@@ -2217,14 +2340,52 @@ mod tests {
             }
         };
 
-        assert_eq!(tools_of(agent).await, ["set_timezone"], "no backend yet");
+        assert_eq!(
+            tools_of(agent).await,
+            ["set_timezone", "web_fetch"],
+            "no search backend yet"
+        );
         add_openrouter_key(&ctx, owner).await;
-        assert_eq!(tools_of(agent).await, ["set_timezone", "web_search"]);
+        assert_eq!(
+            tools_of(agent).await,
+            ["set_timezone", "web_search", "web_fetch"]
+        );
         assert_eq!(
             tools_of(denied).await,
             ["set_timezone"],
-            "policy denies search"
+            "policy denies search and fetch"
         );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_calls_are_checked_and_audited() {
+        let ctx = ctx_with(false, false).await;
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (agent, _rx) = connected_agent(&ctx, owner, "a", serde_json::json!({})).await;
+        let (denied, _rx2) = connected_agent(&ctx, owner, "b", policy_without_search()).await;
+        let call = |url: &str| GatewayToolCall {
+            request_id: "f1".into(),
+            name: "web_fetch".into(),
+            input: serde_json::json!({"url": url, "prompt": "what is it"}),
+        };
+
+        let refused = run_gateway_tool(denied, &call("https://example.com/"), &ctx).await;
+        assert!(refused.expect_err("denied").contains("does not allow"));
+        // No model is listed, so even a fetchable URL stops there; a local
+        // one is refused the same way once a model exists (web_fetch tests).
+        let no_model = run_gateway_tool(agent, &call("https://example.com/"), &ctx).await;
+        assert!(no_model.expect_err("no model").contains("no model"));
+
+        let audited: Vec<String> =
+            sqlx::query_scalar("SELECT details FROM audit_log WHERE action = 'web.fetch'")
+                .fetch_all(&ctx.db)
+                .await
+                .expect("audit");
+        assert_eq!(audited.len(), 1, "a refusal by policy is not audited");
+        assert!(audited[0].contains("example.com"), "{}", audited[0]);
     }
 
     #[tokio::test]

@@ -120,6 +120,16 @@ pub struct GatewayConfig {
     /// ```
     #[serde(default)]
     pub search: SearchConfig,
+    /// The `web_fetch` tool.
+    ///
+    /// TOML form:
+    /// ```toml
+    /// [fetch]
+    /// model = "openrouter:deepseek/deepseek-v4.1-flash-1017"
+    /// per_user_per_minute = 30
+    /// ```
+    #[serde(default)]
+    pub fetch: FetchConfig,
     /// Channel-adapter account configuration (spec §3.4). Keyed by
     /// channel id ("telegram", "slack", …); each value lists the
     /// operator-controlled accounts (bot identities) on that channel.
@@ -366,6 +376,28 @@ pub struct SearchConfig {
 
 pub const MAX_SEARCH_RESULTS: u32 = 10;
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FetchConfig {
+    /// Model that answers from the page, one of `[[llm.models]]`; a cheap
+    /// one will do. Agents whose `allowed_models` exclude it, and all
+    /// agents when it is unset, use their own model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Pages one user's agents may read per minute, together; 0 lifts the
+    /// limit.
+    pub per_user_per_minute: u32,
+}
+
+impl Default for FetchConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            per_user_per_minute: 30,
+        }
+    }
+}
+
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
@@ -454,6 +486,7 @@ impl Default for GatewayConfig {
             network: NetworkConfig::default(),
             llm: LlmConfig::default(),
             search: SearchConfig::default(),
+            fetch: FetchConfig::default(),
             channels: std::collections::BTreeMap::new(),
             bindings: Vec::new(),
         }
@@ -552,6 +585,11 @@ impl GatewayConfig {
         parsed.validate_channel_ids()?;
         parsed.validate_llm()?;
         parsed.validate_search()?;
+        if let Some(model) = &parsed.fetch.model
+            && parsed.llm.catalog().get(model).is_none()
+        {
+            anyhow::bail!("[fetch] model = {model:?} is not one of [[llm.models]]");
+        }
         Ok(parsed)
     }
 

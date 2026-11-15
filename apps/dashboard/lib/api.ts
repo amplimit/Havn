@@ -49,10 +49,13 @@ export type SearchStatus = {
 /** `/agents/{id}/web`: one agent's web access, from its next start. */
 export type AgentWebView = {
   can_search_web: boolean;
-  /** Network egress, and with it the in-sandbox web_fetch tool. */
+  /** web_fetch: the gateway reads pages for the agent. */
+  can_fetch_web: boolean;
+  /** Network egress from the agent's sandbox. */
   egress_allowed: boolean;
   /** What the owner's policy permits; false only in multi-user mode. */
   search_permitted: boolean;
+  fetch_permitted: boolean;
   egress_permitted: boolean;
   /** The backend this agent would search with, or null when none is set up. */
   search_backend: string | null;
@@ -386,7 +389,7 @@ export const api = {
     agent: (agentId: string) => request<AgentWebView>(`/agents/${agentId}/web`),
     patchAgent: (
       agentId: string,
-      patch: { can_search_web?: boolean; egress_allowed?: boolean },
+      patch: { can_search_web?: boolean; can_fetch_web?: boolean; egress_allowed?: boolean },
     ) =>
       request<AgentWebView>(`/agents/${agentId}/web`, {
         method: "PATCH",

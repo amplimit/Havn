@@ -151,10 +151,59 @@ struct Candidate {
     model: Option<String>,
 }
 
+/// Calls per user in the last minute, for a per-user rate limit.
+#[derive(Debug)]
+pub struct UserRate {
+    limit: u32,
+    recent: Mutex<HashMap<UserId, VecDeque<Instant>>>,
+}
+
+impl UserRate {
+    /// `limit` calls per user per minute; 0 for no limit.
+    #[must_use]
+    pub fn new(limit: u32) -> Self {
+        Self {
+            limit,
+            recent: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Count a call by `user`; false, and not counted, when over the limit.
+    pub async fn admit(&self, user: UserId) -> bool {
+        self.admit_at(user, Instant::now()).await
+    }
+
+    async fn admit_at(&self, user: UserId, now: Instant) -> bool {
+        let limit = self.limit as usize;
+        if limit == 0 {
+            return true;
+        }
+        let mut recent = self.recent.lock().await;
+        recent.retain(|_, times| {
+            times
+                .back()
+                .is_some_and(|t| now.saturating_duration_since(*t) < RATE_WINDOW)
+        });
+        let times = recent.entry(user).or_default();
+        while times
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= RATE_WINDOW)
+        {
+            times.pop_front();
+        }
+        if times.len() >= limit {
+            return false;
+        }
+        times.push_back(now);
+        true
+    }
+}
+
+#[derive(Debug)]
 pub struct WebSearch {
     config: SearchConfig,
     openrouter_url: String,
-    recent: Mutex<HashMap<UserId, VecDeque<Instant>>>,
+    rate: UserRate,
 }
 
 impl WebSearch {
@@ -165,10 +214,11 @@ impl WebSearch {
             .get(Backend::OpenRouter.name())
             .map_or(Backend::OpenRouter.default_base_url(), String::as_str)
             .to_string();
+        let rate = UserRate::new(config.per_user_per_minute);
         Self {
             config,
             openrouter_url,
-            recent: Mutex::new(HashMap::new()),
+            rate,
         }
     }
 
@@ -288,32 +338,7 @@ impl WebSearch {
     /// call counts, including ones refused later, so a runtime cannot make
     /// the gateway do unlimited work with failing calls.
     pub async fn admit(&self, user: UserId) -> bool {
-        self.admit_at(user, Instant::now()).await
-    }
-
-    async fn admit_at(&self, user: UserId, now: Instant) -> bool {
-        let limit = self.config.per_user_per_minute as usize;
-        if limit == 0 {
-            return true;
-        }
-        let mut recent = self.recent.lock().await;
-        recent.retain(|_, times| {
-            times
-                .back()
-                .is_some_and(|t| now.saturating_duration_since(*t) < RATE_WINDOW)
-        });
-        let times = recent.entry(user).or_default();
-        while times
-            .front()
-            .is_some_and(|t| now.saturating_duration_since(*t) >= RATE_WINDOW)
-        {
-            times.pop_front();
-        }
-        if times.len() >= limit {
-            return false;
-        }
-        times.push_back(now);
-        true
+        self.rate.admit(user).await
     }
 
     #[must_use]
@@ -1330,9 +1355,9 @@ mod tests {
         assert!(!s.admit(a).await);
         assert!(s.admit(b).await);
         let later = Instant::now() + RATE_WINDOW;
-        assert!(s.admit_at(a, later).await, "the window has passed");
+        assert!(s.rate.admit_at(a, later).await, "the window has passed");
         assert_eq!(
-            s.recent.lock().await.len(),
+            s.rate.recent.lock().await.len(),
             1,
             "b's expired entry is pruned"
         );

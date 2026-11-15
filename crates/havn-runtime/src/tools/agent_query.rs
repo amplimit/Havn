@@ -219,7 +219,6 @@ mod tests {
         ToolCtx {
             workspace_dir: std::path::PathBuf::from("/tmp"),
             agent_db: sqlx::SqlitePool::connect(":memory:").await.unwrap(),
-            http: reqwest::Client::new(),
             policy,
             embedder: None,
         }
