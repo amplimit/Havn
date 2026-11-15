@@ -111,6 +111,48 @@ jobs:
           path: ${{ runner.temp }}/havn-gateway.log
           if-no-files-found: ignore
 
+  namespace-isolation-musl:
+    # The release binaries are musl builds, and std and musl differ in
+    # ways only a run shows (O_PATH is lost through OpenOptions, #121).
+    name: NamespaceSpawner isolation (musl)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: smoke-musl
+      - name: install jq, zig + cargo-zigbuild
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y jq
+          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
+            | sudo tar -xJ -C /opt
+          echo "/opt/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+          cargo install --locked cargo-zigbuild
+      - name: build
+        run: cargo zigbuild --target x86_64-unknown-linux-musl --bins
+      - name: install binaries
+        run: |
+          d=target/x86_64-unknown-linux-musl/debug
+          sudo install -m 0755 "$d/havn" "$d/havn-gateway" "$d/havn-runtime" "$d/havn-init" \
+            /usr/local/bin/
+      - name: run smoke test as root with NamespaceSpawner
+        run: |
+          sudo env RUNNER_TEMP="$RUNNER_TEMP" \
+            HAVN_SKIP_INSTALL=1 \
+            HAVN_SMOKE_EXPECT_SPAWNER=namespace \
+            ./scripts/smoke.sh
+      - name: upload gateway log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-log-namespace-musl
+          path: ${{ runner.temp }}/havn-gateway.log
+          if-no-files-found: ignore
+
   readme-deploy:
     # Install, set up and start havn and the dashboard with the commands in
     # README.md (building this checkout instead of downloading a release),
