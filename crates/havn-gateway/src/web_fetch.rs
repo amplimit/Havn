@@ -1297,7 +1297,7 @@ fn absolute_links(markdown: &str, base: &Url) -> String {
     static LINK: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
     let Some(link) = LINK.get_or_init(|| {
         regex::Regex::new(
-            r#"(!?)\[([^\]\n]*)\]\(\s*<?((?:[^()\s<>]|\([^()\s<>]*\))*)>?(?:\s+"[^"\n]*")?\s*\)"#,
+            r#"(!?)\[([^\]\n]*)\]\(\s*<?((?:\\.|[^()\s<>\\]|\([^()\s<>]*\))*)>?(?:\s+"[^"\n]*")?\s*\)"#,
         )
         .ok()
     }) else {
@@ -1308,7 +1308,9 @@ fn absolute_links(markdown: &str, base: &Url) -> String {
         if &caps[1] == "!" {
             return text.to_string();
         }
-        match base.join(&caps[3]) {
+        // htmd escapes Markdown characters in targets, `\(` for one.
+        let target = unescape(&caps[3]);
+        match base.join(&target) {
             Ok(target) if matches!(target.scheme(), "http" | "https") => {
                 format!("[{text}]({target})")
             }
@@ -1316,6 +1318,19 @@ fn absolute_links(markdown: &str, base: &Url) -> String {
         }
     })
     .into_owned()
+}
+
+/// `text` with backslash escapes removed: `\(` becomes `(`.
+fn unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.extend(chars.next()),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Trailing spaces removed and runs of blank lines collapsed to one.
@@ -1540,6 +1555,15 @@ mod tests {
         assert!(!md.contains("evil"), "{md}");
         assert!(!md.contains("Menu"), "{md}");
         assert!(!md.contains("copyright"), "{md}");
+    }
+
+    #[test]
+    fn escaped_link_targets_are_unescaped() {
+        let base = url("https://example.com/a/");
+        assert_eq!(
+            absolute_links(r"[R](/wiki/Rust_\(lang\)) [x](b\_c)", &base),
+            "[R](https://example.com/wiki/Rust_(lang)) [x](https://example.com/a/b_c)"
+        );
     }
 
     #[test]
