@@ -307,6 +307,11 @@ pub struct NetworkConfig {
     /// otherwise blocked (an internal API, a LAN service). The `agent_dns`
     /// servers are always reachable. Default empty.
     pub agent_private_access: Vec<String>,
+    /// Domains no agent may reach (`web_fetch`, and the egress proxy of
+    /// #136), added to every agent's `network_policy.blocked_domains`;
+    /// users, team admins and agents cannot remove them. An entry
+    /// matches its subdomains.
+    pub blocked_domains: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -461,6 +466,7 @@ impl Default for NetworkConfig {
             agent_dns: vec!["1.1.1.1".into(), "8.8.8.8".into(), "9.9.9.9".into()],
             agent_pool_cidr: "10.42.0.0/16".into(),
             agent_private_access: Vec::new(),
+            blocked_domains: Vec::new(),
         }
     }
 }
@@ -585,6 +591,11 @@ impl GatewayConfig {
         parsed.validate_channel_ids()?;
         parsed.validate_llm()?;
         parsed.validate_search()?;
+        havn_core::policy::validate_domains(
+            "[network] blocked_domains",
+            &parsed.network.blocked_domains,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
         if let Some(model) = &parsed.fetch.model
             && parsed.llm.catalog().get(model).is_none()
         {

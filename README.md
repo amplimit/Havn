@@ -295,6 +295,14 @@ model = "openrouter:deepseek/deepseek-v4.1-flash-1017"   # optional, one of [[ll
 per_user_per_minute = 30     # 0 lifts the limit
 ```
 
+Allowed and blocked domains are set at several levels and only add up: an agent gets every level's entries, and a blocked domain wins over an allowed one.
+
+- The operator blocks domains for every agent with `[network] blocked_domains = ["example.com"]` (applies on restart).
+- Team admins set `network_policy.allowed_domains` and `blocked_domains` in a role's policy; they apply to the members' agents. A member in several roles gets the blocked domains of all of them.
+- Each user keeps lists for all their own agents (`GET` and `PUT /me/domains`, or the agent settings page), and each agent has its own (`PATCH /agents/{id}/web` with `allowed_domains` and `blocked_domains`). Neither can remove an entry set above it.
+
+An entry is a domain such as `example.com` (covering its subdomains) or `*.example.com`, in ASCII (punycode for international names), with at least one dot; a list holds at most 500. Lists apply to `web_fetch` at once: the gateway resolves them on every call. If a user's own lists cannot be read, that user's agents cannot use `web_fetch` until they can.
+
 ### Time zones
 
 Agents are told the current date, time and weekday in each turn, in their owner's time zone, so "today", "tomorrow at 9" and weekdays come out right. A user without a zone gets the gateway host's (`TZ`, `/etc/timezone` or `/etc/localtime`, else UTC). Users set theirs on an agent's settings page or with `PUT /me/timezone` (`{"timezone": "Asia/Shanghai"}`, or `null` for the host's), and an agent can set it with its `set_timezone` tool when the user says where they are. A change reaches the owner's running agents at once.
