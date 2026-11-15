@@ -792,30 +792,9 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
         return;
     }
     // `/new` starts a new chat with the agent; the old one is kept.
-    // Off the account's read loop: it may start the agent and wait for it.
-    if is_command_message(&content, "/new") {
-        let state = state.clone();
-        let channel = channel.to_string();
-        tokio::spawn(async move {
-            let reply = match new_chat(&state, agent_id, &encoded_channel_id).await {
-                Ok(()) => NEW_CHAT_MESSAGE,
-                Err(e) => {
-                    warn!(channel, %agent_id, error = ?e, "could not start a new chat");
-                    NEW_CHAT_FAILED_MESSAGE
-                }
-            };
-            tell_sender(
-                &state,
-                &channel,
-                &inb.account_id,
-                &inb.sender_id,
-                &inb.channel_message_id,
-                reply,
-            )
-            .await;
-        });
-        return;
-    }
+    // `/new` starts a new chat; the runtime confirms. It goes the way of
+    // a message, in order with the ones after it.
+    let new_chat = is_command_message(&content, "/new");
     let msg = InboundMessage {
         conversation: None,
         channel_id: encoded_channel_id,
@@ -896,11 +875,14 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
         }
     }
 
-    if let Err(e) = state
-        .registry
-        .send(agent_id, GatewayToAgent::InboundMessage(msg))
-        .await
-    {
+    let frame = if new_chat {
+        GatewayToAgent::NewChat(havn_proto::NewChat {
+            channel_id: msg.channel_id,
+        })
+    } else {
+        GatewayToAgent::InboundMessage(msg)
+    };
+    if let Err(e) = state.registry.send(agent_id, frame).await {
         warn!(
             channel,
             account = %inb.account_id,
@@ -1100,35 +1082,6 @@ fn is_command_message(content: &MessageContent, name: &str) -> bool {
         return false;
     };
     is_command(text.trim(), name)
-}
-
-const NEW_CHAT_MESSAGE: &str = "(Started a new conversation. The earlier one is kept, and the agent still remembers what \
-     it saved to memory.)";
-const NEW_CHAT_FAILED_MESSAGE: &str =
-    "(Could not start a new conversation right now; please try /new again in a moment.)";
-
-/// End the active chat of `scope` with `agent_id`, starting the agent if
-/// it is stopped: the next message starts a new one.
-async fn new_chat(
-    state: &AppState,
-    agent_id: havn_core::AgentId,
-    scope: &str,
-) -> Result<(), crate::api::ApiError> {
-    let owner = agent_repo::find_by_id(&state.db, agent_id)
-        .await?
-        .ok_or(crate::api::ApiError::NotFound)?
-        .owner_id;
-    crate::api::agents::agent_data::<serde_json::Value>(
-        state,
-        owner,
-        agent_id,
-        havn_proto::DataQuery::LeaveChat {
-            channel_id: scope.to_string(),
-        },
-        true,
-    )
-    .await
-    .map(|_| ())
 }
 
 #[cfg(test)]

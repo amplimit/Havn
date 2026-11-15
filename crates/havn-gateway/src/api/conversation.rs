@@ -199,6 +199,8 @@ pub async fn chat_delete(
     if !deleted.found {
         return Err(ApiError::NotFound);
     }
+    // Its tasks report to the conversation, no longer to the chat.
+    havn_db::repo::cron::forget_chat(&state.db, agent.id, &conversation).await?;
     crate::audit::record_agent_action(
         &state.db,
         user.id,

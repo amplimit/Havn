@@ -1027,6 +1027,18 @@ where
                     }
                 }
             }
+            GatewayToAgent::NewChat(new) => {
+                // Inline, so the conversation's next message, read after
+                // it, starts the new chat.
+                let text = match conversations::leave_active(&ctx.pool, &new.channel_id).await {
+                    Ok(()) => NEW_CHAT_NOTICE,
+                    Err(e) => {
+                        warn!(error = %e, "could not start a new chat");
+                        NEW_CHAT_FAILED_NOTICE
+                    }
+                };
+                send_text(&ctx, new.channel_id, None, text.to_string());
+            }
             GatewayToAgent::ApprovalDecision(decision) => {
                 if !ctx.approvals.decide(&decision) {
                     info!(channel_id = %decision.channel_id, "approval decision with nothing waiting");
@@ -1035,7 +1047,9 @@ where
             GatewayToAgent::StopTurn(stop) => {
                 // The chat named, or every chat of the conversation (a
                 // channel's `/stop`, which names none).
-                let chat = match stop.conversation.as_deref() {
+                let stopped = match stop.conversation.as_deref() {
+                    // A chat of this conversation only: one it does not
+                    // have (deleted, or another's) stops nothing.
                     Some(_) => conversations::existing_chat(
                         &ctx.pool,
                         &stop.channel_id,
@@ -1043,11 +1057,8 @@ where
                     )
                     .await
                     .ok()
-                    .flatten(),
-                    None => None,
-                };
-                let stopped = match chat {
-                    Some(chat) => ctx.turns.stop(&chat),
+                    .flatten()
+                    .is_some_and(|chat| ctx.turns.stop(&chat)),
                     None => ctx.turns.stop_scope(&stop.channel_id),
                 };
                 if stopped {
@@ -1371,8 +1382,13 @@ async fn handle_cron(tick: CronTick, ctx: Ctx) {
     if let Some(chat) = &tick.chat
         && matches!(outcome, CronOutcome::Success)
         && !is_silent_output(&output)
-        && let Err(e) =
-            conversations::record_in_chat(&ctx.pool, chat, Role::Assistant, &output).await
+        && let Err(e) = conversations::record_in_chat(
+            &ctx.pool,
+            chat,
+            Role::Assistant,
+            &format!("(Result of a scheduled task.)\n\n{output}"),
+        )
+        .await
     {
         warn!(%job_id, error = %e, "could not keep the cron result in its chat");
     }
@@ -1502,6 +1518,11 @@ async fn run_conversation(
         }
     }
 }
+
+const NEW_CHAT_NOTICE: &str = "(Started a new conversation. The earlier one is kept, and I \
+     still remember what I saved to memory.)";
+const NEW_CHAT_FAILED_NOTICE: &str =
+    "(Could not start a new conversation right now; please try /new again in a moment.)";
 
 const RESTART_NOTICE: &str = "(The agent is restarting, so a message you sent while it was \
      replying was not answered. Please send it again in a moment.)";
@@ -1915,12 +1936,6 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                     ctx.turns.discard(&conversation);
                 }
                 Ok(serde_json::json!({ "found": found }))
-            }
-            DataQuery::LeaveChat { channel_id } => {
-                conversations::leave_active(&ctx.pool, &channel_id)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                Ok(serde_json::Value::Null)
             }
         }
     }

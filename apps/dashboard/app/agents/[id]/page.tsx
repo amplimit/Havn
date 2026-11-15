@@ -303,7 +303,9 @@ export default function ChatPage({
               if (!msg.broadcast && due > 0) waitingElsewhere.current.set(msg.conversation, due - 1);
               return;
             }
-            if (!current) selectChat(msg.conversation);
+            // A reply to this tab's message names the chat it started; a
+            // task's result does not choose the chat on screen.
+            if (!current && !msg.broadcast) selectChat(msg.conversation);
           }
           if (msg.type === "agent_message") {
             if (!msg.broadcast) setWaiting((n) => Math.max(0, n - 1));

@@ -249,6 +249,16 @@ pub async fn set_enabled(pool: &SqlitePool, id: CronJobId, enabled: bool) -> Res
     Ok(())
 }
 
+/// Unlink `agent_id`'s jobs from `chat`, which was deleted.
+pub async fn forget_chat(pool: &SqlitePool, agent_id: AgentId, chat: &str) -> Result<()> {
+    sqlx::query("UPDATE cron_jobs SET chat = NULL WHERE agent_id = ?1 AND chat = ?2")
+        .bind(agent_id.to_string())
+        .bind(chat)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn delete(pool: &SqlitePool, id: CronJobId) -> Result<()> {
     let res = sqlx::query("DELETE FROM cron_jobs WHERE id = ?1")
         .bind(id.to_string())

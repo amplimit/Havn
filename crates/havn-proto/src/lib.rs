@@ -99,6 +99,13 @@ pub struct StopTurn {
     pub conversation: Option<String>,
 }
 
+/// See [`GatewayToAgent::NewChat`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NewChat {
+    /// The conversation, as in [`InboundMessage::channel_id`].
+    pub channel_id: String,
+}
+
 /// See [`AgentToGateway::ApprovalRequest`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApprovalRequest {
@@ -216,6 +223,10 @@ pub enum GatewayToAgent {
     /// Stop the turn running in a conversation (the user pressed stop or
     /// sent `/stop`). Messages queued behind it still run.
     StopTurn(StopTurn),
+    /// The next message of a conversation starts a new chat (`/new` in a
+    /// channel); the runtime confirms it there. Sent in order with the
+    /// conversation's messages.
+    NewChat(NewChat),
     /// LLM call has completed (success or error). Phase 1 is non-streaming;
     /// streaming chunks land in a follow-up vertical (separate frame variant).
     LlmResponse(LlmResponse),
@@ -380,8 +391,6 @@ pub enum DataQuery {
         channel_id: String,
         conversation: String,
     },
-    /// The next message of `channel_id` starts a new chat (`/new`).
-    LeaveChat { channel_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
