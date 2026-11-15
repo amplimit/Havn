@@ -13,6 +13,8 @@ pub struct ModelEntry {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vision: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,7 +65,8 @@ pub async fn list() -> anyhow::Result<()> {
             .max_output_tokens
             .map(|n| format!("  max_output_tokens={n}"))
             .unwrap_or_default();
-        println!("{}{label}{limit}{default}", m.id);
+        let vision = if m.vision { "  sees images" } else { "" };
+        println!("{}{label}{limit}{vision}{default}", m.id);
     }
     Ok(())
 }
@@ -72,6 +75,7 @@ pub async fn add(
     id: &str,
     label: Option<&str>,
     max_output_tokens: Option<u32>,
+    vision: bool,
     make_default: bool,
 ) -> anyhow::Result<()> {
     let gw = Gateway::from_env()?;
@@ -84,6 +88,7 @@ pub async fn add(
         id: id.to_string(),
         label: label.map(str::to_string),
         max_output_tokens,
+        vision,
     });
     let default_model = if make_default {
         Some(id)

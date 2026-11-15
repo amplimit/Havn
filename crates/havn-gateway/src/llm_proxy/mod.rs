@@ -591,6 +591,123 @@ async fn warn_over_agent_budget(
     }
 }
 
+/// Largest image shown to a model, in bytes: what providers take.
+pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Put the images an agent's turn refers to in `request` (issue #106).
+/// The runtime names a file of its inbox (`{"type": "image", "source":
+/// {"type": "workspace", "path": "inbox/<name>"}}`) rather than sending
+/// its bytes, which would not fit a frame; the gateway reads it here,
+/// through [`crate::agent_files`] so nothing the agent controls is
+/// followed. A model without `vision`, a file that is not a PNG, JPEG,
+/// GIF or WebP image by its first bytes, too large or missing, gets a
+/// line saying so instead. Blocking: it reads files.
+pub fn resolve_workspace_images(
+    request: &mut AnthropicRequest,
+    workspace: &std::path::Path,
+    vision: bool,
+) {
+    let mut inbox: Option<std::io::Result<Option<crate::agent_files::WorkspaceDir>>> = None;
+    for message in &mut request.messages {
+        let Some(blocks) = message.content.as_array_mut() else {
+            continue;
+        };
+        for block in blocks {
+            let is_ref = block.get("type").and_then(serde_json::Value::as_str) == Some("image")
+                && block
+                    .pointer("/source/type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("workspace");
+            if !is_ref {
+                continue;
+            }
+            let path = block
+                .pointer("/source/path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let shown = if vision {
+                let dir = inbox.get_or_insert_with(|| {
+                    crate::agent_files::WorkspaceDir::open(workspace)
+                        .and_then(|root| root.subdir(havn_core::INBOX_DIR))
+                });
+                image_block(dir, &path)
+            } else {
+                Err("this model cannot see images".to_string())
+            };
+            *block = match shown {
+                Ok(image) => image,
+                Err(why) => serde_json::json!({
+                    "type": "text",
+                    "text": format!("(The image {} is not shown: {why}.)", serde_json::Value::String(path)),
+                }),
+            };
+        }
+    }
+}
+
+fn image_block(
+    inbox: &std::io::Result<Option<crate::agent_files::WorkspaceDir>>,
+    path: &str,
+) -> Result<serde_json::Value, String> {
+    if !havn_core::Attachment::in_inbox(path) {
+        return Err("it is not a file of the inbox".into());
+    }
+    let name = &path[havn_core::INBOX_DIR.len() + 1..];
+    let dir = match inbox {
+        Ok(Some(dir)) => dir,
+        Ok(None) => return Err("the inbox is gone".into()),
+        Err(e) => return Err(format!("the inbox cannot be read ({e})")),
+    };
+    let bytes = match dir.read_bytes(name, MAX_IMAGE_BYTES) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Err("it is not there any more".into()),
+        Err(e) => return Err(format!("it cannot be read ({e})")),
+    };
+    let media_type = image_type(&bytes).ok_or("it is not a PNG, JPEG, GIF or WebP image")?;
+    Ok(serde_json::json!({
+        "type": "image",
+        "source": {"type": "base64", "media_type": media_type, "data": base64(&bytes)},
+    }))
+}
+
+/// The image type `bytes` start like.
+fn image_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Standard base64 with padding.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 /// Upper estimate of a request's input tokens (system prompt, messages,
 /// tool definitions), text counted as [`ASCII_BYTES_PER_TOKEN`] describes.
 /// An image block counts as at least [`IMAGE_TOKENS`] whatever its source,
@@ -834,6 +951,83 @@ pub fn model_allowed(allowed_models: &[String], model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_matches_the_standard_vectors() {
+        for (input, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(input.as_bytes()), expected, "{input}");
+        }
+        assert_eq!(base64(&[0xff, 0xfe, 0xfd]), "//79");
+    }
+
+    #[test]
+    fn workspace_images_are_inlined_for_vision_models_only() {
+        let ws = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir(ws.path().join("inbox")).expect("inbox");
+        let png = b"\x89PNG\r\n\x1a\nrest".to_vec();
+        std::fs::write(ws.path().join("inbox/a.png"), &png).expect("png");
+        std::fs::write(ws.path().join("inbox/fake.png"), b"<svg/>").expect("fake");
+        let outside = tempfile::tempdir().expect("tmp");
+        std::fs::write(outside.path().join("secret.png"), &png).expect("secret");
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.png"),
+            ws.path().join("inbox/link.png"),
+        )
+        .expect("link");
+        let refer = |path: &str| serde_json::json!({"type": "image", "source": {"type": "workspace", "path": path}});
+        let request = || AnthropicRequest {
+            model: "m".into(),
+            max_tokens: 10,
+            messages: vec![AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "look"},
+                    refer("inbox/a.png"),
+                    refer("inbox/fake.png"),
+                    refer("inbox/link.png"),
+                    refer("inbox/../agent.db"),
+                    refer("inbox/gone.png"),
+                ]),
+            }],
+            system: None,
+            temperature: None,
+            tools: None,
+        };
+
+        let mut seen = request();
+        resolve_workspace_images(&mut seen, ws.path(), true);
+        let blocks = seen.messages[0].content.as_array().expect("blocks").clone();
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], base64(&png));
+        for (n, why) in [
+            (2, "not a PNG"),
+            (3, "cannot be read"),
+            (4, "not a file of the inbox"),
+            (5, "not there"),
+        ] {
+            let text = blocks[n]["text"].as_str().unwrap_or_default();
+            assert!(text.contains(why), "{n}: {text}");
+        }
+
+        let mut blind = request();
+        resolve_workspace_images(&mut blind, ws.path(), false);
+        let blocks = blind.messages[0].content.as_array().expect("blocks");
+        assert!(
+            blocks[1]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cannot see images")
+        );
+    }
     use serde_json::json;
 
     fn request(content: serde_json::Value, tools: Option<serde_json::Value>) -> AnthropicRequest {

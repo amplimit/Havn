@@ -92,6 +92,9 @@ const MAX_REQUEST_ID_BYTES: usize = 128;
 #[derive(Clone)]
 pub struct AgentSocketCtx {
     pub registry: AgentRegistry,
+    /// Where agents' workspaces are: images a turn refers to are read
+    /// from its inbox.
+    pub workspace_root: std::path::PathBuf,
     pub db: SqlitePool,
     pub http: reqwest::Client,
     pub webchat_router: WebChatRouter,
@@ -1837,6 +1840,38 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                     .await;
                 return;
             }
+            // Images the turn names in the agent's inbox, read here.
+            let workspace = ctx
+                .workspace_root
+                .join(agent_id.to_string())
+                .join("workspace");
+            let vision = entry.vision;
+            ar = match tokio::task::spawn_blocking(move || {
+                llm_proxy::resolve_workspace_images(&mut ar, &workspace, vision);
+                ar
+            })
+            .await
+            {
+                Ok(ar) => ar,
+                Err(e) => {
+                    warn!(%agent_id, error = %e, "could not read the images of an LLM request");
+                    let _ = ctx
+                        .registry
+                        .send(
+                            agent_id,
+                            GatewayToAgent::LlmResponse(LlmResponse {
+                                request_id,
+                                outcome: LlmOutcome::Error {
+                                    message: format!("reading the turn's images failed: {e}"),
+                                },
+                                provider_response: serde_json::Value::Null,
+                                usage: None,
+                            }),
+                        )
+                        .await;
+                    return;
+                }
+            };
             let Some(ring) = ctx.keyring.as_ref() else {
                 let _ = ctx
                     .registry
@@ -2430,6 +2465,7 @@ mod tests {
         let registry = AgentRegistry::new();
         let webchat_router = WebChatRouter::new();
         AgentSocketCtx {
+            workspace_root: std::env::temp_dir(),
             cron_scheduler: CronScheduler::new(
                 db.clone(),
                 registry.clone(),
@@ -2564,6 +2600,7 @@ mod tests {
                     id: "openrouter:cheap/model".into(),
                     label: None,
                     max_output_tokens: None,
+                    vision: false,
                 }],
             }));
     }
@@ -2736,6 +2773,7 @@ mod tests {
                         id: (*id).into(),
                         label: None,
                         max_output_tokens: None,
+                        vision: false,
                     })
                     .collect(),
             }));

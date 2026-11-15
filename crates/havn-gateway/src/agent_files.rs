@@ -47,6 +47,33 @@ impl WorkspaceDir {
         }
     }
 
+    /// Read the regular file `name`, refusing files larger than
+    /// `max_bytes`. `Ok(None)` when it does not exist.
+    pub fn read_bytes(&self, name: &str, max_bytes: u64) -> io::Result<Option<Vec<u8>>> {
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(NOFOLLOW_FLAGS)
+            .open(self.child(name)?)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let meta = file.metadata()?;
+        require_regular(name, &meta)?;
+        if meta.len() > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{name} is larger than {max_bytes} bytes"),
+            ));
+        }
+        let mut bytes = Vec::new();
+        io::Read::by_ref(&mut file)
+            .take(max_bytes)
+            .read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
+    }
+
     /// Read the regular file `name` as UTF-8 (lossily), refusing files
     /// larger than `max_bytes`. `Ok(None)` when it does not exist.
     pub fn read_text(&self, name: &str, max_bytes: u64) -> io::Result<Option<String>> {

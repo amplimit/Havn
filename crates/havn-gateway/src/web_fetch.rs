@@ -1823,6 +1823,7 @@ mod tests {
             id: id.into(),
             label: None,
             max_output_tokens: None,
+            vision: false,
         };
         let catalog = ModelCatalog {
             default_model: Some("openrouter:cheap/model".into()),

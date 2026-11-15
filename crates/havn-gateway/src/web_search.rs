@@ -974,6 +974,7 @@ mod tests {
                     id: (*id).to_string(),
                     label: None,
                     max_output_tokens: None,
+                    vision: false,
                 })
                 .collect(),
         }

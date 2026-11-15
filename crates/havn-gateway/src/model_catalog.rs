@@ -19,6 +19,9 @@ pub struct ModelEntry {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// It takes images (issue #106): files sent in a chat are shown to it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vision: bool,
 }
 
 impl ModelEntry {
@@ -325,6 +328,11 @@ fn write_checked(
                     table.remove("max_output_tokens");
                 }
             }
+            if entry.vision {
+                table["vision"] = value(true);
+            } else {
+                table.remove("vision");
+            }
             models.push(table);
         }
         llm.insert("models", Item::ArrayOfTables(models));
@@ -555,6 +563,7 @@ pub async fn upgrade(
                         id,
                         label: None,
                         max_output_tokens: None,
+                        vision: false,
                     })
                     .collect(),
             };
@@ -602,6 +611,7 @@ mod tests {
             id: id.into(),
             label: None,
             max_output_tokens: None,
+            vision: false,
         }
     }
 

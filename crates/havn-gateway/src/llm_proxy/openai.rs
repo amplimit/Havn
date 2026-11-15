@@ -179,6 +179,8 @@ fn translate_message_to_openai(m: &AnthropicMessage, out: &mut Vec<Value>) -> Re
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut tool_results: Vec<Value> = Vec::new();
+    // Inline images (base64), as `image_url` parts of a user message.
+    let mut images: Vec<Value> = Vec::new();
 
     for block in blocks {
         let kind = block
@@ -233,6 +235,20 @@ fn translate_message_to_openai(m: &AnthropicMessage, out: &mut Vec<Value>) -> Re
                     "content": content,
                 }));
             }
+            "image" if block.pointer("/source/type").and_then(Value::as_str) == Some("base64") => {
+                let media = block
+                    .pointer("/source/media_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("image/png");
+                let data = block
+                    .pointer("/source/data")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                images.push(json!({
+                    "type": "image_url",
+                    "image_url": {"url": format!("data:{media};base64,{data}")},
+                }));
+            }
             other => {
                 // Unknown block types (image, document, thinking, …) — fold
                 // their text representation in if any, otherwise drop with a
@@ -256,6 +272,10 @@ fn translate_message_to_openai(m: &AnthropicMessage, out: &mut Vec<Value>) -> Re
         }
         msg["tool_calls"] = Value::Array(tool_calls);
         out.push(msg);
+    } else if !images.is_empty() {
+        let mut parts = vec![json!({"type": "text", "text": text_parts.join("\n")})];
+        parts.extend(images);
+        out.push(json!({"role": &m.role, "content": parts}));
     } else if !text_parts.is_empty() {
         out.push(json!({"role": &m.role, "content": text_parts.join("\n")}));
     }
@@ -397,6 +417,25 @@ mod tests {
             temperature: None,
             tools: None,
         }
+    }
+
+    #[test]
+    fn an_inline_image_becomes_an_image_url_part() {
+        let r = req(
+            vec![AnthropicMessage {
+                role: "user".into(),
+                content: json!([
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+                ]),
+            }],
+            None,
+        );
+        let body = anthropic_to_openai(&r, "max_tokens").expect("translate");
+        let parts = body["messages"][0]["content"].as_array().expect("parts");
+        assert_eq!(parts[0], json!({"type": "text", "text": "what is this?"}));
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAAA");
     }
 
     #[test]

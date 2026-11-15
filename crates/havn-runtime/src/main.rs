@@ -1564,6 +1564,32 @@ fn with_attachments(text: String, attachments: &[havn_core::Attachment]) -> Stri
     out
 }
 
+/// Images a message carries at most, and the largest shown.
+const MAX_IMAGES: usize = 5;
+const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Add to the last user message of `messages` an image block for each
+/// image among `attachments`, naming its file in the inbox: the gateway
+/// reads it, as the bytes would not fit a frame.
+fn with_images(messages: &mut [serde_json::Value], attachments: &[havn_core::Attachment]) {
+    let images: Vec<serde_json::Value> = attachments
+        .iter()
+        .filter(|a| a.media_type.starts_with("image/") && a.size <= MAX_IMAGE_BYTES)
+        .take(MAX_IMAGES)
+        .map(|a| serde_json::json!({"type": "image", "source": {"type": "workspace", "path": a.path}}))
+        .collect();
+    if images.is_empty() {
+        return;
+    }
+    let Some(last) = messages.iter_mut().rev().find(|m| m["role"] == "user") else {
+        return;
+    };
+    let text = last["content"].as_str().unwrap_or_default().to_string();
+    let mut blocks = vec![serde_json::json!({"type": "text", "text": text})];
+    blocks.extend(images);
+    last["content"] = serde_json::Value::Array(blocks);
+}
+
 fn human_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     let b = bytes as f64;
@@ -1729,6 +1755,11 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
             Role::System | Role::Tool => None,
         })
         .collect();
+    // The images sent with this message, which the gateway shows a model
+    // that can see them (issue #106); later turns name them only.
+    if !matches!(msg.branch, Some(Branch::Regenerate { .. })) {
+        with_images(&mut messages, &msg.attachments);
+    }
 
     // A regenerated reply answers the user turn its branch ends with.
     let user_text = match &msg.branch {
@@ -2631,6 +2662,39 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn images_go_with_the_last_user_message() {
+        let file = |path: &str, media: &str, size: u64| havn_core::Attachment {
+            path: path.into(),
+            name: "x".into(),
+            media_type: media.into(),
+            size,
+            text_path: None,
+        };
+        let mut messages = vec![
+            serde_json::json!({"role": "user", "content": "first"}),
+            serde_json::json!({"role": "assistant", "content": "ok"}),
+            serde_json::json!({"role": "user", "content": "what is in it?"}),
+        ];
+        with_images(
+            &mut messages,
+            &[
+                file("inbox/a.png", "image/png", 10),
+                file("inbox/b.pdf", "application/pdf", 10),
+                file("inbox/huge.jpg", "image/jpeg", MAX_IMAGE_BYTES + 1),
+            ],
+        );
+        assert_eq!(messages[0]["content"], "first");
+        let blocks = messages[2]["content"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], "what is in it?");
+        assert_eq!(blocks[1]["source"]["path"], "inbox/a.png");
+
+        let mut plain = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        with_images(&mut plain, &[file("inbox/b.pdf", "application/pdf", 10)]);
+        assert_eq!(plain[0]["content"], "hi");
+    }
 
     #[test]
     fn attached_files_are_named_in_the_turn() {
