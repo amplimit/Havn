@@ -3,7 +3,7 @@
 //! Persists every turn of every channel in the agent's `agent.db`. Driven by
 //! the runtime's inbound handler: user turn on receive, assistant turn after
 //! the LLM response. `recent` retrieves the recency window for context build.
-//! `search` runs the FTS5 mirror for the `memory_search` tool.
+//! `search_chats` and `around` serve the `conversation_search` tool.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -384,20 +384,167 @@ pub async fn recent(pool: &SqlitePool, channel_id: &str, limit: u32) -> Result<V
     Ok(turns)
 }
 
-/// Full-text search over conversation content. `query` is a `SQLite` FTS5
-/// MATCH expression (use `escape_fts_query` to escape free-form user input).
-pub async fn search(pool: &SqlitePool, query: &str, limit: u32) -> Result<Vec<Turn>> {
-    let rows: Vec<TurnRow> = sqlx::query_as::<_, TurnRow>(
-        "SELECT c.role, c.content, c.created_at \
-         FROM conversations_fts f JOIN conversations c ON c.rowid = f.rowid \
-         WHERE conversations_fts MATCH ?1 \
-         ORDER BY rank LIMIT ?2",
-    )
-    .bind(query)
-    .bind(limit)
+/// A user or assistant turn of a chat, as past-chat search shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatTurn {
+    pub id: String,
+    pub chat: String,
+    pub title: String,
+    pub role: Role,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ChatTurnRow {
+    id: String,
+    chat: String,
+    title: String,
+    role: String,
+    content: String,
+    created_at: DateTime<Utc>,
+}
+
+impl TryFrom<ChatTurnRow> for ChatTurn {
+    type Error = DbError;
+    fn try_from(r: ChatTurnRow) -> Result<Self> {
+        Ok(Self {
+            id: r.id,
+            chat: r.chat,
+            title: r.title,
+            role: Role::parse(&r.role)?,
+            content: r.content,
+            created_at: r.created_at,
+        })
+    }
+}
+
+/// Characters a search term needs to use the trigram index; shorter ones
+/// (most Chinese words) are matched as substrings.
+const TRIGRAM_CHARS: usize = 3;
+
+/// The user and assistant turns of `scope`'s chats that contain every
+/// whitespace-separated term of `query`, best matches first (newest
+/// first when no term is long enough to rank by), at most `limit`.
+/// Turns of every branch count. Other scopes' chats, scheduled runs and
+/// heartbeats are not searched.
+pub async fn search_chats(
+    pool: &SqlitePool,
+    scope: &str,
+    query: &str,
+    limit: u32,
+) -> Result<Vec<ChatTurn>> {
+    let (long, short): (Vec<&str>, Vec<&str>) = query
+        .split_whitespace()
+        .partition(|t| t.chars().count() >= TRIGRAM_CHARS);
+    if long.is_empty() && short.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut sql = String::from(
+        "SELECT c.id, c.channel_id AS chat, h.title, c.role, c.content, c.created_at ",
+    );
+    if long.is_empty() {
+        sql.push_str("FROM conversations c JOIN chats h ON h.id = c.channel_id WHERE h.scope = ?");
+    } else {
+        sql.push_str(
+            "FROM conversations_fts f JOIN conversations c ON c.rowid = f.rowid \
+             JOIN chats h ON h.id = c.channel_id \
+             WHERE conversations_fts MATCH ? AND h.scope = ?",
+        );
+    }
+    sql.push_str(" AND c.role IN ('user', 'assistant')");
+    for _ in &short {
+        sql.push_str(" AND c.content LIKE ? ESCAPE '\\'");
+    }
+    sql.push_str(if long.is_empty() {
+        " ORDER BY c.created_at DESC, c.rowid DESC LIMIT ?"
+    } else {
+        " ORDER BY rank LIMIT ?"
+    });
+    let mut q = sqlx::query_as::<_, ChatTurnRow>(&sql);
+    if !long.is_empty() {
+        let phrases: Vec<String> = long
+            .iter()
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect();
+        q = q.bind(phrases.join(" AND "));
+    }
+    q = q.bind(scope);
+    for term in &short {
+        let escaped = term
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        q = q.bind(format!("%{escaped}%"));
+    }
+    let rows = q.bind(limit).fetch_all(pool).await?;
+    rows.into_iter().map(ChatTurn::try_from).collect()
+}
+
+/// Turn `turn` of one of `scope`'s chats with up to `context` user and
+/// assistant turns before and after it on its branch, oldest first: the
+/// turns it follows, and the newest of each turn's replies after it.
+/// `None` when it is not a turn of `scope`'s chats.
+pub async fn around(
+    pool: &SqlitePool,
+    scope: &str,
+    turn: &str,
+    context: u32,
+) -> Result<Option<Vec<ChatTurn>>> {
+    const SELECT: &str = "SELECT c.id, c.channel_id AS chat, h.title, c.role, c.content, \
+                          c.created_at FROM conversations c JOIN chats h ON h.id = c.channel_id";
+    let found: Option<ChatTurnRow> =
+        sqlx::query_as(&format!("{SELECT} WHERE c.id = ?1 AND h.scope = ?2"))
+            .bind(turn)
+            .bind(scope)
+            .fetch_optional(pool)
+            .await?;
+    let Some(found) = found else {
+        return Ok(None);
+    };
+    let before: Vec<ChatTurnRow> = sqlx::query_as(&format!(
+        "WITH RECURSIVE up(id, depth) AS ( \
+             SELECT parent_id, 1 FROM conversations WHERE id = ?1 \
+             UNION ALL \
+             SELECT c.parent_id, up.depth + 1 FROM conversations c JOIN up ON c.id = up.id \
+             WHERE up.depth < ?2 * 4 \
+         ) \
+         {SELECT} JOIN up ON up.id = c.id \
+         WHERE c.role IN ('user', 'assistant') ORDER BY up.depth LIMIT ?2"
+    ))
+    .bind(turn)
+    .bind(context)
     .fetch_all(pool)
     .await?;
-    rows.into_iter().map(Turn::try_from).collect()
+    let mut after = Vec::new();
+    let mut at = found.id.clone();
+    // Tool and system turns in between are passed over, a few at most.
+    for _ in 0..context.saturating_mul(4) {
+        if after.len() >= context as usize {
+            break;
+        }
+        let next: Option<ChatTurnRow> = sqlx::query_as(&format!(
+            "{SELECT} WHERE c.parent_id = ?1 ORDER BY c.created_at DESC, c.rowid DESC LIMIT 1"
+        ))
+        .bind(&at)
+        .fetch_optional(pool)
+        .await?;
+        let Some(next) = next else {
+            break;
+        };
+        at = next.id.clone();
+        if next.role == "user" || next.role == "assistant" {
+            after.push(next);
+        }
+    }
+    before
+        .into_iter()
+        .rev()
+        .chain(std::iter::once(found))
+        .chain(after)
+        .map(ChatTurn::try_from)
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
 }
 
 /// One conversation of a scope (issue #126); its turns are those whose
@@ -972,19 +1119,125 @@ mod tests {
         assert_eq!(alpha[0].content, "alpha-1");
     }
 
+    async fn say(pool: &SqlitePool, scope: &str, chat: &str, role: Role, text: &str) -> String {
+        chat_for(pool, scope, Some(chat), text).await.expect("chat");
+        record_in_chat(pool, chat, role, text)
+            .await
+            .expect("record")
+            .expect("chat exists")
+    }
+
+    fn chat(n: u32) -> String {
+        format!("00000000-0000-4000-8000-{n:012}")
+    }
+
+    fn contents(hits: &[ChatTurn]) -> Vec<&str> {
+        hits.iter().map(|h| h.content.as_str()).collect()
+    }
+
     #[tokio::test]
-    async fn fts_search_finds_relevant_turn() {
+    async fn search_finds_words_inside_chinese_and_english_text() {
         let pool = connect_in_memory().await.expect("connect");
-        record(&pool, "c", Role::User, "the quick brown fox")
+        say(&pool, "me", &chat(1), Role::User, "我最喜欢的颜色是青绿色").await;
+        say(
+            &pool,
+            "me",
+            &chat(1),
+            Role::Assistant,
+            "Noted: teal is your favourite colour",
+        )
+        .await;
+        say(&pool, "me", &chat(2), Role::User, "the quick brown fox").await;
+
+        let two = search_chats(&pool, "me", "颜色", 10).await.expect("search");
+        assert_eq!(contents(&two), vec!["我最喜欢的颜色是青绿色"]);
+        let three = search_chats(&pool, "me", "青绿色", 10)
             .await
-            .expect("rec");
-        record(&pool, "c", Role::User, "lazy dog jumps")
+            .expect("search");
+        assert_eq!(contents(&three), vec!["我最喜欢的颜色是青绿色"]);
+        let words = search_chats(&pool, "me", "Teal colour", 10)
             .await
-            .expect("rec");
-        let q = escape_fts_query("brown fox");
-        let hits = search(&pool, &q, 5).await.expect("search");
-        assert_eq!(hits.len(), 1);
-        assert!(hits[0].content.contains("brown fox"));
+            .expect("search");
+        assert_eq!(
+            contents(&words),
+            vec!["Noted: teal is your favourite colour"]
+        );
+        assert_eq!(words[0].chat, chat(1));
+        assert_eq!(words[0].title, "我最喜欢的颜色是青绿色");
+        let mixed = search_chats(&pool, "me", "fox 色", 10)
+            .await
+            .expect("search");
+        assert!(mixed.is_empty(), "every term must match: {mixed:?}");
+        let wild = search_chats(&pool, "me", "%", 10).await.expect("search");
+        assert!(wild.is_empty(), "LIKE wildcards are literal: {wild:?}");
+    }
+
+    #[tokio::test]
+    async fn search_stays_in_the_scope_and_skips_runs_outside_chats() {
+        let pool = connect_in_memory().await.expect("connect");
+        say(
+            &pool,
+            "alice",
+            &chat(3),
+            Role::User,
+            "my salary is confidential",
+        )
+        .await;
+        say(
+            &pool,
+            "bob",
+            &chat(4),
+            Role::User,
+            "what is the salary band",
+        )
+        .await;
+        record(&pool, "cron:job", Role::User, "salary report task")
+            .await
+            .expect("record");
+        let hits = search_chats(&pool, "bob", "salary", 10)
+            .await
+            .expect("search");
+        assert_eq!(contents(&hits), vec!["what is the salary band"]);
+    }
+
+    #[tokio::test]
+    async fn around_follows_the_branch_of_the_turn() {
+        let pool = connect_in_memory().await.expect("connect");
+        let c = chat(5);
+        let q1 = say(&pool, "me", &c, Role::User, "q1").await;
+        say(&pool, "me", &c, Role::Assistant, "a1").await;
+        let q2 = say(&pool, "me", &c, Role::User, "q2").await;
+        say(&pool, "me", &c, Role::Assistant, "a2").await;
+        // q2 edited: the newer version is on another branch.
+        rewind(
+            &pool,
+            &c,
+            Rewind::Edit {
+                turn: &q2,
+                text: "q2 edited",
+            },
+        )
+        .await
+        .expect("rewind")
+        .expect("edited");
+        record_reply(&pool, &c, &q1, "unrelated reply")
+            .await
+            .expect("reply");
+
+        let turns = around(&pool, "me", &q2, 1)
+            .await
+            .expect("around")
+            .expect("found");
+        assert_eq!(
+            turns.iter().map(|t| t.content.as_str()).collect::<Vec<_>>(),
+            vec!["a1", "q2", "a2"]
+        );
+        assert!(
+            around(&pool, "other", &q2, 1)
+                .await
+                .expect("around")
+                .is_none()
+        );
     }
 
     #[test]

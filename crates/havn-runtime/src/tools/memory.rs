@@ -1,6 +1,8 @@
 //! Typed memory tools (spec §9.4): `memory_remember`, `memory_search`,
 //! `memory_forget`. Backed by the agent-side SQLite `memory` table with
-//! `kind` + `source` + `ttl_days` + `archived_at`.
+//! `kind` + `source` + `ttl_days` + `archived_at`. And
+//! `conversation_search` over the past chats of the person talking
+//! (issue #105).
 //!
 //! From the user's seat: the agent saves facts about you in four
 //! categories so the dashboard can show them grouped, and so the daily
@@ -11,7 +13,7 @@
 use std::fmt::Write as _;
 
 use async_trait::async_trait;
-use havn_db::agent::conversations::{self, escape_fts_query};
+use havn_db::agent::conversations::{self, ChatTurn};
 use havn_db::agent::memory::{self, Kind, NewEntry, Source};
 use serde_json::{Value, json};
 
@@ -187,10 +189,10 @@ impl Tool for MemorySearchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Full-text search across active memory entries AND prior \
-         conversation turns. Returns up to 10 hits ranked by relevance. \
-         Pass `kinds: [...]` to restrict to specific memory categories \
-         (e.g. only 'event' for 'what happened recently')."
+        "Search active memory entries. Returns up to 10 hits ranked by \
+         relevance. Pass `kinds: [...]` to restrict to specific memory \
+         categories (e.g. only 'event' for 'what happened recently'). \
+         For what was said in earlier chats, use conversation_search."
     }
 
     fn input_schema(&self) -> Value {
@@ -242,13 +244,7 @@ impl Tool for MemorySearchTool {
             Ok(hits) => hits,
             Err(e) => return ToolResult::Error(format!("memory search failed: {e}")),
         };
-        let q = escape_fts_query(raw_query);
-        let conv_hits = match conversations::search(&ctx.agent_db, &q, SEARCH_LIMIT).await {
-            Ok(hits) => hits,
-            Err(e) => return ToolResult::Error(format!("conversation search failed: {e}")),
-        };
-
-        if memory_hits.is_empty() && conv_hits.is_empty() {
+        if memory_hits.is_empty() {
             return ToolResult::Ok("(no matches)".into());
         }
 
@@ -267,21 +263,165 @@ impl Tool for MemorySearchTool {
             }
             out.push('\n');
         }
-        if !conv_hits.is_empty() {
-            out.push_str("# Conversation history\n\n");
-            for turn in conv_hits {
-                writeln!(
-                    out,
-                    "- [{}] {}: {}",
-                    turn.created_at.format("%Y-%m-%d %H:%M"),
-                    turn.role.as_str(),
-                    truncate(&turn.content, 240),
-                )
-                .ok();
+        ToolResult::Ok(out)
+    }
+}
+
+/// Turns `conversation_search` shows before and after the one asked for.
+const CONTEXT_TURNS: u32 = 3;
+/// Characters of a found turn shown, around the first term it matched.
+const EXCERPT_CHARS: usize = 300;
+/// Characters of each turn shown around a found one.
+const AROUND_CHARS: usize = 1200;
+
+pub struct ConversationSearchTool;
+
+#[async_trait]
+impl Tool for ConversationSearchTool {
+    fn name(&self) -> &'static str {
+        "conversation_search"
+    }
+
+    fn description(&self) -> &'static str {
+        "Search the earlier chats of the person you are talking to, \
+         including turns no longer in the conversation you see. Every word \
+         of `query` must appear in a turn; words of three or more \
+         characters match anywhere inside text, so for Chinese or \
+         Japanese give a few words rather than a whole sentence. Returns up \
+         to 10 turns with their chat title, date and turn id. Pass `turn` \
+         (an id from a result) instead to read the turns around it."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Words to look for." },
+                "turn": {
+                    "type": "string",
+                    "description": "A turn id from an earlier result, to read the turns around it."
+                }
             }
+        })
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, input: Value) -> ToolResult {
+        // The chats of the scope the message came from (a dashboard user,
+        // a channel sender): other people's chats with this agent stay
+        // out of reach.
+        let Ok(scope) = super::gateway::CONVERSATION.try_with(Clone::clone) else {
+            return ToolResult::Error(
+                "conversation_search works only while answering a chat message".into(),
+            );
+        };
+        let current = super::gateway::CHAT.try_with(Clone::clone).ok();
+        if let Some(turn) = input.get("turn").and_then(Value::as_str) {
+            return match conversations::around(&ctx.agent_db, &scope, turn, CONTEXT_TURNS).await {
+                Ok(Some(turns)) => ToolResult::Ok(show_around(&turns, turn, current.as_deref())),
+                Ok(None) => ToolResult::Error(format!("no turn {turn:?} in these chats")),
+                Err(e) => ToolResult::Error(format!("conversation_search failed: {e}")),
+            };
+        }
+        let query = input
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let terms: Vec<&str> = query.split_whitespace().collect();
+        if terms.is_empty() {
+            return ToolResult::Error("give `query` (words to look for) or `turn`".into());
+        }
+        let hits =
+            match conversations::search_chats(&ctx.agent_db, &scope, query, SEARCH_LIMIT).await {
+                Ok(hits) => hits,
+                Err(e) => return ToolResult::Error(format!("conversation_search failed: {e}")),
+            };
+        if hits.is_empty() {
+            return ToolResult::Ok("(no matches)".into());
+        }
+        let mut out = String::new();
+        for hit in &hits {
+            writeln!(
+                out,
+                "- [{}] {} in {}{} (turn {}): {}",
+                hit.created_at.format("%Y-%m-%d %H:%M"),
+                hit.role.as_str(),
+                chat_name(hit),
+                if current.as_deref() == Some(hit.chat.as_str()) {
+                    " (this chat)"
+                } else {
+                    ""
+                },
+                hit.id,
+                excerpt(&hit.content, &terms, EXCERPT_CHARS),
+            )
+            .ok();
         }
         ToolResult::Ok(out)
     }
+}
+
+fn chat_name(turn: &ChatTurn) -> String {
+    if turn.title.is_empty() {
+        "an untitled chat".into()
+    } else {
+        format!("chat {:?}", turn.title)
+    }
+}
+
+fn show_around(turns: &[ChatTurn], asked: &str, current: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(first) = turns.first() {
+        let here = if current == Some(first.chat.as_str()) {
+            " (this chat)"
+        } else {
+            ""
+        };
+        writeln!(out, "From {}{here}:", chat_name(first)).ok();
+    }
+    for turn in turns {
+        writeln!(
+            out,
+            "{} [{}] {}: {}",
+            if turn.id == asked { ">" } else { "-" },
+            turn.created_at.format("%Y-%m-%d %H:%M"),
+            turn.role.as_str(),
+            truncate(&turn.content, AROUND_CHARS),
+        )
+        .ok();
+    }
+    out
+}
+
+/// At most `max` characters of `content`, around the first of `terms` it
+/// contains (ignoring case).
+fn excerpt(content: &str, terms: &[&str], max: usize) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    if chars.len() <= max {
+        return content.to_string();
+    }
+    let fold = |c: char| c.to_lowercase().next().unwrap_or(c);
+    let lower: Vec<char> = chars.iter().copied().map(fold).collect();
+    let at = terms
+        .iter()
+        .filter_map(|term| {
+            let term: Vec<char> = term.chars().map(fold).collect();
+            if term.is_empty() {
+                return None;
+            }
+            lower.windows(term.len()).position(|w| w == term.as_slice())
+        })
+        .min()
+        .unwrap_or(0);
+    let start = at.saturating_sub(max / 3).min(chars.len() - max);
+    let mut out = String::new();
+    if start > 0 {
+        out.push('\u{2026}');
+    }
+    out.extend(&chars[start..start + max]);
+    if start + max < chars.len() {
+        out.push('\u{2026}');
+    }
+    out
 }
 
 pub struct MemoryForgetTool;
@@ -480,5 +620,89 @@ mod tests {
             .await;
         assert!(!r.is_error());
         assert_eq!(r.text(), "(no matches)");
+    }
+
+    const CHAT_A: &str = "00000000-0000-4000-8000-00000000000a";
+    const CHAT_B: &str = "00000000-0000-4000-8000-00000000000b";
+
+    async fn chat_turn(
+        ctx: &ToolCtx,
+        scope: &str,
+        chat: &str,
+        role: conversations::Role,
+        text: &str,
+    ) -> String {
+        conversations::chat_for(&ctx.agent_db, scope, Some(chat), text)
+            .await
+            .expect("chat");
+        conversations::record_in_chat(&ctx.agent_db, chat, role, text)
+            .await
+            .expect("record")
+            .expect("chat")
+    }
+
+    async fn search_as(ctx: &ToolCtx, scope: &str, chat: &str, input: Value) -> ToolResult {
+        crate::tools::gateway::CONVERSATION
+            .scope(
+                scope.to_string(),
+                crate::tools::gateway::CHAT
+                    .scope(chat.to_string(), ConversationSearchTool.execute(ctx, input)),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn conversation_search_finds_this_persons_earlier_chats_only() {
+        use conversations::Role;
+        let ctx = ctx().await;
+        let asked = chat_turn(&ctx, "alice", CHAT_A, Role::User, "我们下周去京都旅行").await;
+        chat_turn(
+            &ctx,
+            "alice",
+            CHAT_A,
+            Role::Assistant,
+            "好的，京都的红叶季很美",
+        )
+        .await;
+        chat_turn(&ctx, "bob", CHAT_B, Role::User, "京都的预算是多少").await;
+
+        let r = search_as(&ctx, "alice", "elsewhere", json!({"query": "京都"})).await;
+        assert!(!r.is_error(), "{}", r.text());
+        assert!(r.text().contains("下周去京都旅行"), "{}", r.text());
+        assert!(r.text().contains("红叶季"), "{}", r.text());
+        assert!(
+            !r.text().contains("预算"),
+            "another person's chat: {}",
+            r.text()
+        );
+        assert!(
+            r.text().contains(&format!("(turn {asked})")),
+            "{}",
+            r.text()
+        );
+
+        let r = search_as(&ctx, "alice", CHAT_A, json!({"turn": asked})).await;
+        assert!(r.text().contains("(this chat)"), "{}", r.text());
+        assert!(r.text().contains("> ["), "{}", r.text());
+        assert!(r.text().contains("红叶季"), "{}", r.text());
+        let r = search_as(&ctx, "bob", CHAT_B, json!({"turn": asked})).await;
+        assert!(r.is_error(), "{}", r.text());
+
+        let r = ConversationSearchTool
+            .execute(&ctx, json!({"query": "京都"}))
+            .await;
+        assert!(r.is_error(), "outside a chat: {}", r.text());
+    }
+
+    #[test]
+    fn an_excerpt_is_cut_around_the_first_match() {
+        let text = format!("{}Needle here{}", "a".repeat(500), "b".repeat(500));
+        let cut = excerpt(&text, &["needle"], 30);
+        assert!(
+            cut.starts_with('\u{2026}') && cut.ends_with('\u{2026}'),
+            "{cut}"
+        );
+        assert!(cut.contains("Needle here"), "{cut}");
+        assert_eq!(excerpt("short", &["x"], 30), "short");
     }
 }

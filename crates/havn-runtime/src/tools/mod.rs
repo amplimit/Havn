@@ -152,6 +152,7 @@ impl ToolRegistry {
             Arc::new(memory::MemoryRememberTool),
             Arc::new(memory::MemorySearchTool),
             Arc::new(memory::MemoryForgetTool),
+            Arc::new(memory::ConversationSearchTool),
             Arc::new(files::FileReadTool),
             Arc::new(files::FileWriteTool),
             Arc::new(files::FileEditTool),
