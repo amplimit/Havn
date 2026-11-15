@@ -24,6 +24,7 @@ pub mod conversation;
 pub mod credentials;
 pub mod cron;
 pub mod embedding;
+pub mod files;
 pub mod llm;
 pub mod mcp;
 pub mod me;

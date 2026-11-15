@@ -25,9 +25,49 @@ pub struct InboundMessage {
     /// Where it branches off its chat instead of continuing it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<Branch>,
+    /// Files sent with it, saved in the agent's workspace (issue #106).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
     /// Original platform payload, preserved verbatim for adapter-specific features.
     #[serde(default)]
     pub raw: serde_json::Value,
+}
+
+/// A file sent with a message (issue #106), saved in the agent's
+/// workspace before the message reaches the agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    /// Where it is, relative to the workspace: `inbox/<name>`.
+    pub path: String,
+    /// The name it was sent with.
+    pub name: String,
+    pub media_type: String,
+    pub size: u64,
+    /// Where its text is, when it was extracted (a PDF, say).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_path: Option<String>,
+}
+
+/// Where the files people send are saved, in an agent's workspace.
+pub const INBOX_DIR: &str = "inbox";
+
+impl Attachment {
+    /// Whether `path` names a file directly in the inbox: `inbox/<name>`,
+    /// the name without separators, dot segments or control characters.
+    #[must_use]
+    pub fn in_inbox(path: &str) -> bool {
+        let Some(name) = path
+            .strip_prefix(INBOX_DIR)
+            .and_then(|rest| rest.strip_prefix('/'))
+        else {
+            return false;
+        };
+        !name.is_empty()
+            && name.len() <= 255
+            && !name.starts_with('.')
+            && !name.contains(['/', '\\'])
+            && !name.chars().any(char::is_control)
+    }
 }
 
 /// Where a message branches off its chat (issue #129).
@@ -99,4 +139,28 @@ pub enum MessageContent {
         phone_number: Option<String>,
         vcard: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_files_directly_in_the_inbox_are_attachments() {
+        assert!(Attachment::in_inbox("inbox/20261115-report.pdf"));
+        assert!(Attachment::in_inbox("inbox/报告 2026.pdf"));
+        for bad in [
+            "inbox/",
+            "inbox",
+            "inbox/../agent.db",
+            "inbox/a/b.txt",
+            "inbox/.hidden",
+            "inbox/a\\b",
+            "other/x.pdf",
+            "/inbox/x.pdf",
+            "inbox/a\nb",
+        ] {
+            assert!(!Attachment::in_inbox(bad), "{bad}");
+        }
+    }
 }

@@ -14,7 +14,7 @@
  * gateway under its own DNS name).
  */
 
-import type { ServerMessage, ClientMessage } from "./protocol";
+import type { ServerMessage, ClientMessage, Attachment } from "./protocol";
 
 export type ChatHandlers = {
   onOpen?: () => void;
@@ -26,7 +26,7 @@ export type ChatHandlers = {
 export type ChatHandle = {
   /** Send `text` in chat `conversation`, or the active chat; with `edit`,
    * as a new version of that user turn. */
-  send: (text: string, conversation?: string, edit?: string) => void;
+  send: (text: string, conversation?: string, edit?: string, attachments?: Attachment[]) => void;
   /** Ask for another reply in place of reply `turn`. */
   regenerate: (conversation: string | undefined, turn: string) => void;
   /** Stop the reply the agent is working on in a chat; queued messages still run. */
@@ -74,8 +74,14 @@ export function openChat(
   ws.addEventListener("close", (ev) => handlers.onClose?.(ev));
 
   return {
-    send: (text: string, conversation?: string, edit?: string) => {
-      const frame: ClientMessage = { type: "send", content: text, conversation, edit };
+    send: (text: string, conversation?: string, edit?: string, attachments?: Attachment[]) => {
+      const frame: ClientMessage = {
+        type: "send",
+        content: text,
+        conversation,
+        edit,
+        attachments: attachments?.length ? attachments : undefined,
+      };
       ws.send(JSON.stringify(frame));
     },
     regenerate: (conversation, turn) => {

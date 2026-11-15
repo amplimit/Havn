@@ -6,7 +6,7 @@
 export type ClientMessage =
   /** `conversation`: the chat it continues, a new one when the id is new;
    * `edit`: a user turn this is a new version of. */
-  | { type: "send"; content: string; conversation?: string; edit?: string }
+  | { type: "send"; content: string; conversation?: string; edit?: string; attachments?: Attachment[] }
   /** Another reply in place of reply `turn`, or of the last one. */
   | { type: "regenerate"; conversation?: string; turn?: string }
   | { type: "stop"; conversation?: string }
@@ -31,6 +31,16 @@ export type ServerMessage =
   | { type: "approval_closed"; id: string }
   /** What the reply just sent saved to or forgot from memory. */
   | { type: "memory"; conversation?: string; turn?: string; changes: MemoryChange[] };
+
+/** A file uploaded to the agent's inbox for a message. */
+export type Attachment = {
+  path: string;
+  name: string;
+  media_type: string;
+  size: number;
+  /** Where its text is, when it was extracted (a PDF). */
+  text_path?: string;
+};
 
 export type MemoryChange = {
   action: "saved" | "forgot";

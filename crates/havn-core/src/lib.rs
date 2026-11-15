@@ -14,7 +14,7 @@ pub use error::{Error, Result};
 pub use ids::{
     AgentId, ChannelBindingId, CredentialId, CronJobId, RoleId, SkillId, TeamId, UserId,
 };
-pub use message::{Branch, InboundMessage, MessageContent, OutboundMessage};
+pub use message::{Attachment, Branch, INBOX_DIR, InboundMessage, MessageContent, OutboundMessage};
 pub use policy::{
     AGENT_CGROUP_PARENT, AGENT_CGROUP_PREFIX, AdminVisibility, BudgetExhaustAction, BudgetPolicy,
     ChannelAllowance, ContextToolsetEntry, ContextToolsets, HOOK_REGEX_SIZE_LIMIT, HookPolicy,

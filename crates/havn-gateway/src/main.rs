@@ -717,6 +717,12 @@ async fn serve() -> anyhow::Result<()> {
             "/agents/{id}/approvals",
             get(api::approvals::get).put(api::approvals::put),
         )
+        .route(
+            "/agents/{id}/files",
+            post(api::files::upload).layer(axum::extract::DefaultBodyLimit::max(
+                api::files::MAX_UPLOAD_BYTES,
+            )),
+        )
         .route("/agents/{id}/memory", get(api::memory::list))
         .route(
             "/agents/{id}/memory/{key}",

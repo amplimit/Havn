@@ -523,6 +523,7 @@ mod tests {
             channel: "webchat".into(),
             content,
             timestamp: chrono::Utc::now(),
+            attachments: Vec::new(),
             raw: serde_json::Value::Null,
         })
     }

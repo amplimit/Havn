@@ -12,7 +12,7 @@ import {
 } from "@/lib/api";
 import { openChat, type ChatHandle } from "@/lib/websocket";
 import { Markdown } from "@/components/Markdown";
-import type { MemoryChange, ServerMessage } from "@/lib/protocol";
+import type { Attachment, MemoryChange, ServerMessage } from "@/lib/protocol";
 import {
   BookOpen,
   Brain,
@@ -21,6 +21,7 @@ import {
   Layers,
   MessageSquarePlus,
   MessagesSquare,
+  Paperclip,
   ChevronLeft,
   ChevronRight,
   Pencil,
@@ -29,6 +30,7 @@ import {
   Search,
   Settings,
   Trash2,
+  X,
 } from "lucide-react";
 
 type ApprovalRequest = Extract<ServerMessage, { type: "approval" }>;
@@ -411,11 +413,33 @@ export default function ChatPage({
     ]);
   }
 
-  function sendText(text: string) {
-    if (!text.trim() || !chatRef.current || wsState !== "open") return;
-    pushBubble("you", text);
-    chatRef.current.send(text, chatIdRef.current ?? undefined);
+  function sendText(text: string, files: Attachment[] = []) {
+    if ((!text.trim() && files.length === 0) || !chatRef.current || wsState !== "open") return;
+    // Shown as the agent will read it; the stored turn says the same.
+    const shown = [text, ...files.map((f) => `[Attached file ${JSON.stringify(f.name)}]`)]
+      .filter((line) => line.trim())
+      .join("\n");
+    pushBubble("you", shown);
+    chatRef.current.send(text, chatIdRef.current ?? undefined, undefined, files);
     setWaiting((n) => n + 1);
+  }
+
+  // Files waiting to go with the next message, uploaded already.
+  const [attached, setAttached] = useState<Attachment[]>([]);
+  const [uploading, setUploading] = useState(0);
+  async function attachFiles(files: FileList | null) {
+    if (!files) return;
+    for (const file of Array.from(files)) {
+      setUploading((n) => n + 1);
+      try {
+        const uploaded = await api.files.upload(id, file);
+        setAttached((prev) => [...prev, uploaded]);
+      } catch (e) {
+        pushBubble("system", `error: could not attach ${file.name}: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        setUploading((n) => n - 1);
+      }
+    }
   }
 
   function stopReply() {
@@ -518,8 +542,10 @@ export default function ChatPage({
 
   function onSubmit(e: React.FormEvent) {
     e.preventDefault();
-    sendText(draft);
+    if (uploading > 0) return;
+    sendText(draft, attached);
     setDraft("");
+    setAttached([]);
   }
 
   if (!agent && !error) {
@@ -759,6 +785,10 @@ export default function ChatPage({
           draft={draft}
           setDraft={setDraft}
           onSubmit={onSubmit}
+          attached={attached}
+          uploading={uploading}
+          onAttach={(files) => void attachFiles(files)}
+          onDetach={(path) => setAttached((prev) => prev.filter((a) => a.path !== path))}
         />
       </div>
     </div>
@@ -1277,6 +1307,10 @@ function Composer({
   draft,
   setDraft,
   onSubmit,
+  attached,
+  uploading,
+  onAttach,
+  onDetach,
 }: {
   wsState: "idle" | "connecting" | "open" | "closed" | "error";
   waiting: number;
@@ -1284,7 +1318,14 @@ function Composer({
   draft: string;
   setDraft: (s: string) => void;
   onSubmit: (e: React.FormEvent) => void;
+  /** Files uploaded for the next message, and uploads still running. */
+  attached: Attachment[];
+  uploading: number;
+  onAttach: (files: FileList | null) => void;
+  onDetach: (path: string) => void;
 }) {
+  const fileInput = useRef<HTMLInputElement>(null);
+  const canSend = (draft.trim() !== "" || attached.length > 0) && uploading === 0;
   const [tab, setTab] = useState<"write" | "preview">("write");
   // The composer is ready whenever the WS is up. A message sent while a
   // reply runs waits in the agent and is answered after it, in order.
@@ -1344,7 +1385,7 @@ function Composer({
                 (e.metaKey || e.ctrlKey) &&
                 e.key === "Enter" &&
                 ready &&
-                draft.trim()
+                canSend
               ) {
                 e.preventDefault();
                 onSubmit(e as unknown as React.FormEvent);
@@ -1380,8 +1421,56 @@ function Composer({
           </div>
         )}
 
+        {(attached.length > 0 || uploading > 0) && (
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs" aria-label="attached files">
+            {attached.map((a) => (
+              <span
+                key={a.path}
+                className="inline-flex items-center gap-1 rounded px-2 py-1"
+                style={{ background: "var(--color-surface-muted)", color: "var(--color-body)" }}
+              >
+                <Paperclip size={12} className="shrink-0" aria-hidden="true" />
+                {a.name}
+                <button
+                  type="button"
+                  onClick={() => onDetach(a.path)}
+                  aria-label={`remove ${a.name}`}
+                  title="Do not send it (it stays in the agent's inbox/)"
+                >
+                  <X size={12} aria-hidden="true" />
+                </button>
+              </span>
+            ))}
+            {uploading > 0 && (
+              <span className="inline-flex items-center gap-1" role="status" style={{ color: "var(--color-body)" }}>
+                <Spinner /> uploading
+              </span>
+            )}
+          </div>
+        )}
+
         {/* Action row */}
         <div className="mt-2 flex items-center justify-end gap-3">
+          <input
+            ref={fileInput}
+            type="file"
+            multiple
+            hidden
+            onChange={(e) => {
+              onAttach(e.target.files);
+              e.target.value = "";
+            }}
+          />
+          <button
+            type="button"
+            className="btn-ghost mr-auto inline-flex items-center gap-1.5"
+            onClick={() => fileInput.current?.click()}
+            disabled={!ready}
+            title="Attach files: they are saved in the agent's inbox/ and sent with your message (up to 25 MB each)"
+          >
+            <Paperclip size={16} className="shrink-0" aria-hidden="true" />
+            attach
+          </button>
           {pending && (
             <span
               className="flex items-center gap-2 text-sm"
@@ -1406,7 +1495,7 @@ function Composer({
           <button
             type="submit"
             className="btn-primary"
-            disabled={!ready || !draft.trim()}
+            disabled={!ready || !canSend}
             style={{ minWidth: 110 }}
           >
             {pending ? "queue" : "send"}

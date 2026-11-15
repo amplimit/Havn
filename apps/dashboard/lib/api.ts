@@ -1,3 +1,4 @@
+import type { Attachment } from "./protocol";
 /**
  * Thin REST client for the gateway management API (spec §8.3, §10.3).
  *
@@ -597,6 +598,25 @@ export const api = {
         method: "PATCH",
         body: JSON.stringify(patch),
       }),
+  },
+
+  files: {
+    /** Upload `file` to the agent's inbox for a chat message. */
+    upload: async (agentId: string, file: File): Promise<Attachment> => {
+      const res = await fetch(
+        `${BASE}/agents/${agentId}/files?name=${encodeURIComponent(file.name)}`,
+        {
+          method: "POST",
+          body: file,
+          headers: { "Content-Type": file.type || "application/octet-stream" },
+          cache: "no-store",
+        },
+      );
+      if (!res.ok) {
+        throw new ApiError(res.status, await res.text(), res.headers.get("content-type") ?? "");
+      }
+      return (await res.json()) as Attachment;
+    },
   },
 
   memory: {

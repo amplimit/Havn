@@ -98,6 +98,9 @@ pub enum ClientMessage {
         conversation: Option<String>,
         #[serde(default)]
         edit: Option<String>,
+        /// Files uploaded to the agent's inbox for this message.
+        #[serde(default)]
+        attachments: Vec<havn_core::Attachment>,
     },
     /// Another reply in place of reply `turn` of the chat, or of its last.
     Regenerate {

@@ -109,6 +109,26 @@ impl WorkspaceDir {
         }
     }
 
+    /// Create the regular file `name` with `contents`; false, writing
+    /// nothing, when an entry of any kind already has that name.
+    pub fn create_new(&self, name: &str, contents: &[u8]) -> io::Result<bool> {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .custom_flags(NOFOLLOW_FLAGS)
+            .open(self.child(name)?)
+        {
+            Ok(mut file) => {
+                self.give_to_owner(&file)?;
+                file.write_all(contents)?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Create the subdirectory `name` unless an entry of any kind already
     /// has that name (mkdir does not follow a symlink there).
     pub fn create_subdir_if_missing(&self, name: &str) -> io::Result<()> {
