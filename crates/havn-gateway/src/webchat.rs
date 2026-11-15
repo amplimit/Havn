@@ -333,7 +333,9 @@ mod tests {
         let received = rx.recv().await.expect("recv");
         match received {
             ServerMessage::AgentMessage { content, .. } => assert_eq!(content, "hi"),
-            ServerMessage::Error { .. } => panic!("expected AgentMessage, got Error"),
+            ServerMessage::Error { .. } | ServerMessage::Approval { .. } => {
+                panic!("expected AgentMessage, got Error")
+            }
         }
     }
 
@@ -416,7 +418,9 @@ mod tests {
         for rx in [&mut rx_a, &mut rx_b] {
             match rx.recv().await.expect("frame") {
                 ServerMessage::AgentMessage { content, .. } => assert_eq!(content, "hello"),
-                ServerMessage::Error { .. } => panic!("unexpected Error"),
+                ServerMessage::Error { .. } | ServerMessage::Approval { .. } => {
+                    panic!("unexpected Error")
+                }
             }
         }
         // The unrelated agent's session must NOT have received it.
@@ -452,7 +456,9 @@ mod tests {
         for expected in ["one", "two"] {
             match healthy_rx.try_recv().expect("frame") {
                 ServerMessage::AgentMessage { content, .. } => assert_eq!(content, expected),
-                ServerMessage::Error { .. } => panic!("unexpected Error"),
+                ServerMessage::Error { .. } | ServerMessage::Approval { .. } => {
+                    panic!("unexpected Error")
+                }
             }
         }
         assert!(

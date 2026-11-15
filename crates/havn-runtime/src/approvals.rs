@@ -4,7 +4,7 @@
 //! their [`ApprovalDecision`] lets the call run or refuses it. With no one
 //! to ask (a scheduled run) or no answer in time, the call is refused.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -157,8 +157,8 @@ impl Drop for Forget<'_> {
 
 /// Requests waiting, by conversation, for tests.
 #[cfg(test)]
-fn waiting_by_conversation(approvals: &Approvals) -> HashMap<String, usize> {
-    let mut out = HashMap::new();
+fn waiting_by_conversation(approvals: &Approvals) -> std::collections::HashMap<String, usize> {
+    let mut out = std::collections::HashMap::new();
     for (_, w) in approvals.lock_waiting().iter() {
         *out.entry(w.channel_id.clone()).or_insert(0) += 1;
     }

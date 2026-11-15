@@ -417,7 +417,7 @@ mod tests {
                 assert!(reason.contains("kubectl delete"));
                 assert!(reason.contains("shell"));
             }
-            Veto::Allow => panic!("should have denied"),
+            Veto::Allow | Veto::Ask { .. } => panic!("should have denied"),
         }
     }
 
