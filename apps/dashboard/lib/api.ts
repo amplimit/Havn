@@ -127,9 +127,13 @@ export type SkillListResponse = {
 };
 
 export type ConversationTurn = {
+  id: string;
   role: "user" | "assistant" | "system" | "tool";
   content: string;
   created_at: string;
+  /** Its versions: the turns in its place on other branches, itself
+   * included, oldest first. */
+  versions: string[];
 };
 
 export type ConversationResponse = {
@@ -540,6 +544,12 @@ export const api = {
     delete: (agentId: string, chat: string) =>
       request<void>(`/agents/${agentId}/chats/${encodeURIComponent(chat)}`, {
         method: "DELETE",
+      }),
+    /** Continue `chat` from the branch of `turn`, at its newest turn. */
+    branch: (agentId: string, chat: string, turn: string) =>
+      request<void>(`/agents/${agentId}/chats/${encodeURIComponent(chat)}/branch`, {
+        method: "POST",
+        body: JSON.stringify({ turn }),
       }),
   },
 

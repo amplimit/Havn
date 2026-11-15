@@ -75,55 +75,194 @@ pub async fn record_in_chat(
     role: Role,
     content: &str,
 ) -> Result<bool> {
-    let res = sqlx::query(
-        "INSERT INTO conversations (id, channel_id, role, content) \
-         SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM chats WHERE id = ?2)",
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let head: Option<(Option<String>,)> = sqlx::query_as("SELECT head FROM chats WHERE id = ?1")
+        .bind(chat)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some((parent,)) = head else {
+        return Ok(false);
+    };
+    let id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO conversations (id, channel_id, role, content, parent_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
     )
-    .bind(Uuid::now_v7().to_string())
+    .bind(&id)
     .bind(chat)
     .bind(role.as_str())
     .bind(content)
-    .execute(pool)
+    .bind(parent)
+    .execute(&mut *tx)
     .await?;
-    Ok(res.rows_affected() == 1)
+    sqlx::query("UPDATE chats SET head = ?2 WHERE id = ?1")
+        .bind(chat)
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
-/// Same as [`recent`] but with the channel_id surfaced on each turn.
-/// Public for the dashboard's history-load endpoint, which doesn't
-/// know the channel id ahead of time. Newest-first internally then
-/// reversed so callers get chronological order — matches what the
-/// chat UI wants to render top-to-bottom.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnWithChannel {
-    pub channel_id: String,
-    pub role: Role,
-    pub content: String,
-    pub created_at: DateTime<Utc>,
+/// Where a message branches off its chat (issue #129).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rewind<'a> {
+    /// A new version of user turn `.0`: it follows what that one followed.
+    Edit(&'a str),
+    /// Another reply in place of assistant turn `.0`, or of the last
+    /// reply when `None`.
+    Regenerate(Option<&'a str>),
 }
 
-/// Recent turns for a single channel, returning the channel_id with
-/// each row. Same data as [`recent`], extra column.
-pub async fn recent_with_channel(
-    pool: &SqlitePool,
-    channel_id: &str,
-    limit: u32,
-) -> Result<Vec<TurnWithChannel>> {
-    let rows: Vec<TurnRowChan> = sqlx::query_as::<_, TurnRowChan>(
-        "SELECT channel_id, role, content, created_at FROM conversations \
-         WHERE channel_id = ?1 \
-         ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+/// Move chat `chat`'s head back for `rewind`, so the next turns branch
+/// off there. `Some(true)` when the message's own user turn is to be
+/// recorded (an edit), `Some(false)` when not (a regenerated reply);
+/// `None` when the turn named is not one of the chat's that can be.
+pub async fn rewind(pool: &SqlitePool, chat: &str, rewind: Rewind<'_>) -> Result<Option<bool>> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let head: Option<(Option<String>,)> = sqlx::query_as("SELECT head FROM chats WHERE id = ?1")
+        .bind(chat)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some((head,)) = head else {
+        return Ok(None);
+    };
+    let (turn, wanted, records_user) = match rewind {
+        Rewind::Edit(turn) => (Some(turn.to_string()), Role::User, true),
+        Rewind::Regenerate(Some(turn)) => (Some(turn.to_string()), Role::Assistant, false),
+        Rewind::Regenerate(None) => (head, Role::Assistant, false),
+    };
+    let Some(turn) = turn else {
+        return Ok(None);
+    };
+    let found: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT role, parent_id FROM conversations WHERE id = ?1 AND channel_id = ?2",
     )
-    .bind(channel_id)
+    .bind(&turn)
+    .bind(chat)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let new_head = match found {
+        Some((role, parent)) if Role::parse(&role)? == wanted => parent,
+        // A reply that never came: answer the user turn the branch ends with.
+        Some((role, _))
+            if rewind == Rewind::Regenerate(None) && Role::parse(&role)? == Role::User =>
+        {
+            Some(turn)
+        }
+        _ => return Ok(None),
+    };
+    sqlx::query("UPDATE chats SET head = ?2 WHERE id = ?1")
+        .bind(chat)
+        .bind(new_head)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some(records_user))
+}
+
+/// The last `limit` turns of chat `chat`'s branch, oldest first: the path
+/// to its head.
+pub async fn branch(pool: &SqlitePool, chat: &str, limit: u32) -> Result<Vec<BranchTurn>> {
+    let rows: Vec<BranchRow> = sqlx::query_as::<_, BranchRow>(
+        "WITH RECURSIVE path(id, parent_id, role, content, created_at, depth) AS ( \
+             SELECT c.id, c.parent_id, c.role, c.content, c.created_at, 1 \
+             FROM conversations c JOIN chats h ON h.head = c.id \
+             WHERE h.id = ?1 \
+             UNION ALL \
+             SELECT c.id, c.parent_id, c.role, c.content, c.created_at, p.depth + 1 \
+             FROM conversations c JOIN path p ON c.id = p.parent_id \
+             WHERE p.depth < ?2 \
+         ) \
+         SELECT id, parent_id, role, content, created_at FROM path ORDER BY depth DESC",
+    )
+    .bind(chat)
     .bind(limit)
     .fetch_all(pool)
     .await?;
-    let mut turns: Vec<TurnWithChannel> = rows
-        .into_iter()
-        .rev()
-        .map(TurnWithChannel::try_from)
-        .collect::<Result<_>>()?;
-    turns.shrink_to_fit();
-    Ok(turns)
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The versions of each turn: the children of its parent.
+    let all: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT id, parent_id FROM conversations WHERE channel_id = ?1 \
+         ORDER BY created_at, rowid",
+    )
+    .bind(chat)
+    .fetch_all(pool)
+    .await?;
+    let siblings = |parent: &Option<String>| -> Vec<String> {
+        all.iter()
+            .filter(|(_, p)| p == parent)
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    rows.into_iter()
+        .map(|r| {
+            Ok(BranchTurn {
+                versions: siblings(&r.parent_id),
+                id: r.id,
+                role: Role::parse(&r.role)?,
+                content: r.content,
+                created_at: r.created_at,
+            })
+        })
+        .collect()
+}
+
+/// Continue chat `chat` from `turn`'s branch: its head becomes the newest
+/// turn under `turn`. False when `turn` is not one of the chat's.
+pub async fn switch_branch(pool: &SqlitePool, chat: &str, turn: &str) -> Result<bool> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let found: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM conversations WHERE id = ?1 AND channel_id = ?2")
+            .bind(turn)
+            .bind(chat)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((mut head,)) = found else {
+        return Ok(false);
+    };
+    loop {
+        let child: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM conversations WHERE parent_id = ?1 \
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )
+        .bind(&head)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match child {
+            Some((id,)) => head = id,
+            None => break,
+        }
+    }
+    sqlx::query("UPDATE chats SET head = ?2 WHERE id = ?1")
+        .bind(chat)
+        .bind(&head)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// A turn of a chat's branch, with the versions it has: the turns that
+/// follow the same one, itself included, oldest first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchTurn {
+    pub id: String,
+    pub role: Role,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+    pub versions: Vec<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct BranchRow {
+    id: String,
+    parent_id: Option<String>,
+    role: String,
+    content: String,
+    created_at: DateTime<Utc>,
 }
 
 /// Fetch the most recent `limit` turns for `channel_id` in chronological order
@@ -384,26 +523,6 @@ impl TryFrom<TurnRow> for Turn {
     }
 }
 
-#[derive(Debug, sqlx::FromRow)]
-struct TurnRowChan {
-    channel_id: String,
-    role: String,
-    content: String,
-    created_at: DateTime<Utc>,
-}
-
-impl TryFrom<TurnRowChan> for TurnWithChannel {
-    type Error = DbError;
-    fn try_from(r: TurnRowChan) -> Result<Self> {
-        Ok(Self {
-            channel_id: r.channel_id,
-            role: Role::parse(&r.role)?,
-            content: r.content,
-            created_at: r.created_at,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -512,6 +631,121 @@ mod tests {
         assert_eq!(listed[0].title, "Renamed");
         // Deleting the active chat leaves the scope without one.
         assert_eq!(existing_chat(&pool, "s", None).await.expect("db"), None);
+    }
+
+    async fn said(pool: &SqlitePool, chat: &str) -> Vec<String> {
+        branch(pool, chat, 100)
+            .await
+            .expect("branch")
+            .into_iter()
+            .map(|t| t.content)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn edits_and_regenerated_replies_branch_off() {
+        let pool = connect_in_memory().await.expect("connect");
+        let chat = chat_for(&pool, "s", None, "q1").await.expect("chat");
+        for (role, text) in [
+            (Role::User, "q1"),
+            (Role::Assistant, "a1"),
+            (Role::User, "q2"),
+            (Role::Assistant, "a2"),
+        ] {
+            assert!(
+                record_in_chat(&pool, &chat, role, text)
+                    .await
+                    .expect("record")
+            );
+        }
+        let turns = branch(&pool, &chat, 100).await.expect("branch");
+        assert_eq!(said(&pool, &chat).await, ["q1", "a1", "q2", "a2"]);
+        let (q2, a2) = (turns[2].id.clone(), turns[3].id.clone());
+
+        // Regenerate the last reply: a sibling of a2.
+        assert_eq!(
+            rewind(&pool, &chat, Rewind::Regenerate(None))
+                .await
+                .expect("db"),
+            Some(false)
+        );
+        record_in_chat(&pool, &chat, Role::Assistant, "a2'")
+            .await
+            .expect("record");
+        let turns = branch(&pool, &chat, 100).await.expect("branch");
+        assert_eq!(said(&pool, &chat).await, ["q1", "a1", "q2", "a2'"]);
+        assert_eq!(turns[3].versions.len(), 2);
+        assert_eq!(turns[3].versions[0], a2);
+
+        // Edit q2: a new branch after a1.
+        assert_eq!(
+            rewind(&pool, &chat, Rewind::Edit(&q2)).await.expect("db"),
+            Some(true)
+        );
+        record_in_chat(&pool, &chat, Role::User, "q2 edited")
+            .await
+            .expect("record");
+        record_in_chat(&pool, &chat, Role::Assistant, "a3")
+            .await
+            .expect("record");
+        assert_eq!(said(&pool, &chat).await, ["q1", "a1", "q2 edited", "a3"]);
+        assert_eq!(
+            branch(&pool, &chat, 2).await.expect("branch").len(),
+            2,
+            "limited"
+        );
+
+        // Back to the first version of q2: its newest reply.
+        assert!(switch_branch(&pool, &chat, &q2).await.expect("db"));
+        assert_eq!(said(&pool, &chat).await, ["q1", "a1", "q2", "a2'"]);
+
+        // Turns of another chat, or of the wrong role, cannot be used.
+        let other = chat_for(&pool, "t", None, "x").await.expect("chat");
+        assert_eq!(
+            rewind(&pool, &other, Rewind::Edit(&q2)).await.expect("db"),
+            None
+        );
+        assert_eq!(
+            rewind(&pool, &chat, Rewind::Edit(&a2)).await.expect("db"),
+            None
+        );
+        assert!(!switch_branch(&pool, &other, &q2).await.expect("db"));
+    }
+
+    #[tokio::test]
+    async fn editing_the_first_message_starts_a_new_root() {
+        let pool = connect_in_memory().await.expect("connect");
+        let chat = chat_for(&pool, "s", None, "hi").await.expect("chat");
+        record_in_chat(&pool, &chat, Role::User, "hi")
+            .await
+            .expect("record");
+        record_in_chat(&pool, &chat, Role::Assistant, "hello")
+            .await
+            .expect("record");
+        let first = branch(&pool, &chat, 10).await.expect("branch")[0]
+            .id
+            .clone();
+        assert_eq!(
+            rewind(&pool, &chat, Rewind::Edit(&first))
+                .await
+                .expect("db"),
+            Some(true)
+        );
+        assert!(said(&pool, &chat).await.is_empty());
+        record_in_chat(&pool, &chat, Role::User, "hey")
+            .await
+            .expect("record");
+        let turns = branch(&pool, &chat, 10).await.expect("branch");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].versions.len(), 2);
+        // A regenerate for a user turn with no reply answers it.
+        assert_eq!(
+            rewind(&pool, &chat, Rewind::Regenerate(None))
+                .await
+                .expect("db"),
+            Some(false)
+        );
+        assert_eq!(said(&pool, &chat).await, ["hey"]);
     }
 
     #[tokio::test]

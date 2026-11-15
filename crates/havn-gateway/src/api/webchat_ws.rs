@@ -212,11 +212,23 @@ async fn serve_session<Si, St, E>(
                 continue;
             }
         };
-        let (user_text, conversation) = match parsed {
+        let (user_text, conversation, branch) = match parsed {
             ClientMessage::Send {
                 content,
                 conversation,
-            } => (content, chat_id(conversation)),
+                edit,
+            } => (
+                content,
+                chat_id(conversation),
+                chat_id(edit).map(|turn| havn_core::Branch::Edit { turn }),
+            ),
+            ClientMessage::Regenerate { conversation, turn } => (
+                String::new(),
+                chat_id(conversation),
+                Some(havn_core::Branch::Regenerate {
+                    turn: chat_id(turn),
+                }),
+            ),
             ClientMessage::Decide {
                 id,
                 approve,
@@ -242,6 +254,7 @@ async fn serve_session<Si, St, E>(
 
         let inbound = InboundMessage {
             conversation,
+            branch,
             channel_id: session_id.to_string(),
             sender_id: sender_id.to_string(),
             channel: "webchat".into(),

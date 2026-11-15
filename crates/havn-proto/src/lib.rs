@@ -385,6 +385,13 @@ pub enum DataQuery {
         conversation: String,
         title: String,
     },
+    /// Continue chat `conversation` of `channel_id` from the branch of
+    /// `turn`, at its newest turn: `{"found": bool}`.
+    SwitchBranch {
+        channel_id: String,
+        conversation: String,
+        turn: String,
+    },
     /// Delete chat `conversation` of `channel_id` and its history, stopping
     /// its turn and dropping its queue: `{"found": bool}`.
     DeleteChat {

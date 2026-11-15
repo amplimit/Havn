@@ -469,6 +469,8 @@ An agent answers one message at a time per conversation. A message sent while it
 
 Each user has several chats with an agent. The dashboard chat lists them next to the conversation, most recent first, titled after their first message: "new chat" starts another, and a chat can be renamed or deleted (with its messages). In a channel conversation, `/new` (or `/new@botname`) starts a new chat; the earlier one is kept. Chats keep their own history, queue, stop button and "approve for this conversation" approvals, and a task the agent schedules in a chat reports there and keeps its results in that chat's history; `/stop` in a channel stops the reply running in any of the sender's chats. Deleting a chat stops its reply and drops its waiting messages; the agent's memory is shared by all of them, and `memory_search` finds past messages of every chat. History from before chats existed became each conversation's first chat.
 
+In the dashboard chat, a message can be edited and a reply regenerated. Either starts a branch: the messages after that point stay stored on their own branch, `‹ 2/3 ›` under a message switches between its versions, and the agent sees only the branch on screen. In a channel conversation, `/retry` (or `/retry@botname`) answers the last message again. A branch does not undo what tools already did: files written, messages sent and memories saved stay.
+
 ### Invite codes
 
 Instead of adding every team member to `allow_from` and restarting the gateway, an operator can hand out one-time invite codes for an `allowlist` account:
