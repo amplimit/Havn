@@ -618,6 +618,13 @@ export const api = {
         `/agents/${agentId}/memory/${encodeURIComponent(key)}`,
         { method: "DELETE" },
       ),
+    /** Undo a change a chat showed: take entry `after` out and bring
+     * entry `before` back. 409 when the memory changed since. */
+    undo: (agentId: string, key: string, before?: string, after?: string) =>
+      request<void>(`/agents/${agentId}/memory/${encodeURIComponent(key)}/undo`, {
+        method: "POST",
+        body: JSON.stringify({ before: before ?? null, after: after ?? null }),
+      }),
     /** Add or edit the memory under `key`, as something the user said. */
     save: (
       agentId: string,

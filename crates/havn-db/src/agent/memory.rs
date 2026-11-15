@@ -251,7 +251,7 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
             // user later writes/archives the same key again.
             sqlx::query(
                 "UPDATE memory \
-                 SET key = key || '@archived:' || strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                 SET key = key || '@archived:' || strftime('%Y-%m-%dT%H:%M:%fZ', 'now') || ':' || id \
                  WHERE id = ?1",
             )
             .bind(&old_id)
@@ -265,7 +265,7 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
         Some((archived_id, _, _, Some(_), _, _)) => {
             sqlx::query(
                 "UPDATE memory \
-                 SET key = key || '@reactivated:' || strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                 SET key = key || '@reactivated:' || strftime('%Y-%m-%dT%H:%M:%fZ', 'now') || ':' || id \
                  WHERE id = ?1",
             )
             .bind(&archived_id)
@@ -524,6 +524,60 @@ pub async fn get(pool: &SqlitePool, key: &str) -> Result<Option<Entry>> {
     fetch_one(pool, "WHERE key = ?1 AND archived_at IS NULL", &[key]).await
 }
 
+/// Undo a change to `key` (issue #105): take active row `after` out (the
+/// entry the change wrote; `None` when it forgot one) and bring archived
+/// row `before` back under `key` (the entry it replaced or forgot), as it
+/// was. False, and nothing changed, when `key` changed since: `after` is
+/// no longer its active row (or, without one, it has an active row), or
+/// `before` is not an archived row of it.
+pub async fn undo(
+    pool: &SqlitePool,
+    key: &str,
+    after: Option<&str>,
+    before: Option<&str>,
+) -> Result<bool> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let active: Option<String> =
+        sqlx::query_scalar("SELECT id FROM memory WHERE key = ?1 AND archived_at IS NULL")
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if active.as_deref() != after {
+        return Ok(false);
+    }
+    if let Some(before) = before {
+        let archived: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM memory WHERE id = ?1 AND archived_at IS NOT NULL \
+             AND substr(key, 1, length(?2) + 1) = ?2 || '@'",
+        )
+        .bind(before)
+        .bind(key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if archived.is_none() {
+            return Ok(false);
+        }
+    }
+    if let Some(after) = after {
+        sqlx::query(
+            "UPDATE memory SET archived_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+             key = key || '@undone:' || strftime('%Y-%m-%dT%H:%M:%fZ', 'now') || ':' || id WHERE id = ?1",
+        )
+        .bind(after)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if let Some(before) = before {
+        sqlx::query("UPDATE memory SET archived_at = NULL, key = ?2 WHERE id = ?1")
+            .bind(before)
+            .bind(key)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
 /// Whether `key` holds an entry or ever did: active, replaced, forgotten
 /// or expired (their keys carry an `@...` suffix).
 pub async fn key_known(pool: &SqlitePool, key: &str) -> Result<bool> {
@@ -564,7 +618,7 @@ pub async fn forget(pool: &SqlitePool, key: &str) -> Result<bool> {
     let res = sqlx::query(
         "UPDATE memory \
          SET archived_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
-             key         = key || '@forgotten:' || strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             key         = key || '@forgotten:' || strftime('%Y-%m-%dT%H:%M:%fZ', 'now') || ':' || id \
          WHERE key = ?1 AND archived_at IS NULL",
     )
     .bind(key)
@@ -1261,6 +1315,92 @@ mod tests {
         let (old_key, old_archived) = archived.expect("old row exists");
         assert!(old_key.starts_with("user.employer@archived:"));
         assert!(old_archived.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_change_is_undone_by_its_rows() {
+        let pool = connect_in_memory().await.expect("connect");
+        let entry = |value| NewEntry {
+            key: "pref.editor",
+            value,
+            kind: Kind::Preference,
+            source: Source::UserTold,
+            ttl_days: Some(400),
+        };
+        let long = "v".repeat(3000);
+        let vim = remember(&pool, entry(&long)).await.expect("vim");
+        let emacs = remember(&pool, entry("emacs")).await.expect("emacs");
+        // Undo the replacement: the old row comes back whole, lifetime and all.
+        assert!(
+            undo(&pool, "pref.editor", Some(&emacs), Some(&vim))
+                .await
+                .expect("undo")
+        );
+        let row = get(&pool, "pref.editor").await.expect("get").expect("row");
+        assert_eq!(row.id, vim);
+        assert_eq!(row.value, long);
+        assert_eq!(row.ttl_days, Some(400));
+        // A second undo of the same change finds the key changed.
+        assert!(
+            !undo(&pool, "pref.editor", Some(&emacs), Some(&vim))
+                .await
+                .expect("again")
+        );
+
+        // Undo a forget.
+        assert!(forget(&pool, "pref.editor").await.expect("forget"));
+        assert!(
+            undo(&pool, "pref.editor", None, Some(&vim))
+                .await
+                .expect("undo")
+        );
+        assert_eq!(
+            get(&pool, "pref.editor")
+                .await
+                .expect("get")
+                .expect("row")
+                .id,
+            vim
+        );
+
+        // A later write wins over an old undo.
+        let helix = remember(&pool, entry("helix")).await.expect("helix");
+        let zed = remember(&pool, entry("zed")).await.expect("zed");
+        assert!(
+            !undo(&pool, "pref.editor", Some(&helix), Some(&vim))
+                .await
+                .expect("stale")
+        );
+        assert_eq!(
+            get(&pool, "pref.editor")
+                .await
+                .expect("get")
+                .expect("row")
+                .id,
+            zed
+        );
+        // Another key's row is not taken.
+        assert!(
+            !undo(&pool, "pref.edit", None, Some(&vim))
+                .await
+                .expect("other key")
+        );
+        // Undo a new key's save: nothing comes back.
+        let new = remember(
+            &pool,
+            NewEntry {
+                key: "pref.font",
+                ..entry("Iosevka")
+            },
+        )
+        .await
+        .expect("font");
+        assert!(
+            undo(&pool, "pref.font", Some(&new), None)
+                .await
+                .expect("undo")
+        );
+        assert!(get(&pool, "pref.font").await.expect("get").is_none());
     }
 
     #[tokio::test]

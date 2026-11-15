@@ -8,7 +8,6 @@ import {
   type ChatSummary,
   type ConversationTurn,
   type EmbeddingStatus,
-  type MemoryKind,
   type MeView,
 } from "@/lib/api";
 import { openChat, type ChatHandle } from "@/lib/websocket";
@@ -42,8 +41,10 @@ type Bubble = {
   /** The stored turn it shows, with its versions; absent until stored. */
   turn?: string;
   versions?: string[];
-  /** A note of what a reply saved to or forgot from memory. */
+  /** A note of what a reply saved to or forgot from memory, and that
+   * reply's stored turn, which it stays under. */
   memory?: MemoryChange[];
+  anchor?: string;
 };
 
 const AGENT_POLL_MS = 5000;
@@ -84,12 +85,21 @@ function mergeStored(prev: Bubble[], fetched: Bubble[], since: number): Bubble[]
   const shown = new Map(prev.flatMap((b) => (b.turn ? [[b.turn, b.id] as const] : [])));
   const stored = fetched.map((s) => (s.turn && shown.has(s.turn) ? { ...s, id: shown.get(s.turn)! } : s));
   const recent = stored.filter((s) => s.ts >= since - CLOCK_SKEW_MS);
-  const kept = prev.filter(
-    (b) =>
-      b.role === "system" ||
-      (b.ts >= since && !recent.some((s) => s.role === b.role && s.content === b.content)),
-  );
+  const kept = prev
+    .filter(
+      (b) =>
+        b.role === "system" ||
+        (b.ts >= since && !recent.some((s) => s.role === b.role && s.content === b.content)),
+    )
+    .map((b) => underAnchor(b, stored));
   return [...stored, ...kept].sort((a, b) => a.ts - b.ts);
+}
+
+// A memory note goes right under the reply it came with, whatever the
+// browser's clock says.
+function underAnchor(b: Bubble, stored: Bubble[]): Bubble {
+  const reply = b.anchor ? stored.find((s) => s.turn === b.anchor) : undefined;
+  return reply ? { ...b, ts: reply.ts + 0.5 } : b;
 }
 
 export default function ChatPage({
@@ -319,6 +329,7 @@ export default function ChatPage({
                 content: "",
                 ts: Date.now(),
                 memory: msg.changes,
+                anchor: msg.turn,
               },
             ]);
             return;
@@ -438,7 +449,15 @@ export default function ChatPage({
       const r = await api.conversation.list(id, HISTORY_LIMIT, current);
       if (chatIdRef.current !== current) return;
       const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
-      setBubbles((prev) => [...stored, ...prev.filter((b) => b.role === "system")].sort((a, b) => a.ts - b.ts));
+      // Notes of replies on other branches stay with them.
+      setBubbles((prev) =>
+        [
+          ...stored,
+          ...prev
+            .filter((b) => b.role === "system" && (!b.anchor || stored.some((s) => s.turn === b.anchor)))
+            .map((b) => underAnchor(b, stored)),
+        ].sort((a, b) => a.ts - b.ts),
+      );
     } catch (e) {
       pushBubble("system", `error: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -980,15 +999,9 @@ function MemoryChangeLine({ agentId, change }: { agentId: string; change: Memory
     setState("undoing");
     setError(null);
     try {
-      if (saved) {
-        await api.memory.forget(agentId, change.key);
-      } else {
-        await api.memory.save(agentId, change.key, {
-          value: change.value,
-          kind: change.kind as MemoryKind,
-          expiry: "kind_default",
-        });
-      }
+      // By row: the entry as it was comes back, and only if nothing
+      // changed the key since.
+      await api.memory.undo(agentId, change.key, change.before, change.after);
       setState("undone");
     } catch (e) {
       setState("shown");
@@ -1007,14 +1020,20 @@ function MemoryChangeLine({ agentId, change }: { agentId: string; change: Memory
         </span>
       </span>
       {state === "undone" ? (
-        <span>{saved ? "(forgotten again)" : "(restored)"}</span>
+        <span>(undone)</span>
       ) : (
         <button
           type="button"
           className="underline disabled:opacity-40"
           onClick={() => void undo()}
           disabled={state === "undoing"}
-          title={saved ? "Forget this memory" : "Save it back as something you said"}
+          title={
+            saved
+              ? change.before
+                ? "Put back what it replaced"
+                : "Forget this memory"
+              : "Bring it back as it was"
+          }
         >
           {state === "undoing" ? "undoing…" : "undo"}
         </button>

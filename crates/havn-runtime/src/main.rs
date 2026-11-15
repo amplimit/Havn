@@ -1724,14 +1724,21 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     // exist only in-memory for this iteration).
     // Under the turn it answers, also when the user moved to another
     // branch meanwhile.
-    match conversations::record_reply(&ctx.pool, &chat, &answered, &final_text).await {
-        // Facts are flushed to memory from the owner's dashboard chats only:
-        // memory is the agent's, and a channel may be someone else.
-        Ok(Some(_)) => summarize_when_due(&ctx, &chat, msg.channel == "webchat"),
-        // The chat was deleted while it ran: its reply goes nowhere.
-        Ok(None) => return,
-        Err(e) => warn!(error = %e, "could not persist assistant turn"),
-    }
+    let reply_turn =
+        match conversations::record_reply(&ctx.pool, &chat, &answered, &final_text).await {
+            // Facts are flushed to memory from the owner's dashboard chats only:
+            // memory is the agent's, and a channel may be someone else.
+            Ok(Some(turn)) => {
+                summarize_when_due(&ctx, &chat, msg.channel == "webchat");
+                Some(turn)
+            }
+            // The chat was deleted while it ran: its reply goes nowhere.
+            Ok(None) => return,
+            Err(e) => {
+                warn!(error = %e, "could not persist assistant turn");
+                None
+            }
+        };
 
     let outbound = OutboundMessage {
         conversation: Some(chat.clone()),
@@ -1746,15 +1753,16 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     {
         error!(error = ?e, "failed to enqueue OutboundMessage");
     }
-    let changes = std::mem::take(
+    let changes = tools::memory::changes(std::mem::take(
         &mut *memory_changes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
-    );
+    ));
     if !changes.is_empty() {
         let frame = AgentToGateway::MemoryChanged(havn_proto::MemoryChanged {
             channel_id: msg.channel_id,
             conversation: Some(chat),
+            turn: reply_turn,
             changes,
         });
         if let Err(e) = ctx.writer_tx.send(frame).await {
@@ -2284,6 +2292,12 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                     ctx.turns.discard(&conversation);
                 }
                 Ok(serde_json::json!({ "found": found }))
+            }
+            DataQuery::UndoMemory { key, before, after } => {
+                let undone = memory::undo(&ctx.pool, &key, after.as_deref(), before.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({ "undone": undone }))
             }
             DataQuery::Remember {
                 key,

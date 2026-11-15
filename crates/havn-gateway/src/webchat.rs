@@ -157,6 +157,9 @@ pub enum ServerMessage {
     Memory {
         #[serde(skip_serializing_if = "Option::is_none")]
         conversation: Option<String>,
+        /// The reply's stored turn: the note goes under it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn: Option<String>,
         changes: Vec<havn_proto::MemoryChange>,
     },
 }
@@ -371,9 +374,14 @@ impl WebChatRouter {
                     .take(havn_proto::MAX_MEMORY_CHANGE_CHARS)
                     .collect();
                 change.kind = change.kind.chars().take(32).collect();
+                // Row ids are UUIDs; anything else cannot be undone.
+                let row = |id: Option<String>| id.filter(|id| id.len() <= 64);
+                change.before = row(change.before);
+                change.after = row(change.after);
                 change
             })
             .collect();
+        let turn = changed.turn.filter(|t| t.len() <= 64);
         let conversation = changed
             .conversation
             .filter(|c| c.len() <= MAX_CONVERSATION_ID);
@@ -382,6 +390,7 @@ impl WebChatRouter {
             session_id,
             ServerMessage::Memory {
                 conversation,
+                turn,
                 changes,
             },
         )
@@ -616,10 +625,13 @@ mod tests {
             key: format!("k{n}"),
             value: "v".repeat(2000),
             kind: "preference".into(),
+            before: None,
+            after: Some(format!("row{n}")),
         };
         let changed = havn_proto::MemoryChanged {
             channel_id: session_id.to_string(),
             conversation: Some("c".repeat(65)),
+            turn: Some("t".into()),
             changes: (0..30).map(change).collect(),
         };
         router
@@ -629,8 +641,11 @@ mod tests {
         match rx.recv().await.expect("frame") {
             ServerMessage::Memory {
                 conversation,
+                turn,
                 changes,
             } => {
+                assert_eq!(turn.as_deref(), Some("t"));
+                assert_eq!(changes[3].after.as_deref(), Some("row3"));
                 assert!(conversation.is_none(), "an oversized chat id is dropped");
                 assert_eq!(changes.len(), havn_proto::MAX_MEMORY_CHANGES);
                 assert_eq!(
