@@ -151,35 +151,75 @@ pub struct NewEntry<'a> {
 ///   archived row stays archived (audit) but the agent's view is
 ///   single-valued again.
 ///
+/// - **The agent repeats what the user said** (same value and kind, the
+///   row `user_told`, the caller `agent_inferred` with no `ttl_days`) →
+///   the row stays `user_told` with its lifetime: repeating a fact does
+///   not undo what the user set.
+///
 /// Returns the active row's id after the write — capture this and
 /// pass it to [`set_embedding_by_id`] so a concurrent
 /// `remember(same_key, different_value)` can't have its archive +
 /// re-insert sequence steal your row out from under you.
-#[allow(clippy::explicit_auto_deref)]
 pub async fn remember(pool: &SqlitePool, new: NewEntry<'_>) -> Result<String> {
-    let ttl = new
-        .ttl_days
-        .or_else(|| new.kind.default_ttl_days(new.source));
+    let ttl = match new.ttl_days {
+        Some(days) => Ttl::Set(Some(days)),
+        None => Ttl::KindDefault,
+    };
+    write(pool, new, ttl).await
+}
+
+/// [`remember`], kept until it is forgotten whatever its kind
+/// (`new.ttl_days` is ignored).
+pub async fn remember_until_forgotten(pool: &SqlitePool, new: NewEntry<'_>) -> Result<String> {
+    write(pool, new, Ttl::Set(None)).await
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Ttl {
+    KindDefault,
+    Set(Option<i64>),
+}
+
+#[allow(clippy::explicit_auto_deref)]
+async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<String> {
+    let ttl = match ttl_choice {
+        Ttl::Set(ttl) => ttl,
+        Ttl::KindDefault => new.kind.default_ttl_days(new.source),
+    };
     let mut tx = pool.begin().await?;
 
     // Look up the current row (if any) for this key. We need its id to
     // either UPDATE in place (idempotent reinforcement) or to set as
     // supersedes_id on a fresh INSERT.
-    let existing: Option<(String, String, String, Option<DateTime<Utc>>)> =
-        sqlx::query_as::<_, (String, String, String, Option<DateTime<Utc>>)>(
-            "SELECT id, value, kind, archived_at FROM memory WHERE key = ?1",
-        )
-        .bind(new.key)
-        .fetch_optional(&mut *tx)
-        .await?;
+    #[allow(clippy::type_complexity)]
+    let existing: Option<(
+        String,
+        String,
+        String,
+        Option<DateTime<Utc>>,
+        String,
+        Option<i64>,
+    )> = sqlx::query_as(
+        "SELECT id, value, kind, archived_at, source, ttl_days FROM memory WHERE key = ?1",
+    )
+    .bind(new.key)
+    .fetch_optional(&mut *tx)
+    .await?;
 
     match existing {
-        // Active + value/kind unchanged → idempotent refresh. If the
-        // caller didn't supply an explicit ttl_days, recompute from the
-        // (possibly upgraded) source so that promoting an
-        // agent_inferred row to user_told extends its lifetime per
-        // §9.4. Caller-supplied TTL still wins.
-        Some((_id, ref v, ref k, None)) if v == new.value && k == new.kind.as_str() => {
+        // Active + value/kind unchanged → idempotent refresh. Without an
+        // explicit lifetime it follows the (possibly upgraded) source, so
+        // promoting an agent_inferred row to user_told extends it per
+        // §9.4; the agent repeating a user_told fact changes neither.
+        Some((_id, ref v, ref k, None, ref was, kept))
+            if v == new.value && k == new.kind.as_str() =>
+        {
+            let told = was == Source::UserTold.as_str();
+            let (source, ttl) = if told && new.source == Source::AgentInferred {
+                (Source::UserTold, kept)
+            } else {
+                (new.source, ttl)
+            };
             sqlx::query(
                 "UPDATE memory \
                  SET source     = ?1, \
@@ -187,7 +227,7 @@ pub async fn remember(pool: &SqlitePool, new: NewEntry<'_>) -> Result<String> {
                      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
                  WHERE key = ?3",
             )
-            .bind(new.source.as_str())
+            .bind(source.as_str())
             .bind(ttl)
             .bind(new.key)
             .execute(&mut *tx)
@@ -195,7 +235,7 @@ pub async fn remember(pool: &SqlitePool, new: NewEntry<'_>) -> Result<String> {
         }
         // Active row whose content has changed → archive it, INSERT
         // replacement with supersedes link.
-        Some((old_id, _, _, None)) => {
+        Some((old_id, _, _, None, _, _)) => {
             sqlx::query(
                 "UPDATE memory \
                  SET archived_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
@@ -222,7 +262,7 @@ pub async fn remember(pool: &SqlitePool, new: NewEntry<'_>) -> Result<String> {
         // Only archived rows for this key — suffix the archived row's
         // key so the UNIQUE(key) constraint stays satisfied, then INSERT
         // the new active row linked to it.
-        Some((archived_id, _, _, Some(_))) => {
+        Some((archived_id, _, _, Some(_), _, _)) => {
             sqlx::query(
                 "UPDATE memory \
                  SET key = key || '@reactivated:' || strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
@@ -238,21 +278,14 @@ pub async fn remember(pool: &SqlitePool, new: NewEntry<'_>) -> Result<String> {
         }
     }
 
-    tx.commit().await?;
-    // Read back the active row's id under the same key. The transaction
-    // above committed, so this read is durable + race-free wrt our own
-    // write. A concurrent writer could supersede this row between commit
-    // and read — caller's set_embedding_by_id then becomes a no-op
-    // (correct: the new row will get its own embedding when it's
-    // remembered). The audit-fix point is "don't write embedding to a
-    // key whose row identity may have changed", which the by-id path
-    // honours.
+    // The active row's id, read in the same transaction: a concurrent
+    // write to the key cannot hand back its row instead.
     let id: String =
         sqlx::query_scalar("SELECT id FROM memory WHERE key = ?1 AND archived_at IS NULL")
             .bind(new.key)
-            .fetch_one(pool)
-            .await
-            .unwrap_or_else(|_| String::new());
+            .fetch_one(&mut *tx)
+            .await?;
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -276,17 +309,6 @@ async fn insert_new(
     .execute(tx)
     .await?;
     Ok(())
-}
-
-/// Set how many days active row `id` is kept once unused; `None` keeps
-/// it until it is forgotten. False when there is no such active row.
-pub async fn set_ttl_by_id(pool: &SqlitePool, id: &str, ttl_days: Option<i64>) -> Result<bool> {
-    let res = sqlx::query("UPDATE memory SET ttl_days = ?2 WHERE id = ?1 AND archived_at IS NULL")
-        .bind(id)
-        .bind(ttl_days)
-        .execute(pool)
-        .await?;
-    Ok(res.rows_affected() > 0)
 }
 
 /// Persist an embedding vector for a specific row id. Pin-by-id
@@ -1227,6 +1249,50 @@ mod tests {
         let (old_key, old_archived) = archived.expect("old row exists");
         assert!(old_key.starts_with("user.employer@archived:"));
         assert!(old_archived.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_agent_repeating_what_the_user_said_keeps_it_theirs() {
+        let pool = connect_in_memory().await.expect("connect");
+        let told = NewEntry {
+            key: "trip.dates",
+            value: "May 3 to 9",
+            kind: Kind::Event,
+            source: Source::UserTold,
+            ttl_days: None,
+        };
+        let id = remember_until_forgotten(&pool, told.clone())
+            .await
+            .expect("save");
+        let again = remember(
+            &pool,
+            NewEntry {
+                source: Source::AgentInferred,
+                ..told.clone()
+            },
+        )
+        .await
+        .expect("repeat");
+        assert_eq!(again, id);
+        let row = get(&pool, "trip.dates").await.expect("get").expect("row");
+        assert_eq!(row.source, Source::UserTold);
+        assert_eq!(row.ttl_days, None);
+
+        // The user choosing a lifetime again is applied.
+        remember(
+            &pool,
+            NewEntry {
+                ttl_days: Some(7),
+                ..told.clone()
+            },
+        )
+        .await
+        .expect("days");
+        let row = get(&pool, "trip.dates").await.expect("get").expect("row");
+        assert_eq!(row.ttl_days, Some(7));
+        remember(&pool, told).await.expect("default");
+        let row = get(&pool, "trip.dates").await.expect("get").expect("row");
+        assert_eq!(row.ttl_days, Kind::Event.default_ttl_days(Source::UserTold));
     }
 
     #[tokio::test]

@@ -2024,7 +2024,6 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                 expiry,
             } => {
                 havn_proto::check_memory(&key, &value, expiry)?;
-                let key = key.trim();
                 let kind = memory::Kind::parse(&memory_kind)
                     .ok_or_else(|| format!("unknown memory kind {memory_kind:?}"))?;
                 let ttl_days = match expiry {
@@ -2032,9 +2031,10 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                     havn_proto::MemoryExpiry::KindDefault | havn_proto::MemoryExpiry::Never => None,
                 };
                 let (id, _) = tools::memory::save(
+                    expiry == havn_proto::MemoryExpiry::Never,
                     &ctx.tool_env,
                     memory::NewEntry {
-                        key,
+                        key: &key,
                         value: &value,
                         kind,
                         source: memory::Source::UserTold,
@@ -2043,11 +2043,6 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-                if expiry == havn_proto::MemoryExpiry::Never {
-                    memory::set_ttl_by_id(&ctx.pool, &id, None)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
                 let entry = memory::fetch_by_id(&ctx.pool, &id)
                     .await
                     .map_err(|e| e.to_string())?

@@ -23,7 +23,7 @@ const SEARCH_LIMIT: u32 = 10;
 
 /// Cap on `value` length per row. 4 KB is generous for a single fact and
 /// keeps any one row from dominating the FTS5 token budget.
-const MAX_VALUE_BYTES: usize = 4096;
+const MAX_VALUE_BYTES: usize = havn_proto::MAX_MEMORY_VALUE_BYTES;
 
 pub struct MemoryRememberTool;
 
@@ -106,6 +106,7 @@ impl Tool for MemoryRememberTool {
         }
 
         let (_, truncated) = match save(
+            false,
             ctx,
             NewEntry {
                 key,
@@ -132,34 +133,43 @@ impl Tool for MemoryRememberTool {
 
 /// Save `new` as the active entry for its key, cutting a value over
 /// [`MAX_VALUE_BYTES`] with a marker, and embed it when an embedder is
-/// wired: the row's id, and whether the value was cut. What the
-/// `memory_remember` tool and the dashboard save go through.
-pub async fn save(ctx: &ToolCtx, new: NewEntry<'_>) -> havn_db::Result<(String, bool)> {
+/// wired: the row's id, and whether the value was cut. With
+/// `until_forgotten` it never expires (`new.ttl_days` is ignored). What
+/// the `memory_remember` tool and the dashboard save go through.
+pub async fn save(
+    until_forgotten: bool,
+    ctx: &ToolCtx,
+    new: NewEntry<'_>,
+) -> havn_db::Result<(String, bool)> {
     // Truncate-with-marker rather than reject: the agent can still write
     // the important prefix and sees in the result that it was cut.
     let (stored_value, truncated) = if new.value.len() > MAX_VALUE_BYTES {
-        let mut head: String = new
+        const MARKER: &str = "\n…(truncated to fit memory entry size cap)";
+        let room = MAX_VALUE_BYTES - MARKER.len();
+        let end = new
             .value
-            .chars()
-            .take(MAX_VALUE_BYTES.saturating_sub(64))
-            .collect();
-        head.push_str("\n…(truncated to fit memory entry size cap)");
-        (head, true)
+            .char_indices()
+            .map(|(i, c)| i + c.len_utf8())
+            .take_while(|&end| end <= room)
+            .last()
+            .unwrap_or(0);
+        (format!("{}{MARKER}", &new.value[..end]), true)
     } else {
         (new.value.to_string(), false)
     };
     let key = new.key;
-    let row_id = memory::remember(
-        &ctx.agent_db,
-        NewEntry {
-            key,
-            value: &stored_value,
-            kind: new.kind,
-            source: new.source,
-            ttl_days: new.ttl_days,
-        },
-    )
-    .await?;
+    let entry = NewEntry {
+        key,
+        value: &stored_value,
+        kind: new.kind,
+        source: new.source,
+        ttl_days: new.ttl_days,
+    };
+    let row_id = if until_forgotten {
+        memory::remember_until_forgotten(&ctx.agent_db, entry).await?
+    } else {
+        memory::remember(&ctx.agent_db, entry).await?
+    };
 
     // Hybrid retrieval (spec §9.4 v0.7): embed `"<key>: <value>"`, pinned
     // to the row id so a concurrent write to the same key cannot get this
@@ -694,6 +704,38 @@ mod tests {
             .execute(&ctx, json!({"query": "京都"}))
             .await;
         assert!(r.is_error(), "outside a chat: {}", r.text());
+    }
+
+    #[tokio::test]
+    async fn a_value_over_the_cap_is_cut_by_bytes() {
+        let ctx = ctx().await;
+        let new = |value| NewEntry {
+            key: "k",
+            value,
+            kind: Kind::Preference,
+            source: Source::UserTold,
+            ttl_days: None,
+        };
+        // 1500 three-byte characters: 4500 bytes, over the cap.
+        let long = "字".repeat(1500);
+        let (_, cut) = save(false, &ctx, new(&long)).await.expect("save");
+        assert!(cut);
+        let row = memory::get(&ctx.agent_db, "k")
+            .await
+            .expect("get")
+            .expect("row");
+        assert!(row.value.len() <= MAX_VALUE_BYTES, "{}", row.value.len());
+        assert!(row.value.ends_with("size cap)"));
+        // 1300 of them fit: kept whole, without a marker.
+        let fits = "字".repeat(1300);
+        let (_, cut) = save(true, &ctx, new(&fits)).await.expect("save");
+        assert!(!cut);
+        let row = memory::get(&ctx.agent_db, "k")
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.value, fits);
+        assert_eq!(row.ttl_days, None);
     }
 
     #[test]

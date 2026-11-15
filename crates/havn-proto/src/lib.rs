@@ -411,7 +411,10 @@ pub enum DataQuery {
 }
 
 /// Longest memory key the dashboard can save.
-pub const MAX_MEMORY_KEY_CHARS: usize = 120;
+pub const MAX_MEMORY_KEY_CHARS: usize = 256;
+/// Largest memory text, in bytes of UTF-8. The agent cuts what it saves
+/// to this; the dashboard is refused more.
+pub const MAX_MEMORY_VALUE_BYTES: usize = 4096;
 /// Longest a memory saved in the dashboard is kept unused, in days.
 pub const MAX_MEMORY_DAYS: u32 = 3650;
 
@@ -419,8 +422,8 @@ pub const MAX_MEMORY_DAYS: u32 = 3650;
 /// The gateway answers with it before asking the agent, which checks
 /// again.
 pub fn check_memory(key: &str, value: &str, expiry: MemoryExpiry) -> Result<(), String> {
-    let key = key.trim();
-    if key.is_empty()
+    // A key of dots would be a dot segment in the entry's URL.
+    if key.trim().trim_matches('.').is_empty()
         || key.chars().count() > MAX_MEMORY_KEY_CHARS
         || key.chars().any(char::is_control)
     {
@@ -431,6 +434,12 @@ pub fn check_memory(key: &str, value: &str, expiry: MemoryExpiry) -> Result<(), 
     }
     if value.trim().is_empty() {
         return Err("the memory has no text".into());
+    }
+    if value.len() > MAX_MEMORY_VALUE_BYTES {
+        return Err(format!(
+            "a memory has at most {MAX_MEMORY_VALUE_BYTES} bytes of text; this one has {}",
+            value.len()
+        ));
     }
     if let MemoryExpiry::Days(days) = expiry
         && !(1..=MAX_MEMORY_DAYS).contains(&days)
@@ -720,7 +729,11 @@ mod tests {
     fn a_memory_the_user_saves_is_checked() {
         assert!(check_memory("user.name", "Ada", MemoryExpiry::KindDefault).is_ok());
         assert!(check_memory("  ", "Ada", MemoryExpiry::Never).is_err());
-        assert!(check_memory(&"k".repeat(121), "Ada", MemoryExpiry::Never).is_err());
+        assert!(check_memory(&"k".repeat(257), "Ada", MemoryExpiry::Never).is_err());
+        assert!(check_memory("..", "Ada", MemoryExpiry::Never).is_err());
+        assert!(check_memory(" padded ", "Ada", MemoryExpiry::Never).is_ok());
+        assert!(check_memory("k", &"字".repeat(1366), MemoryExpiry::Never).is_err());
+        assert!(check_memory("k", &"字".repeat(1365), MemoryExpiry::Never).is_ok());
         assert!(check_memory("a\nb", "Ada", MemoryExpiry::Never).is_err());
         assert!(check_memory("k", " \n", MemoryExpiry::Never).is_err());
         assert!(check_memory("k", "v", MemoryExpiry::Days(0)).is_err());

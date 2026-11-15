@@ -28,7 +28,18 @@ const KIND_HINT: Record<MemoryKind, string> = {
 };
 
 /** Longest memory key the gateway accepts. */
-const MAX_KEY_CHARS = 120;
+const MAX_KEY_CHARS = 256;
+/** Entries loaded, and exported: the most the gateway lists. */
+const LIST_LIMIT = 1000;
+
+/** Days a kind keeps an unused entry by default, by source (null: until
+ * forgotten); mirrors `Kind::default_ttl_days` in havn-db. */
+const DEFAULT_DAYS: Record<MemoryKind, Record<MemoryEntry["source"], number | null>> = {
+  identity: { user_told: null, agent_inferred: null },
+  preference: { user_told: null, agent_inferred: 180 },
+  project: { user_told: 180, agent_inferred: 90 },
+  event: { user_told: 90, agent_inferred: 30 },
+};
 
 /**
  * `/agents/[id]/memory` — view, edit, add and export what the agent
@@ -59,7 +70,7 @@ export default function MemoryPage({
 
   async function load() {
     try {
-      const r = await api.memory.list(id);
+      const r = await api.memory.list(id, undefined, LIST_LIMIT);
       setEntries(r.entries);
       setUninitialised(r.uninitialised);
       setError(null);
@@ -71,7 +82,7 @@ export default function MemoryPage({
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const r = await api.memory.list(id).catch((e) => {
+      const r = await api.memory.list(id, undefined, LIST_LIMIT).catch((e) => {
         if (!cancelled)
           setError(e instanceof Error ? e.message : String(e));
         return null;
@@ -120,15 +131,17 @@ export default function MemoryPage({
   }
 
   // Save an added or edited memory; the error, if any, for the form.
+  // Only the form that saved closes.
   async function onSave(
     key: string,
     entry: { value: string; kind: MemoryKind; expiry: MemoryExpiry },
+    added: boolean,
   ): Promise<string | null> {
     try {
       await api.memory.save(id, key, entry);
       await load();
-      setEditing(null);
-      setAdding(false);
+      if (added) setAdding(false);
+      else setEditing((current) => (current === key ? null : current));
       return null;
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
@@ -378,10 +391,12 @@ function lifetime(e: MemoryEntry): string {
   return `forgotten after ${e.ttl_days} day${e.ttl_days === 1 ? "" : "s"} unused`;
 }
 
-function expiryOf(e: MemoryEntry | undefined): { mode: "kind_default" | "never" | "days"; days: number } {
-  if (!e) return { mode: "kind_default", days: 30 };
-  if (e.ttl_days === null) return { mode: "never", days: 30 };
-  return { mode: "days", days: e.ttl_days };
+/** The lifetime an edit starts from: the kind's own unless the entry's
+ * differs from what its kind keeps it for. */
+function expiryOf(e: MemoryEntry | undefined): { mode: "kind_default" | "never" | "days"; days: string } {
+  if (!e || e.ttl_days === DEFAULT_DAYS[e.kind][e.source]) return { mode: "kind_default", days: "30" };
+  if (e.ttl_days === null) return { mode: "never", days: "30" };
+  return { mode: "days", days: String(e.ttl_days) };
 }
 
 function MemoryForm({
@@ -394,6 +409,7 @@ function MemoryForm({
   onSave: (
     key: string,
     entry: { value: string; kind: MemoryKind; expiry: MemoryExpiry },
+    added: boolean,
   ) => Promise<string | null>;
   onCancel: () => void;
 }) {
@@ -408,12 +424,17 @@ function MemoryForm({
 
   async function submit(ev: React.FormEvent) {
     ev.preventDefault();
+    const count = Math.round(Number(days));
+    if (mode === "days" && !(count >= 1 && count <= 3650)) {
+      setError("Keep it for 1 to 3650 days.");
+      return;
+    }
     setSaving(true);
-    const expiry: MemoryExpiry = mode === "days" ? { days } : mode;
+    const expiry: MemoryExpiry = mode === "days" ? { days: count } : mode;
     // A new memory without a key gets one; the agent finds memories by
     // what they say, not by key.
     const chosen = key.trim() || `note.${crypto.getRandomValues(new Uint32Array(1))[0].toString(16)}`;
-    const failed = await onSave(chosen, { value, kind, expiry });
+    const failed = await onSave(chosen, { value, kind, expiry }, !entry);
     setSaving(false);
     setError(failed);
   }
@@ -473,7 +494,7 @@ function MemoryForm({
             min={1}
             max={3650}
             value={days}
-            onChange={(e) => setDays(Math.max(1, Math.min(3650, Number(e.target.value) || 1)))}
+            onChange={(e) => setDays(e.target.value)}
           />
         )}
       </div>
@@ -499,8 +520,11 @@ function download(name: string, type: string, text: string) {
   const a = document.createElement("a");
   a.href = url;
   a.download = name;
+  document.body.appendChild(a);
   a.click();
-  URL.revokeObjectURL(url);
+  a.remove();
+  // Some browsers start the download after this returns.
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 function asMarkdown(entries: MemoryEntry[]): string {
