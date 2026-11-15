@@ -4,8 +4,8 @@
 //!
 //! `/agents/{id}/web`: one agent's web access, the `web_search`,
 //! `web_fetch` and egress switches and its own domain lists, in its policy
-//! override. Edits apply on the agent's next start, like every policy
-//! change.
+//! override. The switches apply on the agent's next start; the lists apply
+//! to `web_fetch` at once, as the gateway resolves them on every call.
 //!
 //! `/me/domains`: the caller's own domain lists, added to every agent they
 //! own, beside the blocked domains of their roles and the operator, which
@@ -256,7 +256,8 @@ pub struct MyDomainsView {
     /// The caller's own lists.
     pub allowed_domains: Vec<String>,
     pub blocked_domains: Vec<String>,
-    /// Set by their roles and the operator; they cannot remove these.
+    /// Set by their roles (as for their personal agents; a team agent uses
+    /// its team's role) and the operator; they cannot remove these.
     pub admin_allowed_domains: Vec<String>,
     pub admin_blocked_domains: Vec<String>,
 }

@@ -553,7 +553,12 @@ impl WebFetch {
             return Err(NOT_KNOWN.into());
         }
         let page = match self.cached(agent, &url).await {
-            Some(page) => page,
+            // The page may have come through a redirect to a domain blocked
+            // since.
+            Some(page) => {
+                refuse_blocked(&page.url, call.policy)?;
+                page
+            }
             None => match self.fetch(&url, call.policy).await? {
                 Fetched::Elsewhere { from, to } => {
                     if known {

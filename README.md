@@ -301,7 +301,7 @@ Allowed and blocked domains are set at several levels and only add up: an agent 
 - Team admins set `network_policy.allowed_domains` and `blocked_domains` in a role's policy; they apply to the members' agents. A member in several roles gets the blocked domains of all of them.
 - Each user keeps lists for all their own agents (`GET` and `PUT /me/domains`, or the agent settings page), and each agent has its own (`PATCH /agents/{id}/web` with `allowed_domains` and `blocked_domains`). Neither can remove an entry set above it.
 
-An entry is a domain such as `example.com` (covering its subdomains) or `*.example.com`, in ASCII (punycode for international names), with at least one dot; a list holds at most 500. Lists apply on the agent's next start for the tools the runtime offers, and at once for the gateway's own checks.
+An entry is a domain such as `example.com` (covering its subdomains) or `*.example.com`, in ASCII (punycode for international names), with at least one dot; a list holds at most 500. Lists apply to `web_fetch` at once: the gateway resolves them on every call. If a user's own lists cannot be read, that user's agents cannot use `web_fetch` until they can.
 
 Config edits are picked up live: `allowed_origins`, `[llm] default_model` and `[[llm.models]]` apply in place, while every other change (`listen`, `db_path`, paths, `[[bindings]]`, `[[channels]]`, ...) is logged as needing a `havn gateway restart` to apply — the gateway never restarts itself. Per-agent resource limits come from the agent's role policy, not a global config block.
 

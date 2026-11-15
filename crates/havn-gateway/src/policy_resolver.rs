@@ -253,8 +253,6 @@ pub async fn upgrade_stored_overrides(db: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The owner's policy as it applies to `agent`: their role in the agent's
-/// team for a team agent, else [`for_user`].
 /// The policy `agent` gets from its owner: their role policy (in the
 /// agent's team, if any), with the owner's own domain lists and the
 /// operator's blocked domains added.
@@ -266,7 +264,10 @@ pub async fn for_owner(db: &SqlitePool, agent: &Agent) -> Policy {
     let personal = match havn_db::repo::users::domains(db, agent.owner_id).await {
         Ok(lists) => lists,
         Err(e) => {
-            warn!(user_id = %agent.owner_id, error = %e, "domain list lookup failed; using the role's lists only");
+            // Without the user's blocked domains, reading the web is off
+            // rather than unguarded.
+            warn!(user_id = %agent.owner_id, error = %e, "domain list lookup failed; turning web_fetch off");
+            policy.permissions.can_fetch_web = false;
             havn_db::repo::users::UserDomains::default()
         }
     };

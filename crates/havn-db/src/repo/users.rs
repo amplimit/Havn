@@ -419,7 +419,7 @@ mod tests {
 }
 
 /// A user's own domain lists, added to the policy of every agent they
-/// own (migration 0013).
+/// own (migration 0014).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UserDomains {
     pub allowed_domains: Vec<String>,

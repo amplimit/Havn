@@ -666,7 +666,12 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
               save({ allowed_domains, blocked_domains })
             }
           />
-          <MyDomainsEditor />
+          <MyDomainsEditor
+            onSaved={() => {
+              // The agent's inherited lines include the user's lists.
+              void api.search.agent(agentId).then(setView, () => undefined);
+            }}
+          />
         </div>
       )}
     </section>
@@ -676,7 +681,7 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
 function parseDomains(text: string): string[] {
   return text
     .split(/[\s,]+/)
-    .map((d) => d.trim())
+    .map((d) => d.trim().toLowerCase().replace(/\.$/, ""))
     .filter((d) => d.length > 0);
 }
 
@@ -765,7 +770,7 @@ function DomainLists({
 }
 
 /** The caller's own domain lists, added to every agent they own. */
-function MyDomainsEditor() {
+function MyDomainsEditor({ onSaved }: { onSaved: () => void }) {
   const [view, setView] = useState<MyDomainsView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -788,6 +793,7 @@ function MyDomainsEditor() {
     setError(null);
     try {
       setView(await api.search.putMyDomains({ allowed_domains, blocked_domains }));
+      onSaved();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

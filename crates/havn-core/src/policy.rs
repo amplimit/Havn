@@ -125,16 +125,27 @@ pub fn validate_domains(what: &str, domains: &[String]) -> crate::Result<()> {
         )));
     }
     for entry in domains {
+        // `*` alone is what roles seeded before 0.2.0 hold, from when the
+        // list was a ceiling; it matches nothing now.
+        if entry == "*" {
+            continue;
+        }
         let name = entry.strip_prefix("*.").unwrap_or(entry);
-        // A single label (`com`) would cover a whole top-level domain.
-        let valid = name.contains('.')
+        let labels: Vec<&str> = name.split('.').collect();
+        // A single label (`com`) would cover a whole top-level domain, and
+        // an all-digit last label is an IP address, not a domain.
+        let valid = labels.len() >= 2
             && name.len() <= 253
-            && !name.starts_with(['.', '-'])
-            && name.split('.').all(|label| {
+            && labels.iter().all(|label| {
                 !label.is_empty()
                     && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
                     && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-            });
+            })
+            && labels
+                .last()
+                .is_some_and(|tld| !tld.chars().all(|c| c.is_ascii_digit()));
         if !valid {
             return Err(crate::Error::InvalidPolicy(format!(
                 "{what}: {entry:?} is not a domain such as example.com or *.example.com"
@@ -725,8 +736,9 @@ fn narrow_channels(own: &ChannelAllowance, cap: &ChannelAllowance) -> ChannelAll
 /// `a` followed by the entries of `b` it lacks.
 #[must_use]
 pub fn union(a: &[String], b: &[String]) -> Vec<String> {
+    let mut seen: std::collections::HashSet<&str> = a.iter().map(String::as_str).collect();
     let mut out = a.to_vec();
-    out.extend(b.iter().filter(|x| !a.contains(x)).cloned());
+    out.extend(b.iter().filter(|x| seen.insert(x.as_str())).cloned());
     out
 }
 
@@ -776,18 +788,26 @@ mod tests {
     #[test]
     fn domain_entries_are_validated() {
         let mut p = Policy::default();
-        p.network_policy.allowed_domains = vec!["example.com".into(), "*.docs.rs".into()];
-        assert!(p.validate().is_ok());
+        p.network_policy.allowed_domains = vec![
+            "example.com".into(),
+            "*.docs.rs".into(),
+            "*".into(),
+            "x-1.io".into(),
+        ];
+        assert!(p.validate().is_ok(), "the legacy * is still accepted");
         for bad in [
             "https://example.com",
             "example.com/path",
             "a..b",
             "",
-            "*",
             "com",
             "*.com",
             "ex ample.com",
             "-x.com",
+            "a.-b.com",
+            "a-.com",
+            "1.2.3.4",
+            "0.1",
             "例子.com",
         ] {
             p.network_policy.blocked_domains = vec![bad.into()];
