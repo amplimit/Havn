@@ -19,7 +19,9 @@ use crate::auth::AuthedUser;
 pub struct CreateCronRequest {
     pub name: String,
     pub prompt: String,
-    /// Either `{"interval_seconds": N}` or `{"at": "<RFC3339>"}`.
+    /// `{"interval_seconds": N}`, `{"at": "<RFC3339>"}`, `{"cron": "0 8 * *
+    /// *"}` or `{"every": "daily 08:00"}`; the last two in `timezone`, by
+    /// default the owner's.
     pub schedule: ScheduleInput,
     /// Optional first-run override; when absent, schedules immediately for
     /// `interval` jobs and uses `at` for one-shot.
@@ -55,11 +57,73 @@ fn validate_deliver(s: &str) -> Option<String> {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum ScheduleInput {
-    Interval { interval_seconds: i64 },
-    At { at: DateTime<Utc> },
+/// Exactly one of `interval_seconds`, `at`, `cron` and `every`; `timezone`
+/// only with the last two.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleInput {
+    #[serde(default)]
+    pub interval_seconds: Option<i64>,
+    #[serde(default)]
+    pub at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub cron: Option<String>,
+    #[serde(default)]
+    pub every: Option<String>,
+    #[serde(default)]
+    pub timezone: Option<String>,
+}
+
+enum ScheduleKind {
+    Interval(i64),
+    At(DateTime<Utc>),
+    Calendar(String, Option<String>),
+}
+
+impl ScheduleInput {
+    fn kind(self) -> Result<ScheduleKind, String> {
+        let given = [
+            self.interval_seconds.is_some(),
+            self.at.is_some(),
+            self.cron.is_some(),
+            self.every.is_some(),
+        ]
+        .iter()
+        .filter(|g| **g)
+        .count();
+        if given != 1 {
+            return Err(
+                "schedule needs exactly one of interval_seconds, at, cron and every".into(),
+            );
+        }
+        if self.timezone.is_some() && self.cron.is_none() && self.every.is_none() {
+            return Err("timezone goes with cron or every".into());
+        }
+        Ok(
+            match (self.interval_seconds, self.at, self.cron.or(self.every)) {
+                (Some(seconds), _, _) => ScheduleKind::Interval(seconds),
+                (_, Some(at), _) => ScheduleKind::At(at),
+                (_, _, Some(expr)) => ScheduleKind::Calendar(expr, self.timezone),
+                _ => return Err("schedule is empty".into()),
+            },
+        )
+    }
+}
+
+/// A calendar schedule from a cron expression or words, in `timezone`
+/// or else `owner`'s zone.
+pub async fn calendar_schedule(
+    db: &sqlx::SqlitePool,
+    owner: havn_core::UserId,
+    expr: &str,
+    timezone: Option<&str>,
+) -> Result<havn_core::calendar::Calendar, String> {
+    let expr = havn_core::calendar::Calendar::from_words(expr).unwrap_or_else(|| expr.to_string());
+    let zone = match timezone {
+        Some(name) => crate::timezone::canonical(name)?,
+        None => crate::timezone::for_user(db, owner).await,
+    };
+    havn_core::calendar::Calendar::parse(&zone, &expr)
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +146,7 @@ pub struct CronJobView {
 pub enum ScheduleView {
     Interval { seconds: i64 },
     At { instant: DateTime<Utc> },
+    Calendar { cron: String, timezone: String },
 }
 
 impl From<CronJob> for CronJobView {
@@ -89,6 +154,10 @@ impl From<CronJob> for CronJobView {
         let schedule = match j.schedule {
             Schedule::Interval { seconds } => ScheduleView::Interval { seconds },
             Schedule::At { instant } => ScheduleView::At { instant },
+            Schedule::Calendar(c) => ScheduleView::Calendar {
+                cron: c.expr().to_string(),
+                timezone: c.zone().to_string(),
+            },
         };
         Self {
             id: j.id.to_string(),
@@ -171,8 +240,9 @@ pub async fn create(
     }
 
     let now = Utc::now();
-    let (schedule, default_next) = match req.schedule {
-        ScheduleInput::Interval { interval_seconds } => {
+    let kind = req.schedule.kind().map_err(ApiError::BadRequest)?;
+    let (schedule, default_next) = match kind {
+        ScheduleKind::Interval(interval_seconds) => {
             if interval_seconds < 1 {
                 return Err(ApiError::BadRequest("interval_seconds must be >= 1".into()));
             }
@@ -183,7 +253,16 @@ pub async fn create(
                 now + ChronoDuration::seconds(interval_seconds),
             )
         }
-        ScheduleInput::At { at } => (Schedule::At { instant: at }, at),
+        ScheduleKind::At(at) => (Schedule::At { instant: at }, at),
+        ScheduleKind::Calendar(cron, timezone) => {
+            let c = calendar_schedule(&state.db, agent.owner_id, &cron, timezone.as_deref())
+                .await
+                .map_err(ApiError::BadRequest)?;
+            let first = c
+                .next_after(now)
+                .ok_or_else(|| ApiError::BadRequest(format!("{:?} never runs", c.expr())))?;
+            (Schedule::Calendar(c), first)
+        }
     };
     let next_run_at = req.next_run_at.unwrap_or(default_next);
 
@@ -273,4 +352,34 @@ pub async fn list_runs(
 
 fn parse_job(s: &str) -> Result<CronJobId, ApiError> {
     CronJobId::from_str(s).map_err(|_| ApiError::BadRequest("invalid cron job id".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn a_schedule_names_one_kind() {
+        let parse = |v: serde_json::Value| -> Result<ScheduleKind, String> {
+            serde_json::from_value::<ScheduleInput>(v)
+                .map_err(|e| e.to_string())?
+                .kind()
+        };
+        assert!(matches!(
+            parse(serde_json::json!({"interval_seconds": 60})),
+            Ok(ScheduleKind::Interval(60))
+        ));
+        assert!(matches!(
+            parse(serde_json::json!({"every": "daily 08:00", "timezone": "Asia/Shanghai"})),
+            Ok(ScheduleKind::Calendar(_, Some(_)))
+        ));
+        assert!(parse(serde_json::json!({"interval_seconds": 60, "cron": "0 8 * * *"})).is_err());
+        assert!(
+            parse(serde_json::json!({"at": "2026-12-01T08:00:00Z", "timezone": "UTC"})).is_err()
+        );
+        assert!(parse(serde_json::json!({"cron": "0 8 * * *", "zone": "UTC"})).is_err());
+        assert!(parse(serde_json::json!({})).is_err());
+    }
 }

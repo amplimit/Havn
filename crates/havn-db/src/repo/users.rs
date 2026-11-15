@@ -417,3 +417,26 @@ mod tests {
             .expect("set on migrated row");
     }
 }
+
+/// `user`'s IANA time zone, `None` when they have not set one.
+pub async fn timezone(pool: &SqlitePool, user: UserId) -> Result<Option<String>> {
+    let zone: Option<Option<String>> =
+        sqlx::query_scalar("SELECT timezone FROM users WHERE id = ?1")
+            .bind(user.to_string())
+            .fetch_optional(pool)
+            .await?;
+    Ok(zone.flatten())
+}
+
+/// Set `user`'s time zone; `None` clears it.
+pub async fn set_timezone(pool: &SqlitePool, user: UserId, zone: Option<&str>) -> Result<()> {
+    let done = sqlx::query("UPDATE users SET timezone = ?2 WHERE id = ?1")
+        .bind(user.to_string())
+        .bind(zone)
+        .execute(pool)
+        .await?;
+    if done.rows_affected() == 0 {
+        return Err(DbError::NotFound);
+    }
+    Ok(())
+}

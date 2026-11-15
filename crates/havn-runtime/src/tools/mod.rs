@@ -269,6 +269,13 @@ impl ToolRegistry {
         self
     }
 
+    /// The registry without the tool called `name`.
+    #[must_use]
+    pub fn without(mut self, name: &str) -> Self {
+        self.tools.retain(|t| t.name() != name);
+        self
+    }
+
     /// Names of every registered tool, regardless of context.
     pub fn names(&self) -> Vec<&str> {
         self.tools.iter().map(|t| t.name()).collect()

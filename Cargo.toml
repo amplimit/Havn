@@ -57,6 +57,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 # IDs / time
 uuid = { version = "1.23", features = ["v5", "v7", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
+# IANA time zones (with the tz database built in) for the user's local time.
+chrono-tz = "0.10"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

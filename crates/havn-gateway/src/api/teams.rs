@@ -853,8 +853,9 @@ mod tests {
             Json(crate::api::cron::CreateCronRequest {
                 name: "nightly".into(),
                 prompt: "p".into(),
-                schedule: crate::api::cron::ScheduleInput::Interval {
-                    interval_seconds: 3600,
+                schedule: crate::api::cron::ScheduleInput {
+                    interval_seconds: Some(3600),
+                    ..crate::api::cron::ScheduleInput::default()
                 },
                 next_run_at: None,
                 wake_check: None,
