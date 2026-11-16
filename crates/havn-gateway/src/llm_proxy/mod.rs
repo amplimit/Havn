@@ -833,7 +833,7 @@ fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
 }
 
 /// The image type `bytes` start like.
-fn image_type(bytes: &[u8]) -> Option<&'static str> {
+pub(crate) fn image_type(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("image/png")
     } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {

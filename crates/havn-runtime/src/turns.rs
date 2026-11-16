@@ -152,6 +152,12 @@ impl Turns {
             .fold(false, |any, chat| self.stop_at(chat, now) || any)
     }
 
+    /// The messages of `chat` not answered yet: the one being answered and
+    /// those queued behind it.
+    pub fn waiting(&self, chat: &str) -> usize {
+        self.lock().get(chat).map_or(0, |turn| 1 + turn.queue.len())
+    }
+
     /// Stop the running turn of `chat` and drop the messages queued behind
     /// it, for a chat that is deleted.
     pub fn discard(&self, chat: &str) {
@@ -273,6 +279,19 @@ mod tests {
         assert!(turns.next("a").is_none());
         assert!(!turns.stop("a"), "idle again");
         assert!(matches!(turns.admit(msg("a", "4")), Admitted::Start(..)));
+    }
+
+    #[test]
+    fn a_chat_counts_its_messages_not_answered_yet() {
+        let turns = Turns::default();
+        assert_eq!(turns.waiting("s1"), 0);
+        assert!(matches!(turns.admit(msg("s1", "a")), Admitted::Start(..)));
+        assert!(matches!(
+            turns.admit(msg("s1", "b")),
+            Admitted::Queued { .. }
+        ));
+        assert_eq!(turns.waiting("s1"), 2);
+        assert_eq!(turns.waiting("s2"), 0);
     }
 
     #[test]

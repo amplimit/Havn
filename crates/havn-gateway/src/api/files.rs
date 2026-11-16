@@ -440,10 +440,20 @@ pub async fn download(
 /// `sent`'s bytes as a download the browser saves rather than shows: an
 /// HTML or SVG file the agent made must not run as the dashboard's page.
 pub fn attachment_response(sent: &crate::outbox::Sent, bytes: Vec<u8>) -> axum::response::Response {
+    file_response(&sent.name, bytes, None)
+}
+
+/// File `name` as a download, or with `image` (a type its bytes were
+/// sniffed as) as that image, shown in place. Neither is ever run as a
+/// page: no sniffing, and a sandbox for anything that would render.
+fn file_response(
+    name: &str,
+    bytes: Vec<u8>,
+    image: Option<&'static str>,
+) -> axum::response::Response {
     use axum::http::header;
     use axum::response::IntoResponse as _;
-    let encoded: String = sent
-        .name
+    let encoded: String = name
         .bytes()
         .map(|b| {
             if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
@@ -453,19 +463,59 @@ pub fn attachment_response(sent: &crate::outbox::Sent, bytes: Vec<u8>) -> axum::
             }
         })
         .collect();
+    let (kind, disposition) = match image {
+        Some(kind) => (kind, "inline"),
+        None => ("application/octet-stream", "attachment"),
+    };
     (
         [
-            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_TYPE, kind.to_string()),
             (
                 header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"file\"; filename*=UTF-8''{encoded}"),
+                format!("{disposition}; filename=\"file\"; filename*=UTF-8''{encoded}"),
             ),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
             (header::CONTENT_SECURITY_POLICY, "sandbox".to_string()),
+            (header::CACHE_CONTROL, "private, max-age=3600".to_string()),
         ],
         bytes,
     )
         .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InboxFileQuery {
+    /// `inbox/<name>`, as an attachment names it.
+    pub path: String,
+}
+
+/// `GET /agents/:id/files?path=inbox/<name>` — a file in the agent's inbox
+/// (one sent in a chat, or its text), for the owner's chat to show: a
+/// PNG, JPEG, GIF or WebP image in place, anything else as a download.
+/// Read without following links, as everything there may be the agent's.
+pub async fn inbox_file(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path(id): Path<String>,
+    Query(q): Query<InboxFileQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    if !Attachment::in_inbox(&q.path) {
+        return Err(ApiError::BadRequest("not a file in the inbox".into()));
+    }
+    let name = q.path[INBOX_DIR.len() + 1..].to_string();
+    let workspace = crate::api::agents::workspace_for(&state, agent.id);
+    let read = name.clone();
+    let bytes = tokio::task::spawn_blocking(move || {
+        inbox(&workspace)
+            .and_then(|dir| dir.read_bytes(&read, MAX_UPLOAD_BYTES as u64 + TEXT_BYTES))
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?
+    .map_err(|e| ApiError::Internal(format!("reading the inbox: {e}")))?
+    .ok_or(ApiError::NotFound)?;
+    let image = crate::llm_proxy::image_type(&bytes);
+    Ok(file_response(&name, bytes, image))
 }
 
 #[cfg(test)]
@@ -473,6 +523,40 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn an_inbox_image_shows_in_place_and_anything_else_downloads() {
+        let header = |r: &axum::response::Response, h: axum::http::HeaderName| {
+            r.headers()
+                .get(h)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+        let png = file_response(
+            "a.png",
+            b"\x89PNG\r\n\x1a\nrest".to_vec(),
+            Some("image/png"),
+        );
+        assert_eq!(header(&png, axum::http::header::CONTENT_TYPE), "image/png");
+        assert!(header(&png, axum::http::header::CONTENT_DISPOSITION).starts_with("inline;"));
+        let page = file_response("x.png.html", b"<script>".to_vec(), None);
+        assert_eq!(
+            header(&page, axum::http::header::CONTENT_TYPE),
+            "application/octet-stream"
+        );
+        assert!(header(&page, axum::http::header::CONTENT_DISPOSITION).starts_with("attachment;"));
+        for r in [&png, &page] {
+            assert_eq!(
+                header(r, axum::http::header::X_CONTENT_TYPE_OPTIONS),
+                "nosniff"
+            );
+            assert_eq!(
+                header(r, axum::http::header::CONTENT_SECURITY_POLICY),
+                "sandbox"
+            );
+        }
+    }
 
     #[test]
     fn a_sent_name_becomes_one_the_inbox_can_hold() {

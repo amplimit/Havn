@@ -2378,9 +2378,19 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                     }
                     None => Vec::new(),
                 };
+                // What the chat still has to answer: a dashboard that comes
+                // back to it shows the reply running. A first message sent
+                // with no chat runs under the session's id.
+                let waiting = chat.as_deref().map_or(0, |c| ctx.turns.waiting(c))
+                    + if conversation.is_none() {
+                        ctx.turns.waiting(&channel_id)
+                    } else {
+                        0
+                    };
                 Ok(serde_json::json!({
                     "conversation": chat,
                     "turns": rows_within_budget(turns, MAX_DATA_REPLY_BYTES, true)?,
+                    "waiting": waiting,
                 }))
             }
             DataQuery::Chats { channel_id, limit } => {
