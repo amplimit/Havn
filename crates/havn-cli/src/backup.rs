@@ -39,9 +39,19 @@ const CONFIG: &str = "config.toml";
 const AGENTS: &str = "agents";
 /// An agent's database, in its directory.
 const AGENT_DB: &str = "workspace/agent.db";
-/// A file at least this large whose blocks hold less than half of it is
-/// sparse: left out, as restoring it would write all of it out.
+/// A file at least this large with holes in it is sparse: left out, as
+/// restoring it would write all of it out.
 const SPARSE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Whether open file `file`, `len` bytes long, has a hole before its end.
+/// A file a filesystem stores compressed has fewer blocks than bytes but
+/// no holes.
+fn has_hole(file: &File, len: u64) -> bool {
+    // SAFETY: lseek on a descriptor this function borrows open; it only
+    // moves the file's offset, which nothing else here relies on.
+    let hole = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_HOLE) };
+    u64::try_from(hole).is_ok_and(|hole| hole < len)
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Manifest {
@@ -350,7 +360,7 @@ pub async fn backup(install: &Install, output: &Path) -> anyhow::Result<Manifest
         }
     }
 
-    let manifest = Manifest {
+    let mut manifest = Manifest {
         format: FORMAT,
         havn_version: env!("CARGO_PKG_VERSION").to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -404,8 +414,11 @@ pub async fn backup(install: &Install, output: &Path) -> anyhow::Result<Manifest
         let walk = Walk {
             copies: &copies,
             left_out: &left_out,
+            skipped: std::cell::RefCell::new(Vec::new()),
         };
         walk.add_tree(&mut tar, &open_dir(root)?, Path::new(AGENTS))?;
+        // Found after the manifest went in: reported, not in the archive's.
+        manifest.incomplete.extend(walk.skipped.into_inner());
     }
     let file = tar.into_inner()?.finish()?;
     file.sync_all()?;
@@ -454,6 +467,8 @@ struct Walk<'a> {
     /// Agents' databases that could not be copied: not archived as they
     /// are on disk either.
     left_out: &'a HashSet<PathBuf>,
+    /// What the walk left out, and why.
+    skipped: std::cell::RefCell<Vec<String>>,
 }
 
 impl Walk<'_> {
@@ -549,8 +564,11 @@ impl Walk<'_> {
             return Ok(());
         }
         let len = opened.len();
-        if len >= SPARSE_BYTES && opened.blocks().saturating_mul(512) < len / 2 {
+        if len >= SPARSE_BYTES && has_hole(&file, len) {
             eprintln!("warning: {} is sparse, left out", entry.display());
+            self.skipped
+                .borrow_mut()
+                .push(format!("{}: sparse, {len} bytes", entry.display()));
             return Ok(());
         }
         let mut header = tar::Header::new_gnu();
@@ -603,6 +621,18 @@ fn inspect(archive: &Path) -> anyhow::Result<Contents> {
     {
         let mut entry = entry.with_context(|| format!("reading {}", archive.display()))?;
         let path = entry.path()?.into_owned();
+        if !path.components().all(|c| matches!(c, Component::Normal(_))) {
+            bail!(
+                "the archive names a path outside its place: {}",
+                path.display()
+            );
+        }
+        if entry.header().entry_type().is_hard_link() {
+            bail!(
+                "the archive holds a hard link, which no havn backup does: {}",
+                path.display()
+            );
+        }
         if manifest.is_none() {
             if path != Path::new(MANIFEST) {
                 bail!(
@@ -706,7 +736,17 @@ pub fn restore(install: &Install, archive: &Path, force: bool) -> anyhow::Result
         Ok(lock) => lock,
         Err(e) => bail!("{e}: stop the gateway before restoring"),
     };
-    let occupied = target.db.exists()
+    let mut target = target;
+    // A link to where the agents are is where they are.
+    if let Ok(real) = fs::canonicalize(&target.workspaces) {
+        target.workspaces = real;
+    }
+    let db_files = ["", "-wal", "-shm"].map(|f| {
+        let mut p = target.db.as_os_str().to_os_string();
+        p.push(f);
+        PathBuf::from(p)
+    });
+    let occupied = db_files.iter().any(|p| fs::symlink_metadata(p).is_ok())
         || fs::read_dir(&target.workspaces).is_ok_and(|mut d| d.next().is_some());
     let mut moved = Vec::new();
     if occupied {
@@ -716,26 +756,71 @@ pub fn restore(install: &Install, archive: &Path, force: bool) -> anyhow::Result
                 target.db.display()
             );
         }
+        // A mount point cannot be moved aside: found out before anything
+        // is, not half way.
+        if let (Ok(root), Some(up)) = (fs::metadata(&target.workspaces), target.workspaces.parent())
+            && fs::metadata(up).is_ok_and(|parent| parent.dev() != root.dev())
+        {
+            bail!(
+                "{} is a mount point, which `--force` cannot move aside: empty it first",
+                target.workspaces.display()
+            );
+        }
         let stamp = format!(
             "{}-{}",
             chrono::Utc::now().format("%Y%m%d-%H%M%S"),
             std::process::id()
         );
-        let db_files = ["", "-wal", "-shm"].map(|f| {
-            let mut p = target.db.as_os_str().to_os_string();
-            p.push(f);
-            PathBuf::from(p)
-        });
         for path in db_files.iter().chain([&target.workspaces]) {
             if fs::symlink_metadata(path).is_ok() {
                 let to = aside(path, &stamp);
-                fs::rename(path, &to)
-                    .with_context(|| format!("moving {} aside", path.display()))?;
+                fs::rename(path, &to).with_context(|| {
+                    format!(
+                        "moving {} aside (moved so far: {})",
+                        path.display(),
+                        list(&moved)
+                    )
+                })?;
+                eprintln!("moved aside: {} -> {}", path.display(), to.display());
                 moved.push(to);
             }
         }
     }
 
+    let placed = place(archive, &target, contents.config.as_deref());
+    match placed {
+        Ok(config) => Ok(Restored {
+            manifest,
+            install: target,
+            moved,
+            config,
+        }),
+        Err(e) if moved.is_empty() => Err(e),
+        Err(e) => Err(e.context(format!(
+            "the restore stopped part way; the installation that was there is at {}",
+            list(&moved)
+        ))),
+    }
+}
+
+fn list(paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        return "nothing".into();
+    }
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Unpack `archive` into `target`, and write its config; where the config
+/// went.
+fn place(
+    archive: &Path,
+    target: &Install,
+    config_text: Option<&[u8]>,
+) -> anyhow::Result<Option<PathBuf>> {
     let data = target
         .db
         .parent()
@@ -778,7 +863,7 @@ pub fn restore(install: &Install, archive: &Path, force: bool) -> anyhow::Result
     }
 
     let mut config = None;
-    if let Some(text) = &contents.config {
+    if let Some(text) = config_text {
         let to = if target.config.exists() {
             target.config.with_extension("toml.restored")
         } else {
@@ -800,12 +885,7 @@ pub fn restore(install: &Install, archive: &Path, force: bool) -> anyhow::Result
             .with_context(|| format!("writing {}", to.display()))?;
         config = Some(to);
     }
-    Ok(Restored {
-        manifest,
-        install: target,
-        moved,
-        config,
-    })
+    Ok(config)
 }
 
 #[cfg(test)]

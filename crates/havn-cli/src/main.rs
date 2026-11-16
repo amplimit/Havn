@@ -562,6 +562,12 @@ async fn run_backup(output: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     println!(
         "Keep HAVN_AGE_KEY apart from it: the archive does not hold the key, and restoring needs it."
     );
+    if !manifest.incomplete.is_empty() {
+        anyhow::bail!(
+            "the backup was written, but {} thing(s) are not in it (above)",
+            manifest.incomplete.len()
+        );
+    }
     Ok(())
 }
 
