@@ -330,8 +330,12 @@ async fn execute_tool_uses(
 }
 
 /// Tell the conversation the turn answers which tool it is about to call
-/// and on what. Never waits: a step that does not fit is not shown.
+/// and on what. Never waits, and leaves most of the queue to the gateway
+/// to what must arrive: a step that does not fit is not shown.
 fn show_step(handle: &LoopHandle, tool: &str, input: &Value) {
+    if handle.writer_tx.capacity() * 2 < handle.writer_tx.max_capacity() {
+        return;
+    }
     let Ok(channel_id) = crate::tools::gateway::CONVERSATION.try_with(Clone::clone) else {
         return;
     };

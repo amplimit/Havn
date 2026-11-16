@@ -393,7 +393,7 @@ impl WebChatRouter {
                 .take(max)
                 .collect()
         };
-        self.send_to_session(
+        self.show_to_session(
             agent_id,
             session_id,
             ServerMessage::Step {
@@ -465,6 +465,31 @@ impl WebChatRouter {
     ) -> Result<(), DeliverError> {
         self.send_to_session(agent_id, session_id, ServerMessage::Error { message })
             .await
+    }
+
+    /// Offer `server_msg` to the tabs of the session that have room for it,
+    /// for what only shows progress: a tab whose queue is full misses it
+    /// and stays open.
+    async fn show_to_session(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        server_msg: ServerMessage,
+    ) -> Result<(), DeliverError> {
+        let targets: Vec<_> = {
+            let map = self.inner.lock().await;
+            map.values()
+                .filter(|t| t.agent_id == agent_id && t.session_id == session_id)
+                .map(|t| t.tx.clone())
+                .collect()
+        };
+        if targets.is_empty() {
+            return Err(DeliverError::NoSession(session_id));
+        }
+        for tx in targets {
+            let _ = tx.try_send(server_msg.clone());
+        }
+        Ok(())
     }
 
     async fn send_to_session(

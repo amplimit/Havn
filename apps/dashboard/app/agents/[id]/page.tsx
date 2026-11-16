@@ -191,6 +191,11 @@ export default function ChatPage({
   const [chat, setChat] = useState<string | null>(null);
   const chatIdRef = useRef<string | null>(null);
   const [chats, setChats] = useState<ChatSummary[]>([]);
+  // For the socket's handler, which outlives a render.
+  const chatsRef = useRef<ChatSummary[]>([]);
+  useEffect(() => {
+    chatsRef.current = chats;
+  }, [chats]);
   // Replies still due in chats not on screen, kept for when they are.
   const waitingElsewhere = useRef(new Map<string, number>());
   // Chats deleted here: what they still send is dropped.
@@ -375,6 +380,8 @@ export default function ChatPage({
           // A reply answers the oldest message waiting; a soft error
           // (agent gone) ends the wait for all of them.
           if (msg.type === "approval") {
+            // The card says what waits; the step before it is not running.
+            setStep(null);
             // The reply still runs; it waits for this answer. Requests are
             // sent again to a reconnecting tab, so keep one card per id.
             setApprovals((prev) => (prev.some((a) => a.id === msg.id) ? prev : [...prev, msg]));
@@ -386,7 +393,11 @@ export default function ChatPage({
           }
           if (msg.type === "step") {
             const current = chatIdRef.current;
-            if (msg.conversation && current && msg.conversation !== current) return;
+            const of = msg.conversation;
+            if (of && deletedChats.current.has(of)) return;
+            if (of && current && of !== current) return;
+            // A new chat not saved yet shows only a chat that is new too.
+            if (of && !current && chatsRef.current.some((c) => c.id === of)) return;
             setStep({ tool: msg.tool, detail: msg.detail });
             return;
           }
@@ -436,13 +447,13 @@ export default function ChatPage({
               setWaiting((n) => Math.max(0, n - 1));
               setStep(null);
             }
-          } else {
+          } else if (msg.type === "error") {
             setWaiting(0);
             setStep(null);
           }
           if (msg.type === "agent_message") {
             pushBubble("agent", msg.content);
-          } else {
+          } else if (msg.type === "error") {
             pushBubble("system", `error: ${msg.message}`);
           }
         },
@@ -633,6 +644,7 @@ export default function ChatPage({
       selectChat(null);
       setBubbles([]);
       setWaiting(0);
+      setStep(null);
     }
     void refreshChats();
   }
