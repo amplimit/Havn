@@ -182,6 +182,10 @@ export default function ChatPage({
   const [waiting, setWaiting] = useState(0);
   // The tool call the reply being written in this chat is making.
   const [step, setStep] = useState<Step | null>(null);
+  // The text of the reply being written, by model call, as it arrives.
+  const [live, setLive] = useState<{ call: string; text: string }[]>([]);
+  // Calls whose text is no longer shown: their reply came or was stopped.
+  const doneCalls = useRef(new Set<string>());
   const pending = waiting > 0;
   // Tool calls of the running reply that wait for the user.
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
@@ -391,14 +395,26 @@ export default function ChatPage({
             setApprovals((prev) => prev.filter((a) => a.id !== msg.id));
             return;
           }
-          if (msg.type === "step") {
+          if (msg.type === "step" || msg.type === "reply_text") {
             const current = chatIdRef.current;
             const of = msg.conversation;
             if (of && deletedChats.current.has(of)) return;
             if (of && current && of !== current) return;
             // A new chat not saved yet shows only a chat that is new too.
             if (of && !current && chatsRef.current.some((c) => c.id === of)) return;
-            setStep({ tool: msg.tool, detail: msg.detail });
+            if (msg.type === "step") {
+              setStep({ tool: msg.tool, detail: msg.detail });
+              return;
+            }
+            if (doneCalls.current.has(msg.call)) return;
+            setStep(null);
+            setLive((prev) => {
+              const i = prev.findIndex((p) => p.call === msg.call);
+              if (i < 0) return [...prev, { call: msg.call, text: msg.text }];
+              const next = [...prev];
+              next[i] = { call: msg.call, text: msg.restart ? msg.text : next[i].text + msg.text };
+              return next;
+            });
             return;
           }
           if (msg.type === "file") {
@@ -446,10 +462,12 @@ export default function ChatPage({
             if (!msg.broadcast) {
               setWaiting((n) => Math.max(0, n - 1));
               setStep(null);
+              endLive();
             }
           } else if (msg.type === "error") {
             setWaiting(0);
             setStep(null);
+            endLive();
           }
           if (msg.type === "agent_message") {
             pushBubble("agent", msg.content);
@@ -460,6 +478,7 @@ export default function ChatPage({
         onError: () => {
           setWaiting(0);
           setStep(null);
+          endLive();
           setWsState("error");
         },
         onClose: () => {
@@ -469,6 +488,7 @@ export default function ChatPage({
           // A reply still due arrives through the reload on reconnect.
           setWaiting(0);
           setStep(null);
+          endLive();
           reconnectTimer = setTimeout(() => {
             if (!cancelled && !chatRef.current) connect();
           }, RECONNECT_MS);
@@ -503,6 +523,14 @@ export default function ChatPage({
   // A file card, once per file.
   function addFile(url: string, name: string, caption: string | undefined, ts: number) {
     setBubbles((prev) => withFiles(prev, [{ url, name, caption, ts }], () => bubbleIdRef.current++));
+  }
+
+  // Stop showing the text being written: the reply replaces it.
+  function endLive() {
+    setLive((prev) => {
+      for (const p of prev) doneCalls.current.add(p.call);
+      return [];
+    });
   }
 
   function pushBubble(role: Bubble["role"], content: string) {
@@ -612,6 +640,7 @@ export default function ChatPage({
     selectChat(target);
     setBubbles([]);
     setStep(null);
+    endLive();
     setWaiting((n) => {
       if (previous) waitingElsewhere.current.set(previous, n);
       return waitingElsewhere.current.get(target) ?? 0;
@@ -645,6 +674,7 @@ export default function ChatPage({
       setBubbles([]);
       setWaiting(0);
       setStep(null);
+      endLive();
     }
     void refreshChats();
   }
@@ -890,6 +920,9 @@ export default function ChatPage({
                 </div>
               </div>
             ))}
+            {pending && live.some((p) => p.text.trim() !== "") && (
+              <LiveBubble text={live.map((p) => p.text.trim()).filter(Boolean).join("\n\n")} />
+            )}
             {pending && <TypingBubble step={step} />}
           </div>
         </div>
@@ -1379,6 +1412,28 @@ function ActionRow({
  * eye doesn't have to retrain. Replaced by the actual reply when
  * `agent_message` arrives (parent flips `pending` to false).
  */
+/** The reply as the model writes it, before the reply itself comes. */
+function LiveBubble({ text }: { text: string }) {
+  return (
+    <div className="flex flex-col items-start">
+      <div
+        className="px-4 py-3"
+        style={{
+          maxWidth: "min(85%, 720px)",
+          borderRadius: "var(--radius-large)",
+          backgroundColor: "var(--color-surface)",
+          color: "var(--color-deep-navy)",
+          border: "1px solid var(--color-border-default)",
+          boxShadow: "var(--shadow-ambient)",
+        }}
+        aria-live="polite"
+      >
+        <Markdown>{text}</Markdown>
+      </div>
+    </div>
+  );
+}
+
 /** A tool call the agent makes while it replies. */
 type Step = { tool: string; detail: string };
 

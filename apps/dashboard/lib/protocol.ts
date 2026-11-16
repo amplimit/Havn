@@ -31,6 +31,8 @@ export type ServerMessage =
   | { type: "approval_closed"; id: string }
   /** A file the agent sent; `url` is under the gateway's API. */
   | { type: "file"; url: string; name: string; caption?: string; conversation?: string }
+  /** Text of a model call of the reply being written, as it arrives. */
+  | { type: "reply_text"; call: string; text: string; restart?: boolean; conversation?: string }
   /** The tool call the reply being written is about to make. */
   | { type: "step"; tool: string; detail: string; conversation?: string }
   /** What the reply just sent saved to or forgot from memory. */

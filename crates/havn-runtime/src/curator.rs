@@ -214,6 +214,7 @@ async fn run_consolidation(
             "system": SYSTEM_PROMPT,
         }),
         billing_user_id: None,
+        reply: None,
     };
 
     let response =

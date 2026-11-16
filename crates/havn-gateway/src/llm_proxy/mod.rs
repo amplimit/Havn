@@ -26,6 +26,8 @@ pub mod gemini;
 pub mod openai;
 pub mod provider;
 
+pub use provider::TextSink;
+
 use std::borrow::Cow;
 
 use havn_core::{AgentId, BudgetExhaustAction, BudgetPolicy, TeamId, UserId};
@@ -238,16 +240,7 @@ pub async fn complete_with_provider(
     request: &AnthropicRequest,
     llm: &LlmConfig,
 ) -> Result<AnthropicResponse, ProxyError> {
-    let provider = dispatch_provider(provider_name)?;
-    let route = Route {
-        provider,
-        name: provider_name,
-        base_url: llm
-            .base_url
-            .get(provider_name)
-            .map_or(provider.default_base_url(), |url| url.trim_end_matches('/')),
-        max_output_tokens,
-    };
+    let route = route(provider_name, max_output_tokens, llm)?;
     complete_through(
         db,
         http,
@@ -256,8 +249,58 @@ pub async fn complete_with_provider(
         billing,
         request,
         llm.max_tokens_ceiling,
+        None,
     )
     .await
+}
+
+/// [`complete_with_provider`], streaming: the reply's text goes to `text`
+/// as the provider writes it (issue #162), and a retry on another
+/// credential first sends [`provider::TextEvent::Restart`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one call site per caller; a parameter struct would only rename them"
+)]
+pub async fn stream_with_provider(
+    db: &SqlitePool,
+    http: &reqwest::Client,
+    keyring: &KeyRing,
+    billing: &Billing,
+    provider_name: &str,
+    max_output_tokens: Option<u32>,
+    request: &AnthropicRequest,
+    llm: &LlmConfig,
+    text: &provider::TextSink,
+) -> Result<AnthropicResponse, ProxyError> {
+    let route = route(provider_name, max_output_tokens, llm)?;
+    complete_through(
+        db,
+        http,
+        keyring,
+        route,
+        billing,
+        request,
+        llm.max_tokens_ceiling,
+        Some(text),
+    )
+    .await
+}
+
+fn route<'a>(
+    provider_name: &'a str,
+    max_output_tokens: Option<u32>,
+    llm: &'a LlmConfig,
+) -> Result<Route<'a>, ProxyError> {
+    let provider = dispatch_provider(provider_name)?;
+    Ok(Route {
+        provider,
+        name: provider_name,
+        base_url: llm
+            .base_url
+            .get(provider_name)
+            .map_or(provider.default_base_url(), |url| url.trim_end_matches('/')),
+        max_output_tokens,
+    })
 }
 
 /// The provider implementation a call goes through, the provider name
@@ -284,6 +327,10 @@ fn with_max_tokens(request: &AnthropicRequest, max_tokens: u32) -> Cow<'_, Anthr
 
 /// `max_tokens` is clamped to the model's known output limit and to
 /// `max_tokens_ceiling` before anything is reserved or sent.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal; the public entry points name each"
+)]
 async fn complete_through(
     db: &SqlitePool,
     http: &reqwest::Client,
@@ -292,6 +339,7 @@ async fn complete_through(
     billing: &Billing,
     request: &AnthropicRequest,
     max_tokens_ceiling: u32,
+    text: Option<&provider::TextSink>,
 ) -> Result<AnthropicResponse, ProxyError> {
     let max_tokens = provider::clamp_max_tokens(
         &request.model,
@@ -317,6 +365,7 @@ async fn complete_through(
     let min_tokens_out = i64::from(request.max_tokens.min(MIN_OUTPUT_TOKENS));
     let mut exhausted: Option<String> = None;
     let mut db_failure: Option<havn_db::DbError> = None;
+    let mut sent = false;
     for cred in chain {
         let caps = Caps {
             agent_tokens,
@@ -378,7 +427,14 @@ async fn complete_through(
         let granted = u32::try_from(reserved.tokens_out).unwrap_or(request.max_tokens);
         let attempt_request = with_max_tokens(request, granted.min(request.max_tokens));
 
-        match try_one(http, keyring, route, &cred, &attempt_request).await {
+        // What an earlier credential streamed is not the reply.
+        if let Some(text) = text
+            && sent
+        {
+            text(provider::TextEvent::Restart);
+        }
+        sent = true;
+        match try_one(http, keyring, route, &cred, &attempt_request, text).await {
             Attempt::Ok(resp) => {
                 if resp.usage.unreported {
                     warn!(
@@ -955,6 +1011,7 @@ async fn try_one(
     route: Route<'_>,
     cred: &Credential,
     request: &AnthropicRequest,
+    text: Option<&provider::TextSink>,
 ) -> Attempt {
     // Decrypt the at-rest ciphertext to bytes, then verify UTF-8 shape
     // before sending. Decrypt errors collapse to "credential malformed
@@ -977,11 +1034,21 @@ async fn try_one(
         };
     };
 
-    match route
-        .provider
-        .complete(http, route.base_url, api_key, request)
-        .await
-    {
+    let result = match text {
+        Some(text) => {
+            route
+                .provider
+                .stream(http, route.base_url, api_key, request, text)
+                .await
+        }
+        None => {
+            route
+                .provider
+                .complete(http, route.base_url, api_key, request)
+                .await
+        }
+    };
+    match result {
         Ok(resp) => Attempt::Ok(resp),
         Err(e) => classify(e),
     }
@@ -1464,6 +1531,7 @@ mod tests {
                 billing,
                 request,
                 ceiling,
+                None,
             )
             .await
         }

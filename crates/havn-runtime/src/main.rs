@@ -2243,6 +2243,7 @@ async fn summarize(ctx: &Ctx, chat: &str, flush: bool) -> anyhow::Result<bool> {
         messages: serde_json::json!([{ "role": "user", "content": transcript }]),
         options: serde_json::json!({ "max_tokens": 2048, "system": SUMMARY_PROMPT }),
         billing_user_id: None,
+        reply: None,
     };
     let response = tool_loop::request_llm(&ctx.writer_tx, &ctx.pending, request).await?;
     let text = match response.outcome {

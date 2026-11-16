@@ -126,6 +126,8 @@ pub struct AgentSocketCtx {
     /// without a side-channel.
     pub embedding_config: Arc<arc_swap::ArcSwap<serde_json::Value>>,
     pub multi_user: bool,
+    /// The streamed LLM calls in flight (issue #162).
+    pub reply_streams: ReplyStreams,
     /// `[llm]` settings: the `max_tokens` ceiling for every proxied LLM
     /// call, whatever the agent's config asks for, and provider base URLs.
     pub llm: Arc<crate::config::LlmConfig>,
@@ -971,6 +973,15 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
                 && let Err(e) = ctx.webchat_router.memory_changed(agent_id, changed).await
             {
                 debug!(%agent_id, error = %e, "memory changes not shown");
+            }
+        }
+        AgentToGateway::LlmCancel { request_id } => {
+            let streams = ctx
+                .reply_streams
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cancelled) = streams.get(&(agent_id, request_id)) {
+                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
         AgentToGateway::Step(step) => {
@@ -1878,6 +1889,7 @@ async fn run_web_search(
 
 async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocketCtx) {
     let request_id = req.request_id.clone();
+    let reply = ReplyText::open(&ctx, agent_id, &req).await;
 
     // Caller-pays billing override (spec §4.4 v0.7 cross-agent query).
     // When the runtime is processing an `IncomingQuery` it stamps every
@@ -2100,18 +2112,36 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                 agent_team: agent.team_id,
                 budget: policy.budget.clone(),
             };
-            match llm_proxy::complete_with_provider(
-                &ctx.db,
-                &ctx.http,
-                ring,
-                &billing,
-                entry.provider(),
-                entry.max_output_tokens,
-                &ar,
-                &ctx.llm,
-            )
-            .await
-            {
+            let result = match &reply {
+                Some(reply) => {
+                    llm_proxy::stream_with_provider(
+                        &ctx.db,
+                        &ctx.http,
+                        ring,
+                        &billing,
+                        entry.provider(),
+                        entry.max_output_tokens,
+                        &ar,
+                        &ctx.llm,
+                        reply.sink.as_ref(),
+                    )
+                    .await
+                }
+                None => {
+                    llm_proxy::complete_with_provider(
+                        &ctx.db,
+                        &ctx.http,
+                        ring,
+                        &billing,
+                        entry.provider(),
+                        entry.max_output_tokens,
+                        &ar,
+                        &ctx.llm,
+                    )
+                    .await
+                }
+            };
+            match result {
                 Ok(resp) => {
                     let usage = LlmUsage {
                         input_tokens: resp.usage.total_input_tokens(),
@@ -2145,12 +2175,148 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
         },
     };
 
+    // The text shown arrives before the reply the runtime sends next.
+    if let Some(reply) = reply {
+        reply.finish(&ctx).await;
+    }
     if let Err(e) = ctx
         .registry
         .send(agent_id, GatewayToAgent::LlmResponse(response))
         .await
     {
         warn!(%agent_id, error = %e, "could not deliver LlmResponse");
+    }
+}
+
+/// How often the text of a streamed call goes to the tabs, at most.
+const REPLY_TEXT_EVERY: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// The LLM calls of each agent whose text is shown as it arrives, by
+/// request id, and whether the runtime has given up on them.
+pub type ReplyStreams = Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<(AgentId, String), Arc<std::sync::atomic::AtomicBool>>,
+    >,
+>;
+
+enum ReplyPiece {
+    Text(String),
+    Restart,
+}
+
+/// A streamed call's text on its way to the tabs of the session its turn
+/// answers (issue #162).
+struct ReplyText {
+    sink: Box<llm_proxy::TextSink>,
+    forward: tokio::task::JoinHandle<()>,
+    key: (AgentId, String),
+}
+
+impl ReplyText {
+    /// For a request whose turn answers a dashboard session of this agent;
+    /// `None` for any other.
+    async fn open(ctx: &AgentSocketCtx, agent_id: AgentId, req: &LlmRequest) -> Option<Self> {
+        let target = req.reply.as_ref()?;
+        let session: crate::webchat::SessionId = target.channel_id.parse().ok()?;
+        if ctx.webchat_router.agent_for_session(session).await != Some(agent_id) {
+            return None;
+        }
+        let conversation = target
+            .conversation
+            .clone()
+            .filter(|c| c.len() <= crate::webchat::MAX_CONVERSATION_ID);
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let key = (agent_id, req.request_id.clone());
+        ctx.reply_streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.clone(), Arc::clone(&cancelled));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let forward = tokio::spawn(forward_reply_text(
+            ctx.webchat_router.clone(),
+            agent_id,
+            session,
+            conversation,
+            req.request_id.clone(),
+            rx,
+            Arc::clone(&cancelled),
+        ));
+        let sink: Box<llm_proxy::TextSink> = Box::new(move |event| {
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let _ = tx.send(match event {
+                llm_proxy::provider::TextEvent::Text(text) => ReplyPiece::Text(text.to_string()),
+                llm_proxy::provider::TextEvent::Restart => ReplyPiece::Restart,
+            });
+        });
+        Some(Self { sink, forward, key })
+    }
+
+    /// Pass on what is left and stop.
+    async fn finish(self, ctx: &AgentSocketCtx) {
+        drop(self.sink);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), self.forward).await;
+        ctx.reply_streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
+
+/// Send the pieces of a call's text to the session's tabs, gathered for
+/// [`REPLY_TEXT_EVERY`] at a time.
+async fn forward_reply_text(
+    router: WebChatRouter,
+    agent_id: AgentId,
+    session: crate::webchat::SessionId,
+    conversation: Option<String>,
+    call: String,
+    mut rx: mpsc::UnboundedReceiver<ReplyPiece>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut open = true;
+    while open {
+        let Some(first) = rx.recv().await else {
+            break;
+        };
+        let mut text = String::new();
+        let mut restart = false;
+        let add = |piece: ReplyPiece, text: &mut String, restart: &mut bool| match piece {
+            ReplyPiece::Text(piece) => text.push_str(&piece),
+            ReplyPiece::Restart => {
+                text.clear();
+                *restart = true;
+            }
+        };
+        add(first, &mut text, &mut restart);
+        let flush = tokio::time::sleep(REPLY_TEXT_EVERY);
+        tokio::pin!(flush);
+        loop {
+            tokio::select! {
+                () = &mut flush => break,
+                piece = rx.recv() => match piece {
+                    Some(piece) => add(piece, &mut text, &mut restart),
+                    None => {
+                        open = false;
+                        break;
+                    }
+                },
+            }
+        }
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) || (text.is_empty() && !restart) {
+            continue;
+        }
+        let _ = router
+            .reply_text(
+                agent_id,
+                session,
+                conversation.clone(),
+                &call,
+                text,
+                restart,
+            )
+            .await;
     }
 }
 
@@ -2655,6 +2821,7 @@ mod tests {
                 serde_json::json!({"provider": "disabled"}),
             )),
             multi_user,
+            reply_streams: ReplyStreams::default(),
             llm: Arc::new(crate::config::LlmConfig::default()),
             models: Arc::new(arc_swap::ArcSwap::from_pointee(
                 crate::model_catalog::ModelCatalog::default(),
@@ -3028,6 +3195,7 @@ mod tests {
             messages: serde_json::json!([{ "role": "user", "content": "hi" }]),
             options: serde_json::json!({}),
             billing_user_id: None,
+            reply: None,
         }
     }
 

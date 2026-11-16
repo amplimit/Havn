@@ -166,6 +166,18 @@ pub enum ServerMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         conversation: Option<String>,
     },
+    /// The text of a model call of the reply being written, as it
+    /// arrives; `restart` drops what the call showed before. The reply
+    /// replaces it all.
+    ReplyText {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        conversation: Option<String>,
+        /// The model call it comes from.
+        call: String,
+        text: String,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        restart: bool,
+    },
     /// The tool call the reply being written is about to make.
     Step {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -373,6 +385,30 @@ impl WebChatRouter {
             },
         };
         self.send_to_session(agent_id, session_id, server_msg).await
+    }
+
+    /// Show the tabs of `session_id` the text a model call of the reply
+    /// being written has added; a tab with no room for it misses it.
+    pub async fn reply_text(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        conversation: Option<String>,
+        call: &str,
+        text: String,
+        restart: bool,
+    ) -> Result<(), DeliverError> {
+        self.show_to_session(
+            agent_id,
+            session_id,
+            ServerMessage::ReplyText {
+                conversation,
+                call: call.to_string(),
+                text,
+                restart,
+            },
+        )
+        .await
     }
 
     /// Show the tabs of the session a turn answers the tool call it is
@@ -776,7 +812,8 @@ mod tests {
             | ServerMessage::ApprovalClosed { .. }
             | ServerMessage::Memory { .. }
             | ServerMessage::File { .. }
-            | ServerMessage::Step { .. } => {
+            | ServerMessage::Step { .. }
+            | ServerMessage::ReplyText { .. } => {
                 panic!("expected AgentMessage, got Error")
             }
         }
@@ -870,7 +907,8 @@ mod tests {
                 | ServerMessage::ApprovalClosed { .. }
                 | ServerMessage::Memory { .. }
                 | ServerMessage::File { .. }
-                | ServerMessage::Step { .. } => {
+                | ServerMessage::Step { .. }
+                | ServerMessage::ReplyText { .. } => {
                     panic!("unexpected Error")
                 }
             }
@@ -914,7 +952,8 @@ mod tests {
                 | ServerMessage::ApprovalClosed { .. }
                 | ServerMessage::Memory { .. }
                 | ServerMessage::File { .. }
-                | ServerMessage::Step { .. } => {
+                | ServerMessage::Step { .. }
+                | ServerMessage::ReplyText { .. } => {
                     panic!("unexpected Error")
                 }
             }

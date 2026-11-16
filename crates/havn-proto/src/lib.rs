@@ -85,6 +85,9 @@ pub enum AgentToGateway {
     /// The tool call a turn answering someone is about to make, for the
     /// dashboard to show while the reply is being written (issue #162).
     Step(Step),
+    /// The runtime no longer waits for this LLM call (its turn was
+    /// stopped): the gateway stops passing its text on.
+    LlmCancel { request_id: String },
 }
 
 /// See [`AgentToGateway::Step`].
@@ -695,6 +698,19 @@ pub struct LlmRequest {
     /// for ordinary LLM calls — gateway falls back to agent owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing_user_id: Option<String>,
+    /// The conversation the reply's text is shown in as the model writes
+    /// it (issue #162): set for a turn answering someone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<ReplyStream>,
+}
+
+/// See [`LlmRequest::reply`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplyStream {
+    pub channel_id: String,
+    /// Its chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
