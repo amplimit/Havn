@@ -867,7 +867,9 @@ impl Grid {
         if matches!(data, Data::Empty) && formula.is_none() {
             return true;
         }
-        let (top, left) = *self.origin.get_or_insert((row, 0));
+        // Without an extent the file states, the first cell's row and
+        // column start what is shown.
+        let (top, left) = *self.origin.get_or_insert((row, col));
         self.used = Some(match self.used {
             None => ((row, col), (row, col)),
             Some(((t, l), (b, r))) => ((t.min(row), l.min(col)), (b.max(row), r.max(col))),
@@ -966,7 +968,10 @@ impl Grid {
         out.push_str(&table(&rows));
         if stopped {
             out.push_str("\n[the rest of the sheet is not shown: the text is too long]\n");
-        } else if cut && declared.is_none() {
+        } else if cut && declared.is_none_or(|(_, (r, _))| r < top.saturating_add(MAX_ROWS as u32))
+        {
+            // Read up to the rows shown, with no extent, or one the cells
+            // went past: how far the sheet goes is not known.
             let _ = writeln!(
                 out,
                 "\n[rows from {} on not shown]",
@@ -1383,6 +1388,24 @@ mod tests {
         assert!(
             undeclared.contains("[rows from 1001 on not shown]"),
             "{undeclared}"
+        );
+        let short = sheet_text(&workbook(&format!(
+            r#"<dimension ref="A1:A5"/><sheetData>{rows}</sheetData>"#
+        )))
+        .expect("text");
+        assert!(short.contains("[rows from 1001 on not shown]"), "{short}");
+        let right = sheet_text(&workbook(
+            r#"<sheetData><row r="2"><c r="CA2"><v>7</v></c><c r="CB2"><v>8</v></c></row></sheetData>"#,
+        ))
+        .expect("text");
+        assert!(
+            right.contains(
+                "|  | CA | CB |
+| --- | --- | --- |
+| 2 | 7 | 8 |
+"
+            ),
+            "{right}"
         );
     }
 
