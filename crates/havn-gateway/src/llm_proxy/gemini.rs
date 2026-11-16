@@ -20,7 +20,9 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::provider::{LlmProvider, ProviderError, Sse, TextEvent, TextSink, status_error};
+use super::provider::{
+    LlmProvider, ProviderError, Sse, TextEvent, TextSink, is_event_stream, pass_text, status_error,
+};
 use super::{AnthropicMessage, AnthropicRequest, AnthropicResponse, AnthropicUsage};
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -133,6 +135,16 @@ impl LlmProvider for GeminiProvider {
                 403 => ProviderError::Unauthorized { body: body_text },
                 code => status_error(code, body_text),
             });
+        }
+        if !is_event_stream(&resp) {
+            let raw: Value = resp
+                .json()
+                .await
+                .map_err(|e| ProviderError::Translation(format!("response decode: {e}")))?;
+            let response = gemini_to_anthropic(&raw, &request.model)
+                .map_err(|e| ProviderError::Translation(format!("response translate: {e}")))?;
+            pass_text(&response, text);
+            return Ok(response);
         }
         let mut events = Sse::new(resp);
         let mut reply = StreamedReply::default();

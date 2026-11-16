@@ -2,7 +2,9 @@
 
 use async_trait::async_trait;
 
-use super::provider::{LlmProvider, ProviderError, Sse, TextEvent, TextSink, status_error};
+use super::provider::{
+    LlmProvider, ProviderError, Sse, TextEvent, TextSink, is_event_stream, pass_text, status_error,
+};
 use super::{AnthropicRequest, AnthropicResponse};
 
 const BASE_URL: &str = "https://api.anthropic.com";
@@ -76,6 +78,14 @@ impl LlmProvider for AnthropicProvider {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(status_error(status.as_u16(), body));
+        }
+        if !is_event_stream(&resp) {
+            let response = resp
+                .json::<AnthropicResponse>()
+                .await
+                .map_err(|e| ProviderError::Translation(e.to_string()))?;
+            pass_text(&response, text);
+            return Ok(response);
         }
         let mut events = Sse::new(resp);
         let mut message = StreamedMessage::default();
@@ -296,6 +306,44 @@ mod tests {
             !followed.load(Ordering::SeqCst),
             "the request, and its API key, went to the redirect target"
         );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_does_not_stream_still_answers_a_streaming_call() {
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "id": "msg_1",
+                    "model": "claude-test",
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "whole" }],
+                    "stop_reason": "end_turn",
+                    "usage": { "input_tokens": 1, "output_tokens": 1 }
+                }))
+            }),
+        );
+        let (base, server) = serve(app).await;
+        let seen = Arc::new(std::sync::Mutex::new(String::new()));
+        let pieces = Arc::clone(&seen);
+        let sink = move |event: TextEvent<'_>| {
+            if let TextEvent::Text(t) = event {
+                pieces.lock().expect("lock").push_str(t);
+            }
+        };
+        let resp = AnthropicProvider
+            .stream(
+                &crate::llm_proxy::http_client().expect("client"),
+                &base,
+                "sk-local",
+                &hi(),
+                &sink,
+            )
+            .await
+            .expect("the whole reply");
+        server.abort();
+        assert_eq!(resp.content[0]["text"], "whole");
+        assert_eq!(*seen.lock().expect("lock"), "whole");
     }
 
     #[test]

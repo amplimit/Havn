@@ -25,7 +25,9 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::provider::{LlmProvider, ProviderError, Sse, TextEvent, TextSink, status_error};
+use super::provider::{
+    LlmProvider, ProviderError, Sse, TextEvent, TextSink, is_event_stream, pass_text, status_error,
+};
 use super::{AnthropicMessage, AnthropicRequest, AnthropicResponse, AnthropicUsage};
 
 const OPENAI_URL: &str = "https://api.openai.com/v1";
@@ -144,6 +146,16 @@ impl LlmProvider for OpenAiProvider {
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
             return Err(status_error(status.as_u16(), body_text));
+        }
+        if !is_event_stream(&resp) {
+            let raw: Value = resp
+                .json()
+                .await
+                .map_err(|e| ProviderError::Translation(format!("response decode: {e}")))?;
+            let response = openai_to_anthropic(&raw)
+                .map_err(|e| ProviderError::Translation(format!("response translate: {e}")))?;
+            pass_text(&response, text);
+            return Ok(response);
         }
 
         let mut events = Sse::new(resp);

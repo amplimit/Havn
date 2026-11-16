@@ -103,15 +103,35 @@ pub trait LlmProvider: Send + Sync {
         text: &TextSink,
     ) -> Result<AnthropicResponse, ProviderError> {
         let response = self.complete(http, base_url, api_key, request).await?;
-        for block in response.content.as_array().into_iter().flatten() {
-            if block.get("type").and_then(serde_json::Value::as_str) == Some("text")
-                && let Some(t) = block.get("text").and_then(serde_json::Value::as_str)
-            {
-                text(TextEvent::Text(t));
-            }
-        }
+        pass_text(&response, text);
         Ok(response)
     }
+}
+
+/// Pass the text of a whole `response` to `text` at once.
+pub fn pass_text(response: &AnthropicResponse, text: &TextSink) {
+    for block in response.content.as_array().into_iter().flatten() {
+        if block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+            && let Some(t) = block.get("text").and_then(serde_json::Value::as_str)
+        {
+            text(TextEvent::Text(t));
+        }
+    }
+}
+
+/// Whether `response` is an event stream; a server that does not stream
+/// answers a streaming request with the whole response instead.
+#[must_use]
+pub fn is_event_stream(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("text/event-stream")
+        })
 }
 
 /// What a streamed call passes on while it runs.
