@@ -45,27 +45,36 @@ const PER_USER_UPLOADS: usize = 2;
 /// How long an upload's body may take to arrive.
 const UPLOAD_SECONDS: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// One of a user's [`PER_USER_UPLOADS`], given back when dropped.
-struct UserUploads(havn_core::UserId);
+/// Whose uploads one counts against: a user's in the dashboard, a channel
+/// account's for the files its senders send, so those never take the
+/// owner's.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Uploader {
+    User(havn_core::UserId),
+    Account { channel: String, account: String },
+}
+
+/// One of an uploader's [`PER_USER_UPLOADS`], given back when dropped.
+struct UserUploads(Uploader);
 
 impl UserUploads {
-    fn running() -> &'static std::sync::Mutex<std::collections::HashMap<havn_core::UserId, usize>> {
+    fn running() -> &'static std::sync::Mutex<std::collections::HashMap<Uploader, usize>> {
         static RUNNING: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<havn_core::UserId, usize>>,
+            std::sync::Mutex<std::collections::HashMap<Uploader, usize>>,
         > = std::sync::OnceLock::new();
         RUNNING.get_or_init(Default::default)
     }
 
-    fn take(user: havn_core::UserId) -> Option<Self> {
+    fn take(uploader: Uploader) -> Option<Self> {
         let mut running = Self::running()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let n = running.entry(user).or_insert(0);
+        let n = running.entry(uploader.clone()).or_insert(0);
         if *n >= PER_USER_UPLOADS {
             return None;
         }
         *n += 1;
-        Some(Self(user))
+        Some(Self(uploader))
     }
 }
 
@@ -108,7 +117,38 @@ pub async fn upload(
     // Before the body is read: whoever may not send files here does not
     // get 25 MB buffered.
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
-    let Some(_mine) = UserUploads::take(user.id) else {
+    let attachment = receive(
+        &state,
+        agent.id,
+        Uploader::User(user.id),
+        &q.name,
+        &headers,
+        body,
+    )
+    .await?;
+    audit::record_agent_action(
+        &state.db,
+        user.id,
+        agent.id,
+        "file.uploaded",
+        serde_json::json!({"path": attachment.path, "size": attachment.size, "media_type": attachment.media_type}),
+    )
+    .await;
+    Ok(Json(attachment))
+}
+
+/// Take file `name`, sent to agent `agent_id` and counted against
+/// `quota`'s uploads at once, into the agent's inbox, with its text saved
+/// next to it when it is a document; the attachment a message then names.
+pub async fn receive(
+    state: &AppState,
+    agent_id: havn_core::AgentId,
+    quota: Uploader,
+    name: &str,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<Attachment, ApiError> {
+    let Some(_mine) = UserUploads::take(quota) else {
         return Err(ApiError::Conflict(format!(
             "{PER_USER_UPLOADS} uploads of yours are still running; wait for one"
         )));
@@ -139,9 +179,9 @@ pub async fn upload(
     if body.is_empty() {
         return Err(ApiError::BadRequest("the file is empty".into()));
     }
-    let name = clean_name(&q.name);
-    let media_type = media_type(&headers, &name);
-    let workspace = crate::api::agents::workspace_for(&state, agent.id);
+    let name = clean_name(name);
+    let media_type = media_type(headers, &name);
+    let workspace = crate::api::agents::workspace_for(state, agent_id);
     crate::workspace::ensure(&workspace)
         .await
         .map_err(|e| ApiError::Internal(format!("workspace: {e}")))?;
@@ -164,7 +204,7 @@ pub async fn upload(
     if let Some(kind) = text_kind {
         match crate::web_fetch::document_text(kind, &body).await {
             Ok((text, _)) if !text.trim().is_empty() => {
-                let workspace = crate::api::agents::workspace_for(&state, agent.id);
+                let workspace = crate::api::agents::workspace_for(state, agent_id);
                 let text_name = format!("{}.txt", stored.file);
                 let written = text_name.clone();
                 let saved = tokio::task::spawn_blocking(move || {
@@ -177,16 +217,16 @@ pub async fn upload(
                     Ok(Ok(true)) => text_path = Some(format!("{INBOX_DIR}/{text_name}")),
                     Ok(Ok(false)) => {}
                     Ok(Err(e)) => {
-                        tracing::warn!(agent_id = %agent.id, error = %e, "could not save a document's text")
+                        tracing::warn!(agent_id = %agent_id, error = %e, "could not save a document's text")
                     }
                     Err(e) => {
-                        tracing::warn!(agent_id = %agent.id, error = %e, "could not save a document's text")
+                        tracing::warn!(agent_id = %agent_id, error = %e, "could not save a document's text")
                     }
                 }
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::info!(agent_id = %agent.id, error = %e, "no text read from an uploaded document")
+                tracing::info!(agent_id = %agent_id, error = %e, "no text read from an uploaded document")
             }
         }
     }
@@ -198,15 +238,23 @@ pub async fn upload(
         size: body.len() as u64,
         text_path,
     };
-    audit::record_agent_action(
-        &state.db,
-        user.id,
-        agent.id,
-        "file.uploaded",
-        serde_json::json!({"path": attachment.path, "size": attachment.size, "media_type": attachment.media_type}),
-    )
-    .await;
-    Ok(Json(attachment))
+    Ok(attachment)
+}
+
+/// Remove a received file no message carried, and its text, from the
+/// inbox of `workspace`.
+pub fn discard(workspace: &std::path::Path, attachment: &Attachment) {
+    let Ok(inbox) = inbox(workspace) else {
+        return;
+    };
+    for path in std::iter::once(&attachment.path).chain(attachment.text_path.as_ref()) {
+        if let Some(name) = path
+            .strip_prefix(INBOX_DIR)
+            .and_then(|rest| rest.strip_prefix('/'))
+        {
+            let _ = inbox.remove(name);
+        }
+    }
 }
 
 struct Stored {
@@ -517,15 +565,15 @@ mod tests {
     #[test]
     fn a_user_runs_a_few_uploads_at_once() {
         let user = havn_core::UserId::new();
-        let first = UserUploads::take(user).expect("first");
-        let _second = UserUploads::take(user).expect("second");
-        assert!(UserUploads::take(user).is_none());
+        let first = UserUploads::take(Uploader::User(user)).expect("first");
+        let _second = UserUploads::take(Uploader::User(user)).expect("second");
+        assert!(UserUploads::take(Uploader::User(user)).is_none());
         assert!(
-            UserUploads::take(havn_core::UserId::new()).is_some(),
+            UserUploads::take(Uploader::User(havn_core::UserId::new())).is_some(),
             "others are not held up"
         );
         drop(first);
-        assert!(UserUploads::take(user).is_some());
+        assert!(UserUploads::take(Uploader::User(user)).is_some());
     }
 
     #[test]

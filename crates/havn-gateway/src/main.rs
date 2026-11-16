@@ -782,6 +782,7 @@ async fn serve() -> anyhow::Result<()> {
         )
         .route("/ws/chat/{agent_id}", get(api::webchat_ws::handler))
         .route("/api/v1/channel", get(api::channel::handler))
+        .route("/api/v1/channel/files", post(api::channel::upload))
         .route(
             "/api/v1/channel/files/{agent}/{file}",
             get(api::channel::file),

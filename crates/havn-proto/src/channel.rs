@@ -67,6 +67,12 @@ pub struct ChannelInbound {
     /// payload is large or sensitive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<serde_json::Value>,
+    /// Files the message carries (issue #106): each one first sent to
+    /// `POST /api/v1/channel/files` by the adapter, for this sender, and
+    /// named here as that answered. A photo or document goes as text (its
+    /// caption, or empty) with its file here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<havn_core::Attachment>,
 }
 
 /// Gateway → adapter: one assistant-turn reply to deliver.
@@ -197,6 +203,7 @@ mod tests {
             },
             timestamp: Utc::now(),
             raw: None,
+            attachments: Vec::new(),
         });
         let s = serde_json::to_string(&frame).expect("serialize");
         // Sanity-check the discriminator and absence of raw.
