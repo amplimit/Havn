@@ -21,7 +21,8 @@ pub use codec::{FrameError, read_frame, write_frame};
 /// 0.4.0: `StopTurn`, `TimezoneUpdate`, `ApprovalRequest` and
 /// `ApprovalDecision`, which an older peer cannot parse and would exit on;
 /// the version check refuses the mix instead.
-pub const PROTOCOL_VERSION: &str = "0.5.0";
+/// 0.6.0: `ChatCommand`.
+pub const PROTOCOL_VERSION: &str = "0.6.0";
 
 /// How often a runtime sends [`AgentToGateway::LivenessPing`] once it is
 /// up. The gateway restarts an agent that stays connected but silent for
@@ -38,6 +39,10 @@ pub enum AgentToGateway {
     Hello { agent_id: String, version: String },
     /// Outbound message to be routed via the appropriate channel adapter.
     OutboundMessage(OutboundMessage),
+    /// The answer to a [`GatewayToAgent::ChatCommand`]: routed as an
+    /// [`AgentToGateway::OutboundMessage`] is, but a web chat shows it as
+    /// a notice, not as a reply.
+    CommandReply(OutboundMessage),
     /// Request an LLM completion via the gateway proxy.
     LlmRequest(LlmRequest),
     /// Cron job finished — gateway records a `CronRun` row, writes the output
@@ -164,6 +169,38 @@ pub struct StopTurn {
     /// when absent.
     #[serde(default)]
     pub conversation: Option<String>,
+}
+
+/// See [`GatewayToAgent::ChatCommand`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatCommand {
+    /// The conversation, as in [`InboundMessage::channel_id`].
+    pub channel_id: String,
+    /// Its chat, as in [`InboundMessage::conversation`]; the active one
+    /// when absent.
+    #[serde(default)]
+    pub conversation: Option<String>,
+    pub command: ChatCommandKind,
+}
+
+/// What a [`ChatCommand`] asks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChatCommandKind {
+    /// Take back the chat's last message and its reply: the next message
+    /// follows what that one followed.
+    Undo,
+    /// The model of the chat: `model` from its next turn on, or the
+    /// agent's again when `None`. The gateway checked the agent may use it.
+    Model { model: Option<String> },
+    /// The agent's own model from now on, for every chat that has none of
+    /// its own; empty for the gateway's default. The gateway saved it.
+    AgentModel { model: String },
+    /// Report on the chat: its model, title, turns, replies waiting.
+    Status {
+        /// The agent's name, which the runtime does not know.
+        agent: String,
+    },
 }
 
 /// See [`GatewayToAgent::NewChat`].
@@ -294,6 +331,10 @@ pub enum GatewayToAgent {
     /// channel); the runtime confirms it there. Sent in order with the
     /// conversation's messages.
     NewChat(NewChat),
+    /// A chat command (`/undo`, `/model`, `/status`, ...) the gateway
+    /// recognised; the runtime answers it in the conversation, at once,
+    /// and it does not become a turn.
+    ChatCommand(ChatCommand),
     /// LLM call has completed (success or error). Phase 1 is non-streaming;
     /// streaming chunks land in a follow-up vertical (separate frame variant).
     LlmResponse(LlmResponse),

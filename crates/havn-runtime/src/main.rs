@@ -42,10 +42,10 @@ use clap::Parser;
 use havn_core::{Branch, InboundMessage, MessageContent, OutboundMessage, Policy};
 use havn_db::agent::conversations::{self as conversations, Role};
 use havn_proto::{
-    AdminOutcome, AgentQueryOutcome, AgentQueryResponse, AgentToGateway, CronOutcome, CronResult,
-    CronTick, DataQuery, DataRequest, DataResponse, GatewayToAgent, IncomingQuery,
-    MemoryForgetRequest, MemoryForgetResponse, PROTOCOL_VERSION, SkillPinRequest, SkillPinResponse,
-    read_frame, write_frame,
+    AdminOutcome, AgentQueryOutcome, AgentQueryResponse, AgentToGateway, ChatCommandKind,
+    CronOutcome, CronResult, CronTick, DataQuery, DataRequest, DataResponse, GatewayToAgent,
+    IncomingQuery, MemoryForgetRequest, MemoryForgetResponse, PROTOCOL_VERSION, SkillPinRequest,
+    SkillPinResponse, read_frame, write_frame,
 };
 use sqlx::SqlitePool;
 use tokio::io::BufReader;
@@ -159,10 +159,10 @@ struct Ctx {
     /// inbound message so the scheduler can detect "user is in active
     /// conversation, don't disrupt" before firing a curator pass.
     last_inbound: curator_scheduler::LastInbound,
-    /// The agent's `config.model` from the handshake, or empty for the
-    /// gateway's default. `Arc<String>` so cloning into per-loop
-    /// `LoopHandle`s is cheap.
-    model: Arc<String>,
+    /// The agent's model: `config.model` from the handshake, or empty for
+    /// the gateway's default, until `/agent_model` changes it. A chat with
+    /// a model of its own uses that instead.
+    model: Arc<std::sync::RwLock<Arc<String>>>,
     max_tokens: u32,
     /// Pending oneshots for outbound `agent_query` calls (spec §4.4
     /// v0.7). The `agent_query` tool inserts an entry per call; the
@@ -187,6 +187,16 @@ struct Ctx {
 }
 
 impl Ctx {
+    /// The agent's model now.
+    fn model(&self) -> Arc<String> {
+        Arc::clone(
+            &self
+                .model
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
     /// Build a [`LoopHandle`] for the *parent* loop — uses the registry
     /// that includes `subagent_spawn` (when the policy allows it), the
     /// parent's wider iteration cap, and the live messages mirror so
@@ -199,7 +209,7 @@ impl Ctx {
             tool_env: self.tool_env.clone(),
             max_iterations: MAX_TOOL_ITERATIONS,
             messages_mirror: Some(Arc::clone(&self.parent_messages)),
-            model: Arc::clone(&self.model),
+            model: self.model(),
             max_tokens: self.max_tokens,
             billing_user_id: None,
             stop: None,
@@ -835,7 +845,7 @@ async fn main() -> anyhow::Result<()> {
         tool_env,
         parent_messages,
         last_inbound,
-        model: session_model,
+        model: Arc::new(std::sync::RwLock::new(session_model)),
         max_tokens: session_max_tokens,
         agent_query_pending,
         gateway_pending,
@@ -1084,6 +1094,20 @@ where
                 };
                 send_text(&ctx, new.channel_id, None, text.to_string());
             }
+            GatewayToAgent::ChatCommand(command) => {
+                // Inline: in order with the conversation's messages, and
+                // answered at once, also while a reply runs.
+                let (chat, text) = chat_command(&ctx, &command).await;
+                let reply = OutboundMessage {
+                    conversation: chat,
+                    channel_id: command.channel_id,
+                    content: MessageContent::Text { text },
+                    reply_to: None,
+                };
+                if let Err(e) = ctx.writer_tx.try_send(AgentToGateway::CommandReply(reply)) {
+                    warn!(error = %e, "could not answer a chat command");
+                }
+            }
             GatewayToAgent::ApprovalDecision(decision) => {
                 if !ctx.approvals.decide(&decision) {
                     info!(channel_id = %decision.channel_id, "approval decision with nothing waiting");
@@ -1321,6 +1345,7 @@ async fn handle_heartbeat(ctx: Ctx) {
         &mut messages,
         &augmented,
         None,
+        None,
     )
     .await
     {
@@ -1394,13 +1419,17 @@ async fn handle_cron(tick: CronTick, ctx: Ctx) {
 
     let augmented = augment_with_skills(&ctx, &ctx.cron_prompt, &tick.prompt, None, false).await;
     let handle = ctx.parent_handle();
-    let run = tool_loop::run_typed(
-        &handle,
-        crate::tools::context::CRON,
-        &mut messages,
-        &augmented,
-    )
-    .await;
+    let run = tool_loop::TURN_MODEL
+        .scope(
+            Arc::clone(&handle.model),
+            tool_loop::run_typed(
+                &handle,
+                crate::tools::context::CRON,
+                &mut messages,
+                &augmented,
+            ),
+        )
+        .await;
     // An LLM error or the iteration cap is a failed run: the gateway records
     // the message in `cron_runs.error` and delivers nothing.
     let (outcome, output) = match run {
@@ -1675,6 +1704,137 @@ const NEW_CHAT_NOTICE: &str = "(Started a new conversation. The earlier one is k
 const NEW_CHAT_FAILED_NOTICE: &str =
     "(Could not start a new conversation right now; please try /new again in a moment.)";
 
+/// The answer to a chat command, and the chat it is about.
+async fn chat_command(ctx: &Ctx, command: &havn_proto::ChatCommand) -> (Option<String>, String) {
+    let scope = &command.channel_id;
+    let requested = command.conversation.as_deref();
+    let existing = || conversations::existing_chat(&ctx.pool, scope, requested);
+    let failed = |e: havn_db::DbError| {
+        warn!(error = %e, "chat command failed");
+        (
+            command.conversation.clone(),
+            "(That did not work right now; please try again in a moment.)".to_string(),
+        )
+    };
+    match &command.command {
+        ChatCommandKind::Undo => {
+            let chat = match existing().await {
+                Ok(Some(chat)) => chat,
+                Ok(None) => return (None, "(There is nothing here to take back.)".into()),
+                Err(e) => return failed(e),
+            };
+            if ctx.turns.waiting(&chat) > 0 {
+                return (
+                    Some(chat),
+                    "(A reply is still being written here. Wait for it, or send /stop, then                      /undo.)"
+                        .into(),
+                );
+            }
+            let text = match conversations::undo(&ctx.pool, &chat).await {
+                Ok(Some(said)) => {
+                    let mut shown: String = said.chars().take(UNDO_EXCERPT_CHARS).collect();
+                    if said.chars().count() > UNDO_EXCERPT_CHARS {
+                        shown.push_str("...");
+                    }
+                    format!(
+                        "(Took back your message \"{}\" and my reply. Your next message \
+                         continues from before it.)",
+                        shown.replace('\n', " ")
+                    )
+                }
+                Ok(None) => "(There is nothing here to take back.)".into(),
+                Err(e) => return failed(e),
+            };
+            (Some(chat), text)
+        }
+        ChatCommandKind::Model { model } => {
+            // A chat that has no message yet is made, so the model is
+            // there for its first.
+            let chat = match conversations::chat_for(&ctx.pool, scope, requested, "").await {
+                Ok(chat) => chat,
+                Err(e) => return failed(e),
+            };
+            if let Err(e) = conversations::set_chat_model(&ctx.pool, &chat, model.as_deref()).await
+            {
+                return failed(e);
+            }
+            let text = match model {
+                Some(model) => format!(
+                    "(This chat uses {model} from its next reply on. /model default goes back \
+                     to the agent's model.)"
+                ),
+                None => format!(
+                    "(This chat uses the agent's model again: {}.)",
+                    model_name(&ctx.model())
+                ),
+            };
+            (Some(chat), text)
+        }
+        ChatCommandKind::AgentModel { model } => {
+            *ctx.model
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(model.clone());
+            info!(model = %model, "the agent's model changed");
+            (
+                command.conversation.clone(),
+                format!(
+                    "(The agent uses {} from now on, in every chat that has no model of its \
+                     own.)",
+                    model_name(model)
+                ),
+            )
+        }
+        ChatCommandKind::Status { agent } => {
+            let chat = match existing().await {
+                Ok(chat) => chat,
+                Err(e) => return failed(e),
+            };
+            let info = match &chat {
+                Some(chat) => match conversations::chat_info(&ctx.pool, chat).await {
+                    Ok(info) => info,
+                    Err(e) => return failed(e),
+                },
+                None => None,
+            };
+            let agent_model = ctx.model();
+            let model = match info.as_ref().and_then(|i| i.model.as_deref()) {
+                Some(own) => format!(
+                    "{own} (this chat's own; the agent's is {})",
+                    model_name(&agent_model)
+                ),
+                None => model_name(&agent_model),
+            };
+            let chat_line = match &info {
+                Some(info) if !info.title.is_empty() => {
+                    format!("{} ({} messages)", info.title, info.turns)
+                }
+                Some(info) => format!("untitled ({} messages)", info.turns),
+                None => "none yet".into(),
+            };
+            let waiting = chat.as_deref().map_or(0, |c| ctx.turns.waiting(c));
+            (
+                chat,
+                format!(
+                    "Agent: {agent}\nModel: {model}\nThis chat: {chat_line}\nReplies being \
+                     written or waiting: {waiting}"
+                ),
+            )
+        }
+    }
+}
+
+/// Characters of a taken-back message `/undo` quotes.
+const UNDO_EXCERPT_CHARS: usize = 60;
+
+/// How a model is named to the user; empty is the gateway's default.
+fn model_name(model: &str) -> String {
+    if model.is_empty() {
+        "the gateway's default model".into()
+    } else {
+        model.to_string()
+    }
+}
+
 const RESTART_NOTICE: &str = "(The agent is restarting, so a message you sent while it was \
      replying was not answered. Please send it again in a moment.)";
 
@@ -1811,6 +1971,15 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         _ => user_text,
     };
 
+    // The chat's own model, when `/model` set one.
+    let chat_model = match conversations::chat_info(&ctx.pool, &chat).await {
+        Ok(info) => info.and_then(|i| i.model).map(Arc::new),
+        Err(e) => {
+            warn!(error = %e, "could not read the chat's model; using the agent's");
+            None
+        }
+    };
+
     // Tool-use loop.
     // Augment the frozen system prompt with FTS-retrieved skills relevant
     // to the user's turn (spec §9.3). Per-call only; base stays frozen.
@@ -1839,6 +2008,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
                         &mut messages,
                         &augmented,
                         Some(stop),
+                        chat_model,
                     ),
                 ),
             ),
@@ -1915,10 +2085,19 @@ async fn run_tool_loop(
     messages: &mut Vec<serde_json::Value>,
     system_prompt: &SystemPrompt,
     stop: Option<tokio_util::sync::CancellationToken>,
+    model: Option<Arc<String>>,
 ) -> anyhow::Result<String> {
     let mut handle = ctx.parent_handle();
     handle.stop = stop;
-    tool_loop::run(&handle, context, messages, system_prompt).await
+    if let Some(model) = model {
+        handle.model = model;
+    }
+    tool_loop::TURN_MODEL
+        .scope(
+            Arc::clone(&handle.model),
+            tool_loop::run(&handle, context, messages, system_prompt),
+        )
+        .await
 }
 
 /// The zone named `name`, or UTC when there is none or it is unknown.
@@ -2239,7 +2418,7 @@ async fn summarize(ctx: &Ctx, chat: &str, flush: bool) -> anyhow::Result<bool> {
     }
     let request = havn_proto::LlmRequest {
         request_id: uuid::Uuid::now_v7().to_string(),
-        model: ctx.model.as_str().into(),
+        model: ctx.model().as_str().into(),
         messages: serde_json::json!([{ "role": "user", "content": transcript }]),
         options: serde_json::json!({ "max_tokens": 2048, "system": SUMMARY_PROMPT }),
         billing_user_id: None,
@@ -2610,7 +2789,7 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
         max_iterations: max_iters,
         // The temp loop is a closed system — no parent_messages to mirror.
         messages_mirror: None,
-        model: Arc::clone(&ctx.model),
+        model: ctx.model(),
         max_tokens: ctx.max_tokens,
         // Caller pays. Every LlmRequest the loop emits carries this
         // override; the gateway resolves credentials and bills usage

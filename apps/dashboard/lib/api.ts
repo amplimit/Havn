@@ -8,6 +8,17 @@ import type { Attachment } from "./protocol";
 
 const BASE = "/api";
 
+/** A chat command, as `GET /commands` lists it. */
+export type ChatCommand = {
+  name: string;
+  aliases: string[];
+  /** How its arguments are written; empty when it takes none. */
+  args: string;
+  about: string;
+  /** Only for the agent's owner. */
+  admin: boolean;
+};
+
 export type AgentView = {
   id: string;
   name: string;
@@ -556,6 +567,8 @@ export const api = {
       ),
   },
 
+  /** The chat commands the gateway answers. */
+  commands: () => request<ChatCommand[]>("/commands"),
   chats: {
     /** The caller's chats with `agentId`, most recently used first. */
     list: (agentId: string) => request<ChatSummary[]>(`/agents/${agentId}/chats`),

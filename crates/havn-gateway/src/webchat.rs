@@ -156,6 +156,13 @@ pub enum ServerMessage {
     },
     /// The approval request `id` was decided or ended; stop showing it.
     ApprovalClosed { id: String },
+    /// The answer to a chat command (`/status`, `/undo`, ...): shown in
+    /// the chat, not kept in it, and not a reply to a message.
+    Notice {
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        conversation: Option<String>,
+    },
     /// A file the agent sent, to download from `url` (relative to the
     /// gateway's API).
     File {
@@ -492,6 +499,41 @@ impl WebChatRouter {
         .await
     }
 
+    /// Show the tabs of `session_id` the answer to a chat command.
+    pub async fn command_notice(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        conversation: Option<String>,
+        content: String,
+    ) -> Result<(), DeliverError> {
+        self.send_to_session(
+            agent_id,
+            session_id,
+            ServerMessage::Notice {
+                content,
+                conversation,
+            },
+        )
+        .await
+    }
+
+    /// The approval request of `agent_id` that has waited longest in
+    /// conversation `channel_id`.
+    pub fn oldest_approval(
+        &self,
+        agent_id: AgentId,
+        channel_id: &str,
+    ) -> Option<havn_proto::ApprovalRequest> {
+        let mut pending = self.lock_approvals();
+        pending.retain(|_, p| p.since.elapsed() < APPROVAL_KEPT);
+        pending
+            .values()
+            .filter(|p| p.agent_id == agent_id && p.request.channel_id == channel_id)
+            .min_by_key(|p| p.since)
+            .map(|p| p.request.clone())
+    }
+
     /// Show `message` as an error in every open tab of `session_id`.
     pub async fn error(
         &self,
@@ -813,6 +855,7 @@ mod tests {
             | ServerMessage::Memory { .. }
             | ServerMessage::File { .. }
             | ServerMessage::Step { .. }
+            | ServerMessage::Notice { .. }
             | ServerMessage::ReplyText { .. } => {
                 panic!("expected AgentMessage, got Error")
             }
@@ -908,6 +951,7 @@ mod tests {
                 | ServerMessage::Memory { .. }
                 | ServerMessage::File { .. }
                 | ServerMessage::Step { .. }
+                | ServerMessage::Notice { .. }
                 | ServerMessage::ReplyText { .. } => {
                     panic!("unexpected Error")
                 }
@@ -953,6 +997,7 @@ mod tests {
                 | ServerMessage::Memory { .. }
                 | ServerMessage::File { .. }
                 | ServerMessage::Step { .. }
+                | ServerMessage::Notice { .. }
                 | ServerMessage::ReplyText { .. } => {
                     panic!("unexpected Error")
                 }

@@ -962,6 +962,25 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
             warn!(%agent_id, "duplicate Hello after handshake — ignoring");
         }
         AgentToGateway::OutboundMessage(msg) => route_outbound(agent_id, msg, ctx).await,
+        AgentToGateway::CommandReply(msg) => {
+            // A web chat shows it as a notice; a channel as any message.
+            match msg.channel_id.parse::<crate::webchat::SessionId>() {
+                Ok(session) if crate::channel_id_codec::decode(&msg.channel_id).is_none() => {
+                    let text = match msg.content {
+                        havn_core::MessageContent::Text { text } => text,
+                        _ => return,
+                    };
+                    if let Err(e) = ctx
+                        .webchat_router
+                        .command_notice(agent_id, session, msg.conversation, text)
+                        .await
+                    {
+                        debug!(%agent_id, error = ?e, "no tab took a command's answer");
+                    }
+                }
+                _ => route_outbound(agent_id, msg, ctx).await,
+            }
+        }
         AgentToGateway::ApprovalRequest(request) => ask_for_approval(agent_id, request, ctx).await,
         AgentToGateway::MemoryChanged(changed) => {
             // Only a dashboard session shows it; a channel's sender is not
@@ -1198,7 +1217,11 @@ async fn ask_for_approval(
             conversation: None,
             channel_id: request.channel_id,
             content: havn_core::MessageContent::Text {
-                text: "(A step of this reply waits for the agent owner's approval.)".into(),
+                text: format!(
+                    "(A step of this reply waits for approval: {}. An admin can send /approve \
+                     or /deny; the agent's owner can also decide in the web chat.)",
+                    request.tool
+                ),
             },
             reply_to: None,
         };
@@ -3928,6 +3951,7 @@ mod tests {
                     adapter_token_ref: "secret:channel:telegram:bot".into(),
                     dm_policy: crate::config::DmPolicy::Allowlist,
                     allow_from: Vec::new(),
+                    admins: Vec::new(),
                 }],
             },
         );

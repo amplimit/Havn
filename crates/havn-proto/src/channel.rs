@@ -38,6 +38,26 @@ pub enum ChannelFrame {
     Ping,
     /// Either direction. Reply to `Ping`.
     Pong,
+    /// Gateway -> adapter, once the connection is open: the chat commands
+    /// the gateway answers, for a platform's command menu (Telegram's
+    /// `setMyCommands`). An adapter that predates it skips it.
+    Commands(ChannelCommands),
+}
+
+/// Gateway -> adapter: see [`ChannelFrame::Commands`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelCommands {
+    pub account_id: String,
+    /// In the order a menu shows them.
+    pub commands: Vec<ChannelCommand>,
+}
+
+/// One entry of [`ChannelCommands`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelCommand {
+    /// Without the slash: lowercase letters, digits and `_`.
+    pub name: String,
+    pub description: String,
 }
 
 /// Adapter → gateway: one inbound user message.

@@ -26,7 +26,7 @@ use havn_core::{AgentId, InboundMessage, MessageContent};
 use havn_proto::GatewayToAgent;
 use serde::Deserialize;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::AppState;
 use crate::agent_registry::AgentRegistry;
@@ -125,6 +125,8 @@ async fn handle_session(socket: WebSocket, state: AppState, agent_id: AgentId, s
     let session_id: SessionId = crate::webchat::session_for(&sender_id, agent_id);
     info!(%agent_id, %session_id, "webchat session opened");
 
+    // Who the chat commands take the user for.
+    let asker = web_asker(&state, agent_id, session_id, &sender_id).await;
     let (ws_sink, ws_stream) = socket.split();
     serve_session(
         ws_sink,
@@ -135,9 +137,104 @@ async fn handle_session(socket: WebSocket, state: AppState, agent_id: AgentId, s
         agent_id,
         session_id,
         &sender_id,
+        Some((&state, asker)),
     )
     .await;
     info!(%agent_id, %session_id, "webchat session closed");
+}
+
+/// The web chat user `sender_id` as chat commands see them: the agent's
+/// owner may use the admin ones.
+async fn web_asker(
+    state: &AppState,
+    agent_id: AgentId,
+    session_id: SessionId,
+    sender_id: &str,
+) -> crate::commands::Asker {
+    let owner = havn_db::repo::agents::find_by_id(&state.db, agent_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|a| a.owner_id.to_string() == sender_id);
+    let name = match sender_id.parse() {
+        Ok(id) => havn_db::repo::users::find_by_id(&state.db, id)
+            .await
+            .ok()
+            .flatten()
+            .map(|u| u.display_name),
+        Err(_) => None,
+    };
+    crate::commands::Asker {
+        agent_id,
+        scope: session_id.to_string(),
+        conversation: None,
+        who: format!(
+            "{} in the web chat{}",
+            name.unwrap_or_else(|| sender_id.to_string()),
+            if owner { ", the agent's owner" } else { "" }
+        ),
+        admin: owner,
+        admin_hint: "the agent's owner",
+    }
+}
+
+/// Answer the chat command `parsed`, sent in chat `conversation` of a web
+/// chat session.
+async fn web_command(
+    state: &AppState,
+    asker: &crate::commands::Asker,
+    conversation: Option<String>,
+    parsed: crate::commands::Parsed<'_>,
+) {
+    let mut asker = asker.clone();
+    asker.conversation = conversation;
+    let session: SessionId = match asker.scope.parse() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let reply = match parsed {
+        refused @ (crate::commands::Parsed::Unknown(_) | crate::commands::Parsed::Misused(_)) => {
+            refused.refusal().unwrap_or_default()
+        }
+        crate::commands::Parsed::Known(command, args) => match command.name {
+            // The page has its own way of doing these.
+            "new" => "(Start a new chat with the New chat button.)".into(),
+            "stop" => {
+                let stop = GatewayToAgent::StopTurn(havn_proto::StopTurn {
+                    conversation: asker.conversation.clone(),
+                    channel_id: asker.scope.clone(),
+                });
+                if let Err(e) = state.registry.send(asker.agent_id, stop).await {
+                    warn!(agent_id = %asker.agent_id, error = ?e, "failed to forward StopTurn");
+                }
+                return;
+            }
+            "retry" => "(Answer again with the button under the reply.)".into(),
+            _ => match crate::commands::run(state, &asker, command, args).await {
+                crate::commands::Action::Reply(text) => text,
+                crate::commands::Action::Agent(command) => {
+                    match state
+                        .registry
+                        .send(asker.agent_id, GatewayToAgent::ChatCommand(command))
+                        .await
+                    {
+                        Ok(()) => return,
+                        Err(e) => {
+                            warn!(agent_id = %asker.agent_id, error = ?e, "failed to forward a chat command");
+                            "(The agent is not reachable right now; try again in a moment.)".into()
+                        }
+                    }
+                }
+            },
+        },
+    };
+    if let Err(e) = state
+        .webchat_router
+        .command_notice(asker.agent_id, session, asker.conversation.clone(), reply)
+        .await
+    {
+        debug!(error = ?e, "no tab took a command's answer");
+    }
 }
 
 /// Serve one tab until the browser closes it, the socket fails, or the
@@ -155,6 +252,9 @@ async fn serve_session<Si, St, E>(
     agent_id: AgentId,
     session_id: SessionId,
     sender_id: &str,
+    // The gateway, and who the user is, for chat commands; without them
+    // (tests) a command goes to the agent as text.
+    commands: Option<(&AppState, crate::commands::Asker)>,
 ) where
     Si: Sink<Message> + Unpin + Send + 'static,
     St: Stream<Item = Result<Message, E>> + Unpin,
@@ -231,6 +331,23 @@ async fn serve_session<Si, St, E>(
         };
         let mut attachments = Vec::new();
         let (user_text, conversation, branch) = match parsed {
+            ClientMessage::Send {
+                content,
+                conversation,
+                edit,
+                attachments: sent,
+            } if edit.is_none()
+                && sent.is_empty()
+                && commands.is_some()
+                && crate::commands::parse(&content).is_some() =>
+            {
+                if let (Some((state, asker)), Some(parsed)) =
+                    (commands.as_ref(), crate::commands::parse(&content))
+                {
+                    web_command(state, asker, chat_id(conversation), parsed).await;
+                }
+                continue;
+            }
             ClientMessage::Send {
                 content,
                 conversation,
@@ -425,7 +542,7 @@ mod tests {
             let registry = AgentRegistry::new();
             let db = havn_db::connect_in_memory().await.expect("db");
             serve_session(
-                sink, stream, &registry, &router, &db, agent_id, session_id, "u",
+                sink, stream, &registry, &router, &db, agent_id, session_id, "u", None,
             )
             .await;
         });

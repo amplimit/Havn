@@ -716,6 +716,14 @@ async fn handle_session(
     // The router holds the only lasting sender: when it drops a stalled
     // adapter, the outbound task below ends and so does this session.
     let registered = frame_tx.downgrade();
+    // The commands, for the platform's command menu.
+    let commands = ChannelFrame::Commands(havn_proto::channel::ChannelCommands {
+        account_id: account_id.clone(),
+        commands: crate::commands::menu(),
+    });
+    if let Err(e) = frame_tx.try_send(commands) {
+        warn!(channel = %channel_id, account = %account_id, error = %e, "could not send the command menu");
+    }
     state.channel_router.register(key.clone(), frame_tx).await;
 
     // Separate mpsc for raw WS control frames (Pong replies to
@@ -1100,26 +1108,80 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
             return;
         }
     };
-    // `/stop` stops the reply running in this conversation instead of
-    // reaching the agent as a message.
-    if is_stop_command(&content) {
-        let stop = GatewayToAgent::StopTurn(havn_proto::StopTurn {
-            conversation: None,
-            channel_id: encoded_channel_id,
-        });
-        if let Err(e) = state.registry.send(agent_id, stop).await {
-            warn!(channel, %agent_id, error = ?e, "failed to forward StopTurn");
+    // A chat command is answered by the gateway or the agent, never by
+    // the model (issues #173, #174). A message with files is not one.
+    let parsed = match &content {
+        MessageContent::Text { text } if named.is_empty() => crate::commands::parse(text),
+        _ => None,
+    };
+    let mut new_chat = false;
+    let mut branch = None;
+    let mut command_frame = None;
+    match parsed {
+        None => {}
+        Some(
+            refused @ (crate::commands::Parsed::Unknown(_) | crate::commands::Parsed::Misused(_)),
+        ) => {
+            let text = refused.refusal().unwrap_or_default();
+            tell_sender(
+                state,
+                channel,
+                &inb.account_id,
+                &inb.sender_id,
+                &inb.channel_message_id,
+                &text,
+            )
+            .await;
+            return;
         }
-        return;
+        Some(crate::commands::Parsed::Known(command, args)) => match command.name {
+            // Stops the reply running in this conversation.
+            "stop" => {
+                let stop = GatewayToAgent::StopTurn(havn_proto::StopTurn {
+                    conversation: None,
+                    channel_id: encoded_channel_id,
+                });
+                if let Err(e) = state.registry.send(agent_id, stop).await {
+                    warn!(channel, %agent_id, error = ?e, "failed to forward StopTurn");
+                }
+                return;
+            }
+            // A new chat; the runtime confirms. It goes the way of a
+            // message, in order with the ones after it.
+            "new" => new_chat = true,
+            // The last message answered again, as a new version of the
+            // reply.
+            "retry" => branch = Some(havn_core::Branch::Regenerate { turn: None }),
+            _ => {
+                let asker = crate::commands::Asker {
+                    agent_id,
+                    scope: encoded_channel_id.clone(),
+                    conversation: None,
+                    who: format!("{} on {channel} account {}", inb.sender_id, inb.account_id),
+                    admin: is_admin(state, channel, &inb.account_id, &inb.sender_id),
+                    admin_hint: "this bot's admins (listed under the account's `admins` in the \
+                                 gateway's config.toml)",
+                };
+                match crate::commands::run(state, &asker, command, args).await {
+                    crate::commands::Action::Reply(text) => {
+                        tell_sender(
+                            state,
+                            channel,
+                            &inb.account_id,
+                            &inb.sender_id,
+                            &inb.channel_message_id,
+                            &text,
+                        )
+                        .await;
+                        return;
+                    }
+                    crate::commands::Action::Agent(command) => {
+                        command_frame = Some(GatewayToAgent::ChatCommand(command));
+                    }
+                }
+            }
+        },
     }
-    // `/new` starts a new chat with the agent; the old one is kept.
-    // `/new` starts a new chat; the runtime confirms. It goes the way of
-    // a message, in order with the ones after it.
-    let new_chat = is_command_message(&content, "/new");
-    // `/retry` answers the last message again, as a new version of the
-    // reply.
-    let branch = is_command_message(&content, "/retry")
-        .then_some(havn_core::Branch::Regenerate { turn: None });
     let msg = InboundMessage {
         conversation: None,
         branch,
@@ -1202,6 +1264,27 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
         }
     }
 
+    // A command for the agent goes now that it runs.
+    if let Some(frame) = command_frame {
+        if let Err(e) = state.registry.send(agent_id, frame).await {
+            warn!(channel, %agent_id, error = ?e, "failed to forward a chat command");
+            let text = match e {
+                SendError::Draining => GATEWAY_RESTARTING_MESSAGE,
+                _ => AGENT_UNREACHABLE_MESSAGE,
+            };
+            tell_sender(
+                state,
+                channel,
+                &inb.account_id,
+                &inb.sender_id,
+                &inb.channel_message_id,
+                text,
+            )
+            .await;
+        }
+        return;
+    }
+
     // The files go with the message once it can reach the agent; a
     // command does not carry them.
     let mut msg = msg;
@@ -1252,6 +1335,16 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
         )
         .await;
     }
+}
+
+/// Whether `sender_id` is listed among the admins of `(channel,
+/// account_id)` in the gateway's config.
+fn is_admin(state: &AppState, channel: &str, account_id: &str, sender_id: &str) -> bool {
+    state
+        .channels
+        .get(channel)
+        .and_then(|entry| entry.accounts.iter().find(|a| a.id == account_id))
+        .is_some_and(|acct| acct.admins.iter().any(|id| id == sender_id))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1408,49 +1501,9 @@ async fn sender_access(
     SenderAccess::Admitted
 }
 
-/// Whether `text` is the command `name`, alone or with Telegram's
-/// `@botname`.
-fn is_command(text: &str, name: &str) -> bool {
-    text.eq_ignore_ascii_case(name)
-        || text.split_once('@').is_some_and(|(cmd, bot)| {
-            cmd.eq_ignore_ascii_case(name)
-                && !bot.is_empty()
-                && bot.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        })
-}
-
-/// A text message that is only `/stop`.
-fn is_stop_command(content: &MessageContent) -> bool {
-    is_command_message(content, "/stop")
-}
-
-/// A text message that is only the command `name`.
-fn is_command_message(content: &MessageContent, name: &str) -> bool {
-    let MessageContent::Text { text } = content else {
-        return false;
-    };
-    is_command(text.trim(), name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn stop_commands_are_recognised() {
-        let text = |t: &str| MessageContent::Text { text: t.into() };
-        assert!(is_stop_command(&text("/stop")));
-        assert!(is_stop_command(&text("  /STOP ")));
-        assert!(is_stop_command(&text("/stop@havn_bot")));
-        assert!(!is_stop_command(&text("/stop now please")));
-        assert!(!is_stop_command(&text("please /stop")));
-        assert!(!is_stop_command(&text("/stop@bot\nplease do X")));
-        assert!(!is_stop_command(&text("/stop@")));
-        assert!(!is_stop_command(&MessageContent::Image {
-            url: "u".into(),
-            caption: Some("/stop".into())
-        }));
-    }
 
     #[test]
     fn tokens_match_constant_time_basic() {
@@ -1588,6 +1641,7 @@ mod tests {
                             adapter_token_ref: format!("secret:channel:telegram:{id}"),
                             dm_policy,
                             allow_from: allow_from.iter().map(|s| (*s).to_string()).collect(),
+                            admins: Vec::new(),
                         })
                         .collect(),
                 },

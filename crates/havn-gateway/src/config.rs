@@ -179,6 +179,13 @@ pub struct ChannelAccount {
     /// policies.
     #[serde(default)]
     pub allow_from: Vec<String>,
+    /// Platform-prefixed sender IDs who may use the admin chat commands
+    /// (`/model`, `/agent_model`, `/usage`, `/approve`, `/deny`): they
+    /// spend the agent owner's credentials or let a step through. Empty,
+    /// the default, is nobody; the owner can still use them in the web
+    /// chat.
+    #[serde(default)]
+    pub admins: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -958,6 +965,7 @@ mod tests {
                     adapter_token_ref: "secret:channel:telegram:alice-tg-bot".into(),
                     dm_policy: DmPolicy::Allowlist,
                     allow_from: Vec::new(),
+                    admins: Vec::new(),
                 }],
             },
         );
@@ -982,6 +990,7 @@ mod tests {
                     adapter_token_ref: "secret:channel:telegram:alice-tg-bot".into(),
                     dm_policy: DmPolicy::Allowlist,
                     allow_from: Vec::new(),
+                    admins: Vec::new(),
                 }],
             },
         );

@@ -271,6 +271,35 @@ struct UsageRow {
     call_count: i64,
 }
 
+/// One model's share of an agent's use: see [`agent_usage`].
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ModelUsage {
+    pub model: String,
+    pub calls: i64,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+}
+
+/// What agent `agent_id`'s model calls since `since_rfc3339` used, per
+/// model, the most used first.
+pub async fn agent_usage(
+    pool: &SqlitePool,
+    agent_id: AgentId,
+    since_rfc3339: &str,
+) -> Result<Vec<ModelUsage>> {
+    Ok(sqlx::query_as::<_, ModelUsage>(
+        "SELECT model, COUNT(*) AS calls, \
+                COALESCE(SUM(tokens_in), 0) AS tokens_in, \
+                COALESCE(SUM(tokens_out), 0) AS tokens_out \
+         FROM credential_usages WHERE agent_id = ?1 AND created_at >= ?2 \
+         GROUP BY model ORDER BY SUM(tokens_in + tokens_out) DESC, model",
+    )
+    .bind(agent_id.to_string())
+    .bind(since_rfc3339)
+    .fetch_all(pool)
+    .await?)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
