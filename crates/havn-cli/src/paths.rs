@@ -27,6 +27,7 @@ const ENV_CONFIG: &str = "HAVN_CONFIG";
 pub struct CliConfig {
     pub listen: Option<String>,
     pub db_path: Option<PathBuf>,
+    pub workspace_root: Option<PathBuf>,
     pub channels: BTreeMap<String, CliChannel>,
 }
 

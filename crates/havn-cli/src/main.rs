@@ -11,6 +11,8 @@
 
 mod agent;
 mod api;
+#[cfg(unix)]
+mod backup;
 mod channel_access;
 mod credential;
 mod doctor;
@@ -69,6 +71,21 @@ enum Command {
     },
     /// Diagnostic checklist: env, binaries, cgroup, DB, gateway reachability.
     Doctor,
+    /// Back up the gateway's and agents' databases, the agents' directories
+    /// and config.toml to one archive; the gateway may keep running.
+    Backup {
+        /// The archive to write (default: `havn-backup-<time>.tar.gz` here).
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+    },
+    /// Restore a backup onto this host. The gateway must be stopped; start
+    /// it afterwards with the same HAVN_AGE_KEY.
+    Restore {
+        archive: std::path::PathBuf,
+        /// Move an existing installation aside (`.pre-restore-<time>`) first.
+        #[arg(long)]
+        force: bool,
+    },
     /// Manage agents through the gateway's management API.
     Agent {
         #[command(subcommand)]
@@ -417,6 +434,8 @@ fn main() -> anyhow::Result<()> {
         Command::Status => async_runtime()?.block_on(status::run()),
         Command::Logs { lines, follow } => logs::run(follow, lines),
         Command::Doctor => async_runtime()?.block_on(doctor::run()),
+        Command::Backup { output } => async_runtime()?.block_on(run_backup(output)),
+        Command::Restore { archive, force } => run_restore(&archive, force),
         Command::Agent { action } => async_runtime()?.block_on(run_agent(action)),
         Command::Credential { action } => async_runtime()?.block_on(run_credential(action)),
         Command::Model { action } => async_runtime()?.block_on(run_model(action)),
@@ -517,6 +536,92 @@ async fn run_user(action: UserAction) -> anyhow::Result<()> {
         UserAction::List => user::list().await,
         UserAction::Delete { id } => user::delete(&id).await,
     }
+}
+
+#[cfg(unix)]
+async fn run_backup(output: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    let install = backup::Install::from_config()?;
+    let output = output.unwrap_or_else(|| {
+        format!(
+            "havn-backup-{}.tar.gz",
+            chrono::Utc::now().format("%Y%m%d-%H%M%S")
+        )
+        .into()
+    });
+    let manifest = backup::backup(&install, &output).await?;
+    for note in &manifest.incomplete {
+        println!("not in the backup: {note}");
+    }
+    let size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "backed up the gateway and {} agent(s) to {} ({:.1} MB)",
+        manifest.agents.len(),
+        output.display(),
+        size as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "Keep HAVN_AGE_KEY apart from it: the archive does not hold the key, and restoring needs it."
+    );
+    if !manifest.incomplete.is_empty() {
+        anyhow::bail!(
+            "the backup was written, but {} thing(s) are not in it (above)",
+            manifest.incomplete.len()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn run_backup(_output: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    anyhow::bail!("havn backup runs on the gateway's host")
+}
+
+#[cfg(unix)]
+fn run_restore(archive: &std::path::Path, force: bool) -> anyhow::Result<()> {
+    let install = backup::Install::from_config()?;
+    let restored = backup::restore(&install, archive, force)?;
+    if !restored.moved.is_empty() {
+        let kept: Vec<String> = restored
+            .moved
+            .iter()
+            .map(|m| m.display().to_string())
+            .collect();
+        println!(
+            "the installation that was there is kept at {}",
+            kept.join(", ")
+        );
+    }
+    println!(
+        "restored the gateway and {} agent(s) from a backup of {} (havn {}): the database at {}, the agents in {}",
+        restored.manifest.agents.len(),
+        restored.manifest.created_at,
+        restored.manifest.havn_version,
+        restored.install.db.display(),
+        restored.install.workspaces.display()
+    );
+    for note in &restored.manifest.incomplete {
+        println!("not in the backup: {note}");
+    }
+    match &restored.config {
+        Some(c) if c.extension().is_some_and(|e| e == "restored") => {
+            println!(
+                "its config.toml is at {}; the one in place was kept",
+                c.display()
+            );
+        }
+        Some(c) => println!("its config.toml is at {}", c.display()),
+        None => {}
+    }
+    println!(
+        "Start the gateway (`systemctl start havn` or `havn gateway start`) with the HAVN_AGE_KEY \
+         the backup was made with; it migrates the databases if this havn is newer."
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn run_restore(_archive: &std::path::Path, _force: bool) -> anyhow::Result<()> {
+    anyhow::bail!("havn restore runs on the gateway's host")
 }
 
 fn async_runtime() -> anyhow::Result<tokio::runtime::Runtime> {

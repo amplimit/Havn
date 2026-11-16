@@ -25,6 +25,11 @@ toml.workspace = true
 sqlx.workspace = true
 libc.workspace = true
 uuid.workspace = true
+tar.workspace = true
+flate2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

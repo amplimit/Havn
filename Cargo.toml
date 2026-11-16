@@ -78,6 +78,9 @@ pdf-extract = "0.12"
 calamine = { version = "0.38", default-features = false, features = ["dates"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 quick-xml = "0.42"
+# `havn backup` archives (issue #163).
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
 encoding_rs = "0.8"
 url = "2"
 
