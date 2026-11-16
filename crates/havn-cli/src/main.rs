@@ -580,9 +580,6 @@ async fn run_backup(_output: Option<std::path::PathBuf>) -> anyhow::Result<()> {
 fn run_restore(archive: &std::path::Path, force: bool) -> anyhow::Result<()> {
     let install = backup::Install::from_config()?;
     let restored = backup::restore(&install, archive, force)?;
-    for moved in &restored.moved {
-        println!("moved aside to {}", moved.display());
-    }
     println!(
         "restored the gateway and {} agent(s) from a backup of {} (havn {}): the database at {}, the agents in {}",
         restored.manifest.agents.len(),
