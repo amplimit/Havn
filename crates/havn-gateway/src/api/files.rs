@@ -1,7 +1,8 @@
 //! `POST /agents/:id/files` — a file the owner sends in the dashboard
 //! chat (issue #106). It is saved in the agent's workspace under
 //! `inbox/`, through [`crate::agent_files`] so that nothing the agent put
-//! there is followed, and a PDF's text is saved next to it. The answer is
+//! there is followed, and the text of a PDF, Word document or spreadsheet
+//! is saved next to it. The answer is
 //! the [`Attachment`] the chat message then carries.
 
 use axum::Json;
@@ -26,8 +27,8 @@ const MAX_INBOX_FILES: usize = 5000;
 /// Bytes of a sent file's name kept in the saved one: with the stamp, a
 /// number and `.txt` it stays under the 255 bytes a name can have.
 const MAX_NAME_BYTES: usize = 200;
-/// Room the inbox check keeps for a PDF's text, written after it.
-const PDF_TEXT_BYTES: u64 = 8 * 1024 * 1024;
+/// Room the inbox check keeps for a document's text, written after it.
+const TEXT_BYTES: u64 = 8 * 1024 * 1024;
 /// Free space a write leaves on the workspace's filesystem, at least,
 /// counting only what an unprivileged user may use: the root gateway
 /// does not eat into the blocks the filesystem reserves for root.
@@ -147,24 +148,21 @@ pub async fn upload(
 
     let stamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
     let bytes = body.clone();
-    let reserve = if media_type == "application/pdf" {
-        PDF_TEXT_BYTES
-    } else {
-        0
-    };
+    let text_kind = crate::web_fetch::Kind::of_file(&media_type, &name);
+    let reserve = if text_kind.is_some() { TEXT_BYTES } else { 0 };
     let file = name.clone();
     let stored =
         tokio::task::spawn_blocking(move || save(&workspace, &stamp, &file, &bytes, reserve))
             .await
             .map_err(|e| ApiError::Internal(format!("saving the file: {e}")))??;
-    // Saved: reading a PDF waits for its own converters, not for this.
+    // Saved: reading its text waits for its own converters, not for this.
     drop(slot);
 
-    // A PDF's text, for the agent to read with file_read. A file whose
-    // text cannot be read still arrives.
+    // A document's text, for the agent to read with file_read. A file
+    // whose text cannot be read still arrives.
     let mut text_path = None;
-    if media_type == "application/pdf" {
-        match crate::web_fetch::pdf_text(&body).await {
+    if let Some(kind) = text_kind {
+        match crate::web_fetch::document_text(kind, &body).await {
             Ok((text, _)) if !text.trim().is_empty() => {
                 let workspace = crate::api::agents::workspace_for(&state, agent.id);
                 let text_name = format!("{}.txt", stored.file);
@@ -179,16 +177,16 @@ pub async fn upload(
                     Ok(Ok(true)) => text_path = Some(format!("{INBOX_DIR}/{text_name}")),
                     Ok(Ok(false)) => {}
                     Ok(Err(e)) => {
-                        tracing::warn!(agent_id = %agent.id, error = %e, "could not save a PDF's text")
+                        tracing::warn!(agent_id = %agent.id, error = %e, "could not save a document's text")
                     }
                     Err(e) => {
-                        tracing::warn!(agent_id = %agent.id, error = %e, "could not save a PDF's text")
+                        tracing::warn!(agent_id = %agent.id, error = %e, "could not save a document's text")
                     }
                 }
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::info!(agent_id = %agent.id, error = %e, "no text read from an uploaded PDF")
+                tracing::info!(agent_id = %agent.id, error = %e, "no text read from an uploaded document")
             }
         }
     }
@@ -344,6 +342,9 @@ pub fn type_of_name(name: &str) -> &'static str {
         "html" | "htm" => "text/html",
         "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "xlsm" => "application/vnd.ms-excel.sheet.macroEnabled.12",
+        "xls" => "application/vnd.ms-excel",
+        "ods" => "application/vnd.oasis.opendocument.spreadsheet",
         _ => "application/octet-stream",
     }
 }

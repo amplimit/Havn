@@ -73,6 +73,11 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "w
 # Markdown, PDF to text, legacy charsets to UTF-8. All pure Rust.
 htmd = "0.5"
 pdf-extract = "0.12"
+# Text of Word and Excel files sent in a chat (issue #106), read in the
+# gateway's converter child like PDFs.
+calamine = { version = "0.38", default-features = false, features = ["dates"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+quick-xml = "0.42"
 encoding_rs = "0.8"
 url = "2"
 
