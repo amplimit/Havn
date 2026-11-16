@@ -16,6 +16,8 @@ pub struct ModelsView {
     pub version: String,
     pub default_model: Option<String>,
     pub effective_default: Option<String>,
+    /// The model that writes chats' titles; `None` for each agent's own.
+    pub title_model: Option<String>,
     pub models: Vec<ModelEntry>,
     pub editable: bool,
 }
@@ -26,6 +28,7 @@ fn view(state: &AppState) -> ModelsView {
         version: catalog.version(),
         default_model: catalog.default_model.clone(),
         effective_default: catalog.default_entry().map(|m| m.id.clone()),
+        title_model: catalog.title_model.clone(),
         models: catalog.models.clone(),
         editable: state.trusted_proxies.is_none(),
     }
@@ -41,7 +44,19 @@ pub struct ModelsPut {
     pub version: String,
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Absent (a client from before title models): the current one, as
+    /// long as it is still listed. `null` clears it.
+    #[serde(default, deserialize_with = "present")]
+    pub title_model: Option<Option<String>>,
     pub models: Vec<ModelEntry>,
+}
+
+/// A field that is present, `null` included.
+fn present<'de, D>(d: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(d).map(Some)
 }
 
 pub async fn put(
@@ -56,8 +71,18 @@ pub async fn put(
                 .into(),
         ));
     }
+    let title_model = match req.title_model {
+        Some(sent) => sent,
+        None => state
+            .models
+            .load()
+            .title_model
+            .clone()
+            .filter(|t| req.models.iter().any(|m| &m.id == t)),
+    };
     let catalog = ModelCatalog {
         default_model: req.default_model,
+        title_model,
         models: req.models,
     };
     catalog
@@ -93,13 +118,14 @@ pub async fn put(
     }
     let ids: Vec<String> = catalog.models.iter().map(|m| m.id.clone()).collect();
     let default_model = catalog.default_model.clone();
+    let title_model = catalog.title_model.clone();
     state.models.store(Arc::new(catalog));
 
     audit::record_user_action(
         &state.db,
         user.id,
         "llm.models.updated",
-        serde_json::json!({ "models": ids, "default_model": default_model }),
+        serde_json::json!({ "models": ids, "default_model": default_model, "title_model": title_model }),
     )
     .await;
     info!(models = ?ids, default = ?default_model, by = %user.id, "model list written to config.toml");
@@ -117,6 +143,7 @@ mod tests {
         Json(ModelsPut {
             version: version.into(),
             default_model: None,
+            title_model: None,
             models: ids
                 .iter()
                 .map(|id| ModelEntry {
@@ -168,6 +195,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_client_that_leaves_out_the_title_model_keeps_it() {
+        let (state, user_id) = state_with(false).await;
+        let put_with = |version: String, ids: &[&str], title: Option<Option<&str>>| {
+            let mut b = body(&version, ids);
+            b.0.title_model = title.map(|t| t.map(String::from));
+            put(State(state.clone()), user(user_id), b)
+        };
+        let first = get(State(state.clone()), user(user_id)).await.0.version;
+        let view = put_with(first, &["openai:a", "openai:b"], Some(Some("openai:b")))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(view.title_model.as_deref(), Some("openai:b"));
+        // An older client: the field left out keeps it.
+        let view = put_with(view.version, &["openai:a", "openai:b"], None)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(view.title_model.as_deref(), Some("openai:b"));
+        // Not when it removed the model.
+        let view = put_with(view.version, &["openai:a"], None).await.unwrap().0;
+        assert_eq!(view.title_model, None);
+        let view = put_with(view.version, &["openai:a"], Some(Some("openai:a")))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(view.title_model.as_deref(), Some("openai:a"));
+        // `null` clears it.
+        let view = put_with(view.version, &["openai:a"], Some(None))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(view.title_model, None);
+        let parsed: crate::config::GatewayConfig =
+            toml::from_str(&std::fs::read_to_string(&state.config_path).unwrap()).unwrap();
+        assert_eq!(parsed.llm.title_model, None);
+        let _ = std::fs::remove_file(&state.config_path);
+    }
+
+    #[test]
+    fn the_title_model_field_tells_absent_from_null() {
+        let absent: ModelsPut =
+            serde_json::from_str(r#"{"version":"v","models":[]}"#).expect("parse");
+        assert_eq!(absent.title_model, None);
+        let null: ModelsPut =
+            serde_json::from_str(r#"{"version":"v","title_model":null,"models":[]}"#)
+                .expect("parse");
+        assert_eq!(null.title_model, Some(None));
+        let set: ModelsPut =
+            serde_json::from_str(r#"{"version":"v","title_model":"openai:a","models":[]}"#)
+                .expect("parse");
+        assert_eq!(set.title_model, Some(Some("openai:a".into())));
+    }
+
+    #[tokio::test]
     async fn put_refuses_a_writer_that_read_an_older_list() {
         let (state, user_id) = state_with(false).await;
         let first = put(
@@ -191,6 +273,7 @@ mod tests {
         // A hand edit the watcher has not applied yet counts as a change.
         let edited = ModelCatalog {
             default_model: None,
+            title_model: None,
             models: vec![],
         };
         model_catalog::write_to_file(&state.config_path, &edited).unwrap();

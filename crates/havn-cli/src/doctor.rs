@@ -878,6 +878,7 @@ mod tests {
         crate::model::ModelsView {
             version: String::new(),
             default_model: None,
+            title_model: None,
             effective_default: ids.first().map(|s| (*s).to_string()),
             models: ids
                 .iter()

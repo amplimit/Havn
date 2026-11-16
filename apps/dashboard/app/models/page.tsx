@@ -23,7 +23,11 @@ export default function ModelsPage() {
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }, []);
 
-  async function save(defaultModel: string | null, models: ModelEntry[]) {
+  async function save(
+    defaultModel: string | null,
+    models: ModelEntry[],
+    titleModel: string | null = view?.title_model ?? null,
+  ) {
     setBusy(true);
     setError(null);
     try {
@@ -31,6 +35,8 @@ export default function ModelsPage() {
         await api.models.put({
           version: view?.version ?? "",
           default_model: defaultModel,
+          // A model no longer listed no longer titles chats.
+          title_model: titleModel && models.some((m) => m.id === titleModel) ? titleModel : null,
           models,
         }),
       );
@@ -127,6 +133,30 @@ export default function ModelsPage() {
           <p className="mt-3 text-sm" style={{ color: "var(--color-ruby)" }}>
             With trust_header on, the list can only be changed in config.toml.
           </p>
+        )}
+        {view && view.models.length > 0 && (
+          <label className="mt-3 flex flex-wrap items-center gap-2 text-sm" style={{ color: "var(--color-body)" }}>
+            Chat titles are written by
+            <select
+              className="input"
+              value={view.title_model ?? ""}
+              disabled={busy || !editable}
+              onChange={(e) => void save(view.default_model, view.models, e.target.value || null)}
+              aria-label="title model"
+            >
+              <option value="">each agent&apos;s own model</option>
+              {view.models.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label ? `${m.label} (${m.id})` : m.id}
+                </option>
+              ))}
+            </select>
+            <span>
+              (<code className="font-mono">[llm] title_model</code>; a small, cheap model
+              does well. Agents use it from their next start. A team&apos;s policy can
+              name another, or turn titles off.)
+            </span>
+          </label>
         )}
       </header>
 

@@ -968,6 +968,7 @@ mod tests {
     fn catalog(models: &[&str]) -> ModelCatalog {
         ModelCatalog {
             default_model: None,
+            title_model: None,
             models: models
                 .iter()
                 .map(|id| ModelEntry {

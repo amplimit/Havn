@@ -165,6 +165,8 @@ pub enum ServerMessage {
     },
     /// The approval request `id` was decided or ended; stop showing it.
     ApprovalClosed { id: String },
+    /// A model titled chat `conversation`.
+    ChatTitle { conversation: String, title: String },
     /// The answer to a chat command (`/status`, `/undo`, ...): shown in
     /// the chat, not kept in it, and not a reply to a message.
     Notice {
@@ -503,6 +505,25 @@ impl WebChatRouter {
                 conversation,
                 turn,
                 changes,
+            },
+        )
+        .await
+    }
+
+    /// Tell the tabs of `session_id` a model titled chat `conversation`.
+    pub async fn chat_titled(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        conversation: String,
+        title: String,
+    ) -> Result<(), DeliverError> {
+        self.show_to_session(
+            agent_id,
+            session_id,
+            ServerMessage::ChatTitle {
+                conversation,
+                title,
             },
         )
         .await
@@ -906,6 +927,7 @@ mod tests {
             | ServerMessage::File { .. }
             | ServerMessage::Step { .. }
             | ServerMessage::Notice { .. }
+            | ServerMessage::ChatTitle { .. }
             | ServerMessage::ReplyText { .. } => {
                 panic!("expected AgentMessage, got Error")
             }
@@ -1037,6 +1059,7 @@ mod tests {
                 | ServerMessage::File { .. }
                 | ServerMessage::Step { .. }
                 | ServerMessage::Notice { .. }
+                | ServerMessage::ChatTitle { .. }
                 | ServerMessage::ReplyText { .. } => {
                     panic!("unexpected Error")
                 }
@@ -1083,6 +1106,7 @@ mod tests {
                 | ServerMessage::File { .. }
                 | ServerMessage::Step { .. }
                 | ServerMessage::Notice { .. }
+                | ServerMessage::ChatTitle { .. }
                 | ServerMessage::ReplyText { .. } => {
                     panic!("unexpected Error")
                 }

@@ -30,6 +30,29 @@ pub struct Policy {
     /// `.havn/hooks.yaml`. The runtime applies them together with the
     /// workspace file, which can add rules but not remove these.
     pub hooks: HookPolicy,
+    /// Chats titled by a model (issue #179).
+    pub chat_titles: ChatTitles,
+}
+
+/// Whether a model writes each new chat's title, and which.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChatTitles {
+    /// A model titles each new chat from its first message. Off, a chat
+    /// is titled after the start of its first message.
+    pub enabled: bool,
+    /// The model that writes them, in place of the gateway's
+    /// `[llm] title_model`; empty for that.
+    pub model: String,
+}
+
+impl Default for ChatTitles {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: String::new(),
+        }
+    }
 }
 
 impl Default for Policy {
@@ -45,6 +68,7 @@ impl Default for Policy {
             admin_visibility: AdminVisibility::default(),
             mcp_servers: HashMap::new(),
             hooks: HookPolicy::default(),
+            chat_titles: ChatTitles::default(),
         }
     }
 }
@@ -569,6 +593,16 @@ impl Policy {
                 })
                 .collect(),
             hooks: self.hooks.union(&ceiling.hooks),
+            // Off where the ceiling has them off; its model, when it names
+            // one, is the one used.
+            chat_titles: ChatTitles {
+                enabled: self.chat_titles.enabled && ceiling.chat_titles.enabled,
+                model: if ceiling.chat_titles.model.is_empty() {
+                    self.chat_titles.model.clone()
+                } else {
+                    ceiling.chat_titles.model.clone()
+                },
+            },
         }
     }
 
@@ -670,6 +704,16 @@ impl Policy {
             // combining roles keeps all of them rather than only the
             // rules every role shares.
             hooks: self.hooks.union(&other.hooks),
+            chat_titles: ChatTitles {
+                enabled: self.chat_titles.enabled || other.chat_titles.enabled,
+                // The model of a role that has them on comes first.
+                model: [&self.chat_titles, &other.chat_titles]
+                    .into_iter()
+                    .filter(|t| !t.model.is_empty())
+                    .min_by_key(|t| !t.enabled)
+                    .map(|t| t.model.clone())
+                    .unwrap_or_default(),
+            },
         }
     }
 }
@@ -796,6 +840,34 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn chat_titles_are_off_where_the_ceiling_has_them_off() {
+        let mut team = Policy::default();
+        team.chat_titles.enabled = false;
+        team.chat_titles.model = "openai:small".into();
+        let mut agent = Policy::default();
+        agent.chat_titles.model = "openai:big".into();
+        let clamped = agent.clamp_to(&team);
+        assert!(!clamped.chat_titles.enabled);
+        assert_eq!(clamped.chat_titles.model, "openai:small");
+        let open = agent.clamp_to(&Policy::default());
+        assert!(open.chat_titles.enabled);
+        assert_eq!(open.chat_titles.model, "openai:big");
+        // Across roles, on wins, and so does the model of a role with them
+        // on.
+        let widened = team.widen_with(&Policy::default());
+        assert!(widened.chat_titles.enabled);
+        assert_eq!(widened.chat_titles.model, "openai:small");
+        let mut on = Policy::default();
+        on.chat_titles.model = "openai:on".into();
+        assert_eq!(team.widen_with(&on).chat_titles.model, "openai:on");
+        assert_eq!(on.widen_with(&team).chat_titles.model, "openai:on");
+        // Both on: the first role's.
+        let mut also = Policy::default();
+        also.chat_titles.model = "openai:also".into();
+        assert_eq!(on.widen_with(&also).chat_titles.model, "openai:on");
+    }
 
     #[test]
     fn domain_lists_only_add_when_merged() {

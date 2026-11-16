@@ -998,16 +998,7 @@ where
                 // The chat it continues, which its turn runs in. A message
                 // that branches off one needs the chat to exist.
                 // A message of files alone is titled after them.
-                let typed = render_content_for_llm(&msg.content).unwrap_or_default();
-                let text = if typed.trim().is_empty() && !msg.attachments.is_empty() {
-                    msg.attachments
-                        .iter()
-                        .map(|a| a.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                } else {
-                    typed
-                };
+                let text = first_text(&msg);
                 let chat = if msg.branch.is_some() {
                     conversations::existing_chat(
                         &ctx.pool,
@@ -1823,6 +1814,131 @@ async fn chat_command(ctx: &Ctx, command: &havn_proto::ChatCommand) -> (Option<S
     }
 }
 
+/// What a model is asked to title a chat with.
+const TITLE_PROMPT: &str = "You name chats. Reply with a title for the chat that starts with \
+     the user's message below: at most 8 words, or 16 characters in Chinese or Japanese, in the \
+     language of the message, without quotes or a full stop. Reply with the title only.";
+/// Characters of the first message a title is written from.
+const TITLE_INPUT_CHARS: usize = 2000;
+/// Output tokens a title call may use.
+const TITLE_MAX_TOKENS: u32 = 1000;
+
+/// What a message gives a new chat to be named after: its text, or the
+/// names of its files when it has only them.
+fn first_text(msg: &InboundMessage) -> String {
+    let typed = render_content_for_llm(&msg.content).unwrap_or_default();
+    if typed.trim().is_empty() && !msg.attachments.is_empty() {
+        msg.attachments
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        typed
+    }
+}
+
+/// Have a model title chat `chat` of `channel_id` from its first message
+/// `text`, unless the user retitled it from `provisional` meanwhile; tell
+/// the conversation's tabs.
+async fn title_chat(
+    ctx: &Ctx,
+    channel_id: String,
+    chat: String,
+    provisional: &str,
+    text: &str,
+) -> anyhow::Result<()> {
+    let message: String = text.chars().take(TITLE_INPUT_CHARS).collect();
+    // The title model, as the gateway resolved it when the agent started;
+    // when it fails (removed from the list since), the agent's own.
+    let named = Some(ctx.tool_env.policy.chat_titles.model.clone()).filter(|m| !m.is_empty());
+    let own = ctx.model();
+    let mut models = named.into_iter().map(Arc::new).collect::<Vec<_>>();
+    if models.first().is_none_or(|m| *m != own) {
+        models.push(own);
+    }
+    let mut failed = anyhow!("no model to title with");
+    let mut text = None;
+    for model in models {
+        let request = havn_proto::LlmRequest {
+            request_id: uuid::Uuid::now_v7().to_string(),
+            model: model.as_str().into(),
+            messages: serde_json::json!([{ "role": "user", "content": message }]),
+            // Room for a reasoning model's thinking before its answer.
+            options: serde_json::json!({ "max_tokens": TITLE_MAX_TOKENS, "system": TITLE_PROMPT }),
+            billing_user_id: None,
+            reply: None,
+        };
+        let response = tool_loop::request_llm(&ctx.writer_tx, &ctx.pending, request).await?;
+        match response.outcome {
+            havn_proto::LlmOutcome::Ok => {
+                if let Some(t) = curator::extract_text(&response.provider_response) {
+                    text = Some(t);
+                    break;
+                }
+                failed = anyhow!("the title had no text");
+                break;
+            }
+            havn_proto::LlmOutcome::Error { message } => {
+                // Only a model the gateway no longer takes gives way to the
+                // agent's own; any other failure is not paid for twice.
+                let gone = message.contains("not in the gateway's model list")
+                    || message.contains("not allowed by this agent's policy");
+                failed = anyhow!("LLM error from {model}: {message}");
+                if !gone {
+                    break;
+                }
+            }
+        }
+    }
+    let Some(text) = text else {
+        return Err(failed);
+    };
+    let Some(title) = clean_title(&text) else {
+        return Err(anyhow!("the title was empty"));
+    };
+    if conversations::retitle(&ctx.pool, &chat, provisional, &title).await? {
+        let titled = AgentToGateway::ChatTitled(havn_proto::ChatTitled {
+            channel_id,
+            conversation: chat,
+            title,
+        });
+        if let Err(e) = ctx.writer_tx.try_send(titled) {
+            warn!(error = %e, "could not tell the chat's new title");
+        }
+    }
+    Ok(())
+}
+
+/// A model's answer as a title: its first line, without quotes, heading
+/// marks, a "Title:" label or a final full stop.
+fn clean_title(text: &str) -> Option<String> {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let line = line
+        .trim_start_matches(['#', '*', ' '])
+        .trim_end_matches(['*', ' ']);
+    let line = ["Title:", "title:", "标题：", "标题:"]
+        .iter()
+        .find_map(|label| line.strip_prefix(label))
+        .unwrap_or(line)
+        .trim_matches(['*', ' ']);
+    let quotes: &[char] = &['"', '\'', '“', '”', '‘', '’', '「', '」', '《', '》', '`'];
+    // Quotes and a full stop, in whichever order they come.
+    let mut line = line;
+    loop {
+        let trimmed = line
+            .trim_end_matches(['.', '。'])
+            .trim_matches(quotes)
+            .trim();
+        if trimmed == line {
+            break;
+        }
+        line = trimmed;
+    }
+    let title: String = line.chars().take(conversations::MAX_TITLE_CHARS).collect();
+    (!title.is_empty()).then_some(title)
+}
+
 /// Characters of a taken-back message `/undo` quotes.
 const UNDO_EXCERPT_CHARS: usize = 60;
 
@@ -1924,6 +2040,33 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
             return;
         }
     };
+
+    // A new chat's first message: a model titles the chat meanwhile. Only
+    // while the chat still has the title its first message gave it: one
+    // the user chose, or a model wrote before an `/undo`, stays. A message
+    // of files alone keeps their names.
+    let provisional = conversations::title_from(&first_text(&msg));
+    let typed = render_content_for_llm(&msg.content).unwrap_or_default();
+    if msg.branch.is_none()
+        && ctx.tool_env.policy.chat_titles.enabled
+        && !typed.trim().is_empty()
+        && !provisional.is_empty()
+    {
+        match conversations::chat_info(&ctx.pool, &chat).await {
+            Ok(Some(info)) if info.turns == 1 && info.title == provisional => {
+                let ctx = ctx.clone();
+                let (channel_id, chat, text) =
+                    (msg.channel_id.clone(), chat.clone(), user_text.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = title_chat(&ctx, channel_id, chat, &provisional, &text).await {
+                        warn!(error = %e, "could not title the chat; it keeps its first message's");
+                    }
+                });
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "could not read the chat"),
+        }
+    }
 
     // The latest turns, and the summary of what came before them.
     let (summary, history) =
@@ -2886,6 +3029,33 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_models_answer_becomes_a_clean_title() {
+        assert_eq!(
+            clean_title("Budget for March").as_deref(),
+            Some("Budget for March")
+        );
+        assert_eq!(
+            clean_title("\n  \"Trip to Kyoto.\"  \nmore").as_deref(),
+            Some("Trip to Kyoto")
+        );
+        assert_eq!(
+            clean_title("**Title:** Q3 report**").as_deref(),
+            Some("Q3 report")
+        );
+        assert_eq!(
+            clean_title("标题：「三月预算」。").as_deref(),
+            Some("三月预算")
+        );
+        assert_eq!(clean_title("# 合同审阅").as_deref(), Some("合同审阅"));
+        assert_eq!(clean_title("  \n \"\" "), None);
+        let long = "x".repeat(200);
+        assert_eq!(
+            clean_title(&long).map(|t| t.chars().count()),
+            Some(conversations::MAX_TITLE_CHARS)
+        );
+    }
 
     #[test]
     fn images_go_with_the_last_user_message() {
