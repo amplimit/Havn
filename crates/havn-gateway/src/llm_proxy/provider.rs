@@ -161,6 +161,13 @@ pub fn status_error(status: u16, body: String) -> ProviderError {
     }
 }
 
+/// A stream that stopped before the provider said the reply was done:
+/// a connection cut, retried on the next credential.
+#[must_use]
+pub fn cut_short() -> ProviderError {
+    ProviderError::Transport("the response stream ended before the reply did".into())
+}
+
 /// Bytes a streamed response may hold, all told.
 const MAX_STREAM_BYTES: usize = 32 * 1024 * 1024;
 

@@ -2177,7 +2177,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
 
     // The text shown arrives before the reply the runtime sends next.
     if let Some(reply) = reply {
-        reply.finish(&ctx).await;
+        reply.finish().await;
     }
     if let Err(e) = ctx
         .registry
@@ -2190,6 +2190,9 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
 
 /// How often the text of a streamed call goes to the tabs, at most.
 const REPLY_TEXT_EVERY: std::time::Duration = std::time::Duration::from_millis(80);
+/// How often the whole text so far goes instead of what it added, so a
+/// tab that missed a piece, or opened during the call, catches up.
+const REPLY_TEXT_WHOLE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The LLM calls of each agent whose text is shown as it arrives, by
 /// request id, and whether the runtime has given up on them.
@@ -2204,12 +2207,16 @@ enum ReplyPiece {
     Restart,
 }
 
+type PieceSender = Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<ReplyPiece>>>>;
+
 /// A streamed call's text on its way to the tabs of the session its turn
-/// answers (issue #162).
+/// answers (issue #162). Dropping it, on any path, forgets the call.
 struct ReplyText {
     sink: Box<llm_proxy::TextSink>,
-    forward: tokio::task::JoinHandle<()>,
+    sender: PieceSender,
+    forward: Option<tokio::task::JoinHandle<()>>,
     key: (AgentId, String),
+    streams: ReplyStreams,
 }
 
 impl ReplyText {
@@ -2232,6 +2239,7 @@ impl ReplyText {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(key.clone(), Arc::clone(&cancelled));
         let (tx, rx) = mpsc::unbounded_channel();
+        let sender: PieceSender = Arc::new(std::sync::Mutex::new(Some(tx)));
         let forward = tokio::spawn(forward_reply_text(
             ctx.webchat_router.clone(),
             agent_id,
@@ -2241,31 +2249,63 @@ impl ReplyText {
             rx,
             Arc::clone(&cancelled),
         ));
+        let pieces = Arc::clone(&sender);
         let sink: Box<llm_proxy::TextSink> = Box::new(move |event| {
             if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
-            let _ = tx.send(match event {
-                llm_proxy::provider::TextEvent::Text(text) => ReplyPiece::Text(text.to_string()),
-                llm_proxy::provider::TextEvent::Restart => ReplyPiece::Restart,
-            });
+            let pieces = pieces
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(tx) = pieces.as_ref() {
+                let _ = tx.send(match event {
+                    llm_proxy::provider::TextEvent::Text(text) => {
+                        ReplyPiece::Text(text.to_string())
+                    }
+                    llm_proxy::provider::TextEvent::Restart => ReplyPiece::Restart,
+                });
+            }
         });
-        Some(Self { sink, forward, key })
+        Some(Self {
+            sink,
+            sender,
+            forward: Some(forward),
+            key,
+            streams: Arc::clone(&ctx.reply_streams),
+        })
+    }
+
+    /// No more text: the forwarder sends what is left and ends.
+    fn close(&self) {
+        self.sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 
     /// Pass on what is left and stop.
-    async fn finish(self, ctx: &AgentSocketCtx) {
-        drop(self.sink);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), self.forward).await;
-        ctx.reply_streams
+    async fn finish(mut self) {
+        self.close();
+        if let Some(forward) = self.forward.take() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), forward).await;
+        }
+    }
+}
+
+impl Drop for ReplyText {
+    fn drop(&mut self) {
+        self.close();
+        self.streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.key);
     }
 }
 
-/// Send the pieces of a call's text to the session's tabs, gathered for
-/// [`REPLY_TEXT_EVERY`] at a time.
+/// Send a call's text to the session's tabs, gathered for
+/// [`REPLY_TEXT_EVERY`] at a time: what it added, after the length the
+/// tabs were last sent, or the whole of it at least every
+/// [`REPLY_TEXT_WHOLE_EVERY`] and after a restart.
 async fn forward_reply_text(
     router: WebChatRouter,
     agent_id: AgentId,
@@ -2275,28 +2315,33 @@ async fn forward_reply_text(
     mut rx: mpsc::UnboundedReceiver<ReplyPiece>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    // The call's text so far, and how much of it the tabs were sent, in
+    // bytes and in the UTF-16 units a browser counts.
+    let mut whole = String::new();
+    let mut sent_bytes = 0;
+    let mut sent_units = 0;
+    let mut last_whole = std::time::Instant::now();
     let mut open = true;
     while open {
         let Some(first) = rx.recv().await else {
             break;
         };
-        let mut text = String::new();
         let mut restart = false;
-        let add = |piece: ReplyPiece, text: &mut String, restart: &mut bool| match piece {
-            ReplyPiece::Text(piece) => text.push_str(&piece),
+        let add = |piece: ReplyPiece, whole: &mut String, restart: &mut bool| match piece {
+            ReplyPiece::Text(piece) => whole.push_str(&piece),
             ReplyPiece::Restart => {
-                text.clear();
+                whole.clear();
                 *restart = true;
             }
         };
-        add(first, &mut text, &mut restart);
+        add(first, &mut whole, &mut restart);
         let flush = tokio::time::sleep(REPLY_TEXT_EVERY);
         tokio::pin!(flush);
         loop {
             tokio::select! {
                 () = &mut flush => break,
                 piece = rx.recv() => match piece {
-                    Some(piece) => add(piece, &mut text, &mut restart),
+                    Some(piece) => add(piece, &mut whole, &mut restart),
                     None => {
                         open = false;
                         break;
@@ -2304,18 +2349,25 @@ async fn forward_reply_text(
                 },
             }
         }
-        if cancelled.load(std::sync::atomic::Ordering::Relaxed) || (text.is_empty() && !restart) {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             continue;
         }
+        let (at, text) = if restart || last_whole.elapsed() >= REPLY_TEXT_WHOLE_EVERY {
+            last_whole = std::time::Instant::now();
+            (0, whole.clone())
+        } else if whole.len() > sent_bytes {
+            (sent_units, whole[sent_bytes..].to_string())
+        } else {
+            continue;
+        };
+        sent_units = if at == 0 {
+            whole.encode_utf16().count()
+        } else {
+            sent_units + text.encode_utf16().count()
+        };
+        sent_bytes = whole.len();
         let _ = router
-            .reply_text(
-                agent_id,
-                session,
-                conversation.clone(),
-                &call,
-                text,
-                restart,
-            )
+            .reply_text(agent_id, session, conversation.clone(), &call, text, at)
             .await;
     }
 }

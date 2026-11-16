@@ -26,7 +26,8 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::provider::{
-    LlmProvider, ProviderError, Sse, TextEvent, TextSink, is_event_stream, pass_text, status_error,
+    LlmProvider, ProviderError, Sse, TextEvent, TextSink, cut_short, is_event_stream, pass_text,
+    status_error,
 };
 use super::{AnthropicMessage, AnthropicRequest, AnthropicResponse, AnthropicUsage};
 
@@ -160,8 +161,10 @@ impl LlmProvider for OpenAiProvider {
 
         let mut events = Sse::new(resp);
         let mut reply = StreamedReply::default();
+        let mut done = false;
         while let Some(data) = events.next().await? {
             if data.trim() == "[DONE]" {
+                done = true;
                 break;
             }
             let chunk: Value = serde_json::from_str(&data)
@@ -175,6 +178,9 @@ impl LlmProvider for OpenAiProvider {
             if let Some(piece) = reply.add(&chunk) {
                 text(TextEvent::Text(&piece));
             }
+        }
+        if !done && reply.finish_reason.is_none() {
+            return Err(cut_short());
         }
         openai_to_anthropic(&reply.whole())
             .map_err(|e| ProviderError::Translation(format!("response translate: {e}")))
@@ -403,13 +409,31 @@ impl StreamedReply {
             .into_iter()
             .flatten()
         {
-            let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty());
+            // Without an index, a new id starts a call; the rest continue
+            // the last one.
+            let index = call
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| match self.tool_calls.iter().next_back() {
+                    Some((last, (last_id, _, _))) => match id {
+                        Some(id) if !last_id.is_empty() && last_id != id => last + 1,
+                        _ => *last,
+                    },
+                    None => 0,
+                });
             let entry = self.tool_calls.entry(index).or_default();
-            if let Some(id) = call.get("id").and_then(Value::as_str) {
+            if let Some(id) = id {
                 entry.0 = id.to_string();
             }
-            if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
-                entry.1.push_str(name);
+            // Some servers repeat the name in every fragment.
+            if let Some(name) = call.pointer("/function/name").and_then(Value::as_str)
+                && entry.1.is_empty()
+            {
+                entry.1 = name.to_string();
             }
             if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str) {
                 entry.2.push_str(arguments);
@@ -795,6 +819,60 @@ mod tests {
         let openrouter =
             anthropic_to_openai(&r, OpenAiProvider::OPENROUTER.max_tokens_field).expect("body");
         assert_eq!(openrouter["max_tokens"], 256);
+    }
+
+    #[tokio::test]
+    async fn a_stream_cut_short_is_not_a_reply() {
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Half a\"}}]}\n\n",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let err = OpenAiProvider::OPENROUTER
+            .stream(
+                &crate::llm_proxy::http_client().expect("client"),
+                &base,
+                "sk-local",
+                &req(
+                    vec![AnthropicMessage {
+                        role: "user".into(),
+                        content: json!("hi"),
+                    }],
+                    None,
+                ),
+                &|_: TextEvent<'_>| {},
+            )
+            .await
+            .expect_err("no end, no reply");
+        server.abort();
+        assert!(matches!(err, ProviderError::Transport(_)), "{err}");
+    }
+
+    #[test]
+    fn tool_calls_without_an_index_or_with_repeated_names_stay_apart() {
+        let chunks = [
+            json!({"choices": [{"delta": {"tool_calls": [{"id": "a", "function": {"name": "shell", "arguments": "{\"command\":"}}]}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [{"function": {"name": "shell", "arguments": "\"ls\"}"}}]}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [{"id": "b", "function": {"name": "file_read", "arguments": "{\"path\":\"x\"}"}}]}, "finish_reason": "tool_calls"}]}),
+        ];
+        let mut reply = StreamedReply::default();
+        for c in &chunks {
+            reply.add(c);
+        }
+        let response = openai_to_anthropic(&reply.whole()).expect("translate");
+        assert_eq!(response.content[0]["name"], "shell");
+        assert_eq!(response.content[0]["input"]["command"], "ls");
+        assert_eq!(response.content[1]["name"], "file_read");
+        assert_eq!(response.content[1]["input"]["path"], "x");
     }
 
     #[test]

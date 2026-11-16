@@ -184,8 +184,10 @@ export default function ChatPage({
   const [step, setStep] = useState<Step | null>(null);
   // The text of the reply being written, by model call, as it arrives.
   const [live, setLive] = useState<{ call: string; text: string }[]>([]);
-  // Calls whose text is no longer shown: their reply came or was stopped.
+  // Calls whose text is no longer shown: their reply came or was stopped;
+  // and those shown now. Kept apart from `live` so a call ends at once.
   const doneCalls = useRef(new Set<string>());
+  const liveCalls = useRef(new Set<string>());
   const pending = waiting > 0;
   // Tool calls of the running reply that wait for the user.
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
@@ -407,12 +409,21 @@ export default function ChatPage({
               return;
             }
             if (doneCalls.current.has(msg.call)) return;
+            liveCalls.current.add(msg.call);
             setStep(null);
             setLive((prev) => {
               const i = prev.findIndex((p) => p.call === msg.call);
-              if (i < 0) return [...prev, { call: msg.call, text: msg.text }];
+              if (msg.at === 0) {
+                if (i < 0) return [...prev, { call: msg.call, text: msg.text }];
+                const next = [...prev];
+                next[i] = { call: msg.call, text: msg.text };
+                return next;
+              }
+              // A piece that does not follow what is shown waits for the
+              // next whole text.
+              if (i < 0 || prev[i].text.length !== msg.at) return prev;
               const next = [...prev];
-              next[i] = { call: msg.call, text: msg.restart ? msg.text : next[i].text + msg.text };
+              next[i] = { call: msg.call, text: prev[i].text + msg.text };
               return next;
             });
             return;
@@ -510,15 +521,16 @@ export default function ChatPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, me?.ws_token]);
 
-  // Auto-scroll to bottom on new bubbles or when the typing
-  // indicator appears.
+  // Auto-scroll to bottom on new bubbles, when the typing indicator
+  // appears, and as the reply being written grows.
+  const liveLength = live.reduce((n, p) => n + p.text.length, 0);
   useEffect(() => {
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     scrollRef.current?.scrollTo({
       top: scrollRef.current.scrollHeight,
       behavior: reduce ? "auto" : "smooth",
     });
-  }, [bubbles.length, pending]);
+  }, [bubbles.length, pending, liveLength]);
 
   // A file card, once per file.
   function addFile(url: string, name: string, caption: string | undefined, ts: number) {
@@ -527,10 +539,14 @@ export default function ChatPage({
 
   // Stop showing the text being written: the reply replaces it.
   function endLive() {
-    setLive((prev) => {
-      for (const p of prev) doneCalls.current.add(p.call);
-      return [];
-    });
+    for (const call of liveCalls.current) doneCalls.current.add(call);
+    liveCalls.current.clear();
+    // The oldest are forgotten; their text stopped coming long ago.
+    for (const call of doneCalls.current) {
+      if (doneCalls.current.size <= 500) break;
+      doneCalls.current.delete(call);
+    }
+    setLive([]);
   }
 
   function pushBubble(role: Bubble["role"], content: string) {

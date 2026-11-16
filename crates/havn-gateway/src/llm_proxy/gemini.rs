@@ -21,7 +21,8 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::provider::{
-    LlmProvider, ProviderError, Sse, TextEvent, TextSink, is_event_stream, pass_text, status_error,
+    LlmProvider, ProviderError, Sse, TextEvent, TextSink, cut_short, is_event_stream, pass_text,
+    status_error,
 };
 use super::{AnthropicMessage, AnthropicRequest, AnthropicResponse, AnthropicUsage};
 
@@ -160,6 +161,10 @@ impl LlmProvider for GeminiProvider {
             for piece in reply.add(&chunk) {
                 text(TextEvent::Text(&piece));
             }
+        }
+        // A blocked prompt ends with its feedback and no candidate.
+        if reply.finish.is_none() && reply.last.get("promptFeedback").is_none() {
+            return Err(cut_short());
         }
         gemini_to_anthropic(&reply.whole(), &request.model)
             .map_err(|e| ProviderError::Translation(format!("response translate: {e}")))
@@ -410,6 +415,11 @@ impl StreamedReply {
     /// The whole response, as the API answers a call that does not stream:
     /// the last chunk's finish reason, usage and feedback, with every part.
     fn whole(&self) -> Value {
+        // Nothing came but the last chunk (a blocked prompt's feedback):
+        // it is the response.
+        if self.parts.is_empty() && self.finish.is_none() {
+            return self.last.clone();
+        }
         let mut whole = self.last.clone();
         if !whole.is_object() {
             whole = json!({});

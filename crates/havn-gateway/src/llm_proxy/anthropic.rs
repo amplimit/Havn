@@ -3,7 +3,8 @@
 use async_trait::async_trait;
 
 use super::provider::{
-    LlmProvider, ProviderError, Sse, TextEvent, TextSink, is_event_stream, pass_text, status_error,
+    LlmProvider, ProviderError, Sse, TextEvent, TextSink, cut_short, is_event_stream, pass_text,
+    status_error,
 };
 use super::{AnthropicRequest, AnthropicResponse};
 
@@ -108,6 +109,9 @@ impl LlmProvider for AnthropicProvider {
                 break;
             }
         }
+        if !message.stopped {
+            return Err(cut_short());
+        }
         serde_json::from_value(message.whole())
             .map_err(|e| ProviderError::Translation(format!("response translate: {e}")))
     }
@@ -174,6 +178,13 @@ impl StreamedMessage {
                         "signature",
                         delta.get("signature").and_then(Value::as_str)?,
                     ),
+                    "citations_delta" => {
+                        let citation = delta.get("citation")?.clone();
+                        match block.get_mut("citations").and_then(Value::as_array_mut) {
+                            Some(citations) => citations.push(citation),
+                            None => block["citations"] = Value::Array(vec![citation]),
+                        }
+                    }
                     _ => {}
                 }
             }

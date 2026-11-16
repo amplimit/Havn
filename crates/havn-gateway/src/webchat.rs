@@ -167,16 +167,16 @@ pub enum ServerMessage {
         conversation: Option<String>,
     },
     /// The text of a model call of the reply being written, as it
-    /// arrives; `restart` drops what the call showed before. The reply
-    /// replaces it all.
+    /// arrives: `text` goes after the first `at` UTF-16 units of what the
+    /// call showed, and with `at` 0 is all of it. A tab whose text is not
+    /// `at` long waits for the next whole. The reply replaces it all.
     ReplyText {
         #[serde(skip_serializing_if = "Option::is_none")]
         conversation: Option<String>,
         /// The model call it comes from.
         call: String,
         text: String,
-        #[serde(skip_serializing_if = "std::ops::Not::not")]
-        restart: bool,
+        at: usize,
     },
     /// The tool call the reply being written is about to make.
     Step {
@@ -396,7 +396,7 @@ impl WebChatRouter {
         conversation: Option<String>,
         call: &str,
         text: String,
-        restart: bool,
+        at: usize,
     ) -> Result<(), DeliverError> {
         self.show_to_session(
             agent_id,
@@ -405,7 +405,7 @@ impl WebChatRouter {
                 conversation,
                 call: call.to_string(),
                 text,
-                restart,
+                at,
             },
         )
         .await
