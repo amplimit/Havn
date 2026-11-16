@@ -322,6 +322,11 @@ fn media_type(headers: &HeaderMap, name: &str) -> String {
     if let Some(sent) = sent {
         return sent;
     }
+    type_of_name(name).into()
+}
+
+/// The media type a file name's extension says.
+pub fn type_of_name(name: &str) -> &'static str {
     let ext = name
         .rsplit_once('.')
         .map(|(_, ext)| ext.to_ascii_lowercase())
@@ -341,7 +346,77 @@ fn media_type(headers: &HeaderMap, name: &str) -> String {
         "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         _ => "application/octet-stream",
     }
-    .into()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OutboxQuery {
+    /// Only the files sent in this chat.
+    #[serde(default)]
+    pub conversation: Option<String>,
+}
+
+/// `GET /agents/:id/outbox` — the files the agent sent (issue #106),
+/// oldest first, for the chat that shows them.
+pub async fn sent(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path(id): Path<String>,
+    Query(q): Query<OutboxQuery>,
+) -> Result<Json<Vec<crate::outbox::Sent>>, ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let outbox = crate::outbox::dir(&state.workspace_root, agent.id);
+    let sent = tokio::task::spawn_blocking(move || {
+        crate::outbox::list(&outbox, q.conversation.as_deref(), 200)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(sent))
+}
+
+/// `GET /agents/:id/outbox/:file` — a file the agent sent, as a download.
+pub async fn download(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path((id, file)): Path<(String, String)>,
+) -> Result<axum::response::Response, ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let outbox = crate::outbox::dir(&state.workspace_root, agent.id);
+    let found = tokio::task::spawn_blocking(move || crate::outbox::read(&outbox, &file))
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+    Ok(attachment_response(&found.0, found.1))
+}
+
+/// `sent`'s bytes as a download the browser saves rather than shows: an
+/// HTML or SVG file the agent made must not run as the dashboard's page.
+pub fn attachment_response(sent: &crate::outbox::Sent, bytes: Vec<u8>) -> axum::response::Response {
+    use axum::http::header;
+    use axum::response::IntoResponse as _;
+    let encoded: String = sent
+        .name
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    (
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"file\"; filename*=UTF-8''{encoded}"),
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (header::CONTENT_SECURITY_POLICY, "sandbox".to_string()),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -395,6 +470,47 @@ mod tests {
             "text/\tplain".parse().unwrap(),
         );
         assert_eq!(media_type(&headers, "a.md"), "text/markdown");
+    }
+
+    #[test]
+    fn a_sent_file_is_downloaded_never_shown() {
+        let sent = crate::outbox::Sent {
+            id: "x".into(),
+            name: "报告 <b>.html".into(),
+            media_type: "text/html".into(),
+            size: 3,
+            channel_id: "c".into(),
+            conversation: None,
+            caption: None,
+            created_at: chrono::Utc::now(),
+        };
+        let response = attachment_response(&sent, b"<b>".to_vec());
+        let header = |name: axum::http::HeaderName| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            header(axum::http::header::CONTENT_TYPE),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            header(axum::http::header::CONTENT_SECURITY_POLICY),
+            "sandbox"
+        );
+        assert_eq!(
+            header(axum::http::header::X_CONTENT_TYPE_OPTIONS),
+            "nosniff"
+        );
+        let disposition = header(axum::http::header::CONTENT_DISPOSITION);
+        assert!(disposition.starts_with("attachment;"), "{disposition}");
+        assert!(
+            disposition.contains("%E6%8A%A5%E5%91%8A%20%3Cb%3E.html"),
+            "{disposition}"
+        );
     }
 
     #[test]

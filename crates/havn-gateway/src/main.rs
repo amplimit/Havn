@@ -18,6 +18,7 @@ mod heartbeat;
 mod keyring;
 mod llm_proxy;
 mod model_catalog;
+mod outbox;
 mod perm;
 mod policy_resolver;
 mod query_broker;
@@ -724,6 +725,8 @@ async fn serve() -> anyhow::Result<()> {
             // knows who is sending.
             post(api::files::upload),
         )
+        .route("/agents/{id}/outbox", get(api::files::sent))
+        .route("/agents/{id}/outbox/{file}", get(api::files::download))
         .route("/agents/{id}/memory", get(api::memory::list))
         .route(
             "/agents/{id}/memory/{key}",
@@ -777,6 +780,10 @@ async fn serve() -> anyhow::Result<()> {
         )
         .route("/ws/chat/{agent_id}", get(api::webchat_ws::handler))
         .route("/api/v1/channel", get(api::channel::handler))
+        .route(
+            "/api/v1/channel/files/{agent}/{file}",
+            get(api::channel::file),
+        )
         .route("/v1/llm/anthropic", post(api::llm::anthropic))
         .with_state(state)
         .layer(TraceLayer::new_for_http());

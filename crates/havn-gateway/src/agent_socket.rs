@@ -1249,6 +1249,60 @@ pub async fn forward_decision(
 /// Send `msg` from `agent_id` where its channel id points, with the checks
 /// every agent message gets.
 async fn route_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSocketCtx) {
+    let _ = deliver_outbound(agent_id, msg, ctx).await;
+}
+
+/// Whether agent `agent_id` may send to channel sender `(channel,
+/// account, sender)`: its binding allows it, or the sender was admitted.
+async fn channel_send_permitted(
+    ctx: &AgentSocketCtx,
+    agent_id: AgentId,
+    channel: &str,
+    account_id: &str,
+    sender_id: &str,
+) -> Result<(), crate::channel_router::OutboundRefusal> {
+    use crate::channel_router::OutboundRefusal;
+    match crate::channel_router::outbound_permitted(
+        &ctx.bindings,
+        &ctx.channels,
+        agent_id,
+        channel,
+        account_id,
+        sender_id,
+    ) {
+        Ok(()) => Ok(()),
+        // Senders admitted by invite code live in the DB.
+        Err(OutboundRefusal::RecipientNotAllowed) => {
+            match havn_db::repo::channel_access::is_allowed(&ctx.db, channel, account_id, sender_id)
+                .await
+            {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(OutboundRefusal::RecipientNotAllowed),
+                Err(e) => {
+                    warn!(%agent_id, error = %e, "channel allowlist lookup failed");
+                    Err(OutboundRefusal::RecipientNotAllowed)
+                }
+            }
+        }
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Whether `url` names a file this gateway put in agent `agent_id`'s
+/// outbox, under `prefix` (`/api/v1/channel/files` or `/agents`): the
+/// only file links passed on, so an agent cannot have an adapter fetch
+/// (with its token) or a dashboard link to a URL of its choosing.
+fn minted_file_url(url: &str, prefix: &str, agent_id: AgentId) -> bool {
+    let Some(rest) = url.strip_prefix(&format!("{prefix}/{agent_id}/")) else {
+        return false;
+    };
+    let rest = rest.strip_prefix("outbox/").unwrap_or(rest);
+    uuid::Uuid::parse_str(rest).is_ok_and(|id| id.to_string() == rest)
+}
+
+/// Route `msg` to its conversation; whether it reached it (an open tab, a
+/// connected adapter).
+async fn deliver_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSocketCtx) -> bool {
     // Three dispatch cases by channel_id shape:
     //  1. "broadcast" sentinel — fan out to all open WebChat
     //     sessions for this agent (heartbeat/cron output).
@@ -1260,36 +1314,13 @@ async fn route_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSock
     if msg.channel_id == "broadcast" {
         let n = ctx.webchat_router.broadcast(agent_id, msg).await;
         debug!(%agent_id, sessions = n, "broadcast outbound delivered");
+        n > 0
     } else if let Some((channel, account_id, sender_id)) =
         crate::channel_id_codec::decode(&msg.channel_id)
     {
-        use crate::channel_router::OutboundRefusal;
-        let refusal = match crate::channel_router::outbound_permitted(
-            &ctx.bindings,
-            &ctx.channels,
-            agent_id,
-            channel,
-            account_id,
-            sender_id,
-        ) {
-            Ok(()) => None,
-            // Senders admitted by invite code live in the DB.
-            Err(OutboundRefusal::RecipientNotAllowed) => {
-                match havn_db::repo::channel_access::is_allowed(
-                    &ctx.db, channel, account_id, sender_id,
-                )
-                .await
-                {
-                    Ok(true) => None,
-                    Ok(false) => Some(OutboundRefusal::RecipientNotAllowed),
-                    Err(e) => {
-                        warn!(%agent_id, error = %e, "channel allowlist lookup failed");
-                        Some(OutboundRefusal::RecipientNotAllowed)
-                    }
-                }
-            }
-            Err(refusal) => Some(refusal),
-        };
+        let refusal = channel_send_permitted(ctx, agent_id, channel, account_id, sender_id)
+            .await
+            .err();
         if let Some(refusal) = refusal {
             warn!(
                 %agent_id,
@@ -1298,7 +1329,7 @@ async fn route_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSock
                 reason = refusal.as_str(),
                 "dropping channel-adapter outbound"
             );
-            return;
+            return false;
         }
         // Channel-adapter outbound. Translate havn-core's
         // MessageContent into havn-proto's
@@ -1310,8 +1341,20 @@ async fn route_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSock
             MessageContent::Image { url, caption } => {
                 Some(ChannelMessageContent::Image { url, caption })
             }
-            MessageContent::File { url, filename } => {
-                Some(ChannelMessageContent::File { url, filename })
+            MessageContent::File {
+                url,
+                filename,
+                caption,
+            } if minted_file_url(&url, "/api/v1/channel/files", agent_id) => {
+                Some(ChannelMessageContent::File {
+                    url,
+                    filename,
+                    caption,
+                })
+            }
+            MessageContent::File { url, .. } => {
+                warn!(%agent_id, url, "dropping a file link the gateway did not make");
+                None
             }
             // Agents rarely emit Audio / Location / Contact
             // outbound — these are user-input shapes. When
@@ -1355,12 +1398,13 @@ async fn route_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSock
             _ => None,
         };
         match translated {
-            Some(content) => {
-                if let Err(e) = ctx
-                    .channel_router
-                    .deliver(channel, account_id, sender_id, msg.reply_to, content)
-                    .await
-                {
+            Some(content) => match ctx
+                .channel_router
+                .deliver(channel, account_id, sender_id, msg.reply_to, content)
+                .await
+            {
+                Ok(_) => true,
+                Err(e) => {
                     warn!(
                         %agent_id,
                         channel,
@@ -1368,14 +1412,29 @@ async fn route_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSock
                         error = %e,
                         "could not deliver outbound to channel adapter (offline?)"
                     );
+                    // Otherwise it is kept for the adapter's resume.
+                    !matches!(e, crate::channel_router::DeliverError::NeverConnected(_))
                 }
-            }
+            },
             None => {
-                warn!(%agent_id, "dropping channel-adapter outbound: unsupported MessageContent variant")
+                warn!(%agent_id, "dropping channel-adapter outbound: unsupported MessageContent variant");
+                false
             }
         }
-    } else if let Err(e) = ctx.webchat_router.deliver(agent_id, msg).await {
-        warn!(%agent_id, error = %e, "could not deliver outbound to webchat");
+    } else {
+        if let havn_core::MessageContent::File { url, .. } = &msg.content
+            && !minted_file_url(url, "/agents", agent_id)
+        {
+            warn!(%agent_id, url, "dropping a file link the gateway did not make");
+            return false;
+        }
+        match ctx.webchat_router.deliver(agent_id, msg).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(%agent_id, error = %e, "could not deliver outbound to webchat");
+                false
+            }
+        }
     }
 }
 
@@ -1399,8 +1458,9 @@ async fn gateway_tools_for(
     agent: &havn_db::repo::agents::Agent,
     policy: &Policy,
 ) -> Vec<GatewayToolSpec> {
-    // Every agent may set its owner's time zone.
-    let mut tools = vec![crate::timezone::spec()];
+    // Every agent may set its owner's time zone and send files to the
+    // conversation it answers.
+    let mut tools = vec![crate::timezone::spec(), crate::outbox::spec()];
     if policy.permissions.can_search_web {
         match ctx
             .search
@@ -1454,8 +1514,110 @@ async fn run_gateway_tool(
         crate::schedule::TOOL_NAME => run_schedule(agent_id, call, ctx).await,
         crate::web_search::TOOL_NAME => run_web_search(agent_id, call, ctx).await,
         crate::web_fetch::TOOL_NAME => run_web_fetch(agent_id, call, ctx).await,
+        crate::outbox::TOOL_NAME => run_send_file(agent_id, call, ctx).await,
         other => Err(format!("the gateway has no tool named {other:?}")),
     }
+}
+
+/// `send_file`: copy the file into the agent's outbox and send its
+/// conversation a [`havn_core::MessageContent::File`] naming where to get
+/// it. A channel adapter fetches it with its token; the dashboard shows a
+/// download.
+async fn run_send_file(
+    agent_id: AgentId,
+    call: &GatewayToolCall,
+    ctx: &AgentSocketCtx,
+) -> Result<String, String> {
+    let channel_id = call
+        .conversation
+        .clone()
+        .ok_or("send_file works only while answering someone's message")?;
+    // Somewhere it can go, before anything is kept.
+    if let Some((channel, account, sender)) = crate::channel_id_codec::decode(&channel_id) {
+        channel_send_permitted(ctx, agent_id, channel, account, sender)
+            .await
+            .map_err(|r| format!("this conversation cannot be sent files ({})", r.as_str()))?;
+    } else {
+        let session = channel_id
+            .parse::<crate::webchat::SessionId>()
+            .map_err(|_| "send_file works only while answering someone's message".to_string())?;
+        if ctx.webchat_router.agent_for_session(session).await != Some(agent_id) {
+            return Err("the conversation has no open dashboard tab to send the file to".into());
+        }
+    }
+    let path = call
+        .input
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing required field: path")?
+        .to_string();
+    let caption = call
+        .input
+        .get("caption")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let workspace = ctx
+        .workspace_root
+        .join(agent_id.to_string())
+        .join("workspace");
+    let outbox = crate::outbox::dir(&ctx.workspace_root, agent_id);
+    let chat = call.chat.clone();
+    let to = channel_id.clone();
+    let sent = tokio::task::spawn_blocking(move || {
+        crate::outbox::send(
+            &workspace,
+            &outbox,
+            &path,
+            caption.as_deref(),
+            &to,
+            chat.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| format!("sending the file failed: {e}"))??;
+    // Where the conversation's channel gets it.
+    let url = if crate::channel_id_codec::decode(&channel_id).is_some() {
+        format!("/api/v1/channel/files/{agent_id}/{}", sent.id)
+    } else {
+        format!("/agents/{agent_id}/outbox/{}", sent.id)
+    };
+    let delivered = deliver_outbound(
+        agent_id,
+        OutboundMessage {
+            conversation: call.chat.clone(),
+            channel_id,
+            content: havn_core::MessageContent::File {
+                url,
+                filename: sent.name.clone(),
+                caption: sent.caption.clone(),
+            },
+            reply_to: None,
+        },
+        ctx,
+    )
+    .await;
+    if !delivered {
+        let outbox = crate::outbox::dir(&ctx.workspace_root, agent_id);
+        let id = sent.id.clone();
+        let _ = tokio::task::spawn_blocking(move || crate::outbox::remove(&outbox, &id)).await;
+        return Err(
+            "the file could not be delivered: the conversation's app is not connected".into(),
+        );
+    }
+    if let Ok(Some(agent)) = agents_repo::find_by_id(&ctx.db, agent_id).await {
+        crate::audit::record_agent_action(
+            &ctx.db,
+            agent.owner_id,
+            agent_id,
+            "file.sent",
+            serde_json::json!({"id": sent.id, "name": sent.name, "size": sent.size}),
+        )
+        .await;
+    }
+    Ok(format!(
+        "sent {:?} ({} bytes) to the conversation",
+        sent.name, sent.size
+    ))
 }
 
 async fn run_set_timezone(
@@ -2639,17 +2801,23 @@ mod tests {
 
         assert_eq!(
             tools_of(agent).await,
-            ["set_timezone", "web_fetch", "schedule"],
+            ["set_timezone", "send_file", "web_fetch", "schedule"],
             "no search backend yet"
         );
         add_openrouter_key(&ctx, owner).await;
         assert_eq!(
             tools_of(agent).await,
-            ["set_timezone", "web_search", "web_fetch", "schedule"]
+            [
+                "set_timezone",
+                "send_file",
+                "web_search",
+                "web_fetch",
+                "schedule"
+            ]
         );
         assert_eq!(
             tools_of(denied).await,
-            ["set_timezone", "schedule"],
+            ["set_timezone", "send_file", "schedule"],
             "policy denies search and fetch"
         );
     }

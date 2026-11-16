@@ -104,6 +104,10 @@ struct ReplayEntry {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum DeliverError {
+    /// No adapter has connected for this (channel, account) pair since
+    /// the gateway started: nothing is kept for one to resume.
+    #[error("no adapter has connected for {0:?}")]
+    NeverConnected(AccountKey),
     /// No adapter daemon is currently connected for this (channel,
     /// account) pair. If one was connected before, the reply is kept in
     /// the replay buffer for its `Resume`; the caller (agent_socket
@@ -185,7 +189,7 @@ impl ChannelRouter {
             let mut map = self.inner.lock().await;
             let state = map
                 .get_mut(&key)
-                .ok_or_else(|| DeliverError::NoSession(key.clone()))?;
+                .ok_or_else(|| DeliverError::NeverConnected(key.clone()))?;
             let seq = state.next_seq;
             state.next_seq = state.next_seq.saturating_add(1);
             let frame = ChannelFrame::Outbound(ChannelOutbound {
@@ -477,7 +481,7 @@ mod tests {
                 ChannelMessageContent::Text { text: "x".into() },
             )
             .await;
-        assert!(matches!(r, Err(DeliverError::NoSession(_))));
+        assert!(matches!(r, Err(DeliverError::NeverConnected(_))));
     }
 
     #[tokio::test]

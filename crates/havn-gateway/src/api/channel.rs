@@ -258,6 +258,49 @@ pub async fn handler(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
+    authenticate(&state, &q, &headers).await?;
+    let account_id = q.account.clone();
+    let channel_id = q.channel.clone();
+    Ok(ws.on_upgrade(move |socket| handle_session(socket, state, channel_id, account_id)))
+}
+
+/// `GET /api/v1/channel/files/:agent/:file?channel=&account=` — a file an
+/// agent sent to one of the account's senders (issue #106), for the
+/// adapter to post the way its platform does. Authenticated like the
+/// adapter's WebSocket; an adapter gets only the files sent through its
+/// own account.
+pub async fn file(
+    State(state): State<AppState>,
+    Query(q): Query<ChannelQuery>,
+    axum::extract::Path((agent, file)): axum::extract::Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    authenticate(&state, &q, &headers).await?;
+    let agent = havn_core::AgentId::from_str(&agent).map_err(|_| ApiError::NotFound)?;
+    let outbox = crate::outbox::dir(&state.workspace_root, agent);
+    let (channel, account) = (q.channel.clone(), q.account.clone());
+    // Its metadata first: an adapter gets only files sent through its
+    // own account, and reads nothing of the others'.
+    let found = tokio::task::spawn_blocking(move || {
+        let sent = crate::outbox::meta(&outbox, &file)?;
+        match channel_id_codec::decode(&sent.channel_id) {
+            Some((c, a, _)) if c == channel && a == account => crate::outbox::read(&outbox, &file),
+            _ => None,
+        }
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?
+    .ok_or(ApiError::NotFound)?;
+    Ok(crate::api::files::attachment_response(&found.0, found.1))
+}
+
+/// Check that the request carries the adapter token of the configured
+/// `(channel, account)` it names.
+async fn authenticate(
+    state: &AppState,
+    q: &ChannelQuery,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
     let presented = headers
         .get(ADAPTER_TOKEN_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -364,12 +407,9 @@ pub async fn handler(
     info!(
         channel = %q.channel,
         account = %q.account,
-        "channel WS: adapter authenticated"
+        "channel adapter authenticated"
     );
-
-    let account_id = q.account.clone();
-    let channel_id = q.channel.clone();
-    Ok(ws.on_upgrade(move |socket| handle_session(socket, state, channel_id, account_id)))
+    Ok(())
 }
 
 /// Best-effort constant-time byte comparison for adapter tokens.
@@ -734,7 +774,15 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
     let content = match inb.content {
         ChannelMessageContent::Text { text } => MessageContent::Text { text },
         ChannelMessageContent::Image { url, caption } => MessageContent::Image { url, caption },
-        ChannelMessageContent::File { url, filename } => MessageContent::File { url, filename },
+        ChannelMessageContent::File {
+            url,
+            filename,
+            caption,
+        } => MessageContent::File {
+            url,
+            filename,
+            caption,
+        },
         ChannelMessageContent::Audio {
             transcript,
             duration_seconds,

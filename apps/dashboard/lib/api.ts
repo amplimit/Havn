@@ -107,6 +107,18 @@ export type MemoryEntry = {
   supersedes_id: string | null;
 };
 
+/** A file the agent sent, kept by the gateway. */
+export type SentFile = {
+  id: string;
+  name: string;
+  media_type: string;
+  size: number;
+  channel_id: string;
+  conversation?: string;
+  caption?: string;
+  created_at: string;
+};
+
 /** How long a memory the user saves is kept once unused. */
 export type MemoryExpiry = "kind_default" | "never" | { days: number };
 
@@ -600,6 +612,14 @@ export const api = {
         method: "PATCH",
         body: JSON.stringify(patch),
       }),
+  },
+
+  outbox: {
+    /** The files the agent sent in chat `conversation`, oldest first. */
+    list: (agentId: string, conversation?: string) =>
+      request<SentFile[]>(
+        `/agents/${agentId}/outbox${conversation ? `?conversation=${encodeURIComponent(conversation)}` : ""}`,
+      ),
   },
 
   files: {
