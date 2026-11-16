@@ -1657,6 +1657,48 @@ mod tests {
             );
         }
 
+        #[test]
+        fn files_of_a_message_that_did_not_go_are_put_back() {
+            let agent = havn_core::AgentId::new();
+            let file = havn_core::Attachment {
+                path: "inbox/3-b.pdf".into(),
+                name: "b.pdf".into(),
+                media_type: "application/pdf".into(),
+                size: 9,
+                text_path: Some("inbox/3-b.pdf.txt".into()),
+            };
+            restore_received(agent, "telegram", "bot", "tg:7", vec![file.clone()]);
+            let taken = take_received(
+                agent,
+                "telegram",
+                "bot",
+                "tg:7",
+                std::slice::from_ref(&file),
+            );
+            assert_eq!(taken, std::slice::from_ref(&file));
+            restore_received(agent, "telegram", "bot", "tg:7", taken);
+            assert_eq!(
+                take_received(
+                    agent,
+                    "telegram",
+                    "bot",
+                    "tg:7",
+                    std::slice::from_ref(&file)
+                ),
+                [file]
+            );
+        }
+
+        #[test]
+        fn a_sender_may_send_so_many_files_an_hour() {
+            let sender = format!("tg:{}", uuid::Uuid::now_v7().simple());
+            for _ in 0..MAX_SENDER_FILES {
+                assert!(sender_may_send("telegram", "bot", &sender));
+            }
+            assert!(!sender_may_send("telegram", "bot", &sender));
+            assert!(sender_may_send("telegram", "other", &sender), "per account");
+        }
+
         fn text_from(sender: &str, text: &str) -> ChannelInbound {
             ChannelInbound {
                 seq: 1,
