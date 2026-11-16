@@ -250,6 +250,90 @@ pub async fn rewind(pool: &SqlitePool, chat: &str, rewind: Rewind<'_>) -> Result
     Ok(Some(answer))
 }
 
+/// Take back chat `chat`'s last message and what answered it (`/undo`):
+/// its head moves to the turn that message followed, and the message stays
+/// as a version of it. The message's text, or `None`, and nothing changed,
+/// when the chat has no message to take back.
+pub async fn undo(pool: &SqlitePool, chat: &str) -> Result<Option<String>> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let head: Option<(Option<String>,)> = sqlx::query_as("SELECT head FROM chats WHERE id = ?1")
+        .bind(chat)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some((mut at,)) = head else {
+        return Ok(None);
+    };
+    while let Some(turn) = at {
+        match turn_of(&mut tx, chat, &turn).await? {
+            Some((Role::User, parent)) => {
+                let (text,): (String,) =
+                    sqlx::query_as("SELECT content FROM conversations WHERE id = ?1")
+                        .bind(&turn)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                set_head(&mut tx, chat, parent.as_deref()).await?;
+                tx.commit().await?;
+                return Ok(Some(text));
+            }
+            Some((_, parent)) => at = parent,
+            None => break,
+        }
+    }
+    Ok(None)
+}
+
+/// What `/status` tells of a chat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatInfo {
+    pub title: String,
+    /// Its own model, when it has one.
+    pub model: Option<String>,
+    /// Turns of its branch, up to its head.
+    pub turns: i64,
+}
+
+/// Chat `chat`'s title, own model and length, or `None` when there is no
+/// such chat.
+pub async fn chat_info(pool: &SqlitePool, chat: &str) -> Result<Option<ChatInfo>> {
+    let found: Option<(String, Option<String>, i64)> = sqlx::query_as(
+        "WITH RECURSIVE path(id, parent_id) AS ( \
+             SELECT c.id, c.parent_id FROM conversations c JOIN chats h ON h.head = c.id \
+             WHERE h.id = ?1 \
+             UNION ALL \
+             SELECT c.id, c.parent_id FROM conversations c JOIN path p ON c.id = p.parent_id \
+         ) \
+         SELECT title, model, (SELECT COUNT(*) FROM path) FROM chats WHERE id = ?1",
+    )
+    .bind(chat)
+    .fetch_optional(pool)
+    .await?;
+    Ok(found.map(|(title, model, turns)| ChatInfo {
+        title,
+        model,
+        turns,
+    }))
+}
+
+/// Chat `chat`'s own model, when it has one.
+pub async fn chat_model(pool: &SqlitePool, chat: &str) -> Result<Option<String>> {
+    let found: Option<(Option<String>,)> = sqlx::query_as("SELECT model FROM chats WHERE id = ?1")
+        .bind(chat)
+        .fetch_optional(pool)
+        .await?;
+    Ok(found.and_then(|(model,)| model))
+}
+
+/// Set chat `chat`'s own model, or clear it with `None`. False when there
+/// is no such chat.
+pub async fn set_chat_model(pool: &SqlitePool, chat: &str, model: Option<&str>) -> Result<bool> {
+    let res = sqlx::query("UPDATE chats SET model = ?2 WHERE id = ?1")
+        .bind(chat)
+        .bind(model)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// The last `limit` turns of chat `chat`'s branch, oldest first: the path
 /// to its head. Their `versions` are left empty; see [`with_versions`].
 pub async fn branch(pool: &SqlitePool, chat: &str, limit: u32) -> Result<Vec<BranchTurn>> {
@@ -1226,6 +1310,89 @@ mod tests {
         );
         assert!(!switch_branch(&pool, &other, &q2).await.expect("db"));
         assert_eq!(said(&pool, &chat).await.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn undo_takes_back_the_last_exchange_and_keeps_it_as_a_version() {
+        let pool = connect_in_memory().await.expect("connect");
+        let chat = chat_for(&pool, "s", None, "q1").await.expect("chat");
+        for (role, text) in [
+            (Role::User, "q1"),
+            (Role::Assistant, "a1"),
+            (Role::User, "q2"),
+            (Role::Assistant, "a2"),
+        ] {
+            record_in_chat(&pool, &chat, role, text)
+                .await
+                .expect("record")
+                .expect("chat");
+        }
+        assert_eq!(undo(&pool, &chat).await.expect("db").as_deref(), Some("q2"));
+        assert_eq!(said(&pool, &chat).await, ["q1", "a1"]);
+        let info = chat_info(&pool, &chat).await.expect("db").expect("chat");
+        assert_eq!((info.title.as_str(), info.turns), ("q1", 2));
+
+        // The next message follows a1, beside the one taken back.
+        record_in_chat(&pool, &chat, Role::User, "q3")
+            .await
+            .expect("record")
+            .expect("chat");
+        assert_eq!(said(&pool, &chat).await, ["q1", "a1", "q3"]);
+        assert_eq!(versions(&pool, &chat).await, [1, 1, 2]);
+
+        assert_eq!(undo(&pool, &chat).await.expect("db").as_deref(), Some("q3"));
+        assert_eq!(undo(&pool, &chat).await.expect("db").as_deref(), Some("q1"));
+        assert!(said(&pool, &chat).await.is_empty());
+        assert_eq!(undo(&pool, &chat).await.expect("db"), None, "nothing left");
+        assert_eq!(undo(&pool, "no-such-chat").await.expect("db"), None);
+    }
+
+    #[tokio::test]
+    async fn a_chat_keeps_its_own_model_until_cleared() {
+        let pool = connect_in_memory().await.expect("connect");
+        let chat = chat_for(&pool, "s", None, "").await.expect("chat");
+        let info = chat_info(&pool, &chat).await.expect("db").expect("chat");
+        assert_eq!((info.model, info.turns, info.title.as_str()), (None, 0, ""));
+        assert!(
+            set_chat_model(&pool, &chat, Some("deepseek:deepseek-chat"))
+                .await
+                .expect("db")
+        );
+        let info = chat_info(&pool, &chat).await.expect("db").expect("chat");
+        assert_eq!(info.model.as_deref(), Some("deepseek:deepseek-chat"));
+        assert_eq!(
+            chat_model(&pool, &chat).await.expect("db").as_deref(),
+            Some("deepseek:deepseek-chat")
+        );
+        assert!(set_chat_model(&pool, &chat, None).await.expect("db"));
+        assert_eq!(
+            chat_info(&pool, &chat)
+                .await
+                .expect("db")
+                .expect("chat")
+                .model,
+            None
+        );
+        assert!(
+            !set_chat_model(&pool, "no-such-chat", None)
+                .await
+                .expect("db")
+        );
+        // A chat made empty takes its title from its first message.
+        record_in_chat(&pool, &chat, Role::User, "hello")
+            .await
+            .expect("record")
+            .expect("chat");
+        let again = chat_for(&pool, "s", None, "hello").await.expect("chat");
+        assert_eq!(again, chat);
+        assert_eq!(
+            chat_info(&pool, &chat)
+                .await
+                .expect("db")
+                .expect("chat")
+                .title,
+            "hello"
+        );
     }
 
     #[tokio::test]

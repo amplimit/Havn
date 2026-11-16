@@ -49,7 +49,16 @@ pub struct WebChatRouter {
     /// here instead of by an agent.
     gateway_waiters:
         Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<GatewayAnswer>>>>,
+    /// When chat commands were sent to an agent for a session and not
+    /// answered yet: an agent's notice is shown only as such an answer.
+    command_replies: Arc<std::sync::Mutex<HashMap<(AgentId, SessionId), Vec<std::time::Instant>>>>,
 }
+
+/// Unanswered chat commands kept per session; more are not sent.
+const MAX_COMMANDS_WAITING: usize = 16;
+/// How long a command's answer is awaited: an agent that restarted or
+/// crashed meanwhile never sends it.
+const COMMAND_REPLY_KEPT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The owner's answer to a question of the gateway's own: allow, always,
 /// and who decided.
@@ -156,6 +165,13 @@ pub enum ServerMessage {
     },
     /// The approval request `id` was decided or ended; stop showing it.
     ApprovalClosed { id: String },
+    /// The answer to a chat command (`/status`, `/undo`, ...): shown in
+    /// the chat, not kept in it, and not a reply to a message.
+    Notice {
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        conversation: Option<String>,
+    },
     /// A file the agent sent, to download from `url` (relative to the
     /// gateway's API).
     File {
@@ -492,6 +508,82 @@ impl WebChatRouter {
         .await
     }
 
+    /// Show the tabs of `session_id` the answer to a chat command.
+    pub async fn command_notice(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        conversation: Option<String>,
+        content: String,
+    ) -> Result<(), DeliverError> {
+        self.send_to_session(
+            agent_id,
+            session_id,
+            ServerMessage::Notice {
+                content,
+                conversation,
+            },
+        )
+        .await
+    }
+
+    /// A chat command went to `agent_id` for `session_id`: its answer is
+    /// awaited. False when too many are awaited already.
+    pub fn expect_command_reply(&self, agent_id: AgentId, session_id: SessionId) -> bool {
+        let mut waiting = self
+            .command_replies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        waiting.retain(|_, sent| {
+            sent.retain(|at| at.elapsed() < COMMAND_REPLY_KEPT);
+            !sent.is_empty()
+        });
+        let sent = waiting.entry((agent_id, session_id)).or_default();
+        if sent.len() >= MAX_COMMANDS_WAITING {
+            return false;
+        }
+        sent.push(std::time::Instant::now());
+        true
+    }
+
+    /// Whether an answer of `agent_id` to a chat command of `session_id`
+    /// was awaited; it no longer is.
+    pub fn take_command_reply(&self, agent_id: AgentId, session_id: SessionId) -> bool {
+        let mut waiting = self
+            .command_replies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (agent_id, session_id);
+        let Some(sent) = waiting.get_mut(&key) else {
+            return false;
+        };
+        sent.retain(|at| at.elapsed() < COMMAND_REPLY_KEPT);
+        let awaited = !sent.is_empty();
+        if awaited {
+            sent.remove(0);
+        }
+        if sent.is_empty() {
+            waiting.remove(&key);
+        }
+        awaited
+    }
+
+    /// The approval request of `agent_id` that has waited longest in
+    /// conversation `channel_id`.
+    pub fn oldest_approval(
+        &self,
+        agent_id: AgentId,
+        channel_id: &str,
+    ) -> Option<havn_proto::ApprovalRequest> {
+        let mut pending = self.lock_approvals();
+        pending.retain(|_, p| p.since.elapsed() < APPROVAL_KEPT);
+        pending
+            .values()
+            .filter(|p| p.agent_id == agent_id && p.request.channel_id == channel_id)
+            .min_by_key(|p| p.since)
+            .map(|p| p.request.clone())
+    }
+
     /// Show `message` as an error in every open tab of `session_id`.
     pub async fn error(
         &self,
@@ -813,10 +905,46 @@ mod tests {
             | ServerMessage::Memory { .. }
             | ServerMessage::File { .. }
             | ServerMessage::Step { .. }
+            | ServerMessage::Notice { .. }
             | ServerMessage::ReplyText { .. } => {
                 panic!("expected AgentMessage, got Error")
             }
         }
+    }
+
+    #[test]
+    fn an_agents_notice_must_answer_a_command() {
+        let router = WebChatRouter::new();
+        let (agent, other) = (AgentId::new(), AgentId::new());
+        let session: SessionId = Uuid::now_v7();
+        assert!(!router.take_command_reply(agent, session), "nothing asked");
+        assert!(router.expect_command_reply(agent, session));
+        assert!(router.expect_command_reply(agent, session));
+        assert!(
+            !router.take_command_reply(other, session),
+            "another agent's"
+        );
+        assert!(router.take_command_reply(agent, session));
+        assert!(router.take_command_reply(agent, session));
+        assert!(!router.take_command_reply(agent, session), "both answered");
+        for _ in 0..MAX_COMMANDS_WAITING {
+            assert!(router.expect_command_reply(agent, session));
+        }
+        assert!(
+            !router.expect_command_reply(agent, session),
+            "too many waiting"
+        );
+        // Answers that never came are forgotten after a while.
+        router
+            .command_replies
+            .lock()
+            .expect("lock")
+            .get_mut(&(agent, session))
+            .expect("waiting")
+            .iter_mut()
+            .for_each(|at| *at -= COMMAND_REPLY_KEPT);
+        assert!(!router.take_command_reply(agent, session), "expired");
+        assert!(router.expect_command_reply(agent, session));
     }
 
     #[tokio::test]
@@ -908,6 +1036,7 @@ mod tests {
                 | ServerMessage::Memory { .. }
                 | ServerMessage::File { .. }
                 | ServerMessage::Step { .. }
+                | ServerMessage::Notice { .. }
                 | ServerMessage::ReplyText { .. } => {
                     panic!("unexpected Error")
                 }
@@ -953,6 +1082,7 @@ mod tests {
                 | ServerMessage::Memory { .. }
                 | ServerMessage::File { .. }
                 | ServerMessage::Step { .. }
+                | ServerMessage::Notice { .. }
                 | ServerMessage::ReplyText { .. } => {
                     panic!("unexpected Error")
                 }

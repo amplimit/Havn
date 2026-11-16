@@ -5,6 +5,7 @@ import Link from "next/link";
 import {
   api,
   type AgentView,
+  type ChatCommand,
   type ChatSummary,
   type ConversationTurn,
   type EmbeddingStatus,
@@ -236,6 +237,8 @@ export default function ChatPage({
   // socket handlers read.
   const [chat, setChat] = useState<string | null>(null);
   const chatIdRef = useRef<string | null>(null);
+  // `/undo`s sent whose answer has not come: the chat reloads with it.
+  const undoing = useRef(0);
   const [chats, setChats] = useState<ChatSummary[]>([]);
   // For the socket's handler, which outlives a render.
   const chatsRef = useRef<ChatSummary[]>([]);
@@ -480,6 +483,18 @@ export default function ChatPage({
             addFile(msg.url, msg.name, msg.caption, Date.now());
             return;
           }
+          if (msg.type === "notice") {
+            const current = chatIdRef.current;
+            if (msg.conversation && current && msg.conversation !== current) return;
+            pushBubble("system", msg.content);
+            // What `/undo` took back leaves the screen; other answers leave
+            // the chat as it is, messages still waiting included.
+            if (undoing.current > 0) {
+              undoing.current -= 1;
+              void catchUp();
+            }
+            return;
+          }
           if (msg.type === "memory") {
             // Under the reply it came with, in the chat on screen only.
             const current = chatIdRef.current;
@@ -621,6 +636,33 @@ export default function ChatPage({
 
   function sendText(text: string, files: Attachment[] = []) {
     if ((!text.trim() && files.length === 0) || !chatRef.current || wsState !== "open") return;
+    // A command (alone, without files) is not a message: the page does
+    // what it has a button for, and the gateway answers the rest.
+    const command = files.length === 0 ? commandIn(text) : null;
+    if (command !== null) {
+      // A command given what it does not take is the gateway's to answer.
+      const known = command.bare
+        ? commands.find((c) => c.name === command.name || c.aliases.includes(command.name))
+        : undefined;
+      if (known?.name === "new") {
+        openChatById(null);
+        return;
+      }
+      if (known?.name === "stop") {
+        stopReply();
+        return;
+      }
+      if (known?.name === "retry") {
+        const last = [...bubbles].map((b, i) => [b, i] as const).reverse().find(([b]) => b.role === "agent" && b.turn);
+        if (last) regenerate(last[1], last[0].turn!);
+        else pushBubble("system", "There is no reply here to answer again.");
+        return;
+      }
+      pushBubble("system", text.trim());
+      if (command.bare && command.name === "undo") undoing.current += 1;
+      chatRef.current.send(text.trim(), chatIdRef.current ?? undefined);
+      return;
+    }
     // In the shape of the stored turn, which shows the same.
     pushBubble("you", joinMessage(text, files));
     chatRef.current.send(text, chatIdRef.current ?? undefined, undefined, files);
@@ -628,6 +670,15 @@ export default function ChatPage({
     if (waiting === 0) clearLive();
     setWaiting((n) => n + 1);
   }
+
+  // The chat commands, for the composer's suggestions.
+  const [commands, setCommands] = useState<ChatCommand[]>([]);
+  useEffect(() => {
+    api
+      .commands()
+      .then(setCommands)
+      .catch((e) => console.warn("[chat] commands unavailable", e));
+  }, []);
 
   // Files waiting to go with the next message, uploaded already.
   const [attached, setAttached] = useState<Attachment[]>([]);
@@ -1033,6 +1084,7 @@ export default function ChatPage({
           uploading={uploading}
           onAttach={(files) => void attachFiles(files)}
           onDetach={(path) => setAttached((prev) => prev.filter((a) => a.path !== path))}
+          commands={commands}
         />
       </div>
     </div>
@@ -1355,6 +1407,16 @@ function AttachmentCard({
  * (Chinese, Japanese, Korean), whose Enter confirms what it composes.
  * Files pasted go to `onFiles`.
  */
+/** The command `text` is (lowercase, without the slash) and whether
+ * nothing follows it, or `null` for an ordinary message. */
+function commandIn(text: string): { name: string; bare: boolean } | null {
+  const m = /^\/([A-Za-z0-9_]{1,32})(?:@[A-Za-z0-9_]+)?(?:\s+(.*))?$/.exec(text.trim());
+  // `/start` (Telegram's first message) goes to the agent, as the gateway
+  // sends it.
+  if (!m || text.trim().includes("\n") || m[1].toLowerCase() === "start") return null;
+  return { name: m[1].toLowerCase(), bare: !m[2] };
+}
+
 function MessageInput({
   value,
   onChange,
@@ -1932,6 +1994,7 @@ function Composer({
   uploading,
   onAttach,
   onDetach,
+  commands,
 }: {
   agentId: string;
   wsState: "idle" | "connecting" | "open" | "closed" | "error";
@@ -1945,8 +2008,16 @@ function Composer({
   uploading: number;
   onAttach: (files: File[]) => void;
   onDetach: (path: string) => void;
+  commands: ChatCommand[];
 }) {
   const fileInput = useRef<HTMLInputElement>(null);
+  // Commands that start with what is typed after a slash, before any
+  // space: picking one puts it in the box.
+  const typed = /^\/([A-Za-z0-9_]*)$/.exec(draft.trim())?.[1]?.toLowerCase();
+  const suggested =
+    typed === undefined || attached.length > 0
+      ? []
+      : commands.filter((c) => c.name.startsWith(typed) || c.aliases.some((a) => a.startsWith(typed)));
   const canSend = (draft.trim() !== "" || attached.length > 0) && uploading === 0;
   const [tab, setTab] = useState<"write" | "preview">("write");
   // The composer is ready whenever the WS is up. A message sent while a
@@ -2010,6 +2081,38 @@ function Composer({
               </span>
             )}
           </div>
+        )}
+
+        {suggested.length > 0 && tab === "write" && (
+          <ul
+            className="card mb-2 overflow-y-auto py-1 text-sm"
+            role="listbox"
+            aria-label="Commands"
+            style={{ maxHeight: 240, backgroundColor: "var(--color-surface)" }}
+          >
+            {suggested.map((c) => (
+              <li key={c.name}>
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={false}
+                  className="flex w-full items-baseline gap-2 px-3 py-1.5 text-left"
+                  // The text box keeps the focus: Enter then sends.
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => setDraft(`/${c.name}${c.args ? " " : ""}`)}
+                >
+                  <span className="font-mono" style={{ color: "var(--color-deep-navy)" }}>
+                    /{c.name}
+                    {c.args && <span style={{ color: "var(--color-body)" }}> {c.args}</span>}
+                  </span>
+                  <span style={{ color: "var(--color-body)" }}>
+                    {c.about}
+                    {c.admin && " (owner only)"}
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
         )}
 
         {/* Body */}

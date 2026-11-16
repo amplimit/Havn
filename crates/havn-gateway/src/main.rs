@@ -10,6 +10,7 @@ mod audit;
 mod auth;
 mod channel_id_codec;
 mod channel_router;
+mod commands;
 mod config;
 mod credential_resolver;
 mod cron;
@@ -665,6 +666,7 @@ async fn serve() -> anyhow::Result<()> {
             get(api::embedding::status).patch(api::embedding::patch),
         )
         .route("/search", get(api::search::status))
+        .route("/commands", get(commands::list))
         .route(
             "/llm/models",
             get(api::models::get).put(api::models::put),

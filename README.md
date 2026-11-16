@@ -529,6 +529,35 @@ Each user has several chats with an agent. The dashboard chat lists them next to
 
 In the dashboard chat, a message can be edited and a reply regenerated. Either starts a branch: the messages after that point stay stored on their own branch, `‹ 2/3 ›` under a message switches between its versions, and the agent sees only the branch on screen. In a channel conversation, `/retry` (or `/retry@botname`) answers the last message again. A branch does not undo what tools already did: files written, messages sent and memories saved stay.
 
+### Chat commands
+
+A message that is only a command is answered by the gateway or the agent and never reaches the model, in a channel conversation and in the dashboard chat (where typing `/` lists them). `/name@botname` works too; an unknown command, or a command given words it does not take, gets a short answer saying so.
+
+| Command | Does |
+|---------|------|
+| `/new` (`/reset`, `/clear`) | starts a new chat; the earlier one is kept |
+| `/stop` | stops the reply being written |
+| `/retry` | answers the last message again |
+| `/undo` | takes back the last message and its reply; they stay stored as a version |
+| `/status` | the agent, the chat's model, its title and length, replies waiting |
+| `/model [name\|number\|default]` | lists the models the agent may use, or sets this chat's own; `/new` goes back to the agent's |
+| `/agent_model [name\|number\|default]` | sets the agent's model, as its settings page does, for every chat without one of its own |
+| `/usage [days]` | the agent's model calls and tokens, per model (30 days by default) |
+| `/approve [always]`, `/deny` | answer the step of this conversation waiting for approval |
+| `/whoami` | who the gateway takes you for, and whether you may use the admin commands |
+| `/help` (`/commands`) | lists them |
+
+`/model`, `/agent_model`, `/usage`, `/approve` and `/deny` spend the agent owner's credentials or let a step through, so only admins may use them: in the dashboard, the agent's owner; in a channel, the senders listed in the account's `admins` (none by default):
+
+```toml
+[[channels.telegram.accounts]]
+id = "acme-bot"
+allow_from = ["tg:123456789", "tg:987654321"]
+admins = ["tg:123456789"]
+```
+
+A Telegram adapter that knows the command list sets it as the bot's command menu (`setMyCommands`) when it connects, so typing `/` in Telegram shows them.
+
 ### Invite codes
 
 Instead of adding every team member to `allow_from` and restarting the gateway, an operator can hand out one-time invite codes for an `allowlist` account:

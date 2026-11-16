@@ -962,6 +962,29 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
             warn!(%agent_id, "duplicate Hello after handshake — ignoring");
         }
         AgentToGateway::OutboundMessage(msg) => route_outbound(agent_id, msg, ctx).await,
+        AgentToGateway::CommandReply(msg) => {
+            // A web chat shows it as a notice; a channel as any message.
+            match msg.channel_id.parse::<crate::webchat::SessionId>() {
+                Ok(session) if crate::channel_id_codec::decode(&msg.channel_id).is_none() => {
+                    if !ctx.webchat_router.take_command_reply(agent_id, session) {
+                        warn!(%agent_id, "dropping a command answer no command asked for");
+                        return;
+                    }
+                    let text = match msg.content {
+                        havn_core::MessageContent::Text { text } => text,
+                        _ => return,
+                    };
+                    if let Err(e) = ctx
+                        .webchat_router
+                        .command_notice(agent_id, session, msg.conversation, text)
+                        .await
+                    {
+                        debug!(%agent_id, error = ?e, "no tab took a command's answer");
+                    }
+                }
+                _ => route_outbound(agent_id, msg, ctx).await,
+            }
+        }
         AgentToGateway::ApprovalRequest(request) => ask_for_approval(agent_id, request, ctx).await,
         AgentToGateway::MemoryChanged(changed) => {
             // Only a dashboard session shows it; a channel's sender is not
@@ -1193,12 +1216,26 @@ async fn ask_for_approval(
         )
         .await;
     }
-    if crate::channel_id_codec::decode(&request.channel_id).is_some() {
+    if let Some((channel, account, _)) = crate::channel_id_codec::decode(&request.channel_id) {
+        let admins = ctx
+            .channels
+            .get(channel)
+            .and_then(|entry| entry.accounts.iter().find(|a| a.id == account))
+            .is_some_and(|acct| !acct.admins.is_empty());
         let message = OutboundMessage {
             conversation: None,
             channel_id: request.channel_id,
             content: havn_core::MessageContent::Text {
-                text: "(A step of this reply waits for the agent owner's approval.)".into(),
+                text: format!(
+                    "(A step of this reply waits for approval: {}. {}the agent's owner can \
+                     decide in the web chat.)",
+                    request.tool,
+                    if admins {
+                        "An admin can send /approve or /deny here, or "
+                    } else {
+                        ""
+                    }
+                ),
             },
             reply_to: None,
         };
@@ -1209,7 +1246,7 @@ async fn ask_for_approval(
 /// The owner's answer to approval request `id` of `agent_id`: sent to the
 /// agent for the request's conversation, closed in every tab, and audited
 /// as `tool.approval.decided` with who decided. A request no longer
-/// waiting is ignored.
+/// waiting is ignored, and false.
 #[allow(
     clippy::too_many_arguments,
     reason = "one call site; a parameter struct would only rename them"
@@ -1223,15 +1260,15 @@ pub async fn forward_decision(
     id: &str,
     approve: bool,
     remember: bool,
-) {
+) -> bool {
     let Some(request) = router.close_approval(agent_id, id).await else {
-        return;
+        return false;
     };
     // The gateway's own question (the egress proxy) is answered here and
     // audited where it was asked.
     if let Some(waiter) = router.take_gateway_waiter(id) {
         let _ = waiter.send((approve, remember, decided_by.to_string()));
-        return;
+        return true;
     }
     if let Ok(Some(agent)) = agents_repo::find_by_id(db, agent_id).await {
         crate::audit::record(
@@ -1263,6 +1300,7 @@ pub async fn forward_decision(
     {
         warn!(%agent_id, error = ?e, "failed to forward an approval decision");
     }
+    true
 }
 
 /// Send `msg` from `agent_id` where its channel id points, with the checks
@@ -3928,6 +3966,7 @@ mod tests {
                     adapter_token_ref: "secret:channel:telegram:bot".into(),
                     dm_policy: crate::config::DmPolicy::Allowlist,
                     allow_from: Vec::new(),
+                    admins: Vec::new(),
                 }],
             },
         );

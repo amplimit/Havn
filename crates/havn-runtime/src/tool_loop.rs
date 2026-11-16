@@ -32,6 +32,12 @@ use crate::system_prompt::SystemPrompt;
 use crate::tools::agent_query::PendingQueries;
 use crate::tools::{ToolCtx, ToolRegistry, ToolResult};
 
+tokio::task_local! {
+    /// The model of the turn whose tool loop runs (a chat's own, or the
+    /// agent's when the turn began): a subagent it spawns uses it too.
+    pub static TURN_MODEL: Arc<String>;
+}
+
 /// Shared map of in-flight LLM requests keyed by request_id. Both the
 /// parent and any subagents register their oneshots here; the runtime's
 /// reader loop dispatches `LlmResponse` frames into them.

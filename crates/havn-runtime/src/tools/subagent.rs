@@ -194,7 +194,10 @@ impl Tool for SubagentSpawnTool {
             "subagent spawned"
         );
 
-        let handle = self.bridge.child_handle.clone();
+        let mut handle = self.bridge.child_handle.clone();
+        if let Ok(model) = tool_loop::TURN_MODEL.try_with(Arc::clone) {
+            handle.model = model;
+        }
         let prompt = Arc::clone(&self.bridge.parent_system_prompt);
         match tool_loop::run(&handle, context::SUBAGENT, &mut messages, &prompt).await {
             Ok(text) => ToolResult::Ok(text),

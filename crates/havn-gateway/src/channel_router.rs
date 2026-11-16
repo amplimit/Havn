@@ -788,6 +788,7 @@ mod tests {
                     adapter_token_ref: "secret:channel:telegram:bot".into(),
                     dm_policy,
                     allow_from: allow_from.iter().map(|s| (*s).to_string()).collect(),
+                    admins: Vec::new(),
                 }],
             },
         );

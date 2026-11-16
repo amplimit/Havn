@@ -40,7 +40,9 @@ export type ServerMessage =
   /** The tool call the reply being written is about to make. */
   | { type: "step"; tool: string; detail: string; conversation?: string }
   /** What the reply just sent saved to or forgot from memory. */
-  | { type: "memory"; conversation?: string; turn?: string; changes: MemoryChange[] };
+  | { type: "memory"; conversation?: string; turn?: string; changes: MemoryChange[] }
+  /** The answer to a chat command (`/status`, `/undo`, ...): shown, not kept, not a reply. */
+  | { type: "notice"; content: string; conversation?: string };
 
 /** A file uploaded to the agent's inbox for a message. */
 export type Attachment = {
