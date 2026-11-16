@@ -105,15 +105,54 @@ Agent cgroups are `/sys/fs/cgroup/havn/agent-<id>`. The gateway creates that top
 sudo -i
 # Replace the binaries with the release you move to; the running gateway is not touched yet
 curl -fsSL https://raw.githubusercontent.com/amplimit/havn/main/install.sh | HAVN_VERSION=<version> bash
-systemctl stop havn
-# While it is stopped, back up the data: havn.db and every agent's agent.db
-cp -a ~/.local/share/havn ~/havn-backup-$(date +%Y%m%d-%H%M%S)
-systemctl start havn
+havn backup -o ~/havn-backup-before-upgrade.tar.gz   # see Backup and restore
+systemctl restart havn
 ```
 
 A stopping gateway takes no new messages and gives the agents up to 30 seconds to finish what they are doing. Open chats still get those replies, and are told when one was cut off. Gateways up to v0.1.4 stop their agents at once, so the stop before leaving one of them drops work in progress; choose a quiet moment for it. Agents that were running start again with the gateway, and the dashboard reconnects on its own.
 
-The new gateway and agents migrate their databases when they start, and there is no way back, so keep the backup until the new version works. With a `db_path` or `workspace_root` other than the default, back up those too. Upgrade the dashboard separately: check out the new tag in its directory, then run `npm install` and `npm run build`, and restart it.
+The new gateway and agents migrate their databases when they start, and there is no way back, so keep the backup until the new version works. Upgrade the dashboard separately: check out the new tag in its directory, then run `npm install` and `npm run build`, and restart it.
+
+### Backup and restore
+
+```bash
+sudo -i
+havn backup                          # havn-backup-<time>.tar.gz in this directory; -o names the file
+systemctl stop havn
+havn restore havn-backup-<time>.tar.gz [--force]
+systemctl start havn
+```
+
+`havn backup` writes one archive (mode 0600) holding:
+
+- a consistent copy of the gateway's database and of every agent's (SQLite `VACUUM INTO`), so the gateway and its agents may keep running;
+- every agent's directory: workspace, inbox, outbox and home, with owners, modes and times;
+- `config.toml`.
+
+Links in workspaces are kept as links and never followed. A backup does not hold `HAVN_AGE_KEY`: the credentials in it stay encrypted, and restoring them needs the same key, so keep the key apart from the archives.
+
+`havn restore` needs the gateway stopped, and a backup made by this version of havn or an older one; the gateway migrates the databases when it starts. Onto a host that already has an installation it refuses unless `--force`, which moves the data directory (and `workspace_root`, if it lies elsewhere) aside to `<dir>.pre-restore-<time>` first. A `config.toml` already in place is kept, and the archive's is written beside it as `config.toml.restored`. Moving to a new host: install havn, put `HAVN_AGE_KEY` in `/etc/havn/havn.env`, restore, then start.
+
+A daily backup with systemd, keeping two weeks:
+
+```ini
+# /etc/systemd/system/havn-backup.service
+[Service]
+Type=oneshot
+WorkingDirectory=/var/backups/havn
+ExecStart=/usr/local/bin/havn backup
+ExecStartPost=/usr/bin/find /var/backups/havn -name 'havn-backup-*.tar.gz' -mtime +14 -delete
+
+# /etc/systemd/system/havn-backup.timer
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Create the directory (`install -d -m 700 /var/backups/havn`), then `systemctl enable --now havn-backup.timer`. Copy the archives off the host as well; a backup on the same disk does not survive the disk.
 
 ### Build from source
 
