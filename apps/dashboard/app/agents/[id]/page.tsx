@@ -180,6 +180,8 @@ export default function ChatPage({
   // Replies still due: one per message sent, the running one first and
   // the rest queued behind it in the agent.
   const [waiting, setWaiting] = useState(0);
+  // The tool call the reply being written in this chat is making.
+  const [step, setStep] = useState<Step | null>(null);
   const pending = waiting > 0;
   // Tool calls of the running reply that wait for the user.
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
@@ -189,6 +191,11 @@ export default function ChatPage({
   const [chat, setChat] = useState<string | null>(null);
   const chatIdRef = useRef<string | null>(null);
   const [chats, setChats] = useState<ChatSummary[]>([]);
+  // For the socket's handler, which outlives a render.
+  const chatsRef = useRef<ChatSummary[]>([]);
+  useEffect(() => {
+    chatsRef.current = chats;
+  }, [chats]);
   // Replies still due in chats not on screen, kept for when they are.
   const waitingElsewhere = useRef(new Map<string, number>());
   // Chats deleted here: what they still send is dropped.
@@ -373,6 +380,8 @@ export default function ChatPage({
           // A reply answers the oldest message waiting; a soft error
           // (agent gone) ends the wait for all of them.
           if (msg.type === "approval") {
+            // The card says what waits; the step before it is not running.
+            if (!msg.conversation || msg.conversation === chatIdRef.current) setStep(null);
             // The reply still runs; it waits for this answer. Requests are
             // sent again to a reconnecting tab, so keep one card per id.
             setApprovals((prev) => (prev.some((a) => a.id === msg.id) ? prev : [...prev, msg]));
@@ -380,6 +389,16 @@ export default function ChatPage({
           }
           if (msg.type === "approval_closed") {
             setApprovals((prev) => prev.filter((a) => a.id !== msg.id));
+            return;
+          }
+          if (msg.type === "step") {
+            const current = chatIdRef.current;
+            const of = msg.conversation;
+            if (of && deletedChats.current.has(of)) return;
+            if (of && current && of !== current) return;
+            // A new chat not saved yet shows only a chat that is new too.
+            if (of && !current && chatsRef.current.some((c) => c.id === of)) return;
+            setStep({ tool: msg.tool, detail: msg.detail });
             return;
           }
           if (msg.type === "file") {
@@ -424,18 +443,23 @@ export default function ChatPage({
             void catchUp();
           }
           if (msg.type === "agent_message") {
-            if (!msg.broadcast) setWaiting((n) => Math.max(0, n - 1));
-          } else {
+            if (!msg.broadcast) {
+              setWaiting((n) => Math.max(0, n - 1));
+              setStep(null);
+            }
+          } else if (msg.type === "error") {
             setWaiting(0);
+            setStep(null);
           }
           if (msg.type === "agent_message") {
             pushBubble("agent", msg.content);
-          } else {
+          } else if (msg.type === "error") {
             pushBubble("system", `error: ${msg.message}`);
           }
         },
         onError: () => {
           setWaiting(0);
+          setStep(null);
           setWsState("error");
         },
         onClose: () => {
@@ -444,6 +468,7 @@ export default function ChatPage({
           setWsState("closed");
           // A reply still due arrives through the reload on reconnect.
           setWaiting(0);
+          setStep(null);
           reconnectTimer = setTimeout(() => {
             if (!cancelled && !chatRef.current) connect();
           }, RECONNECT_MS);
@@ -586,6 +611,7 @@ export default function ChatPage({
     const target = next ?? newChatId();
     selectChat(target);
     setBubbles([]);
+    setStep(null);
     setWaiting((n) => {
       if (previous) waitingElsewhere.current.set(previous, n);
       return waitingElsewhere.current.get(target) ?? 0;
@@ -618,6 +644,7 @@ export default function ChatPage({
       selectChat(null);
       setBubbles([]);
       setWaiting(0);
+      setStep(null);
     }
     void refreshChats();
   }
@@ -863,7 +890,7 @@ export default function ChatPage({
                 </div>
               </div>
             ))}
-            {pending && <TypingBubble />}
+            {pending && <TypingBubble step={step} />}
           </div>
         </div>
 
@@ -1352,9 +1379,42 @@ function ActionRow({
  * eye doesn't have to retrain. Replaced by the actual reply when
  * `agent_message` arrives (parent flips `pending` to false).
  */
-function TypingBubble() {
+/** A tool call the agent makes while it replies. */
+type Step = { tool: string; detail: string };
+
+/** What a step does, as the chat shows it. */
+function stepText({ tool, detail }: Step): string {
+  const verbs: Record<string, string> = {
+    web_search: "Searching the web",
+    web_fetch: "Reading a page",
+    shell: "Running",
+    file_read: "Reading",
+    file_write: "Writing",
+    file_edit: "Editing",
+    memory_search: "Searching memory",
+    memory_remember: "Remembering",
+    memory_forget: "Forgetting",
+    memory_store: "Remembering",
+    skill_manage: "Updating a skill",
+    conversation_search: "Searching past chats",
+    send_file: "Sending",
+    schedule: "Scheduling",
+    set_timezone: "Setting the time zone",
+    subagent_spawn: "Handing off a task",
+    agent_query: "Asking another agent",
+  };
+  const verb = verbs[tool] ?? `Using ${tool}`;
+  return detail ? `${verb}: ${detail}` : verb;
+}
+
+function TypingBubble({ step }: { step: Step | null }) {
   return (
-    <div className="flex flex-col items-start">
+    <div className="flex flex-col items-start gap-1">
+      {step && (
+        <p className="wrap-anywhere px-1 text-xs" style={{ color: "var(--color-body)" }} role="status">
+          {stepText(step)}
+        </p>
+      )}
       <div
         className="flex items-center gap-1 px-4 py-3"
         style={{

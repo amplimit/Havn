@@ -973,6 +973,14 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
                 debug!(%agent_id, error = %e, "memory changes not shown");
             }
         }
+        AgentToGateway::Step(step) => {
+            // A channel's sender sees the adapter's "typing" instead.
+            if step.channel_id.parse::<crate::webchat::SessionId>().is_ok()
+                && let Err(e) = ctx.webchat_router.step(agent_id, step).await
+            {
+                debug!(%agent_id, error = %e, "step not shown");
+            }
+        }
         AgentToGateway::ApprovalClosed { request_id } => {
             // The egress proxy's questions are closed by the proxy only.
             if !request_id.starts_with(crate::egress_proxy::REQUEST_PREFIX) {
