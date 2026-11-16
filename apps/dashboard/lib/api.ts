@@ -270,6 +270,8 @@ export type ModelsView = {
   /** Default set in config.toml; null when the first entry is the default. */
   default_model: string | null;
   effective_default: string | null;
+  /** The model that writes chats' titles; null for each agent's own. */
+  title_model: string | null;
   models: ModelEntry[];
   /** False with trust_header on: the list is then edited in config.toml only. */
   editable: boolean;
@@ -452,9 +454,26 @@ export type CronJobView = {
 /** `/agents/{id}/approvals`: tools whose every call waits for approval. */
 export type ApprovalsView = { tools: string[]; inherited: string[] };
 
+/** Whether a model titles the agent's new chats. */
+export type TitlesView = {
+  enabled: boolean;
+  /** Off by the owner's role: cannot be turned on here. */
+  locked: boolean;
+  /** The model that writes them; empty for the agent's own. */
+  model: string;
+};
+
 export const api = {
   me: () => request<MeView>("/me"),
   timezone: () => request<TimezoneView>("/me/timezone"),
+  titles: {
+    get: (agentId: string) => request<TitlesView>(`/agents/${agentId}/titles`),
+    put: (agentId: string, enabled: boolean) =>
+      request<TitlesView>(`/agents/${agentId}/titles`, {
+        method: "PUT",
+        body: JSON.stringify({ enabled }),
+      }),
+  },
   approvals: {
     get: (agentId: string) => request<ApprovalsView>(`/agents/${agentId}/approvals`),
     put: (agentId: string, tools: string[]) =>
@@ -515,6 +534,7 @@ export const api = {
     put: (body: {
       version: string;
       default_model: string | null;
+      title_model: string | null;
       models: ModelEntry[];
     }) =>
       request<ModelsView>("/llm/models", {

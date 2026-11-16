@@ -1823,6 +1823,86 @@ async fn chat_command(ctx: &Ctx, command: &havn_proto::ChatCommand) -> (Option<S
     }
 }
 
+/// What a model is asked to title a chat with.
+const TITLE_PROMPT: &str = "You name chats. Reply with a title for the chat that starts with \
+     the user's message below: at most 8 words, or 16 characters in Chinese or Japanese, in the \
+     language of the message, without quotes or a full stop. Reply with the title only.";
+/// Characters of the first message a title is written from.
+const TITLE_INPUT_CHARS: usize = 2000;
+
+/// Have a model title chat `chat` of `channel_id` from its first message
+/// `text`, unless the user retitled it from `provisional` meanwhile; tell
+/// the conversation's tabs.
+async fn title_chat(
+    ctx: &Ctx,
+    channel_id: String,
+    chat: String,
+    provisional: &str,
+    text: &str,
+) -> anyhow::Result<()> {
+    let model = Some(ctx.tool_env.policy.chat_titles.model.clone())
+        .filter(|m| !m.is_empty())
+        .map_or_else(|| ctx.model(), Arc::new);
+    let message: String = text.chars().take(TITLE_INPUT_CHARS).collect();
+    let request = havn_proto::LlmRequest {
+        request_id: uuid::Uuid::now_v7().to_string(),
+        model: model.as_str().into(),
+        messages: serde_json::json!([{ "role": "user", "content": message }]),
+        options: serde_json::json!({ "max_tokens": 200, "system": TITLE_PROMPT }),
+        billing_user_id: None,
+        reply: None,
+    };
+    let response = tool_loop::request_llm(&ctx.writer_tx, &ctx.pending, request).await?;
+    let text = match response.outcome {
+        havn_proto::LlmOutcome::Ok => curator::extract_text(&response.provider_response)
+            .ok_or_else(|| anyhow!("the title had no text"))?,
+        havn_proto::LlmOutcome::Error { message } => return Err(anyhow!("LLM error: {message}")),
+    };
+    let Some(title) = clean_title(&text) else {
+        return Err(anyhow!("the title was empty"));
+    };
+    if conversations::retitle(&ctx.pool, &chat, provisional, &title).await? {
+        let titled = AgentToGateway::ChatTitled(havn_proto::ChatTitled {
+            channel_id,
+            conversation: chat,
+            title,
+        });
+        if let Err(e) = ctx.writer_tx.try_send(titled) {
+            warn!(error = %e, "could not tell the chat's new title");
+        }
+    }
+    Ok(())
+}
+
+/// A model's answer as a title: its first line, without quotes, heading
+/// marks, a "Title:" label or a final full stop.
+fn clean_title(text: &str) -> Option<String> {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let line = line
+        .trim_start_matches(['#', '*', ' '])
+        .trim_end_matches(['*', ' ']);
+    let line = ["Title:", "title:", "标题：", "标题:"]
+        .iter()
+        .find_map(|label| line.strip_prefix(label))
+        .unwrap_or(line)
+        .trim_matches(['*', ' ']);
+    let quotes: &[char] = &['"', '\'', '“', '”', '‘', '’', '「', '」', '《', '》', '`'];
+    // Quotes and a full stop, in whichever order they come.
+    let mut line = line;
+    loop {
+        let trimmed = line
+            .trim_end_matches(['.', '。'])
+            .trim_matches(quotes)
+            .trim();
+        if trimmed == line {
+            break;
+        }
+        line = trimmed;
+    }
+    let title: String = line.chars().take(conversations::MAX_TITLE_CHARS).collect();
+    (!title.is_empty()).then_some(title)
+}
+
 /// Characters of a taken-back message `/undo` quotes.
 const UNDO_EXCERPT_CHARS: usize = 60;
 
@@ -1924,6 +2004,24 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
             return;
         }
     };
+
+    // A new chat's first message: a model titles the chat meanwhile.
+    if msg.branch.is_none() && ctx.tool_env.policy.chat_titles.enabled {
+        match conversations::chat_info(&ctx.pool, &chat).await {
+            Ok(Some(info)) if info.turns == 1 => {
+                let ctx = ctx.clone();
+                let (channel_id, chat, text) =
+                    (msg.channel_id.clone(), chat.clone(), user_text.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = title_chat(&ctx, channel_id, chat, &info.title, &text).await {
+                        warn!(error = %e, "could not title the chat; it keeps its first message's");
+                    }
+                });
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "could not read the chat"),
+        }
+    }
 
     // The latest turns, and the summary of what came before them.
     let (summary, history) =
@@ -2886,6 +2984,33 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_models_answer_becomes_a_clean_title() {
+        assert_eq!(
+            clean_title("Budget for March").as_deref(),
+            Some("Budget for March")
+        );
+        assert_eq!(
+            clean_title("\n  \"Trip to Kyoto.\"  \nmore").as_deref(),
+            Some("Trip to Kyoto")
+        );
+        assert_eq!(
+            clean_title("**Title:** Q3 report**").as_deref(),
+            Some("Q3 report")
+        );
+        assert_eq!(
+            clean_title("标题：「三月预算」。").as_deref(),
+            Some("三月预算")
+        );
+        assert_eq!(clean_title("# 合同审阅").as_deref(), Some("合同审阅"));
+        assert_eq!(clean_title("  \n \"\" "), None);
+        let long = "x".repeat(200);
+        assert_eq!(
+            clean_title(&long).map(|t| t.chars().count()),
+            Some(conversations::MAX_TITLE_CHARS)
+        );
+    }
 
     #[test]
     fn images_go_with_the_last_user_message() {

@@ -387,6 +387,9 @@ enum ModelAction {
     Remove { id: String },
     /// Make a listed model the model of agents that do not set one.
     Default { id: String },
+    /// The model that writes chats' titles; without an id, each agent's
+    /// own model writes them.
+    Title { id: Option<String> },
 }
 
 #[derive(Debug, Subcommand)]
@@ -653,6 +656,7 @@ async fn run_model(action: ModelAction) -> anyhow::Result<()> {
         } => model::add(&id, label.as_deref(), max_output_tokens, vision, default).await,
         ModelAction::Remove { id } => model::remove(&id).await,
         ModelAction::Default { id } => model::set_default(&id).await,
+        ModelAction::Title { id } => model::set_title(id.as_deref()).await,
     }
 }
 

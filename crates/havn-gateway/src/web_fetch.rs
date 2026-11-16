@@ -1876,6 +1876,7 @@ mod tests {
         };
         let catalog = ModelCatalog {
             default_model: Some("openrouter:cheap/model".into()),
+            title_model: None,
             models: vec![entry("openrouter:cheap/model"), entry("anthropic:claude-x")],
         };
         let f = WebFetch::new(FetchConfig {

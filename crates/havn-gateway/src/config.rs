@@ -351,6 +351,10 @@ pub struct LlmConfig {
     pub base_url: std::collections::BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// The model that writes chats' titles (issue #179), unless a team's
+    /// policy names another. Unset, each agent's own model writes them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title_model: Option<String>,
     pub models: Vec<crate::model_catalog::ModelEntry>,
 }
 
@@ -359,6 +363,7 @@ impl LlmConfig {
     pub fn catalog(&self) -> crate::model_catalog::ModelCatalog {
         crate::model_catalog::ModelCatalog {
             default_model: self.default_model.clone(),
+            title_model: self.title_model.clone(),
             models: self.models.clone(),
         }
     }
@@ -470,6 +475,7 @@ impl Default for LlmConfig {
             max_tokens_ceiling: DEFAULT_MAX_TOKENS_CEILING,
             base_url: std::collections::BTreeMap::new(),
             default_model: None,
+            title_model: None,
             models: Vec::new(),
         }
     }

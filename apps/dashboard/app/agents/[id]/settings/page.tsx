@@ -29,6 +29,7 @@ import {
   type ModelsView,
   type CronJobView,
   type ApprovalsView,
+  type TitlesView,
   type MyDomainsView,
   type TimezoneView,
 } from "@/lib/api";
@@ -299,6 +300,7 @@ export default function SettingsPage({
       <WebAccessEditor agentId={id} />
       <TimezoneEditor />
       <ScheduledTasks agentId={id} />
+      <TitlesEditor agentId={id} />
       <ApprovalsEditor agentId={id} />
 
       <McpEditor agentId={id} />
@@ -534,6 +536,72 @@ function BootstrapFileEditor({
  * in a channel). A name ending in * covers a prefix, such as all tools of
  * one MCP server. Applies on the agent's next start.
  */
+/** Whether a model titles the agent's new chats. */
+function TitlesEditor({ agentId }: { agentId: string }) {
+  const [view, setView] = useState<TitlesView | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    api.titles.get(agentId).then(
+      (v) => {
+        if (!cancelled) setView(v);
+      },
+      (e: unknown) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId]);
+  async function toggle(enabled: boolean) {
+    setSaving(true);
+    setError(null);
+    try {
+      setView(await api.titles.put(agentId, enabled));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+  if (!view) return error ? <p className="mt-10 text-sm" role="alert">{error}</p> : null;
+  return (
+    <section className="mt-10 card px-4 py-4" aria-labelledby="titles-title">
+      <h2 id="titles-title" className="display-h3 mb-2">
+        chat titles
+      </h2>
+      <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
+        A model names each new chat from its first message, while the agent answers it.
+        Off, a chat is named after the start of its first message. Written by{" "}
+        {view.model ? <span className="font-mono">{view.model}</span> : "the agent's own model"}
+        ; the gateway&apos;s title model is set on the models page. Applies on the
+        agent&apos;s next start.
+      </p>
+      {error && (
+        <p className="mb-2 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
+          {error}
+        </p>
+      )}
+      <label className="inline-flex items-center gap-2 text-sm">
+        <input
+          type="checkbox"
+          checked={view.enabled}
+          disabled={saving || (view.locked && !view.enabled)}
+          onChange={(e) => void toggle(e.target.checked)}
+        />
+        let a model title new chats
+      </label>
+      {view.locked && (
+        <p className="mt-1 text-xs" style={{ color: "var(--color-body)" }}>
+          Your role has chat titles off; a team admin can turn them on.
+        </p>
+      )}
+    </section>
+  );
+}
+
 function ApprovalsEditor({ agentId }: { agentId: string }) {
   const [view, setView] = useState<ApprovalsView | null>(null);
   const [text, setText] = useState("");

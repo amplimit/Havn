@@ -48,6 +48,10 @@ pub fn split_model_ref(id: &str) -> Option<(&str, &str)> {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelCatalog {
     pub default_model: Option<String>,
+    /// The model that writes chats' titles (issue #179), unless a team's
+    /// policy names another; `None` for each agent's own model.
+    #[serde(default)]
+    pub title_model: Option<String>,
     pub models: Vec<ModelEntry>,
 }
 
@@ -86,6 +90,11 @@ impl ModelCatalog {
             && !seen.contains(default.as_str())
         {
             anyhow::bail!("[llm] default_model {default:?} is not one of the [[llm.models]] ids");
+        }
+        if let Some(title) = &self.title_model
+            && !seen.contains(title.as_str())
+        {
+            anyhow::bail!("[llm] title_model {title:?} is not one of the [[llm.models]] ids");
         }
         Ok(())
     }
@@ -131,6 +140,8 @@ struct FileLlm {
     #[serde(default)]
     default_model: Option<String>,
     #[serde(default)]
+    title_model: Option<String>,
+    #[serde(default)]
     models: Vec<ModelEntry>,
 }
 
@@ -156,6 +167,7 @@ fn parse_catalog(raw: &str) -> anyhow::Result<ModelCatalog> {
     let file: FileConfig = toml::from_str(raw)?;
     Ok(ModelCatalog {
         default_model: file.llm.default_model,
+        title_model: file.llm.title_model,
         models: file.llm.models,
     })
 }
@@ -262,6 +274,12 @@ fn write_checked(
         Some(id) => llm["default_model"] = value(id.as_str()),
         None => {
             llm.remove("default_model");
+        }
+    }
+    match &catalog.title_model {
+        Some(id) => llm["title_model"] = value(id.as_str()),
+        None => {
+            llm.remove("title_model");
         }
     }
     if catalog.models.is_empty() {
@@ -557,6 +575,7 @@ pub async fn upgrade(
         if !seeded.is_empty() {
             let catalog = ModelCatalog {
                 default_model: None,
+                title_model: None,
                 models: seeded
                     .into_iter()
                     .map(|id| ModelEntry {
@@ -618,6 +637,7 @@ mod tests {
     fn catalog(ids: &[&str], default: Option<&str>) -> ModelCatalog {
         ModelCatalog {
             default_model: default.map(str::to_string),
+            title_model: None,
             models: ids.iter().copied().map(entry).collect(),
         }
     }

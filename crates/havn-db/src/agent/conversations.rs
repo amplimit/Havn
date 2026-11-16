@@ -314,6 +314,27 @@ pub async fn chat_info(pool: &SqlitePool, chat: &str) -> Result<Option<ChatInfo>
     }))
 }
 
+/// Title chat `chat` `title` if it is still titled `provisional`: a title
+/// the user gave it meanwhile stays. Whether it was retitled.
+pub async fn retitle(
+    pool: &SqlitePool,
+    chat: &str,
+    provisional: &str,
+    title: &str,
+) -> Result<bool> {
+    let title: String = title.trim().chars().take(MAX_TITLE_CHARS).collect();
+    if title.is_empty() {
+        return Ok(false);
+    }
+    let res = sqlx::query("UPDATE chats SET title = ?3 WHERE id = ?1 AND title = ?2")
+        .bind(chat)
+        .bind(provisional)
+        .bind(&title)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// Chat `chat`'s own model, when it has one.
 pub async fn chat_model(pool: &SqlitePool, chat: &str) -> Result<Option<String>> {
     let found: Option<(Option<String>,)> = sqlx::query_as("SELECT model FROM chats WHERE id = ?1")
@@ -1392,6 +1413,25 @@ mod tests {
                 .expect("chat")
                 .title,
             "hello"
+        );
+        // A model's title replaces the provisional one, not the user's.
+        assert!(
+            retitle(&pool, &chat, "hello", "Greeting")
+                .await
+                .expect("db")
+        );
+        assert!(
+            !retitle(&pool, &chat, "hello", "Other").await.expect("db"),
+            "no longer provisional"
+        );
+        assert!(
+            !retitle(&pool, &chat, "Greeting", "  ").await.expect("db"),
+            "empty"
+        );
+        assert!(rename_chat(&pool, "s", &chat, "Mine").await.expect("db"));
+        assert!(
+            !retitle(&pool, &chat, "Greeting", "Late").await.expect("db"),
+            "renamed"
         );
     }
 

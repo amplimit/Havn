@@ -654,7 +654,9 @@ async fn handle_connection(
             // merged → default. Same chain used at spawn time so
             // cgroup limits and tool registry stay consistent
             // (spec §6.3).
-            let policy = policy_resolver::for_session(&ctx.db, &agent, ctx.multi_user).await;
+            let mut policy = policy_resolver::for_session(&ctx.db, &agent, ctx.multi_user).await;
+            // The model that titles chats, as the runtime uses it.
+            policy.chat_titles.model = title_model(&policy, &ctx.models.load());
             let gateway_tools = gateway_tools_for(&ctx, &agent, &policy).await;
             (policy, model, max_tokens, name, gateway_tools)
         }
@@ -962,6 +964,24 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
             warn!(%agent_id, "duplicate Hello after handshake — ignoring");
         }
         AgentToGateway::OutboundMessage(msg) => route_outbound(agent_id, msg, ctx).await,
+        AgentToGateway::ChatTitled(titled) => {
+            if let Ok(session) = titled.channel_id.parse::<crate::webchat::SessionId>()
+                && crate::channel_id_codec::decode(&titled.channel_id).is_none()
+            {
+                let title: String = titled
+                    .title
+                    .chars()
+                    .take(havn_db::agent::conversations::MAX_TITLE_CHARS)
+                    .collect();
+                if let Err(e) = ctx
+                    .webchat_router
+                    .chat_titled(agent_id, session, titled.conversation, title)
+                    .await
+                {
+                    debug!(%agent_id, error = ?e, "no tab took a chat's title");
+                }
+            }
+        }
         AgentToGateway::CommandReply(msg) => {
             // A web chat shows it as a notice; a channel as any message.
             match msg.channel_id.parse::<crate::webchat::SessionId>() {
@@ -1240,6 +1260,31 @@ async fn ask_for_approval(
             reply_to: None,
         };
         route_outbound(agent_id, message, ctx).await;
+    }
+}
+
+/// The model that writes chat titles for an agent with `policy`: its
+/// team's, else the gateway's `[llm] title_model`, when listed and allowed
+/// to the agent; empty for the agent's own model.
+pub(crate) fn title_model(policy: &Policy, catalog: &crate::model_catalog::ModelCatalog) -> String {
+    let named = Some(policy.chat_titles.model.as_str())
+        .filter(|m| !m.is_empty())
+        .or(catalog.title_model.as_deref());
+    match named {
+        Some(model)
+            if catalog.get(model).is_some()
+                && llm_proxy::model_allowed(&policy.allowed_models, model) =>
+        {
+            model.to_string()
+        }
+        Some(model) => {
+            warn!(
+                model,
+                "the title model is not listed or not allowed to this agent; its own model titles chats"
+            );
+            String::new()
+        }
+        None => String::new(),
     }
 }
 
@@ -2886,6 +2931,35 @@ mod tests {
     use havn_spawner::AgentHandle;
     use std::time::Duration;
 
+    #[test]
+    fn the_title_model_is_the_teams_then_the_gateways_when_allowed() {
+        let entry = |id: &str| -> crate::model_catalog::ModelEntry {
+            serde_json::from_value(serde_json::json!({ "id": id })).expect("entry")
+        };
+        let mut catalog = crate::model_catalog::ModelCatalog {
+            default_model: None,
+            title_model: Some("openai:small".into()),
+            models: vec![
+                entry("openai:small"),
+                entry("openai:big"),
+                entry("openai:team"),
+            ],
+        };
+        let mut policy = Policy::default();
+        assert_eq!(title_model(&policy, &catalog), "openai:small");
+        policy.chat_titles.model = "openai:team".into();
+        assert_eq!(title_model(&policy, &catalog), "openai:team");
+        // Not allowed to the agent, or not listed: its own model.
+        policy.allowed_models = vec!["openai:big".into()];
+        assert_eq!(title_model(&policy, &catalog), "");
+        policy.allowed_models = vec!["*".into()];
+        policy.chat_titles.model = "openai:gone".into();
+        assert_eq!(title_model(&policy, &catalog), "");
+        policy.chat_titles.model.clear();
+        catalog.title_model = None;
+        assert_eq!(title_model(&policy, &catalog), "");
+    }
+
     async fn ctx_with(multi_user: bool, verify_peer_cgroup: bool) -> AgentSocketCtx {
         let db = connect_in_memory().await.expect("db");
         let registry = AgentRegistry::new();
@@ -3023,6 +3097,7 @@ mod tests {
         ctx.models
             .store(Arc::new(crate::model_catalog::ModelCatalog {
                 default_model: None,
+                title_model: None,
                 models: vec![crate::model_catalog::ModelEntry {
                     id: "openrouter:cheap/model".into(),
                     label: None,
@@ -3200,6 +3275,7 @@ mod tests {
         ctx.models
             .store(Arc::new(crate::model_catalog::ModelCatalog {
                 default_model: None,
+                title_model: None,
                 models: catalog
                     .iter()
                     .map(|id| crate::model_catalog::ModelEntry {

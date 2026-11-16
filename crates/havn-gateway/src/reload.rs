@@ -82,6 +82,10 @@ pub const RULES: &[ReloadRule] = &[
         kind: ReloadKind::Hot,
     },
     ReloadRule {
+        prefix: "llm.title_model",
+        kind: ReloadKind::Hot,
+    },
+    ReloadRule {
         prefix: "reload",
         kind: ReloadKind::Restart,
     },
@@ -207,7 +211,10 @@ impl ReloadHandles {
                     new_count = new.allowed_origins.len(),
                     "hot-reloaded allowed_origins"
                 );
-            } else if path.starts_with("llm.models") || path.starts_with("llm.default_model") {
+            } else if path.starts_with("llm.models")
+                || path.starts_with("llm.default_model")
+                || path.starts_with("llm.title_model")
+            {
                 let catalog = new.llm.catalog();
                 info!(
                     models = catalog.models.len(),
@@ -436,6 +443,7 @@ mod tests {
             vision: false,
         }];
         new.llm.default_model = Some("openai:gpt-5".into());
+        new.llm.title_model = Some("openai:gpt-5".into());
         let changed = diff_paths(
             &serde_json::to_value(&old).unwrap(),
             &serde_json::to_value(&new).unwrap(),

@@ -41,6 +41,8 @@ export type ServerMessage =
   | { type: "step"; tool: string; detail: string; conversation?: string }
   /** What the reply just sent saved to or forgot from memory. */
   | { type: "memory"; conversation?: string; turn?: string; changes: MemoryChange[] }
+  /** A model titled chat `conversation`. */
+  | { type: "chat_title"; conversation: string; title: string }
   /** The answer to a chat command (`/status`, `/undo`, ...): shown, not kept, not a reply. */
   | { type: "notice"; content: string; conversation?: string };
 

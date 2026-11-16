@@ -30,6 +30,29 @@ pub struct Policy {
     /// `.havn/hooks.yaml`. The runtime applies them together with the
     /// workspace file, which can add rules but not remove these.
     pub hooks: HookPolicy,
+    /// Chats titled by a model (issue #179).
+    pub chat_titles: ChatTitles,
+}
+
+/// Whether a model writes each new chat's title, and which.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChatTitles {
+    /// A model titles each new chat from its first message. Off, a chat
+    /// is titled after the start of its first message.
+    pub enabled: bool,
+    /// The model that writes them, in place of the gateway's
+    /// `[llm] title_model`; empty for that.
+    pub model: String,
+}
+
+impl Default for ChatTitles {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: String::new(),
+        }
+    }
 }
 
 impl Default for Policy {
@@ -45,6 +68,7 @@ impl Default for Policy {
             admin_visibility: AdminVisibility::default(),
             mcp_servers: HashMap::new(),
             hooks: HookPolicy::default(),
+            chat_titles: ChatTitles::default(),
         }
     }
 }
@@ -569,6 +593,16 @@ impl Policy {
                 })
                 .collect(),
             hooks: self.hooks.union(&ceiling.hooks),
+            // Off where the ceiling has them off; its model, when it names
+            // one, is the one used.
+            chat_titles: ChatTitles {
+                enabled: self.chat_titles.enabled && ceiling.chat_titles.enabled,
+                model: if ceiling.chat_titles.model.is_empty() {
+                    self.chat_titles.model.clone()
+                } else {
+                    ceiling.chat_titles.model.clone()
+                },
+            },
         }
     }
 
@@ -670,6 +704,14 @@ impl Policy {
             // combining roles keeps all of them rather than only the
             // rules every role shares.
             hooks: self.hooks.union(&other.hooks),
+            chat_titles: ChatTitles {
+                enabled: self.chat_titles.enabled || other.chat_titles.enabled,
+                model: if self.chat_titles.model.is_empty() {
+                    other.chat_titles.model.clone()
+                } else {
+                    self.chat_titles.model.clone()
+                },
+            },
         }
     }
 }
@@ -796,6 +838,25 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn chat_titles_are_off_where_the_ceiling_has_them_off() {
+        let mut team = Policy::default();
+        team.chat_titles.enabled = false;
+        team.chat_titles.model = "openai:small".into();
+        let mut agent = Policy::default();
+        agent.chat_titles.model = "openai:big".into();
+        let clamped = agent.clamp_to(&team);
+        assert!(!clamped.chat_titles.enabled);
+        assert_eq!(clamped.chat_titles.model, "openai:small");
+        let open = agent.clamp_to(&Policy::default());
+        assert!(open.chat_titles.enabled);
+        assert_eq!(open.chat_titles.model, "openai:big");
+        // Across roles, on wins.
+        let widened = team.widen_with(&Policy::default());
+        assert!(widened.chat_titles.enabled);
+        assert_eq!(widened.chat_titles.model, "openai:small");
+    }
 
     #[test]
     fn domain_lists_only_add_when_merged() {

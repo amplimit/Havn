@@ -848,6 +848,87 @@ pub(crate) fn embedding_env_passthrough(embedding: &serde_json::Value) -> Vec<St
     vec![name.to_string()]
 }
 
+/// Whether a model titles the agent's new chats (issue #179).
+#[derive(Debug, Serialize)]
+pub struct TitlesView {
+    pub enabled: bool,
+    /// Off by the owner's role, which the agent cannot turn on.
+    pub locked: bool,
+    /// The model that writes them; empty for the agent's own.
+    pub model: String,
+}
+
+async fn titles_view(state: &AppState, agent: &Agent) -> TitlesView {
+    let multi_user = state.trusted_proxies.is_some();
+    let policy = policy_resolver::for_session(&state.db, agent, multi_user).await;
+    let owner = policy_resolver::for_owner(&state.db, agent).await;
+    TitlesView {
+        enabled: policy.chat_titles.enabled,
+        locked: multi_user && !owner.chat_titles.enabled,
+        model: crate::agent_socket::title_model(&policy, &state.models.load()),
+    }
+}
+
+/// `GET /agents/{id}/titles`.
+pub async fn titles_get(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path(id): Path<String>,
+) -> Result<Json<TitlesView>, ApiError> {
+    let agent = resolve_agent(&id, &user, &state).await?;
+    Ok(Json(titles_view(&state, &agent).await))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TitlesPut {
+    pub enabled: bool,
+}
+
+/// `PUT /agents/{id}/titles`: turn titles on or off for the agent, in its
+/// policy override. Applies on the agent's next start.
+pub async fn titles_put(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path(id): Path<String>,
+    Json(req): Json<TitlesPut>,
+) -> Result<Json<TitlesView>, ApiError> {
+    let agent = resolve_agent(&id, &user, &state).await?;
+    if req.enabled && titles_view(&state, &agent).await.locked {
+        return Err(ApiError::Forbidden(
+            "your role has chat titles off; a team admin can turn them on".into(),
+        ));
+    }
+    let updated = repo::update_config(&state.db, agent.id, None, |current| {
+        let mut config = current.as_object().cloned().unwrap_or_default();
+        let mut policy = config
+            .get("policy")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut titles = policy
+            .get("chat_titles")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        titles.insert("enabled".into(), serde_json::Value::Bool(req.enabled));
+        policy.insert("chat_titles".into(), serde_json::Value::Object(titles));
+        config.insert("policy".into(), serde_json::Value::Object(policy));
+        Ok::<_, std::convert::Infallible>(serde_json::Value::Object(config))
+    })
+    .await?;
+    let Ok(updated) = updated;
+    audit::record_agent_action(
+        &state.db,
+        user.id,
+        agent.id,
+        "agent.chat_titles.changed",
+        serde_json::json!({ "enabled": req.enabled }),
+    )
+    .await;
+    Ok(Json(titles_view(&state, &updated).await))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{check_model, check_policy_override, embedding_env_passthrough};
@@ -860,6 +941,7 @@ mod tests {
             .models
             .store(std::sync::Arc::new(crate::model_catalog::ModelCatalog {
                 default_model: None,
+                title_model: None,
                 models: vec![crate::model_catalog::ModelEntry {
                     id: "openai:gpt-5".into(),
                     label: None,

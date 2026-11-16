@@ -16,6 +16,8 @@ pub struct ModelsView {
     pub version: String,
     pub default_model: Option<String>,
     pub effective_default: Option<String>,
+    /// The model that writes chats' titles; `None` for each agent's own.
+    pub title_model: Option<String>,
     pub models: Vec<ModelEntry>,
     pub editable: bool,
 }
@@ -26,6 +28,7 @@ fn view(state: &AppState) -> ModelsView {
         version: catalog.version(),
         default_model: catalog.default_model.clone(),
         effective_default: catalog.default_entry().map(|m| m.id.clone()),
+        title_model: catalog.title_model.clone(),
         models: catalog.models.clone(),
         editable: state.trusted_proxies.is_none(),
     }
@@ -41,6 +44,8 @@ pub struct ModelsPut {
     pub version: String,
     #[serde(default)]
     pub default_model: Option<String>,
+    #[serde(default)]
+    pub title_model: Option<String>,
     pub models: Vec<ModelEntry>,
 }
 
@@ -58,6 +63,7 @@ pub async fn put(
     }
     let catalog = ModelCatalog {
         default_model: req.default_model,
+        title_model: req.title_model,
         models: req.models,
     };
     catalog
@@ -93,13 +99,14 @@ pub async fn put(
     }
     let ids: Vec<String> = catalog.models.iter().map(|m| m.id.clone()).collect();
     let default_model = catalog.default_model.clone();
+    let title_model = catalog.title_model.clone();
     state.models.store(Arc::new(catalog));
 
     audit::record_user_action(
         &state.db,
         user.id,
         "llm.models.updated",
-        serde_json::json!({ "models": ids, "default_model": default_model }),
+        serde_json::json!({ "models": ids, "default_model": default_model, "title_model": title_model }),
     )
     .await;
     info!(models = ?ids, default = ?default_model, by = %user.id, "model list written to config.toml");
@@ -117,6 +124,7 @@ mod tests {
         Json(ModelsPut {
             version: version.into(),
             default_model: None,
+            title_model: None,
             models: ids
                 .iter()
                 .map(|id| ModelEntry {
@@ -191,6 +199,7 @@ mod tests {
         // A hand edit the watcher has not applied yet counts as a change.
         let edited = ModelCatalog {
             default_model: None,
+            title_model: None,
             models: vec![],
         };
         model_catalog::write_to_file(&state.config_path, &edited).unwrap();

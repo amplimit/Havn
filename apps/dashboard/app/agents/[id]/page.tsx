@@ -483,6 +483,10 @@ export default function ChatPage({
             addFile(msg.url, msg.name, msg.caption, Date.now());
             return;
           }
+          if (msg.type === "chat_title") {
+            void refreshChats();
+            return;
+          }
           if (msg.type === "notice") {
             const current = chatIdRef.current;
             if (msg.conversation && current && msg.conversation !== current) return;

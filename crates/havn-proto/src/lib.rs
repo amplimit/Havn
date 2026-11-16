@@ -22,7 +22,8 @@ pub use codec::{FrameError, read_frame, write_frame};
 /// `ApprovalDecision`, which an older peer cannot parse and would exit on;
 /// the version check refuses the mix instead.
 /// 0.6.0: `ChatCommand`.
-pub const PROTOCOL_VERSION: &str = "0.6.0";
+/// 0.7.0: `ChatTitled`.
+pub const PROTOCOL_VERSION: &str = "0.7.0";
 
 /// How often a runtime sends [`AgentToGateway::LivenessPing`] once it is
 /// up. The gateway restarts an agent that stays connected but silent for
@@ -43,6 +44,9 @@ pub enum AgentToGateway {
     /// [`AgentToGateway::OutboundMessage`] is, but a web chat shows it as
     /// a notice, not as a reply.
     CommandReply(OutboundMessage),
+    /// A model titled a new chat (issue #179): a web chat shows the title
+    /// in its list.
+    ChatTitled(ChatTitled),
     /// Request an LLM completion via the gateway proxy.
     LlmRequest(LlmRequest),
     /// Cron job finished — gateway records a `CronRun` row, writes the output
@@ -169,6 +173,16 @@ pub struct StopTurn {
     /// when absent.
     #[serde(default)]
     pub conversation: Option<String>,
+}
+
+/// See [`AgentToGateway::ChatTitled`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatTitled {
+    /// The conversation, as in [`InboundMessage::channel_id`].
+    pub channel_id: String,
+    /// The chat.
+    pub conversation: String,
+    pub title: String,
 }
 
 /// See [`GatewayToAgent::ChatCommand`].
