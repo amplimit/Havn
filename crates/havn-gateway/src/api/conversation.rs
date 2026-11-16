@@ -54,8 +54,9 @@ pub struct ConversationResponse {
     pub conversation: Option<String>,
     pub turns: Vec<TurnView>,
     /// Messages of the chat the agent has not answered yet, the one it
-    /// answers now included.
-    pub waiting: usize,
+    /// answers now included; absent from a runtime that does not say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<usize>,
     /// `true` when the agent has never been started — agent.db
     /// doesn't exist on disk yet.
     pub uninitialised: bool,
@@ -66,7 +67,7 @@ struct ConversationRows {
     conversation: Option<String>,
     turns: Vec<BranchTurn>,
     #[serde(default)]
-    waiting: usize,
+    waiting: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]

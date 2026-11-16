@@ -517,10 +517,14 @@ pub async fn inbox_file(
         return Err(ApiError::Forbidden("not from another site".into()));
     }
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
-    // Files read at once, each held whole while it is sent.
-    static READING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
-    let _reading = READING
-        .acquire()
+    // Files held at once: each is read whole, and its slot is given back
+    // once it has been sent.
+    static READING: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let reading = READING
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(8)))
+        .clone()
+        .acquire_owned()
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     if !Attachment::in_inbox(&q.path) {
@@ -538,7 +542,26 @@ pub async fn inbox_file(
     .map_err(|e| ApiError::Internal(format!("reading the inbox: {e}")))?
     .ok_or(ApiError::NotFound)?;
     let image = crate::llm_proxy::image_type(&bytes);
-    Ok(file_response(&name, bytes, image))
+    let bytes = axum::body::Bytes::from(bytes);
+    let pieces: Vec<axum::body::Bytes> = (0..bytes.len())
+        .step_by(64 * 1024)
+        .map(|at| bytes.slice(at..(at + 64 * 1024).min(bytes.len())))
+        .collect();
+    let mut response = file_response(&name, Vec::new(), image);
+    // The slot goes with the last piece.
+    let body = futures_util::stream::unfold(
+        (pieces.into_iter(), reading),
+        |(mut pieces, reading)| async move {
+            pieces
+                .next()
+                .map(|piece| (Ok::<_, std::convert::Infallible>(piece), (pieces, reading)))
+        },
+    );
+    response
+        .headers_mut()
+        .remove(axum::http::header::CONTENT_LENGTH);
+    *response.body_mut() = axum::body::Body::from_stream(body);
+    Ok(response)
 }
 
 #[cfg(test)]

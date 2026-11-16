@@ -334,7 +334,7 @@ export default function ChatPage({
         if (!chatIdRef.current && r.conversation) selectChat(r.conversation);
         // A reply still running when the page was left shows again; the
         // agent's count is the count.
-        setWaiting(r.waiting ?? 0);
+        if (r.waiting !== undefined) setWaiting(r.waiting);
         if (r.turns.length === 0) return;
         const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
         setBubbles((prev) => mergeStored(prev, stored, since));
@@ -410,7 +410,7 @@ export default function ChatPage({
         const r = await api.conversation.list(id, HISTORY_LIMIT, asked ?? undefined);
         if (cancelled || chatIdRef.current !== asked) return;
         if (!asked && r.conversation) selectChat(r.conversation);
-        if (reconnected) setWaiting(r.waiting ?? 0);
+        if (reconnected && r.waiting !== undefined) setWaiting(r.waiting);
         const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
         setBubbles((prev) => mergeStored(prev, stored, since));
       } catch (e) {
