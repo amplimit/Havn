@@ -84,7 +84,7 @@ function splitMessage(content: string): { text: string; files: Attachment[] } {
       return true;
     }
   });
-  return { text: lines.join("\n").trim(), files };
+  return { text: lines.join("\n").trimEnd(), files };
 }
 
 /** A message as its stored turn holds it: the text, then a line per file. */
@@ -332,9 +332,9 @@ export default function ChatPage({
         const r = await api.conversation.list(id, HISTORY_LIMIT, chat ?? undefined);
         if (cancelled) return;
         if (!chatIdRef.current && r.conversation) selectChat(r.conversation);
-        // A reply still running when the page was left shows again.
-        const due = r.waiting ?? 0;
-        setWaiting((n) => Math.max(n, due));
+        // A reply still running when the page was left shows again; the
+        // agent's count is the count.
+        setWaiting(r.waiting ?? 0);
         if (r.turns.length === 0) return;
         const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
         setBubbles((prev) => mergeStored(prev, stored, since));
@@ -410,10 +410,7 @@ export default function ChatPage({
         const r = await api.conversation.list(id, HISTORY_LIMIT, asked ?? undefined);
         if (cancelled || chatIdRef.current !== asked) return;
         if (!asked && r.conversation) selectChat(r.conversation);
-        if (reconnected) {
-          const due = r.waiting ?? 0;
-          setWaiting((n) => Math.max(n, due));
-        }
+        if (reconnected) setWaiting(r.waiting ?? 0);
         const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
         setBubbles((prev) => mergeStored(prev, stored, since));
       } catch (e) {
@@ -545,8 +542,10 @@ export default function ChatPage({
           chatRef.current = null;
           if (cancelled) return;
           setWsState("closed");
-          // A reply still due arrives through the reload on reconnect.
+          // A reply still due arrives through the reload on reconnect, and
+          // the agent says again what is still running.
           setWaiting(0);
+          waitingElsewhere.current.clear();
           setStep(null);
           clearLive();
           reconnectTimer = setTimeout(() => {
@@ -1260,17 +1259,18 @@ function AttachmentCards({
 }: {
   agentId: string;
   files: Attachment[];
-  onRemove?: (path: string) => void;
+  /** Remove the file at this index. */
+  onRemove?: (index: number) => void;
   align?: "start" | "end";
 }) {
   return (
     <div className={`flex flex-wrap gap-2 ${align === "end" ? "justify-end" : ""}`} aria-label="attached files">
-      {files.map((f) => (
+      {files.map((f, i) => (
         <AttachmentCard
-          key={f.path}
+          key={`${i}:${f.path}`}
           agentId={agentId}
           file={f}
-          onRemove={onRemove ? () => onRemove(f.path) : undefined}
+          onRemove={onRemove ? () => onRemove(i) : undefined}
         />
       ))}
     </div>
@@ -1311,7 +1311,7 @@ function AttachmentCard({
           }}
         >
           {/* eslint-disable-next-line @next/next/no-img-element -- an inbox file, served by the gateway */}
-          <img src={url} alt={file.name} className="h-full w-full object-cover" />
+          <img src={url} alt={file.name} loading="lazy" className="h-full w-full object-cover" />
         </a>
       ) : (
         <a
@@ -1389,13 +1389,17 @@ function MessageInput({
       value={value}
       onChange={(e) => onChange(e.target.value)}
       onKeyDown={(e) => {
+        // What an input method composes takes its keys first.
+        if (e.nativeEvent.isComposing || e.keyCode === 229) return;
         if (e.key === "Escape" && onEscape) {
           e.preventDefault();
           onEscape();
           return;
         }
         if (e.key !== "Enter" || e.shiftKey) return;
-        if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+        // A touch keyboard has no Shift: its Enter starts a line, and the
+        // send button sends.
+        if (!(e.metaKey || e.ctrlKey) && window.matchMedia("(pointer: coarse)").matches) return;
         e.preventDefault();
         onEnter();
       }}
@@ -1479,8 +1483,11 @@ function MessageEditor({
         e.preventDefault();
         send();
       }}
-      onDragOver={(e) => e.preventDefault()}
+      onDragOver={(e) => {
+        if (e.dataTransfer.types.includes("Files")) e.preventDefault();
+      }}
       onDrop={(e) => {
+        if (!e.dataTransfer.types.includes("Files")) return;
         e.preventDefault();
         void add(Array.from(e.dataTransfer.files));
       }}
@@ -1489,7 +1496,7 @@ function MessageEditor({
         <AttachmentCards
           agentId={agentId}
           files={kept}
-          onRemove={(path) => setKept((prev) => prev.filter((f) => f.path !== path))}
+          onRemove={(index) => setKept((prev) => prev.filter((_, i) => i !== index))}
         />
       )}
       <MessageInput
@@ -1949,8 +1956,11 @@ function Composer({
   return (
     <form
       onSubmit={onSubmit}
-      onDragOver={(e) => e.preventDefault()}
+      onDragOver={(e) => {
+        if (e.dataTransfer.types.includes("Files")) e.preventDefault();
+      }}
       onDrop={(e) => {
+        if (!e.dataTransfer.types.includes("Files")) return;
         e.preventDefault();
         if (ready) onAttach(Array.from(e.dataTransfer.files));
       }}
@@ -1993,7 +2003,7 @@ function Composer({
 
         {(attached.length > 0 || uploading > 0) && (
           <div className="mb-2 flex flex-wrap items-center gap-2">
-            <AttachmentCards agentId={agentId} files={attached} onRemove={onDetach} />
+            <AttachmentCards agentId={agentId} files={attached} onRemove={(i) => onDetach(attached[i].path)} />
             {uploading > 0 && (
               <span className="inline-flex items-center gap-1 text-xs" role="status" style={{ color: "var(--color-body)" }}>
                 <Spinner /> uploading

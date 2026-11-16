@@ -453,6 +453,19 @@ fn file_response(
 ) -> axum::response::Response {
     use axum::http::header;
     use axum::response::IntoResponse as _;
+    let (kind, disposition) = match image {
+        Some(kind) => (kind, "inline"),
+        None => ("application/octet-stream", "attachment"),
+    };
+    // An image saved from the page is saved as what it is.
+    let lower = name.to_ascii_lowercase();
+    let says = |ext: &str| {
+        lower.ends_with(&format!(".{ext}")) || (ext == "jpeg" && lower.ends_with(".jpg"))
+    };
+    let name = match image.and_then(|kind| kind.strip_prefix("image/")) {
+        Some(ext) if !says(ext) => format!("{name}.{ext}"),
+        _ => name.to_string(),
+    };
     let encoded: String = name
         .bytes()
         .map(|b| {
@@ -463,10 +476,6 @@ fn file_response(
             }
         })
         .collect();
-    let (kind, disposition) = match image {
-        Some(kind) => (kind, "inline"),
-        None => ("application/octet-stream", "attachment"),
-    };
     (
         [
             (header::CONTENT_TYPE, kind.to_string()),
@@ -498,8 +507,22 @@ pub async fn inbox_file(
     user: AuthedUser,
     Path(id): Path<String>,
     Query(q): Query<InboxFileQuery>,
+    headers: HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
+    // Another site's page cannot even learn whether a file is there.
+    if headers
+        .get("sec-fetch-site")
+        .is_some_and(|v| v.as_bytes() == b"cross-site")
+    {
+        return Err(ApiError::Forbidden("not from another site".into()));
+    }
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    // Files read at once, each held whole while it is sent.
+    static READING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+    let _reading = READING
+        .acquire()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     if !Attachment::in_inbox(&q.path) {
         return Err(ApiError::BadRequest("not a file in the inbox".into()));
     }
@@ -538,6 +561,14 @@ mod tests {
             b"\x89PNG\r\n\x1a\nrest".to_vec(),
             Some("image/png"),
         );
+        assert!(header(&png, axum::http::header::CONTENT_DISPOSITION).ends_with("''a.png"));
+        // A name the agent chose that says another type is saved as the image.
+        let disguised = file_response("x.html", b"\x89PNG\r\n\x1a\n".to_vec(), Some("image/png"));
+        assert!(
+            header(&disguised, axum::http::header::CONTENT_DISPOSITION).ends_with("''x.html.png")
+        );
+        let jpg = file_response("p.JPG", b"\xff\xd8\xff".to_vec(), Some("image/jpeg"));
+        assert!(header(&jpg, axum::http::header::CONTENT_DISPOSITION).ends_with("''p.JPG"));
         assert_eq!(header(&png, axum::http::header::CONTENT_TYPE), "image/png");
         assert!(header(&png, axum::http::header::CONTENT_DISPOSITION).starts_with("inline;"));
         let page = file_response("x.png.html", b"<script>".to_vec(), None);
