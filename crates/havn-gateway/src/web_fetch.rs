@@ -11,8 +11,8 @@
 //! URL, so the model cannot put data from the agent into a URL of its
 //! choosing. Domains on the policy's allowed domains need no such record.
 //!
-//! Untrusted documents are never parsed in the gateway: the HTML and PDF
-//! parsers run in a child of the gateway binary (`--convert-page`) with no
+//! Untrusted documents are never parsed in the gateway: the HTML, PDF and
+//! Office parsers run in a child of the gateway binary (`--convert-page`) with no
 //! network, bounded memory and CPU time, killed on a deadline; under a root
 //! gateway it runs as `nobody`. A parser that panics or loops loses one
 //! fetch, not the gateway.
@@ -280,6 +280,10 @@ pub enum Kind {
     Html,
     Pdf,
     Text,
+    /// A Word document (.docx).
+    Docx,
+    /// A spreadsheet (.xlsx, .xlsm, .xls, .ods).
+    Sheet,
 }
 
 impl Kind {
@@ -288,6 +292,8 @@ impl Kind {
             Self::Html => "html",
             Self::Pdf => "pdf",
             Self::Text => "text",
+            Self::Docx => "docx",
+            Self::Sheet => "sheet",
         }
     }
 
@@ -296,6 +302,31 @@ impl Kind {
             "html" => Some(Self::Html),
             "pdf" => Some(Self::Pdf),
             "text" => Some(Self::Text),
+            "docx" => Some(Self::Docx),
+            "sheet" => Some(Self::Sheet),
+            _ => None,
+        }
+    }
+
+    /// A file format read only whole, not as text cut at a limit.
+    pub fn binary(self) -> bool {
+        matches!(self, Self::Pdf | Self::Docx | Self::Sheet)
+    }
+
+    /// The kind of a file sent in a chat whose text is read for the agent,
+    /// by its media type or else its name's extension.
+    pub fn of_file(media_type: &str, name: &str) -> Option<Self> {
+        if let Some(kind) = Self::of(media_type, b"").filter(|k| k.binary()) {
+            return Some(kind);
+        }
+        let ext = name
+            .rsplit_once('.')
+            .map(|(_, ext)| ext.to_ascii_lowercase())
+            .unwrap_or_default();
+        match ext.as_str() {
+            "pdf" => Some(Self::Pdf),
+            "docx" => Some(Self::Docx),
+            "xlsx" | "xlsm" | "xls" | "ods" => Some(Self::Sheet),
             _ => None,
         }
     }
@@ -313,6 +344,13 @@ impl Kind {
         match mime.as_str() {
             "" | "text/html" | "application/xhtml+xml" => Some(Self::Html),
             "application/pdf" | "application/x-pdf" => Some(Self::Pdf),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+                Some(Self::Docx)
+            }
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            | "application/vnd.ms-excel.sheet.macroenabled.12"
+            | "application/vnd.ms-excel"
+            | "application/vnd.oasis.opendocument.spreadsheet" => Some(Self::Sheet),
             "application/json"
             | "application/xml"
             | "application/javascript"
@@ -724,9 +762,9 @@ impl WebFetch {
                 .map_err(|e| format!("reading {url} failed: {}", error_chain(&e)))?;
             let kind = Kind::of(&content_type, &body)
                 .ok_or_else(|| format!("{url} is {content_type}, which web_fetch cannot read"))?;
-            if cut && kind == Kind::Pdf {
+            if cut && kind.binary() {
                 return Err(format!(
-                    "{url} is a PDF larger than {} MB",
+                    "{url} is a document larger than {} MB",
                     MAX_BODY_BYTES / (1024 * 1024)
                 ));
             }
@@ -751,7 +789,7 @@ impl WebFetch {
             .acquire_owned()
             .await
             .map_err(|_| "the gateway is shutting down".to_string())?;
-        let input = if kind == Kind::Pdf {
+        let input = if kind.binary() {
             body
         } else {
             decode(&body, content_type).into_bytes()
@@ -1119,10 +1157,10 @@ fn error_chain(e: &dyn std::error::Error) -> String {
     out
 }
 
-/// The text of PDF `input` (issue #106: a file sent in a chat), read in a
-/// converter child under the same limits as a fetched page, and whether
-/// it was cut.
-pub async fn pdf_text(input: &[u8]) -> Result<(String, bool), String> {
+/// The text of document `input` of `kind` (issue #106: a file sent in a
+/// chat), read in a converter child under the same limits as a fetched
+/// page, and whether it was cut.
+pub async fn document_text(kind: Kind, input: &[u8]) -> Result<(String, bool), String> {
     // Converters of uploads, apart from the tool's: each may take
     // [`CONVERT_MEMORY_BYTES`].
     static UPLOAD_CONVERSIONS: Semaphore = Semaphore::const_new(2);
@@ -1131,7 +1169,7 @@ pub async fn pdf_text(input: &[u8]) -> Result<(String, bool), String> {
         .await
         .map_err(|e| e.to_string())?;
     let url = Url::parse("https://upload.invalid/").map_err(|e| e.to_string())?;
-    convert_in_child(Kind::Pdf, input, &url).await
+    convert_in_child(kind, input, &url).await
 }
 
 /// The gateway binary, for the converter. `/proc/self/exe` still runs
@@ -1300,7 +1338,7 @@ pub fn convert_main(args: &[String]) -> bool {
         false
     };
     let Some(kind) = args.first().and_then(|k| Kind::named(k)) else {
-        return fail("usage: havn-gateway --convert-page <html|pdf|text>");
+        return fail("usage: havn-gateway --convert-page <html|pdf|text|docx|sheet>");
     };
     let mut input = Vec::new();
     if let Err(e) = std::io::stdin()
@@ -1365,14 +1403,16 @@ fn cap_text(mut text: String) -> (String, bool) {
     (text, true)
 }
 
-/// The text of a document: HTML as Markdown, PDF as plain text, text as
-/// it is. HTML and text arrive as UTF-8.
+/// The text of a document: HTML, Word and spreadsheets as Markdown, PDF
+/// as plain text, text as it is. HTML and text arrive as UTF-8.
 fn convert(kind: Kind, input: &[u8], url: &Url) -> Result<String, String> {
     let text = match kind {
         Kind::Text => String::from_utf8_lossy(input).into_owned(),
         Kind::Html => html_to_markdown(&String::from_utf8_lossy(input), url)?,
         Kind::Pdf => pdf_extract::extract_text_from_mem(input)
             .map_err(|e| format!("not a readable PDF: {e}"))?,
+        Kind::Docx => crate::office::docx_text(input)?,
+        Kind::Sheet => crate::office::sheet_text(input)?,
     };
     Ok(tidy(&text))
 }
@@ -1643,6 +1683,15 @@ mod tests {
         assert_eq!(Kind::of("application/ld+json", b""), Some(Kind::Text));
         assert_eq!(Kind::of("text/markdown", b""), Some(Kind::Text));
         assert_eq!(Kind::of("image/png", b""), None);
+        assert_eq!(Kind::of("application/vnd.ms-excel", b""), Some(Kind::Sheet));
+        assert_eq!(
+            Kind::of_file("application/octet-stream", "a.DOCX"),
+            Some(Kind::Docx)
+        );
+        assert_eq!(Kind::of_file("", "b.xls"), Some(Kind::Sheet));
+        assert_eq!(Kind::of_file("application/pdf", "c"), Some(Kind::Pdf));
+        assert_eq!(Kind::of_file("text/html", "d.html"), None);
+        assert_eq!(Kind::of_file("text/plain", "e.doc"), None);
     }
 
     #[test]

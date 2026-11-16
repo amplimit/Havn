@@ -18,6 +18,7 @@ mod heartbeat;
 mod keyring;
 mod llm_proxy;
 mod model_catalog;
+mod office;
 mod outbox;
 mod perm;
 mod policy_resolver;
