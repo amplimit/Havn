@@ -46,11 +46,14 @@ const SPARSE_BYTES: u64 = 64 * 1024 * 1024;
 /// Whether open file `file`, `len` bytes long, has a hole before its end.
 /// A file a filesystem stores compressed has fewer blocks than bytes but
 /// no holes.
-fn has_hole(file: &File, len: u64) -> bool {
-    // SAFETY: lseek on a descriptor this function borrows open; it only
-    // moves the file's offset, which nothing else here relies on.
+/// The file's offset is back at its start afterwards, where reading it
+/// begins.
+fn has_hole(file: &File, len: u64) -> io::Result<bool> {
+    // SAFETY: lseek on a descriptor this function borrows open; the offset
+    // it moves is set back to the start below, before anything reads.
     let hole = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_HOLE) };
-    u64::try_from(hole).is_ok_and(|hole| hole < len)
+    io::Seek::seek(&mut &*file, io::SeekFrom::Start(0))?;
+    Ok(u64::try_from(hole).is_ok_and(|hole| hole < len))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -564,7 +567,12 @@ impl Walk<'_> {
             return Ok(());
         }
         let len = opened.len();
-        if len >= SPARSE_BYTES && has_hole(&file, len) {
+        // Holes, and most of it: a hole or two in a large file (a
+        // preallocated download) keeps it.
+        if len >= SPARSE_BYTES
+            && opened.blocks().saturating_mul(512) < len / 2
+            && has_hole(&file, len)?
+        {
             eprintln!("warning: {} is sparse, left out", entry.display());
             self.skipped
                 .borrow_mut()
@@ -1037,6 +1045,25 @@ mod tests {
             read(&at.db).await,
             "mine",
             "the installation stays in place"
+        );
+    }
+
+    #[test]
+    fn looking_for_holes_leaves_the_file_to_be_read_from_its_start() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("dense");
+        fs::write(&path, vec![7u8; 100_000]).unwrap();
+        let file = File::open(&path).unwrap();
+        assert!(!has_hole(&file, 100_000).unwrap());
+        let mut body = Exactly {
+            inner: file.take(100_000),
+            left: 100_000,
+        };
+        let mut out = Vec::new();
+        body.read_to_end(&mut out).unwrap();
+        assert!(
+            out.iter().all(|b| *b == 7),
+            "read from where the hole search left it"
         );
     }
 

@@ -159,7 +159,8 @@ Environment=HOME=/root
 EnvironmentFile=-/etc/havn/havn.env
 WorkingDirectory=/var/backups/havn
 ExecStart=/usr/local/bin/havn backup
-ExecStartPost=/usr/bin/find /var/backups/havn -name 'havn-backup-*.tar.gz' -mtime +14 -delete
+# After a failed backup too, so old archives never pile up
+ExecStopPost=/usr/bin/find /var/backups/havn -name 'havn-backup-*.tar.gz' -mtime +14 -delete
 
 # /etc/systemd/system/havn-backup.timer
 [Timer]
