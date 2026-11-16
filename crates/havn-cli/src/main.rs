@@ -74,7 +74,7 @@ enum Command {
     /// Back up the gateway's and agents' databases, the agents' directories
     /// and config.toml to one archive; the gateway may keep running.
     Backup {
-        /// The archive to write (default: havn-backup-<time>.tar.gz here).
+        /// The archive to write (default: `havn-backup-<time>.tar.gz` here).
         #[arg(short, long)]
         output: Option<std::path::PathBuf>,
     },
