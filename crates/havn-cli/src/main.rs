@@ -580,6 +580,17 @@ async fn run_backup(_output: Option<std::path::PathBuf>) -> anyhow::Result<()> {
 fn run_restore(archive: &std::path::Path, force: bool) -> anyhow::Result<()> {
     let install = backup::Install::from_config()?;
     let restored = backup::restore(&install, archive, force)?;
+    if !restored.moved.is_empty() {
+        let kept: Vec<String> = restored
+            .moved
+            .iter()
+            .map(|m| m.display().to_string())
+            .collect();
+        println!(
+            "the installation that was there is kept at {}",
+            kept.join(", ")
+        );
+    }
     println!(
         "restored the gateway and {} agent(s) from a backup of {} (havn {}): the database at {}, the agents in {}",
         restored.manifest.agents.len(),
