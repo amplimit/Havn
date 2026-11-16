@@ -1412,7 +1412,8 @@ async fn deliver_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSo
                         error = %e,
                         "could not deliver outbound to channel adapter (offline?)"
                     );
-                    false
+                    // Otherwise it is kept for the adapter's resume.
+                    !matches!(e, crate::channel_router::DeliverError::NeverConnected(_))
                 }
             },
             None => {

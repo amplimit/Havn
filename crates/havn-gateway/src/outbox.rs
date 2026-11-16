@@ -240,12 +240,11 @@ fn prune(outbox: &Path) -> Vec<Sent> {
                 .ok()
                 .and_then(|t| t.elapsed().ok())
                 .is_some_and(|age| age > std::time::Duration::from_secs(3600));
+            // A file another send is still writing or has just moved into
+            // place is left alone: only old ones are swept.
             let orphan = uuid::Uuid::parse_str(stem).is_ok()
-                && if name.ends_with(".part") {
-                    stale
-                } else {
-                    !kept.iter().any(|s| s.id == stem)
-                };
+                && stale
+                && (name.ends_with(".part") || !kept.iter().any(|s| s.id == stem));
             if orphan {
                 let _ = std::fs::remove_file(entry.path());
             }
@@ -361,9 +360,21 @@ mod tests {
             .set_modified(old)
             .expect("age");
         std::fs::write(outbox.join(&stray), b"no meta").expect("orphan");
+        std::fs::File::options()
+            .write(true)
+            .open(outbox.join(&stray))
+            .expect("open")
+            .set_modified(old)
+            .expect("age");
+        let fresh = uuid::Uuid::now_v7().to_string();
+        std::fs::write(outbox.join(&fresh), b"just moved in").expect("fresh");
         send(ws.path(), &outbox, "out/report.pdf", None, "c1", None).expect("send");
         assert!(!part.exists());
         assert!(!outbox.join(&stray).exists());
         assert!(outbox.join(&sent.id).exists(), "a kept file stays");
+        assert!(
+            outbox.join(&fresh).exists(),
+            "a file another send is writing stays"
+        );
     }
 }
