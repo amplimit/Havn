@@ -710,7 +710,7 @@ impl Policy {
                 model: [&self.chat_titles, &other.chat_titles]
                     .into_iter()
                     .filter(|t| !t.model.is_empty())
-                    .max_by_key(|t| t.enabled)
+                    .min_by_key(|t| !t.enabled)
                     .map(|t| t.model.clone())
                     .unwrap_or_default(),
             },
@@ -863,6 +863,10 @@ mod tests {
         on.chat_titles.model = "openai:on".into();
         assert_eq!(team.widen_with(&on).chat_titles.model, "openai:on");
         assert_eq!(on.widen_with(&team).chat_titles.model, "openai:on");
+        // Both on: the first role's.
+        let mut also = Policy::default();
+        also.chat_titles.model = "openai:also".into();
+        assert_eq!(on.widen_with(&also).chat_titles.model, "openai:on");
     }
 
     #[test]

@@ -1877,9 +1877,17 @@ async fn title_chat(
                     break;
                 }
                 failed = anyhow!("the title had no text");
+                break;
             }
             havn_proto::LlmOutcome::Error { message } => {
+                // Only a model the gateway no longer takes gives way to the
+                // agent's own; any other failure is not paid for twice.
+                let gone = message.contains("not in the gateway's model list")
+                    || message.contains("not allowed by this agent's policy");
                 failed = anyhow!("LLM error from {model}: {message}");
+                if !gone {
+                    break;
+                }
             }
         }
     }
