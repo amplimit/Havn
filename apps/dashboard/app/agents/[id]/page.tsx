@@ -1411,7 +1411,10 @@ function AttachmentCard({
  * nothing follows it, or `null` for an ordinary message. */
 function commandIn(text: string): { name: string; bare: boolean } | null {
   const m = /^\/([A-Za-z0-9_]{1,32})(?:@[A-Za-z0-9_]+)?(?:\s+(.*))?$/.exec(text.trim());
-  return m && !text.trim().includes("\n") ? { name: m[1].toLowerCase(), bare: !m[2] } : null;
+  // `/start` (Telegram's first message) goes to the agent, as the gateway
+  // sends it.
+  if (!m || text.trim().includes("\n") || m[1].toLowerCase() === "start") return null;
+  return { name: m[1].toLowerCase(), bare: !m[2] };
 }
 
 function MessageInput({

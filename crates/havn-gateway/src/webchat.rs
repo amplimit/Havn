@@ -49,13 +49,16 @@ pub struct WebChatRouter {
     /// here instead of by an agent.
     gateway_waiters:
         Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<GatewayAnswer>>>>,
-    /// Chat commands sent to an agent for a session and not answered yet:
-    /// an agent's notice is shown only as such an answer.
-    command_replies: Arc<std::sync::Mutex<HashMap<(AgentId, SessionId), usize>>>,
+    /// When chat commands were sent to an agent for a session and not
+    /// answered yet: an agent's notice is shown only as such an answer.
+    command_replies: Arc<std::sync::Mutex<HashMap<(AgentId, SessionId), Vec<std::time::Instant>>>>,
 }
 
-/// Unanswered chat commands kept per session; more are not shown.
+/// Unanswered chat commands kept per session; more are not sent.
 const MAX_COMMANDS_WAITING: usize = 16;
+/// How long a command's answer is awaited: an agent that restarted or
+/// crashed meanwhile never sends it.
+const COMMAND_REPLY_KEPT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The owner's answer to a question of the gateway's own: allow, always,
 /// and who decided.
@@ -531,11 +534,15 @@ impl WebChatRouter {
             .command_replies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let n = waiting.entry((agent_id, session_id)).or_insert(0);
-        if *n >= MAX_COMMANDS_WAITING {
+        waiting.retain(|_, sent| {
+            sent.retain(|at| at.elapsed() < COMMAND_REPLY_KEPT);
+            !sent.is_empty()
+        });
+        let sent = waiting.entry((agent_id, session_id)).or_default();
+        if sent.len() >= MAX_COMMANDS_WAITING {
             return false;
         }
-        *n += 1;
+        sent.push(std::time::Instant::now());
         true
     }
 
@@ -546,17 +553,19 @@ impl WebChatRouter {
             .command_replies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match waiting.get_mut(&(agent_id, session_id)) {
-            Some(n) if *n > 1 => {
-                *n -= 1;
-                true
-            }
-            Some(_) => {
-                waiting.remove(&(agent_id, session_id));
-                true
-            }
-            None => false,
+        let key = (agent_id, session_id);
+        let Some(sent) = waiting.get_mut(&key) else {
+            return false;
+        };
+        sent.retain(|at| at.elapsed() < COMMAND_REPLY_KEPT);
+        let awaited = !sent.is_empty();
+        if awaited {
+            sent.remove(0);
         }
+        if sent.is_empty() {
+            waiting.remove(&key);
+        }
+        awaited
     }
 
     /// The approval request of `agent_id` that has waited longest in
@@ -925,6 +934,17 @@ mod tests {
             !router.expect_command_reply(agent, session),
             "too many waiting"
         );
+        // Answers that never came are forgotten after a while.
+        router
+            .command_replies
+            .lock()
+            .expect("lock")
+            .get_mut(&(agent, session))
+            .expect("waiting")
+            .iter_mut()
+            .for_each(|at| *at -= COMMAND_REPLY_KEPT);
+        assert!(!router.take_command_reply(agent, session), "expired");
+        assert!(router.expect_command_reply(agent, session));
     }
 
     #[tokio::test]
