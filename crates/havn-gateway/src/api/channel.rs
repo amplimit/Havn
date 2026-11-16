@@ -294,6 +294,166 @@ pub async fn file(
     Ok(crate::api::files::attachment_response(&found.0, found.1))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UploadQuery {
+    pub channel: String,
+    pub account: String,
+    /// The sender who sent the file, as its messages name them.
+    pub sender: String,
+    /// The file's name on the platform.
+    pub name: String,
+}
+
+/// A file a channel's sender sent, waiting for the message that carries it.
+struct Received {
+    channel: String,
+    account: String,
+    sender: String,
+    attachment: havn_core::Attachment,
+    at: Instant,
+}
+
+/// How long a file sent waits for its message.
+const RECEIVED_FOR: Duration = Duration::from_secs(3600);
+/// Files waiting at once, across all accounts.
+const MAX_RECEIVED: usize = 2000;
+/// Files one message carries at most.
+const MAX_MESSAGE_FILES: usize = 10;
+
+/// The files channel senders sent, by agent and inbox path.
+fn received() -> &'static std::sync::Mutex<HashMap<(havn_core::AgentId, String), Received>> {
+    static RECEIVED: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<(havn_core::AgentId, String), Received>>,
+    > = std::sync::OnceLock::new();
+    RECEIVED.get_or_init(Default::default)
+}
+
+/// `POST /api/v1/channel/files?channel=&account=&sender=&name=` — a file
+/// one of the account's senders sent (issue #106), saved in the bound
+/// agent's inbox as the dashboard's uploads are, under the same limits,
+/// with its text when it is a document. Authenticated like the adapter's
+/// WebSocket, and only for a sender the account answers. The answer is
+/// the attachment the sender's message then names; only that sender's
+/// message, through this account, can.
+pub async fn upload(
+    State(state): State<AppState>,
+    Query(q): Query<UploadQuery>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Result<axum::Json<havn_core::Attachment>, ApiError> {
+    let account = ChannelQuery {
+        channel: q.channel.clone(),
+        account: q.account.clone(),
+    };
+    authenticate(&state, &account, &headers).await?;
+    channel_id_codec::validate_channel_id_part("sender_id", &q.sender)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let agent_id = channel_router::agent_for_account(&state.bindings, &q.channel, &q.account)
+        .and_then(|a| havn_core::AgentId::from_str(a).ok())
+        .ok_or(ApiError::NotFound)?;
+    // Before the body is read: only a sender the account answers may put
+    // files in the agent's inbox.
+    let probe = ChannelInbound {
+        seq: 0,
+        account_id: q.account.clone(),
+        channel_message_id: String::new(),
+        sender_id: q.sender.clone(),
+        content: ChannelMessageContent::Text {
+            text: String::new(),
+        },
+        timestamp: chrono::Utc::now(),
+        raw: None,
+        attachments: Vec::new(),
+    };
+    if sender_access(&state, &q.channel, agent_id, &probe).await != SenderAccess::Allowed {
+        return Err(ApiError::Forbidden(
+            "this sender may not send the agent files".into(),
+        ));
+    }
+    let agent = agent_repo::find_by_id(&state.db, agent_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+    let attachment =
+        crate::api::files::receive(&state, agent_id, agent.owner_id, &q.name, &headers, body)
+            .await?;
+    crate::audit::record_agent_action(
+        &state.db,
+        agent.owner_id,
+        agent_id,
+        "file.received",
+        serde_json::json!({
+            "channel": q.channel,
+            "account": q.account,
+            "sender": q.sender,
+            "path": attachment.path,
+            "size": attachment.size,
+            "media_type": attachment.media_type,
+        }),
+    )
+    .await;
+    {
+        let mut waiting = received()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        waiting.retain(|_, r| r.at.elapsed() < RECEIVED_FOR);
+        while waiting.len() >= MAX_RECEIVED {
+            let Some(oldest) = waiting
+                .iter()
+                .min_by_key(|(_, r)| r.at)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            waiting.remove(&oldest);
+        }
+        waiting.insert(
+            (agent_id, attachment.path.clone()),
+            Received {
+                channel: q.channel,
+                account: q.account,
+                sender: q.sender,
+                attachment: attachment.clone(),
+                at: Instant::now(),
+            },
+        );
+    }
+    Ok(axum::Json(attachment))
+}
+
+/// The attachments of a message from `sender`: of the files it names,
+/// those this sender sent through this account, each for one message. A
+/// file the agent's owner sent, or another sender, cannot be named.
+fn take_received(
+    agent_id: havn_core::AgentId,
+    channel: &str,
+    account: &str,
+    sender: &str,
+    named: &[havn_core::Attachment],
+) -> Vec<havn_core::Attachment> {
+    let mut waiting = received()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    named
+        .iter()
+        .take(MAX_MESSAGE_FILES)
+        .filter_map(|a| {
+            let key = (agent_id, a.path.clone());
+            let theirs = waiting.get(&key).is_some_and(|r| {
+                r.channel == channel
+                    && r.account == account
+                    && r.sender == sender
+                    && r.at.elapsed() < RECEIVED_FOR
+            });
+            if !theirs {
+                warn!(channel, account, path = %a.path, "dropping an attachment the sender did not send");
+                return None;
+            }
+            waiting.remove(&key).map(|r| r.attachment)
+        })
+        .collect()
+}
+
 /// Check that the request carries the adapter token of the configured
 /// `(channel, account)` it names.
 async fn authenticate(
@@ -855,7 +1015,13 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
         channel: channel.to_string(),
         content,
         timestamp: inb.timestamp,
-        attachments: Vec::new(),
+        attachments: take_received(
+            agent_id,
+            channel,
+            &inb.account_id,
+            &inb.sender_id,
+            &inb.attachments,
+        ),
         raw: inb.raw.unwrap_or(serde_json::Value::Null),
     };
 
@@ -1321,6 +1487,48 @@ mod tests {
             }
         }
 
+        #[test]
+        fn a_message_carries_only_files_its_sender_sent() {
+            let agent = havn_core::AgentId::new();
+            let file = |path: &str| havn_core::Attachment {
+                path: path.into(),
+                name: "a.png".into(),
+                media_type: "image/png".into(),
+                size: 3,
+                text_path: None,
+            };
+            {
+                let mut waiting = received().lock().expect("lock");
+                for (path, sender) in [("inbox/1-a.png", "tg:1"), ("inbox/2-a.png", "tg:2")] {
+                    waiting.insert(
+                        (agent, path.into()),
+                        Received {
+                            channel: "telegram".into(),
+                            account: "bot".into(),
+                            sender: sender.into(),
+                            attachment: file(path),
+                            at: Instant::now(),
+                        },
+                    );
+                }
+            }
+            let named = [
+                file("inbox/1-a.png"),
+                file("inbox/2-a.png"),
+                file("inbox/owner-passport.png"),
+            ];
+            let kept = take_received(agent, "telegram", "bot", "tg:1", &named);
+            assert_eq!(kept, [file("inbox/1-a.png")]);
+            // Once: a second message cannot name it again.
+            assert!(take_received(agent, "telegram", "bot", "tg:1", &named[..1]).is_empty());
+            // Another account of the channel cannot name tg:2's either.
+            assert!(take_received(agent, "telegram", "other", "tg:2", &named[1..2]).is_empty());
+            assert_eq!(
+                take_received(agent, "telegram", "bot", "tg:2", &named[1..2]),
+                [file("inbox/2-a.png")]
+            );
+        }
+
         fn text_from(sender: &str, text: &str) -> ChannelInbound {
             ChannelInbound {
                 seq: 1,
@@ -1330,6 +1538,7 @@ mod tests {
                 content: ChannelMessageContent::Text { text: text.into() },
                 timestamp: chrono::Utc::now(),
                 raw: None,
+                attachments: Vec::new(),
             }
         }
 

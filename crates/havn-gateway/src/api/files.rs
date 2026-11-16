@@ -108,7 +108,30 @@ pub async fn upload(
     // Before the body is read: whoever may not send files here does not
     // get 25 MB buffered.
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
-    let Some(_mine) = UserUploads::take(user.id) else {
+    let attachment = receive(&state, agent.id, user.id, &q.name, &headers, body).await?;
+    audit::record_agent_action(
+        &state.db,
+        user.id,
+        agent.id,
+        "file.uploaded",
+        serde_json::json!({"path": attachment.path, "size": attachment.size, "media_type": attachment.media_type}),
+    )
+    .await;
+    Ok(Json(attachment))
+}
+
+/// Take file `name`, sent to agent `agent_id` and counted against user
+/// `quota`'s uploads at once, into the agent's inbox, with its text saved
+/// next to it when it is a document; the attachment a message then names.
+pub async fn receive(
+    state: &AppState,
+    agent_id: havn_core::AgentId,
+    quota: havn_core::UserId,
+    name: &str,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<Attachment, ApiError> {
+    let Some(_mine) = UserUploads::take(quota) else {
         return Err(ApiError::Conflict(format!(
             "{PER_USER_UPLOADS} uploads of yours are still running; wait for one"
         )));
@@ -139,9 +162,9 @@ pub async fn upload(
     if body.is_empty() {
         return Err(ApiError::BadRequest("the file is empty".into()));
     }
-    let name = clean_name(&q.name);
-    let media_type = media_type(&headers, &name);
-    let workspace = crate::api::agents::workspace_for(&state, agent.id);
+    let name = clean_name(name);
+    let media_type = media_type(headers, &name);
+    let workspace = crate::api::agents::workspace_for(state, agent_id);
     crate::workspace::ensure(&workspace)
         .await
         .map_err(|e| ApiError::Internal(format!("workspace: {e}")))?;
@@ -164,7 +187,7 @@ pub async fn upload(
     if let Some(kind) = text_kind {
         match crate::web_fetch::document_text(kind, &body).await {
             Ok((text, _)) if !text.trim().is_empty() => {
-                let workspace = crate::api::agents::workspace_for(&state, agent.id);
+                let workspace = crate::api::agents::workspace_for(state, agent_id);
                 let text_name = format!("{}.txt", stored.file);
                 let written = text_name.clone();
                 let saved = tokio::task::spawn_blocking(move || {
@@ -177,16 +200,16 @@ pub async fn upload(
                     Ok(Ok(true)) => text_path = Some(format!("{INBOX_DIR}/{text_name}")),
                     Ok(Ok(false)) => {}
                     Ok(Err(e)) => {
-                        tracing::warn!(agent_id = %agent.id, error = %e, "could not save a document's text")
+                        tracing::warn!(agent_id = %agent_id, error = %e, "could not save a document's text")
                     }
                     Err(e) => {
-                        tracing::warn!(agent_id = %agent.id, error = %e, "could not save a document's text")
+                        tracing::warn!(agent_id = %agent_id, error = %e, "could not save a document's text")
                     }
                 }
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::info!(agent_id = %agent.id, error = %e, "no text read from an uploaded document")
+                tracing::info!(agent_id = %agent_id, error = %e, "no text read from an uploaded document")
             }
         }
     }
@@ -198,15 +221,7 @@ pub async fn upload(
         size: body.len() as u64,
         text_path,
     };
-    audit::record_agent_action(
-        &state.db,
-        user.id,
-        agent.id,
-        "file.uploaded",
-        serde_json::json!({"path": attachment.path, "size": attachment.size, "media_type": attachment.media_type}),
-    )
-    .await;
-    Ok(Json(attachment))
+    Ok(attachment)
 }
 
 struct Stored {
