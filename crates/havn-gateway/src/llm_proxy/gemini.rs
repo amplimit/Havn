@@ -163,7 +163,7 @@ impl LlmProvider for GeminiProvider {
             }
         }
         // A blocked prompt ends with its feedback and no candidate.
-        if reply.finish.is_none() && reply.last.get("promptFeedback").is_none() {
+        if reply.finish.is_none() && reply.last.pointer("/promptFeedback/blockReason").is_none() {
             return Err(cut_short());
         }
         gemini_to_anthropic(&reply.whole(), &request.model)

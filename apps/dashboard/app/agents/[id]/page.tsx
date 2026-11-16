@@ -489,7 +489,7 @@ export default function ChatPage({
         onError: () => {
           setWaiting(0);
           setStep(null);
-          endLive();
+          clearLive();
           setWsState("error");
         },
         onClose: () => {
@@ -499,7 +499,7 @@ export default function ChatPage({
           // A reply still due arrives through the reload on reconnect.
           setWaiting(0);
           setStep(null);
-          endLive();
+          clearLive();
           reconnectTimer = setTimeout(() => {
             if (!cancelled && !chatRef.current) connect();
           }, RECONNECT_MS);
@@ -521,20 +521,35 @@ export default function ChatPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, me?.ws_token]);
 
-  // Auto-scroll to bottom on new bubbles, when the typing indicator
-  // appears, and as the reply being written grows.
-  const liveLength = live.reduce((n, p) => n + p.text.length, 0);
+  // Auto-scroll to bottom on new bubbles or when the typing
+  // indicator appears.
   useEffect(() => {
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     scrollRef.current?.scrollTo({
       top: scrollRef.current.scrollHeight,
       behavior: reduce ? "auto" : "smooth",
     });
-  }, [bubbles.length, pending, liveLength]);
+  }, [bubbles.length, pending]);
+
+  // As the reply being written grows, follow it, unless the user scrolled
+  // up to read.
+  const atBottom = useRef(true);
+  const liveLength = live.reduce((n, p) => n + p.text.length, 0);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el && liveLength > 0 && atBottom.current) el.scrollTo({ top: el.scrollHeight });
+  }, [liveLength]);
 
   // A file card, once per file.
   function addFile(url: string, name: string, caption: string | undefined, ts: number) {
     setBubbles((prev) => withFiles(prev, [{ url, name, caption, ts }], () => bubbleIdRef.current++));
+  }
+
+  // Hide the text being written; a call still running shows it again
+  // with its next whole text.
+  function clearLive() {
+    liveCalls.current.clear();
+    setLive([]);
   }
 
   // Stop showing the text being written: the reply replaces it.
@@ -567,6 +582,8 @@ export default function ChatPage({
       .join("\n");
     pushBubble("you", shown);
     chatRef.current.send(text, chatIdRef.current ?? undefined, undefined, files);
+    // Text left from a stopped reply goes before a new one starts.
+    if (waiting === 0) clearLive();
     setWaiting((n) => n + 1);
   }
 
@@ -611,6 +628,8 @@ export default function ChatPage({
     setBubbles((prev) => [...prev.slice(0, idx), ...prev.slice(idx).filter((b) => b.memory)]);
     pushBubble("you", text);
     chatRef.current.send(text, chatIdRef.current ?? undefined, turn);
+    // Text left from a stopped reply goes before a new one starts.
+    if (waiting === 0) clearLive();
     setWaiting((n) => n + 1);
   }
 
@@ -620,6 +639,8 @@ export default function ChatPage({
     // Memory notes stay: what the replies changed is still in memory.
     setBubbles((prev) => [...prev.slice(0, idx), ...prev.slice(idx).filter((b) => b.memory)]);
     chatRef.current.regenerate(chatIdRef.current ?? undefined, turn);
+    // Text left from a stopped reply goes before a new one starts.
+    if (waiting === 0) clearLive();
     setWaiting((n) => n + 1);
   }
 
@@ -656,7 +677,7 @@ export default function ChatPage({
     selectChat(target);
     setBubbles([]);
     setStep(null);
-    endLive();
+    clearLive();
     setWaiting((n) => {
       if (previous) waitingElsewhere.current.set(previous, n);
       return waitingElsewhere.current.get(target) ?? 0;
@@ -823,6 +844,10 @@ export default function ChatPage({
         {/* Conversation */}
         <div
           ref={scrollRef}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+          }}
           className="flex-1 overflow-y-auto px-4 py-6 sm:px-8"
           style={{ backgroundColor: "var(--color-surface-muted)" }}
         >
