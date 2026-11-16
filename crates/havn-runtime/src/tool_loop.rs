@@ -388,12 +388,25 @@ async fn call_llm(
         options["tools"] = handle.registry.schemas_for(context);
     }
 
+    // A turn answering someone shows its text as the model writes it.
+    let reply = (context == crate::tools::context::WEBCHAT)
+        .then(|| {
+            crate::tools::gateway::CONVERSATION
+                .try_with(Clone::clone)
+                .ok()
+        })
+        .flatten()
+        .map(|channel_id| havn_proto::ReplyStream {
+            channel_id,
+            conversation: crate::tools::gateway::CHAT.try_with(Clone::clone).ok(),
+        });
     let build = |messages: &[Value]| LlmRequest {
         request_id: request_id.clone(),
         model: handle.model.as_str().into(),
         messages: Value::Array(messages.to_vec()),
         options: options.clone(),
         billing_user_id: handle.billing_user_id.clone(),
+        reply: reply.clone(),
     };
     let mut llm_req = build(messages);
     // The frame adds its `"type"` tag to the request's own JSON.
@@ -421,7 +434,32 @@ async fn call_llm(
         llm_req = build(messages);
     }
 
-    request_llm(&handle.writer_tx, &handle.pending, llm_req).await
+    // A stopped turn drops this future: the gateway is told, and stops
+    // showing the call's text.
+    let mut cancel = CancelOnDrop {
+        writer_tx: &handle.writer_tx,
+        request_id: llm_req.reply.is_some().then(|| request_id.clone()),
+    };
+    let response = request_llm(&handle.writer_tx, &handle.pending, llm_req).await;
+    cancel.request_id = None;
+    response
+}
+
+/// Sends [`AgentToGateway::LlmCancel`] for its call when dropped before
+/// the call's answer came.
+struct CancelOnDrop<'a> {
+    writer_tx: &'a mpsc::Sender<AgentToGateway>,
+    request_id: Option<String>,
+}
+
+impl Drop for CancelOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(request_id) = self.request_id.take() {
+            let _ = self
+                .writer_tx
+                .try_send(AgentToGateway::LlmCancel { request_id });
+        }
+    }
 }
 
 /// Replace tool results in `messages`, oldest first, with a short note until
@@ -691,6 +729,7 @@ mod tests {
             messages: serde_json::json!([{ "role": "user", "content": "hi" }]),
             options: serde_json::json!({}),
             billing_user_id: None,
+            reply: None,
         }
     }
 

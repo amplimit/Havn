@@ -90,6 +90,153 @@ pub trait LlmProvider: Send + Sync {
         api_key: &str,
         request: &AnthropicRequest,
     ) -> Result<AnthropicResponse, ProviderError>;
+
+    /// Like [`Self::complete`], with the reply's text passed to `text` as
+    /// it arrives (issue #162). A provider that cannot stream passes it
+    /// whole once the call is done.
+    async fn stream(
+        &self,
+        http: &reqwest::Client,
+        base_url: &str,
+        api_key: &str,
+        request: &AnthropicRequest,
+        text: &TextSink,
+    ) -> Result<AnthropicResponse, ProviderError> {
+        let response = self.complete(http, base_url, api_key, request).await?;
+        pass_text(&response, text);
+        Ok(response)
+    }
+}
+
+/// Pass the text of a whole `response` to `text` at once.
+pub fn pass_text(response: &AnthropicResponse, text: &TextSink) {
+    for block in response.content.as_array().into_iter().flatten() {
+        if block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+            && let Some(t) = block.get("text").and_then(serde_json::Value::as_str)
+        {
+            text(TextEvent::Text(t));
+        }
+    }
+}
+
+/// Whether `response` is an event stream; a server that does not stream
+/// answers a streaming request with the whole response instead.
+#[must_use]
+pub fn is_event_stream(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("text/event-stream")
+        })
+}
+
+/// What a streamed call passes on while it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextEvent<'a> {
+    /// The next piece of the reply's text.
+    Text(&'a str),
+    /// The call starts over on another credential: what it passed so far
+    /// is not the reply.
+    Restart,
+}
+
+/// Where a streamed call's text goes.
+pub type TextSink = dyn Fn(TextEvent<'_>) + Send + Sync;
+
+/// The error an unsuccessful HTTP status stands for.
+#[must_use]
+pub fn status_error(status: u16, body: String) -> ProviderError {
+    match status {
+        401 => ProviderError::Unauthorized { body },
+        402 | 429 => ProviderError::QuotaOrRateLimit { status, body },
+        500..=599 => ProviderError::Upstream { status, body },
+        other => ProviderError::BadRequest {
+            status: other,
+            body,
+        },
+    }
+}
+
+/// A stream that stopped before the provider said the reply was done:
+/// a connection cut, retried on the next credential.
+#[must_use]
+pub fn cut_short() -> ProviderError {
+    ProviderError::Transport("the response stream ended before the reply did".into())
+}
+
+/// Bytes a streamed response may hold, all told.
+const MAX_STREAM_BYTES: usize = 32 * 1024 * 1024;
+
+/// The events of a server-sent event stream: each one's `data` lines,
+/// joined. Comments and other fields are skipped.
+pub struct Sse {
+    response: reqwest::Response,
+    buffer: Vec<u8>,
+    read: usize,
+    done: bool,
+}
+
+impl Sse {
+    #[must_use]
+    pub fn new(response: reqwest::Response) -> Self {
+        Self {
+            response,
+            buffer: Vec::new(),
+            read: 0,
+            done: false,
+        }
+    }
+
+    /// The next event's data, `None` at the end of the stream.
+    pub async fn next(&mut self) -> Result<Option<String>, ProviderError> {
+        loop {
+            if let Some(end) = self.buffer.windows(2).position(|w| w == b"\n\n") {
+                let event: Vec<u8> = self.buffer.drain(..end + 2).collect();
+                if let Some(data) = event_data(&event) {
+                    return Ok(Some(data));
+                }
+                continue;
+            }
+            if self.done {
+                let rest = std::mem::take(&mut self.buffer);
+                return Ok(event_data(&rest));
+            }
+            match self
+                .response
+                .chunk()
+                .await
+                .map_err(|e| ProviderError::Transport(e.to_string()))?
+            {
+                Some(bytes) => {
+                    self.read += bytes.len();
+                    if self.read > MAX_STREAM_BYTES {
+                        return Err(ProviderError::Translation(format!(
+                            "the streamed response is larger than {} MB",
+                            MAX_STREAM_BYTES / (1024 * 1024)
+                        )));
+                    }
+                    // Lines may end in CRLF; JSON data never holds a raw CR.
+                    self.buffer.extend(bytes.iter().filter(|b| **b != b'\r'));
+                }
+                None => self.done = true,
+            }
+        }
+    }
+}
+
+/// The `data` of one event, `None` when it has none.
+fn event_data(event: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(event);
+    let lines: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|data| data.strip_prefix(' ').unwrap_or(data))
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// Maximum output tokens of known models, keyed by model-name prefix in

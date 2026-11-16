@@ -25,7 +25,10 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::provider::{LlmProvider, ProviderError};
+use super::provider::{
+    LlmProvider, ProviderError, Sse, TextEvent, TextSink, cut_short, is_event_stream, pass_text,
+    status_error,
+};
 use super::{AnthropicMessage, AnthropicRequest, AnthropicResponse, AnthropicUsage};
 
 const OPENAI_URL: &str = "https://api.openai.com/v1";
@@ -105,21 +108,7 @@ impl LlmProvider for OpenAiProvider {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                401 => ProviderError::Unauthorized { body: body_text },
-                402 | 429 => ProviderError::QuotaOrRateLimit {
-                    status: status.as_u16(),
-                    body: body_text,
-                },
-                500..=599 => ProviderError::Upstream {
-                    status: status.as_u16(),
-                    body: body_text,
-                },
-                other => ProviderError::BadRequest {
-                    status: other,
-                    body: body_text,
-                },
-            });
+            return Err(status_error(status.as_u16(), body_text));
         }
 
         let raw: Value = resp
@@ -127,6 +116,73 @@ impl LlmProvider for OpenAiProvider {
             .await
             .map_err(|e| ProviderError::Translation(format!("response decode: {e}")))?;
         openai_to_anthropic(&raw)
+            .map_err(|e| ProviderError::Translation(format!("response translate: {e}")))
+    }
+
+    async fn stream(
+        &self,
+        http: &reqwest::Client,
+        base_url: &str,
+        api_key: &str,
+        request: &AnthropicRequest,
+        text: &TextSink,
+    ) -> Result<AnthropicResponse, ProviderError> {
+        let mut body = anthropic_to_openai(request, self.max_tokens_field)
+            .map_err(|e| ProviderError::Translation(format!("request build: {e}")))?;
+        body["stream"] = Value::Bool(true);
+        body["stream_options"] = json!({ "include_usage": true });
+
+        let mut builder = http
+            .post(format!("{base_url}/chat/completions"))
+            .bearer_auth(api_key)
+            .json(&body);
+        for (k, v) in self.extra_headers {
+            builder = builder.header(*k, *v);
+        }
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(status_error(status.as_u16(), body_text));
+        }
+        if !is_event_stream(&resp) {
+            let raw: Value = resp
+                .json()
+                .await
+                .map_err(|e| ProviderError::Translation(format!("response decode: {e}")))?;
+            let response = openai_to_anthropic(&raw)
+                .map_err(|e| ProviderError::Translation(format!("response translate: {e}")))?;
+            pass_text(&response, text);
+            return Ok(response);
+        }
+
+        let mut events = Sse::new(resp);
+        let mut reply = StreamedReply::default();
+        let mut done = false;
+        while let Some(data) = events.next().await? {
+            if data.trim() == "[DONE]" {
+                done = true;
+                break;
+            }
+            let chunk: Value = serde_json::from_str(&data)
+                .map_err(|e| ProviderError::Translation(format!("stream chunk decode: {e}")))?;
+            if let Some(error) = chunk.get("error") {
+                return Err(ProviderError::Upstream {
+                    status: 502,
+                    body: error.to_string(),
+                });
+            }
+            if let Some(piece) = reply.add(&chunk) {
+                text(TextEvent::Text(&piece));
+            }
+        }
+        if !done && reply.finish_reason.is_none() {
+            return Err(cut_short());
+        }
+        openai_to_anthropic(&reply.whole())
             .map_err(|e| ProviderError::Translation(format!("response translate: {e}")))
     }
 }
@@ -321,6 +377,113 @@ fn translate_tools_to_openai(tools: &Value) -> Result<Value, String> {
 
 /// Translate a successful OpenAI Chat Completions response back to the
 /// canonical Anthropic shape the runtime expects.
+/// A streamed chat completion, put back together.
+#[derive(Default)]
+struct StreamedReply {
+    id: Option<String>,
+    model: Option<String>,
+    text: String,
+    /// Tool calls by their index: id, name, arguments.
+    tool_calls: std::collections::BTreeMap<u64, (String, String, String)>,
+    finish_reason: Option<String>,
+    usage: Option<Value>,
+}
+
+impl StreamedReply {
+    /// Add one chunk; the text it adds, if any.
+    fn add(&mut self, chunk: &Value) -> Option<String> {
+        let field = |key: &str| chunk.get(key).and_then(Value::as_str).map(str::to_string);
+        self.id = self.id.take().or_else(|| field("id"));
+        self.model = self.model.take().or_else(|| field("model"));
+        if let Some(usage) = chunk.get("usage").filter(|u| u.is_object()) {
+            self.usage = Some(usage.clone());
+        }
+        let choice = chunk.get("choices")?.as_array()?.first()?;
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            self.finish_reason = Some(reason.to_string());
+        }
+        let delta = choice.get("delta")?;
+        for call in delta
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty());
+            // Without an index, a new id starts a call; the rest continue
+            // the last one.
+            let index = call
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| match self.tool_calls.iter().next_back() {
+                    Some((last, (last_id, _, _))) => match id {
+                        Some(id) if !last_id.is_empty() && last_id != id => last + 1,
+                        _ => *last,
+                    },
+                    None => 0,
+                });
+            let entry = self.tool_calls.entry(index).or_default();
+            if let Some(id) = id {
+                entry.0 = id.to_string();
+            }
+            // Some servers repeat the name in every fragment.
+            if let Some(name) = call.pointer("/function/name").and_then(Value::as_str)
+                && entry.1.is_empty()
+            {
+                entry.1 = name.to_string();
+            }
+            if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str) {
+                entry.2.push_str(arguments);
+            }
+        }
+        let piece = delta.get("content").and_then(Value::as_str)?;
+        if piece.is_empty() {
+            return None;
+        }
+        self.text.push_str(piece);
+        Some(piece.to_string())
+    }
+
+    /// The whole response, as the API answers a call that does not stream.
+    fn whole(&self) -> Value {
+        let tool_calls: Vec<Value> = self
+            .tool_calls
+            .iter()
+            .map(|(index, (id, name, arguments))| {
+                let id = if id.is_empty() {
+                    format!("call_{index}")
+                } else {
+                    id.clone()
+                };
+                json!({
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments },
+                })
+            })
+            .collect();
+        let mut message = json!({
+            "role": "assistant",
+            "content": if self.text.is_empty() { Value::Null } else { Value::String(self.text.clone()) },
+        });
+        if !tool_calls.is_empty() {
+            message["tool_calls"] = Value::Array(tool_calls);
+        }
+        let mut whole = json!({
+            "id": self.id.clone().unwrap_or_default(),
+            "model": self.model.clone().unwrap_or_default(),
+            "choices": [{ "message": message, "finish_reason": self.finish_reason }],
+        });
+        if let Some(usage) = &self.usage {
+            whole["usage"] = usage.clone();
+        }
+        whole
+    }
+}
+
 fn openai_to_anthropic(raw: &Value) -> Result<AnthropicResponse, String> {
     let id = raw
         .get("id")
@@ -410,6 +573,71 @@ fn openai_to_anthropic(raw: &Value) -> Result<AnthropicResponse, String> {
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
+
+    #[tokio::test]
+    async fn a_streamed_call_passes_its_text_on_and_returns_the_whole_reply() {
+        // CRLF line ends, a comment, an event split across chunks.
+        let body = concat!(
+            ": OPENROUTER PROCESSING\r\n\r\n",
+            "data: {\"id\":\"g\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move |axum::Json(sent): axum::Json<Value>| async move {
+                assert_eq!(sent["stream"], true);
+                assert_eq!(sent["stream_options"]["include_usage"], true);
+                let pieces: Vec<Result<String, std::convert::Infallible>> = body
+                    .as_bytes()
+                    .chunks(7)
+                    .map(|c| Ok(String::from_utf8_lossy(c).into_owned()))
+                    .collect();
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    axum::body::Body::from_stream(futures_util::stream::iter(pieces)),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let pieces = std::sync::Arc::clone(&seen);
+        let sink = move |event: TextEvent<'_>| {
+            if let TextEvent::Text(t) = event {
+                pieces.lock().unwrap().push(t.to_string());
+            }
+        };
+        let response = OpenAiProvider::OPENROUTER
+            .stream(
+                &crate::llm_proxy::http_client().expect("client"),
+                &base,
+                "sk-local",
+                &req(
+                    vec![AnthropicMessage {
+                        role: "user".into(),
+                        content: json!("hi"),
+                    }],
+                    None,
+                ),
+                &sink,
+            )
+            .await
+            .expect("a streamed reply");
+        server.abort();
+        assert_eq!(seen.lock().unwrap().concat(), "Hello");
+        assert_eq!(response.content[0]["text"], "Hello");
+        assert_eq!(response.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(
+            (response.usage.input_tokens, response.usage.output_tokens),
+            (3, 2)
+        );
+    }
 
     fn req(messages: Vec<AnthropicMessage>, system: Option<&str>) -> AnthropicRequest {
         AnthropicRequest {
@@ -591,6 +819,87 @@ mod tests {
         let openrouter =
             anthropic_to_openai(&r, OpenAiProvider::OPENROUTER.max_tokens_field).expect("body");
         assert_eq!(openrouter["max_tokens"], 256);
+    }
+
+    #[tokio::test]
+    async fn a_stream_cut_short_is_not_a_reply() {
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Half a\"}}]}\n\n",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let err = OpenAiProvider::OPENROUTER
+            .stream(
+                &crate::llm_proxy::http_client().expect("client"),
+                &base,
+                "sk-local",
+                &req(
+                    vec![AnthropicMessage {
+                        role: "user".into(),
+                        content: json!("hi"),
+                    }],
+                    None,
+                ),
+                &|_: TextEvent<'_>| {},
+            )
+            .await
+            .expect_err("no end, no reply");
+        server.abort();
+        assert!(matches!(err, ProviderError::Transport(_)), "{err}");
+    }
+
+    #[test]
+    fn tool_calls_without_an_index_or_with_repeated_names_stay_apart() {
+        let chunks = [
+            json!({"choices": [{"delta": {"tool_calls": [{"id": "a", "function": {"name": "shell", "arguments": "{\"command\":"}}]}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [{"function": {"name": "shell", "arguments": "\"ls\"}"}}]}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [{"id": "b", "function": {"name": "file_read", "arguments": "{\"path\":\"x\"}"}}]}, "finish_reason": "tool_calls"}]}),
+        ];
+        let mut reply = StreamedReply::default();
+        for c in &chunks {
+            reply.add(c);
+        }
+        let response = openai_to_anthropic(&reply.whole()).expect("translate");
+        assert_eq!(response.content[0]["name"], "shell");
+        assert_eq!(response.content[0]["input"]["command"], "ls");
+        assert_eq!(response.content[1]["name"], "file_read");
+        assert_eq!(response.content[1]["input"]["path"], "x");
+    }
+
+    #[test]
+    fn a_streamed_reply_is_put_back_together() {
+        let chunks = [
+            json!({"id": "gen-1", "model": "deepseek/x", "choices": [{"delta": {"role": "assistant", "content": ""}}]}),
+            json!({"choices": [{"delta": {"content": "Let me "}}]}),
+            json!({"choices": [{"delta": {"content": "check."}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_a", "function": {"name": "web_search", "arguments": "{\"query\":"}}]}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "\"rust\"}"}}]}}]}),
+            json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 12, "completion_tokens": 7}}),
+        ];
+        let mut reply = StreamedReply::default();
+        let pieces: Vec<String> = chunks.iter().filter_map(|c| reply.add(c)).collect();
+        assert_eq!(pieces, ["Let me ", "check."]);
+        let response = openai_to_anthropic(&reply.whole()).expect("translate");
+        assert_eq!(response.id, "gen-1");
+        assert_eq!(response.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(response.content[0]["text"], "Let me check.");
+        assert_eq!(response.content[1]["name"], "web_search");
+        assert_eq!(response.content[1]["input"]["query"], "rust");
+        assert_eq!(
+            (response.usage.input_tokens, response.usage.output_tokens),
+            (12, 7)
+        );
+        assert!(!response.usage.unreported);
     }
 
     #[test]

@@ -20,7 +20,10 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::provider::{LlmProvider, ProviderError};
+use super::provider::{
+    LlmProvider, ProviderError, Sse, TextEvent, TextSink, cut_short, is_event_stream, pass_text,
+    status_error,
+};
 use super::{AnthropicMessage, AnthropicRequest, AnthropicResponse, AnthropicUsage};
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -96,6 +99,74 @@ impl LlmProvider for GeminiProvider {
             .await
             .map_err(|e| ProviderError::Translation(format!("response decode: {e}")))?;
         gemini_to_anthropic(&raw, &request.model)
+            .map_err(|e| ProviderError::Translation(format!("response translate: {e}")))
+    }
+
+    async fn stream(
+        &self,
+        http: &reqwest::Client,
+        base_url: &str,
+        api_key: &str,
+        request: &AnthropicRequest,
+        text: &TextSink,
+    ) -> Result<AnthropicResponse, ProviderError> {
+        if !is_plain_model_name(&request.model) {
+            return Err(ProviderError::BadRequest {
+                status: 400,
+                body: format!("invalid Gemini model name {:?}", request.model),
+            });
+        }
+        let body = anthropic_to_gemini(request)
+            .map_err(|e| ProviderError::Translation(format!("request build: {e}")))?;
+        let url = format!(
+            "{base_url}/models/{}:streamGenerateContent?alt=sse",
+            request.model
+        );
+        let resp = http
+            .post(url)
+            .header("x-goog-api-key", api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(match status.as_u16() {
+                403 => ProviderError::Unauthorized { body: body_text },
+                code => status_error(code, body_text),
+            });
+        }
+        if !is_event_stream(&resp) {
+            let raw: Value = resp
+                .json()
+                .await
+                .map_err(|e| ProviderError::Translation(format!("response decode: {e}")))?;
+            let response = gemini_to_anthropic(&raw, &request.model)
+                .map_err(|e| ProviderError::Translation(format!("response translate: {e}")))?;
+            pass_text(&response, text);
+            return Ok(response);
+        }
+        let mut events = Sse::new(resp);
+        let mut reply = StreamedReply::default();
+        while let Some(data) = events.next().await? {
+            let chunk: Value = serde_json::from_str(&data)
+                .map_err(|e| ProviderError::Translation(format!("stream chunk decode: {e}")))?;
+            if let Some(error) = chunk.get("error") {
+                return Err(ProviderError::Upstream {
+                    status: 502,
+                    body: error.to_string(),
+                });
+            }
+            for piece in reply.add(&chunk) {
+                text(TextEvent::Text(&piece));
+            }
+        }
+        // A blocked prompt ends with its feedback and no candidate.
+        if reply.finish.is_none() && reply.last.pointer("/promptFeedback/blockReason").is_none() {
+            return Err(cut_short());
+        }
+        gemini_to_anthropic(&reply.whole(), &request.model)
             .map_err(|e| ProviderError::Translation(format!("response translate: {e}")))
     }
 }
@@ -288,6 +359,80 @@ fn sanitize_schema_for_gemini(v: &mut Value) {
     }
 }
 
+/// A streamed `generateContent` response, put back together: the parts of
+/// every chunk, a text part added to the text part before it.
+#[derive(Default)]
+struct StreamedReply {
+    parts: Vec<Value>,
+    finish: Option<Value>,
+    last: Value,
+}
+
+impl StreamedReply {
+    /// Add one chunk; the pieces of reply text it adds (not thoughts).
+    fn add(&mut self, chunk: &Value) -> Vec<String> {
+        let mut pieces = Vec::new();
+        let parts = chunk
+            .pointer("/candidates/0/content/parts")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for part in parts {
+            let thought = part
+                .get("thought")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if let Some(piece) = part.get("text").and_then(Value::as_str) {
+                if !thought && !piece.is_empty() {
+                    pieces.push(piece.to_string());
+                }
+                let joins = self.parts.last().is_some_and(|last| {
+                    last.get("text").is_some()
+                        && last
+                            .get("thought")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                            == thought
+                });
+                if joins && let Some(last) = self.parts.last_mut() {
+                    let whole = format!("{}{piece}", last["text"].as_str().unwrap_or(""));
+                    last["text"] = Value::String(whole);
+                    if let Some(signature) = part.get("thoughtSignature") {
+                        last["thoughtSignature"] = signature.clone();
+                    }
+                    continue;
+                }
+            }
+            self.parts.push(part);
+        }
+        if let Some(finish) = chunk.pointer("/candidates/0/finishReason") {
+            self.finish = Some(finish.clone());
+        }
+        self.last = chunk.clone();
+        pieces
+    }
+
+    /// The whole response, as the API answers a call that does not stream:
+    /// the last chunk's finish reason, usage and feedback, with every part.
+    fn whole(&self) -> Value {
+        // Nothing came but the last chunk (a blocked prompt's feedback):
+        // it is the response.
+        if self.parts.is_empty() && self.finish.is_none() {
+            return self.last.clone();
+        }
+        let mut whole = self.last.clone();
+        if !whole.is_object() {
+            whole = json!({});
+        }
+        let mut candidate = json!({ "content": { "role": "model", "parts": self.parts } });
+        if let Some(finish) = &self.finish {
+            candidate["finishReason"] = finish.clone();
+        }
+        whole["candidates"] = json!([candidate]);
+        whole
+    }
+}
+
 fn gemini_to_anthropic(raw: &Value, model: &str) -> Result<AnthropicResponse, String> {
     let candidate = raw
         .get("candidates")
@@ -380,6 +525,29 @@ fn gemini_to_anthropic(raw: &Value, model: &str) -> Result<AnthropicResponse, St
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn a_streamed_reply_is_put_back_together() {
+        let chunks = [
+            json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "plan", "thought": true}]}}]}),
+            json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "Hel"}]}}]}),
+            json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "lo", "thoughtSignature": "sig"}]}}]}),
+            json!({"candidates": [{"content": {"role": "model", "parts": [{"functionCall": {"name": "shell", "args": {"command": "ls"}}}]}, "finishReason": "STOP"}]}),
+            json!({"usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 4}}),
+        ];
+        let mut reply = StreamedReply::default();
+        let pieces: Vec<String> = chunks.iter().flat_map(|c| reply.add(c)).collect();
+        assert_eq!(pieces, ["Hel", "lo"]);
+        let whole = reply.whole();
+        assert_eq!(whole["candidates"][0]["finishReason"], "STOP");
+        let parts = whole["candidates"][0]["content"]["parts"]
+            .as_array()
+            .expect("parts");
+        assert_eq!(parts.len(), 3, "{parts:?}");
+        assert_eq!(parts[1]["text"], "Hello");
+        assert_eq!(parts[1]["thoughtSignature"], "sig");
+        assert_eq!(whole["usageMetadata"]["promptTokenCount"], 9);
+    }
 
     #[test]
     fn model_names_cannot_change_the_url() {

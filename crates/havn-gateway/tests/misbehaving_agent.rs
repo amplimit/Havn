@@ -519,6 +519,7 @@ fn llm_request(request_id: &str) -> AgentToGateway {
         messages: json!([{ "role": "user", "content": "hi" }]),
         options: json!({}),
         billing_user_id: None,
+        reply: None,
     })
 }
 
@@ -833,6 +834,7 @@ async fn oversized_frames_close_the_connection() {
         messages: json!([{ "role": "user", "content": "x".repeat(too_large) }]),
         options: json!({}),
         billing_user_id: None,
+        reply: None,
     }))
     .expect("encode");
     frame.push(b'\n');
