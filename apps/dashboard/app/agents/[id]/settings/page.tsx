@@ -531,11 +531,6 @@ function BootstrapFileEditor({
   );
 }
 
-/**
- * Tools whose every call waits for your approval in the chat (or /approve
- * in a channel). A name ending in * covers a prefix, such as all tools of
- * one MCP server. Applies on the agent's next start.
- */
 /** Whether a model titles the agent's new chats. */
 function TitlesEditor({ agentId }: { agentId: string }) {
   const [view, setView] = useState<TitlesView | null>(null);
@@ -602,6 +597,11 @@ function TitlesEditor({ agentId }: { agentId: string }) {
   );
 }
 
+/**
+ * Tools whose every call waits for your approval in the chat (or /approve
+ * in a channel). A name ending in * covers a prefix, such as all tools of
+ * one MCP server. Applies on the agent's next start.
+ */
 function ApprovalsEditor({ agentId }: { agentId: string }) {
   const [view, setView] = useState<ApprovalsView | null>(null);
   const [text, setText] = useState("");

@@ -706,11 +706,13 @@ impl Policy {
             hooks: self.hooks.union(&other.hooks),
             chat_titles: ChatTitles {
                 enabled: self.chat_titles.enabled || other.chat_titles.enabled,
-                model: if self.chat_titles.model.is_empty() {
-                    other.chat_titles.model.clone()
-                } else {
-                    self.chat_titles.model.clone()
-                },
+                // The model of a role that has them on comes first.
+                model: [&self.chat_titles, &other.chat_titles]
+                    .into_iter()
+                    .filter(|t| !t.model.is_empty())
+                    .max_by_key(|t| t.enabled)
+                    .map(|t| t.model.clone())
+                    .unwrap_or_default(),
             },
         }
     }
@@ -852,10 +854,15 @@ mod tests {
         let open = agent.clamp_to(&Policy::default());
         assert!(open.chat_titles.enabled);
         assert_eq!(open.chat_titles.model, "openai:big");
-        // Across roles, on wins.
+        // Across roles, on wins, and so does the model of a role with them
+        // on.
         let widened = team.widen_with(&Policy::default());
         assert!(widened.chat_titles.enabled);
         assert_eq!(widened.chat_titles.model, "openai:small");
+        let mut on = Policy::default();
+        on.chat_titles.model = "openai:on".into();
+        assert_eq!(team.widen_with(&on).chat_titles.model, "openai:on");
+        assert_eq!(on.widen_with(&team).chat_titles.model, "openai:on");
     }
 
     #[test]

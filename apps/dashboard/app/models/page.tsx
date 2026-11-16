@@ -153,7 +153,8 @@ export default function ModelsPage() {
             </select>
             <span>
               (<code className="font-mono">[llm] title_model</code>; a small, cheap model
-              does well. A team&apos;s policy can name another, or turn titles off.)
+              does well. Agents use it from their next start. A team&apos;s policy can
+              name another, or turn titles off.)
             </span>
           </label>
         )}

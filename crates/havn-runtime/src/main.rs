@@ -998,16 +998,7 @@ where
                 // The chat it continues, which its turn runs in. A message
                 // that branches off one needs the chat to exist.
                 // A message of files alone is titled after them.
-                let typed = render_content_for_llm(&msg.content).unwrap_or_default();
-                let text = if typed.trim().is_empty() && !msg.attachments.is_empty() {
-                    msg.attachments
-                        .iter()
-                        .map(|a| a.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                } else {
-                    typed
-                };
+                let text = first_text(&msg);
                 let chat = if msg.branch.is_some() {
                     conversations::existing_chat(
                         &ctx.pool,
@@ -1829,6 +1820,23 @@ const TITLE_PROMPT: &str = "You name chats. Reply with a title for the chat that
      language of the message, without quotes or a full stop. Reply with the title only.";
 /// Characters of the first message a title is written from.
 const TITLE_INPUT_CHARS: usize = 2000;
+/// Output tokens a title call may use.
+const TITLE_MAX_TOKENS: u32 = 1000;
+
+/// What a message gives a new chat to be named after: its text, or the
+/// names of its files when it has only them.
+fn first_text(msg: &InboundMessage) -> String {
+    let typed = render_content_for_llm(&msg.content).unwrap_or_default();
+    if typed.trim().is_empty() && !msg.attachments.is_empty() {
+        msg.attachments
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        typed
+    }
+}
 
 /// Have a model title chat `chat` of `channel_id` from its first message
 /// `text`, unless the user retitled it from `provisional` meanwhile; tell
@@ -1840,23 +1848,43 @@ async fn title_chat(
     provisional: &str,
     text: &str,
 ) -> anyhow::Result<()> {
-    let model = Some(ctx.tool_env.policy.chat_titles.model.clone())
-        .filter(|m| !m.is_empty())
-        .map_or_else(|| ctx.model(), Arc::new);
     let message: String = text.chars().take(TITLE_INPUT_CHARS).collect();
-    let request = havn_proto::LlmRequest {
-        request_id: uuid::Uuid::now_v7().to_string(),
-        model: model.as_str().into(),
-        messages: serde_json::json!([{ "role": "user", "content": message }]),
-        options: serde_json::json!({ "max_tokens": 200, "system": TITLE_PROMPT }),
-        billing_user_id: None,
-        reply: None,
-    };
-    let response = tool_loop::request_llm(&ctx.writer_tx, &ctx.pending, request).await?;
-    let text = match response.outcome {
-        havn_proto::LlmOutcome::Ok => curator::extract_text(&response.provider_response)
-            .ok_or_else(|| anyhow!("the title had no text"))?,
-        havn_proto::LlmOutcome::Error { message } => return Err(anyhow!("LLM error: {message}")),
+    // The title model, as the gateway resolved it when the agent started;
+    // when it fails (removed from the list since), the agent's own.
+    let named = Some(ctx.tool_env.policy.chat_titles.model.clone()).filter(|m| !m.is_empty());
+    let own = ctx.model();
+    let mut models = named.into_iter().map(Arc::new).collect::<Vec<_>>();
+    if models.first().is_none_or(|m| *m != own) {
+        models.push(own);
+    }
+    let mut failed = anyhow!("no model to title with");
+    let mut text = None;
+    for model in models {
+        let request = havn_proto::LlmRequest {
+            request_id: uuid::Uuid::now_v7().to_string(),
+            model: model.as_str().into(),
+            messages: serde_json::json!([{ "role": "user", "content": message }]),
+            // Room for a reasoning model's thinking before its answer.
+            options: serde_json::json!({ "max_tokens": TITLE_MAX_TOKENS, "system": TITLE_PROMPT }),
+            billing_user_id: None,
+            reply: None,
+        };
+        let response = tool_loop::request_llm(&ctx.writer_tx, &ctx.pending, request).await?;
+        match response.outcome {
+            havn_proto::LlmOutcome::Ok => {
+                if let Some(t) = curator::extract_text(&response.provider_response) {
+                    text = Some(t);
+                    break;
+                }
+                failed = anyhow!("the title had no text");
+            }
+            havn_proto::LlmOutcome::Error { message } => {
+                failed = anyhow!("LLM error from {model}: {message}");
+            }
+        }
+    }
+    let Some(text) = text else {
+        return Err(failed);
     };
     let Some(title) = clean_title(&text) else {
         return Err(anyhow!("the title was empty"));
@@ -2005,15 +2033,24 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         }
     };
 
-    // A new chat's first message: a model titles the chat meanwhile.
-    if msg.branch.is_none() && ctx.tool_env.policy.chat_titles.enabled {
+    // A new chat's first message: a model titles the chat meanwhile. Only
+    // while the chat still has the title its first message gave it: one
+    // the user chose, or a model wrote before an `/undo`, stays. A message
+    // of files alone keeps their names.
+    let provisional = conversations::title_from(&first_text(&msg));
+    let typed = render_content_for_llm(&msg.content).unwrap_or_default();
+    if msg.branch.is_none()
+        && ctx.tool_env.policy.chat_titles.enabled
+        && !typed.trim().is_empty()
+        && !provisional.is_empty()
+    {
         match conversations::chat_info(&ctx.pool, &chat).await {
-            Ok(Some(info)) if info.turns == 1 => {
+            Ok(Some(info)) if info.turns == 1 && info.title == provisional => {
                 let ctx = ctx.clone();
                 let (channel_id, chat, text) =
                     (msg.channel_id.clone(), chat.clone(), user_text.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = title_chat(&ctx, channel_id, chat, &info.title, &text).await {
+                    if let Err(e) = title_chat(&ctx, channel_id, chat, &provisional, &text).await {
                         warn!(error = %e, "could not title the chat; it keeps its first message's");
                     }
                 });

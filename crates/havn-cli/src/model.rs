@@ -29,23 +29,21 @@ pub struct ModelsView {
 
 // `version` is the one the list was read at: the gateway refuses the write
 // if the list changed since.
+// `title_model` is sent only when it changes (`Some`, with `None` to clear
+// it): a gateway from before title models refuses the field, and one since
+// keeps its own when the field is left out.
 async fn save(
     gw: &Gateway,
     version: &str,
     default_model: Option<&str>,
-    title_model: Option<&str>,
+    title_model: Option<Option<&str>>,
     models: &[ModelEntry],
 ) -> anyhow::Result<ModelsView> {
-    gw.put_json(
-        "/llm/models",
-        &json!({
-            "version": version,
-            "default_model": default_model,
-            "title_model": title_model,
-            "models": models,
-        }),
-    )
-    .await
+    let mut body = json!({ "version": version, "default_model": default_model, "models": models });
+    if let Some(title) = title_model {
+        body["title_model"] = json!(title);
+    }
+    gw.put_json("/llm/models", &body).await
 }
 
 pub async fn list() -> anyhow::Result<()> {
@@ -108,14 +106,7 @@ pub async fn add(
     } else {
         view.default_model.as_deref()
     };
-    let saved = save(
-        &gw,
-        &view.version,
-        default_model,
-        view.title_model.as_deref(),
-        &models,
-    )
-    .await?;
+    let saved = save(&gw, &view.version, default_model, None, &models).await?;
     println!(
         "added {id}; default model: {}",
         saved.effective_default.as_deref().unwrap_or("none")
@@ -133,7 +124,7 @@ pub async fn remove(id: &str) -> anyhow::Result<()> {
         anyhow::bail!("{id} is not listed");
     }
     let default_model = view.default_model.as_deref().filter(|d| *d != id);
-    let title_model = view.title_model.as_deref().filter(|t| *t != id);
+    let title_model = (view.title_model.as_deref() == Some(id)).then_some(None);
     let saved = save(&gw, &view.version, default_model, title_model, &models).await?;
     println!(
         "removed {id}; default model: {}",
@@ -148,14 +139,7 @@ pub async fn set_default(id: &str) -> anyhow::Result<()> {
     if !view.models.iter().any(|m| m.id == id) {
         anyhow::bail!("{id} is not listed; add it with `havn model add {id}`");
     }
-    save(
-        &gw,
-        &view.version,
-        Some(id),
-        view.title_model.as_deref(),
-        &view.models,
-    )
-    .await?;
+    save(&gw, &view.version, Some(id), None, &view.models).await?;
     println!("default model: {id}");
     Ok(())
 }
@@ -174,13 +158,17 @@ pub async fn set_title(id: Option<&str>) -> anyhow::Result<()> {
         &gw,
         &view.version,
         view.default_model.as_deref(),
-        id,
+        Some(id),
         &view.models,
     )
     .await?;
     match id {
-        Some(id) => println!("chat titles are written by {id}"),
-        None => println!("chat titles are written by each agent's own model"),
+        Some(id) => {
+            println!("chat titles are written by {id} (agents use it from their next start)")
+        }
+        None => println!(
+            "chat titles are written by each agent's own model (agents use it from their next start)"
+        ),
     }
     Ok(())
 }

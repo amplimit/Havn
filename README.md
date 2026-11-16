@@ -531,7 +531,7 @@ In the dashboard chat, a message can be edited and a reply regenerated. Either s
 
 ### Chat titles
 
-A model names each new chat from its first message, while the agent answers it (in a channel too); until then, and if that fails, the chat is named after the start of its first message, and a chat renamed by hand keeps its name. The model that writes titles is `[llm] title_model` in config.toml, set on the dashboard's models page or with `havn model title <provider:model>` (a small, cheap model does well); without one, each agent's own model writes them. A role's policy can name another (`"chat_titles": {"model": "..."}`) or turn titles off for its members' agents (`"chat_titles": {"enabled": false}`), and an agent's settings page turns them off for that agent. Changes apply on the agent's next start.
+A model names each new chat from its first message, while the agent answers it (in a channel too); until then, and if that fails, the chat is named after the start of its first message, and a chat renamed by hand keeps its name. The model that writes titles is `[llm] title_model` in config.toml, set on the dashboard's models page or with `havn model title <provider:model>` (a small, cheap model does well); without one, each agent's own model writes them. A role's policy can name another (`"chat_titles": {"model": "..."}`) or turn titles off (`"chat_titles": {"enabled": false}`; in multi-user mode an agent cannot turn them back on, and a user with several roles has them when any of the roles does), and an agent's settings page turns them off for that agent. A message of files alone keeps their names as its chat's title. Changes apply on the agent's next start; a title model removed meanwhile gives way to the agent's own model.
 
 ### Chat commands
 
