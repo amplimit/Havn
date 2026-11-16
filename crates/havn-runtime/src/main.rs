@@ -1939,6 +1939,9 @@ fn clean_title(text: &str) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
+/// Characters of a found turn the dashboard's search shows.
+const SEARCH_EXCERPT_CHARS: usize = 160;
+
 /// Characters of a taken-back message `/undo` quotes.
 const UNDO_EXCERPT_CHARS: usize = 60;
 
@@ -2720,6 +2723,38 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                     MAX_DATA_REPLY_BYTES,
                     false,
                 )?))
+            }
+            DataQuery::SearchChats {
+                channel_id,
+                query,
+                limit,
+            } => {
+                let limit = limit.min(MAX_DATA_ROWS);
+                let chats = conversations::chats_titled(&ctx.pool, &channel_id, &query, limit)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let terms: Vec<&str> = query.split_whitespace().collect();
+                let turns: Vec<serde_json::Value> = conversations::search_chats(
+                    &ctx.pool,
+                    &channel_id,
+                    &query,
+                    limit,
+                )
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "id": t.id,
+                        "chat": t.chat,
+                        "title": t.title,
+                        "role": t.role.as_str(),
+                        "excerpt": tools::memory::excerpt(&t.content, &terms, SEARCH_EXCERPT_CHARS),
+                        "created_at": t.created_at,
+                    })
+                })
+                .collect();
+                Ok(serde_json::json!({ "chats": chats, "turns": turns }))
             }
             DataQuery::RenameChat {
                 channel_id,

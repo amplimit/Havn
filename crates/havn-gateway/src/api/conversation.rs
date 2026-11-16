@@ -142,6 +142,46 @@ pub async fn list(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    pub q: String,
+}
+
+/// Longest search the dashboard may send, in characters.
+const MAX_SEARCH_CHARS: usize = 200;
+/// Chats and turns a search returns at most, each.
+const SEARCH_RESULTS: u32 = 30;
+
+/// `GET /agents/:id/search?q=`: the caller's chats with the agent whose
+/// titles or turns have every word of `q` (issue #175).
+pub async fn search(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path(id): Path<String>,
+    Query(q): Query<SearchQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let query = q.q.trim();
+    if query.is_empty() || query.chars().count() > MAX_SEARCH_CHARS {
+        return Err(ApiError::BadRequest(format!(
+            "q must be 1 to {MAX_SEARCH_CHARS} characters"
+        )));
+    }
+    let found: serde_json::Value = crate::api::agents::agent_data(
+        &state,
+        user.id,
+        agent.id,
+        havn_proto::DataQuery::SearchChats {
+            channel_id: session(&user, agent.id),
+            query: query.to_string(),
+            limit: SEARCH_RESULTS,
+        },
+        true,
+    )
+    .await?;
+    Ok(Json(found))
+}
+
 /// `GET /agents/:id/chats`: the caller's chats with the agent, most
 /// recently used first.
 pub async fn chats(

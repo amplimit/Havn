@@ -654,6 +654,51 @@ pub async fn around(
         .map(Some)
 }
 
+/// A chat whose title matched a search (issue #175), with the turn it
+/// starts with, to read from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TitledChat {
+    pub id: String,
+    pub title: String,
+    pub updated_at: String,
+    pub first_turn: Option<String>,
+}
+
+/// The chats of `scope` whose title contains every whitespace-separated
+/// term of `query` (case aside, for Latin letters), most recently used
+/// first, at most `limit`.
+pub async fn chats_titled(
+    pool: &SqlitePool,
+    scope: &str,
+    query: &str,
+    limit: u32,
+) -> Result<Vec<TitledChat>> {
+    let terms: Vec<&str> = query.split_whitespace().collect();
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut sql = String::from(
+        "SELECT c.id, c.title, c.updated_at, \
+                (SELECT t.id FROM conversations t WHERE t.channel_id = c.id \
+                   AND t.parent_id IS NULL AND t.role = 'user' \
+                 ORDER BY t.created_at, t.rowid LIMIT 1) AS first_turn \
+         FROM chats c WHERE c.scope = ?",
+    );
+    for _ in &terms {
+        sql.push_str(" AND c.title LIKE ? ESCAPE '\\'");
+    }
+    sql.push_str(" ORDER BY c.updated_at DESC, c.rowid DESC LIMIT ?");
+    let mut q = sqlx::query_as::<_, TitledChat>(&sql).bind(scope);
+    for term in &terms {
+        let escaped = term
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        q = q.bind(format!("%{escaped}%"));
+    }
+    Ok(q.bind(limit).fetch_all(pool).await?)
+}
+
 /// One conversation of a scope (issue #126); its turns are those whose
 /// `channel_id` is its id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
@@ -1589,6 +1634,63 @@ mod tests {
         assert!(mixed.is_empty(), "every term must match: {mixed:?}");
         let wild = search_chats(&pool, "me", "%", 10).await.expect("search");
         assert!(wild.is_empty(), "LIKE wildcards are literal: {wild:?}");
+    }
+
+    #[tokio::test]
+    async fn chats_are_found_by_their_titles_in_their_scope() {
+        let pool = connect_in_memory().await.expect("connect");
+        let budget = chat_for(&pool, "s", None, "q").await.expect("chat");
+        let first = record_in_chat(&pool, &budget, Role::User, "q")
+            .await
+            .expect("record")
+            .expect("chat");
+        record_in_chat(&pool, &budget, Role::Assistant, "a")
+            .await
+            .expect("record");
+        assert!(
+            rename_chat(&pool, "s", &budget, "March budget 三月预算")
+                .await
+                .expect("db")
+        );
+        leave_active(&pool, "s").await.expect("leave");
+        let other = chat_for(&pool, "s", None, "Trip to Kyoto")
+            .await
+            .expect("chat");
+        let theirs = chat_for(&pool, "t", None, "My budget").await.expect("chat");
+        let found = chats_titled(&pool, "s", "BUDGET", 10).await.expect("db");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, budget);
+        assert_eq!(found[0].first_turn.as_deref(), Some(first.as_str()));
+        let found = chats_titled(&pool, "s", "预算 march", 10)
+            .await
+            .expect("db");
+        assert_eq!(
+            found.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            [budget.as_str()]
+        );
+        let found = chats_titled(&pool, "s", "kyoto", 10).await.expect("db");
+        assert_eq!(
+            found.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            [other.as_str()]
+        );
+        assert_eq!(found[0].first_turn, None, "no message yet");
+        assert!(
+            chats_titled(&pool, "s", "%", 10)
+                .await
+                .expect("db")
+                .is_empty()
+        );
+        assert!(
+            chats_titled(&pool, "s", "  ", 10)
+                .await
+                .expect("db")
+                .is_empty()
+        );
+        let mine = chats_titled(&pool, "t", "budget", 10).await.expect("db");
+        assert_eq!(
+            mine.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            [theirs.as_str()]
+        );
     }
 
     #[tokio::test]

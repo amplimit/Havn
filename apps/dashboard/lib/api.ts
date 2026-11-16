@@ -178,6 +178,21 @@ export type ConversationResponse = {
 };
 
 /** One of the caller's chats with an agent. */
+/** What a search of the caller's chats found. */
+export type ChatSearch = {
+  /** Chats whose title has every word, with the turn each starts at. */
+  chats: { id: string; title: string; updated_at: string; first_turn: string | null }[];
+  /** Messages that have every word, with an excerpt around the first. */
+  turns: {
+    id: string;
+    chat: string;
+    title: string;
+    role: "user" | "assistant";
+    excerpt: string;
+    created_at: string;
+  }[];
+};
+
 export type ChatSummary = {
   id: string;
   title: string;
@@ -592,6 +607,9 @@ export const api = {
   chats: {
     /** The caller's chats with `agentId`, most recently used first. */
     list: (agentId: string) => request<ChatSummary[]>(`/agents/${agentId}/chats`),
+    /** Titles and messages of the caller's chats with `agentId` that have every word of `q`. */
+    search: (agentId: string, q: string) =>
+      request<ChatSearch>(`/agents/${agentId}/search?q=${encodeURIComponent(q)}`),
     rename: (agentId: string, chat: string, title: string) =>
       request<void>(`/agents/${agentId}/chats/${encodeURIComponent(chat)}`, {
         method: "PATCH",
