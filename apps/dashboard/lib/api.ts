@@ -19,6 +19,21 @@ export type ChatCommand = {
   admin: boolean;
 };
 
+/** What a search of the caller's chats found. */
+export type ChatSearch = {
+  /** Chats whose title has every word, with the turn each starts at. */
+  chats: { id: string; title: string; updated_at: string; first_turn: string | null }[];
+  /** Messages that have every word, with an excerpt around the first. */
+  turns: {
+    id: string;
+    chat: string;
+    title: string;
+    role: "user" | "assistant";
+    excerpt: string;
+    created_at: string;
+  }[];
+};
+
 export type AgentView = {
   id: string;
   name: string;
@@ -178,21 +193,6 @@ export type ConversationResponse = {
 };
 
 /** One of the caller's chats with an agent. */
-/** What a search of the caller's chats found. */
-export type ChatSearch = {
-  /** Chats whose title has every word, with the turn each starts at. */
-  chats: { id: string; title: string; updated_at: string; first_turn: string | null }[];
-  /** Messages that have every word, with an excerpt around the first. */
-  turns: {
-    id: string;
-    chat: string;
-    title: string;
-    role: "user" | "assistant";
-    excerpt: string;
-    created_at: string;
-  }[];
-};
-
 export type ChatSummary = {
   id: string;
   title: string;

@@ -112,6 +112,8 @@ function sizeBytes(size: string): number {
   return Math.round(Number(m[1]) * unit);
 }
 const HISTORY_LIMIT = 100;
+// How long after showing a found message new bubbles leave the view where it is.
+const JUMP_HOLD_MS = 2000;
 const RECONNECT_MS = 1500;
 
 function turnBubbles(turns: ConversationTurn[], nextId: () => number): Bubble[] {
@@ -240,9 +242,12 @@ export default function ChatPage({
   const chatIdRef = useRef<string | null>(null);
   // `/undo`s sent whose answer has not come: the chat reloads with it.
   const undoing = useRef(0);
-  // A found message to show once its chat is on screen, and the one shown.
-  const jumpTo = useRef<string | null>(null);
+  // A found message to show once its chat is on screen (`branched` once
+  // its chat was moved to the message's branch), and the one shown; when
+  // a jump scrolled, so the next updates do not scroll away from it.
+  const jumpTo = useRef<{ chat: string; turn: string; branched: boolean } | null>(null);
   const [found, setFound] = useState<string | null>(null);
+  const jumpedAt = useRef(0);
   const [chats, setChats] = useState<ChatSummary[]>([]);
   // For the socket's handler, which outlives a render.
   const chatsRef = useRef<ChatSummary[]>([]);
@@ -593,24 +598,47 @@ export default function ChatPage({
   }, [id, me?.ws_token]);
 
   // Auto-scroll to bottom on new bubbles or when the typing
-  // indicator appears; to a found message instead, once it is shown.
+  // indicator appears; not while a found message is to be shown, nor right
+  // after it was (the chat's file cards arrive just after its messages).
   useEffect(() => {
+    if (jumpTo.current || Date.now() - jumpedAt.current < JUMP_HOLD_MS) return;
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const target = jumpTo.current;
-    if (target) {
-      const el = scrollRef.current?.querySelector(`[data-turn="${CSS.escape(target)}"]`);
-      if (!el) return;
-      jumpTo.current = null;
-      el.scrollIntoView({ block: "center", behavior: reduce ? "auto" : "smooth" });
-      setFound(target);
-      setTimeout(() => setFound((f) => (f === target ? null : f)), 4000);
-      return;
-    }
     scrollRef.current?.scrollTo({
       top: scrollRef.current.scrollHeight,
       behavior: reduce ? "auto" : "smooth",
     });
-  }, [bubbles, pending]);
+  }, [bubbles.length, pending]);
+
+  // A found message, once its chat's messages are on screen: scrolled to
+  // and marked; on another branch, the chat moves to it first; older than
+  // what is loaded, the user is told.
+  useEffect(() => {
+    const jump = jumpTo.current;
+    if (!jump || chatIdRef.current !== jump.chat || bubbles.length === 0) return;
+    const el = scrollRef.current?.querySelector(`[data-turn="${CSS.escape(jump.turn)}"]`);
+    if (el) {
+      jumpTo.current = null;
+      jumpedAt.current = Date.now();
+      const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      el.scrollIntoView({ block: "center", behavior: reduce ? "auto" : "smooth" });
+      setFound(jump.turn);
+      setTimeout(() => setFound((f) => (f === jump.turn ? null : f)), 4000);
+      return;
+    }
+    if (jump.branched) {
+      jumpTo.current = null;
+      pushBubble("system", "That message is further back than this chat shows.");
+      return;
+    }
+    if (waiting > 0) {
+      jumpTo.current = null;
+      pushBubble("system", "That message is on another version of this chat; wait for the reply, then open it again.");
+      return;
+    }
+    jump.branched = true;
+    void showVersion(jump.turn);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bubbles]);
 
   // As the reply being written grows, follow it, unless the user scrolled
   // up to read.
@@ -785,19 +813,13 @@ export default function ChatPage({
     }
   }
 
-  // Show the found message `turn` of chat `target`: on its branch, in view.
-  async function openFound(target: string, turn: string | null) {
-    try {
-      if (turn) await api.chats.branch(id, target, turn);
-    } catch (e) {
-      pushBubble("system", `error: ${e instanceof Error ? e.message : String(e)}`);
-      return;
-    }
-    jumpTo.current = turn;
+  // Show chat `target`, and in it the found message `turn` (see the
+  // effect above); a found title only opens its chat.
+  function openFound(target: string, turn: string | null) {
+    jumpTo.current = turn ? { chat: target, turn, branched: false } : null;
     if (target === chatIdRef.current) {
-      const r = await api.conversation.list(id, HISTORY_LIMIT, target);
-      if (chatIdRef.current !== target) return;
-      setBubbles(turnBubbles(r.turns, () => bubbleIdRef.current++));
+      // Already on screen: the effect runs on what is shown.
+      setBubbles((prev) => [...prev]);
     } else {
       openChatById(target);
     }
@@ -1348,7 +1370,7 @@ function SearchResults({
                 <button
                   type="button"
                   className="w-full truncate rounded px-2 py-1.5 text-left text-sm"
-                  onClick={() => onFound(c.id, c.first_turn)}
+                  onClick={() => onFound(c.id, null)}
                   title={c.title}
                 >
                   <Marked text={c.title || "untitled"} query={query} />
