@@ -19,6 +19,7 @@ import {
   Brain,
   Check,
   Copy,
+  FileText,
   Layers,
   MessageSquarePlus,
   MessagesSquare,
@@ -57,17 +58,56 @@ const AGENT_POLL_MS = 5000;
 const MAX_ATTACHMENTS = 10;
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 
-// A turn's attachment lines, which tell the agent where each file is, read
-// as "attached: <name>".
-const ATTACHMENT_LINE = /^\[Attached file, user-supplied and untrusted: name ("(?:[^"\\]|\\.)*")[^\n]*\]$/gm;
-function shownText(content: string): string {
-  return content.replace(ATTACHMENT_LINE, (_line, name: string) => {
+// A turn's attachment lines, which tell the agent where each file is, as
+// the runtime writes them.
+const JSON_STRING = String.raw`"(?:[^"\\]|\\.)*"`;
+const ATTACHMENT_LINE = new RegExp(
+  String.raw`^\[Attached file, user-supplied and untrusted: name (${JSON_STRING}), type (${JSON_STRING}), ([^,\]]+), saved at (${JSON_STRING})(?:; its text \(untrusted\) is at (${JSON_STRING}), read it with file_read)?\]$`,
+);
+
+/** A user turn's text, and the files it carried, from its stored content. */
+function splitMessage(content: string): { text: string; files: Attachment[] } {
+  const files: Attachment[] = [];
+  const lines = content.split("\n").filter((line) => {
+    const m = ATTACHMENT_LINE.exec(line);
+    if (!m) return true;
     try {
-      return `*attached: ${JSON.parse(name) as string}*`;
+      files.push({
+        name: JSON.parse(m[1]) as string,
+        media_type: JSON.parse(m[2]) as string,
+        size: sizeBytes(m[3]),
+        path: JSON.parse(m[4]) as string,
+        ...(m[5] ? { text_path: JSON.parse(m[5]) as string } : {}),
+      });
+      return false;
     } catch {
-      return _line;
+      return true;
     }
   });
+  return { text: lines.join("\n").trimEnd(), files };
+}
+
+/** A message as its stored turn holds it: the text, then a line per file. */
+function joinMessage(text: string, files: Attachment[]): string {
+  const line = (a: Attachment) =>
+    `[Attached file, user-supplied and untrusted: name ${JSON.stringify(a.name)}, type ${JSON.stringify(a.media_type)}, ${humanSize(a.size)}, saved at ${JSON.stringify(a.path)}` +
+    (a.text_path ? `; its text (untrusted) is at ${JSON.stringify(a.text_path)}, read it with file_read]` : "]");
+  return [text, ...files.map(line)].filter((l) => l.trim()).join("\n");
+}
+
+/** A size as the runtime writes it: 12 B, 3.4 KB, 1.2 MB. */
+function humanSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** About the bytes a size [`humanSize`] wrote stands for. */
+function sizeBytes(size: string): number {
+  const m = /^([\d.]+) (B|KB|MB)$/.exec(size.trim());
+  if (!m) return 0;
+  const unit = m[2] === "MB" ? 1024 * 1024 : m[2] === "KB" ? 1024 : 1;
+  return Math.round(Number(m[1]) * unit);
 }
 const HISTORY_LIMIT = 100;
 const RECONNECT_MS = 1500;
@@ -292,6 +332,9 @@ export default function ChatPage({
         const r = await api.conversation.list(id, HISTORY_LIMIT, chat ?? undefined);
         if (cancelled) return;
         if (!chatIdRef.current && r.conversation) selectChat(r.conversation);
+        // A reply still running when the page was left shows again; the
+        // agent's count is the count.
+        if (r.waiting !== undefined) setWaiting(r.waiting);
         if (r.turns.length === 0) return;
         const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
         setBubbles((prev) => mergeStored(prev, stored, since));
@@ -358,13 +401,16 @@ export default function ChatPage({
     let cancelled = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-    async function catchUp() {
+    // `reconnected`: the socket is new, and with it what this tab knew of
+    // the replies running; the agent says how many still are.
+    async function catchUp(reconnected = false) {
       try {
         const since = Date.now();
         const asked = chatIdRef.current;
         const r = await api.conversation.list(id, HISTORY_LIMIT, asked ?? undefined);
         if (cancelled || chatIdRef.current !== asked) return;
         if (!asked && r.conversation) selectChat(r.conversation);
+        if (reconnected && r.waiting !== undefined) setWaiting(r.waiting);
         const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
         setBubbles((prev) => mergeStored(prev, stored, since));
       } catch (e) {
@@ -380,7 +426,7 @@ export default function ChatPage({
           setWsState("open");
           // The gateway sends what still waits to every new connection.
           setApprovals([]);
-          void catchUp();
+          void catchUp(true);
         },
         onMessage: (msg) => {
           // A reply answers the oldest message waiting; a soft error
@@ -496,8 +542,10 @@ export default function ChatPage({
           chatRef.current = null;
           if (cancelled) return;
           setWsState("closed");
-          // A reply still due arrives through the reload on reconnect.
+          // A reply still due arrives through the reload on reconnect, and
+          // the agent says again what is still running.
           setWaiting(0);
+          waitingElsewhere.current.clear();
           setStep(null);
           clearLive();
           reconnectTimer = setTimeout(() => {
@@ -573,14 +621,8 @@ export default function ChatPage({
 
   function sendText(text: string, files: Attachment[] = []) {
     if ((!text.trim() && files.length === 0) || !chatRef.current || wsState !== "open") return;
-    // In the shape of the stored turn's lines, which show the same.
-    const shown = [
-      text,
-      ...files.map((f) => `[Attached file, user-supplied and untrusted: name ${JSON.stringify(f.name)}]`),
-    ]
-      .filter((line) => line.trim())
-      .join("\n");
-    pushBubble("you", shown);
+    // In the shape of the stored turn, which shows the same.
+    pushBubble("you", joinMessage(text, files));
     chatRef.current.send(text, chatIdRef.current ?? undefined, undefined, files);
     // Text left from a stopped reply goes before a new one starts.
     if (waiting === 0) clearLive();
@@ -590,10 +632,9 @@ export default function ChatPage({
   // Files waiting to go with the next message, uploaded already.
   const [attached, setAttached] = useState<Attachment[]>([]);
   const [uploading, setUploading] = useState(0);
-  async function attachFiles(files: FileList | null) {
-    if (!files) return;
-    const room = MAX_ATTACHMENTS - attached.length - uploading;
-    const picked = Array.from(files);
+  // Upload `picked` to the agent's inbox, as many as `room` leaves, each
+  // as it goes: `done` gets each one uploaded.
+  async function uploadFiles(picked: File[], room: number, done: (a: Attachment) => void) {
     if (picked.length > room) {
       pushBubble("system", `error: a message carries up to ${MAX_ATTACHMENTS} files`);
     }
@@ -602,17 +643,25 @@ export default function ChatPage({
       pushBubble("system", `error: ${file.name} is over ${MAX_UPLOAD_BYTES / (1024 * 1024)} MB`);
       return false;
     });
-    // The whole batch counts at once, so a second pick cannot pass the limit.
-    setUploading((n) => n + batch.length);
     for (const file of batch) {
       try {
-        const uploaded = await api.files.upload(id, file);
-        setAttached((prev) => [...prev, uploaded]);
+        done(await api.files.upload(id, file));
       } catch (e) {
         pushBubble("system", `error: could not attach ${file.name}: ${e instanceof Error ? e.message : String(e)}`);
-      } finally {
-        setUploading((n) => n - 1);
       }
+    }
+  }
+
+  async function attachFiles(files: File[]) {
+    if (files.length === 0) return;
+    // The whole pick counts at once, so a second pick cannot pass the limit.
+    const room = MAX_ATTACHMENTS - attached.length - uploading;
+    const counted = Math.min(files.length, Math.max(0, room));
+    setUploading((n) => n + counted);
+    try {
+      await uploadFiles(files, room, (a) => setAttached((prev) => [...prev, a]));
+    } finally {
+      setUploading((n) => n - counted);
     }
   }
 
@@ -622,12 +671,12 @@ export default function ChatPage({
 
   // A new version of the user turn at `idx`: what came after it leaves
   // the screen, and stays stored on its own branch.
-  function editMessage(idx: number, turn: string, text: string) {
-    if (!text.trim() || !chatRef.current || wsState !== "open") return;
+  function editMessage(idx: number, turn: string, text: string, files: Attachment[]) {
+    if ((!text.trim() && files.length === 0) || !chatRef.current || wsState !== "open") return;
     // Memory notes stay: what the replies changed is still in memory.
     setBubbles((prev) => [...prev.slice(0, idx), ...prev.slice(idx).filter((b) => b.memory)]);
-    pushBubble("you", text);
-    chatRef.current.send(text, chatIdRef.current ?? undefined, turn);
+    pushBubble("you", joinMessage(text, files));
+    chatRef.current.send(text, chatIdRef.current ?? undefined, turn, files);
     // Text left from a stopped reply goes before a new one starts.
     if (waiting === 0) clearLive();
     setWaiting((n) => n + 1);
@@ -722,8 +771,8 @@ export default function ChatPage({
     chatRef.current.decide(id, approve, remember);
   }
 
-  function onSubmit(e: React.FormEvent) {
-    e.preventDefault();
+  function onSubmit(e?: React.FormEvent) {
+    e?.preventDefault();
     if (uploading > 0) return;
     sendText(draft, attached);
     setDraft("");
@@ -872,11 +921,13 @@ export default function ChatPage({
               ) : (
               <Bubble
                 key={b.id}
+                agentId={id}
                 bubble={b}
                 busy={pending || wsState !== "open"}
+                onUpload={uploadFiles}
                 onEdit={
                   b.role === "you" && b.turn
-                    ? (text) => editMessage(idx, b.turn!, text)
+                    ? (text, files) => editMessage(idx, b.turn!, text, files)
                     : undefined
                 }
                 onRegenerate={
@@ -893,7 +944,8 @@ export default function ChatPage({
                         // is correct (it can see what didn't work).
                         for (let i = idx - 1; i >= 0; i--) {
                           if (bubbles[i].role === "you") {
-                            sendText(bubbles[i].content);
+                            const again = splitMessage(bubbles[i].content);
+                            sendText(again.text, again.files);
                             return;
                           }
                         }
@@ -970,6 +1022,7 @@ export default function ChatPage({
 
         {/* Composer */}
         <Composer
+          agentId={id}
           wsState={wsState}
           waiting={waiting}
           onStop={stopReply}
@@ -1077,29 +1130,56 @@ function ChatList({
 function Bubble({
   bubble,
   busy,
+  agentId,
   onRetry,
   onEdit,
+  onUpload,
   onRegenerate,
   onVersion,
 }: {
   bubble: Bubble;
+  agentId: string;
   /** A reply is due: branching waits for it. */
   busy: boolean;
   onRetry?: () => void;
-  onEdit?: (text: string) => void;
+  onEdit?: (text: string, files: Attachment[]) => void;
+  onUpload: (picked: File[], room: number, done: (a: Attachment) => void) => Promise<void>;
   onRegenerate?: () => void;
   onVersion: (turn: string) => void;
 }) {
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(bubble.content);
   const align =
     bubble.role === "you" ? "items-end" : "items-start";
+  // A message of the user's: its text, its files shown above it.
+  const message = bubble.role === "you" ? splitMessage(bubble.content) : null;
+  if (editing && message) {
+    return (
+      <div className="flex flex-col items-end">
+        <MessageEditor
+          agentId={agentId}
+          text={message.text}
+          files={message.files}
+          busy={busy}
+          onUpload={onUpload}
+          onCancel={() => setEditing(false)}
+          onSend={(text, files) => {
+            setEditing(false);
+            onEdit?.(text, files);
+          }}
+        />
+      </div>
+    );
+  }
   // System bubbles stay plain — markdown renderer is overkill for
   // "agent reconnecting…" hints. User + agent get full markdown +
   // a below-bubble action row (copy / retry).
   const isSystem = bubble.role === "system";
   return (
-    <div className={`flex flex-col ${align}`}>
+    <div className={`flex flex-col gap-1.5 ${align}`}>
+      {message && message.files.length > 0 && (
+        <AttachmentCards agentId={agentId} files={message.files} align="end" />
+      )}
+      {(!message || message.text) && (
       <div
         className="px-4 py-2.5"
         style={{
@@ -1126,50 +1206,22 @@ function Bubble({
                 }),
         }}
       >
-        {editing ? (
-          <form
-            className="flex flex-col gap-2"
-            onSubmit={(e) => {
-              e.preventDefault();
-              setEditing(false);
-              onEdit?.(draft);
-            }}
-          >
-            <textarea
-              className="input min-h-20 w-full text-sm"
-              style={{ color: "var(--color-deep-navy)", minWidth: "min(60vw, 480px)" }}
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              aria-label="edit message"
-              autoFocus
-            />
-            <div className="flex justify-end gap-2">
-              <button type="button" className="btn-ghost" onClick={() => setEditing(false)}>
-                cancel
-              </button>
-              <button type="submit" className="btn-primary" disabled={!draft.trim() || busy}>
-                send
-              </button>
-            </div>
-          </form>
-        ) : isSystem ? (
+        {isSystem ? (
           <span style={{ whiteSpace: "pre-wrap" }}>{bubble.content}</span>
         ) : (
-          <Markdown>{bubble.role === "you" ? shownText(bubble.content) : bubble.content}</Markdown>
+          <Markdown>{message ? message.text : bubble.content}</Markdown>
         )}
       </div>
-      {!isSystem && !editing && (
+      )}
+      {!isSystem && (
         <ActionRow
-          text={bubble.content}
+          text={message ? message.text : bubble.content}
           onRetry={onRetry}
           align={bubble.role === "you" ? "end" : "start"}
         >
           {onEdit && (
             <RowButton
-              onClick={() => {
-                setDraft(bubble.content);
-                setEditing(true);
-              }}
+              onClick={() => setEditing(true)}
               disabled={busy}
               title="Edit and send again; the messages after it stay on their own branch. What tools already did (files written, messages sent) is not undone."
               label="edit"
@@ -1195,6 +1247,306 @@ function Bubble({
         </ActionRow>
       )}
     </div>
+  );
+}
+
+/** Files a message carries, as cards: images as thumbnails. */
+function AttachmentCards({
+  agentId,
+  files,
+  onRemove,
+  align = "start",
+}: {
+  agentId: string;
+  files: Attachment[];
+  /** Remove the file at this index. */
+  onRemove?: (index: number) => void;
+  align?: "start" | "end";
+}) {
+  return (
+    <div className={`flex flex-wrap gap-2 ${align === "end" ? "justify-end" : ""}`} aria-label="attached files">
+      {files.map((f, i) => (
+        <AttachmentCard
+          key={`${i}:${f.path}`}
+          agentId={agentId}
+          file={f}
+          onRemove={onRemove ? () => onRemove(i) : undefined}
+        />
+      ))}
+    </div>
+  );
+}
+
+function AttachmentCard({
+  agentId,
+  file,
+  onRemove,
+}: {
+  agentId: string;
+  file: Attachment;
+  onRemove?: () => void;
+}) {
+  // The gateway shows an inbox image in place and gives anything else as a
+  // download.
+  const url = `/api/agents/${agentId}/files?path=${encodeURIComponent(file.path)}`;
+  const image = /^image\/(png|jpeg|gif|webp)$/.test(file.media_type);
+  const dot = file.name.lastIndexOf(".");
+  const kind = (dot > 0 ? file.name.slice(dot + 1) : file.media_type.split("/").pop() || "file")
+    .toUpperCase()
+    .slice(0, 6);
+  return (
+    <div className="relative">
+      {image ? (
+        <a
+          href={url}
+          target="_blank"
+          rel="noreferrer"
+          title={file.name}
+          className="block overflow-hidden"
+          style={{
+            width: 96,
+            height: 96,
+            borderRadius: "var(--radius-large)",
+            border: "1px solid var(--color-border-default)",
+          }}
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element -- an inbox file, served by the gateway */}
+          <img src={url} alt={file.name} loading="lazy" className="h-full w-full object-cover" />
+        </a>
+      ) : (
+        <a
+          href={url}
+          download={file.name}
+          title={`${file.name}${file.size ? ` (${humanSize(file.size)})` : ""}`}
+          className="card flex items-center gap-2 px-3 py-2"
+          style={{ width: 208, backgroundColor: "var(--color-surface)" }}
+        >
+          <FileText size={20} className="shrink-0" aria-hidden="true" style={{ color: "var(--color-body)" }} />
+          <span className="min-w-0">
+            <span className="block truncate text-sm" style={{ color: "var(--color-deep-navy)" }}>
+              {file.name}
+            </span>
+            <span className="block text-xs" style={{ color: "var(--color-body)" }}>
+              {kind}
+              {file.size ? ` · ${humanSize(file.size)}` : ""}
+            </span>
+          </span>
+        </a>
+      )}
+      {onRemove && (
+        <button
+          type="button"
+          onClick={onRemove}
+          aria-label={`remove ${file.name}`}
+          title="Remove it from the message (it stays in the agent's inbox/)"
+          className="absolute -right-1.5 -top-1.5 rounded-full p-0.5"
+          style={{ backgroundColor: "var(--color-deep-navy)", color: "white" }}
+        >
+          <X size={12} aria-hidden="true" />
+        </button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A text box that grows with its text. Enter calls `onEnter` and
+ * Shift+Enter starts a new line, except while an input method composes
+ * (Chinese, Japanese, Korean), whose Enter confirms what it composes.
+ * Files pasted go to `onFiles`.
+ */
+function MessageInput({
+  value,
+  onChange,
+  onEnter,
+  onEscape,
+  onFiles,
+  disabled,
+  placeholder,
+  autoFocus,
+  label,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  onEnter: () => void;
+  onEscape?: () => void;
+  onFiles?: (files: File[]) => void;
+  disabled?: boolean;
+  placeholder?: string;
+  autoFocus?: boolean;
+  label: string;
+}) {
+  const ref = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight + 2, 320)}px`;
+  }, [value]);
+  return (
+    <textarea
+      ref={ref}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      onKeyDown={(e) => {
+        // What an input method composes takes its keys first.
+        if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+        if (e.key === "Escape" && onEscape) {
+          e.preventDefault();
+          onEscape();
+          return;
+        }
+        if (e.key !== "Enter" || e.shiftKey) return;
+        // A touch keyboard has no Shift: its Enter starts a line, and the
+        // send button sends.
+        if (!(e.metaKey || e.ctrlKey) && window.matchMedia("(pointer: coarse)").matches) return;
+        e.preventDefault();
+        onEnter();
+      }}
+      onPaste={(e) => {
+        const files = Array.from(e.clipboardData.files);
+        // Text copied with a picture (from a document) stays text.
+        if (files.length > 0 && onFiles && !e.clipboardData.getData("text/plain")) {
+          e.preventDefault();
+          onFiles(files);
+        }
+      }}
+      disabled={disabled}
+      placeholder={placeholder}
+      autoFocus={autoFocus}
+      aria-label={label}
+      rows={2}
+      className="input w-full"
+      style={{
+        resize: "none",
+        overflowY: "auto",
+        minHeight: 56,
+        maxHeight: 320,
+        fontFamily: "inherit",
+        padding: "10px 12px",
+        lineHeight: 1.45,
+      }}
+    />
+  );
+}
+
+/**
+ * Editing a message: its text and its files, which can be removed and
+ * added to. Send waits for a change.
+ */
+function MessageEditor({
+  agentId,
+  text,
+  files,
+  busy,
+  onUpload,
+  onCancel,
+  onSend,
+}: {
+  agentId: string;
+  text: string;
+  files: Attachment[];
+  busy: boolean;
+  onUpload: (picked: File[], room: number, done: (a: Attachment) => void) => Promise<void>;
+  onCancel: () => void;
+  onSend: (text: string, files: Attachment[]) => void;
+}) {
+  const [draft, setDraft] = useState(text);
+  const [kept, setKept] = useState(files);
+  const [uploading, setUploading] = useState(0);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const unchanged =
+    draft.trim() === text.trim() &&
+    kept.length === files.length &&
+    kept.every((f, i) => f.path === files[i].path);
+  const empty = !draft.trim() && kept.length === 0;
+  const blocked = busy || uploading > 0 || unchanged || empty;
+  async function add(picked: File[]) {
+    if (picked.length === 0) return;
+    const room = MAX_ATTACHMENTS - kept.length - uploading;
+    const counted = Math.min(picked.length, Math.max(0, room));
+    setUploading((n) => n + counted);
+    try {
+      await onUpload(picked, room, (a) => setKept((prev) => [...prev, a]));
+    } finally {
+      setUploading((n) => n - counted);
+    }
+  }
+  function send() {
+    if (!blocked) onSend(draft, kept);
+  }
+  return (
+    <form
+      className="card flex w-full flex-col gap-2 p-3"
+      style={{ maxWidth: "min(85%, 720px)", minWidth: "min(100%, 360px)", backgroundColor: "var(--color-surface)" }}
+      onSubmit={(e) => {
+        e.preventDefault();
+        send();
+      }}
+      onDragOver={(e) => {
+        if (e.dataTransfer.types.includes("Files")) e.preventDefault();
+      }}
+      onDrop={(e) => {
+        if (!e.dataTransfer.types.includes("Files")) return;
+        e.preventDefault();
+        void add(Array.from(e.dataTransfer.files));
+      }}
+    >
+      {kept.length > 0 && (
+        <AttachmentCards
+          agentId={agentId}
+          files={kept}
+          onRemove={(index) => setKept((prev) => prev.filter((_, i) => i !== index))}
+        />
+      )}
+      <MessageInput
+        value={draft}
+        onChange={setDraft}
+        onEnter={send}
+        onEscape={onCancel}
+        onFiles={(picked) => void add(picked)}
+        autoFocus
+        label="edit message"
+      />
+      <div className="flex items-center gap-2">
+        <input
+          ref={fileInput}
+          type="file"
+          multiple
+          hidden
+          onChange={(e) => {
+            void add(Array.from(e.target.files ?? []));
+            e.target.value = "";
+          }}
+        />
+        <button
+          type="button"
+          className="btn-ghost mr-auto inline-flex items-center gap-1.5"
+          onClick={() => fileInput.current?.click()}
+          disabled={kept.length + uploading >= MAX_ATTACHMENTS}
+          title="Attach files to the message"
+        >
+          <Paperclip size={16} className="shrink-0" aria-hidden="true" />
+          attach
+        </button>
+        {uploading > 0 && (
+          <span className="inline-flex items-center gap-1 text-xs" role="status" style={{ color: "var(--color-body)" }}>
+            <Spinner /> uploading
+          </span>
+        )}
+        <button type="button" className="btn-ghost" onClick={onCancel}>
+          cancel
+        </button>
+        <button
+          type="submit"
+          className="btn-primary"
+          disabled={blocked}
+          title={unchanged ? "Change the text or the files to send it again" : undefined}
+        >
+          send
+        </button>
+      </div>
+    </form>
   );
 }
 
@@ -1569,6 +1921,7 @@ function Dot({ delayMs }: { delayMs: number }) {
 // or via the explicit button. Plain textarea (multi-line, monospace
 // optional) keeps the input ergonomic for code blocks and longer prompts.
 function Composer({
+  agentId,
   wsState,
   waiting,
   onStop,
@@ -1580,16 +1933,17 @@ function Composer({
   onAttach,
   onDetach,
 }: {
+  agentId: string;
   wsState: "idle" | "connecting" | "open" | "closed" | "error";
   waiting: number;
   onStop: () => void;
   draft: string;
   setDraft: (s: string) => void;
-  onSubmit: (e: React.FormEvent) => void;
+  onSubmit: (e?: React.FormEvent) => void;
   /** Files uploaded for the next message, and uploads still running. */
   attached: Attachment[];
   uploading: number;
-  onAttach: (files: FileList | null) => void;
+  onAttach: (files: File[]) => void;
   onDetach: (path: string) => void;
 }) {
   const fileInput = useRef<HTMLInputElement>(null);
@@ -1602,6 +1956,14 @@ function Composer({
   return (
     <form
       onSubmit={onSubmit}
+      onDragOver={(e) => {
+        if (e.dataTransfer.types.includes("Files")) e.preventDefault();
+      }}
+      onDrop={(e) => {
+        if (!e.dataTransfer.types.includes("Files")) return;
+        e.preventDefault();
+        if (ready) onAttach(Array.from(e.dataTransfer.files));
+      }}
       className="border-t px-4 py-3 sm:px-8"
       style={{ borderColor: "var(--color-border-default)" }}
     >
@@ -1628,47 +1990,46 @@ function Composer({
             </ComposerTab>
           </div>
           <span className="text-xs" style={{ color: "var(--color-body)" }}>
-            <kbd
-              className="font-mono"
-              style={{ fontSize: 11 }}
-            >
-              Cmd/Ctrl+Enter
+            <kbd className="font-mono" style={{ fontSize: 11 }}>
+              Enter
             </kbd>{" "}
-            to send · markdown supported
+            to send ·{" "}
+            <kbd className="font-mono" style={{ fontSize: 11 }}>
+              Shift+Enter
+            </kbd>{" "}
+            new line · markdown
           </span>
         </div>
 
+        {(attached.length > 0 || uploading > 0) && (
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <AttachmentCards agentId={agentId} files={attached} onRemove={(i) => onDetach(attached[i].path)} />
+            {uploading > 0 && (
+              <span className="inline-flex items-center gap-1 text-xs" role="status" style={{ color: "var(--color-body)" }}>
+                <Spinner /> uploading
+              </span>
+            )}
+          </div>
+        )}
+
         {/* Body */}
         {tab === "write" ? (
-          <textarea
+          <MessageInput
             placeholder={
               ready
-                ? "Type a message — markdown welcome (lists, code blocks, links, tables)"
+                ? "Message the agent: Enter sends, Shift+Enter starts a new line, files can be pasted or dropped"
                 : "Waiting for agent connection…"
             }
             value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (
-                (e.metaKey || e.ctrlKey) &&
-                e.key === "Enter" &&
-                ready &&
-                canSend
-              ) {
-                e.preventDefault();
-                onSubmit(e as unknown as React.FormEvent);
-              }
+            onChange={setDraft}
+            onEnter={() => {
+              if (ready && canSend) onSubmit();
+            }}
+            onFiles={(files) => {
+              if (ready) onAttach(files);
             }}
             disabled={!ready}
-            rows={4}
-            className="input w-full"
-            style={{
-              resize: "vertical",
-              minHeight: 84,
-              fontFamily: "inherit",
-              padding: "10px 12px",
-              lineHeight: 1.45,
-            }}
+            label="message"
           />
         ) : (
           <div
@@ -1689,34 +2050,6 @@ function Composer({
           </div>
         )}
 
-        {(attached.length > 0 || uploading > 0) && (
-          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs" aria-label="attached files">
-            {attached.map((a) => (
-              <span
-                key={a.path}
-                className="inline-flex items-center gap-1 rounded px-2 py-1"
-                style={{ background: "var(--color-surface-muted)", color: "var(--color-body)" }}
-              >
-                <Paperclip size={12} className="shrink-0" aria-hidden="true" />
-                {a.name}
-                <button
-                  type="button"
-                  onClick={() => onDetach(a.path)}
-                  aria-label={`remove ${a.name}`}
-                  title="Do not send it (it stays in the agent's inbox/)"
-                >
-                  <X size={12} aria-hidden="true" />
-                </button>
-              </span>
-            ))}
-            {uploading > 0 && (
-              <span className="inline-flex items-center gap-1" role="status" style={{ color: "var(--color-body)" }}>
-                <Spinner /> uploading
-              </span>
-            )}
-          </div>
-        )}
-
         {/* Action row */}
         <div className="mt-2 flex items-center justify-end gap-3">
           <input
@@ -1725,7 +2058,7 @@ function Composer({
             multiple
             hidden
             onChange={(e) => {
-              onAttach(e.target.files);
+              onAttach(Array.from(e.target.files ?? []));
               e.target.value = "";
             }}
           />

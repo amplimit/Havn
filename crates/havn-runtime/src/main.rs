@@ -2378,9 +2378,14 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                     }
                     None => Vec::new(),
                 };
+                // What the chat still has to answer: a dashboard that comes
+                // back to it shows the reply running. Every message has its
+                // chat before it is admitted, so the chat's key counts it.
+                let waiting = chat.as_deref().map_or(0, |c| ctx.turns.waiting(c));
                 Ok(serde_json::json!({
                     "conversation": chat,
                     "turns": rows_within_budget(turns, MAX_DATA_REPLY_BYTES, true)?,
+                    "waiting": waiting,
                 }))
             }
             DataQuery::Chats { channel_id, limit } => {

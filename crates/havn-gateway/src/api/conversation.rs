@@ -53,6 +53,10 @@ pub struct ConversationResponse {
     /// chat yet (or the one asked for is not its).
     pub conversation: Option<String>,
     pub turns: Vec<TurnView>,
+    /// Messages of the chat the agent has not answered yet, the one it
+    /// answers now included; absent from a runtime that does not say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<usize>,
     /// `true` when the agent has never been started — agent.db
     /// doesn't exist on disk yet.
     pub uninitialised: bool,
@@ -62,6 +66,8 @@ pub struct ConversationResponse {
 struct ConversationRows {
     conversation: Option<String>,
     turns: Vec<BranchTurn>,
+    #[serde(default)]
+    waiting: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +137,7 @@ pub async fn list(
         channel_id,
         conversation: rows.conversation,
         turns: views,
+        waiting: rows.waiting,
         uninitialised: false,
     }))
 }

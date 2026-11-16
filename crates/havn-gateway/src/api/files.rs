@@ -440,10 +440,33 @@ pub async fn download(
 /// `sent`'s bytes as a download the browser saves rather than shows: an
 /// HTML or SVG file the agent made must not run as the dashboard's page.
 pub fn attachment_response(sent: &crate::outbox::Sent, bytes: Vec<u8>) -> axum::response::Response {
+    file_response(&sent.name, bytes, None)
+}
+
+/// File `name` as a download, or with `image` (a type its bytes were
+/// sniffed as) as that image, shown in place. Neither is ever run as a
+/// page: no sniffing, and a sandbox for anything that would render.
+fn file_response(
+    name: &str,
+    bytes: Vec<u8>,
+    image: Option<&'static str>,
+) -> axum::response::Response {
     use axum::http::header;
     use axum::response::IntoResponse as _;
-    let encoded: String = sent
-        .name
+    let (kind, disposition) = match image {
+        Some(kind) => (kind, "inline"),
+        None => ("application/octet-stream", "attachment"),
+    };
+    // An image saved from the page is saved as what it is.
+    let lower = name.to_ascii_lowercase();
+    let says = |ext: &str| {
+        lower.ends_with(&format!(".{ext}")) || (ext == "jpeg" && lower.ends_with(".jpg"))
+    };
+    let name = match image.and_then(|kind| kind.strip_prefix("image/")) {
+        Some(ext) if !says(ext) => format!("{name}.{ext}"),
+        _ => name.to_string(),
+    };
+    let encoded: String = name
         .bytes()
         .map(|b| {
             if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
@@ -455,17 +478,90 @@ pub fn attachment_response(sent: &crate::outbox::Sent, bytes: Vec<u8>) -> axum::
         .collect();
     (
         [
-            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_TYPE, kind.to_string()),
             (
                 header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"file\"; filename*=UTF-8''{encoded}"),
+                format!("{disposition}; filename=\"file\"; filename*=UTF-8''{encoded}"),
             ),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
             (header::CONTENT_SECURITY_POLICY, "sandbox".to_string()),
+            (header::CACHE_CONTROL, "private, max-age=3600".to_string()),
         ],
         bytes,
     )
         .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InboxFileQuery {
+    /// `inbox/<name>`, as an attachment names it.
+    pub path: String,
+}
+
+/// `GET /agents/:id/files?path=inbox/<name>` — a file in the agent's inbox
+/// (one sent in a chat, or its text), for the owner's chat to show: a
+/// PNG, JPEG, GIF or WebP image in place, anything else as a download.
+/// Read without following links, as everything there may be the agent's.
+pub async fn inbox_file(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path(id): Path<String>,
+    Query(q): Query<InboxFileQuery>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
+    // Another site's page cannot even learn whether a file is there.
+    if headers
+        .get("sec-fetch-site")
+        .is_some_and(|v| v.as_bytes() == b"cross-site")
+    {
+        return Err(ApiError::Forbidden("not from another site".into()));
+    }
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    // Files held at once: each is read whole, and its slot is given back
+    // once it has been sent.
+    static READING: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let reading = READING
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(8)))
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    if !Attachment::in_inbox(&q.path) {
+        return Err(ApiError::BadRequest("not a file in the inbox".into()));
+    }
+    let name = q.path[INBOX_DIR.len() + 1..].to_string();
+    let workspace = crate::api::agents::workspace_for(&state, agent.id);
+    let read = name.clone();
+    let bytes = tokio::task::spawn_blocking(move || {
+        inbox(&workspace)
+            .and_then(|dir| dir.read_bytes(&read, MAX_UPLOAD_BYTES as u64 + TEXT_BYTES))
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?
+    .map_err(|e| ApiError::Internal(format!("reading the inbox: {e}")))?
+    .ok_or(ApiError::NotFound)?;
+    let image = crate::llm_proxy::image_type(&bytes);
+    let bytes = axum::body::Bytes::from(bytes);
+    let pieces: Vec<axum::body::Bytes> = (0..bytes.len())
+        .step_by(64 * 1024)
+        .map(|at| bytes.slice(at..(at + 64 * 1024).min(bytes.len())))
+        .collect();
+    let mut response = file_response(&name, Vec::new(), image);
+    // The slot goes with the last piece.
+    let body = futures_util::stream::unfold(
+        (pieces.into_iter(), reading),
+        |(mut pieces, reading)| async move {
+            pieces
+                .next()
+                .map(|piece| (Ok::<_, std::convert::Infallible>(piece), (pieces, reading)))
+        },
+    );
+    response
+        .headers_mut()
+        .remove(axum::http::header::CONTENT_LENGTH);
+    *response.body_mut() = axum::body::Body::from_stream(body);
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -473,6 +569,48 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn an_inbox_image_shows_in_place_and_anything_else_downloads() {
+        let header = |r: &axum::response::Response, h: axum::http::HeaderName| {
+            r.headers()
+                .get(h)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+        let png = file_response(
+            "a.png",
+            b"\x89PNG\r\n\x1a\nrest".to_vec(),
+            Some("image/png"),
+        );
+        assert!(header(&png, axum::http::header::CONTENT_DISPOSITION).ends_with("''a.png"));
+        // A name the agent chose that says another type is saved as the image.
+        let disguised = file_response("x.html", b"\x89PNG\r\n\x1a\n".to_vec(), Some("image/png"));
+        assert!(
+            header(&disguised, axum::http::header::CONTENT_DISPOSITION).ends_with("''x.html.png")
+        );
+        let jpg = file_response("p.JPG", b"\xff\xd8\xff".to_vec(), Some("image/jpeg"));
+        assert!(header(&jpg, axum::http::header::CONTENT_DISPOSITION).ends_with("''p.JPG"));
+        assert_eq!(header(&png, axum::http::header::CONTENT_TYPE), "image/png");
+        assert!(header(&png, axum::http::header::CONTENT_DISPOSITION).starts_with("inline;"));
+        let page = file_response("x.png.html", b"<script>".to_vec(), None);
+        assert_eq!(
+            header(&page, axum::http::header::CONTENT_TYPE),
+            "application/octet-stream"
+        );
+        assert!(header(&page, axum::http::header::CONTENT_DISPOSITION).starts_with("attachment;"));
+        for r in [&png, &page] {
+            assert_eq!(
+                header(r, axum::http::header::X_CONTENT_TYPE_OPTIONS),
+                "nosniff"
+            );
+            assert_eq!(
+                header(r, axum::http::header::CONTENT_SECURITY_POLICY),
+                "sandbox"
+            );
+        }
+    }
 
     #[test]
     fn a_sent_name_becomes_one_the_inbox_can_hold() {

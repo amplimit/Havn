@@ -725,7 +725,7 @@ async fn serve() -> anyhow::Result<()> {
             "/agents/{id}/files",
             // The handler reads the body itself, up to its limit, once it
             // knows who is sending.
-            post(api::files::upload),
+            post(api::files::upload).get(api::files::inbox_file),
         )
         .route("/agents/{id}/outbox", get(api::files::sent))
         .route("/agents/{id}/outbox/{file}", get(api::files::download))

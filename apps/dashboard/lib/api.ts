@@ -161,6 +161,8 @@ export type ConversationResponse = {
   /** The chat the turns are of; `null` when there is no active one yet. */
   conversation: string | null;
   turns: ConversationTurn[];
+  /** Messages of the chat not answered yet, the one being answered included. */
+  waiting?: number;
   uninitialised: boolean;
 };
 
