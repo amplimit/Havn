@@ -73,7 +73,8 @@ impl Install {
     }
 }
 
-/// Copy database `db` to `into`, consistent even while it is written.
+/// Copy database `db` to `into`, consistent even while it is written, and
+/// check the copy.
 async fn snapshot(db: &Path, into: &Path) -> anyhow::Result<()> {
     let opts = SqliteConnectOptions::new().filename(db).read_only(true);
     let mut conn = SqliteConnection::connect_with(&opts)
@@ -85,7 +86,76 @@ async fn snapshot(db: &Path, into: &Path) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("copying {}", db.display()))?;
     conn.close().await.ok();
+    let opts = SqliteConnectOptions::new().filename(into).read_only(true);
+    let mut copy = SqliteConnection::connect_with(&opts).await?;
+    let (check,): (String,) = sqlx::query_as("PRAGMA integrity_check")
+        .fetch_one(&mut copy)
+        .await?;
+    copy.close().await.ok();
+    if check != "ok" {
+        bail!("the copy of {} is not sound: {check}", db.display());
+    }
     Ok(())
+}
+
+/// The identity of regular file `name` of open directory `base` (inode,
+/// size, change time), `None` when it is not there or not a regular file.
+fn stamp(base: &Path, name: &str) -> io::Result<Option<(u64, u64, i64, i64)>> {
+    match fs::symlink_metadata(base.join(name)) {
+        Ok(m) if m.is_file() => Ok(Some((m.ino(), m.len(), m.mtime(), m.mtime_nsec()))),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Copy regular file `src` to `dst` (only this user can read it), never
+/// what a link at `src` names.
+fn copy_regular(src: &Path, dst: &Path) -> io::Result<()> {
+    let mut from = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(src)?;
+    if !from.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a regular file",
+        ));
+    }
+    let mut to = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(dst)?;
+    io::copy(&mut from, &mut to)?;
+    Ok(())
+}
+
+/// Copy an agent's database and its write-ahead log out of its workspace,
+/// open directory `workspace`, into `into` and `into-wal`: byte for byte,
+/// never through a link (the workspace is the agent's, and it could put
+/// one there to another tenant's database), again while either changes.
+/// False when the workspace has no database file.
+fn copy_agent_db(workspace: &File, into: &Path) -> anyhow::Result<bool> {
+    let base = PathBuf::from(format!("/proc/self/fd/{}", workspace.as_raw_fd()));
+    let wal_copy = PathBuf::from(format!("{}-wal", into.display()));
+    for _ in 0..5 {
+        let before = (stamp(&base, "agent.db")?, stamp(&base, "agent.db-wal")?);
+        if before.0.is_none() {
+            return Ok(false);
+        }
+        copy_regular(&base.join("agent.db"), into)?;
+        if before.1.is_some() {
+            copy_regular(&base.join("agent.db-wal"), &wal_copy)?;
+        } else {
+            let _ = fs::remove_file(&wal_copy);
+        }
+        if (stamp(&base, "agent.db")?, stamp(&base, "agent.db-wal")?) == before {
+            return Ok(true);
+        }
+    }
+    bail!("the agent's database kept changing while it was copied; try again")
 }
 
 /// A directory only this user can read, removed when dropped.
@@ -136,11 +206,18 @@ pub async fn backup(install: &Install, output: &Path) -> anyhow::Result<Manifest
                 continue;
             }
             let id = name.to_string_lossy().into_owned();
-            let db = dir.join(AGENT_DB);
-            if fs::symlink_metadata(&db).is_ok_and(|m| m.is_file()) {
-                let copy = scratch.0.join(format!("{id}.db"));
-                snapshot(&db, &copy).await?;
-                copies.insert(Path::new(AGENTS).join(&name).join(AGENT_DB), copy);
+            // `<id>` is the gateway's; `workspace` in it the agent's.
+            if let Ok(workspace) = open_dir(&dir.join("workspace")) {
+                let raw = scratch.0.join(format!("{id}.raw.db"));
+                if copy_agent_db(&workspace, &raw)
+                    .with_context(|| format!("copying the database of agent {id}"))?
+                {
+                    let copy = scratch.0.join(format!("{id}.db"));
+                    snapshot(&raw, &copy)
+                        .await
+                        .with_context(|| format!("the database of agent {id}"))?;
+                    copies.insert(Path::new(AGENTS).join(&name).join(AGENT_DB), copy);
+                }
             }
             agents.push(id);
         }
@@ -214,8 +291,9 @@ fn add_tree<W: io::Write>(
     name: &Path,
     copies: &HashMap<PathBuf, PathBuf>,
 ) -> io::Result<()> {
+    let dir_meta = dir.metadata()?;
     let mut header = tar::Header::new_gnu();
-    header.set_metadata_in_mode(&dir.metadata()?, tar::HeaderMode::Complete);
+    header.set_metadata_in_mode(&dir_meta, tar::HeaderMode::Complete);
     header.set_size(0);
     tar.append_data(&mut header, name, io::empty())?;
 
@@ -271,6 +349,11 @@ fn add_tree<W: io::Write>(
             };
             let opened = file.metadata()?;
             if !opened.is_file() || opened.ino() != meta.ino() {
+                continue;
+            }
+            // A second name of another owner's file: not the agent's to
+            // keep.
+            if opened.nlink() > 1 && opened.uid() != dir_meta.uid() {
                 continue;
             }
             let mut header = tar::Header::new_gnu();
@@ -353,6 +436,8 @@ pub fn restore(install: &Install, archive: &Path, force: bool) -> anyhow::Result
     let file = File::open(archive).with_context(|| format!("opening {}", archive.display()))?;
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
     tar.set_preserve_permissions(true);
+    // Nothing restored runs as its owner for whoever starts it.
+    tar.set_mask(0o6000);
     tar.set_preserve_ownerships(true);
     tar.set_preserve_mtime(true);
     tar.set_unpack_xattrs(false);
@@ -498,10 +583,18 @@ mod tests {
         let secret = from.path().join("secret");
         fs::write(&secret, "host secret").unwrap();
         std::os::unix::fs::symlink(&secret, at.workspaces.join("a1/workspace/leak")).unwrap();
+        // An agent whose database is a link to the gateway's: the link is
+        // kept, the gateway's database is not copied as the agent's.
+        fs::create_dir_all(at.workspaces.join("a2/workspace")).unwrap();
+        std::os::unix::fs::symlink(&at.db, at.workspaces.join("a2/workspace/agent.db")).unwrap();
+        // A setuid file comes back without the bit.
+        let suid = at.workspaces.join("a1/workspace/tool");
+        fs::write(&suid, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&suid, std::os::unix::fs::PermissionsExt::from_mode(0o4755)).unwrap();
 
         let archive = from.path().join("backup.tar.gz");
         let manifest = backup(&at, &archive).await.expect("backup");
-        assert_eq!(manifest.agents, ["a1"]);
+        assert_eq!(manifest.agents, ["a1", "a2"]);
         assert_eq!(fs::metadata(&archive).unwrap().mode() & 0o777, 0o600);
 
         let to = tempfile::tempdir().expect("dir");
@@ -525,6 +618,20 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read_link(&leak).unwrap(), secret);
+        let linked = into.workspaces.join("a2/workspace/agent.db");
+        assert!(
+            fs::symlink_metadata(&linked)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::metadata(into.workspaces.join("a1/workspace/tool"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o755
+        );
 
         // A second restore needs --force, and moves the first aside.
         let err = restore(&into, &archive, false).expect_err("occupied");
