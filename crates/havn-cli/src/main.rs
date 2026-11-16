@@ -549,6 +549,9 @@ async fn run_backup(output: Option<std::path::PathBuf>) -> anyhow::Result<()> {
         .into()
     });
     let manifest = backup::backup(&install, &output).await?;
+    for note in &manifest.incomplete {
+        println!("not in the backup: {note}");
+    }
     let size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
     println!(
         "backed up the gateway and {} agent(s) to {} ({:.1} MB)",
@@ -572,14 +575,19 @@ fn run_restore(archive: &std::path::Path, force: bool) -> anyhow::Result<()> {
     let install = backup::Install::from_config()?;
     let restored = backup::restore(&install, archive, force)?;
     for moved in &restored.moved {
-        println!("moved the existing installation to {}", moved.display());
+        println!("moved aside to {}", moved.display());
     }
     println!(
-        "restored the gateway and {} agent(s) from a backup of {} (havn {})",
+        "restored the gateway and {} agent(s) from a backup of {} (havn {}): the database at {}, the agents in {}",
         restored.manifest.agents.len(),
         restored.manifest.created_at,
-        restored.manifest.havn_version
+        restored.manifest.havn_version,
+        restored.install.db.display(),
+        restored.install.workspaces.display()
     );
+    for note in &restored.manifest.incomplete {
+        println!("not in the backup: {note}");
+    }
     match &restored.config {
         Some(c) if c.extension().is_some_and(|e| e == "restored") => {
             println!(

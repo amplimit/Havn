@@ -101,29 +101,6 @@ pub fn data_dir(cfg: &CliConfig) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("./havn-data"))
 }
 
-/// Where the gateway keeps its agents' directories: `workspace_root`, by
-/// default `agents` in its default data directory, as the gateway has it.
-#[must_use]
-pub fn workspace_root(cfg: &CliConfig) -> PathBuf {
-    cfg.workspace_root.clone().unwrap_or_else(|| {
-        std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join(".local/share/havn"))
-            .unwrap_or_else(|| PathBuf::from("./havn-data"))
-            .join("agents")
-    })
-}
-
-/// Where `config.toml` would be without `$HAVN_CONFIG`.
-#[must_use]
-pub fn default_config_path() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("havn")
-        .join("config.toml")
-}
-
 /// Path to the PID file written by `havn gateway start --detach`.
 #[must_use]
 pub fn pid_file(cfg: &CliConfig) -> PathBuf {
