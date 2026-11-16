@@ -467,9 +467,9 @@ impl WebChatRouter {
             .await
     }
 
-    /// Offer `server_msg` to the tabs of the session that have room for it,
-    /// for what only shows progress: a tab whose queue is full misses it
-    /// and stays open.
+    /// Offer `server_msg` to the tabs of the session whose queue is at
+    /// least half free, for what only shows progress: no tab is closed for
+    /// it, nor filled so that the next reply would close it.
     async fn show_to_session(
         &self,
         agent_id: AgentId,
@@ -486,8 +486,11 @@ impl WebChatRouter {
         if targets.is_empty() {
             return Err(DeliverError::NoSession(session_id));
         }
+        // Half of each queue stays free for what must arrive.
         for tx in targets {
-            let _ = tx.try_send(server_msg.clone());
+            if tx.capacity() * 2 >= tx.max_capacity() {
+                let _ = tx.try_send(server_msg.clone());
+            }
         }
         Ok(())
     }

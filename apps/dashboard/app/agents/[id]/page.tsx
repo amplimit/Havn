@@ -381,7 +381,7 @@ export default function ChatPage({
           // (agent gone) ends the wait for all of them.
           if (msg.type === "approval") {
             // The card says what waits; the step before it is not running.
-            setStep(null);
+            if (!msg.conversation || msg.conversation === chatIdRef.current) setStep(null);
             // The reply still runs; it waits for this answer. Requests are
             // sent again to a reconnecting tab, so keep one card per id.
             setApprovals((prev) => (prev.some((a) => a.id === msg.id) ? prev : [...prev, msg]));
