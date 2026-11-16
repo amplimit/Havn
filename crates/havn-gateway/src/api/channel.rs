@@ -319,6 +319,12 @@ const RECEIVED_FOR: Duration = Duration::from_secs(3600);
 const MAX_RECEIVED: usize = 2000;
 /// Files one message carries at most.
 const MAX_MESSAGE_FILES: usize = 10;
+/// Files one sender may send in [`RECEIVED_FOR`].
+const MAX_SENDER_FILES: usize = 60;
+/// Bytes of a sender id, at most.
+const MAX_SENDER_BYTES: usize = 128;
+const FILE_LOST_MESSAGE: &str =
+    "The file did not reach the agent (it may have restarted meanwhile). Please send it again.";
 
 /// The files channel senders sent, by agent and inbox path.
 fn received() -> &'static std::sync::Mutex<HashMap<(havn_core::AgentId, String), Received>> {
@@ -348,6 +354,9 @@ pub async fn upload(
     authenticate(&state, &account, &headers).await?;
     channel_id_codec::validate_channel_id_part("sender_id", &q.sender)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    if q.sender.len() > MAX_SENDER_BYTES {
+        return Err(ApiError::BadRequest("the sender id is too long".into()));
+    }
     let agent_id = channel_router::agent_for_account(&state.bindings, &q.channel, &q.account)
         .and_then(|a| havn_core::AgentId::from_str(a).ok())
         .ok_or(ApiError::NotFound)?;
@@ -374,9 +383,17 @@ pub async fn upload(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or(ApiError::NotFound)?;
+    if !sender_may_send(&q.channel, &q.account, &q.sender) {
+        return Err(ApiError::Conflict(format!(
+            "this sender sent {MAX_SENDER_FILES} files in the last hour; wait a while"
+        )));
+    }
+    let uploader = crate::api::files::Uploader::Account {
+        channel: q.channel.clone(),
+        account: q.account.clone(),
+    };
     let attachment =
-        crate::api::files::receive(&state, agent_id, agent.owner_id, &q.name, &headers, body)
-            .await?;
+        crate::api::files::receive(&state, agent_id, uploader, &q.name, &headers, body).await?;
     crate::audit::record_agent_action(
         &state.db,
         agent.owner_id,
@@ -392,11 +409,18 @@ pub async fn upload(
         }),
     )
     .await;
-    {
+    let forgotten = {
         let mut waiting = received()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        waiting.retain(|_, r| r.at.elapsed() < RECEIVED_FOR);
+        let mut forgotten: Vec<(havn_core::AgentId, havn_core::Attachment)> = Vec::new();
+        waiting.retain(|(agent, _), r| {
+            let keep = r.at.elapsed() < RECEIVED_FOR;
+            if !keep {
+                forgotten.push((*agent, r.attachment.clone()));
+            }
+            keep
+        });
         while waiting.len() >= MAX_RECEIVED {
             let Some(oldest) = waiting
                 .iter()
@@ -405,7 +429,9 @@ pub async fn upload(
             else {
                 break;
             };
-            waiting.remove(&oldest);
+            if let Some(r) = waiting.remove(&oldest) {
+                forgotten.push((oldest.0, r.attachment));
+            }
         }
         waiting.insert(
             (agent_id, attachment.path.clone()),
@@ -417,8 +443,72 @@ pub async fn upload(
                 at: Instant::now(),
             },
         );
+        forgotten
+    };
+    // Files no message carried leave the inbox with their record.
+    if !forgotten.is_empty() {
+        let workspaces: Vec<(std::path::PathBuf, havn_core::Attachment)> = forgotten
+            .into_iter()
+            .map(|(agent, a)| (crate::api::agents::workspace_for(&state, agent), a))
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            for (workspace, a) in &workspaces {
+                crate::api::files::discard(workspace, a);
+            }
+        });
     }
     Ok(axum::Json(attachment))
+}
+
+/// Whether `sender` may send another file now, counting it if so.
+fn sender_may_send(channel: &str, account: &str, sender: &str) -> bool {
+    static SENT: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<(String, String, String), VecDeque<Instant>>>,
+    > = std::sync::OnceLock::new();
+    let mut sent = SENT
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    sent.retain(|_, times| {
+        while times.front().is_some_and(|t| t.elapsed() >= RECEIVED_FOR) {
+            times.pop_front();
+        }
+        !times.is_empty()
+    });
+    let times = sent
+        .entry((channel.to_string(), account.to_string(), sender.to_string()))
+        .or_default();
+    if times.len() >= MAX_SENDER_FILES {
+        return false;
+    }
+    times.push_back(Instant::now());
+    true
+}
+
+/// Put back attachments [`take_received`] took for a message that then
+/// did not reach the agent, so the adapter can send it again.
+fn restore_received(
+    agent_id: havn_core::AgentId,
+    channel: &str,
+    account: &str,
+    sender: &str,
+    attachments: Vec<havn_core::Attachment>,
+) {
+    let mut waiting = received()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for attachment in attachments {
+        waiting.insert(
+            (agent_id, attachment.path.clone()),
+            Received {
+                channel: channel.to_string(),
+                account: account.to_string(),
+                sender: sender.to_string(),
+                attachment,
+                at: Instant::now(),
+            },
+        );
+    }
 }
 
 /// The attachments of a message from `sender`: of the files it names,
@@ -434,6 +524,15 @@ fn take_received(
     let mut waiting = received()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if named.len() > MAX_MESSAGE_FILES {
+        warn!(
+            channel,
+            account,
+            sender,
+            files = named.len(),
+            "a message names more files than it may carry; keeping the first"
+        );
+    }
     named
         .iter()
         .take(MAX_MESSAGE_FILES)
@@ -446,7 +545,7 @@ fn take_received(
                     && r.at.elapsed() < RECEIVED_FOR
             });
             if !theirs {
-                warn!(channel, account, path = %a.path, "dropping an attachment the sender did not send");
+                warn!(channel, account, sender, path = ?a.path, "dropping an attachment the sender did not send");
                 return None;
             }
             waiting.remove(&key).map(|r| r.attachment)
@@ -831,7 +930,7 @@ async fn handle_session(
 /// no binding exists, log + drop — the user gets no reply, which is
 /// the operator-visible signal that they need to add a binding (the
 /// startup `dangling_bindings` warning catches the inverse case).
-async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
+async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound) {
     let agent_id_str =
         match channel_router::agent_for_account(&state.bindings, channel, &inb.account_id) {
             Some(s) => s,
@@ -931,6 +1030,20 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
     }
 
     let encoded_channel_id = channel_id_codec::encode(channel, &inb.account_id, &inb.sender_id);
+    let named = std::mem::take(&mut inb.attachments);
+    // A message with files goes as text: what an adapter sent as a file
+    // or image with them keeps its caption.
+    if !named.is_empty() {
+        match &inb.content {
+            ChannelMessageContent::Image { caption, .. }
+            | ChannelMessageContent::File { caption, .. } => {
+                inb.content = ChannelMessageContent::Text {
+                    text: caption.clone().unwrap_or_default(),
+                };
+            }
+            _ => {}
+        }
+    }
     let content = match inb.content {
         ChannelMessageContent::Text { text } => MessageContent::Text { text },
         ChannelMessageContent::Image { url, caption } => MessageContent::Image { url, caption },
@@ -1015,13 +1128,7 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
         channel: channel.to_string(),
         content,
         timestamp: inb.timestamp,
-        attachments: take_received(
-            agent_id,
-            channel,
-            &inb.account_id,
-            &inb.sender_id,
-            &inb.attachments,
-        ),
+        attachments: Vec::new(),
         raw: inb.raw.unwrap_or(serde_json::Value::Null),
     };
 
@@ -1095,6 +1202,26 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
         }
     }
 
+    // The files go with the message once it can reach the agent; a
+    // command does not carry them.
+    let mut msg = msg;
+    if !new_chat && msg.branch.is_none() && !named.is_empty() {
+        msg.attachments = take_received(agent_id, channel, &inb.account_id, &inb.sender_id, &named);
+        let empty = matches!(&msg.content, MessageContent::Text { text } if text.trim().is_empty());
+        if msg.attachments.is_empty() && empty {
+            tell_sender(
+                state,
+                channel,
+                &inb.account_id,
+                &inb.sender_id,
+                &inb.channel_message_id,
+                FILE_LOST_MESSAGE,
+            )
+            .await;
+            return;
+        }
+    }
+    let carried = msg.attachments.clone();
     let frame = if new_chat {
         GatewayToAgent::NewChat(havn_proto::NewChat {
             channel_id: msg.channel_id,
@@ -1103,6 +1230,7 @@ async fn handle_inbound(state: &AppState, channel: &str, inb: ChannelInbound) {
         GatewayToAgent::InboundMessage(msg)
     };
     if let Err(e) = state.registry.send(agent_id, frame).await {
+        restore_received(agent_id, channel, &inb.account_id, &inb.sender_id, carried);
         warn!(
             channel,
             account = %inb.account_id,
