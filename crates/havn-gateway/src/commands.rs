@@ -174,6 +174,11 @@ pub fn parse(text: &str) -> Option<Parsed<'_>> {
         return None;
     }
     let lower = name.to_ascii_lowercase();
+    // Telegram sends it as a user's first message to a bot: the agent
+    // greets them.
+    if lower == "start" {
+        return None;
+    }
     Some(match find(&lower) {
         Some(command) if command.args.is_empty() && !args.is_empty() => Parsed::Misused(command),
         Some(command) => Parsed::Known(command, args),
@@ -281,6 +286,19 @@ pub enum Action {
     Reply(String),
     /// Send this to the agent, which answers in the conversation.
     Agent(ChatCommand),
+}
+
+/// What to tell the sender when `frame` cannot reach the agent but did
+/// its part already: `/agent_model` saved the agent's model.
+#[must_use]
+pub fn saved_already(frame: &havn_proto::GatewayToAgent) -> Option<&'static str> {
+    match frame {
+        havn_proto::GatewayToAgent::ChatCommand(ChatCommand {
+            command: ChatCommandKind::AgentModel { .. },
+            ..
+        }) => Some("(Saved. The agent uses that model from its next start.)"),
+        _ => None,
+    }
 }
 
 /// Carry out `command` with `args` for `asker`. `/new`, `/stop` and
@@ -441,6 +459,17 @@ async fn model(state: &AppState, asker: &Asker, agent_wide: bool, args: &str) ->
         }
     };
     if !agent_wide {
+        if let Ok(Some(agent)) = agents_repo::find_by_id(&state.db, asker.agent_id).await {
+            crate::audit::record(
+                &state.db,
+                agent.owner_id,
+                agent.team_id,
+                Some(asker.agent_id),
+                "chat.model.changed",
+                serde_json::json!({ "model": chosen, "by": asker.who, "conversation": asker.scope }),
+            )
+            .await;
+        }
         return Action::Agent(ChatCommand {
             channel_id: asker.scope.clone(),
             conversation: asker.conversation.clone(),
@@ -545,7 +574,7 @@ async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> S
     else {
         return "(Nothing here is waiting for approval.)".into();
     };
-    crate::agent_socket::forward_decision(
+    let decided = crate::agent_socket::forward_decision(
         &state.registry,
         &state.db,
         &state.webchat_router,
@@ -556,6 +585,9 @@ async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> S
         remember,
     )
     .await;
+    if !decided {
+        return "(That step was decided or ended meanwhile; nothing changed.)".into();
+    }
     match (approve, remember) {
         (true, true) => format!(
             "(Approved {}, and the same step for the rest of the chat.)",
@@ -630,6 +662,9 @@ mod tests {
             Some("(/stop takes nothing after it: send /stop on its own.)")
         );
         assert!(parse("/model 2").expect("a command").refusal().is_none());
+        // Telegram's first message reaches the agent.
+        assert!(parse("/start").is_none());
+        assert!(parse("/start ref-42").is_none());
     }
 
     #[test]

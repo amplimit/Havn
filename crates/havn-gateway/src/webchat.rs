@@ -49,7 +49,13 @@ pub struct WebChatRouter {
     /// here instead of by an agent.
     gateway_waiters:
         Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<GatewayAnswer>>>>,
+    /// Chat commands sent to an agent for a session and not answered yet:
+    /// an agent's notice is shown only as such an answer.
+    command_replies: Arc<std::sync::Mutex<HashMap<(AgentId, SessionId), usize>>>,
 }
+
+/// Unanswered chat commands kept per session; more are not shown.
+const MAX_COMMANDS_WAITING: usize = 16;
 
 /// The owner's answer to a question of the gateway's own: allow, always,
 /// and who decided.
@@ -518,6 +524,41 @@ impl WebChatRouter {
         .await
     }
 
+    /// A chat command went to `agent_id` for `session_id`: its answer is
+    /// awaited. False when too many are awaited already.
+    pub fn expect_command_reply(&self, agent_id: AgentId, session_id: SessionId) -> bool {
+        let mut waiting = self
+            .command_replies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let n = waiting.entry((agent_id, session_id)).or_insert(0);
+        if *n >= MAX_COMMANDS_WAITING {
+            return false;
+        }
+        *n += 1;
+        true
+    }
+
+    /// Whether an answer of `agent_id` to a chat command of `session_id`
+    /// was awaited; it no longer is.
+    pub fn take_command_reply(&self, agent_id: AgentId, session_id: SessionId) -> bool {
+        let mut waiting = self
+            .command_replies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match waiting.get_mut(&(agent_id, session_id)) {
+            Some(n) if *n > 1 => {
+                *n -= 1;
+                true
+            }
+            Some(_) => {
+                waiting.remove(&(agent_id, session_id));
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The approval request of `agent_id` that has waited longest in
     /// conversation `channel_id`.
     pub fn oldest_approval(
@@ -860,6 +901,30 @@ mod tests {
                 panic!("expected AgentMessage, got Error")
             }
         }
+    }
+
+    #[test]
+    fn an_agents_notice_must_answer_a_command() {
+        let router = WebChatRouter::new();
+        let (agent, other) = (AgentId::new(), AgentId::new());
+        let session: SessionId = Uuid::now_v7();
+        assert!(!router.take_command_reply(agent, session), "nothing asked");
+        assert!(router.expect_command_reply(agent, session));
+        assert!(router.expect_command_reply(agent, session));
+        assert!(
+            !router.take_command_reply(other, session),
+            "another agent's"
+        );
+        assert!(router.take_command_reply(agent, session));
+        assert!(router.take_command_reply(agent, session));
+        assert!(!router.take_command_reply(agent, session), "both answered");
+        for _ in 0..MAX_COMMANDS_WAITING {
+            assert!(router.expect_command_reply(agent, session));
+        }
+        assert!(
+            !router.expect_command_reply(agent, session),
+            "too many waiting"
+        );
     }
 
     #[tokio::test]

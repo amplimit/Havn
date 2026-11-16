@@ -966,6 +966,10 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
             // A web chat shows it as a notice; a channel as any message.
             match msg.channel_id.parse::<crate::webchat::SessionId>() {
                 Ok(session) if crate::channel_id_codec::decode(&msg.channel_id).is_none() => {
+                    if !ctx.webchat_router.take_command_reply(agent_id, session) {
+                        warn!(%agent_id, "dropping a command answer no command asked for");
+                        return;
+                    }
                     let text = match msg.content {
                         havn_core::MessageContent::Text { text } => text,
                         _ => return,
@@ -1212,15 +1216,25 @@ async fn ask_for_approval(
         )
         .await;
     }
-    if crate::channel_id_codec::decode(&request.channel_id).is_some() {
+    if let Some((channel, account, _)) = crate::channel_id_codec::decode(&request.channel_id) {
+        let admins = ctx
+            .channels
+            .get(channel)
+            .and_then(|entry| entry.accounts.iter().find(|a| a.id == account))
+            .is_some_and(|acct| !acct.admins.is_empty());
         let message = OutboundMessage {
             conversation: None,
             channel_id: request.channel_id,
             content: havn_core::MessageContent::Text {
                 text: format!(
-                    "(A step of this reply waits for approval: {}. An admin can send /approve \
-                     or /deny; the agent's owner can also decide in the web chat.)",
-                    request.tool
+                    "(A step of this reply waits for approval: {}. {}the agent's owner can \
+                     decide in the web chat.)",
+                    request.tool,
+                    if admins {
+                        "An admin can send /approve or /deny here, or "
+                    } else {
+                        ""
+                    }
                 ),
             },
             reply_to: None,
@@ -1232,7 +1246,7 @@ async fn ask_for_approval(
 /// The owner's answer to approval request `id` of `agent_id`: sent to the
 /// agent for the request's conversation, closed in every tab, and audited
 /// as `tool.approval.decided` with who decided. A request no longer
-/// waiting is ignored.
+/// waiting is ignored, and false.
 #[allow(
     clippy::too_many_arguments,
     reason = "one call site; a parameter struct would only rename them"
@@ -1246,15 +1260,15 @@ pub async fn forward_decision(
     id: &str,
     approve: bool,
     remember: bool,
-) {
+) -> bool {
     let Some(request) = router.close_approval(agent_id, id).await else {
-        return;
+        return false;
     };
     // The gateway's own question (the egress proxy) is answered here and
     // audited where it was asked.
     if let Some(waiter) = router.take_gateway_waiter(id) {
         let _ = waiter.send((approve, remember, decided_by.to_string()));
-        return;
+        return true;
     }
     if let Ok(Some(agent)) = agents_repo::find_by_id(db, agent_id).await {
         crate::audit::record(
@@ -1286,6 +1300,7 @@ pub async fn forward_decision(
     {
         warn!(%agent_id, error = ?e, "failed to forward an approval decision");
     }
+    true
 }
 
 /// Send `msg` from `agent_id` where its channel id points, with the checks

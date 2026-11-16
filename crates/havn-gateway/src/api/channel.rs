@@ -907,19 +907,18 @@ async fn handle_session(
             ChannelFrame::Pong => {
                 // Server-initiated keepalive lands later. Silently accept.
             }
-            // ChannelFrame is non_exhaustive but serde already rejects
-            // unknown discriminator strings before we reach this match
-            // (see `unknown_kind_is_rejected` in havn-proto's tests).
-            // The wildcard exists only to satisfy the compiler against
-            // future variants added by this crate's own future selves
-            // — at which point the right thing is to handle them, not
-            // silently drop. Compile error here = "you added a variant,
-            // now wire it up".
+            ChannelFrame::Commands(_) => {
+                warn!(channel = %channel_id, account = %account_id, "dropping Commands frame from adapter (wrong direction)");
+            }
+            // ChannelFrame is non_exhaustive; what an adapter sends is
+            // never a reason to stop the gateway.
             #[allow(
                 unreachable_patterns,
                 reason = "compiler requires arm for non_exhaustive enum"
             )]
-            _ => unreachable!("serde rejects unknown ChannelFrame kinds before this match"),
+            _ => {
+                warn!(channel = %channel_id, account = %account_id, "dropping a channel frame of a kind the gateway does not take");
+            }
         }
     }
 
@@ -1266,11 +1265,13 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
 
     // A command for the agent goes now that it runs.
     if let Some(frame) = command_frame {
+        let saved = crate::commands::saved_already(&frame);
         if let Err(e) = state.registry.send(agent_id, frame).await {
             warn!(channel, %agent_id, error = ?e, "failed to forward a chat command");
-            let text = match e {
-                SendError::Draining => GATEWAY_RESTARTING_MESSAGE,
-                _ => AGENT_UNREACHABLE_MESSAGE,
+            let text = match (saved, e) {
+                (Some(saved), _) => saved,
+                (None, SendError::Draining) => GATEWAY_RESTARTING_MESSAGE,
+                (None, _) => AGENT_UNREACHABLE_MESSAGE,
             };
             tell_sender(
                 state,

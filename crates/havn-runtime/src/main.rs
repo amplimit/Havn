@@ -1726,7 +1726,7 @@ async fn chat_command(ctx: &Ctx, command: &havn_proto::ChatCommand) -> (Option<S
             if ctx.turns.waiting(&chat) > 0 {
                 return (
                     Some(chat),
-                    "(A reply is still being written here. Wait for it, or send /stop, then                      /undo.)"
+                    "(A reply is still being written here. Wait for it, or send /stop, then /undo.)"
                         .into(),
                 );
             }
@@ -1737,7 +1737,7 @@ async fn chat_command(ctx: &Ctx, command: &havn_proto::ChatCommand) -> (Option<S
                         shown.push_str("...");
                     }
                     format!(
-                        "(Took back your message \"{}\" and my reply. Your next message \
+                        "(Took back your message \"{}\" and what followed it. Your next message \
                          continues from before it.)",
                         shown.replace('\n', " ")
                     )
@@ -1972,8 +1972,8 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     };
 
     // The chat's own model, when `/model` set one.
-    let chat_model = match conversations::chat_info(&ctx.pool, &chat).await {
-        Ok(info) => info.and_then(|i| i.model).map(Arc::new),
+    let chat_model = match conversations::chat_model(&ctx.pool, &chat).await {
+        Ok(model) => model.map(Arc::new),
         Err(e) => {
             warn!(error = %e, "could not read the chat's model; using the agent's");
             None

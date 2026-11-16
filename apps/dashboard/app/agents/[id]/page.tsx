@@ -237,6 +237,8 @@ export default function ChatPage({
   // socket handlers read.
   const [chat, setChat] = useState<string | null>(null);
   const chatIdRef = useRef<string | null>(null);
+  // `/undo`s sent whose answer has not come: the chat reloads with it.
+  const undoing = useRef(0);
   const [chats, setChats] = useState<ChatSummary[]>([]);
   // For the socket's handler, which outlives a render.
   const chatsRef = useRef<ChatSummary[]>([]);
@@ -485,8 +487,12 @@ export default function ChatPage({
             const current = chatIdRef.current;
             if (msg.conversation && current && msg.conversation !== current) return;
             pushBubble("system", msg.content);
-            // What `/undo` took back leaves the screen.
-            void catchUp();
+            // What `/undo` took back leaves the screen; other answers leave
+            // the chat as it is, messages still waiting included.
+            if (undoing.current > 0) {
+              undoing.current -= 1;
+              void catchUp();
+            }
             return;
           }
           if (msg.type === "memory") {
@@ -653,6 +659,7 @@ export default function ChatPage({
         return;
       }
       pushBubble("system", text.trim());
+      if (command.bare && command.name === "undo") undoing.current += 1;
       chatRef.current.send(text.trim(), chatIdRef.current ?? undefined);
       return;
     }

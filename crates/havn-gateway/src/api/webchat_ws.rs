@@ -213,15 +213,29 @@ async fn web_command(
             _ => match crate::commands::run(state, &asker, command, args).await {
                 crate::commands::Action::Reply(text) => text,
                 crate::commands::Action::Agent(command) => {
-                    match state
-                        .registry
-                        .send(asker.agent_id, GatewayToAgent::ChatCommand(command))
-                        .await
+                    let frame = GatewayToAgent::ChatCommand(command);
+                    let saved = crate::commands::saved_already(&frame);
+                    if !state
+                        .webchat_router
+                        .expect_command_reply(asker.agent_id, session)
                     {
-                        Ok(()) => return,
-                        Err(e) => {
-                            warn!(agent_id = %asker.agent_id, error = ?e, "failed to forward a chat command");
-                            "(The agent is not reachable right now; try again in a moment.)".into()
+                        "(Too many commands are waiting for an answer; try again in a moment.)"
+                            .into()
+                    } else {
+                        match state.registry.send(asker.agent_id, frame).await {
+                            Ok(()) => return,
+                            Err(e) => {
+                                state
+                                    .webchat_router
+                                    .take_command_reply(asker.agent_id, session);
+                                warn!(agent_id = %asker.agent_id, error = ?e, "failed to forward a chat command");
+                                saved
+                                    .unwrap_or(
+                                        "(The agent is not reachable right now; try again in a \
+                                         moment.)",
+                                    )
+                                    .into()
+                            }
                         }
                     }
                 }

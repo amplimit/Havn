@@ -314,6 +314,15 @@ pub async fn chat_info(pool: &SqlitePool, chat: &str) -> Result<Option<ChatInfo>
     }))
 }
 
+/// Chat `chat`'s own model, when it has one.
+pub async fn chat_model(pool: &SqlitePool, chat: &str) -> Result<Option<String>> {
+    let found: Option<(Option<String>,)> = sqlx::query_as("SELECT model FROM chats WHERE id = ?1")
+        .bind(chat)
+        .fetch_optional(pool)
+        .await?;
+    Ok(found.and_then(|(model,)| model))
+}
+
 /// Set chat `chat`'s own model, or clear it with `None`. False when there
 /// is no such chat.
 pub async fn set_chat_model(pool: &SqlitePool, chat: &str, model: Option<&str>) -> Result<bool> {
@@ -1351,6 +1360,10 @@ mod tests {
         );
         let info = chat_info(&pool, &chat).await.expect("db").expect("chat");
         assert_eq!(info.model.as_deref(), Some("deepseek:deepseek-chat"));
+        assert_eq!(
+            chat_model(&pool, &chat).await.expect("db").as_deref(),
+            Some("deepseek:deepseek-chat")
+        );
         assert!(set_chat_model(&pool, &chat, None).await.expect("db"));
         assert_eq!(
             chat_info(&pool, &chat)
