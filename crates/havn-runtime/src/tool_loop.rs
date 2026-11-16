@@ -308,6 +308,9 @@ async fn execute_tool_uses(
         let input = block.get("input").cloned().unwrap_or(Value::Null);
 
         debug!(name, id, context, "tool call");
+        if context == crate::tools::context::WEBCHAT {
+            show_step(handle, name, &input);
+        }
         let result = handle
             .registry
             .execute_for(context, name, input, &handle.tool_env)
@@ -322,6 +325,46 @@ async fn execute_tool_uses(
             "content": text,
             "is_error": is_error,
         }));
+    }
+    out
+}
+
+/// Tell the conversation the turn answers which tool it is about to call
+/// and on what. Never waits: a step that does not fit is not shown.
+fn show_step(handle: &LoopHandle, tool: &str, input: &Value) {
+    let Ok(channel_id) = crate::tools::gateway::CONVERSATION.try_with(Clone::clone) else {
+        return;
+    };
+    let conversation = crate::tools::gateway::CHAT.try_with(Clone::clone).ok();
+    let _ = handle
+        .writer_tx
+        .try_send(AgentToGateway::Step(havn_proto::Step {
+            channel_id,
+            conversation,
+            tool: tool.to_string(),
+            detail: step_detail(input),
+        }));
+}
+
+/// What a tool call works on, as one line: the first of the fields that
+/// name it, never a file's or message's content.
+fn step_detail(input: &Value) -> String {
+    const NAMING: [&str; 8] = [
+        "command", "query", "url", "path", "key", "name", "prompt", "task",
+    ];
+    let Some(text) = NAMING
+        .iter()
+        .find_map(|k| input.get(*k).and_then(Value::as_str))
+    else {
+        return String::new();
+    };
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = line
+        .chars()
+        .take(havn_proto::MAX_STEP_DETAIL_CHARS)
+        .collect();
+    if out.len() < line.len() {
+        out.push('…');
     }
     out
 }
@@ -597,6 +640,24 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn a_step_names_what_a_call_works_on_never_its_content() {
+        let detail = |v: Value| step_detail(&v);
+        assert_eq!(
+            detail(serde_json::json!({"command": "ls -la
+  /tmp"})),
+            "ls -la /tmp"
+        );
+        assert_eq!(
+            detail(serde_json::json!({"path": "notes.md", "content": "secret"})),
+            "notes.md"
+        );
+        assert_eq!(detail(serde_json::json!({"content": "secret"})), "");
+        let long = detail(serde_json::json!({"query": "x".repeat(500)}));
+        assert_eq!(long.chars().count(), havn_proto::MAX_STEP_DETAIL_CHARS + 1);
+        assert!(long.ends_with('…'));
+    }
 
     #[test]
     fn stopped_replies_keep_the_text_so_far() {

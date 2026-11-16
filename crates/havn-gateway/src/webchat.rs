@@ -166,6 +166,13 @@ pub enum ServerMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         conversation: Option<String>,
     },
+    /// The tool call the reply being written is about to make.
+    Step {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        conversation: Option<String>,
+        tool: String,
+        detail: String,
+    },
     /// What the reply just sent saved to or forgot from memory.
     Memory {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -366,6 +373,36 @@ impl WebChatRouter {
             },
         };
         self.send_to_session(agent_id, session_id, server_msg).await
+    }
+
+    /// Show the tabs of the session a turn answers the tool call it is
+    /// about to make. Ignored for conversations that are not webchat
+    /// sessions.
+    pub async fn step(
+        &self,
+        agent_id: AgentId,
+        step: havn_proto::Step,
+    ) -> Result<(), DeliverError> {
+        let session_id: SessionId = step
+            .channel_id
+            .parse()
+            .map_err(|_| DeliverError::InvalidChannelId(step.channel_id.clone()))?;
+        let line = |text: &str, max: usize| -> String {
+            text.chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .take(max)
+                .collect()
+        };
+        self.send_to_session(
+            agent_id,
+            session_id,
+            ServerMessage::Step {
+                conversation: step.conversation.filter(|c| c.len() <= MAX_CONVERSATION_ID),
+                tool: line(&step.tool, 64),
+                detail: line(&step.detail, havn_proto::MAX_STEP_DETAIL_CHARS + 1),
+            },
+        )
+        .await
     }
 
     /// Show the tabs of the session a reply went to what its turn changed
@@ -710,7 +747,8 @@ mod tests {
             | ServerMessage::Approval { .. }
             | ServerMessage::ApprovalClosed { .. }
             | ServerMessage::Memory { .. }
-            | ServerMessage::File { .. } => {
+            | ServerMessage::File { .. }
+            | ServerMessage::Step { .. } => {
                 panic!("expected AgentMessage, got Error")
             }
         }
@@ -803,7 +841,8 @@ mod tests {
                 | ServerMessage::Approval { .. }
                 | ServerMessage::ApprovalClosed { .. }
                 | ServerMessage::Memory { .. }
-                | ServerMessage::File { .. } => {
+                | ServerMessage::File { .. }
+                | ServerMessage::Step { .. } => {
                     panic!("unexpected Error")
                 }
             }
@@ -846,7 +885,8 @@ mod tests {
                 | ServerMessage::Approval { .. }
                 | ServerMessage::ApprovalClosed { .. }
                 | ServerMessage::Memory { .. }
-                | ServerMessage::File { .. } => {
+                | ServerMessage::File { .. }
+                | ServerMessage::Step { .. } => {
                     panic!("unexpected Error")
                 }
             }

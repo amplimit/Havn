@@ -82,7 +82,27 @@ pub enum AgentToGateway {
     /// What a reply's turn saved to or forgot from the agent's memory,
     /// sent after the reply, for the dashboard to show under it.
     MemoryChanged(MemoryChanged),
+    /// The tool call a turn answering someone is about to make, for the
+    /// dashboard to show while the reply is being written (issue #162).
+    Step(Step),
 }
+
+/// See [`AgentToGateway::Step`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Step {
+    /// The conversation the turn answers.
+    pub channel_id: String,
+    /// Its chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
+    pub tool: String,
+    /// What it works on: the command, query, URL or path, one line.
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// Characters of a [`Step`]'s detail shown.
+pub const MAX_STEP_DETAIL_CHARS: usize = 160;
 
 /// See [`AgentToGateway::MemoryChanged`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
