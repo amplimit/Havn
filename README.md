@@ -312,6 +312,18 @@ id = "openrouter:deepseek/deepseek-v4.1-flash-1017"
 max_output_tokens = 32000       # optional cap on max_tokens for this model
 ```
 
+A model is asked to think only when its entry says how, since providers and models take it differently and no list of them is kept: `thinking = { style = "toggle" }` is on or off; `style = "effort"` takes `levels` (`["low", "medium", "high"]`, as the model names them); `style = "budget"` takes `budgets`, numbers of tokens (not for `openai:` models). `default` is a chat's choice when it made none (off without one), and `mandatory = true` leaves off out for a model that always thinks. The gateway asks for it as each API takes it: Anthropic `thinking` with a token budget (levels map to budgets, and temperature is dropped), OpenAI-compatible `reasoning_effort`, OpenRouter `reasoning`, Gemini `thinkingConfig`; the reasoning a model returns is shown folded in the web chat. Set it with `havn model thinking <id> effort:low,medium,high --default medium` (or `toggle`, `budget:2048,8192`, `none`) or on the models page, and try it with `havn model check <id>` or the page's check button, which sends the model a very short question and says whether it answered with reasoning, without, or was refused. The web chat's composer picks the model and the thinking of one chat (`/think` in a chat too, for the agent's owner or an account's admins); the thinking menu is greyed out for a model without `thinking`, and a choice the chat's model does not take falls back to its default. Titles, summaries and memory curation are asked not to think.
+
+```toml
+[[llm.models]]
+id = "openrouter:deepseek/deepseek-v4.1-flash-1017"
+thinking = { style = "effort", levels = ["low", "medium", "high"], default = "medium" }
+
+[[llm.models]]
+id = "anthropic:claude-sonnet-4-6"
+thinking = { style = "budget", budgets = [2048, 8192, 16384] }
+```
+
 On the first start after an upgrade from a gateway without the list, agent and policy model names are rewritten to `provider:model` with the provider older gateways inferred from the name, and if `config.toml` has no `[llm] models` yet, the models existing agents use are added to it (led by `anthropic:claude-opus-4-6`, the model older gateways gave agents without one, if there are such agents). A new install, or an upgraded one without agents, starts with an empty list: add a model with `havn model add` before the first chat.
 
 `max_tokens` on every LLM call is capped by `[llm] max_tokens_ceiling` (default 128000, the largest output limit of a known model; applied on `havn gateway restart`), whatever agents ask for. A running call holds a reservation of up to that many output tokens against the caps it is billed to, so with small caps on a shared credential, lower it to keep one user's large `max_tokens` from tying up everyone else's remaining budget:
@@ -543,15 +555,16 @@ A message that is only a command is answered by the gateway or the agent and nev
 | `/stop` | stops the reply being written |
 | `/retry` | answers the last message again |
 | `/undo` | takes back the last message and its reply; they stay stored as a version |
-| `/status` | the agent, the chat's model, its title and length, replies waiting |
+| `/status` | the agent, the chat's model and thinking, its title and length, replies waiting |
 | `/model [name\|number\|default]` | lists the models the agent may use, or sets this chat's own; `/new` goes back to the agent's |
+| `/think [off\|on\|level\|tokens\|default]` | shows or sets how much this chat's model thinks, within what its `thinking` offers |
 | `/agent_model [name\|number\|default]` | sets the agent's model, as its settings page does, for every chat without one of its own |
 | `/usage [days]` | the agent's model calls and tokens, per model (30 days by default) |
 | `/approve [always]`, `/deny` | answer the step of this conversation waiting for approval |
 | `/whoami` | who the gateway takes you for, and whether you may use the admin commands |
 | `/help` (`/commands`) | lists them |
 
-`/model`, `/agent_model`, `/usage`, `/approve` and `/deny` spend the agent owner's credentials or let a step through, so only admins may use them: in the dashboard, the agent's owner; in a channel, the senders listed in the account's `admins` (none by default):
+`/model`, `/think`, `/agent_model`, `/usage`, `/approve` and `/deny` spend the agent owner's credentials or let a step through, so only admins may use them: in the dashboard, the agent's owner; in a channel, the senders listed in the account's `admins` (none by default):
 
 ```toml
 [[channels.telegram.accounts]]
