@@ -519,9 +519,17 @@ pub enum DataQuery {
     ChatSettings {
         channel_id: String,
         conversation: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present"
+        )]
         model: Option<Option<String>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present"
+        )]
         thinking: Option<Option<String>>,
     },
     /// Search the chats of `channel_id` (issue #175): `{"chats": [...],
@@ -902,11 +910,39 @@ pub enum CronOutcome {
     Error { message: String },
 }
 
+/// A field that is present, `null` included: `null` clears, absent keeps.
+fn present<'de, D>(d: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(d).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn chat_settings_tell_clearing_from_keeping() {
+        let q = DataQuery::ChatSettings {
+            channel_id: "c".into(),
+            conversation: "x".into(),
+            model: Some(None),
+            thinking: None,
+        };
+        let text = serde_json::to_string(&q).expect("encode");
+        let back: DataQuery = serde_json::from_str(&text).expect("decode");
+        let DataQuery::ChatSettings {
+            model, thinking, ..
+        } = back
+        else {
+            panic!("not chat settings: {text}");
+        };
+        assert_eq!(model, Some(None), "null clears: {text}");
+        assert_eq!(thinking, None, "absent keeps: {text}");
+    }
 
     #[test]
     fn a_memory_the_user_saves_is_checked() {

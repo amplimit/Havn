@@ -636,6 +636,43 @@ mod tests {
     }
 
     #[test]
+    fn thinking_is_asked_for_and_thoughts_kept_apart() {
+        use super::super::Reasoning;
+        let ask = |reasoning: Option<Reasoning>| {
+            let mut r = req(
+                vec![AnthropicMessage {
+                    role: "user".into(),
+                    content: json!("hi"),
+                }],
+                None,
+            );
+            r.reasoning = reasoning;
+            anthropic_to_gemini(&r).expect("translate")["generationConfig"]["thinkingConfig"]
+                .clone()
+        };
+        assert_eq!(ask(Some(Reasoning::Off)), json!({"thinkingBudget": 0}));
+        assert_eq!(
+            ask(Some(Reasoning::Budget(2048))),
+            json!({"thinkingBudget": 2048, "includeThoughts": true})
+        );
+        assert_eq!(
+            ask(Some(Reasoning::Effort("low".into()))),
+            json!({"thinkingLevel": "low", "includeThoughts": true})
+        );
+        assert_eq!(ask(None), Value::Null);
+        let raw = json!({"candidates": [{"content": {"role": "model", "parts": [
+            {"text": "first the sum", "thought": true},
+            {"text": "42"},
+        ]}, "finishReason": "STOP"}]});
+        let resp = gemini_to_anthropic(&raw, "gemini-x").expect("translate");
+        assert_eq!(
+            resp.content[0],
+            json!({"type": "thinking", "thinking": "first the sum"})
+        );
+        assert_eq!(resp.content[1], json!({"type": "text", "text": "42"}));
+    }
+
+    #[test]
     fn translates_assistant_to_model_role() {
         let r = req(
             vec![AnthropicMessage {
