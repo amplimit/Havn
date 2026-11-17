@@ -110,6 +110,9 @@ pub struct GatewayConfig {
     /// ```
     #[serde(default)]
     pub llm: LlmConfig,
+    /// What the dashboard may show of agents' workspaces (issue #177).
+    #[serde(default)]
+    pub workspace: WorkspaceConfig,
     /// Backend of the `web_search` tool.
     ///
     /// TOML form:
@@ -329,6 +332,46 @@ pub struct NetworkConfig {
     pub default_egress: String,
 }
 
+/// `[workspace]`: whether owners may browse their agents' workspaces from
+/// the dashboard. Off unless turned on; with it on, each agent's page is on
+/// unless its owner turns it off.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct WorkspaceConfig {
+    pub browse: bool,
+}
+
+/// Set `[workspace] browse` in the config file at `path`, keeping the rest
+/// of the file as it is.
+pub fn write_workspace_browse(path: &std::path::Path, browse: bool) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let target = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(e) => return Err(e).with_context(|| format!("resolving {}", path.display())),
+    };
+    let raw = match std::fs::read_to_string(&target) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", target.display())),
+    };
+    let mut doc: toml_edit::DocumentMut = raw
+        .parse()
+        .with_context(|| format!("parsing {}", target.display()))?;
+    let item = doc
+        .entry("workspace")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    if let Some(inline) = item.as_inline_table_mut() {
+        let table = std::mem::replace(inline, toml_edit::InlineTable::new()).into_table();
+        *item = toml_edit::Item::Table(table);
+    }
+    let table = item
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("workspace in {} is not a table", target.display()))?;
+    table["browse"] = toml_edit::value(browse);
+    crate::model_catalog::replace_file(&target, doc.to_string().as_bytes())
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct LlmConfig {
@@ -514,6 +557,7 @@ impl Default for GatewayConfig {
             seccomp: SeccompConfig::default(),
             network: NetworkConfig::default(),
             llm: LlmConfig::default(),
+            workspace: WorkspaceConfig::default(),
             search: SearchConfig::default(),
             fetch: FetchConfig::default(),
             channels: std::collections::BTreeMap::new(),

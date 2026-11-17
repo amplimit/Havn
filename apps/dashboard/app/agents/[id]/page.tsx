@@ -26,6 +26,7 @@ import {
   Check,
   Copy,
   FileText,
+  FolderOpen,
   Layers,
   MessageSquarePlus,
   MessagesSquare,
@@ -217,6 +218,14 @@ export default function ChatPage({
   const [agent, setAgent] = useState<AgentView | null>(null);
   const [me, setMe] = useState<MeView | null>(null);
   const [embedding, setEmbedding] = useState<EmbeddingStatus | null>(null);
+  // Whether the agent's workspace can be browsed (issue #177).
+  const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  useEffect(() => {
+    api.workspace
+      .access(id)
+      .then((a) => setWorkspaceOpen(a.enabled))
+      .catch(() => setWorkspaceOpen(false));
+  }, [id]);
   const [error, setError] = useState<string | null>(null);
   const [bubbles, setBubbles] = useState<Bubble[]>([]);
   const [draft, setDraft] = useState("");
@@ -1058,6 +1067,16 @@ export default function ChatPage({
               <BookOpen size={16} className="shrink-0" aria-hidden="true" />
               skills
             </Link>
+            {workspaceOpen && (
+              <Link
+                href={`/agents/${agent.id}/workspace`}
+                className="btn-ghost inline-flex items-center gap-1.5"
+                title="Browse the files in the agent's workspace"
+              >
+                <FolderOpen size={16} className="shrink-0" aria-hidden="true" />
+                workspace
+              </Link>
+            )}
             <Link
               href={`/agents/${agent.id}/settings`}
               className="btn-ghost inline-flex items-center gap-1.5"
