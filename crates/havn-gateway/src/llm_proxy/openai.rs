@@ -89,7 +89,7 @@ impl LlmProvider for OpenAiProvider {
         api_key: &str,
         request: &AnthropicRequest,
     ) -> Result<AnthropicResponse, ProviderError> {
-        let body = anthropic_to_openai(request, self.max_tokens_field)
+        let body = anthropic_to_openai(request, self.max_tokens_field, self.name)
             .map_err(|e| ProviderError::Translation(format!("request build: {e}")))?;
 
         let mut builder = http
@@ -127,7 +127,7 @@ impl LlmProvider for OpenAiProvider {
         request: &AnthropicRequest,
         text: &TextSink,
     ) -> Result<AnthropicResponse, ProviderError> {
-        let mut body = anthropic_to_openai(request, self.max_tokens_field)
+        let mut body = anthropic_to_openai(request, self.max_tokens_field, self.name)
             .map_err(|e| ProviderError::Translation(format!("request build: {e}")))?;
         body["stream"] = Value::Bool(true);
         body["stream_options"] = json!({ "include_usage": true });
@@ -194,15 +194,31 @@ impl LlmProvider for OpenAiProvider {
 /// body. Tool uses / results inside content blocks are unwrapped into
 /// OpenAI's split `tool_calls` (assistant) / `role: "tool"` (response)
 /// shape.
-fn anthropic_to_openai(req: &AnthropicRequest, max_tokens_field: &str) -> Result<Value, String> {
+fn anthropic_to_openai(
+    req: &AnthropicRequest,
+    max_tokens_field: &str,
+    provider: &str,
+) -> Result<Value, String> {
     let mut messages: Vec<Value> = Vec::with_capacity(req.messages.len() + 1);
+    // With thinking on, the turn's reasoning goes back on the assistant
+    // message that called a tool, where DeepSeek and OpenRouter want it.
+    let reasoning_field = match &req.reasoning {
+        Some(r) if *r != super::Reasoning::Off => {
+            Some(if provider == OpenAiProvider::OPENROUTER_NAME {
+                "reasoning"
+            } else {
+                "reasoning_content"
+            })
+        }
+        _ => None,
+    };
 
     if let Some(sys) = req.system.as_ref().filter(|s| !s.is_empty()) {
         messages.push(json!({"role": "system", "content": sys}));
     }
 
     for m in &req.messages {
-        translate_message_to_openai(m, &mut messages)?;
+        translate_message_to_openai(m, &mut messages, reasoning_field)?;
     }
 
     let mut body = json!({
@@ -213,13 +229,42 @@ fn anthropic_to_openai(req: &AnthropicRequest, max_tokens_field: &str) -> Result
     if let Some(t) = req.temperature {
         body["temperature"] = json!(t);
     }
+    // How much to think (issue #190): OpenRouter's normalized `reasoning`,
+    // or `reasoning_effort` for an OpenAI-compatible endpoint, which takes
+    // no budget.
+    match (&req.reasoning, provider) {
+        (None, _) => {}
+        (Some(r), OpenAiProvider::OPENROUTER_NAME) => {
+            let reasoning = match r {
+                super::Reasoning::Off => Some(json!({"enabled": false})),
+                super::Reasoning::On => Some(json!({"enabled": true})),
+                super::Reasoning::Effort(effort) => Some(json!({"effort": effort})),
+                // Within max_tokens, as models behind it count it.
+                super::Reasoning::Budget(n) => {
+                    super::budget_within(*n, req.max_tokens).map(|n| json!({"max_tokens": n}))
+                }
+            };
+            if let Some(reasoning) = reasoning {
+                body["reasoning"] = reasoning;
+            }
+        }
+        (Some(r), _) => match r {
+            super::Reasoning::Off | super::Reasoning::Budget(_) => {}
+            super::Reasoning::On => body["reasoning_effort"] = json!("medium"),
+            super::Reasoning::Effort(effort) => body["reasoning_effort"] = json!(effort),
+        },
+    }
     if let Some(tools) = req.tools.as_ref() {
         body["tools"] = translate_tools_to_openai(tools)?;
     }
     Ok(body)
 }
 
-fn translate_message_to_openai(m: &AnthropicMessage, out: &mut Vec<Value>) -> Result<(), String> {
+fn translate_message_to_openai(
+    m: &AnthropicMessage,
+    out: &mut Vec<Value>,
+    reasoning_field: Option<&str>,
+) -> Result<(), String> {
     // Plain string content — same shape on both sides.
     if let Some(s) = m.content.as_str() {
         out.push(json!({"role": &m.role, "content": s}));
@@ -237,6 +282,7 @@ fn translate_message_to_openai(m: &AnthropicMessage, out: &mut Vec<Value>) -> Re
     // any text content.
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
+    let mut thinking = String::new();
     let mut tool_results: Vec<Value> = Vec::new();
     // Inline images (base64), as `image_url` parts of a user message.
     let mut images: Vec<Value> = Vec::new();
@@ -311,8 +357,15 @@ fn translate_message_to_openai(m: &AnthropicMessage, out: &mut Vec<Value>) -> Re
                     "image_url": {"url": format!("data:{media};base64,{data}")},
                 }));
             }
-            // A model's reasoning is not sent back to it.
-            "thinking" | "redacted_thinking" => {}
+            // A model's reasoning goes back only where it asks for it.
+            "thinking" => {
+                if reasoning_field.is_some()
+                    && let Some(t) = block.get("thinking").and_then(Value::as_str)
+                {
+                    thinking.push_str(t);
+                }
+            }
+            "redacted_thinking" => {}
             other => {
                 // Unknown block types (image, document, …) — fold
                 // their text representation in if any, otherwise drop with a
@@ -335,6 +388,11 @@ fn translate_message_to_openai(m: &AnthropicMessage, out: &mut Vec<Value>) -> Re
             msg["content"] = json!(text_parts.join("\n"));
         }
         msg["tool_calls"] = Value::Array(tool_calls);
+        if let Some(field) = reasoning_field
+            && !thinking.is_empty()
+        {
+            msg[field] = json!(thinking);
+        }
         out.push(msg);
     } else if !images.is_empty() {
         let mut parts = vec![json!({"type": "text", "text": text_parts.join("\n")})];
@@ -676,6 +734,7 @@ mod tests {
         AnthropicRequest {
             model: "gpt-4o".into(),
             max_tokens: 256,
+            reasoning: None,
             messages,
             system: system.map(String::from),
             temperature: None,
@@ -695,7 +754,7 @@ mod tests {
             }],
             None,
         );
-        let body = anthropic_to_openai(&r, "max_tokens").expect("translate");
+        let body = anthropic_to_openai(&r, "max_tokens", "openai").expect("translate");
         let parts = body["messages"][0]["content"].as_array().expect("parts");
         assert_eq!(parts[0], json!({"type": "text", "text": "what is this?"}));
         assert_eq!(parts[1]["type"], "image_url");
@@ -711,7 +770,7 @@ mod tests {
             }],
             Some("you are a calc"),
         );
-        let body = anthropic_to_openai(&r, "max_tokens").expect("translate");
+        let body = anthropic_to_openai(&r, "max_tokens", "openai").expect("translate");
         let messages = body["messages"].as_array().expect("messages array");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "system");
@@ -737,7 +796,7 @@ mod tests {
             }],
             None,
         );
-        let body = anthropic_to_openai(&r, "max_tokens").expect("translate");
+        let body = anthropic_to_openai(&r, "max_tokens", "openai").expect("translate");
         let messages = body["messages"].as_array().expect("messages");
         assert_eq!(messages.len(), 1);
         let m = &messages[0];
@@ -767,7 +826,7 @@ mod tests {
             }],
             None,
         );
-        let body = anthropic_to_openai(&r, "max_tokens").expect("translate");
+        let body = anthropic_to_openai(&r, "max_tokens", "openai").expect("translate");
         let messages = body["messages"].as_array().expect("messages");
         // No primary user message (no text), just the tool message.
         assert_eq!(messages.len(), 1);
@@ -792,7 +851,7 @@ mod tests {
                 "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}
             }
         ]));
-        let body = anthropic_to_openai(&r, "max_tokens").expect("translate");
+        let body = anthropic_to_openai(&r, "max_tokens", "openai").expect("translate");
         let tools = body["tools"].as_array().expect("tools");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");
@@ -845,12 +904,16 @@ mod tests {
     #[test]
     fn max_tokens_field_follows_the_provider() {
         let r = req(vec![], None);
-        let openai =
-            anthropic_to_openai(&r, OpenAiProvider::OPENAI.max_tokens_field).expect("body");
+        let openai = anthropic_to_openai(&r, OpenAiProvider::OPENAI.max_tokens_field, "openai")
+            .expect("body");
         assert_eq!(openai["max_completion_tokens"], 256);
         assert!(openai.get("max_tokens").is_none());
-        let openrouter =
-            anthropic_to_openai(&r, OpenAiProvider::OPENROUTER.max_tokens_field).expect("body");
+        let openrouter = anthropic_to_openai(
+            &r,
+            OpenAiProvider::OPENROUTER.max_tokens_field,
+            "openrouter",
+        )
+        .expect("body");
         assert_eq!(openrouter["max_tokens"], 256);
     }
 
@@ -936,6 +999,82 @@ mod tests {
     }
 
     #[test]
+    fn thinking_is_asked_for_as_each_endpoint_takes_it() {
+        let ask = |reasoning: super::super::Reasoning, provider: &str| {
+            let mut r = req(
+                vec![AnthropicMessage {
+                    role: "user".into(),
+                    content: json!("hi"),
+                }],
+                None,
+            );
+            r.reasoning = Some(reasoning);
+            r.max_tokens = 8192;
+            anthropic_to_openai(&r, "max_tokens", provider).expect("translate")
+        };
+        use super::super::Reasoning;
+        let or = OpenAiProvider::OPENROUTER_NAME;
+        assert_eq!(
+            ask(Reasoning::Effort("low".into()), or)["reasoning"],
+            json!({"effort": "low"})
+        );
+        assert_eq!(
+            ask(Reasoning::Budget(2048), or)["reasoning"],
+            json!({"max_tokens": 2048})
+        );
+        assert_eq!(
+            ask(Reasoning::Budget(60000), or)["reasoning"],
+            json!({"max_tokens": 4096}),
+            "a budget leaves the reply room"
+        );
+        assert_eq!(
+            ask(Reasoning::Off, or)["reasoning"],
+            json!({"enabled": false})
+        );
+        assert_eq!(
+            ask(Reasoning::On, or)["reasoning"],
+            json!({"enabled": true})
+        );
+        assert_eq!(
+            ask(Reasoning::Effort("high".into()), "openai")["reasoning_effort"],
+            "high"
+        );
+        assert!(
+            ask(Reasoning::Off, "openai")
+                .get("reasoning_effort")
+                .is_none()
+        );
+        assert!(ask(Reasoning::Off, "openai").get("reasoning").is_none());
+    }
+
+    #[test]
+    fn with_thinking_on_the_reasoning_goes_back_with_its_tool_call() {
+        let tool_turn = |reasoning: Option<super::super::Reasoning>, provider: &str| {
+            let mut r = req(
+                vec![AnthropicMessage {
+                    role: "assistant".into(),
+                    content: json!([
+                        {"type": "thinking", "thinking": "need the date"},
+                        {"type": "tool_use", "id": "t1", "name": "shell", "input": {"command": "date"}},
+                    ]),
+                }],
+                None,
+            );
+            r.reasoning = reasoning;
+            anthropic_to_openai(&r, "max_tokens", provider).expect("translate")
+        };
+        use super::super::Reasoning;
+        let on = tool_turn(Some(Reasoning::Effort("high".into())), "openai");
+        assert_eq!(on["messages"][0]["reasoning_content"], "need the date");
+        let or = tool_turn(Some(Reasoning::On), OpenAiProvider::OPENROUTER_NAME);
+        assert_eq!(or["messages"][0]["reasoning"], "need the date");
+        for off in [None, Some(Reasoning::Off)] {
+            let body = tool_turn(off, "openai");
+            assert!(!body.to_string().contains("need the date"));
+        }
+    }
+
+    #[test]
     fn reasoning_is_kept_apart_and_not_sent_back() {
         // DeepSeek streams `reasoning_content`, OpenRouter `reasoning`.
         let chunks = [
@@ -970,7 +1109,7 @@ mod tests {
             }],
             None,
         );
-        let body = anthropic_to_openai(&r, "max_tokens").expect("translate");
+        let body = anthropic_to_openai(&r, "max_tokens", "openai").expect("translate");
         assert_eq!(body["messages"][0]["content"], "42");
         assert!(!body.to_string().contains("secret"));
     }

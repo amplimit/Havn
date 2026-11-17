@@ -115,6 +115,10 @@ pub struct AnthropicMessage {
 pub struct AnthropicRequest {
     pub model: String,
     pub max_tokens: u32,
+    /// Whether and how much the model is asked to think (issue #190),
+    /// as its provider adapter puts it; `None` asks nothing.
+    #[serde(skip)]
+    pub reasoning: Option<Reasoning>,
     pub messages: Vec<AnthropicMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
@@ -125,6 +129,27 @@ pub struct AnthropicRequest {
     /// (or translated to OpenAI/Gemini shape inside the relevant provider).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<serde_json::Value>,
+}
+
+/// What a request asks of a model's thinking, from the model's
+/// [`crate::model_catalog::ThinkingSpec`] and the chat's choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reasoning {
+    Off,
+    On,
+    Effort(String),
+    Budget(u32),
+}
+
+/// A thinking budget of `budget` tokens within a request of `max_tokens`,
+/// which counts it: the smallest budget providers take (1024), leaving
+/// the reply room; `None` when `max_tokens` has no room for both.
+#[must_use]
+pub fn budget_within(budget: u32, max_tokens: u32) -> Option<u32> {
+    (max_tokens >= 2048).then(|| {
+        let room = (max_tokens / 2).clamp(1024, 4096);
+        budget.min(max_tokens - room).max(1024)
+    })
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1147,6 +1172,7 @@ mod tests {
         let mut request = AnthropicRequest {
             model: "m".into(),
             max_tokens: 10,
+            reasoning: None,
             messages: vec![AnthropicMessage {
                 role: "user".into(),
                 content: serde_json::Value::Array(blocks),
@@ -1224,6 +1250,7 @@ mod tests {
         let request = || AnthropicRequest {
             model: "m".into(),
             max_tokens: 10,
+            reasoning: None,
             messages: vec![AnthropicMessage {
                 role: "user".into(),
                 content: serde_json::json!([
@@ -1272,6 +1299,7 @@ mod tests {
         AnthropicRequest {
             model: "claude-sonnet-4-6".into(),
             max_tokens: 64,
+            reasoning: None,
             messages: vec![AnthropicMessage {
                 role: "user".into(),
                 content,
@@ -1500,6 +1528,7 @@ mod tests {
         fn ask(max_tokens: u32) -> AnthropicRequest {
             AnthropicRequest {
                 model: "claude-sonnet-4-6".into(),
+                reasoning: None,
                 max_tokens,
                 messages: vec![AnthropicMessage {
                     role: "user".into(),

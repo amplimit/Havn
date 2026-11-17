@@ -947,6 +947,7 @@ mod tests {
                     label: None,
                     max_output_tokens: None,
                     vision: false,
+                    thinking: None,
                 }],
             }));
         assert!(check_model(&state, None).is_ok());

@@ -22,6 +22,181 @@ pub struct ModelEntry {
     /// It takes images (issue #106): files sent in a chat are shown to it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub vision: bool,
+    /// How it thinks, when it can (issue #190): absent, it is not asked to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingSpec>,
+}
+
+/// How a model can be asked to think, as its admin set it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThinkingSpec {
+    pub style: ThinkingStyle,
+    /// The levels it takes, for `effort`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub levels: Vec<String>,
+    /// The token budgets offered, for `budget`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budgets: Vec<u32>,
+    /// The choice of a chat that made none: `off`, `on`, a level or a
+    /// budget. Unset, `off` (or the first choice, when it must think).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// It always thinks: `off` is not a choice.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mandatory: bool,
+}
+
+/// How a model's thinking is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingStyle {
+    /// On or off.
+    Toggle,
+    /// By level, such as `low` / `medium` / `high`.
+    Effort,
+    /// By a number of tokens.
+    Budget,
+}
+
+/// Longest level name, and most levels or budgets one model offers.
+const MAX_LEVEL_LEN: usize = 16;
+const MAX_CHOICES: usize = 8;
+
+impl ThinkingSpec {
+    /// What a chat may choose, `off` first unless it must think.
+    #[must_use]
+    pub fn choices(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.mandatory {
+            out.push("off".to_string());
+        }
+        match self.style {
+            ThinkingStyle::Toggle => out.push("on".to_string()),
+            ThinkingStyle::Effort => out.extend(self.levels.iter().cloned()),
+            ThinkingStyle::Budget => out.extend(self.budgets.iter().map(ToString::to_string)),
+        }
+        out
+    }
+
+    /// What a request asks for, when a chat chose `choice` (or nothing):
+    /// a choice this model does not offer gives way to its default.
+    #[must_use]
+    pub fn resolve(&self, choice: Option<&str>) -> crate::llm_proxy::Reasoning {
+        use crate::llm_proxy::Reasoning;
+        let choices = self.choices();
+        let pick = choice
+            .filter(|c| choices.iter().any(|x| x == c))
+            .or_else(|| {
+                self.default
+                    .as_deref()
+                    .filter(|d| choices.iter().any(|x| x == d))
+            })
+            .or_else(|| choices.first().map(String::as_str))
+            .unwrap_or("off");
+        match (pick, self.style) {
+            ("off", _) => Reasoning::Off,
+            ("on", _) => Reasoning::On,
+            (level, ThinkingStyle::Effort) => Reasoning::Effort(level.to_string()),
+            (budget, ThinkingStyle::Budget) => {
+                budget.parse().map_or(Reasoning::On, Reasoning::Budget)
+            }
+            (_, ThinkingStyle::Toggle) => Reasoning::On,
+        }
+    }
+
+    fn validate(&self, id: &str) -> anyhow::Result<()> {
+        let provider = split_model_ref(id).map_or("", |(p, _)| p);
+        match self.style {
+            ThinkingStyle::Effort => {
+                if self.levels.is_empty() || self.levels.len() > MAX_CHOICES {
+                    anyhow::bail!(
+                        "[[llm.models]] {id:?}: thinking by effort lists 1 to {MAX_CHOICES} levels"
+                    );
+                }
+                for level in &self.levels {
+                    let ok = !level.is_empty()
+                        && level.len() <= MAX_LEVEL_LEN
+                        && level
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                        && level != "off"
+                        && level != "on";
+                    if !ok {
+                        anyhow::bail!(
+                            "[[llm.models]] {id:?}: thinking level {level:?} is not a short lowercase word (nor off or on)"
+                        );
+                    }
+                }
+            }
+            ThinkingStyle::Budget => {
+                if provider == "openai" {
+                    anyhow::bail!(
+                        "[[llm.models]] {id:?}: an OpenAI-compatible endpoint takes thinking by effort or on/off, not by budget"
+                    );
+                }
+                if self.budgets.is_empty()
+                    || self.budgets.len() > MAX_CHOICES
+                    || self.budgets.iter().any(|b| *b < 128)
+                {
+                    anyhow::bail!(
+                        "[[llm.models]] {id:?}: thinking by budget lists 1 to {MAX_CHOICES} budgets of at least 128 tokens"
+                    );
+                }
+            }
+            ThinkingStyle::Toggle => {}
+        }
+        if let Some(default) = &self.default
+            && !self.choices().contains(default)
+        {
+            anyhow::bail!(
+                "[[llm.models]] {id:?}: thinking default {default:?} is not one of {:?}",
+                self.choices()
+            );
+        }
+        Ok(())
+    }
+
+    /// As an inline table of config.toml.
+    fn to_toml(&self) -> InlineTable {
+        let mut t = InlineTable::new();
+        t.insert(
+            "style",
+            match self.style {
+                ThinkingStyle::Toggle => "toggle",
+                ThinkingStyle::Effort => "effort",
+                ThinkingStyle::Budget => "budget",
+            }
+            .into(),
+        );
+        if !self.levels.is_empty() {
+            t.insert(
+                "levels",
+                self.levels
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<toml_edit::Array>()
+                    .into(),
+            );
+        }
+        if !self.budgets.is_empty() {
+            t.insert(
+                "budgets",
+                self.budgets
+                    .iter()
+                    .map(|b| i64::from(*b))
+                    .collect::<toml_edit::Array>()
+                    .into(),
+            );
+        }
+        if let Some(default) = &self.default {
+            t.insert("default", default.as_str().into());
+        }
+        if self.mandatory {
+            t.insert("mandatory", true.into());
+        }
+        t
+    }
 }
 
 impl ModelEntry {
@@ -75,6 +250,9 @@ impl ModelCatalog {
                     "[[llm.models]] {:?}: max_output_tokens must be at least 1",
                     entry.id
                 );
+            }
+            if let Some(thinking) = &entry.thinking {
+                thinking.validate(&entry.id)?;
             }
             if let Some(label) = &entry.label
                 && (label.len() > MAX_LABEL_LEN || label.chars().any(char::is_control))
@@ -351,6 +529,12 @@ fn write_checked(
             } else {
                 table.remove("vision");
             }
+            match &entry.thinking {
+                Some(thinking) => table["thinking"] = value(thinking.to_toml()),
+                None => {
+                    table.remove("thinking");
+                }
+            }
             models.push(table);
         }
         llm.insert("models", Item::ArrayOfTables(models));
@@ -583,6 +767,7 @@ pub async fn upgrade(
                         label: None,
                         max_output_tokens: None,
                         vision: false,
+                        thinking: None,
                     })
                     .collect(),
             };
@@ -625,12 +810,104 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn a_models_thinking_resolves_within_its_choices() {
+        use crate::llm_proxy::Reasoning;
+        let effort = ThinkingSpec {
+            style: ThinkingStyle::Effort,
+            levels: vec!["low".into(), "high".into()],
+            budgets: Vec::new(),
+            default: Some("low".into()),
+            mandatory: false,
+        };
+        assert_eq!(effort.choices(), ["off", "low", "high"]);
+        assert_eq!(effort.resolve(None), Reasoning::Effort("low".into()));
+        assert_eq!(
+            effort.resolve(Some("high")),
+            Reasoning::Effort("high".into())
+        );
+        assert_eq!(effort.resolve(Some("off")), Reasoning::Off);
+        assert_eq!(
+            effort.resolve(Some("4096")),
+            Reasoning::Effort("low".into()),
+            "not its choice"
+        );
+        let mandatory = ThinkingSpec {
+            style: ThinkingStyle::Budget,
+            levels: Vec::new(),
+            budgets: vec![1024, 8192],
+            default: None,
+            mandatory: true,
+        };
+        assert_eq!(mandatory.choices(), ["1024", "8192"]);
+        assert_eq!(
+            mandatory.resolve(Some("off")),
+            Reasoning::Budget(1024),
+            "it must think"
+        );
+        assert_eq!(mandatory.resolve(Some("8192")), Reasoning::Budget(8192));
+        let toggle = ThinkingSpec {
+            style: ThinkingStyle::Toggle,
+            levels: Vec::new(),
+            budgets: Vec::new(),
+            default: None,
+            mandatory: false,
+        };
+        assert_eq!(
+            toggle.resolve(None),
+            Reasoning::Off,
+            "off unless the default says on"
+        );
+        assert_eq!(toggle.resolve(Some("on")), Reasoning::On);
+    }
+
+    #[test]
+    fn thinking_is_checked_and_written_to_config_toml() {
+        let mut c = ModelCatalog::default();
+        c.models.push(ModelEntry {
+            id: "openrouter:deepseek/deepseek-v4.1-flash".into(),
+            label: None,
+            max_output_tokens: None,
+            vision: false,
+            thinking: Some(ThinkingSpec {
+                style: ThinkingStyle::Effort,
+                levels: vec!["low".into(), "medium".into(), "high".into()],
+                budgets: Vec::new(),
+                default: Some("medium".into()),
+                mandatory: false,
+            }),
+        });
+        c.validate().expect("valid");
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").expect("write");
+        write_to_file(&path, &c).expect("written");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("thinking = { style = \"effort\""), "{text}");
+        assert_eq!(read_from_file(&path).expect("read back"), c);
+
+        let mut bad = c.clone();
+        bad.models[0].thinking.as_mut().expect("thinking").default = Some("max".into());
+        assert!(bad.validate().is_err(), "a default it does not offer");
+        let mut bad = c.clone();
+        bad.models[0].id = "openai:gpt-5".into();
+        let spec = bad.models[0].thinking.as_mut().expect("thinking");
+        spec.style = ThinkingStyle::Budget;
+        spec.budgets = vec![1024];
+        spec.default = None;
+        assert!(
+            bad.validate().is_err(),
+            "an OpenAI endpoint takes no budget"
+        );
+    }
+
     fn entry(id: &str) -> ModelEntry {
         ModelEntry {
             id: id.into(),
             label: None,
             max_output_tokens: None,
             vision: false,
+            thinking: None,
         }
     }
 

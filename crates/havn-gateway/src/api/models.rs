@@ -132,6 +132,175 @@ pub async fn put(
     Ok(Json(view(&state)))
 }
 
+/// The models an agent may use, for a chat's model menu (issue #190).
+#[derive(Debug, Serialize)]
+pub struct AgentModelsView {
+    /// The agent's own model; `None` for the gateway's default.
+    pub agent_model: Option<String>,
+    /// The gateway's default.
+    pub default_model: Option<String>,
+    pub models: Vec<ModelEntry>,
+}
+
+/// `GET /agents/{id}/models`.
+pub async fn for_agent(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<AgentModelsView>, ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let models = crate::commands::usable_models(&state, agent.id)
+        .await
+        .unwrap_or_default();
+    Ok(Json(AgentModelsView {
+        agent_model: agent
+            .config
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from),
+        default_model: state.models.load().default_entry().map(|m| m.id.clone()),
+        models,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelCheck {
+    /// The entry to check, saved or not: its thinking as set there.
+    pub entry: ModelEntry,
+}
+
+/// What a model check found (issue #190).
+#[derive(Debug, Serialize)]
+pub struct ModelCheckView {
+    /// `reasoning`: it answered and showed its reasoning; `no_reasoning`:
+    /// it answered without; `error`: the provider refused.
+    pub outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Characters of a check's reasoning and reply shown.
+const CHECK_EXCERPT: usize = 300;
+
+/// Most tokens a check's answer may take, with thinking, and the largest
+/// thinking budget it asks for.
+const CHECK_MAX_TOKENS: u32 = 4096;
+const CHECK_BUDGET: u32 = 2048;
+
+/// `POST /llm/models/check`: send `entry` a very short request, with its
+/// thinking at its default, on the caller's credentials, and say how it
+/// answered.
+pub async fn check(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Json(req): Json<ModelCheck>,
+) -> Result<Json<ModelCheckView>, ApiError> {
+    let entry = req.entry;
+    // With trust_header, the list is the operator's, in config.toml: only
+    // a listed model, as listed, is checked.
+    if state.trusted_proxies.is_some() && state.models.load().get(&entry.id) != Some(&entry) {
+        return Err(ApiError::Forbidden(
+            "with trust_header enabled only a model listed in config.toml, as listed, can be \
+             checked"
+                .into(),
+        ));
+    }
+    ModelCatalog {
+        default_model: None,
+        title_model: None,
+        models: vec![entry.clone()],
+    }
+    .validate()
+    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let policy = crate::policy_resolver::for_user(&state.db, user.id).await;
+    if !crate::llm_proxy::model_allowed(&policy.allowed_models, &entry.id) {
+        return Err(ApiError::Forbidden(format!(
+            "model {:?} is not allowed by your policy",
+            entry.id
+        )));
+    }
+    let ring = state
+        .keyring
+        .as_ref()
+        .ok_or_else(|| ApiError::NoCredential(entry.provider().to_string()))?;
+    // A check is a short question: a budget is cut to what it needs.
+    let reasoning = entry.thinking.as_ref().map(|t| match t.resolve(None) {
+        crate::llm_proxy::Reasoning::Budget(n) => {
+            crate::llm_proxy::Reasoning::Budget(n.min(CHECK_BUDGET))
+        }
+        other => other,
+    });
+    let request = crate::llm_proxy::AnthropicRequest {
+        model: entry.model().to_string(),
+        max_tokens: if reasoning.is_some() {
+            CHECK_MAX_TOKENS
+        } else {
+            512
+        },
+        reasoning,
+        messages: vec![crate::llm_proxy::AnthropicMessage {
+            role: "user".into(),
+            content: serde_json::json!("What is 17 + 25? Answer with the number."),
+        }],
+        system: None,
+        temperature: None,
+        tools: None,
+    };
+    let answer = crate::llm_proxy::complete_with_provider(
+        &state.db,
+        &state.http,
+        ring,
+        &crate::llm_proxy::Billing::user(user.id),
+        entry.provider(),
+        entry.max_output_tokens,
+        &request,
+        &state.llm,
+    )
+    .await;
+    let excerpt = |s: &str| -> String { s.trim().chars().take(CHECK_EXCERPT).collect() };
+    let view = match answer {
+        Ok(resp) => {
+            let of = |kind: &str, key: &str| -> String {
+                resp.content
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|b: &&serde_json::Value| {
+                        b.get("type").and_then(serde_json::Value::as_str) == Some(kind)
+                    })
+                    .filter_map(|b: &serde_json::Value| {
+                        b.get(key).and_then(serde_json::Value::as_str)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let (reasoning, reply) = (of("thinking", "thinking"), of("text", "text"));
+            ModelCheckView {
+                outcome: if reasoning.trim().is_empty() {
+                    "no_reasoning"
+                } else {
+                    "reasoning"
+                },
+                reasoning: (!reasoning.trim().is_empty()).then(|| excerpt(&reasoning)),
+                reply: Some(excerpt(&reply)),
+                error: None,
+            }
+        }
+        Err(e) => ModelCheckView {
+            outcome: "error",
+            reasoning: None,
+            reply: None,
+            error: Some(excerpt(&e.to_string())),
+        },
+    };
+    Ok(Json(view))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -151,6 +320,7 @@ mod tests {
                     label: None,
                     max_output_tokens: None,
                     vision: false,
+                    thinking: None,
                 })
                 .collect(),
         })

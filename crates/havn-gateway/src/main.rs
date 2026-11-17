@@ -700,6 +700,8 @@ async fn serve() -> anyhow::Result<()> {
         .route("/agents/{id}/conversation", get(api::conversation::list))
         .route("/agents/{id}/chats", get(api::conversation::chats))
         .route("/agents/{id}/search", get(api::conversation::search))
+        .route("/agents/{id}/models", get(api::models::for_agent))
+        .route("/llm/models/check", post(api::models::check))
         .route(
             "/agents/{id}/chats/{chat}",
             patch(api::conversation::chat_patch).delete(api::conversation::chat_delete),

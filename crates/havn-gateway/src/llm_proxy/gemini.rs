@@ -158,6 +158,22 @@ impl LlmProvider for GeminiProvider {
                     body: error.to_string(),
                 });
             }
+            for part in chunk
+                .pointer("/candidates/0/content/parts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if part
+                    .get("thought")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    && let Some(piece) = part.get("text").and_then(Value::as_str)
+                    && !piece.is_empty()
+                {
+                    text(TextEvent::Reasoning(piece));
+                }
+            }
             for piece in reply.add(&chunk) {
                 text(TextEvent::Text(&piece));
             }
@@ -191,6 +207,21 @@ fn anthropic_to_gemini(req: &AnthropicRequest) -> Result<Value, String> {
     });
     if let Some(t) = req.temperature {
         body["generationConfig"]["temperature"] = json!(t);
+    }
+    // How much to think (issue #190), with the thoughts returned.
+    if let Some(r) = &req.reasoning {
+        let config = match r {
+            super::Reasoning::Off => Some(json!({"thinkingBudget": 0})),
+            super::Reasoning::On => Some(json!({"thinkingBudget": -1, "includeThoughts": true})),
+            super::Reasoning::Budget(n) => super::budget_within(*n, req.max_tokens)
+                .map(|n| json!({"thinkingBudget": n, "includeThoughts": true})),
+            super::Reasoning::Effort(level) => {
+                Some(json!({"thinkingLevel": level, "includeThoughts": true}))
+            }
+        };
+        if let Some(config) = config {
+            body["generationConfig"]["thinkingConfig"] = config;
+        }
     }
     if let Some(sys) = req.system.as_ref().filter(|s| !s.is_empty()) {
         body["systemInstruction"] = json!({"parts": [{"text": sys}]});
@@ -451,7 +482,17 @@ fn gemini_to_anthropic(raw: &Value, model: &str) -> Result<AnthropicResponse, St
     let mut tool_call_counter: u64 = 0;
     for part in &parts {
         if let Some(text) = part.get("text").and_then(Value::as_str) {
-            if !text.is_empty() {
+            // A thought (asked for with `includeThoughts`) is reasoning, not
+            // the reply.
+            if part
+                .get("thought")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                if !text.is_empty() {
+                    content_blocks.push(json!({"type": "thinking", "thinking": text}));
+                }
+            } else if !text.is_empty() {
                 content_blocks.push(json!({"type": "text", "text": text}));
             }
         } else if let Some(fc) = part.get("functionCall") {
@@ -573,6 +614,7 @@ mod tests {
         AnthropicRequest {
             model: "gemini-2.5-flash".into(),
             max_tokens: 256,
+            reasoning: None,
             messages,
             system: system.map(String::from),
             temperature: None,
@@ -595,6 +637,44 @@ mod tests {
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0]["role"], "user");
         assert_eq!(contents[0]["parts"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn thinking_is_asked_for_and_thoughts_kept_apart() {
+        use super::super::Reasoning;
+        let ask = |reasoning: Option<Reasoning>| {
+            let mut r = req(
+                vec![AnthropicMessage {
+                    role: "user".into(),
+                    content: json!("hi"),
+                }],
+                None,
+            );
+            r.reasoning = reasoning;
+            r.max_tokens = 8192;
+            anthropic_to_gemini(&r).expect("translate")["generationConfig"]["thinkingConfig"]
+                .clone()
+        };
+        assert_eq!(ask(Some(Reasoning::Off)), json!({"thinkingBudget": 0}));
+        assert_eq!(
+            ask(Some(Reasoning::Budget(2048))),
+            json!({"thinkingBudget": 2048, "includeThoughts": true})
+        );
+        assert_eq!(
+            ask(Some(Reasoning::Effort("low".into()))),
+            json!({"thinkingLevel": "low", "includeThoughts": true})
+        );
+        assert_eq!(ask(None), Value::Null);
+        let raw = json!({"candidates": [{"content": {"role": "model", "parts": [
+            {"text": "first the sum", "thought": true},
+            {"text": "42"},
+        ]}, "finishReason": "STOP"}]});
+        let resp = gemini_to_anthropic(&raw, "gemini-x").expect("translate");
+        assert_eq!(
+            resp.content[0],
+            json!({"type": "thinking", "thinking": "first the sum"})
+        );
+        assert_eq!(resp.content[1], json!({"type": "text", "text": "42"}));
     }
 
     #[test]

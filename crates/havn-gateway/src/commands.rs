@@ -78,6 +78,13 @@ pub const COMMANDS: &[Command] = &[
         admin: true,
     },
     Command {
+        name: "think",
+        aliases: &[],
+        args: "[off | on | level | tokens | default]",
+        about: "Show or set how much this chat's model thinks",
+        admin: true,
+    },
+    Command {
         name: "usage",
         aliases: &[],
         args: "[days]",
@@ -338,6 +345,18 @@ pub async fn run(state: &AppState, asker: &Asker, command: &Command, args: &str)
             to_agent(ChatCommandKind::Status { agent })
         }
         "model" | "agent_model" => model(state, asker, command.name == "agent_model", args).await,
+        "think" => {
+            let choice = args.to_ascii_lowercase();
+            if !choice.is_empty() && !is_thinking_choice(&choice) {
+                return Action::Reply(
+                    "(Send /think off, on, a level such as high, a number of tokens, or default.)"
+                        .into(),
+                );
+            }
+            to_agent(ChatCommandKind::Think {
+                choice: (!choice.is_empty()).then_some(choice),
+            })
+        }
         "usage" => Action::Reply(usage(state, asker.agent_id, args).await),
         "approve" | "deny" => {
             Action::Reply(decide(state, asker, command.name == "approve", args).await)
@@ -349,8 +368,20 @@ pub async fn run(state: &AppState, asker: &Asker, command: &Command, args: &str)
     }
 }
 
+/// Whether `choice` reads as a thinking choice: a short lowercase word
+/// or a number of tokens. Whether the chat's model takes it is decided
+/// when it is asked.
+#[must_use]
+pub fn is_thinking_choice(choice: &str) -> bool {
+    !choice.is_empty()
+        && choice.len() <= 16
+        && choice
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
 /// The models agent `agent_id` may use, in the gateway's order.
-async fn usable_models(state: &AppState, agent_id: AgentId) -> Option<Vec<ModelEntry>> {
+pub async fn usable_models(state: &AppState, agent_id: AgentId) -> Option<Vec<ModelEntry>> {
     let agent = agents_repo::find_by_id(&state.db, agent_id).await.ok()??;
     let policy =
         crate::policy_resolver::for_session(&state.db, &agent, state.trusted_proxies.is_some())

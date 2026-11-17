@@ -390,6 +390,21 @@ enum ModelAction {
     /// The model that writes chats' titles; without an id, each agent's
     /// own model writes them.
     Title { id: Option<String> },
+    /// How a listed model thinks: none, toggle, effort:low,medium,high or
+    /// budget:1024,4096,16384.
+    Thinking {
+        id: String,
+        spec: String,
+        /// The choice of a chat that made none: off, on, a level or a budget.
+        #[arg(long)]
+        default: Option<String>,
+        /// It always thinks: off is not offered.
+        #[arg(long)]
+        mandatory: bool,
+    },
+    /// Send a listed model a very short request with its thinking at its
+    /// default, and say how it answered.
+    Check { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -657,6 +672,13 @@ async fn run_model(action: ModelAction) -> anyhow::Result<()> {
         ModelAction::Remove { id } => model::remove(&id).await,
         ModelAction::Default { id } => model::set_default(&id).await,
         ModelAction::Title { id } => model::set_title(id.as_deref()).await,
+        ModelAction::Thinking {
+            id,
+            spec,
+            default,
+            mandatory,
+        } => model::set_thinking(&id, &spec, default.as_deref(), mandatory).await,
+        ModelAction::Check { id } => model::check(&id).await,
     }
 }
 

@@ -15,6 +15,9 @@ pub struct ModelEntry {
     pub max_output_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub vision: bool,
+    /// How it thinks (issue #190), passed through as the gateway has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +103,7 @@ pub async fn add(
         label: label.map(str::to_string),
         max_output_tokens,
         vision,
+        thinking: None,
     });
     let default_model = if make_default {
         Some(id)
@@ -141,6 +145,107 @@ pub async fn set_default(id: &str) -> anyhow::Result<()> {
     }
     save(&gw, &view.version, Some(id), None, &view.models).await?;
     println!("default model: {id}");
+    Ok(())
+}
+
+/// The thinking of a model as `spec` writes it: `none`, `toggle`,
+/// `effort:low,medium,high` or `budget:1024,4096,16384`.
+fn thinking_spec(
+    spec: &str,
+    default: Option<&str>,
+    mandatory: bool,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let (style, list) = spec.split_once(':').unwrap_or((spec, ""));
+    let items: Vec<&str> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut out = match style {
+        "none" => return Ok(None),
+        "toggle" => json!({ "style": "toggle" }),
+        "effort" => json!({ "style": "effort", "levels": items }),
+        "budget" => {
+            let budgets = items
+                .iter()
+                .map(|b| b.parse::<u32>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| {
+                    anyhow::anyhow!("budgets are numbers of tokens, such as budget:1024,4096")
+                })?;
+            json!({ "style": "budget", "budgets": budgets })
+        }
+        other => anyhow::bail!("{other:?} is not none, toggle, effort:<levels> or budget:<tokens>"),
+    };
+    if let Some(default) = default {
+        out["default"] = json!(default);
+    }
+    if mandatory {
+        out["mandatory"] = json!(true);
+    }
+    Ok(Some(out))
+}
+
+/// `havn model thinking ID SPEC`: how a listed model thinks.
+pub async fn set_thinking(
+    id: &str,
+    spec: &str,
+    default: Option<&str>,
+    mandatory: bool,
+) -> anyhow::Result<()> {
+    let gw = Gateway::from_env()?;
+    let view: ModelsView = gw.get_json("/llm/models").await?;
+    let mut models = view.models;
+    let Some(entry) = models.iter_mut().find(|m| m.id == id) else {
+        anyhow::bail!("{id} is not listed; add it with `havn model add {id}`");
+    };
+    entry.thinking = thinking_spec(spec, default, mandatory)?;
+    save(
+        &gw,
+        &view.version,
+        view.default_model.as_deref(),
+        None,
+        &models,
+    )
+    .await?;
+    println!("{id}: thinking {spec}; check it with `havn model check {id}`");
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckView {
+    outcome: String,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    reply: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// `havn model check ID`: send a listed model a very short request with its
+/// thinking at its default, and say how it answered.
+pub async fn check(id: &str) -> anyhow::Result<()> {
+    let gw = Gateway::from_env()?;
+    let view: ModelsView = gw.get_json("/llm/models").await?;
+    let Some(entry) = view.models.into_iter().find(|m| m.id == id) else {
+        anyhow::bail!("{id} is not listed");
+    };
+    let found: CheckView = gw
+        .post_json("/llm/models/check", &json!({ "entry": entry }))
+        .await?;
+    match found.outcome.as_str() {
+        "reasoning" => println!(
+            "{id} answered and showed its reasoning:\n  {}\n  answer: {}",
+            found.reasoning.unwrap_or_default().replace('\n', " "),
+            found.reply.unwrap_or_default()
+        ),
+        "no_reasoning" => println!(
+            "{id} answered without showing reasoning: it may not think as set, or keep its reasoning to itself. Answer: {}",
+            found.reply.unwrap_or_default()
+        ),
+        _ => println!("{id} refused: {}", found.error.unwrap_or_default()),
+    }
     Ok(())
 }
 

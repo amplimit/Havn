@@ -35,11 +35,12 @@ impl LlmProvider for AnthropicProvider {
         api_key: &str,
         request: &AnthropicRequest,
     ) -> Result<AnthropicResponse, ProviderError> {
+        let body = request_body(request)?;
         let resp = http
             .post(format!("{base_url}/v1/messages"))
             .header("x-api-key", api_key)
             .header("anthropic-version", VERSION)
-            .json(request)
+            .json(&body)
             .send()
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
@@ -64,8 +65,7 @@ impl LlmProvider for AnthropicProvider {
         request: &AnthropicRequest,
         text: &TextSink,
     ) -> Result<AnthropicResponse, ProviderError> {
-        let mut body = serde_json::to_value(request)
-            .map_err(|e| ProviderError::Translation(format!("request build: {e}")))?;
+        let mut body = request_body(request)?;
         body["stream"] = serde_json::Value::Bool(true);
         let resp = http
             .post(format!("{base_url}/v1/messages"))
@@ -242,6 +242,36 @@ impl StreamedMessage {
     }
 }
 
+/// The request as the Messages API takes it, asking the model to think
+/// (issue #190): adaptive thinking, at an effort for a level, as current
+/// models take it, or a fixed budget, as Haiku 4.5 and older models take
+/// it, leaving room for the reply. With thinking on, no temperature;
+/// thinking is shown summarized, since newer models leave it out unless
+/// asked. Off sends no `thinking`: several current models refuse
+/// `disabled`, and older ones do not think without being asked.
+fn request_body(request: &AnthropicRequest) -> Result<serde_json::Value, ProviderError> {
+    let mut body = serde_json::to_value(request)
+        .map_err(|e| ProviderError::Translation(format!("request build: {e}")))?;
+    let adaptive = || serde_json::json!({"type": "adaptive", "display": "summarized"});
+    let thinking = match &request.reasoning {
+        None | Some(super::Reasoning::Off) => None,
+        Some(super::Reasoning::On) => Some(adaptive()),
+        Some(super::Reasoning::Effort(level)) => {
+            body["output_config"] = serde_json::json!({"effort": level});
+            Some(adaptive())
+        }
+        Some(super::Reasoning::Budget(n)) => super::budget_within(*n, request.max_tokens)
+            .map(|budget| serde_json::json!({"type": "enabled", "budget_tokens": budget})),
+    };
+    if let Some(thinking) = thinking {
+        body["thinking"] = thinking;
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("temperature");
+        }
+    }
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
@@ -411,6 +441,7 @@ mod tests {
         AnthropicRequest {
             model: "claude-test".into(),
             max_tokens: 16,
+            reasoning: None,
             messages: vec![AnthropicMessage {
                 role: "user".into(),
                 content: serde_json::json!("hi"),
@@ -419,5 +450,53 @@ mod tests {
             temperature: None,
             tools: None,
         }
+    }
+
+    #[test]
+    fn thinking_is_asked_for_as_the_model_takes_it() {
+        use super::super::Reasoning;
+        let mut r = AnthropicRequest {
+            model: "claude-x".into(),
+            max_tokens: 16000,
+            reasoning: Some(Reasoning::Effort("high".into())),
+            messages: Vec::new(),
+            system: None,
+            temperature: Some(0.2),
+            tools: None,
+        };
+        let body = request_body(&r).expect("body");
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "summarized"})
+        );
+        assert_eq!(body["output_config"], serde_json::json!({"effort": "high"}));
+        assert!(body.get("temperature").is_none());
+        r.reasoning = Some(Reasoning::On);
+        let body = request_body(&r).expect("body");
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert!(body.get("output_config").is_none());
+        // A budget, for older models: the reply keeps room.
+        r.reasoning = Some(Reasoning::Budget(60000));
+        assert_eq!(
+            request_body(&r).expect("body")["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 11904})
+        );
+        r.max_tokens = 2048;
+        assert_eq!(
+            request_body(&r).expect("body")["thinking"]["budget_tokens"],
+            1024
+        );
+        r.max_tokens = 2047;
+        assert!(
+            request_body(&r).expect("body").get("thinking").is_none(),
+            "no room for the smallest budget and a reply"
+        );
+        r.max_tokens = 16000;
+        r.reasoning = Some(Reasoning::Off);
+        let body = request_body(&r).expect("body");
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["temperature"], 0.2);
+        r.reasoning = None;
+        assert_eq!(request_body(&r).expect("body")["temperature"], 0.2);
     }
 }

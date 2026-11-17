@@ -171,6 +171,11 @@ pub struct ConversationResponse {
     /// answers now included; absent from a runtime that does not say.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting: Option<usize>,
+    /// The chat's own model and thinking choice, when it has them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
     /// `true` when the agent has never been started — agent.db
     /// doesn't exist on disk yet.
     pub uninitialised: bool,
@@ -182,6 +187,10 @@ struct ConversationRows {
     turns: Vec<BranchTurn>,
     #[serde(default)]
     waiting: Option<usize>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    thinking: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,7 +205,23 @@ pub struct BranchSwitch {
 
 #[derive(Debug, Deserialize)]
 pub struct ChatPatch {
-    pub title: String,
+    /// A new title.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// The chat's own model; `null` for the agent's (issue #190).
+    #[serde(default, deserialize_with = "present")]
+    pub model: Option<Option<String>>,
+    /// The chat's own thinking choice; `null` for its model's default.
+    #[serde(default, deserialize_with = "present")]
+    pub thinking: Option<Option<String>>,
+}
+
+/// A field that is present, `null` included.
+fn present<'de, D>(d: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(d).map(Some)
 }
 
 /// The webchat session of `user` with `agent`.
@@ -253,6 +278,8 @@ pub async fn list(
         conversation: rows.conversation,
         turns: views,
         waiting: rows.waiting,
+        model: rows.model,
+        thinking: rows.thinking,
         uninitialised: false,
     }))
 }
@@ -327,17 +354,58 @@ pub async fn chat_patch(
     Json(req): Json<ChatPatch>,
 ) -> Result<StatusCode, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
-    let title = req.title.trim();
-    if title.is_empty() {
+    let conversation = chat_param(Some(chat))?.unwrap_or_default();
+    let title = req.title.as_deref().map(str::trim);
+    if title.is_some_and(str::is_empty) {
         return Err(ApiError::BadRequest("title must be non-empty".into()));
     }
+    if req.model.is_some() || req.thinking.is_some() {
+        // Only a model the agent may use; a thinking choice that reads as
+        // one (the model decides whether it takes it).
+        if let Some(Some(model)) = &req.model {
+            let usable = crate::commands::usable_models(&state, agent.id)
+                .await
+                .unwrap_or_default();
+            if !usable.iter().any(|m| &m.id == model) {
+                return Err(ApiError::BadRequest(format!(
+                    "{model:?} is not a model this agent may use"
+                )));
+            }
+        }
+        if let Some(Some(thinking)) = &req.thinking
+            && !crate::commands::is_thinking_choice(thinking)
+        {
+            return Err(ApiError::BadRequest(format!(
+                "{thinking:?} is not a thinking choice"
+            )));
+        }
+        let set: Found = crate::api::agents::agent_data(
+            &state,
+            user.id,
+            agent.id,
+            havn_proto::DataQuery::ChatSettings {
+                channel_id: session(&user, agent.id),
+                conversation: conversation.clone(),
+                model: req.model.clone(),
+                thinking: req.thinking.clone(),
+            },
+            true,
+        )
+        .await?;
+        if !set.found {
+            return Err(ApiError::NotFound);
+        }
+    }
+    let Some(title) = title else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
     let renamed: Found = crate::api::agents::agent_data(
         &state,
         user.id,
         agent.id,
         havn_proto::DataQuery::RenameChat {
             channel_id: session(&user, agent.id),
-            conversation: chat_param(Some(chat))?.unwrap_or_default(),
+            conversation,
             title: title.to_string(),
         },
         true,

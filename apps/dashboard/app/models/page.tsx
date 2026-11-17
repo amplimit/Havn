@@ -1,7 +1,16 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ApiError, LLM_PROVIDERS as PROVIDERS, api, type ModelEntry, type ModelsView } from "@/lib/api";
+import {
+  ApiError,
+  LLM_PROVIDERS as PROVIDERS,
+  api,
+  thinkingChoices,
+  type ModelCheck,
+  type ModelEntry,
+  type ModelsView,
+  type ThinkingSpec,
+} from "@/lib/api";
 import { SkeletonList } from "@/components/SkeletonList";
 
 export default function ModelsPage() {
@@ -279,12 +288,27 @@ export default function ModelsPage() {
                   </span>
                 )}
                 {m.vision && <span className="pill pill-stopped">sees images</span>}
+                {m.thinking && (
+                  <span className="pill pill-stopped">
+                    thinks: {thinkingChoices(m.thinking).join(" / ")}
+                  </span>
+                )}
               </div>
               {m.label && (
                 <p className="mt-1 font-mono text-xs wrap-anywhere" style={{ color: "var(--color-body)" }}>
                   {m.id}
                 </p>
               )}
+              <ThinkingEditor
+                entry={m}
+                editable={editable && !busy}
+                onSave={(thinking) =>
+                  save(
+                    view.default_model,
+                    view.models.map((x) => (x.id === m.id ? { ...x, thinking } : x)),
+                  )
+                }
+              />
             </div>
             {editable && (
               <div className="flex flex-wrap gap-2">
@@ -327,6 +351,151 @@ export default function ModelsPage() {
           </li>
         ))}
       </ul>
+    </div>
+  );
+}
+
+/**
+ * How a model thinks, as its admin sets it: the style its provider takes
+ * (on/off, levels, or token budgets), the choices, the default; and a
+ * check that sends it a very short request with it.
+ */
+function ThinkingEditor({
+  entry,
+  editable,
+  onSave,
+}: {
+  entry: ModelEntry;
+  editable: boolean;
+  onSave: (thinking: ThinkingSpec | undefined) => Promise<boolean>;
+}) {
+  const spec = entry.thinking;
+  const [open, setOpen] = useState(false);
+  const [style, setStyle] = useState<"none" | ThinkingSpec["style"]>(spec?.style ?? "none");
+  const [list, setList] = useState(
+    spec?.style === "budget" ? (spec.budgets ?? []).join(", ") : (spec?.levels ?? []).join(", "),
+  );
+  const [defaultChoice, setDefaultChoice] = useState(spec?.default ?? "");
+  const [mandatory, setMandatory] = useState(spec?.mandatory ?? false);
+  const [check, setCheck] = useState<ModelCheck | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  function draft(): ThinkingSpec | undefined {
+    if (style === "none") return undefined;
+    const items = list.split(/[\s,]+/).filter(Boolean);
+    const out: ThinkingSpec = { style };
+    if (style === "effort") out.levels = items;
+    if (style === "budget") out.budgets = items.map(Number);
+    if (defaultChoice) out.default = defaultChoice;
+    if (mandatory) out.mandatory = true;
+    return out;
+  }
+
+  async function runCheck() {
+    setChecking(true);
+    setError(null);
+    setCheck(null);
+    try {
+      setCheck(await api.models.check({ ...entry, thinking: draft() }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  const provider = entry.id.split(":")[0];
+  const muted = { color: "var(--color-body)" };
+  if (!open) {
+    return (
+      <button type="button" className="mt-2 text-xs underline" style={muted} onClick={() => setOpen(true)}>
+        {spec ? "thinking settings" : "set up thinking"}
+      </button>
+    );
+  }
+  const current = draft();
+  return (
+    <div className="mt-3 grid gap-2 text-sm" style={muted}>
+      <label className="flex flex-wrap items-center gap-2">
+        thinking
+        <select
+          className="input"
+          value={style}
+          disabled={!editable}
+          onChange={(e) => setStyle(e.target.value as typeof style)}
+          aria-label={`thinking of ${entry.id}`}
+        >
+          <option value="none">none: not asked to think</option>
+          <option value="toggle">on or off</option>
+          <option value="effort">by level</option>
+          {provider !== "openai" && <option value="budget">by token budget</option>}
+        </select>
+      </label>
+      {(style === "effort" || style === "budget") && (
+        <label className="flex flex-wrap items-center gap-2">
+          {style === "effort" ? "levels it takes" : "budgets offered (tokens)"}
+          <input
+            className="input"
+            value={list}
+            disabled={!editable}
+            placeholder={style === "effort" ? "low, medium, high" : "1024, 4096, 16384"}
+            onChange={(e) => setList(e.target.value)}
+          />
+        </label>
+      )}
+      {current && (
+        <label className="flex flex-wrap items-center gap-2">
+          default for a chat
+          <select
+            className="input"
+            value={defaultChoice}
+            disabled={!editable}
+            onChange={(e) => setDefaultChoice(e.target.value)}
+          >
+            <option value="">{mandatory ? "the first" : "off"}</option>
+            {thinkingChoices(current)
+              .filter((c) => c !== "off")
+              .map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+          </select>
+        </label>
+      )}
+      {current && (
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked={mandatory} disabled={!editable} onChange={(e) => setMandatory(e.target.checked)} />
+          it always thinks (no off)
+        </label>
+      )}
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          className="btn-ghost"
+          disabled={!editable}
+          onClick={() => void onSave(current).then((ok) => ok && setOpen(false))}
+        >
+          save
+        </button>
+        <button type="button" className="btn-ghost" disabled={checking} onClick={() => void runCheck()}>
+          {checking ? "checking…" : "check"}
+        </button>
+        <button type="button" className="text-xs underline" onClick={() => setOpen(false)}>
+          close
+        </button>
+      </div>
+      {error && <p role="alert" style={{ color: "var(--color-ruby)" }}>{error}</p>}
+      {check && (
+        <p role="status" className="text-xs">
+          {check.outcome === "reasoning" &&
+            `It answered and showed its reasoning: "${check.reasoning}" Answer: ${check.reply}`}
+          {check.outcome === "no_reasoning" &&
+            `It answered without showing reasoning: it may not think as set, or keep its reasoning to itself. Answer: ${check.reply}`}
+          {check.outcome === "error" && `The provider refused: ${check.error}`}
+        </p>
+      )}
     </div>
   );
 }

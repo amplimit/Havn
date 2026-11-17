@@ -5,8 +5,10 @@ import Link from "next/link";
 import {
   api,
   type AgentView,
+  type AgentModels,
   type ChatCommand,
   type ChatSearch,
+  thinkingChoices,
   type ChatSummary,
   type ConversationTurn,
   type EmbeddingStatus,
@@ -432,10 +434,15 @@ export default function ChatPage({
       try {
         const since = Date.now();
         const asked = chatIdRef.current;
+        const changes = settingsChanged.current;
         const r = await api.conversation.list(id, HISTORY_LIMIT, asked ?? undefined);
         if (cancelled || chatIdRef.current !== asked) return;
         if (!asked && r.conversation) selectChat(r.conversation);
         if (reconnected && r.waiting !== undefined) setWaiting(r.waiting);
+        if (settingsChanged.current === changes) {
+          setChatModel(r.model ?? null);
+          setChatThinking(r.thinking ?? null);
+        }
         const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
         setBubbles((prev) => mergeStored(prev, stored, since));
       } catch (e) {
@@ -748,6 +755,40 @@ export default function ChatPage({
     setWaiting((n) => n + 1);
   }
 
+  // The models the agent may use, and the chat's own model and thinking
+  // choice (null: the agent's model, the model's default).
+  const [models, setModels] = useState<AgentModels | null>(null);
+  const [chatModel, setChatModel] = useState<string | null>(null);
+  const [chatThinking, setChatThinking] = useState<string | null>(null);
+  // Counts the chat settings changed here, so a history load that started
+  // before one does not put back what the chat had.
+  const settingsChanged = useRef(0);
+  useEffect(() => {
+    api.models
+      .forAgent(id)
+      .then(setModels)
+      .catch((e) => console.warn("[chat] models unavailable", e));
+  }, [id]);
+
+  // Set the chat's model or thinking choice; a chat with no message yet
+  // gets its id here.
+  async function setChatSettings(settings: { model?: string | null; thinking?: string | null }) {
+    settingsChanged.current += 1;
+    let chatId = chatIdRef.current;
+    if (!chatId) {
+      chatId = newChatId();
+      selectChat(chatId);
+    }
+    try {
+      await api.chats.settings(id, chatId, settings);
+      settingsChanged.current += 1;
+      if (settings.model !== undefined) setChatModel(settings.model);
+      if (settings.thinking !== undefined) setChatThinking(settings.thinking);
+    } catch (e) {
+      pushBubble("system", `error: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   // The chat commands, for the composer's suggestions.
   const [commands, setCommands] = useState<ChatCommand[]>([]);
   useEffect(() => {
@@ -872,6 +913,9 @@ export default function ChatPage({
     const target = next ?? newChatId();
     selectChat(target);
     setBubbles([]);
+    // Until its history says otherwise, a chat has the defaults.
+    setChatModel(null);
+    setChatThinking(null);
     setStep(null);
     clearLive();
     setWaiting((n) => {
@@ -1191,6 +1235,10 @@ export default function ChatPage({
           onAttach={(files) => void attachFiles(files)}
           onDetach={(path) => setAttached((prev) => prev.filter((a) => a.path !== path))}
           commands={commands}
+          models={models}
+          chatModel={chatModel}
+          chatThinking={chatThinking}
+          onSettings={(s) => void setChatSettings(s)}
         />
       </div>
     </div>
@@ -2158,6 +2206,79 @@ function ActionRow({
  * `agent_message` arrives (parent flips `pending` to false).
  */
 /** The reply as the model writes it, before the reply itself comes. */
+/**
+ * The chat's model and how much it thinks, for this chat only: the model
+ * menu as on the agent's settings page; the thinking menu with off first,
+ * then what the model takes, greyed out for a model that cannot think.
+ */
+function ChatModelMenus({
+  models,
+  chatModel,
+  chatThinking,
+  disabled,
+  onSettings,
+}: {
+  models: AgentModels;
+  chatModel: string | null;
+  chatThinking: string | null;
+  disabled: boolean;
+  onSettings: (settings: { model?: string | null; thinking?: string | null }) => void;
+}) {
+  const agentModel = models.agent_model ?? models.default_model;
+  const model = chatModel ?? agentModel;
+  const spec = models.models.find((m) => m.id === model)?.thinking;
+  const choices = spec ? thinkingChoices(spec) : [];
+  const fallback = spec?.default ?? choices[0] ?? "off";
+  const thinking = chatThinking && choices.includes(chatThinking) ? chatThinking : fallback;
+  const name = (id: string | null) => {
+    const m = models.models.find((x) => x.id === id);
+    return m?.label ?? id ?? "default";
+  };
+  const thinkingName = (c: string) =>
+    c === "off" ? "thinking off" : c === "on" ? "thinking on" : spec?.style === "budget" ? `think ${Number(c).toLocaleString()} tokens` : `think ${c}`;
+  return (
+    <>
+      <select
+        className="input text-sm"
+        style={{ maxWidth: 220, padding: "4px 8px" }}
+        aria-label="model of this chat"
+        title="The model of this chat; others keep theirs"
+        value={chatModel ?? ""}
+        disabled={disabled}
+        onChange={(e) => onSettings({ model: e.target.value || null })}
+      >
+        <option value="">{name(agentModel)} (agent&apos;s)</option>
+        {models.models.map((m) => (
+          <option key={m.id} value={m.id}>
+            {m.label ?? m.id}
+            {m.id === agentModel ? " (kept for this chat)" : ""}
+          </option>
+        ))}
+      </select>
+      <select
+        className="input text-sm"
+        style={{ maxWidth: 200, padding: "4px 8px" }}
+        aria-label="thinking of this chat"
+        title={spec ? "How much this chat's model thinks" : "This model is not set up to think"}
+        value={spec ? thinking : "off"}
+        disabled={disabled || !spec}
+        onChange={(e) => onSettings({ thinking: e.target.value })}
+      >
+        {spec ? (
+          choices.map((c) => (
+            <option key={c} value={c}>
+              {thinkingName(c)}
+              {c === fallback && !chatThinking ? " (default)" : ""}
+            </option>
+          ))
+        ) : (
+          <option value="off">no thinking</option>
+        )}
+      </select>
+    </>
+  );
+}
+
 /** The reasoning of the reply being written, as it arrives. */
 function LiveThinking({ text }: { text: string }) {
   const box = useRef<HTMLDivElement>(null);
@@ -2391,6 +2512,10 @@ function Composer({
   onAttach,
   onDetach,
   commands,
+  models,
+  chatModel,
+  chatThinking,
+  onSettings,
 }: {
   agentId: string;
   wsState: "idle" | "connecting" | "open" | "closed" | "error";
@@ -2405,6 +2530,11 @@ function Composer({
   onAttach: (files: File[]) => void;
   onDetach: (path: string) => void;
   commands: ChatCommand[];
+  /** The models the agent may use, and the chat's own choices. */
+  models: AgentModels | null;
+  chatModel: string | null;
+  chatThinking: string | null;
+  onSettings: (settings: { model?: string | null; thinking?: string | null }) => void;
 }) {
   const fileInput = useRef<HTMLInputElement>(null);
   // Commands that start with what is typed after a slash, before any
@@ -2571,6 +2701,15 @@ function Composer({
             <Paperclip size={16} className="shrink-0" aria-hidden="true" />
             attach
           </button>
+          {models && models.models.length > 0 && (
+            <ChatModelMenus
+              models={models}
+              chatModel={chatModel}
+              chatThinking={chatThinking}
+              disabled={!ready}
+              onSettings={onSettings}
+            />
+          )}
           {pending && (
             <span
               className="flex items-center gap-2 text-sm"
