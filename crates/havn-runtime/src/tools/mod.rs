@@ -156,6 +156,8 @@ impl ToolRegistry {
             Arc::new(files::FileReadTool),
             Arc::new(files::FileWriteTool),
             Arc::new(files::FileEditTool),
+            Arc::new(files::FileFindTool),
+            Arc::new(files::FileSearchTool),
         ];
         if policy.permissions.can_use_shell {
             tools.push(Arc::new(shell::ShellTool));
@@ -296,7 +298,8 @@ impl ToolRegistry {
     /// True iff the named tool is disabled in this execution context by
     /// `policy.context_toolsets[context].disabled`.
     /// Disabling `file_write` disables `file_edit` too: both change files,
-    /// and a policy written before `file_edit` existed means both.
+    /// and a policy written before `file_edit` existed means both. Likewise
+    /// disabling `file_read` disables `file_find` and `file_search`.
     fn disabled_in(&self, context: &str, tool_name: &str) -> bool {
         // Scheduled runs, heartbeats and other agents' queries answer no
         // one's chat message: there are no past chats of theirs to search.
@@ -313,10 +316,11 @@ impl ToolRegistry {
             .0
             .get(context)
             .is_some_and(|entry| {
-                entry
-                    .disabled
-                    .iter()
-                    .any(|d| d == tool_name || (d == "file_write" && tool_name == "file_edit"))
+                entry.disabled.iter().any(|d| {
+                    d == tool_name
+                        || (d == "file_write" && tool_name == "file_edit")
+                        || (d == "file_read" && matches!(tool_name, "file_find" | "file_search"))
+                })
             })
     }
 
@@ -446,6 +450,21 @@ impl ToolRegistry {
             }
         }
 
+        // Finding and searching files leave out the files a rule about
+        // file_read guards; the registry says which, whatever the model
+        // sent in that field.
+        let mut input = input;
+        if matches!(name, "file_find" | "file_search")
+            && let Some(obj) = input.as_object_mut()
+        {
+            let guarded = self
+                .hooks
+                .as_ref()
+                .map(|h| h.load().guarded_reads())
+                .unwrap_or_default();
+            obj.insert(files::GUARDED_READS.into(), serde_json::json!(guarded));
+        }
+
         tool.execute(ctx, input).await
     }
 }
@@ -459,6 +478,7 @@ impl ToolRegistry {
 /// | `shell` | `command` |
 /// | `web_fetch` | `url` |
 /// | `file_read` / `file_write` / `file_edit` | `path` |
+/// | `file_find` / `file_search` | `path` |
 /// | `memory_search` | `query` |
 /// | other | concatenated values, lossy fallback |
 ///
@@ -475,6 +495,7 @@ fn flatten_input_for_hook(tool: &str, input: &serde_json::Value) -> String {
         "shell" => pick("command"),
         "web_fetch" => pick("url"),
         "file_read" | "file_write" | "file_edit" => pick("path"),
+        "file_find" | "file_search" => pick("path"),
         "memory_search" => pick("query"),
         "memory_remember" | "memory_forget" => pick("key"),
         "subagent_spawn" => pick("task"),
@@ -531,6 +552,8 @@ mod tests {
             "file_read",
             "file_write",
             "file_edit",
+            "file_find",
+            "file_search",
             "shell",
             "skill_manage",
         ] {
@@ -555,6 +578,10 @@ mod tests {
         // Always-on tools still present.
         assert!(names.contains(&"memory_remember".into()));
         assert!(names.contains(&"file_read".into()));
+        assert!(
+            names.contains(&"file_find".into()) && names.contains(&"file_search".into()),
+            "found without shell"
+        );
     }
 
     // ---- context layer (per call) -----------------------------------------
@@ -627,6 +654,60 @@ mod tests {
             .await;
         assert!(res.is_error(), "{res:?}");
         assert!(res.text().contains("disabled"), "{}", res.text());
+    }
+
+    #[tokio::test]
+    async fn finding_files_follows_file_read_and_its_rules() {
+        let mut policy = Policy::default();
+        policy.hooks.pre_tool_use.push(havn_core::ToolHookRule {
+            tool: "file_read".into(),
+            deny: vec!["^secrets/".into()],
+            ask: Vec::new(),
+        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("secrets")).expect("dir");
+        std::fs::write(dir.path().join("secrets/key.md"), "k").expect("write");
+        std::fs::write(dir.path().join("notes.md"), "n").expect("write");
+        let set = crate::hooks::load(&policy.hooks, dir.path())
+            .await
+            .expect("hooks");
+        let reg = registry(policy.clone()).with_hooks(crate::hooks::handle(set));
+        let env = ToolCtx {
+            workspace_dir: dir.path().to_path_buf(),
+            agent_db: dummy_pool().await,
+            policy: Arc::clone(&reg.policy),
+            embedder: None,
+        };
+        // The model cannot clear the rules by sending the field itself.
+        let res = reg
+            .execute_for(
+                context::WEBCHAT,
+                "file_find",
+                serde_json::json!({"pattern": "*.md", files::GUARDED_READS: []}),
+                &env,
+            )
+            .await;
+        assert!(!res.text().contains("secrets/key.md"), "{}", res.text());
+        assert!(res.text().contains("notes.md"), "{}", res.text());
+        // Nor hide files from a registry that has no rules.
+        let res = registry(Policy::default())
+            .execute_for(
+                context::WEBCHAT,
+                "file_find",
+                serde_json::json!({"pattern": "*.md", files::GUARDED_READS: ["."]}),
+                &env,
+            )
+            .await;
+        assert!(res.text().contains("secrets/key.md"), "{}", res.text());
+
+        policy.context_toolsets.0.insert(
+            context::CRON.into(),
+            ContextToolsetEntry {
+                disabled: vec!["file_read".into()],
+            },
+        );
+        let names = names_in(&registry(policy).schemas_for(context::CRON));
+        assert!(!names.contains(&"file_find".into()) && !names.contains(&"file_search".into()));
     }
 
     #[tokio::test]
