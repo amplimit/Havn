@@ -574,6 +574,7 @@ A message that is only a command is answered by the gateway or the agent and nev
 | `/agent_model [name\|number\|default]` | sets the agent's model, as its settings page does, for every chat without one of its own |
 | `/usage [days]` | the agent's model calls and tokens, per model (30 days by default) |
 | `/approve [always]`, `/deny` | answer the step of this conversation waiting for approval |
+| `/disconnect` | in a chat app, ends this account's link to a Havn account (see [Connecting a chat account](#connecting-a-chat-account)) |
 | `/whoami` | who the gateway takes you for, and whether you may use the admin commands |
 | `/help` (`/commands`) | lists them |
 
@@ -637,7 +638,7 @@ A Havn user can connect their own Telegram account (or another chat app's) to th
 
 - A linked sender who owns the agent may use the admin commands (`/model`, `/approve`, ...) without being listed in `admins`; `admins` stays for people without a Havn account.
 - A linked sender may write to the bots of every agent of the same user without another code.
-- A sender is one user's, and a user has one sender per channel: linking again replaces the earlier link, and the earlier sender loses what the user's codes gave it. A sender linked to another user is refused ("already connected to another Havn account"); that user disconnects it first. A sender who can already write to the bot links with the link (`/start <code>`) too; a plain invite code sent that way is left for its person.
+- A sender is one user's, and a user has one sender per channel: linking again replaces the earlier link, and the earlier sender loses what the user's codes gave it. A code for a sender linked to another user is refused ("already connected to another Havn account"): the person sends `/disconnect` to the bot first, which ends the link whoever it is to (`havn access unlink --channel telegram tg:123` does the same for the operator). A sender who can already write to the bot links with the link (`/start <code>`) too; a plain invite code sent that way is left for its person.
 - Links are listed, and removed, under **chat apps** on any agent's settings page (`GET` and `DELETE /me/channel-links`). Disconnecting takes back the access the user's codes gave the sender; an admission they had otherwise (`allow_from`, an invite) stays.
 - An account bound to several agents (`[[bindings]]`) sends its messages to the first; only that agent's owner can make codes for it.
 - Links are per channel, so an adapter's sender ids must be the same person on every account of the channel, as Telegram's user ids are. `havn access list` shows who each sender is linked to. Creating a code and linking and unlinking are audited as `channel_link.code_created`, `channel_link.created` and `channel_link.removed`.

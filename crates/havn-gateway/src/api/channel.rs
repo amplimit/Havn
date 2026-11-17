@@ -71,7 +71,12 @@ const PAIR_WELCOME: &str = "Hello! This bot needs pairing before you can use it.
                             pairing link you got. No code yet? Ask whoever runs this bot.";
 const PAIR_UNPAIRED: &str = "Not paired yet. Send your pairing code, or /help.";
 const PAIR_INVALID_CODE: &str = "That pairing code is not valid or has expired.";
-const PAIR_LINKED_ELSEWHERE: &str = "This chat account is already connected to another Havn                                      account. Disconnect it there first, then open the pairing                                      link again.";
+const PAIR_LINKED_ELSEWHERE: &str = "This chat account is already connected to another Havn \
+                                     account. Send /disconnect to end that, then open the \
+                                     pairing link again.";
+/// What `/disconnect` says (issue #182); `{name}` is the account's name.
+const DISCONNECTED_MESSAGE: &str = "Disconnected from Havn account {name}.";
+const NOT_CONNECTED_MESSAGE: &str = "This chat account is not connected to a Havn account.";
 const PAIR_TOO_MANY_TRIES: &str =
     "Too many tries. Please wait a few minutes, then send your pairing code again.";
 const PAIR_HELP: &str = "This bot answers only people who have paired with it. To pair, send the \
@@ -1018,6 +1023,10 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
     // is the gate the audit found missing: without it, any platform user
     // who can reach the bot gets the full agent toolset.
     let access = sender_access(state, channel, agent_id, &inb).await;
+    if access == SenderAccess::Disconnect {
+        disconnect(state, channel, &inb).await;
+        return;
+    }
     if matches!(access, SenderAccess::Admitted | SenderAccess::Linked(_)) {
         let text = match &access {
             SenderAccess::Linked(name) => linked_text(state, channel, &inb.account_id, name),
@@ -1420,6 +1429,8 @@ enum SenderAccess {
     Linked(String),
     /// Not forwarded: the sender is not paired; how it is answered.
     Denied(Refusal),
+    /// `/disconnect`: end the sender's link to a Havn account, whoever's.
+    Disconnect,
 }
 
 /// What a sender who is not paired is told (issue #183).
@@ -1547,6 +1558,14 @@ async fn sender_access(
         _ => None,
     };
     let command = text.and_then(bot_command);
+    // The person in the chat app may always end a link of theirs, so a
+    // link made to the wrong account does not lock them out.
+    if command
+        .as_ref()
+        .is_some_and(|(name, _)| name == "disconnect")
+    {
+        return SenderAccess::Disconnect;
+    }
     let admitted = match acct.dm_policy {
         DmPolicy::Open => true,
         DmPolicy::Allowlist => {
@@ -1712,6 +1731,47 @@ async fn redeem_code(
         .flatten()
         .map_or_else(|| "your Havn account".to_string(), |u| u.display_name);
     SenderAccess::Linked(name)
+}
+
+/// `/disconnect` from the sender of `inb`: end their link, say so. A
+/// sender with no link is told within the limit strangers are answered in.
+async fn disconnect(state: &AppState, channel: &str, inb: &ChannelInbound) {
+    let text = match channel_access::unlink_sender(&state.db, channel, &inb.sender_id).await {
+        Ok(Some(link)) => {
+            crate::audit::record_user_action(
+                &state.db,
+                link.user_id,
+                "channel_link.removed",
+                serde_json::json!({
+                    "channel": channel,
+                    "sender_id": inb.sender_id,
+                    "by": "the sender",
+                }),
+            )
+            .await;
+            DISCONNECTED_MESSAGE.replace("{name}", &link.user_name)
+        }
+        Ok(None) => {
+            let key = format!("{channel}|{}|{}", inb.account_id, inb.sender_id);
+            if !state.dm_reject_limiter.should_send(&key) {
+                return;
+            }
+            NOT_CONNECTED_MESSAGE.to_string()
+        }
+        Err(e) => {
+            warn!(channel, error = %e, "disconnect: could not remove the link");
+            return;
+        }
+    };
+    tell_sender(
+        state,
+        channel,
+        &inb.account_id,
+        &inb.sender_id,
+        &inb.channel_message_id,
+        &text,
+    )
+    .await;
 }
 
 // ---- Pairing from the web (issue #182) ----
@@ -2715,6 +2775,48 @@ mod tests {
                 .expect("db")
                 .expect("linked");
             assert_eq!(link.user_id, f.owner);
+        }
+
+        #[tokio::test]
+        async fn the_person_can_disconnect_a_link_made_to_someone_else() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let mallory = havn_db::repo::users::create(
+                &f.state.db,
+                havn_db::repo::users::NewUser {
+                    display_name: "Mallory",
+                },
+            )
+            .await
+            .expect("user")
+            .id;
+            let theirs = channel_access::create_link_code(&f.state.db, "telegram", "bot", mallory)
+                .await
+                .expect("code")
+                .code;
+            f.send("tg:1", &format!("/start {theirs}")).await;
+            f.replies();
+            f.send("tg:1", "/disconnect@bot").await;
+            assert_eq!(
+                f.replies(),
+                vec![(
+                    "tg:1".to_string(),
+                    "Disconnected from Havn account Mallory.".to_string()
+                )]
+            );
+            assert!(f.forwarded().is_empty());
+            let code = link_code(&f, "bot").await;
+            f.send("tg:1", &format!("/start {code}")).await;
+            let link = channel_access::linked_user(&f.state.db, "telegram", "tg:1")
+                .await
+                .expect("db")
+                .expect("linked");
+            assert_eq!(link.user_id, f.owner, "their own account now");
+            f.replies();
+            f.send("tg:2", "/disconnect").await;
+            assert_eq!(
+                f.replies(),
+                vec![("tg:2".to_string(), NOT_CONNECTED_MESSAGE.to_string())]
+            );
         }
 
         #[tokio::test]

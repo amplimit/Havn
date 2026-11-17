@@ -292,6 +292,24 @@ pub async fn access_list(channel: Option<&str>, account: Option<&str>) -> anyhow
     Ok(())
 }
 
+/// `havn access unlink`: end a sender's link to a Havn account.
+pub async fn access_unlink(channel: &str, sender: &str) -> anyhow::Result<()> {
+    let pool = open_db_pub().await?;
+    match channel_access::unlink_sender(&pool, channel, sender)
+        .await
+        .context("removing the link")?
+    {
+        Some(link) => {
+            println!(
+                "{channel} {sender} is no longer linked to {:?}",
+                link.user_name
+            );
+            Ok(())
+        }
+        None => anyhow::bail!("{sender} on {channel} is not linked to a Havn user"),
+    }
+}
+
 /// Returns a warning when the sender stays admitted through `allow_from`.
 async fn revoke_sender_with(
     pool: &sqlx::SqlitePool,

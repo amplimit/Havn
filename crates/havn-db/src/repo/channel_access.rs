@@ -463,6 +463,23 @@ pub async fn list_links(pool: &SqlitePool, user: Option<UserId>) -> Result<Vec<C
     rows.into_iter().map(ChannelLink::try_from).collect()
 }
 
+/// Remove the link of `sender_id` on `channel`, whoever it is to, as
+/// [`unlink`] does; the link removed, if there was one. For the person in
+/// the chat app (`/disconnect`) and the operator: a sender linked to the
+/// wrong user is not stuck with it.
+pub async fn unlink_sender(
+    pool: &SqlitePool,
+    channel: &str,
+    sender_id: &str,
+) -> Result<Option<ChannelLink>> {
+    let Some(link) = linked_user(pool, channel, sender_id).await? else {
+        return Ok(None);
+    };
+    Ok(unlink(pool, link.user_id, channel, sender_id)
+        .await?
+        .then_some(link))
+}
+
 /// Take back from `sender_id` on `channel` the admissions that codes
 /// `user` made on the web gave it; admissions it had otherwise stay.
 async fn revoke_link_access(
@@ -792,6 +809,51 @@ mod tests {
             Some(bob)
         );
         assert_eq!(list_links(&pool, None).await.expect("links").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_sender_can_drop_a_link_made_to_someone_else() {
+        let pool = connect_in_memory().await.expect("db");
+        let mallory = user(&pool, "Mallory").await;
+        let alice = user(&pool, "Alice").await;
+        let now = Utc::now();
+        let theirs = create_link_code(&pool, "telegram", "bot", mallory)
+            .await
+            .expect("code");
+        redeem(
+            &pool,
+            "telegram",
+            "bot",
+            "tg:alice",
+            &theirs.code,
+            now,
+            false,
+        )
+        .await
+        .expect("redeem");
+        let dropped = unlink_sender(&pool, "telegram", "tg:alice")
+            .await
+            .expect("unlink")
+            .expect("was linked");
+        assert_eq!(dropped.user_id, mallory);
+        assert!(
+            !is_allowed(&pool, "telegram", "bot", "tg:alice")
+                .await
+                .expect("allowed")
+        );
+        let own = create_link_code(&pool, "telegram", "bot", alice)
+            .await
+            .expect("code");
+        redeem(&pool, "telegram", "bot", "tg:alice", &own.code, now, false)
+            .await
+            .expect("redeem")
+            .expect("linked to Alice now");
+        assert!(
+            unlink_sender(&pool, "telegram", "tg:nobody")
+                .await
+                .expect("unlink")
+                .is_none()
+        );
     }
 
     #[tokio::test]

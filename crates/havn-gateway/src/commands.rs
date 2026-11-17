@@ -106,6 +106,13 @@ pub const COMMANDS: &[Command] = &[
         admin: true,
     },
     Command {
+        name: "disconnect",
+        aliases: &[],
+        args: "",
+        about: "Disconnect this chat account from its Havn account",
+        admin: false,
+    },
+    Command {
         name: "whoami",
         aliases: &[],
         args: "",
@@ -337,6 +344,11 @@ pub async fn run(state: &AppState, asker: &Asker, command: &Command, args: &str)
             }
         )),
         "undo" => to_agent(ChatCommandKind::Undo),
+        // The gateway does it before a chat-app message gets here.
+        "disconnect" => Action::Reply(
+            "(Chat-app accounts are disconnected on an agent's settings page, under chat apps.)"
+                .into(),
+        ),
         "status" => {
             let agent = match agents_repo::find_by_id(&state.db, asker.agent_id).await {
                 Ok(Some(agent)) => agent.name,

@@ -166,6 +166,14 @@ enum InviteAction {
 
 #[derive(Debug, Subcommand)]
 enum AccessAction {
+    /// End a sender's link to a Havn account, with the access the user's
+    /// pairing codes gave it.
+    Unlink {
+        #[arg(long)]
+        channel: String,
+        /// Platform-prefixed sender id, as shown by `access list`.
+        sender: String,
+    },
     /// List allowed senders from config and from redeemed invites.
     List {
         #[arg(long)]
@@ -481,6 +489,9 @@ async fn run_invite(action: InviteAction) -> anyhow::Result<()> {
 
 async fn run_access(action: AccessAction) -> anyhow::Result<()> {
     match action {
+        AccessAction::Unlink { channel, sender } => {
+            channel_access::access_unlink(&channel, &sender).await
+        }
         AccessAction::List { channel, account } => {
             channel_access::access_list(channel.as_deref(), account.as_deref()).await
         }
