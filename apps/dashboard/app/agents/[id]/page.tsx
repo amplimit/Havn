@@ -9,6 +9,7 @@ import {
   type ChatCommand,
   type ChatSearch,
   thinkingChoices,
+  type ChannelChat,
   type ChatSummary,
   type ConversationTurn,
   type EmbeddingStatus,
@@ -273,6 +274,11 @@ export default function ChatPage({
   const [found, setFound] = useState<string | null>(null);
   const jumpedAt = useRef(0);
   const [chats, setChats] = useState<ChatSummary[]>([]);
+  // The caller's chats in the chat apps they linked (issue #184), and the
+  // scope of the one on screen when it is one: read-only here.
+  const [channelChats, setChannelChats] = useState<ChannelChat[]>([]);
+  const [scope, setScope] = useState<string | null>(null);
+  const scopeRef = useRef<string | null>(null);
   // For the socket's handler, which outlives a render.
   const chatsRef = useRef<ChatSummary[]>([]);
   useEffect(() => {
@@ -285,9 +291,11 @@ export default function ChatPage({
   // The chat list on narrow screens, where it replaces the chat.
   const [showChats, setShowChats] = useState(false);
 
-  function selectChat(next: string | null) {
+  function selectChat(next: string | null, nextScope: string | null = null) {
     chatIdRef.current = next;
+    scopeRef.current = nextScope;
     setChat(next);
+    setScope(nextScope);
   }
 
   const refreshChats = useCallback(async () => {
@@ -296,6 +304,10 @@ export default function ChatPage({
     } catch (e) {
       console.warn("[chat] chat list load failed", e);
     }
+    api.channels
+      .chats(id)
+      .then(setChannelChats)
+      .catch(() => setChannelChats([]));
   }, [id]);
 
   useEffect(() => {
@@ -308,6 +320,12 @@ export default function ChatPage({
         console.warn("[chat] chat list load failed", e);
       }
     })();
+    api.channels
+      .chats(id)
+      .then((list) => {
+        if (!cancelled) setChannelChats(list);
+      })
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
@@ -365,7 +383,7 @@ export default function ChatPage({
     (async () => {
       try {
         const since = Date.now();
-        const r = await api.conversation.list(id, HISTORY_LIMIT, chat ?? undefined);
+        const r = await api.conversation.list(id, HISTORY_LIMIT, chat ?? undefined, scope ?? undefined);
         if (cancelled) return;
         if (!chatIdRef.current && r.conversation) selectChat(r.conversation);
         // A reply still running when the page was left shows again; the
@@ -376,7 +394,7 @@ export default function ChatPage({
         setBubbles((prev) => mergeStored(prev, stored, since));
         // The files sent in it, which its stored turns do not hold.
         const shown = r.conversation ?? chat ?? undefined;
-        if (shown) {
+        if (shown && !scope) {
           api.outbox
             .list(id, shown)
             .then((sent) => {
@@ -395,7 +413,7 @@ export default function ChatPage({
     return () => {
       cancelled = true;
     };
-  }, [id, chat]);
+  }, [id, chat, scope]);
 
   // Poll the agent row for status / connected — used for the stop
   // button and the header pill. Doesn't gate the WS (auto-spawn does
@@ -443,6 +461,8 @@ export default function ChatPage({
       try {
         const since = Date.now();
         const asked = chatIdRef.current;
+        // A channel chat on screen is read from the chat app's side.
+        if (scopeRef.current) return;
         const changes = settingsChanged.current;
         const r = await api.conversation.list(id, HISTORY_LIMIT, asked ?? undefined);
         if (cancelled || chatIdRef.current !== asked) return;
@@ -877,8 +897,9 @@ export default function ChatPage({
     const current = chatIdRef.current;
     if (!current) return false;
     try {
-      await api.chats.branch(id, current, turn);
-      const r = await api.conversation.list(id, HISTORY_LIMIT, current);
+      const onScope = scopeRef.current ?? undefined;
+      await api.chats.branch(id, current, turn, onScope);
+      const r = await api.conversation.list(id, HISTORY_LIMIT, current, onScope);
       if (chatIdRef.current !== current) return false;
       const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
       // Notes of replies on other branches stay with them.
@@ -913,14 +934,14 @@ export default function ChatPage({
 
   // Show chat `next`, or a new one. Approvals stay: they are the agent's,
   // whichever chat asked.
-  function openChatById(next: string | null) {
+  function openChatById(next: string | null, nextScope: string | null = null) {
     setShowChats(false);
     // A found message of another chat is no longer to be shown.
     if (jumpTo.current && jumpTo.current.chat !== next) jumpTo.current = null;
-    if (next !== null && next === chatIdRef.current) return;
+    if (next !== null && next === chatIdRef.current && nextScope === scopeRef.current) return;
     const previous = chatIdRef.current;
     const target = next ?? newChatId();
-    selectChat(target);
+    selectChat(target, nextScope);
     setBubbles([]);
     // Until its history says otherwise, a chat has the defaults.
     setChatModel(null);
@@ -931,6 +952,21 @@ export default function ChatPage({
       if (previous) waitingElsewhere.current.set(previous, n);
       return waitingElsewhere.current.get(target) ?? 0;
     });
+  }
+
+  // Continue the channel chat on screen on the web (issue #184): it
+  // becomes one of the caller's web chats; there is no way back.
+  async function continueOnWeb() {
+    const current = chatIdRef.current;
+    const from = scopeRef.current;
+    if (!current || !from) return;
+    try {
+      await api.channels.move(id, current, from);
+      selectChat(current, null);
+      await refreshChats();
+    } catch (e) {
+      pushBubble("system", `error: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   async function renameChat(c: ChatSummary) {
@@ -1007,8 +1043,11 @@ export default function ChatPage({
     <div className="flex h-[calc(100dvh-(--spacing(15)))] md:h-dvh">
       <ChatList
         chats={chats}
-        current={chat}
-        onOpen={openChatById}
+        current={scope ? null : chat}
+        channelChats={channelChats}
+        currentChannel={scope ? { chat, scope } : null}
+        onOpenChannel={(c) => openChatById(c.id, c.scope)}
+        onOpen={(c) => openChatById(c)}
         onRename={renameChat}
         onDelete={deleteChat}
         onFound={(chat, turn, onBranch) => {
@@ -1143,12 +1182,13 @@ export default function ChatPage({
                 busy={pending || wsState !== "open"}
                 onUpload={uploadFiles}
                 onEdit={
-                  b.role === "you" && b.turn
+                  // A chat-app chat is read-only here.
+                  b.role === "you" && b.turn && !scope
                     ? (text, files) => editMessage(idx, b.turn!, text, files)
                     : undefined
                 }
                 onRegenerate={
-                  b.role === "agent" && b.turn ? () => regenerate(idx, b.turn!) : undefined
+                  b.role === "agent" && b.turn && !scope ? () => regenerate(idx, b.turn!) : undefined
                 }
                 onVersion={(turn) => void showVersion(turn)}
                 onRetry={
@@ -1240,7 +1280,13 @@ export default function ChatPage({
           </div>
         </div>
 
-        {/* Composer */}
+        {/* Composer; a channel chat continues in its app, or moves here */}
+        {scope ? (
+          <ChannelChatBar
+            channel={channelChats.find((c) => c.id === chat && c.scope === scope)?.channel ?? "the chat app"}
+            onMove={() => void continueOnWeb()}
+          />
+        ) : (
         <Composer
           agentId={id}
           wsState={wsState}
@@ -1259,7 +1305,46 @@ export default function ChatPage({
           chatThinking={chatThinking}
           onSettings={(s) => void setChatSettings(s)}
         />
+        )}
       </div>
+    </div>
+  );
+}
+
+/** The name a chat app goes by. */
+function appName(channel: string): string {
+  return channel.charAt(0).toUpperCase() + channel.slice(1);
+}
+
+/**
+ * In place of the composer for a channel chat: it lives in its app and
+ * continues there, or moves to the web for good.
+ */
+function ChannelChatBar({ channel, onMove }: { channel: string; onMove: () => void }) {
+  const [moving, setMoving] = useState(false);
+  return (
+    <div
+      className="flex flex-wrap items-center justify-between gap-3 border-t px-4 py-4 text-sm sm:px-8"
+      style={{ borderColor: "var(--color-border-default)", color: "var(--color-body)" }}
+      role="region"
+      aria-label="channel chat"
+    >
+      <p>
+        This chat lives in {appName(channel)} and continues there. Continue it here instead: it
+        becomes a web chat, and your next message in {appName(channel)} starts a new chat. There
+        is no way back.
+      </p>
+      <button
+        type="button"
+        className="btn-ghost"
+        disabled={moving}
+        onClick={() => {
+          setMoving(true);
+          onMove();
+        }}
+      >
+        continue on the web
+      </button>
     </div>
   );
 }
@@ -1268,6 +1353,9 @@ function ChatList({
   agentId,
   chats,
   current,
+  channelChats,
+  currentChannel,
+  onOpenChannel,
   onOpen,
   onRename,
   onDelete,
@@ -1277,6 +1365,10 @@ function ChatList({
   agentId: string;
   chats: ChatSummary[];
   current: string | null;
+  /** The caller's chats in the chat apps they linked, read-only here. */
+  channelChats: ChannelChat[];
+  currentChannel: { chat: string | null; scope: string } | null;
+  onOpenChannel: (chat: ChannelChat) => void;
   onOpen: (chat: string | null) => void;
   onRename: (chat: ChatSummary) => void;
   onDelete: (chat: ChatSummary) => void;
@@ -1404,6 +1496,33 @@ function ChatList({
             </li>
           )}
         </ul>
+        {channelChats.length > 0 && (
+          <>
+            <p className="mt-4 px-2 pb-1 text-xs" style={{ color: "var(--color-body)" }}>
+              in chat apps
+            </p>
+            <ul className="flex flex-col gap-0.5" aria-label="chats in chat apps">
+              {channelChats.map((c) => {
+                const on = currentChannel?.chat === c.id && currentChannel.scope === c.scope;
+                const title = c.title || "untitled";
+                return (
+                  <li key={`${c.scope}/${c.id}`} className="flex items-center gap-1.5 rounded" style={itemStyle(on)}>
+                    <button
+                      type="button"
+                      className="min-w-0 flex-1 truncate px-2 py-1.5 text-left text-sm"
+                      onClick={() => onOpenChannel(c)}
+                      aria-current={on ? "true" : undefined}
+                      title={`${title} (${appName(c.channel)}, read-only here)`}
+                    >
+                      {title}
+                    </button>
+                    <span className="pill pill-stopped mr-1.5 shrink-0 text-xs">{appName(c.channel)}</span>
+                  </li>
+                );
+              })}
+            </ul>
+          </>
+        )}
       </nav>
       )}
     </aside>

@@ -2932,6 +2932,26 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                     };
                 Ok(serde_json::json!({ "found": found }))
             }
+            DataQuery::MoveChat {
+                from,
+                conversation,
+                to,
+            } => {
+                // Not while its reply runs: it would go where the chat was.
+                if ctx.turns.waiting(&conversation) > 0 {
+                    return Ok(
+                        serde_json::json!({ "moved": false, "busy": true, "was_active": false }),
+                    );
+                }
+                let moved = conversations::move_chat(&ctx.pool, &from, &conversation, &to)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({
+                    "moved": moved.is_some(),
+                    "busy": false,
+                    "was_active": moved.unwrap_or(false),
+                }))
+            }
             DataQuery::DeleteChat {
                 channel_id,
                 conversation,

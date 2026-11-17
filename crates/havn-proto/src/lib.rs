@@ -553,6 +553,16 @@ pub enum DataQuery {
         conversation: String,
         turn: String,
     },
+    /// Move chat `conversation` from scope `from` to scope `to` (issue
+    /// #184: a channel chat continued on the web), unless a reply runs or
+    /// waits in it: `{"moved": bool, "busy": bool, "was_active": bool}`;
+    /// `was_active` when it was `from`'s active chat, which `from` then has
+    /// none of.
+    MoveChat {
+        from: String,
+        conversation: String,
+        to: String,
+    },
     /// Delete chat `conversation` of `channel_id` and its history, stopping
     /// its turn and dropping its queue: `{"found": bool}`.
     DeleteChat {

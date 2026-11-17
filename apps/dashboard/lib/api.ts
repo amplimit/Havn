@@ -552,6 +552,15 @@ export type PairingCode = {
   expires_at: string;
 };
 
+/** One of the caller's chats with an agent in a chat app they linked (issue #184). */
+export type ChannelChat = ChatSummary & {
+  channel: string;
+  account_id: string;
+  sender_id: string;
+  /** Pass back to read it, switch its versions or move it to the web. */
+  scope: string;
+};
+
 /** A chat-app account linked to the caller. */
 export type ChannelLinkView = {
   channel: string;
@@ -605,6 +614,14 @@ export const api = {
     pair: (agentId: string) =>
       request<PairingCode[]>(`/agents/${agentId}/pairing`, { method: "POST" }),
     links: () => request<ChannelLinkView[]>("/me/channel-links"),
+    /** The caller's chats with `agentId` in the chat apps they linked. */
+    chats: (agentId: string) => request<ChannelChat[]>(`/agents/${agentId}/channel-chats`),
+    /** Continue channel chat `chat` on the web; there is no way back. */
+    move: (agentId: string, chat: string, scope: string) =>
+      request<void>(`/agents/${agentId}/chats/${encodeURIComponent(chat)}/move`, {
+        method: "POST",
+        body: JSON.stringify({ scope }),
+      }),
     unlink: (channel: string, sender: string) =>
       request<void>(
         `/me/channel-links?channel=${encodeURIComponent(channel)}&sender=${encodeURIComponent(sender)}`,
@@ -743,10 +760,11 @@ export const api = {
      * with `agentId`. Newest at the end. Empty when the agent has
      * never been started (`uninitialised: true`) or when this is the
      * user's first chat with this agent. */
-    list: (agentId: string, limit = 100, conversation?: string) =>
+    list: (agentId: string, limit = 100, conversation?: string, scope?: string) =>
       request<ConversationResponse>(
         `/agents/${agentId}/conversation?limit=${limit}` +
-          (conversation ? `&conversation=${encodeURIComponent(conversation)}` : ""),
+          (conversation ? `&conversation=${encodeURIComponent(conversation)}` : "") +
+          (scope ? `&scope=${encodeURIComponent(scope)}` : ""),
       ),
   },
 
@@ -779,10 +797,10 @@ export const api = {
         `/agents/${agentId}/chats/${encodeURIComponent(chat)}/turns/${encodeURIComponent(turn)}/trace`,
       ),
     /** Continue `chat` from the branch of `turn`, at its newest turn. */
-    branch: (agentId: string, chat: string, turn: string) =>
+    branch: (agentId: string, chat: string, turn: string, scope?: string) =>
       request<void>(`/agents/${agentId}/chats/${encodeURIComponent(chat)}/branch`, {
         method: "POST",
-        body: JSON.stringify({ turn }),
+        body: JSON.stringify(scope ? { turn, scope } : { turn }),
       }),
   },
 

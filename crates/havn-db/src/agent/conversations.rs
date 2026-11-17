@@ -966,6 +966,30 @@ pub async fn rename_chat(pool: &SqlitePool, scope: &str, id: &str, title: &str) 
     Ok(res.rows_affected() == 1)
 }
 
+/// Move chat `id` from scope `from` to scope `to`; `None` when it is not a
+/// chat of `from`, else whether it was `from`'s active chat (which `from`
+/// then has none of, so its next message starts a new chat).
+pub async fn move_chat(pool: &SqlitePool, from: &str, id: &str, to: &str) -> Result<Option<bool>> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let moved = sqlx::query("UPDATE chats SET scope = ?3 WHERE id = ?1 AND scope = ?2")
+        .bind(id)
+        .bind(from)
+        .bind(to)
+        .execute(&mut *tx)
+        .await?;
+    if moved.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let left = sqlx::query("DELETE FROM active_chats WHERE scope = ?1 AND chat_id = ?2")
+        .bind(from)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some(left.rows_affected() > 0))
+}
+
 /// Delete chat `id` of `scope` with its history; false when it is not one.
 pub async fn delete_chat(pool: &SqlitePool, scope: &str, id: &str) -> Result<bool> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -1243,6 +1267,49 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_chat_moves_to_another_scope_and_leaves_its_place() {
+        let pool = connect_in_memory().await.expect("connect");
+        let chat = chat_for(&pool, "telegram|bot|tg:1", None, "hi")
+            .await
+            .expect("chat");
+        assert_eq!(
+            existing_chat(&pool, "telegram|bot|tg:1", None)
+                .await
+                .expect("db")
+                .as_deref(),
+            Some(chat.as_str())
+        );
+        assert_eq!(
+            move_chat(&pool, "web:x", &chat, "web:y").await.expect("db"),
+            None,
+            "not a chat of that scope"
+        );
+        assert_eq!(
+            move_chat(&pool, "telegram|bot|tg:1", &chat, "web:x")
+                .await
+                .expect("db"),
+            Some(true)
+        );
+        assert_eq!(
+            existing_chat(&pool, "telegram|bot|tg:1", None)
+                .await
+                .expect("db"),
+            None
+        );
+        assert_eq!(chats(&pool, "web:x", 10).await.expect("db").len(), 1);
+        assert!(
+            chats(&pool, "telegram|bot|tg:1", 10)
+                .await
+                .expect("db")
+                .is_empty()
+        );
+        let next = chat_for(&pool, "telegram|bot|tg:1", None, "again")
+            .await
+            .expect("chat");
+        assert_ne!(next, chat, "the channel's next message starts a new chat");
+    }
 
     #[tokio::test]
     async fn own_chat_is_the_chat_named_or_a_new_one() {
