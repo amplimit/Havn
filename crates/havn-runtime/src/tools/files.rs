@@ -500,8 +500,6 @@ fn git(workspace: &Path) -> tokio::process::Command {
     cmd
 }
 
-/// Join a user-provided path under `workspace`, rejecting absolute paths and
-/// any component that could escape the workspace (`..`, root, prefix).
 /// The field of a `file_find` or `file_search` input in which the registry
 /// passes the patterns of the hook rules about `file_read`.
 pub const GUARDED_READS: &str = "guarded_reads";
@@ -520,6 +518,8 @@ const MAX_CONTEXT_LINES: usize = 3;
 const MAX_LINKS_NAMED: usize = 5;
 /// Bytes looked at to tell a binary file.
 const BINARY_SNIFF_BYTES: usize = 8192;
+/// Most bytes of results one call returns, as `file_read` returns.
+const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Whether `rel` (a path within the workspace, `/`-separated) is left out
 /// of finds and searches: version control, and the runtime's own state
@@ -563,17 +563,35 @@ fn glob_regex(glob: &str) -> Result<regex::Regex, String> {
             }
             ',' if braces > 0 => re.push('|'),
             '[' => {
-                let Some(end) = chars[i + 1..].iter().position(|c| *c == ']') else {
-                    return Err(format!("unclosed '[' in {glob:?}"));
-                };
-                let set: String = chars[i + 1..i + 1 + end].iter().collect();
-                let set = set
-                    .strip_prefix('!')
-                    .map_or(set.clone(), |s| format!("^{s}"));
+                // A set: `!` or `^` first negates it, and a `]` right after
+                // that is one of its characters. A `-` between two
+                // characters is a range; anything else is taken as written.
+                let mut j = i + 1;
                 re.push('[');
-                re.push_str(&set.replace('\\', "\\\\"));
+                if matches!(chars.get(j), Some('!' | '^')) {
+                    re.push('^');
+                    j += 1;
+                }
+                let first = j;
+                loop {
+                    let Some(&c) = chars.get(j) else {
+                        return Err(format!("unclosed '[' in {glob:?}"));
+                    };
+                    if c == ']' && j > first {
+                        break;
+                    }
+                    let range = c == '-'
+                        && j > first
+                        && chars[j - 1] != '-'
+                        && chars.get(j + 1).is_some_and(|n| *n != ']' && *n != '-');
+                    if !range && c.is_ascii_punctuation() {
+                        re.push('\\');
+                    }
+                    re.push(c);
+                    j += 1;
+                }
                 re.push(']');
-                i += end + 1;
+                i = j;
             }
             c => re.push_str(&regex::escape(&c.to_string())),
         }
@@ -625,35 +643,52 @@ fn guards_of(input: &Value) -> Vec<regex::Regex> {
 }
 
 /// The directory or file `user_path` names in `workspace` (the whole
-/// workspace when empty), refused when it, or a link on the way, leads
-/// out of it.
+/// workspace when empty), with its path as the walk writes it (its names
+/// joined by `/`, so `./a//b/.` is `a/b`); refused when it, or a link on
+/// the way, leads out of it, or it is the runtime's own.
 fn start_of(workspace: &Path, user_path: Option<&str>) -> Result<(PathBuf, String), String> {
-    let user_path = user_path
-        .map(str::trim)
-        .filter(|p| !p.is_empty() && *p != ".");
-    let Some(user_path) = user_path else {
+    let Some(user_path) = user_path.map(str::trim).filter(|p| !p.is_empty()) else {
         return Ok((workspace.to_path_buf(), String::new()));
     };
-    let joined = safe_join(workspace, user_path)?;
+    safe_join(workspace, user_path)?;
+    let rel = Path::new(user_path)
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    if rel.is_empty() {
+        return Ok((workspace.to_path_buf(), String::new()));
+    }
+    if hidden(&rel) {
+        return Err(format!("{user_path} is not searched"));
+    }
+    let joined = workspace.join(&rel);
     let root = workspace
         .canonicalize()
         .map_err(|e| format!("workspace: {e}"))?;
     let real = joined
         .canonicalize()
         .map_err(|_| format!("not found: {user_path}"))?;
-    if !real.starts_with(&root) || is_link_on_way(workspace, user_path) {
+    if !real.starts_with(&root) || is_link_on_way(workspace, &rel) {
         return Err(format!(
             "{user_path} leads out of the workspace or through a link"
         ));
     }
-    let rel = user_path
-        .trim_start_matches("./")
-        .trim_end_matches('/')
-        .to_string();
-    if hidden(&rel) {
-        return Err(format!("{user_path} is not searched"));
-    }
     Ok((joined, rel))
+}
+
+/// `rel` as seen from `base`, the folder a call looks in: a glob with `/`
+/// matches from there.
+fn under<'a>(rel: &'a str, base: &str) -> &'a str {
+    if base.is_empty() {
+        return rel;
+    }
+    rel.strip_prefix(base)
+        .and_then(|r| r.strip_prefix('/'))
+        .unwrap_or(rel)
 }
 
 /// Whether a component of `user_path` under `workspace` is a link.
@@ -697,22 +732,24 @@ fn walk(start: &Path, rel: &str, each: &mut dyn FnMut(Found) -> bool) -> Walked 
         let Ok(entries) = std::fs::read_dir(&path) else {
             continue;
         };
-        let mut children: Vec<(PathBuf, String)> = entries
-            .filter_map(Result::ok)
-            .filter_map(|e| {
-                let name = e.file_name().into_string().ok()?;
-                let child = if rel.is_empty() {
-                    name
-                } else {
-                    format!("{rel}/{name}")
-                };
-                (!hidden(&child)).then(|| (e.path(), child))
-            })
-            .collect();
-        seen += children.len();
-        if seen > MAX_WALK_ENTRIES {
-            walked.stopped = true;
-            return walked;
+        let mut children: Vec<(PathBuf, String)> = Vec::new();
+        for entry in entries.filter_map(Result::ok) {
+            seen += 1;
+            if seen > MAX_WALK_ENTRIES {
+                walked.stopped = true;
+                return walked;
+            }
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            if !hidden(&child) {
+                children.push((entry.path(), child));
+            }
         }
         // Popped from the end: reversed, they come out in name order.
         children.sort_by(|a, b| b.1.cmp(&a.1));
@@ -766,10 +803,7 @@ fn walk_notes(walked: &Walked, out: &mut String) {
         ));
     }
     if walked.guarded > 0 {
-        out.push_str(&format!(
-            "\n({} file(s) left out: the agent's rules guard reading them)",
-            walked.guarded
-        ));
+        out.push_str("\n(some files were left out: the agent's rules guard reading them)");
     }
     if walked.stopped {
         out.push_str(&format!(
@@ -827,7 +861,7 @@ impl Tool for FileFindTool {
             let mut matches: Vec<Found> = Vec::new();
             let mut guarded = 0usize;
             let mut walked = walk(&start, &rel, &mut |f| {
-                if glob.is_match(&f.rel) {
+                if glob.is_match(under(&f.rel, &rel)) {
                     if guards.iter().any(|g| g.is_match(&f.rel)) {
                         guarded += 1;
                     } else {
@@ -848,19 +882,24 @@ impl Tool for FileFindTool {
         let mut out = if total == 0 {
             format!("no files match {pattern:?}")
         } else {
-            matches
-                .iter()
-                .take(limit)
-                .map(|f| {
-                    let when = f.modified.map_or_else(String::new, |m| {
-                        chrono::DateTime::<chrono::Utc>::from(m)
-                            .format("%Y-%m-%d %H:%M UTC")
-                            .to_string()
-                    });
-                    format!("{}  {}  {}", f.rel, size_text(f.size), when)
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            let mut listed = String::new();
+            for f in matches.iter().take(limit) {
+                let when = f.modified.map_or_else(String::new, |m| {
+                    chrono::DateTime::<chrono::Utc>::from(m)
+                        .format("%Y-%m-%d %H:%M UTC")
+                        .to_string()
+                });
+                let line = format!("{}  {}  {}", f.rel, size_text(f.size), when);
+                if listed.len() + line.len() + 1 > MAX_OUTPUT_BYTES {
+                    listed.push_str("\n(the list is cut short: narrow the pattern or the path)");
+                    break;
+                }
+                if !listed.is_empty() {
+                    listed.push('\n');
+                }
+                listed.push_str(&line);
+            }
+            listed
         };
         if total > limit {
             out.push_str(&format!(
@@ -967,14 +1006,27 @@ impl Tool for FileSearchTool {
     }
 }
 
-/// `text` within [`MAX_LINE_CHARS`].
-fn line_text(text: &str) -> String {
+/// `text` within [`MAX_LINE_CHARS`], around the match at byte `at` when
+/// there is one.
+fn line_text(text: &str, at: Option<usize>) -> String {
     let text = text.trim_end_matches('\r');
-    if text.chars().count() <= MAX_LINE_CHARS {
+    let count = text.chars().count();
+    if count <= MAX_LINE_CHARS {
         return text.to_string();
     }
-    let mut out: String = text.chars().take(MAX_LINE_CHARS).collect();
-    out.push('\u{2026}');
+    let lead = MAX_LINE_CHARS / 5;
+    let from = at
+        .and_then(|b| text.get(..b))
+        .map_or(0, |before| before.chars().count().saturating_sub(lead))
+        .min(count - MAX_LINE_CHARS);
+    let mut out = String::new();
+    if from > 0 {
+        out.push('\u{2026}');
+    }
+    out.extend(text.chars().skip(from).take(MAX_LINE_CHARS));
+    if from + MAX_LINE_CHARS < count {
+        out.push('\u{2026}');
+    }
     out
 }
 
@@ -987,17 +1039,47 @@ struct Scope<'a> {
     only: Option<&'a regex::Regex>,
 }
 
+/// The start of the file at `path`, then the rest unless the start shows
+/// it binary (a NUL byte); text that is not UTF-8 is read with
+/// replacement characters.
+fn read_text(path: &Path) -> Option<Result<String, ()>> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut bytes = vec![0u8; BINARY_SNIFF_BYTES];
+    let mut got = 0;
+    while got < bytes.len() {
+        match file.read(&mut bytes[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(_) => return None,
+        }
+    }
+    bytes.truncate(got);
+    if bytes.contains(&0) {
+        return Some(Err(()));
+    }
+    file.take(MAX_SEARCH_FILE_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(Ok(match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }))
+}
+
 /// The lines matching `needle` in the files of `scope`, as
-/// `path:line: text`, context lines as `path-line- text`.
+/// `path:line: text`, context lines as `path-line- text`, a `--` between
+/// groups that are apart.
 fn search(scope: &Scope<'_>, needle: &regex::Regex, context: usize, limit: usize) -> String {
     let only = scope.only;
     let mut out: Vec<String> = Vec::new();
+    let mut bytes = 0usize;
     let mut matched = 0usize;
-    let mut cut = false;
+    let (mut cut, mut full) = (false, false);
     let (mut binary, mut large, mut files) = (0usize, 0usize, 0usize);
     let mut guarded = 0usize;
     let mut walked = walk(scope.start, scope.rel, &mut |f| {
-        if only.is_some_and(|g| !g.is_match(&f.rel)) {
+        if only.is_some_and(|g| !g.is_match(under(&f.rel, scope.rel))) {
             return true;
         }
         if scope.guards.iter().any(|g| g.is_match(&f.rel)) {
@@ -1008,45 +1090,72 @@ fn search(scope: &Scope<'_>, needle: &regex::Regex, context: usize, limit: usize
             large += 1;
             return true;
         }
-        let Ok(bytes) = std::fs::read(&f.path) else {
-            return true;
-        };
-        if bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
-            binary += 1;
-            return true;
-        }
-        let Ok(text) = String::from_utf8(bytes) else {
-            binary += 1;
-            return true;
+        let text = match read_text(&f.path) {
+            None => return true,
+            Some(Err(())) => {
+                binary += 1;
+                return true;
+            }
+            Some(Ok(text)) => text,
         };
         files += 1;
         let lines: Vec<&str> = text.lines().collect();
-        let mut shown_to = 0usize;
-        for (i, line) in lines.iter().enumerate() {
-            if !needle.is_match(line) {
-                continue;
+        let mut shown_to: Option<usize> = None;
+        let mut push = |out: &mut Vec<String>, line: String| -> bool {
+            if bytes + line.len() + 1 > MAX_OUTPUT_BYTES {
+                return false;
             }
+            bytes += line.len() + 1;
+            out.push(line);
+            true
+        };
+        for (i, line) in lines.iter().enumerate() {
+            let Some(hit) = needle.find(line) else {
+                continue;
+            };
             if matched == limit {
                 cut = true;
                 return false;
             }
             matched += 1;
-            let from = i.saturating_sub(context).max(shown_to);
-            if context > 0 && from > shown_to && !out.is_empty() {
-                out.push("--".into());
+            let from = i.saturating_sub(context).max(shown_to.unwrap_or(0));
+            // A group apart from the one before it, in this file or another.
+            if context > 0 && !out.is_empty() && shown_to.is_none_or(|to| from > to) {
+                if !push(&mut out, "--".into()) {
+                    full = true;
+                    return false;
+                }
             }
+            let mut group: Vec<String> = Vec::new();
             for (j, l) in lines.iter().enumerate().take(i).skip(from) {
-                out.push(format!("{}-{}- {}", f.rel, j + 1, line_text(l)));
+                group.push(format!("{}-{}- {}", f.rel, j + 1, line_text(l, None)));
             }
-            out.push(format!("{}:{}: {}", f.rel, i + 1, line_text(line)));
-            let to = (i + 1 + context).min(lines.len());
-            for (j, l) in lines.iter().enumerate().take(to).skip(i + 1) {
+            group.push(format!(
+                "{}:{}: {}",
+                f.rel,
+                i + 1,
+                line_text(line, Some(hit.start()))
+            ));
+            let mut to = i + 1;
+            for (j, l) in lines
+                .iter()
+                .enumerate()
+                .take((i + 1 + context).min(lines.len()))
+                .skip(i + 1)
+            {
                 if needle.is_match(l) {
                     break;
                 }
-                out.push(format!("{}-{}- {}", f.rel, j + 1, line_text(l)));
+                group.push(format!("{}-{}- {}", f.rel, j + 1, line_text(l, None)));
+                to = j + 1;
             }
-            shown_to = to.max(i + 1);
+            for line in group {
+                if !push(&mut out, line) {
+                    full = true;
+                    return false;
+                }
+            }
+            shown_to = Some(to);
         }
         true
     });
@@ -1059,6 +1168,12 @@ fn search(scope: &Scope<'_>, needle: &regex::Regex, context: usize, limit: usize
     if cut {
         text.push_str(&format!(
             "\n(stopped at {limit} matching lines: narrow the pattern, the path or the glob)"
+        ));
+    }
+    if full {
+        text.push_str(&format!(
+            "\n(stopped at {} KB of results: narrow the pattern, the path or the glob)",
+            MAX_OUTPUT_BYTES / 1024
         ));
     }
     if binary > 0 || large > 0 {
@@ -1075,6 +1190,8 @@ fn search(scope: &Scope<'_>, needle: &regex::Regex, context: usize, limit: usize
     text
 }
 
+/// Join a user-provided path under `workspace`, rejecting absolute paths and
+/// any component that could escape the workspace (`..`, root, prefix).
 fn safe_join(workspace: &Path, user_path: &str) -> Result<PathBuf, String> {
     if user_path.is_empty() {
         return Err("path must be non-empty".into());
@@ -1252,7 +1369,7 @@ mod tests {
         assert!(found.starts_with("notes.md  "), "{found}");
         assert!(!found.contains("secrets/key.md"), "{found}");
         assert!(
-            found.contains("(1 file(s) left out: the agent's rules guard reading them)"),
+            found.contains("(some files were left out: the agent's rules guard reading them)"),
             "{found}"
         );
         let other = text_of(
@@ -1280,6 +1397,116 @@ mod tests {
             unchecked.starts_with("no matches"),
             "a rule that does not compile guards all: {unchecked}"
         );
+    }
+
+    #[test]
+    fn glob_sets_take_their_characters_as_written() {
+        let m = |g: &str, p: &str| glob_regex(g).expect("glob").is_match(p);
+        assert!(m("[]a]x", "]x") && m("[]a]x", "ax"));
+        assert!(m("[!]a]x", "bx") && !m("[!]a]x", "]x"));
+        assert!(m("[a-c]", "b") && !m("[a-c]", "-"));
+        assert!(m("[-a]", "-"));
+        assert!(m("[&&]", "&") && m("[~~]", "~"));
+        assert!(m("[\\]]", "\\]"));
+        assert!(m("[一二]月.md", "二月.md"));
+    }
+
+    #[tokio::test]
+    async fn any_way_of_writing_a_path_is_the_same_path() {
+        let ctx = ctx().await;
+        put(&ctx, "secrets/key.md", b"token abc").await;
+        put(&ctx, ".havn/hooks.yaml", b"token def").await;
+        put(&ctx, "a/b/c.md", b"token ghi").await;
+        for path in [".//.havn", "./.havn/", ".havn/.", "agent.db", ".//agent.db"] {
+            assert!(
+                matches!(
+                    FileSearchTool
+                        .execute(&ctx, json!({"pattern": "token", "path": path}))
+                        .await,
+                    ToolResult::Error(_)
+                ),
+                "{path}"
+            );
+        }
+        for path in [".//secrets", "secrets/.", "./secrets//", "secrets"] {
+            let mut input = json!({"pattern": "token", "path": path});
+            input[GUARDED_READS] = json!(["^secrets/"]);
+            let out = text_of(FileSearchTool.execute(&ctx, input).await);
+            assert!(!out.contains("abc"), "{path}: {out}");
+        }
+        let found = text_of(
+            FileFindTool
+                .execute(&ctx, json!({"pattern": "b/*.md", "path": "a//"}))
+                .await,
+        );
+        assert!(
+            found.starts_with("a/b/c.md  "),
+            "a glob with / matches from the path looked in: {found}"
+        );
+        let all = text_of(
+            FileFindTool
+                .execute(&ctx, json!({"pattern": "**", "path": "."}))
+                .await,
+        );
+        assert!(!all.contains(".havn"), "{all}");
+    }
+
+    #[tokio::test]
+    async fn results_stop_at_a_size_and_long_lines_show_their_match() {
+        let ctx = ctx().await;
+        let line = format!("{}needle{}", "长".repeat(400), "尾".repeat(400));
+        put(&ctx, "long.txt", line.as_bytes()).await;
+        let out = text_of(
+            FileSearchTool
+                .execute(&ctx, json!({"pattern": "needle"}))
+                .await,
+        );
+        let first = out.lines().next().expect("a line");
+        assert!(
+            first.starts_with("long.txt:1: \u{2026}") && first.contains("needle"),
+            "{first}"
+        );
+        assert!(first.chars().count() < MAX_LINE_CHARS + 20, "{first}");
+        let many: String = (0..3000)
+            .map(|i| format!("match {i} {}\n", "x".repeat(200)))
+            .collect();
+        put(&ctx, "many.txt", many.as_bytes()).await;
+        let out = text_of(
+            FileSearchTool
+                .execute(
+                    &ctx,
+                    json!({"pattern": "match", "path": "many.txt", "limit": 500}),
+                )
+                .await,
+        );
+        assert!(out.len() < MAX_OUTPUT_BYTES + 512, "{}", out.len());
+        assert!(out.contains("KB of results"), "{}", &out[out.len() - 200..]);
+        put(&ctx, "latin1.txt", b"caf\xe9 needle here").await;
+        let out = text_of(
+            FileSearchTool
+                .execute(
+                    &ctx,
+                    json!({"pattern": "needle here", "path": "latin1.txt"}),
+                )
+                .await,
+        );
+        assert!(
+            out.starts_with("latin1.txt:1: caf\u{fffd} needle here"),
+            "text not UTF-8 is still searched: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn groups_in_different_files_are_set_apart() {
+        let ctx = ctx().await;
+        put(&ctx, "a.md", b"x\nhit\n").await;
+        put(&ctx, "b.md", b"hit\ny\n").await;
+        let out = text_of(
+            FileSearchTool
+                .execute(&ctx, json!({"pattern": "hit", "context": 1}))
+                .await,
+        );
+        assert_eq!(out, "a.md-1- x\na.md:2: hit\n--\nb.md:1: hit\nb.md-2- y");
     }
 
     #[tokio::test]

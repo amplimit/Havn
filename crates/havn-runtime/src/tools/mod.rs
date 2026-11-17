@@ -478,7 +478,7 @@ impl ToolRegistry {
 /// | `shell` | `command` |
 /// | `web_fetch` | `url` |
 /// | `file_read` / `file_write` / `file_edit` | `path` |
-/// | `file_find` / `file_search` | `path`, `glob` and `pattern` |
+/// | `file_find` / `file_search` | `path` |
 /// | `memory_search` | `query` |
 /// | other | concatenated values, lossy fallback |
 ///
@@ -495,9 +495,7 @@ fn flatten_input_for_hook(tool: &str, input: &serde_json::Value) -> String {
         "shell" => pick("command"),
         "web_fetch" => pick("url"),
         "file_read" | "file_write" | "file_edit" => pick("path"),
-        "file_find" | "file_search" => {
-            format!("{} {} {}", pick("path"), pick("glob"), pick("pattern"))
-        }
+        "file_find" | "file_search" => pick("path"),
         "memory_search" => pick("query"),
         "memory_remember" | "memory_forget" => pick("key"),
         "subagent_spawn" => pick("task"),
@@ -656,6 +654,60 @@ mod tests {
             .await;
         assert!(res.is_error(), "{res:?}");
         assert!(res.text().contains("disabled"), "{}", res.text());
+    }
+
+    #[tokio::test]
+    async fn finding_files_follows_file_read_and_its_rules() {
+        let mut policy = Policy::default();
+        policy.hooks.pre_tool_use.push(havn_core::ToolHookRule {
+            tool: "file_read".into(),
+            deny: vec!["^secrets/".into()],
+            ask: Vec::new(),
+        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("secrets")).expect("dir");
+        std::fs::write(dir.path().join("secrets/key.md"), "k").expect("write");
+        std::fs::write(dir.path().join("notes.md"), "n").expect("write");
+        let set = crate::hooks::load(&policy.hooks, dir.path())
+            .await
+            .expect("hooks");
+        let reg = registry(policy.clone()).with_hooks(crate::hooks::handle(set));
+        let env = ToolCtx {
+            workspace_dir: dir.path().to_path_buf(),
+            agent_db: dummy_pool().await,
+            policy: Arc::clone(&reg.policy),
+            embedder: None,
+        };
+        // The model cannot clear the rules by sending the field itself.
+        let res = reg
+            .execute_for(
+                context::WEBCHAT,
+                "file_find",
+                serde_json::json!({"pattern": "*.md", files::GUARDED_READS: []}),
+                &env,
+            )
+            .await;
+        assert!(!res.text().contains("secrets/key.md"), "{}", res.text());
+        assert!(res.text().contains("notes.md"), "{}", res.text());
+        // Nor hide files from a registry that has no rules.
+        let res = registry(Policy::default())
+            .execute_for(
+                context::WEBCHAT,
+                "file_find",
+                serde_json::json!({"pattern": "*.md", files::GUARDED_READS: ["."]}),
+                &env,
+            )
+            .await;
+        assert!(res.text().contains("secrets/key.md"), "{}", res.text());
+
+        policy.context_toolsets.0.insert(
+            context::CRON.into(),
+            ContextToolsetEntry {
+                disabled: vec!["file_read".into()],
+            },
+        );
+        let names = names_in(&registry(policy).schemas_for(context::CRON));
+        assert!(!names.contains(&"file_find".into()) && !names.contains(&"file_search".into()));
     }
 
     #[tokio::test]

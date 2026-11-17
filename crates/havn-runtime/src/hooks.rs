@@ -314,7 +314,9 @@ impl HookSet {
     pub fn guarded_reads(&self) -> Vec<String> {
         self.rules
             .iter()
-            .filter(|rule| rule.covers("file_read"))
+            // A rule for every tool (`*`) is about commands and URLs as
+            // much as paths: only rules naming file tools count.
+            .filter(|rule| rule.tool.starts_with("file") && rule.covers("file_read"))
             .flat_map(|rule| rule.deny.iter().chain(&rule.ask))
             .map(|p| p.as_str().to_string())
             .collect()
@@ -411,6 +413,8 @@ mod tests {
     deny: ['^private/']
   - tool: shell
     deny: ['rm']
+  - tool: '*'
+    deny: ['curl']
 ",
         );
         assert_eq!(set.guarded_reads(), ["^secrets/", "\\.env$", "^private/"]);
