@@ -249,6 +249,23 @@ pub async fn set_enabled(pool: &SqlitePool, id: CronJobId, enabled: bool) -> Res
     Ok(())
 }
 
+/// Deliver `agent_id`'s jobs made in `chat` to `deliver` from now on (a
+/// chat moved to the web: `webchat`).
+pub async fn redeliver_chat(
+    pool: &SqlitePool,
+    agent_id: AgentId,
+    chat: &str,
+    deliver: &str,
+) -> Result<u64> {
+    let res = sqlx::query("UPDATE cron_jobs SET deliver = ?3 WHERE agent_id = ?1 AND chat = ?2")
+        .bind(agent_id.to_string())
+        .bind(chat)
+        .bind(deliver)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
 /// Unlink `agent_id`'s jobs from `chat`, which was deleted.
 pub async fn forget_chat(pool: &SqlitePool, agent_id: AgentId, chat: &str) -> Result<()> {
     sqlx::query("UPDATE cron_jobs SET chat = NULL WHERE agent_id = ?1 AND chat = ?2")

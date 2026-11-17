@@ -404,8 +404,30 @@ pub struct OutboxQuery {
     pub conversation: Option<String>,
 }
 
-/// `GET /agents/:id/outbox` — the files the agent sent (issue #106),
-/// oldest first, for the chat that shows them.
+/// Where the caller's own files went: their web chats (and the results
+/// tasks deliver there) and their linked chat-app chats (issue #184). The
+/// files the agent sent other people in a chat app are theirs, not the
+/// agent owner's.
+async fn own_scopes(
+    state: &AppState,
+    user: &AuthedUser,
+    agent: havn_core::AgentId,
+) -> Result<Vec<String>, ApiError> {
+    let mut scopes = vec![
+        crate::webchat::session_for(&user.id.to_string(), agent).to_string(),
+        "broadcast".to_string(),
+    ];
+    scopes.extend(
+        crate::api::conversation::linked_scopes(state, user, agent)
+            .await?
+            .into_iter()
+            .map(|l| l.scope),
+    );
+    Ok(scopes)
+}
+
+/// `GET /agents/:id/outbox` — the files the agent sent (issue #106) to
+/// the caller, oldest first, for the chat that shows them.
 pub async fn sent(
     State(state): State<AppState>,
     user: AuthedUser,
@@ -413,13 +435,18 @@ pub async fn sent(
     Query(q): Query<OutboxQuery>,
 ) -> Result<Json<Vec<crate::outbox::Sent>>, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let own = own_scopes(&state, &user, agent.id).await?;
     let outbox = crate::outbox::dir(&state.workspace_root, agent.id);
     let sent = tokio::task::spawn_blocking(move || {
         crate::outbox::list(&outbox, q.conversation.as_deref(), 200)
     })
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(Json(sent))
+    Ok(Json(
+        sent.into_iter()
+            .filter(|s| own.contains(&s.channel_id))
+            .collect(),
+    ))
 }
 
 /// `GET /agents/:id/outbox/:file` — a file the agent sent, as a download.
@@ -429,10 +456,12 @@ pub async fn download(
     Path((id, file)): Path<(String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let own = own_scopes(&state, &user, agent.id).await?;
     let outbox = crate::outbox::dir(&state.workspace_root, agent.id);
     let found = tokio::task::spawn_blocking(move || crate::outbox::read(&outbox, &file))
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
+        .filter(|(sent, _)| own.contains(&sent.channel_id))
         .ok_or(ApiError::NotFound)?;
     Ok(attachment_response(&found.0, found.1))
 }

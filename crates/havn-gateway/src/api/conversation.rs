@@ -30,6 +30,9 @@ pub struct ConversationQuery {
     pub limit: Option<u32>,
     /// The chat to read; the active one when absent.
     pub conversation: Option<String>,
+    /// A channel chat's scope (issue #184), one of the caller's linked
+    /// senders; the caller's web chats when absent.
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -136,6 +139,7 @@ pub async fn turn_trace(
     State(state): State<AppState>,
     user: AuthedUser,
     Path((id, chat, turn)): Path<(String, String, String)>,
+    Query(q): Query<ScopeQuery>,
 ) -> Result<Json<TraceView>, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
     let row: TraceRow = crate::api::agents::agent_data(
@@ -143,7 +147,7 @@ pub async fn turn_trace(
         user.id,
         agent.id,
         havn_proto::DataQuery::TurnTrace {
-            channel_id: session(&user, agent.id),
+            channel_id: scope_of(&state, &user, agent.id, q.scope.as_deref()).await?,
             conversation: chat_param(Some(chat))?.unwrap_or_default(),
             turn: chat_param(Some(turn))?.unwrap_or_default(),
         },
@@ -201,6 +205,9 @@ struct Found {
 #[derive(Debug, Deserialize)]
 pub struct BranchSwitch {
     pub turn: String,
+    /// A channel chat's scope, as in [`ConversationQuery::scope`].
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,6 +229,74 @@ where
     D: serde::Deserializer<'de>,
 {
     Option::<String>::deserialize(d).map(Some)
+}
+
+/// `?scope=`: a channel chat's scope, as in [`ConversationQuery::scope`].
+#[derive(Debug, Deserialize)]
+pub struct ScopeQuery {
+    pub scope: Option<String>,
+}
+
+/// A channel chat scope of `user` with an agent (issue #184): a sender
+/// they linked (issue #182), on an account whose messages reach the agent.
+#[derive(Debug, Clone)]
+pub struct LinkedScope {
+    pub scope: String,
+    pub channel: String,
+    pub account_id: String,
+    pub sender_id: String,
+}
+
+/// `user`'s channel chat scopes with `agent`. Only their own linked
+/// senders: other people's chats with the agent are not theirs to see.
+pub async fn linked_scopes(
+    state: &AppState,
+    user: &AuthedUser,
+    agent: havn_core::AgentId,
+) -> Result<Vec<LinkedScope>, ApiError> {
+    let links = havn_db::repo::channel_access::list_links(&state.db, Some(user.id))
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let agent = agent.to_string();
+    let mut scopes = Vec::new();
+    for binding in state.bindings.iter().filter(|b| {
+        b.agent_id == agent
+            && crate::channel_router::agent_for_account(&state.bindings, &b.channel, &b.account_id)
+                == Some(agent.as_str())
+    }) {
+        for link in links.iter().filter(|l| l.channel == binding.channel) {
+            scopes.push(LinkedScope {
+                scope: crate::channel_id_codec::encode(
+                    &binding.channel,
+                    &binding.account_id,
+                    &link.sender_id,
+                ),
+                channel: binding.channel.clone(),
+                account_id: binding.account_id.clone(),
+                sender_id: link.sender_id.clone(),
+            });
+        }
+    }
+    Ok(scopes)
+}
+
+/// The scope a request reads: `requested`, when it is one of the caller's
+/// channel chat scopes with the agent, else their web chats.
+async fn scope_of(
+    state: &AppState,
+    user: &AuthedUser,
+    agent: havn_core::AgentId,
+    requested: Option<&str>,
+) -> Result<String, ApiError> {
+    let Some(requested) = requested else {
+        return Ok(session(user, agent));
+    };
+    linked_scopes(state, user, agent)
+        .await?
+        .into_iter()
+        .find(|l| l.scope == requested)
+        .map(|l| l.scope)
+        .ok_or(ApiError::NotFound)
 }
 
 /// The webchat session of `user` with `agent`.
@@ -246,7 +321,7 @@ pub async fn list(
 ) -> Result<Json<ConversationResponse>, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
     let agent_id = agent.id;
-    let channel_id = session(&user, agent_id);
+    let channel_id = scope_of(&state, &user, agent_id, q.scope.as_deref()).await?;
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let rows: ConversationRows = crate::api::agents::agent_data(
         &state,
@@ -346,6 +421,154 @@ pub async fn chats(
     Ok(Json(chats))
 }
 
+/// One of the caller's channel chats with the agent (issue #184).
+#[derive(Debug, Serialize)]
+pub struct ChannelChat {
+    #[serde(flatten)]
+    pub chat: Chat,
+    pub channel: String,
+    pub account_id: String,
+    pub sender_id: String,
+    /// Pass back as `scope` to read it, switch its versions or move it.
+    pub scope: String,
+}
+
+/// `GET /agents/:id/channel-chats`: the caller's chats with the agent in
+/// the chat apps they linked, most recently used first; read-only here.
+pub async fn channel_chats(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<ChannelChat>>, ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let mut all = Vec::new();
+    for linked in linked_scopes(&state, &user, agent.id).await? {
+        let chats: Vec<Chat> = crate::api::agents::agent_data(
+            &state,
+            user.id,
+            agent.id,
+            havn_proto::DataQuery::Chats {
+                channel_id: linked.scope.clone(),
+                limit: MAX_CHATS,
+            },
+            true,
+        )
+        .await?;
+        all.extend(chats.into_iter().map(|chat| ChannelChat {
+            chat,
+            channel: linked.channel.clone(),
+            account_id: linked.account_id.clone(),
+            sender_id: linked.sender_id.clone(),
+            scope: linked.scope.clone(),
+        }));
+    }
+    all.sort_by(|a, b| b.chat.updated_at.cmp(&a.chat.updated_at));
+    Ok(Json(all))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatMove {
+    /// The channel chat's scope, from `channel-chats`.
+    pub scope: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Moved {
+    moved: bool,
+    busy: bool,
+    was_active: bool,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+/// What the chat app is told when its current chat moves to the web; an
+/// earlier chat is named, so it is not taken for the current one.
+const MOVED_NOTICE_EARLIER: &str =
+    "Your earlier chat \"{title}\" continues in Havn's web chat now.";
+const MOVED_NOTICE_NEW: &str =
+    "This chat continues in Havn's web chat now. Your next message here starts a new chat.";
+
+/// `POST /agents/:id/chats/:chat/move`: continue one of the caller's
+/// channel chats on the web (issue #184). There is no way back: the chat
+/// becomes one of their web chats, the channel's next message starts a new
+/// chat if it was the channel's current one, and tasks made in it deliver
+/// to the web. Refused while a reply runs or waits in it.
+pub async fn chat_move(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path((id, chat)): Path<(String, String)>,
+    Json(req): Json<ChatMove>,
+) -> Result<StatusCode, ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let linked = linked_scopes(&state, &user, agent.id)
+        .await?
+        .into_iter()
+        .find(|l| l.scope == req.scope)
+        .ok_or(ApiError::NotFound)?;
+    let conversation = chat_param(Some(chat))?.unwrap_or_default();
+    let moved: Moved = crate::api::agents::agent_data(
+        &state,
+        user.id,
+        agent.id,
+        havn_proto::DataQuery::MoveChat {
+            from: linked.scope.clone(),
+            conversation: conversation.clone(),
+            to: session(&user, agent.id),
+        },
+        true,
+    )
+    .await?;
+    if moved.busy {
+        return Err(ApiError::Conflict(
+            "a reply is running or waiting in this chat; move it when it is done".into(),
+        ));
+    }
+    if !moved.moved {
+        return Err(ApiError::NotFound);
+    }
+    if let Err(e) =
+        havn_db::repo::cron::redeliver_chat(&state.db, agent.id, &conversation, "webchat").await
+    {
+        tracing::warn!(error = %e, "moving a chat: its tasks still deliver to the chat app");
+    }
+    let notice = havn_proto::channel::ChannelMessageContent::Text {
+        text: if moved.was_active {
+            MOVED_NOTICE_NEW.to_string()
+        } else {
+            MOVED_NOTICE_EARLIER.replace(
+                "{title}",
+                moved
+                    .title
+                    .as_deref()
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or("untitled"),
+            )
+        },
+    };
+    if let Err(e) = state
+        .channel_router
+        .deliver(
+            &linked.channel,
+            &linked.account_id,
+            &linked.sender_id,
+            None,
+            notice,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "moving a chat: the chat app was not told");
+    }
+    crate::audit::record_agent_action(
+        &state.db,
+        user.id,
+        agent.id,
+        "chat.moved_to_web",
+        serde_json::json!({ "chat": conversation, "channel": linked.channel, "account_id": linked.account_id }),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `PATCH /agents/:id/chats/:chat`: rename one of the caller's chats.
 pub async fn chat_patch(
     State(state): State<AppState>,
@@ -431,7 +654,7 @@ pub async fn chat_branch(
         user.id,
         agent.id,
         havn_proto::DataQuery::SwitchBranch {
-            channel_id: session(&user, agent.id),
+            channel_id: scope_of(&state, &user, agent.id, req.scope.as_deref()).await?,
             conversation: chat_param(Some(chat))?.unwrap_or_default(),
             turn: chat_param(Some(req.turn))?.unwrap_or_default(),
         },
@@ -516,5 +739,100 @@ mod trace_tests {
             TraceItem::Thinking { text } => assert_eq!(text.len(), MAX_TRACE_PART),
             TraceItem::Step { .. } => panic!("a thinking part"),
         }
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::sync::Arc;
+
+    use super::*;
+    use havn_db::repo::channel_access;
+
+    #[tokio::test]
+    async fn only_the_callers_own_linked_senders_are_their_channel_chats() {
+        let (mut state, owner) = crate::auth::tests::state_with(false).await;
+        let agent = havn_db::repo::agents::create(
+            &state.db,
+            havn_db::repo::agents::NewAgent {
+                owner_id: owner,
+                team_id: None,
+                name: "bound",
+                config: serde_json::json!({}),
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        let other_agent = havn_core::AgentId::new();
+        state.bindings = Arc::new(vec![
+            crate::config::ChannelBindingConfig {
+                agent_id: agent.to_string(),
+                channel: "telegram".into(),
+                account_id: "bot".into(),
+            },
+            // Its messages go to another agent: not this agent's chats.
+            crate::config::ChannelBindingConfig {
+                agent_id: other_agent.to_string(),
+                channel: "telegram".into(),
+                account_id: "other".into(),
+            },
+            crate::config::ChannelBindingConfig {
+                agent_id: agent.to_string(),
+                channel: "telegram".into(),
+                account_id: "other".into(),
+            },
+        ]);
+        let someone = havn_db::repo::users::create(
+            &state.db,
+            havn_db::repo::users::NewUser {
+                display_name: "Someone",
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        for (user, sender) in [(owner, "tg:mine"), (someone, "tg:theirs")] {
+            let code = channel_access::create_link_code(&state.db, "telegram", "bot", user)
+                .await
+                .unwrap();
+            channel_access::redeem(
+                &state.db,
+                "telegram",
+                "bot",
+                sender,
+                &code.code,
+                Utc::now(),
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        let me = AuthedUser {
+            id: owner,
+            display_name: "owner".into(),
+        };
+        let scopes = linked_scopes(&state, &me, agent).await.unwrap();
+        let mine = crate::channel_id_codec::encode("telegram", "bot", "tg:mine");
+        assert_eq!(
+            scopes.iter().map(|s| s.scope.as_str()).collect::<Vec<_>>(),
+            [mine.as_str()]
+        );
+        assert_eq!(
+            scope_of(&state, &me, agent, Some(&mine)).await.unwrap(),
+            mine
+        );
+        let theirs = crate::channel_id_codec::encode("telegram", "bot", "tg:theirs");
+        assert!(matches!(
+            scope_of(&state, &me, agent, Some(&theirs)).await,
+            Err(ApiError::NotFound)
+        ));
+        assert_eq!(
+            scope_of(&state, &me, agent, None).await.unwrap(),
+            session(&me, agent)
+        );
     }
 }

@@ -1157,6 +1157,20 @@ where
                     handle_skill_pin(req, ctx).await;
                 });
             }
+            // A chat moves in order with the messages around it: a message
+            // gets its chat and is admitted before the next frame is read,
+            // so a move never lands between the two (issue #184).
+            GatewayToAgent::DataRequest(req) if matches!(req.query, DataQuery::MoveChat { .. }) => {
+                // Its answer is sent apart: a gateway slow to read does
+                // not hold up the frames behind it.
+                let response = answer_data_request(req, &ctx).await;
+                let writer = ctx.writer_tx.clone();
+                work.spawn(async move {
+                    if let Err(e) = writer.send(AgentToGateway::DataResponse(response)).await {
+                        error!(error = ?e, "could not enqueue DataResponse");
+                    }
+                });
+            }
             GatewayToAgent::DataRequest(req) => {
                 let ctx = ctx.clone();
                 work.spawn(async move {
@@ -2737,6 +2751,18 @@ fn parse_summary(text: &str) -> (String, Vec<(String, String, havn_db::agent::me
 
 /// Answer a dashboard read with rows from this agent's own database.
 async fn handle_data_request(req: DataRequest, ctx: Ctx) {
+    let response = answer_data_request(req, &ctx).await;
+    if let Err(e) = ctx
+        .writer_tx
+        .send(AgentToGateway::DataResponse(response))
+        .await
+    {
+        error!(error = ?e, "could not enqueue DataResponse");
+    }
+}
+
+/// The answer to a dashboard's data request.
+async fn answer_data_request(req: DataRequest, ctx: &Ctx) -> DataResponse {
     use havn_db::agent::{memory, skills_index};
     let result: Result<serde_json::Value, String> = async {
         match req.query {
@@ -2932,6 +2958,34 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                     };
                 Ok(serde_json::json!({ "found": found }))
             }
+            DataQuery::MoveChat {
+                from,
+                conversation,
+                to,
+            } => {
+                // Not while its reply runs: it would go where the chat was.
+                if ctx.turns.waiting(&conversation) > 0 {
+                    return Ok(
+                        serde_json::json!({ "moved": false, "busy": true, "was_active": false }),
+                    );
+                }
+                let moved = conversations::move_chat(&ctx.pool, &from, &conversation, &to)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let title = match moved {
+                    Some(_) => conversations::chat_info(&ctx.pool, &conversation)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .map(|info| info.title),
+                    None => None,
+                };
+                Ok(serde_json::json!({
+                    "moved": moved.is_some(),
+                    "busy": false,
+                    "was_active": moved.unwrap_or(false),
+                    "title": title,
+                }))
+            }
             DataQuery::DeleteChat {
                 channel_id,
                 conversation,
@@ -3000,15 +3054,9 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
             AdminOutcome::Error { message }
         }
     };
-    if let Err(e) = ctx
-        .writer_tx
-        .send(AgentToGateway::DataResponse(DataResponse {
-            request_id: req.request_id,
-            outcome,
-        }))
-        .await
-    {
-        error!(error = ?e, "could not enqueue DataResponse");
+    DataResponse {
+        request_id: req.request_id,
+        outcome,
     }
 }
 

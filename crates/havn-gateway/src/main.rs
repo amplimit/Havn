@@ -753,6 +753,11 @@ async fn serve() -> anyhow::Result<()> {
         .route("/agents/{id}/outbox", get(api::files::sent))
         .route("/agents/{id}/workspace", get(api::files::workspace_list))
         .route("/agents/{id}/pairing", post(api::channel::pairing_create))
+        .route("/agents/{id}/channel-chats", get(api::conversation::channel_chats))
+        .route(
+            "/agents/{id}/chats/{chat}/move",
+            post(api::conversation::chat_move),
+        )
         .route(
             "/me/channel-links",
             get(api::channel::links_list).delete(api::channel::links_remove),
