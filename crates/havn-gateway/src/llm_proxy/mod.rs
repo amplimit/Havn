@@ -141,31 +141,6 @@ pub enum Reasoning {
     Budget(u32),
 }
 
-/// Tokens a thinking budget is given when only on, or by level, for a
-/// provider that takes budgets.
-pub const DEFAULT_THINKING_BUDGET: u32 = 4096;
-
-impl Reasoning {
-    /// As a number of tokens: what a level means to a provider that takes
-    /// a budget.
-    #[must_use]
-    pub fn budget(&self) -> Option<u32> {
-        match self {
-            Self::Off => None,
-            Self::On => Some(DEFAULT_THINKING_BUDGET),
-            Self::Budget(n) => Some(*n),
-            Self::Effort(level) => Some(match level.as_str() {
-                "minimal" => 1024,
-                "low" => 2048,
-                "medium" => 8192,
-                "high" => 16384,
-                "xhigh" | "max" => 32768,
-                _ => DEFAULT_THINKING_BUDGET,
-            }),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnthropicResponse {
     pub id: String,

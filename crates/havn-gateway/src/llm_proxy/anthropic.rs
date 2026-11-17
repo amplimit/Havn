@@ -242,21 +242,36 @@ impl StreamedMessage {
     }
 }
 
-/// The request as the Messages API takes it, with `thinking` when the
-/// model is asked to think (issue #190): a budget below `max_tokens`, and
-/// no temperature, which thinking does not take.
+/// Least `max_tokens` a request asking for a thinking budget needs: the
+/// smallest budget the API takes and as much again for the reply.
+const MIN_BUDGET_ROOM: u32 = 2048;
+
+/// The request as the Messages API takes it, asking the model to think
+/// (issue #190): adaptive thinking, at an effort for a level, as current
+/// models take it, or a fixed budget, as Haiku 4.5 and older models take
+/// it, leaving room for the reply. With thinking on, no temperature;
+/// thinking is shown summarized, since newer models leave it out unless
+/// asked. Off sends no `thinking`: several current models refuse
+/// `disabled`, and older ones do not think without being asked.
 fn request_body(request: &AnthropicRequest) -> Result<serde_json::Value, ProviderError> {
     let mut body = serde_json::to_value(request)
         .map_err(|e| ProviderError::Translation(format!("request build: {e}")))?;
-    if let Some(budget) = request
-        .reasoning
-        .as_ref()
-        .and_then(super::Reasoning::budget)
-    {
-        let budget = budget
-            .min(request.max_tokens.saturating_sub(1024))
-            .max(1024);
-        body["thinking"] = serde_json::json!({"type": "enabled", "budget_tokens": budget});
+    let adaptive = || serde_json::json!({"type": "adaptive", "display": "summarized"});
+    let thinking = match &request.reasoning {
+        None | Some(super::Reasoning::Off) => None,
+        Some(super::Reasoning::On) => Some(adaptive()),
+        Some(super::Reasoning::Effort(level)) => {
+            body["output_config"] = serde_json::json!({"effort": level});
+            Some(adaptive())
+        }
+        Some(super::Reasoning::Budget(n)) => (request.max_tokens >= MIN_BUDGET_ROOM).then(|| {
+            let room = (request.max_tokens / 2).clamp(1024, 4096);
+            let budget = (*n).min(request.max_tokens - room).max(1024);
+            serde_json::json!({"type": "enabled", "budget_tokens": budget})
+        }),
+    };
+    if let Some(thinking) = thinking {
+        body["thinking"] = thinking;
         if let Some(obj) = body.as_object_mut() {
             obj.remove("temperature");
         }
@@ -445,11 +460,12 @@ mod tests {
     }
 
     #[test]
-    fn thinking_is_asked_for_with_a_budget_under_max_tokens() {
+    fn thinking_is_asked_for_as_the_model_takes_it() {
+        use super::super::Reasoning;
         let mut r = AnthropicRequest {
             model: "claude-x".into(),
             max_tokens: 16000,
-            reasoning: Some(super::super::Reasoning::Effort("medium".into())),
+            reasoning: Some(Reasoning::Effort("high".into())),
             messages: Vec::new(),
             system: None,
             temperature: Some(0.2),
@@ -458,16 +474,35 @@ mod tests {
         let body = request_body(&r).expect("body");
         assert_eq!(
             body["thinking"],
-            serde_json::json!({"type": "enabled", "budget_tokens": 8192})
+            serde_json::json!({"type": "adaptive", "display": "summarized"})
         );
+        assert_eq!(body["output_config"], serde_json::json!({"effort": "high"}));
         assert!(body.get("temperature").is_none());
-        r.reasoning = Some(super::super::Reasoning::Budget(60000));
+        r.reasoning = Some(Reasoning::On);
+        let body = request_body(&r).expect("body");
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert!(body.get("output_config").is_none());
+        // A budget, for older models: the reply keeps room.
+        r.reasoning = Some(Reasoning::Budget(60000));
+        assert_eq!(
+            request_body(&r).expect("body")["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 11904})
+        );
+        r.max_tokens = 2048;
         assert_eq!(
             request_body(&r).expect("body")["thinking"]["budget_tokens"],
-            14976
+            1024
         );
-        r.reasoning = Some(super::super::Reasoning::Off);
-        assert!(request_body(&r).expect("body").get("thinking").is_none());
+        r.max_tokens = 2047;
+        assert!(
+            request_body(&r).expect("body").get("thinking").is_none(),
+            "no room for the smallest budget and a reply"
+        );
+        r.max_tokens = 16000;
+        r.reasoning = Some(Reasoning::Off);
+        let body = request_body(&r).expect("body");
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["temperature"], 0.2);
         r.reasoning = None;
         assert_eq!(request_body(&r).expect("body")["temperature"], 0.2);
     }

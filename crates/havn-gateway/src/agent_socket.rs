@@ -2092,9 +2092,11 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                         .and_then(serde_json::Value::as_str),
                 )
             });
-            // Anthropic wants room for the reply after the thinking budget.
+            // A thinking budget on Anthropic counts within `max_tokens`:
+            // ask for room for the reply after it (the clamps below still
+            // apply, and the request then shrinks the budget).
             if entry.provider() == "anthropic"
-                && let Some(budget) = ar.reasoning.as_ref().and_then(llm_proxy::Reasoning::budget)
+                && let Some(llm_proxy::Reasoning::Budget(budget)) = &ar.reasoning
             {
                 ar.max_tokens = ar.max_tokens.max(budget.saturating_add(4096));
             }

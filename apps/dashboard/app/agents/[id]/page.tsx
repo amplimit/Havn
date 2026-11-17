@@ -434,12 +434,15 @@ export default function ChatPage({
       try {
         const since = Date.now();
         const asked = chatIdRef.current;
+        const changes = settingsChanged.current;
         const r = await api.conversation.list(id, HISTORY_LIMIT, asked ?? undefined);
         if (cancelled || chatIdRef.current !== asked) return;
         if (!asked && r.conversation) selectChat(r.conversation);
         if (reconnected && r.waiting !== undefined) setWaiting(r.waiting);
-        setChatModel(r.model ?? null);
-        setChatThinking(r.thinking ?? null);
+        if (settingsChanged.current === changes) {
+          setChatModel(r.model ?? null);
+          setChatThinking(r.thinking ?? null);
+        }
         const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
         setBubbles((prev) => mergeStored(prev, stored, since));
       } catch (e) {
@@ -757,6 +760,9 @@ export default function ChatPage({
   const [models, setModels] = useState<AgentModels | null>(null);
   const [chatModel, setChatModel] = useState<string | null>(null);
   const [chatThinking, setChatThinking] = useState<string | null>(null);
+  // Counts the chat settings changed here, so a history load that started
+  // before one does not put back what the chat had.
+  const settingsChanged = useRef(0);
   useEffect(() => {
     api.models
       .forAgent(id)
@@ -767,6 +773,7 @@ export default function ChatPage({
   // Set the chat's model or thinking choice; a chat with no message yet
   // gets its id here.
   async function setChatSettings(settings: { model?: string | null; thinking?: string | null }) {
+    settingsChanged.current += 1;
     let chatId = chatIdRef.current;
     if (!chatId) {
       chatId = newChatId();
@@ -774,6 +781,7 @@ export default function ChatPage({
     }
     try {
       await api.chats.settings(id, chatId, settings);
+      settingsChanged.current += 1;
       if (settings.model !== undefined) setChatModel(settings.model);
       if (settings.thinking !== undefined) setChatThinking(settings.thinking);
     } catch (e) {
@@ -2240,13 +2248,12 @@ function ChatModelMenus({
         onChange={(e) => onSettings({ model: e.target.value || null })}
       >
         <option value="">{name(agentModel)} (agent&apos;s)</option>
-        {models.models
-          .filter((m) => m.id !== agentModel)
-          .map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.label ?? m.id}
-            </option>
-          ))}
+        {models.models.map((m) => (
+          <option key={m.id} value={m.id}>
+            {m.label ?? m.id}
+            {m.id === agentModel ? " (kept for this chat)" : ""}
+          </option>
+        ))}
       </select>
       <select
         className="input text-sm"

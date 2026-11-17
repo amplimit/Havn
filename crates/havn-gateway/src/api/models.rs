@@ -187,6 +187,11 @@ pub struct ModelCheckView {
 /// Characters of a check's reasoning and reply shown.
 const CHECK_EXCERPT: usize = 300;
 
+/// Most tokens a check's answer may take, with thinking, and the largest
+/// thinking budget it asks for.
+const CHECK_MAX_TOKENS: u32 = 4096;
+const CHECK_BUDGET: u32 = 2048;
+
 /// `POST /llm/models/check`: send `entry` a very short request, with its
 /// thinking at its default, on the caller's credentials, and say how it
 /// answered.
@@ -196,6 +201,15 @@ pub async fn check(
     Json(req): Json<ModelCheck>,
 ) -> Result<Json<ModelCheckView>, ApiError> {
     let entry = req.entry;
+    // With trust_header, the list is the operator's, in config.toml: only
+    // a listed model, as listed, is checked.
+    if state.trusted_proxies.is_some() && state.models.load().get(&entry.id) != Some(&entry) {
+        return Err(ApiError::Forbidden(
+            "with trust_header enabled only a model listed in config.toml, as listed, can be \
+             checked"
+                .into(),
+        ));
+    }
     ModelCatalog {
         default_model: None,
         title_model: None,
@@ -214,13 +228,20 @@ pub async fn check(
         .keyring
         .as_ref()
         .ok_or_else(|| ApiError::NoCredential(entry.provider().to_string()))?;
-    let reasoning = entry.thinking.as_ref().map(|t| t.resolve(None));
-    let budget = reasoning
-        .as_ref()
-        .and_then(crate::llm_proxy::Reasoning::budget);
+    // A check is a short question: a budget is cut to what it needs.
+    let reasoning = entry.thinking.as_ref().map(|t| match t.resolve(None) {
+        crate::llm_proxy::Reasoning::Budget(n) => {
+            crate::llm_proxy::Reasoning::Budget(n.min(CHECK_BUDGET))
+        }
+        other => other,
+    });
     let request = crate::llm_proxy::AnthropicRequest {
         model: entry.model().to_string(),
-        max_tokens: budget.map_or(512, |b| b.saturating_add(1024)),
+        max_tokens: if reasoning.is_some() {
+            CHECK_MAX_TOKENS
+        } else {
+            512
+        },
         reasoning,
         messages: vec![crate::llm_proxy::AnthropicMessage {
             role: "user".into(),

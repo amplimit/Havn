@@ -355,6 +355,10 @@ pub async fn chat_patch(
 ) -> Result<StatusCode, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
     let conversation = chat_param(Some(chat))?.unwrap_or_default();
+    let title = req.title.as_deref().map(str::trim);
+    if title.is_some_and(str::is_empty) {
+        return Err(ApiError::BadRequest("title must be non-empty".into()));
+    }
     if req.model.is_some() || req.thinking.is_some() {
         // Only a model the agent may use; a thinking choice that reads as
         // one (the model decides whether it takes it).
@@ -375,7 +379,7 @@ pub async fn chat_patch(
                 "{thinking:?} is not a thinking choice"
             )));
         }
-        let _: Found = crate::api::agents::agent_data(
+        let set: Found = crate::api::agents::agent_data(
             &state,
             user.id,
             agent.id,
@@ -388,13 +392,13 @@ pub async fn chat_patch(
             true,
         )
         .await?;
+        if !set.found {
+            return Err(ApiError::NotFound);
+        }
     }
-    let Some(title) = req.title.as_deref().map(str::trim) else {
+    let Some(title) = title else {
         return Ok(StatusCode::NO_CONTENT);
     };
-    if title.is_empty() {
-        return Err(ApiError::BadRequest("title must be non-empty".into()));
-    }
     let renamed: Found = crate::api::agents::agent_data(
         &state,
         user.id,

@@ -82,9 +82,28 @@ fn clip(text: &str, max: usize) -> String {
     out
 }
 
-/// Take the thinking blocks out of the assistant messages of `messages`.
+/// Take the thinking blocks out of the assistant messages before the last
+/// message someone wrote (one that is not only tool results): the turn
+/// being answered keeps its reasoning, as Anthropic and DeepSeek want it
+/// back with each tool call.
 fn drop_thinking(messages: &mut [Value]) {
-    for message in messages.iter_mut() {
+    let tool_results_only = |m: &Value| {
+        m.get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                !blocks.is_empty()
+                    && blocks
+                        .iter()
+                        .all(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+            })
+    };
+    let turn = messages
+        .iter()
+        .rposition(|m| {
+            m.get("role").and_then(Value::as_str) == Some("user") && !tool_results_only(m)
+        })
+        .unwrap_or(0);
+    for message in messages[..turn].iter_mut() {
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
@@ -298,8 +317,8 @@ pub async fn run_typed(
             }
         }
 
-        // Only the newest assistant message keeps its thinking: Anthropic's
-        // tools need that one back, and older ones only fill the frame.
+        // Only this turn keeps its thinking: its tool calls need it back,
+        // and older turns' only fill the frame.
         drop_thinking(messages);
         // Always append the assistant turn so the next call has context.
         messages.push(serde_json::json!({ "role": "assistant", "content": content.clone() }));
@@ -802,19 +821,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_newest_assistant_message_keeps_its_thinking() {
-        let mut messages = vec![
-            serde_json::json!({"role": "user", "content": "q"}),
+    fn only_the_turn_being_answered_keeps_its_thinking() {
+        let tool_call = |id: &str, thought: &str| {
             serde_json::json!({"role": "assistant", "content": [
-                {"type": "thinking", "thinking": "old", "signature": "s"},
-                {"type": "tool_use", "id": "t1", "name": "shell", "input": {}}
-            ]}),
-            serde_json::json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}),
+                {"type": "thinking", "thinking": thought, "signature": "s"},
+                {"type": "tool_use", "id": id, "name": "shell", "input": {}}
+            ]})
+        };
+        let result = |id: &str| serde_json::json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": "ok"}]});
+        let mut messages = vec![
+            serde_json::json!({"role": "user", "content": "earlier"}),
+            tool_call("t0", "old"),
+            result("t0"),
+            serde_json::json!({"role": "assistant", "content": [{"type": "thinking", "thinking": "old too"}, {"type": "text", "text": "done"}]}),
+            serde_json::json!({"role": "user", "content": "now"}),
+            tool_call("t1", "first"),
+            result("t1"),
+            tool_call("t2", "second"),
+            result("t2"),
         ];
         drop_thinking(&mut messages);
         assert_eq!(messages[1]["content"].as_array().map(Vec::len), Some(1));
         assert_eq!(messages[1]["content"][0]["type"], "tool_use");
-        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[3]["content"][0]["type"], "text");
+        assert_eq!(messages[5]["content"][0]["thinking"], "first");
+        assert_eq!(messages[7]["content"][0]["thinking"], "second");
+        assert_eq!(messages[8]["content"][0]["type"], "tool_result");
     }
 
     #[test]

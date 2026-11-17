@@ -2869,9 +2869,12 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                 model,
                 thinking,
             } => {
-                let chat = conversations::chat_for(&ctx.pool, &channel_id, Some(&conversation), "")
+                let Some(chat) = conversations::own_chat(&ctx.pool, &channel_id, &conversation)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| e.to_string())?
+                else {
+                    return Ok(serde_json::json!({ "found": false }));
+                };
                 if let Some(model) = model {
                     conversations::set_chat_model(&ctx.pool, &chat, model.as_deref())
                         .await

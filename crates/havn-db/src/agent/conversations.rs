@@ -810,6 +810,31 @@ pub fn title_from(text: &str) -> String {
 /// new chat); otherwise the scope's active chat, or a new one. The chat
 /// becomes the scope's active one, is titled after `text` if it has no
 /// title, and moves to the top of the list.
+/// Chat `id` of `scope`, made when there is no chat of that id yet and it
+/// is a UUID; `None` for another scope's chat or a malformed id. It is
+/// not made the active chat, nor moved up the list.
+pub async fn own_chat(pool: &SqlitePool, scope: &str, id: &str) -> Result<Option<String>> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let found: Option<(String,)> = sqlx::query_as("SELECT scope FROM chats WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let own = match found {
+        Some((of,)) => (of == scope).then(|| id.to_string()),
+        None if Uuid::parse_str(id).is_ok() => {
+            sqlx::query("INSERT INTO chats (id, scope) VALUES (?1, ?2)")
+                .bind(id)
+                .bind(scope)
+                .execute(&mut *tx)
+                .await?;
+            Some(id.to_string())
+        }
+        None => None,
+    };
+    tx.commit().await?;
+    Ok(own)
+}
+
 pub async fn chat_for(
     pool: &SqlitePool,
     scope: &str,
@@ -1218,6 +1243,32 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[tokio::test]
+    async fn own_chat_is_the_chat_named_or_a_new_one() {
+        let pool = connect_in_memory().await.expect("connect");
+        let mine = "0193b4b0-0000-7000-8000-000000000001";
+        assert_eq!(
+            own_chat(&pool, "a", mine).await.expect("db").as_deref(),
+            Some(mine)
+        );
+        assert_eq!(
+            own_chat(&pool, "a", mine).await.expect("db").as_deref(),
+            Some(mine)
+        );
+        assert_eq!(
+            own_chat(&pool, "b", mine).await.expect("db"),
+            None,
+            "another scope's"
+        );
+        assert_eq!(own_chat(&pool, "a", "not-a-chat").await.expect("db"), None);
+        let active: Option<(String,)> =
+            sqlx::query_as("SELECT chat_id FROM active_chats WHERE scope = 'a'")
+                .fetch_optional(&pool)
+                .await
+                .expect("db");
+        assert_eq!(active, None, "not made active");
+    }
     use crate::agent::connect_in_memory;
 
     #[tokio::test]
