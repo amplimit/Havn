@@ -335,6 +335,17 @@ pub async fn retitle(
     Ok(res.rows_affected() > 0)
 }
 
+/// What reply `turn` of chat `chat` did on the way, when it was kept.
+pub async fn trace_of(pool: &SqlitePool, chat: &str, turn: &str) -> Result<Option<String>> {
+    let found: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT trace FROM conversations WHERE id = ?2 AND channel_id = ?1")
+            .bind(chat)
+            .bind(turn)
+            .fetch_optional(pool)
+            .await?;
+    Ok(found.and_then(|(trace,)| trace))
+}
+
 /// Keep `trace`, what reply `turn` did on the way, with it.
 pub async fn set_trace(pool: &SqlitePool, turn: &str, trace: &str) -> Result<()> {
     sqlx::query("UPDATE conversations SET trace = ?2 WHERE id = ?1")
@@ -1346,6 +1357,14 @@ mod tests {
         let turns = branch(&pool, &chat, 100).await.expect("branch");
         assert_eq!(turns[3].trace.as_deref(), Some(r#"{"items":[]}"#));
         assert_eq!(turns[2].trace, None);
+        assert_eq!(
+            trace_of(&pool, &chat, &reply).await.expect("db").as_deref(),
+            Some(r#"{"items":[]}"#)
+        );
+        assert_eq!(
+            trace_of(&pool, "another-chat", &reply).await.expect("db"),
+            None
+        );
 
         // Edit q2: a new version after a1, recorded with the rewind.
         let edited = rewind(

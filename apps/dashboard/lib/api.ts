@@ -184,8 +184,11 @@ export type TurnTrace = {
   ms: number;
   items: TraceItem[];
   /** Parts not kept. */
-  left_out?: number;
+  left_out: number;
 };
+
+/** What a reply's folded line says of its turn. */
+export type TraceSummary = { ms: number; thought: boolean; steps: number };
 
 export type ConversationTurn = {
   id: string;
@@ -195,8 +198,8 @@ export type ConversationTurn = {
   /** Its versions: the turns in its place on other branches, itself
    * included, oldest first. */
   versions: string[];
-  /** For a reply: what its turn did on the way. */
-  trace?: TurnTrace;
+  /** For a reply: what its turn did on the way, in short. */
+  trace?: TraceSummary;
 };
 
 export type ConversationResponse = {
@@ -637,6 +640,11 @@ export const api = {
       request<void>(`/agents/${agentId}/chats/${encodeURIComponent(chat)}`, {
         method: "DELETE",
       }),
+    /** What reply `turn` of `chat` did on the way. */
+    trace: (agentId: string, chat: string, turn: string) =>
+      request<TurnTrace>(
+        `/agents/${agentId}/chats/${encodeURIComponent(chat)}/turns/${encodeURIComponent(turn)}/trace`,
+      ),
     /** Continue `chat` from the branch of `turn`, at its newest turn. */
     branch: (agentId: string, chat: string, turn: string) =>
       request<void>(`/agents/${agentId}/chats/${encodeURIComponent(chat)}/branch`, {

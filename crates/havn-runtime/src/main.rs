@@ -1939,6 +1939,27 @@ fn clean_title(text: &str) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
+/// What the folded line of a turn's trace says: how long the turn took,
+/// whether the model thought, and how many tool calls it made.
+fn trace_summary(raw: &str) -> Option<String> {
+    let trace: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let items = trace.get("items")?.as_array()?;
+    let kind = |k: &str| {
+        items
+            .iter()
+            .filter(|i| i.get("kind").and_then(serde_json::Value::as_str) == Some(k))
+            .count()
+    };
+    Some(
+        serde_json::json!({
+            "ms": trace.get("ms").and_then(serde_json::Value::as_u64).unwrap_or(0),
+            "thought": kind("thinking") > 0,
+            "steps": kind("step"),
+        })
+        .to_string(),
+    )
+}
+
 /// Characters of a found turn the dashboard's search shows.
 const SEARCH_EXCERPT_CHARS: usize = 160;
 
@@ -2190,7 +2211,8 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
-            if !kept.items.is_empty() {
+            // Only the dashboard shows it, and only for its own chats.
+            if msg.channel == "webchat" && !kept.items.is_empty() {
                 let trace = serde_json::json!({
                     "ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     "items": kept.items,
@@ -2720,9 +2742,15 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                             conversations::branch(&ctx.pool, chat, limit.min(MAX_DATA_ROWS))
                                 .await
                                 .map_err(|e| e.to_string())?;
-                        conversations::with_versions(&ctx.pool, chat, turns)
+                        let mut turns = conversations::with_versions(&ctx.pool, chat, turns)
                             .await
-                            .map_err(|e| e.to_string())?
+                            .map_err(|e| e.to_string())?;
+                        // A turn's trace is read when it is opened: here,
+                        // what its folded line says.
+                        for turn in &mut turns {
+                            turn.trace = turn.trace.take().and_then(|raw| trace_summary(&raw));
+                        }
+                        turns
                     }
                     None => Vec::new(),
                 };
@@ -2785,6 +2813,23 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                     }));
                 }
                 Ok(serde_json::json!({ "chats": chats, "turns": turns }))
+            }
+            DataQuery::TurnTrace {
+                channel_id,
+                conversation,
+                turn,
+            } => {
+                let chat =
+                    conversations::existing_chat(&ctx.pool, &channel_id, Some(&conversation))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                let trace = match chat {
+                    Some(chat) => conversations::trace_of(&ctx.pool, &chat, &turn)
+                        .await
+                        .map_err(|e| e.to_string())?,
+                    None => None,
+                };
+                Ok(serde_json::json!({ "trace": trace }))
             }
             DataQuery::RenameChat {
                 channel_id,

@@ -12,6 +12,7 @@ import {
   type EmbeddingStatus,
   type MeView,
   type SentFile,
+  type TraceSummary,
   type TurnTrace,
 } from "@/lib/api";
 import { openChat, type ChatHandle } from "@/lib/websocket";
@@ -48,8 +49,8 @@ type Bubble = {
   /** The stored turn it shows, with its versions; absent until stored. */
   turn?: string;
   versions?: string[];
-  /** For a reply: what its turn did on the way. */
-  trace?: TurnTrace;
+  /** For a reply: what its turn did on the way, in short. */
+  trace?: TraceSummary;
   /** A file the agent sent, to download. */
   file?: { url: string; name: string; caption?: string };
   /** A note of what a reply saved to or forgot from memory, and that
@@ -1075,6 +1076,7 @@ export default function ChatPage({
                 agentId={id}
                 bubble={b}
                 found={b.turn !== undefined && b.turn === found}
+                chatId={chat}
                 busy={pending || wsState !== "open"}
                 onUpload={uploadFiles}
                 onEdit={
@@ -1455,6 +1457,7 @@ function Bubble({
   busy,
   found,
   agentId,
+  chatId,
   onRetry,
   onEdit,
   onUpload,
@@ -1463,6 +1466,8 @@ function Bubble({
 }: {
   bubble: Bubble;
   agentId: string;
+  /** The chat it is in, once it has one. */
+  chatId?: string | null;
   /** A reply is due: branching waits for it. */
   busy: boolean;
   /** The message a search led to: marked for a moment. */
@@ -1510,8 +1515,8 @@ function Bubble({
           : undefined
       }
     >
-      {bubble.role === "agent" && bubble.trace && bubble.trace.items.length > 0 && (
-        <TraceFold trace={bubble.trace} />
+      {bubble.role === "agent" && bubble.trace && bubble.turn && chatId && (bubble.trace.thought || bubble.trace.steps > 0) && (
+        <TraceFold agentId={agentId} chat={chatId} turn={bubble.turn} summary={bubble.trace} />
       )}
       {message && message.files.length > 0 && (
         <AttachmentCards agentId={agentId} files={message.files} align="end" />
@@ -2188,21 +2193,46 @@ function took(ms: number): string {
 
 /**
  * What a reply's turn did on the way, folded into one line: the model's
- * reasoning and each tool call, with its input and result, when opened.
+ * reasoning and each tool call, with its input and result, read when
+ * opened.
  */
-function TraceFold({ trace }: { trace: TurnTrace }) {
-  const steps = trace.items.filter((i) => i.kind === "step").length;
-  const thought = trace.items.some((i) => i.kind === "thinking");
+function TraceFold({
+  agentId,
+  chat,
+  turn,
+  summary,
+}: {
+  agentId: string;
+  chat: string;
+  turn: string;
+  summary: TraceSummary;
+}) {
+  const [trace, setTrace] = useState<TurnTrace | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const parts = [
-    thought ? "thought" : null,
-    steps > 0 ? `${steps} step${steps === 1 ? "" : "s"}` : null,
+    summary.thought ? "thought" : null,
+    summary.steps > 0 ? `${summary.steps} step${summary.steps === 1 ? "" : "s"}` : null,
   ].filter(Boolean);
   const muted = { color: "var(--color-body)" };
   return (
-    <details className="text-xs" style={{ maxWidth: "min(85%, 720px)", ...muted }}>
+    <details
+      className="text-xs"
+      style={{ maxWidth: "min(85%, 720px)", ...muted }}
+      onToggle={(e) => {
+        if (!e.currentTarget.open || trace) return;
+        api.chats.trace(agentId, chat, turn).then(setTrace, (err: unknown) =>
+          setError(err instanceof Error ? err.message : String(err)),
+        );
+      }}
+    >
       <summary className="cursor-pointer select-none">
-        {parts.join(" · ")} · {took(trace.ms)}
+        {parts.join(" · ")} · {took(summary.ms)}
       </summary>
+      {!trace ? (
+        <p className="mt-2 pl-3" role={error ? "alert" : undefined}>
+          {error ?? "loading…"}
+        </p>
+      ) : (
       <ol className="mt-2 flex flex-col gap-2 border-l-2 pl-3" style={{ borderColor: "var(--color-border-default)" }}>
         {trace.items.map((item, i) =>
           item.kind === "thinking" ? (
@@ -2227,8 +2257,9 @@ function TraceFold({ trace }: { trace: TurnTrace }) {
             </li>
           ),
         )}
-        {(trace.left_out ?? 0) > 0 && <li>…and {trace.left_out} more, not kept.</li>}
+        {trace.left_out > 0 && <li>…and {trace.left_out} more, not kept.</li>}
       </ol>
+      )}
     </details>
   );
 }

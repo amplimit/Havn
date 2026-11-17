@@ -501,6 +501,13 @@ pub enum DataQuery {
     },
     /// The chats of `channel_id`, most recently used first.
     Chats { channel_id: String, limit: u32 },
+    /// What reply `turn` of chat `conversation` of `channel_id` did on the
+    /// way (issue #178): `{"trace": json | null}`.
+    TurnTrace {
+        channel_id: String,
+        conversation: String,
+        turn: String,
+    },
     /// Search the chats of `channel_id` (issue #175): `{"chats": [...],
     /// "turns": [...]}`, the chats whose title has every word of `query`
     /// and the user and assistant turns that do, each with an excerpt.

@@ -41,8 +41,10 @@ tokio::task_local! {
     pub static TRACE: Arc<std::sync::Mutex<Trace>>;
 }
 
-/// Entries one turn's trace keeps at most, and characters of each part.
+/// Entries one turn's trace keeps at most, characters of all its parts,
+/// and of each part.
 const TRACE_ENTRIES: usize = 60;
+const TRACE_TOTAL_CHARS: usize = 48_000;
 const TRACE_THINKING_CHARS: usize = 8_000;
 const TRACE_INPUT_CHARS: usize = 1_500;
 const TRACE_RESULT_CHARS: usize = 2_000;
@@ -53,12 +55,14 @@ pub struct Trace {
     pub items: Vec<Value>,
     /// Entries that did not fit.
     pub left_out: usize,
+    chars: usize,
 }
 
 impl Trace {
-    fn push(&mut self, item: Value) {
-        if self.items.len() < TRACE_ENTRIES {
+    fn push(&mut self, item: Value, chars: usize) {
+        if self.items.len() < TRACE_ENTRIES && self.chars + chars <= TRACE_TOTAL_CHARS {
             self.items.push(item);
+            self.chars += chars;
         } else {
             self.left_out += 1;
         }
@@ -75,12 +79,13 @@ fn clip(text: &str, max: usize) -> String {
     out
 }
 
-/// Add to the running turn's trace, when one is kept.
-fn trace(item: Value) {
+/// Add to the running turn's trace, when one is kept; `chars` is the
+/// length of its text.
+fn trace(item: Value, chars: usize) {
     let _ = TRACE.try_with(|t| {
         t.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(item);
+            .push(item, chars);
     });
 }
 
@@ -249,30 +254,28 @@ pub async fn run_typed(
             .and_then(Value::as_str)
             .unwrap_or("end_turn")
             .to_string();
-        let mut content = provider_response
+        let content = provider_response
             .get("content")
             .cloned()
             .unwrap_or(Value::Array(Vec::new()));
-        // The model's reasoning is kept for the dashboard, never sent back.
-        if let Some(blocks) = content.as_array_mut() {
-            for block in blocks.iter() {
-                if context == crate::tools::context::WEBCHAT
-                    && block.get("type").and_then(Value::as_str) == Some("thinking")
+        // The model's reasoning, kept for the dashboard. It stays in this
+        // turn's messages, as Anthropic's thinking with tools needs; the
+        // adapters of other providers leave it out, and later turns are
+        // built from the stored replies, which never hold it.
+        if context == crate::tools::context::WEBCHAT {
+            for block in content.as_array().into_iter().flatten() {
+                if block.get("type").and_then(Value::as_str) == Some("thinking")
                     && let Some(text) = block.get("thinking").and_then(Value::as_str)
                     && !text.trim().is_empty()
                 {
-                    trace(serde_json::json!({
-                        "kind": "thinking",
-                        "text": clip(text.trim(), TRACE_THINKING_CHARS),
-                    }));
+                    let text = clip(text.trim(), TRACE_THINKING_CHARS);
+                    let chars = text.chars().count();
+                    trace(
+                        serde_json::json!({ "kind": "thinking", "text": text }),
+                        chars,
+                    );
                 }
             }
-            blocks.retain(|b| {
-                !matches!(
-                    b.get("type").and_then(Value::as_str),
-                    Some("thinking" | "redacted_thinking")
-                )
-            });
         }
 
         // Always append the assistant turn so the next call has context.
@@ -394,13 +397,19 @@ async fn execute_tool_uses(
         };
         if context == crate::tools::context::WEBCHAT {
             let input = block.get("input").cloned().unwrap_or(Value::Null);
-            trace(serde_json::json!({
-                "kind": "step",
-                "tool": name,
-                "input": clip(&input.to_string(), TRACE_INPUT_CHARS),
-                "result": clip(&text, TRACE_RESULT_CHARS),
-                "error": is_error,
-            }));
+            let input = clip(&input.to_string(), TRACE_INPUT_CHARS);
+            let result = clip(&text, TRACE_RESULT_CHARS);
+            let chars = input.chars().count() + result.chars().count();
+            trace(
+                serde_json::json!({
+                    "kind": "step",
+                    "tool": name,
+                    "input": input,
+                    "result": result,
+                    "error": is_error,
+                }),
+                chars,
+            );
         }
         out.push(serde_json::json!({
             "type": "tool_result",
