@@ -237,6 +237,7 @@ impl ReloadHandles {
                 );
                 self.models.store(Arc::new(catalog));
             } else if path.starts_with("channel_texts") {
+                new.warn_channel_texts();
                 self.channel_texts
                     .store(Arc::new(new.channel_texts.clone()));
                 info!("hot-reloaded the channel bots' texts");

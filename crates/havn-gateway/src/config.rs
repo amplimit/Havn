@@ -347,6 +347,8 @@ pub struct PairingTexts {
     pub unpaired: Option<String>,
     /// The answer to a code that is wrong, used or expired.
     pub invalid_code: Option<String>,
+    /// The answer to a code sent after too many tries.
+    pub too_many_tries: Option<String>,
     /// The answer to `/help`.
     pub help: Option<String>,
     /// The answer to a code accepted.
@@ -682,6 +684,7 @@ impl GatewayConfig {
         let raw = std::fs::read_to_string(path)?;
         let mut parsed: Self = toml::from_str(&raw)?;
         parsed.validate_channel_ids()?;
+        parsed.warn_channel_texts();
         parsed.validate_llm()?;
         parsed.validate_search()?;
         if !matches!(
@@ -822,6 +825,27 @@ impl GatewayConfig {
             })?;
         }
         Ok(())
+    }
+
+    /// Warn about `[channel_texts]` for an account the config does not
+    /// declare (a typo leaves its bot with the defaults). Texts too long
+    /// for a chat message are cut when sent.
+    pub fn warn_channel_texts(&self) {
+        for (channel, accounts) in &self.channel_texts {
+            for account in accounts.keys() {
+                let declared = self
+                    .channels
+                    .get(channel)
+                    .is_some_and(|entry| entry.accounts.iter().any(|a| &a.id == account));
+                if !declared {
+                    tracing::warn!(
+                        channel = %channel,
+                        account = %account,
+                        "[channel_texts] names an account not in [[channels.<channel>.accounts]]; its texts are not used"
+                    );
+                }
+            }
+        }
     }
 
     /// Resolve the config path the watcher should target. Mirrors the

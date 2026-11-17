@@ -56,9 +56,13 @@ const ADAPTER_TOKEN_HEADER: &str = "x-adapter-token";
 /// make the bot send more than this.
 const DM_REPLY_LIMIT: u32 = 3;
 const DM_REPLY_WINDOW: Duration = Duration::from_secs(60);
-/// Senders the reply limiter tracks at once; past it, new senders get no
-/// answer until older windows end.
+/// Senders the reply limiter tracks at once per account; past it, new
+/// senders to that account get no answer until older windows end. Per
+/// account, so a flood at one bot does not silence another's.
 const DM_REPLY_MAX_KEYS: usize = 10_000;
+/// Characters of a configured text sent: below every platform's message
+/// limit (Telegram's is 4096).
+const MAX_PAIRING_TEXT_CHARS: usize = 2000;
 
 /// What an `allowlist` bot tells a sender who is not paired (issue #183),
 /// unless `[channel_texts]` says otherwise.
@@ -67,6 +71,8 @@ const PAIR_WELCOME: &str = "Hello! This bot needs pairing before you can use it.
                             pairing link you got. No code yet? Ask whoever runs this bot.";
 const PAIR_UNPAIRED: &str = "Not paired yet. Send your pairing code, or /help.";
 const PAIR_INVALID_CODE: &str = "That pairing code is not valid or has expired.";
+const PAIR_TOO_MANY_TRIES: &str =
+    "Too many tries. Please wait a few minutes, then send your pairing code again.";
 const PAIR_HELP: &str = "This bot answers only people who have paired with it. To pair, send the \
                          pairing code you were given (it looks like 7K3M-QX9P-2HWD-RT4B), or open \
                          the pairing link you got. Codes come from whoever runs this bot.";
@@ -97,10 +103,11 @@ const INVITE_LIMITER_MAX_KEYS: usize = 10_000;
 /// someone flooding a bot would get the bot to send as many answers
 /// (reflector amplification).
 ///
-/// Key: `"{channel}|{account_id}|{sender_id}"`.
+/// Key: `"{channel}|{account_id}|{sender_id}"`; the senders of each
+/// `"{channel}|{account_id}"` are counted apart.
 #[derive(Debug, Clone, Default)]
 pub struct DmRejectLimiter {
-    windows: Arc<std::sync::Mutex<HashMap<String, (Instant, u32)>>>,
+    accounts: Arc<std::sync::Mutex<HashMap<String, HashMap<String, (Instant, u32)>>>>,
 }
 
 impl DmRejectLimiter {
@@ -115,14 +122,16 @@ impl DmRejectLimiter {
     }
 
     fn should_send_at(&self, key: &str, now: Instant) -> bool {
-        let mut map = self.windows.lock().unwrap_or_else(|e| e.into_inner());
-        if map.len() >= DM_REPLY_MAX_KEYS && !map.contains_key(key) {
+        let (account, sender) = key.rsplit_once('|').unwrap_or(("", key));
+        let mut accounts = self.accounts.lock().unwrap_or_else(|e| e.into_inner());
+        let map = accounts.entry(account.to_string()).or_default();
+        if map.len() >= DM_REPLY_MAX_KEYS && !map.contains_key(sender) {
             map.retain(|_, (start, _)| now.duration_since(*start) < DM_REPLY_WINDOW);
             if map.len() >= DM_REPLY_MAX_KEYS {
                 return false;
             }
         }
-        let (start, count) = map.entry(key.to_string()).or_insert((now, 0));
+        let (start, count) = map.entry(sender.to_string()).or_insert((now, 0));
         if now.duration_since(*start) >= DM_REPLY_WINDOW {
             *start = now;
             *count = 0;
@@ -1385,9 +1394,10 @@ enum Refusal {
     Welcome,
     /// `/help`.
     Help,
-    /// A code that is wrong, used, expired or for another bot, or one
-    /// past the attempts allowed.
+    /// A code that is wrong, used, expired or for another bot.
     InvalidCode,
+    /// A code past the attempts allowed, valid or not.
+    TooManyTries,
     /// Anything else.
     Unpaired,
     /// Not a refusal: the code was accepted.
@@ -1405,20 +1415,27 @@ fn pairing_text(state: &AppState, channel: &str, account_id: &str, why: Refusal)
         Refusal::Welcome => (own.and_then(|t| t.welcome.clone()), PAIR_WELCOME),
         Refusal::Help => (own.and_then(|t| t.help.clone()), PAIR_HELP),
         Refusal::InvalidCode => (own.and_then(|t| t.invalid_code.clone()), PAIR_INVALID_CODE),
+        Refusal::TooManyTries => (
+            own.and_then(|t| t.too_many_tries.clone()),
+            PAIR_TOO_MANY_TRIES,
+        ),
         Refusal::Unpaired => (own.and_then(|t| t.unpaired.clone()), PAIR_UNPAIRED),
         Refusal::Paired => (own.and_then(|t| t.paired.clone()), INVITE_WELCOME_MESSAGE),
     };
-    set.filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| default.to_string())
+    set.filter(|t| !t.trim().is_empty()).map_or_else(
+        || default.to_string(),
+        |t| t.chars().take(MAX_PAIRING_TEXT_CHARS).collect(),
+    )
 }
 
-/// `text` as a command to a bot: `/name` or `/name@bot`, then the rest.
-fn bot_command(text: &str) -> Option<(&str, &str)> {
+/// `text` as a command to a bot: `/name` or `/name@bot` (its name in
+/// lower case), then the rest.
+fn bot_command(text: &str) -> Option<(String, &str)> {
     let text = text.trim();
     let word = text.split_whitespace().next()?;
     let name = word.strip_prefix('/')?;
     let name = name.split_once('@').map_or(name, |(n, _)| n);
-    Some((name, text[word.len()..].trim()))
+    Some((name.to_ascii_lowercase(), text[word.len()..].trim()))
 }
 
 /// Reply to the sender's message `message_id` with `text`.
@@ -1487,9 +1504,9 @@ async fn sender_access(
     // `/start` alone welcomes; `/start <code>`, from a pairing link,
     // pairs; `/help` explains. Any other text that reads as a code pairs.
     let candidate = match bot_command(text) {
-        Some(("start", "")) => return SenderAccess::Denied(Refusal::Welcome),
-        Some(("start", payload)) => payload,
-        Some(("help", _)) => return SenderAccess::Denied(Refusal::Help),
+        Some((name, "")) if name == "start" => return SenderAccess::Denied(Refusal::Welcome),
+        Some((name, payload)) if name == "start" => payload,
+        Some((name, _)) if name == "help" => return SenderAccess::Denied(Refusal::Help),
         Some(_) => return SenderAccess::Denied(Refusal::Unpaired),
         None => text.as_str(),
     };
@@ -1512,7 +1529,7 @@ async fn sender_access(
                     "invite: too many attempts from this sender; ignoring codes for the rest of the window"
                 );
             }
-            return SenderAccess::Denied(Refusal::InvalidCode);
+            return SenderAccess::Denied(Refusal::TooManyTries);
         }
     }
     let invite = match channel_access::redeem(
@@ -1614,24 +1631,31 @@ mod tests {
     }
 
     #[test]
-    fn a_flood_of_new_senders_is_bounded() {
+    fn a_flood_of_new_senders_is_bounded_per_account() {
         let limiter = DmRejectLimiter::new();
         let start = Instant::now();
         for i in 0..DM_REPLY_MAX_KEYS {
             assert!(limiter.should_send_at(&format!("telegram|bot|flood:{i}"), start));
         }
         assert!(!limiter.should_send_at("telegram|bot|tg:new", start));
+        assert!(
+            limiter.should_send_at("telegram|other-bot|tg:new", start),
+            "a flood at one bot does not silence another"
+        );
         assert!(limiter.should_send_at("telegram|bot|tg:new", start + DM_REPLY_WINDOW));
     }
 
     #[test]
     fn bot_commands_are_read_with_or_without_the_bot_name() {
-        assert_eq!(bot_command("/start"), Some(("start", "")));
+        assert_eq!(bot_command("/start"), Some(("start".to_string(), "")));
         assert_eq!(
             bot_command(" /start@acme_bot  7K3M-QX9P "),
-            Some(("start", "7K3M-QX9P"))
+            Some(("start".to_string(), "7K3M-QX9P"))
         );
-        assert_eq!(bot_command("/help@acme_bot"), Some(("help", "")));
+        assert_eq!(
+            bot_command("/HELP@acme_bot"),
+            Some(("help".to_string(), ""))
+        );
         assert_eq!(bot_command("hello /start"), None);
         assert_eq!(bot_command(""), None);
     }
@@ -2128,6 +2152,51 @@ mod tests {
                 f.forwarded(),
                 vec!["tg:toml".to_string(), "tg:db".to_string()]
             );
+        }
+
+        #[tokio::test]
+        async fn start_codes_and_bare_codes_share_one_budget() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            for _ in 0..INVITE_ATTEMPT_LIMIT {
+                f.send("tg:1", "/start AAAA-AAAA-AAAA-AAAA").await;
+            }
+            f.replies();
+            // Its answers for this minute are used up; the attempts are
+            // what is counted here.
+            f.state.dm_reject_limiter = DmRejectLimiter::new();
+            let code = f.invite("bot").await;
+            f.send("tg:1", &code).await;
+            assert!(!f.allowed("tg:1").await);
+            assert_eq!(
+                f.replies(),
+                vec![("tg:1".to_string(), PAIR_TOO_MANY_TRIES.to_string())],
+                "a valid code past the tries is told to wait, not that it is invalid"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_link_code_may_be_lower_case_with_dashes() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let code = f.invite("bot").await;
+            f.send("tg:1", &format!("/Start@bot {}", code.to_lowercase()))
+                .await;
+            assert!(f.allowed("tg:1").await);
+            f.replies();
+            f.send("tg:1", "/help").await;
+            let replies = f.replies();
+            assert!(
+                replies.iter().any(|(_, t)| t.contains("/new"))
+                    && !replies.iter().any(|(_, t)| t == PAIR_HELP),
+                "a paired /help lists the commands, not how to pair: {replies:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn open_accounts_send_start_to_the_agent() {
+            let mut f = fixture(DmPolicy::Open, &[]).await;
+            f.send("tg:1", "/start").await;
+            assert_eq!(f.forwarded(), vec!["tg:1".to_string()]);
+            assert!(f.replies().is_empty());
         }
 
         #[tokio::test]

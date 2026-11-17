@@ -600,10 +600,10 @@ havn invite create --channel telegram --account acme-bot --expires 2h
 The command prints a code such as `7K3M-QX9P-2HWD-RT4B` once. Send it to the person over a channel you trust (the way you hand out the code is what vouches for them). They message the code to the bot in a private chat, or open `https://t.me/<bot>?start=<code>`, which sends `/start <code>`; case, dashes and spaces don't matter. The gateway then adds their sender id to the account's allowlist, marks the code used, records a `channel_access.granted` audit entry and replies with a short welcome. The code itself is not passed to the agent. Their later messages reach the agent like those of anyone in `allow_from`.
 
 - A code works once, only for the channel and account it was created for, and expires after `--expires` (default 24h, at most 30d). havn stores only its SHA-256 hash.
-- A wrong, used, expired or revoked code gets the same answer ("That pairing code is not valid or has expired."), so a sender can't tell which. Each sender gets 5 attempts per account every 15 minutes, and failed attempts are logged.
+- A wrong, used, expired or revoked code gets the same answer ("That pairing code is not valid or has expired."), so a sender can't tell which. Each sender gets 5 attempts per account every 15 minutes; after that any code, a valid one too, is answered "Too many tries" until the 15 minutes are over. Failed attempts are logged.
 - On `dm_policy = "open"` accounts everyone is already admitted, so codes are passed to the agent as ordinary messages.
 
-A sender who is not paired yet is answered and never reaches the agent: `/start` gets a welcome that asks for the pairing code, `/help` explains how to pair, and any other message "Not paired yet. Send your pairing code, or /help." Every message is answered, at most 3 a minute per sender, so a stranger cannot make the bot send more. The texts can be set per account, for a bot that speaks another language; a text left out or blank keeps the default, and changes apply without a restart:
+A sender who is not paired yet is answered and never reaches the agent: `/start` gets a welcome that asks for the pairing code, `/help` explains how to pair, and any other message "Not paired yet. Send your pairing code, or /help." Every message is answered, at most 3 a minute per sender (and to at most 10,000 senders at once per account), so a stranger cannot make the bot send more. Commands are read in any case, with or without `@botname`. The texts can be set per account, for a bot that speaks another language; a text left out or blank keeps the default, and changes apply without a restart:
 
 ```toml
 [channel_texts.telegram.acme-bot]
@@ -612,7 +612,10 @@ unpaired     = "还没有配对。请发送配对码，或发送 /help。"
 invalid_code = "配对码无效或已过期。"
 help         = "这个机器人只回复已配对的人。请发送管理员给你的配对码。"
 paired       = "配对成功，现在可以聊天了。"
+too_many_tries = "尝试次数太多，请几分钟后再发送配对码。"
 ```
+
+A text is cut to 2000 characters, and the gateway warns about texts for an account it does not declare.
 
 Manage invites and admitted senders with the same direct-database commands as `havn user` (no gateway restart needed):
 
