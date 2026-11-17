@@ -2287,6 +2287,7 @@ pub type ReplyStreams = Arc<
 
 enum ReplyPiece {
     Text(String),
+    Reasoning(String),
     Restart,
 }
 
@@ -2345,6 +2346,9 @@ impl ReplyText {
                     llm_proxy::provider::TextEvent::Text(text) => {
                         ReplyPiece::Text(text.to_string())
                     }
+                    llm_proxy::provider::TextEvent::Reasoning(text) => {
+                        ReplyPiece::Reasoning(text.to_string())
+                    }
                     llm_proxy::provider::TextEvent::Restart => ReplyPiece::Restart,
                 });
             }
@@ -2385,8 +2389,41 @@ impl Drop for ReplyText {
     }
 }
 
-/// Send a call's text to the session's tabs, gathered for
-/// [`REPLY_TEXT_EVERY`] at a time: what it added, after the length the
+/// One text a call streams, its reply or its reasoning, and how much of
+/// it the tabs were sent, in bytes and in the UTF-16 units a browser
+/// counts.
+#[derive(Default)]
+struct Streamed {
+    whole: String,
+    sent_bytes: usize,
+    sent_units: usize,
+    restart: bool,
+}
+
+impl Streamed {
+    /// What to send now, as `(at, text)`: what was added since, or all of
+    /// it after a restart or when `whole_due`.
+    fn next(&mut self, whole_due: bool) -> Option<(usize, String)> {
+        let (at, text) = if self.restart || (whole_due && !self.whole.is_empty()) {
+            (0, self.whole.clone())
+        } else if self.whole.len() > self.sent_bytes {
+            (self.sent_units, self.whole[self.sent_bytes..].to_string())
+        } else {
+            return None;
+        };
+        self.sent_units = if at == 0 {
+            self.whole.encode_utf16().count()
+        } else {
+            self.sent_units + text.encode_utf16().count()
+        };
+        self.sent_bytes = self.whole.len();
+        self.restart = false;
+        Some((at, text))
+    }
+}
+
+/// Send a call's text and reasoning to the session's tabs, gathered for
+/// [`REPLY_TEXT_EVERY`] at a time: what each added, after the length the
 /// tabs were last sent, or the whole of it at least every
 /// [`REPLY_TEXT_WHOLE_EVERY`] and after a restart.
 async fn forward_reply_text(
@@ -2398,33 +2435,32 @@ async fn forward_reply_text(
     mut rx: mpsc::UnboundedReceiver<ReplyPiece>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    // The call's text so far, and how much of it the tabs were sent, in
-    // bytes and in the UTF-16 units a browser counts.
-    let mut whole = String::new();
-    let mut sent_bytes = 0;
-    let mut sent_units = 0;
+    let mut text = Streamed::default();
+    let mut reasoning = Streamed::default();
     let mut last_whole = std::time::Instant::now();
     let mut open = true;
     while open {
         let Some(first) = rx.recv().await else {
             break;
         };
-        let mut restart = false;
-        let add = |piece: ReplyPiece, whole: &mut String, restart: &mut bool| match piece {
-            ReplyPiece::Text(piece) => whole.push_str(&piece),
+        let add = |piece: ReplyPiece, text: &mut Streamed, reasoning: &mut Streamed| match piece {
+            ReplyPiece::Text(piece) => text.whole.push_str(&piece),
+            ReplyPiece::Reasoning(piece) => reasoning.whole.push_str(&piece),
             ReplyPiece::Restart => {
-                whole.clear();
-                *restart = true;
+                for s in [&mut *text, &mut *reasoning] {
+                    s.whole.clear();
+                    s.restart = true;
+                }
             }
         };
-        add(first, &mut whole, &mut restart);
+        add(first, &mut text, &mut reasoning);
         let flush = tokio::time::sleep(REPLY_TEXT_EVERY);
         tokio::pin!(flush);
         loop {
             tokio::select! {
                 () = &mut flush => break,
                 piece = rx.recv() => match piece {
-                    Some(piece) => add(piece, &mut whole, &mut restart),
+                    Some(piece) => add(piece, &mut text, &mut reasoning),
                     None => {
                         open = false;
                         break;
@@ -2435,23 +2471,25 @@ async fn forward_reply_text(
         if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             continue;
         }
-        let (at, text) = if restart || last_whole.elapsed() >= REPLY_TEXT_WHOLE_EVERY {
+        let whole_due = last_whole.elapsed() >= REPLY_TEXT_WHOLE_EVERY;
+        if whole_due {
             last_whole = std::time::Instant::now();
-            (0, whole.clone())
-        } else if whole.len() > sent_bytes {
-            (sent_units, whole[sent_bytes..].to_string())
-        } else {
-            continue;
-        };
-        sent_units = if at == 0 {
-            whole.encode_utf16().count()
-        } else {
-            sent_units + text.encode_utf16().count()
-        };
-        sent_bytes = whole.len();
-        let _ = router
-            .reply_text(agent_id, session, conversation.clone(), &call, text, at)
-            .await;
+        }
+        for (stream, thinking) in [(&mut reasoning, true), (&mut text, false)] {
+            if let Some((at, piece)) = stream.next(whole_due) {
+                let _ = router
+                    .reply_text(
+                        agent_id,
+                        session,
+                        conversation.clone(),
+                        &call,
+                        piece,
+                        at,
+                        thinking,
+                    )
+                    .await;
+            }
+        }
     }
 }
 
@@ -2930,6 +2968,31 @@ mod tests {
     use havn_proto::AgentQueryOutcome;
     use havn_spawner::AgentHandle;
     use std::time::Duration;
+
+    #[test]
+    fn a_streamed_text_is_sent_in_pieces_and_whole_after_a_restart() {
+        let mut s = Streamed::default();
+        assert_eq!(s.next(false), None, "nothing yet");
+        assert_eq!(s.next(true), None, "an empty text is not sent whole");
+        s.whole.push_str("héllo");
+        assert_eq!(s.next(false), Some((0, "héllo".into())));
+        s.whole.push_str(" wörld");
+        assert_eq!(
+            s.next(false),
+            Some((5, " wörld".into())),
+            "after the UTF-16 units sent"
+        );
+        assert_eq!(s.next(false), None);
+        assert_eq!(s.next(true), Some((0, "héllo wörld".into())));
+        s.whole.clear();
+        s.restart = true;
+        assert_eq!(
+            s.next(false),
+            Some((0, String::new())),
+            "a restart clears the tabs"
+        );
+        assert_eq!(s.next(false), None);
+    }
 
     #[test]
     fn the_title_model_is_the_teams_then_the_gateways_when_allowed() {

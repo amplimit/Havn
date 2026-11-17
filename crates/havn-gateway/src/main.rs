@@ -709,6 +709,10 @@ async fn serve() -> anyhow::Result<()> {
             post(api::conversation::chat_branch),
         )
         .route(
+            "/agents/{id}/chats/{chat}/turns/{turn}/trace",
+            get(api::conversation::turn_trace),
+        )
+        .route(
             "/agents/{id}/bootstrap",
             get(api::bootstrap::get).put(api::bootstrap::put),
         )

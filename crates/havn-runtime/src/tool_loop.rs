@@ -36,6 +36,74 @@ tokio::task_local! {
     /// The model of the turn whose tool loop runs (a chat's own, or the
     /// agent's when the turn began): a subagent it spawns uses it too.
     pub static TURN_MODEL: Arc<String>;
+    /// What the conversation turn whose tool loop runs did on the way:
+    /// its reasoning and tool calls, kept with its reply (issue #178).
+    pub static TRACE: Arc<std::sync::Mutex<Trace>>;
+}
+
+/// Entries one turn's trace keeps at most, characters of all its parts,
+/// and of each part.
+const TRACE_ENTRIES: usize = 60;
+const TRACE_TOTAL_CHARS: usize = 48_000;
+const TRACE_THINKING_CHARS: usize = 8_000;
+const TRACE_INPUT_CHARS: usize = 1_500;
+const TRACE_RESULT_CHARS: usize = 2_000;
+
+/// A turn's reasoning and tool calls, in order.
+#[derive(Debug, Default)]
+pub struct Trace {
+    pub items: Vec<Value>,
+    /// Entries that did not fit.
+    pub left_out: usize,
+    chars: usize,
+}
+
+impl Trace {
+    fn push(&mut self, item: Value, chars: usize) {
+        if self.items.len() < TRACE_ENTRIES && self.chars + chars <= TRACE_TOTAL_CHARS {
+            self.items.push(item);
+            self.chars += chars;
+        } else {
+            self.left_out += 1;
+        }
+    }
+}
+
+/// `text` cut to `max` characters, marked when cut.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// Take the thinking blocks out of the assistant messages of `messages`.
+fn drop_thinking(messages: &mut [Value]) {
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+            blocks.retain(|b| {
+                !matches!(
+                    b.get("type").and_then(Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+            });
+        }
+    }
+}
+
+/// Add to the running turn's trace, when one is kept; `chars` is the
+/// length of its text.
+fn trace(item: Value, chars: usize) {
+    let _ = TRACE.try_with(|t| {
+        t.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(item, chars);
+    });
 }
 
 /// Shared map of in-flight LLM requests keyed by request_id. Both the
@@ -207,7 +275,29 @@ pub async fn run_typed(
             .get("content")
             .cloned()
             .unwrap_or(Value::Array(Vec::new()));
+        // The model's reasoning, kept for the dashboard. It stays in this
+        // turn's messages, as Anthropic's thinking with tools needs; the
+        // adapters of other providers leave it out, and later turns are
+        // built from the stored replies, which never hold it.
+        if context == crate::tools::context::WEBCHAT {
+            for block in content.as_array().into_iter().flatten() {
+                if block.get("type").and_then(Value::as_str) == Some("thinking")
+                    && let Some(text) = block.get("thinking").and_then(Value::as_str)
+                    && !text.trim().is_empty()
+                {
+                    let text = clip(text.trim(), TRACE_THINKING_CHARS);
+                    let chars = text.chars().count();
+                    trace(
+                        serde_json::json!({ "kind": "thinking", "text": text }),
+                        chars,
+                    );
+                }
+            }
+        }
 
+        // Only the newest assistant message keeps its thinking: Anthropic's
+        // tools need that one back, and older ones only fill the frame.
+        drop_thinking(messages);
         // Always append the assistant turn so the next call has context.
         messages.push(serde_json::json!({ "role": "assistant", "content": content.clone() }));
         last_text = extract_text(&content).unwrap_or_default();
@@ -325,6 +415,22 @@ async fn execute_tool_uses(
             ToolResult::Ok(s) => (s, false),
             ToolResult::Error(s) => (s, true),
         };
+        if context == crate::tools::context::WEBCHAT {
+            let input = block.get("input").cloned().unwrap_or(Value::Null);
+            let input = clip(&input.to_string(), TRACE_INPUT_CHARS);
+            let result = clip(&text, TRACE_RESULT_CHARS);
+            let chars = input.chars().count() + result.chars().count();
+            trace(
+                serde_json::json!({
+                    "kind": "step",
+                    "tool": name,
+                    "input": input,
+                    "result": result,
+                    "error": is_error,
+                }),
+                chars,
+            );
+        }
         out.push(serde_json::json!({
             "type": "tool_result",
             "tool_use_id": id,
@@ -688,6 +794,22 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn only_the_newest_assistant_message_keeps_its_thinking() {
+        let mut messages = vec![
+            serde_json::json!({"role": "user", "content": "q"}),
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "old", "signature": "s"},
+                {"type": "tool_use", "id": "t1", "name": "shell", "input": {}}
+            ]}),
+            serde_json::json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}),
+        ];
+        drop_thinking(&mut messages);
+        assert_eq!(messages[1]["content"].as_array().map(Vec::len), Some(1));
+        assert_eq!(messages[1]["content"][0]["type"], "tool_use");
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+    }
 
     #[test]
     fn a_step_names_what_a_call_works_on_never_its_content() {

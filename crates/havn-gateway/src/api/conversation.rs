@@ -41,6 +41,120 @@ pub struct TurnView {
     /// Its versions (issue #129): the turns in its place on other
     /// branches, itself included, oldest first.
     pub versions: Vec<String>,
+    /// For a reply: what its turn did on the way, as its folded line says
+    /// it (issue #178); the whole of it from `GET .../turns/{turn}/trace`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace: Option<TraceSummary>,
+}
+
+/// What a reply's folded line says of its turn.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TraceSummary {
+    pub ms: u64,
+    pub thought: bool,
+    pub steps: u32,
+}
+
+/// One part of what a reply's turn did, as the dashboard shows it. The
+/// agent writes its database, so what it stored is read into these and
+/// nothing else.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TraceItem {
+    Thinking {
+        text: String,
+    },
+    Step {
+        tool: String,
+        input: String,
+        result: String,
+        #[serde(default)]
+        error: bool,
+    },
+}
+
+/// What a reply's turn did on the way.
+#[derive(Debug, Serialize)]
+pub struct TraceView {
+    pub ms: u64,
+    pub items: Vec<TraceItem>,
+    pub left_out: u64,
+}
+
+/// Characters of a trace part passed on: the runtime keeps them shorter.
+const MAX_TRACE_PART: usize = 10_000;
+/// Parts of a trace passed on at most.
+const MAX_TRACE_ITEMS: usize = 100;
+
+/// A stored trace as the dashboard may see it: parts of the known kinds,
+/// cut to size; `None` when it is not a trace.
+fn trace_view(raw: &str) -> Option<TraceView> {
+    let trace: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let cut = |s: String| -> String { s.chars().take(MAX_TRACE_PART).collect() };
+    let items = trace
+        .get("items")?
+        .as_array()?
+        .iter()
+        .take(MAX_TRACE_ITEMS)
+        .filter_map(|item| serde_json::from_value::<TraceItem>(item.clone()).ok())
+        .map(|item| match item {
+            TraceItem::Thinking { text } => TraceItem::Thinking { text: cut(text) },
+            TraceItem::Step {
+                tool,
+                input,
+                result,
+                error,
+            } => TraceItem::Step {
+                tool: cut(tool),
+                input: cut(input),
+                result: cut(result),
+                error,
+            },
+        })
+        .collect();
+    Some(TraceView {
+        ms: trace
+            .get("ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        items,
+        left_out: trace
+            .get("left_out")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct TraceRow {
+    trace: Option<String>,
+}
+
+/// `GET /agents/:id/chats/:chat/turns/:turn/trace`: what one of the
+/// caller's replies did on the way.
+pub async fn turn_trace(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path((id, chat, turn)): Path<(String, String, String)>,
+) -> Result<Json<TraceView>, ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let row: TraceRow = crate::api::agents::agent_data(
+        &state,
+        user.id,
+        agent.id,
+        havn_proto::DataQuery::TurnTrace {
+            channel_id: session(&user, agent.id),
+            conversation: chat_param(Some(chat))?.unwrap_or_default(),
+            turn: chat_param(Some(turn))?.unwrap_or_default(),
+        },
+        true,
+    )
+    .await?;
+    row.trace
+        .as_deref()
+        .and_then(trace_view)
+        .map(Json)
+        .ok_or(ApiError::NotFound)
 }
 
 #[derive(Debug, Serialize)]
@@ -130,6 +244,7 @@ pub async fn list(
             content: t.content,
             created_at: t.created_at,
             versions: t.versions,
+            trace: t.trace.and_then(|raw| serde_json::from_str(&raw).ok()),
         })
         .collect();
     Ok(Json(ConversationResponse {
@@ -303,5 +418,35 @@ fn role_str(r: Role) -> &'static str {
         Role::Assistant => "assistant",
         Role::System => "system",
         Role::Tool => "tool",
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+
+    #[test]
+    fn a_stored_trace_is_read_into_known_parts_only() {
+        let raw = serde_json::json!({
+            "ms": 1200,
+            "left_out": 2,
+            "items": [
+                {"kind": "thinking", "text": "hmm"},
+                {"kind": "step", "tool": "shell", "input": "{}", "result": "ok", "error": false},
+                {"kind": "step", "tool": "shell", "input": {}, "result": "an object is not text"},
+                {"kind": "html", "text": "<script>"},
+                "not an object"
+            ]
+        })
+        .to_string();
+        let view = trace_view(&raw).expect("a trace");
+        assert_eq!((view.ms, view.left_out, view.items.len()), (1200, 2, 2));
+        assert!(trace_view("not json").is_none());
+        assert!(trace_view(r#"{"ms": 1}"#).is_none(), "no items");
+        let long = serde_json::json!({"ms": 1, "items": [{"kind": "thinking", "text": "x".repeat(MAX_TRACE_PART + 5)}]}).to_string();
+        match &trace_view(&long).expect("a trace").items[0] {
+            TraceItem::Thinking { text } => assert_eq!(text.len(), MAX_TRACE_PART),
+            TraceItem::Step { .. } => panic!("a thinking part"),
+        }
     }
 }

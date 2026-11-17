@@ -36,7 +36,15 @@ export type ServerMessage =
    * goes after the first `at` characters (UTF-16 units) of the call's text,
    * and with `at` 0 is all of it.
    */
-  | { type: "reply_text"; call: string; text: string; at: number; conversation?: string }
+  | {
+      type: "reply_text";
+      call: string;
+      text: string;
+      at: number;
+      conversation?: string;
+      /** The call's reasoning, not its reply. */
+      thinking?: boolean;
+    }
   /** The tool call the reply being written is about to make. */
   | { type: "step"; tool: string; detail: string; conversation?: string }
   /** What the reply just sent saved to or forgot from memory. */

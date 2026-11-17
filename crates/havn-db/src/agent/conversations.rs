@@ -335,6 +335,27 @@ pub async fn retitle(
     Ok(res.rows_affected() > 0)
 }
 
+/// What reply `turn` of chat `chat` did on the way, when it was kept.
+pub async fn trace_of(pool: &SqlitePool, chat: &str, turn: &str) -> Result<Option<String>> {
+    let found: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT trace FROM conversations WHERE id = ?2 AND channel_id = ?1")
+            .bind(chat)
+            .bind(turn)
+            .fetch_optional(pool)
+            .await?;
+    Ok(found.and_then(|(trace,)| trace))
+}
+
+/// Keep `trace`, what reply `turn` did on the way, with it.
+pub async fn set_trace(pool: &SqlitePool, turn: &str, trace: &str) -> Result<()> {
+    sqlx::query("UPDATE conversations SET trace = ?2 WHERE id = ?1")
+        .bind(turn)
+        .bind(trace)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Chat `chat`'s own model, when it has one.
 pub async fn chat_model(pool: &SqlitePool, chat: &str) -> Result<Option<String>> {
     let found: Option<(Option<String>,)> = sqlx::query_as("SELECT model FROM chats WHERE id = ?1")
@@ -394,7 +415,8 @@ pub async fn branch(pool: &SqlitePool, chat: &str, limit: u32) -> Result<Vec<Bra
              FROM conversations c JOIN path p ON c.id = p.parent_id \
              WHERE p.depth < ?2 \
          ) \
-         SELECT id, parent_id, role, content, created_at FROM path ORDER BY depth DESC",
+         SELECT p.id, p.parent_id, p.role, p.content, p.created_at, c.trace \
+         FROM path p JOIN conversations c ON c.id = p.id ORDER BY p.depth DESC",
     )
     .bind(chat)
     .bind(limit)
@@ -409,6 +431,7 @@ pub async fn branch(pool: &SqlitePool, chat: &str, limit: u32) -> Result<Vec<Bra
                 content: r.content,
                 created_at: r.created_at,
                 versions: Vec::new(),
+                trace: r.trace,
             })
         })
         .collect()
@@ -483,6 +506,9 @@ pub struct BranchTurn {
     pub content: String,
     pub created_at: DateTime<Utc>,
     pub versions: Vec<String>,
+    /// For a reply: what its turn did on the way, as JSON (issue #178).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -492,6 +518,7 @@ struct BranchRow {
     role: String,
     content: String,
     created_at: DateTime<Utc>,
+    trace: Option<String>,
 }
 
 /// Fetch the most recent `limit` turns for `channel_id` in chronological order
@@ -1002,6 +1029,8 @@ async fn since_summary(pool: &SqlitePool, chat: &str, limit: u32) -> Result<Sinc
             content: row.content,
             created_at: row.created_at,
             versions: Vec::new(),
+            // What the model reads: never a turn's trace.
+            trace: None,
         });
     }
     let keep = limit as usize;
@@ -1318,6 +1347,24 @@ mod tests {
             .expect("record");
         assert_eq!(said(&pool, &chat).await, ["q1", "a1", "q2", "a2'"]);
         assert_eq!(versions(&pool, &chat).await, [1, 1, 1, 2]);
+        // A reply's trace comes back with its branch.
+        let reply = branch(&pool, &chat, 100).await.expect("branch")[3]
+            .id
+            .clone();
+        set_trace(&pool, &reply, r#"{"items":[]}"#)
+            .await
+            .expect("trace");
+        let turns = branch(&pool, &chat, 100).await.expect("branch");
+        assert_eq!(turns[3].trace.as_deref(), Some(r#"{"items":[]}"#));
+        assert_eq!(turns[2].trace, None);
+        assert_eq!(
+            trace_of(&pool, &chat, &reply).await.expect("db").as_deref(),
+            Some(r#"{"items":[]}"#)
+        );
+        assert_eq!(
+            trace_of(&pool, "another-chat", &reply).await.expect("db"),
+            None
+        );
 
         // Edit q2: a new version after a1, recorded with the rewind.
         let edited = rewind(

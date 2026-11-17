@@ -272,6 +272,8 @@ fn translate_message_to_gemini(m: &AnthropicMessage) -> Result<Value, String> {
                     }
                 }));
             }
+            // A model's reasoning is not sent back to it.
+            "thinking" | "redacted_thinking" => {}
             other => {
                 if let Some(t) = block.get("text").and_then(Value::as_str) {
                     parts.push(json!({"text": t}));

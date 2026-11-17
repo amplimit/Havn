@@ -175,6 +175,9 @@ impl LlmProvider for OpenAiProvider {
                     body: error.to_string(),
                 });
             }
+            if let Some(piece) = reasoning_piece(&chunk) {
+                text(TextEvent::Reasoning(piece));
+            }
             if let Some(piece) = reply.add(&chunk) {
                 text(TextEvent::Text(&piece));
             }
@@ -308,8 +311,10 @@ fn translate_message_to_openai(m: &AnthropicMessage, out: &mut Vec<Value>) -> Re
                     "image_url": {"url": format!("data:{media};base64,{data}")},
                 }));
             }
+            // A model's reasoning is not sent back to it.
+            "thinking" | "redacted_thinking" => {}
             other => {
-                // Unknown block types (image, document, thinking, …) — fold
+                // Unknown block types (image, document, …) — fold
                 // their text representation in if any, otherwise drop with a
                 // marker rather than failing the whole call.
                 if let Some(t) = block.get("text").and_then(Value::as_str) {
@@ -377,12 +382,24 @@ fn translate_tools_to_openai(tools: &Value) -> Result<Value, String> {
 
 /// Translate a successful OpenAI Chat Completions response back to the
 /// canonical Anthropic shape the runtime expects.
+/// The reasoning a streamed chunk adds: DeepSeek's `reasoning_content`, or
+/// OpenRouter's `reasoning`.
+fn reasoning_piece(chunk: &Value) -> Option<&str> {
+    let delta = chunk.pointer("/choices/0/delta")?;
+    ["reasoning_content", "reasoning"]
+        .iter()
+        .find_map(|key| delta.get(*key).and_then(Value::as_str))
+        .filter(|piece| !piece.is_empty())
+}
+
 /// A streamed chat completion, put back together.
 #[derive(Default)]
 struct StreamedReply {
     id: Option<String>,
     model: Option<String>,
     text: String,
+    /// The model's reasoning before its reply, when it shows it.
+    reasoning: String,
     /// Tool calls by their index: id, name, arguments.
     tool_calls: std::collections::BTreeMap<u64, (String, String, String)>,
     finish_reason: Option<String>,
@@ -401,6 +418,9 @@ impl StreamedReply {
         let choice = chunk.get("choices")?.as_array()?.first()?;
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
             self.finish_reason = Some(reason.to_string());
+        }
+        if let Some(piece) = reasoning_piece(chunk) {
+            self.reasoning.push_str(piece);
         }
         let delta = choice.get("delta")?;
         for call in delta
@@ -472,6 +492,9 @@ impl StreamedReply {
         if !tool_calls.is_empty() {
             message["tool_calls"] = Value::Array(tool_calls);
         }
+        if !self.reasoning.is_empty() {
+            message["reasoning_content"] = Value::String(self.reasoning.clone());
+        }
         let mut whole = json!({
             "id": self.id.clone().unwrap_or_default(),
             "model": self.model.clone().unwrap_or_default(),
@@ -505,6 +528,16 @@ fn openai_to_anthropic(raw: &Value) -> Result<AnthropicResponse, String> {
         .ok_or("response.choices[0].message missing")?;
 
     let mut content_blocks: Vec<Value> = Vec::new();
+
+    // The model's reasoning, as Anthropic's thinking block: the runtime
+    // keeps it for the dashboard and never sends it back.
+    if let Some(reasoning) = ["reasoning_content", "reasoning"]
+        .iter()
+        .find_map(|key| message.get(*key).and_then(Value::as_str))
+        .filter(|r| !r.trim().is_empty())
+    {
+        content_blocks.push(json!({"type": "thinking", "thinking": reasoning}));
+    }
 
     // Text content (may be null when the assistant only made tool calls).
     if let Some(text) = message.get("content").and_then(Value::as_str) {
@@ -900,6 +933,46 @@ mod tests {
             (12, 7)
         );
         assert!(!response.usage.unreported);
+    }
+
+    #[test]
+    fn reasoning_is_kept_apart_and_not_sent_back() {
+        // DeepSeek streams `reasoning_content`, OpenRouter `reasoning`.
+        let chunks = [
+            json!({"choices": [{"delta": {"reasoning_content": "The user wants "}}]}),
+            json!({"choices": [{"delta": {"reasoning": "a number."}}]}),
+            json!({"choices": [{"delta": {"content": "42"}}]}),
+            json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+        ];
+        let reasoning: Vec<&str> = chunks.iter().filter_map(reasoning_piece).collect();
+        assert_eq!(reasoning, ["The user wants ", "a number."]);
+        let mut reply = StreamedReply::default();
+        let pieces: Vec<String> = chunks.iter().filter_map(|c| reply.add(c)).collect();
+        assert_eq!(pieces, ["42"], "reasoning is not reply text");
+        let response = openai_to_anthropic(&reply.whole()).expect("translate");
+        assert_eq!(response.content[0]["type"], "thinking");
+        assert_eq!(response.content[0]["thinking"], "The user wants a number.");
+        assert_eq!(response.content[1]["text"], "42");
+
+        // A call that does not stream gives it in the message.
+        let raw = json!({"choices": [{"message": {"role": "assistant", "content": "ok", "reasoning_content": "think"}, "finish_reason": "stop"}]});
+        let response = openai_to_anthropic(&raw).expect("translate");
+        assert_eq!(response.content[0]["thinking"], "think");
+
+        // Sent back in a later call, a thinking block is left out.
+        let r = req(
+            vec![AnthropicMessage {
+                role: "assistant".into(),
+                content: json!([
+                    {"type": "thinking", "thinking": "secret"},
+                    {"type": "text", "text": "42"},
+                ]),
+            }],
+            None,
+        );
+        let body = anthropic_to_openai(&r, "max_tokens").expect("translate");
+        assert_eq!(body["messages"][0]["content"], "42");
+        assert!(!body.to_string().contains("secret"));
     }
 
     #[test]
