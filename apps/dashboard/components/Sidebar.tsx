@@ -17,6 +17,7 @@ import {
   KeyRound,
   Menu,
   Plus,
+  SlidersHorizontal,
   TriangleAlert,
   Users,
   X,
@@ -275,6 +276,7 @@ export function Sidebar() {
           <SidebarLink href="/models" pathname={pathname} icon={Boxes} label="models" />
           <SidebarLink href="/credentials" pathname={pathname} icon={KeyRound} label="credentials" />
           <SidebarLink href="/teams" pathname={pathname} icon={Users} label="teams" />
+          <SidebarLink href="/settings" pathname={pathname} icon={SlidersHorizontal} label="settings" />
         </nav>
         <VersionLine gateway={gatewayVersion} />
       </div>

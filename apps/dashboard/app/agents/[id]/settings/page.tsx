@@ -30,6 +30,7 @@ import {
   type CronJobView,
   type ApprovalsView,
   type TitlesView,
+  type WorkspaceAccess,
   type MyDomainsView,
   type TimezoneView,
 } from "@/lib/api";
@@ -301,6 +302,7 @@ export default function SettingsPage({
       <TimezoneEditor />
       <ScheduledTasks agentId={id} />
       <TitlesEditor agentId={id} />
+      <WorkspaceAccessEditor agentId={id} />
       <ApprovalsEditor agentId={id} />
 
       <McpEditor agentId={id} />
@@ -528,6 +530,70 @@ function BootstrapFileEditor({
         )}
       </div>
     </div>
+  );
+}
+
+/** Whether the agent's workspace can be browsed from the dashboard. */
+function WorkspaceAccessEditor({ agentId }: { agentId: string }) {
+  const [view, setView] = useState<WorkspaceAccess | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    api.workspace.access(agentId).then(
+      (v) => {
+        if (!cancelled) setView(v);
+      },
+      (e: unknown) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId]);
+  async function toggle(enabled: boolean) {
+    setSaving(true);
+    setError(null);
+    try {
+      setView(await api.workspace.setAccess(agentId, enabled));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+  if (!view) return error ? <p className="mt-10 text-sm" role="alert">{error}</p> : null;
+  return (
+    <section className="mt-10 card px-4 py-4" aria-labelledby="workspace-title">
+      <h2 id="workspace-title" className="display-h3 mb-2">
+        workspace browsing
+      </h2>
+      <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
+        A read-only page of the files in the agent&apos;s workspace: folders, previews of text
+        and images, downloads. Only you see it.
+      </p>
+      {error && (
+        <p className="mb-2 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
+          {error}
+        </p>
+      )}
+      <label className="inline-flex items-center gap-2 text-sm">
+        <input
+          type="checkbox"
+          checked={view.enabled}
+          disabled={saving || !view.gateway}
+          onChange={(e) => void toggle(e.target.checked)}
+        />
+        let me browse this agent&apos;s workspace
+      </label>
+      {!view.gateway && (
+        <p className="mt-1 text-xs" style={{ color: "var(--color-body)" }}>
+          Workspace browsing is off for this gateway; it is turned on in the gateway&apos;s
+          settings ([workspace] browse in config.toml).
+        </p>
+      )}
+    </section>
   );
 }
 

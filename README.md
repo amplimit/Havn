@@ -287,6 +287,8 @@ pre_tool_use:
     ask: ["\\bdeploy\\b", "^git push"]
 ```
 
+Agents find files with `file_find` (by name, with a glob) and `file_search` (by content), which need no `shell`. They leave out the files that rules about `file_read` (or `file_*`) deny or ask about, matched against each file's path in the workspace, so a search cannot read what `file_read` may not; they never follow links, and skip `.git`, `.havn` and the agent's database.
+
 The agent settings page keeps a list of tools whose every call needs approval (`GET` and `PUT /agents/{id}/approvals`). Requests and decisions are audited as `tool.approval.requested` and `tool.approval.decided`, with who decided. Like `deny`, `ask` guards against model mistakes on matching inputs; the sandbox and permissions stay the enforcement.
 ## Configuration
 
@@ -418,6 +420,17 @@ In trust-header (multi-user) mode:
 - The gateway-wide embedding configuration can only be changed in `config.toml`.
 
 Cron jobs may carry a `wake_check` script. It runs on the host as the dedicated `havn-wakecheck` user (created by `install.sh`; the gateway must run as root to switch to it) with a minimal environment. Without that user the script is skipped and the job always wakes.
+
+### Browsing an agent's workspace
+
+An agent's owner can browse the files in its workspace from the dashboard (the agent's **workspace** page): folders, text and images shown in place, any file downloaded. It is read-only, and off unless the gateway allows it:
+
+```toml
+[workspace]
+browse = true   # default false
+```
+
+The dashboard's **settings** page turns it on or off and writes it to config.toml (with `trust_header` on, only the file can); it applies at once. With it on, every agent's page is there unless its owner turns it off on the agent's settings page (`PUT /agents/{id}/workspace/access`); with it off, no agent's is, and an agent's settings cannot turn it on. Only the owner can browse, and not from another site's page. Links in the workspace are listed with where they point and never followed; the agent's database and `.havn` are never listed or sent; files over 50 MB are not sent; images are shown in place and everything else is sent as a download. Changes are audited as `workspace.browse.changed` and `agent.workspace_browse.changed`.
 
 ### Multi-user mode behind an SSO proxy
 

@@ -930,6 +930,191 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn a_workspace_is_browsed_only_as_far_as_both_switches_and_its_own_files_allow() {
+        use std::sync::atomic::Ordering;
+        let (mut state, user_id) = crate::auth::tests::state_with(false).await;
+        let root = tempfile::tempdir().unwrap();
+        state.workspace_root = root.path().to_path_buf();
+        let agent = havn_db::repo::agents::create(
+            &state.db,
+            havn_db::repo::agents::NewAgent {
+                owner_id: user_id,
+                team_id: None,
+                name: "browsed",
+                config: serde_json::json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let ws = crate::api::agents::workspace_for(&state, agent.id);
+        std::fs::create_dir_all(ws.join("notes")).unwrap();
+        std::fs::create_dir_all(ws.join(".havn/home")).unwrap();
+        std::fs::write(ws.join("notes/a.md"), "hello").unwrap();
+        std::fs::write(ws.join("agent.db"), "db").unwrap();
+        std::fs::write(ws.join("agent.db-wal"), "db").unwrap();
+        std::fs::write(ws.join(".havn/home/token"), "secret").unwrap();
+        std::fs::write(ws.join("pic.png"), b"\x89PNG\r\n\x1a\nrest").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.md"), "outside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.join("out")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.md"), ws.join("notes/s.md"))
+            .unwrap();
+
+        let id = agent.id.to_string();
+        let user = || AuthedUser {
+            id: user_id,
+            display_name: "owner".into(),
+        };
+        let list = |state: &AppState, path: &str| {
+            workspace_list(
+                State(state.clone()),
+                user(),
+                Path(id.clone()),
+                Query(WorkspaceQuery { path: path.into() }),
+                HeaderMap::new(),
+            )
+        };
+        let file = |state: &AppState, path: &str| {
+            workspace_file(
+                State(state.clone()),
+                user(),
+                Path(id.clone()),
+                Query(WorkspaceQuery { path: path.into() }),
+                HeaderMap::new(),
+            )
+        };
+
+        // Off for the gateway: nothing, and the owner cannot turn it on.
+        assert!(matches!(
+            list(&state, "").await,
+            Err(ApiError::Forbidden(_))
+        ));
+        assert!(matches!(
+            file(&state, "notes/a.md").await,
+            Err(ApiError::Forbidden(_))
+        ));
+        let refused = access_put(
+            State(state.clone()),
+            user(),
+            Path(id.clone()),
+            Json(AccessPut { enabled: true }),
+        )
+        .await;
+        assert!(matches!(refused, Err(ApiError::Forbidden(_))));
+
+        state.workspace_browse.store(true, Ordering::Relaxed);
+        let top = list(&state, "").await.unwrap().0;
+        let names: Vec<(&str, &str)> = top
+            .entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.kind))
+            .collect();
+        assert_eq!(
+            names,
+            [("notes", "dir"), ("out", "link"), ("pic.png", "file")]
+        );
+        assert_eq!(
+            top.entries[1].target.as_deref(),
+            Some(outside.path().to_string_lossy().as_ref())
+        );
+        let notes = list(&state, "notes/").await.unwrap().0;
+        assert_eq!(notes.entries.len(), 2, "{:?}", notes.entries);
+        assert_eq!(notes.entries[1].kind, "link");
+
+        for hidden in [".havn", ".havn/home", "agent.db", "out"] {
+            assert!(
+                matches!(list(&state, hidden).await, Err(ApiError::NotFound)),
+                "{hidden}"
+            );
+        }
+        for bad in ["notes/..", "./notes", "a\\b"] {
+            assert!(
+                matches!(list(&state, bad).await, Err(ApiError::BadRequest(_))),
+                "{bad}"
+            );
+        }
+        for unseen in [
+            "out/secret.md",
+            "notes/s.md",
+            "agent.db",
+            "agent.db-wal",
+            ".havn/home/token",
+            "nope.md",
+        ] {
+            assert!(
+                matches!(file(&state, unseen).await, Err(ApiError::NotFound)),
+                "{unseen}"
+            );
+        }
+        assert!(matches!(
+            file(&state, "notes").await,
+            Err(ApiError::BadRequest(_))
+        ));
+
+        let header = |r: &axum::response::Response, h: axum::http::HeaderName| {
+            r.headers()
+                .get(h)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+        let md = file(&state, "notes/a.md").await.unwrap();
+        assert!(header(&md, axum::http::header::CONTENT_DISPOSITION).starts_with("attachment;"));
+        let png = file(&state, "pic.png").await.unwrap();
+        assert!(header(&png, axum::http::header::CONTENT_DISPOSITION).starts_with("inline;"));
+        assert_eq!(header(&png, axum::http::header::CONTENT_TYPE), "image/png");
+
+        let mut cross = HeaderMap::new();
+        cross.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        let other_site = workspace_list(
+            State(state.clone()),
+            user(),
+            Path(id.clone()),
+            Query(WorkspaceQuery {
+                path: String::new(),
+            }),
+            cross,
+        )
+        .await;
+        assert!(matches!(other_site, Err(ApiError::Forbidden(_))));
+
+        // The owner turns it off for this agent.
+        let view = access_put(
+            State(state.clone()),
+            user(),
+            Path(id.clone()),
+            Json(AccessPut { enabled: false }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(view.gateway && !view.agent && !view.enabled);
+        assert!(matches!(
+            list(&state, "").await,
+            Err(ApiError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn the_gateway_switch_is_written_to_config_toml_keeping_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# mine\nlisten = \"127.0.0.1:9000\"\n").unwrap();
+        crate::config::write_workspace_browse(&path, true).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with("# mine\nlisten = \"127.0.0.1:9000\"\n"),
+            "{text}"
+        );
+        let parsed: crate::config::GatewayConfig = toml::from_str(&text).unwrap();
+        assert!(parsed.workspace.browse);
+        crate::config::write_workspace_browse(&path, false).unwrap();
+        let parsed: crate::config::GatewayConfig =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!parsed.workspace.browse);
+    }
+
     #[test]
     fn an_inbox_image_shows_in_place_and_anything_else_downloads() {
         let header = |r: &axum::response::Response, h: axum::http::HeaderName| {

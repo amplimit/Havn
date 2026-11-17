@@ -542,9 +542,61 @@ export type TitlesView = {
   model: string;
 };
 
+/** Whether an agent's workspace can be browsed (issue #177). */
+export type WorkspaceAccess = {
+  /** `[workspace] browse` in the gateway's config.toml. */
+  gateway: boolean;
+  /** The owner's switch for this agent. */
+  agent: boolean;
+  /** Both: the workspace page is there. */
+  enabled: boolean;
+};
+
+export type WorkspaceEntry = {
+  name: string;
+  kind: "dir" | "file" | "link" | "other";
+  size?: number;
+  /** Unix seconds. */
+  modified?: number;
+  /** Where a link points, as written; never followed. */
+  target?: string;
+};
+
+export type WorkspaceListing = {
+  path: string;
+  entries: WorkspaceEntry[];
+  /** More entries than were listed. */
+  truncated: boolean;
+};
+
+/** The gateway's workspace browsing switch. */
+export type BrowseView = {
+  browse: boolean;
+  /** The dashboard may change it (not with trust_header). */
+  editable: boolean;
+};
+
+/** Where a file of agent `agentId`'s workspace is fetched or downloaded. */
+export function workspaceFileUrl(agentId: string, path: string): string {
+  return `${BASE}/agents/${agentId}/workspace/file?path=${encodeURIComponent(path)}`;
+}
+
 export const api = {
   me: () => request<MeView>("/me"),
   timezone: () => request<TimezoneView>("/me/timezone"),
+  workspace: {
+    access: (agentId: string) => request<WorkspaceAccess>(`/agents/${agentId}/workspace/access`),
+    setAccess: (agentId: string, enabled: boolean) =>
+      request<WorkspaceAccess>(`/agents/${agentId}/workspace/access`, {
+        method: "PUT",
+        body: JSON.stringify({ enabled }),
+      }),
+    list: (agentId: string, path: string) =>
+      request<WorkspaceListing>(`/agents/${agentId}/workspace?path=${encodeURIComponent(path)}`),
+    browse: () => request<BrowseView>("/settings/workspace"),
+    setBrowse: (browse: boolean) =>
+      request<BrowseView>("/settings/workspace", { method: "PUT", body: JSON.stringify({ browse }) }),
+  },
   titles: {
     get: (agentId: string) => request<TitlesView>(`/agents/${agentId}/titles`),
     put: (agentId: string, enabled: boolean) =>
