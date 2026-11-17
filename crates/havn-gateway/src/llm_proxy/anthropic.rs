@@ -242,10 +242,6 @@ impl StreamedMessage {
     }
 }
 
-/// Least `max_tokens` a request asking for a thinking budget needs: the
-/// smallest budget the API takes and as much again for the reply.
-const MIN_BUDGET_ROOM: u32 = 2048;
-
 /// The request as the Messages API takes it, asking the model to think
 /// (issue #190): adaptive thinking, at an effort for a level, as current
 /// models take it, or a fixed budget, as Haiku 4.5 and older models take
@@ -264,11 +260,8 @@ fn request_body(request: &AnthropicRequest) -> Result<serde_json::Value, Provide
             body["output_config"] = serde_json::json!({"effort": level});
             Some(adaptive())
         }
-        Some(super::Reasoning::Budget(n)) => (request.max_tokens >= MIN_BUDGET_ROOM).then(|| {
-            let room = (request.max_tokens / 2).clamp(1024, 4096);
-            let budget = (*n).min(request.max_tokens - room).max(1024);
-            serde_json::json!({"type": "enabled", "budget_tokens": budget})
-        }),
+        Some(super::Reasoning::Budget(n)) => super::budget_within(*n, request.max_tokens)
+            .map(|budget| serde_json::json!({"type": "enabled", "budget_tokens": budget})),
     };
     if let Some(thinking) = thinking {
         body["thinking"] = thinking;

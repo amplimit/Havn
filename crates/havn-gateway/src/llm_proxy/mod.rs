@@ -141,6 +141,17 @@ pub enum Reasoning {
     Budget(u32),
 }
 
+/// A thinking budget of `budget` tokens within a request of `max_tokens`,
+/// which counts it: the smallest budget providers take (1024), leaving
+/// the reply room; `None` when `max_tokens` has no room for both.
+#[must_use]
+pub fn budget_within(budget: u32, max_tokens: u32) -> Option<u32> {
+    (max_tokens >= 2048).then(|| {
+        let room = (max_tokens / 2).clamp(1024, 4096);
+        budget.min(max_tokens - room).max(1024)
+    })
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnthropicResponse {
     pub id: String,

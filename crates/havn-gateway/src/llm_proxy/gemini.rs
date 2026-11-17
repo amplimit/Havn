@@ -210,14 +210,18 @@ fn anthropic_to_gemini(req: &AnthropicRequest) -> Result<Value, String> {
     }
     // How much to think (issue #190), with the thoughts returned.
     if let Some(r) = &req.reasoning {
-        body["generationConfig"]["thinkingConfig"] = match r {
-            super::Reasoning::Off => json!({"thinkingBudget": 0}),
-            super::Reasoning::On => json!({"thinkingBudget": -1, "includeThoughts": true}),
-            super::Reasoning::Budget(n) => json!({"thinkingBudget": n, "includeThoughts": true}),
+        let config = match r {
+            super::Reasoning::Off => Some(json!({"thinkingBudget": 0})),
+            super::Reasoning::On => Some(json!({"thinkingBudget": -1, "includeThoughts": true})),
+            super::Reasoning::Budget(n) => super::budget_within(*n, req.max_tokens)
+                .map(|n| json!({"thinkingBudget": n, "includeThoughts": true})),
             super::Reasoning::Effort(level) => {
-                json!({"thinkingLevel": level, "includeThoughts": true})
+                Some(json!({"thinkingLevel": level, "includeThoughts": true}))
             }
         };
+        if let Some(config) = config {
+            body["generationConfig"]["thinkingConfig"] = config;
+        }
     }
     if let Some(sys) = req.system.as_ref().filter(|s| !s.is_empty()) {
         body["systemInstruction"] = json!({"parts": [{"text": sys}]});
@@ -647,6 +651,7 @@ mod tests {
                 None,
             );
             r.reasoning = reasoning;
+            r.max_tokens = 8192;
             anthropic_to_gemini(&r).expect("translate")["generationConfig"]["thinkingConfig"]
                 .clone()
         };

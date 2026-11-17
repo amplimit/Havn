@@ -235,12 +235,18 @@ fn anthropic_to_openai(
     match (&req.reasoning, provider) {
         (None, _) => {}
         (Some(r), OpenAiProvider::OPENROUTER_NAME) => {
-            body["reasoning"] = match r {
-                super::Reasoning::Off => json!({"enabled": false}),
-                super::Reasoning::On => json!({"enabled": true}),
-                super::Reasoning::Effort(effort) => json!({"effort": effort}),
-                super::Reasoning::Budget(n) => json!({"max_tokens": n}),
+            let reasoning = match r {
+                super::Reasoning::Off => Some(json!({"enabled": false})),
+                super::Reasoning::On => Some(json!({"enabled": true})),
+                super::Reasoning::Effort(effort) => Some(json!({"effort": effort})),
+                // Within max_tokens, as models behind it count it.
+                super::Reasoning::Budget(n) => {
+                    super::budget_within(*n, req.max_tokens).map(|n| json!({"max_tokens": n}))
+                }
             };
+            if let Some(reasoning) = reasoning {
+                body["reasoning"] = reasoning;
+            }
         }
         (Some(r), _) => match r {
             super::Reasoning::Off | super::Reasoning::Budget(_) => {}
@@ -1003,6 +1009,7 @@ mod tests {
                 None,
             );
             r.reasoning = Some(reasoning);
+            r.max_tokens = 8192;
             anthropic_to_openai(&r, "max_tokens", provider).expect("translate")
         };
         use super::super::Reasoning;
@@ -1014,6 +1021,11 @@ mod tests {
         assert_eq!(
             ask(Reasoning::Budget(2048), or)["reasoning"],
             json!({"max_tokens": 2048})
+        );
+        assert_eq!(
+            ask(Reasoning::Budget(60000), or)["reasoning"],
+            json!({"max_tokens": 4096}),
+            "a budget leaves the reply room"
         );
         assert_eq!(
             ask(Reasoning::Off, or)["reasoning"],
