@@ -90,6 +90,10 @@ pub const RULES: &[ReloadRule] = &[
         kind: ReloadKind::Hot,
     },
     ReloadRule {
+        prefix: "channel_texts",
+        kind: ReloadKind::Hot,
+    },
+    ReloadRule {
         prefix: "reload",
         kind: ReloadKind::Restart,
     },
@@ -196,6 +200,8 @@ pub struct ReloadHandles {
     pub models: Arc<ArcSwap<crate::model_catalog::ModelCatalog>>,
     /// `[workspace] browse`.
     pub workspace_browse: Arc<std::sync::atomic::AtomicBool>,
+    /// `[channel_texts]`.
+    pub channel_texts: Arc<ArcSwap<crate::config::ChannelTexts>>,
 }
 
 impl ReloadHandles {
@@ -204,6 +210,7 @@ impl ReloadHandles {
             allowed_origins: Arc::new(ArcSwap::from_pointee(cfg.allowed_origins.clone())),
             models: Arc::new(ArcSwap::from_pointee(cfg.llm.catalog())),
             workspace_browse: Arc::new(std::sync::atomic::AtomicBool::new(cfg.workspace.browse)),
+            channel_texts: Arc::new(ArcSwap::from_pointee(cfg.channel_texts.clone())),
         }
     }
 
@@ -229,6 +236,10 @@ impl ReloadHandles {
                     "hot-reloaded the model list"
                 );
                 self.models.store(Arc::new(catalog));
+            } else if path.starts_with("channel_texts") {
+                self.channel_texts
+                    .store(Arc::new(new.channel_texts.clone()));
+                info!("hot-reloaded the channel bots' texts");
             } else if path.starts_with("workspace") {
                 self.workspace_browse
                     .store(new.workspace.browse, std::sync::atomic::Ordering::Relaxed);
@@ -443,6 +454,27 @@ mod tests {
 
         let live = handles.allowed_origins.load();
         assert_eq!(&**live, &vec!["https://example.com".to_string()]);
+    }
+
+    #[test]
+    fn channel_texts_apply_in_place() {
+        let old = GatewayConfig::default();
+        let new: GatewayConfig =
+            toml::from_str("[channel_texts.telegram.acme-bot]\nwelcome = \"欢迎\"\n")
+                .expect("config");
+        let handles = ReloadHandles::from_config(&old);
+        let plan = ReloadPlan::build(&diff_paths(
+            &serde_json::to_value(&old).expect("old"),
+            &serde_json::to_value(&new).expect("new"),
+        ));
+        assert!(plan.restart_paths.is_empty(), "{:?}", plan.restart_paths);
+        handles.apply_hot(&new, &plan.hot_paths);
+        assert_eq!(
+            handles.channel_texts.load()["telegram"]["acme-bot"]
+                .welcome
+                .as_deref(),
+            Some("欢迎")
+        );
     }
 
     #[test]

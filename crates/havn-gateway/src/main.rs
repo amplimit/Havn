@@ -178,6 +178,9 @@ struct AppState {
     /// `[workspace] browse`, hot-reloaded: whether owners may browse their
     /// agents' workspaces (issue #177).
     pub workspace_browse: Arc<std::sync::atomic::AtomicBool>,
+    /// `[channel_texts]`, hot-reloaded: what channel bots tell senders
+    /// who are not paired (issue #183).
+    pub channel_texts: Arc<ArcSwap<config::ChannelTexts>>,
     pub config_path: PathBuf,
     pub models_write: Arc<tokio::sync::Mutex<()>>,
     pub search: Arc<web_search::WebSearch>,
@@ -481,6 +484,7 @@ async fn serve() -> anyhow::Result<()> {
     let allowed_origins = reload_handles.allowed_origins.clone();
     let models = reload_handles.models.clone();
     let workspace_browse = reload_handles.workspace_browse.clone();
+    let channel_texts = reload_handles.channel_texts.clone();
     info!(
         allowed_origins = ?allowed_origins.load(),
         "webchat origin allowlist"
@@ -556,6 +560,7 @@ async fn serve() -> anyhow::Result<()> {
         llm: Arc::clone(&llm),
         models: models.clone(),
         workspace_browse,
+        channel_texts,
         config_path: config_path.clone(),
         models_write: Arc::new(tokio::sync::Mutex::new(())),
         search: Arc::clone(&search),
