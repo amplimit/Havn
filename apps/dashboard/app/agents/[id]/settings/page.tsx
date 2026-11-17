@@ -551,6 +551,17 @@ function ChannelPairing({ agentId }: { agentId: string }) {
     );
   }, []);
   useEffect(loadLinks, [loadLinks]);
+  // While codes are shown: a code redeemed in the chat app shows up as a
+  // link, and one past its time as expired.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!codes) return;
+    const timer = setInterval(() => {
+      setNow(Date.now());
+      loadLinks();
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [codes, loadLinks]);
   async function connect() {
     setBusy(true);
     setError(null);
@@ -612,7 +623,9 @@ function ChannelPairing({ agentId }: { agentId: string }) {
                 {c.code}
               </p>
               <p className="text-xs" style={muted}>
-                Works once, until {new Date(c.expires_at).toLocaleTimeString()}.
+                {Date.parse(c.expires_at) > now
+                  ? `Works once, until ${new Date(c.expires_at).toLocaleTimeString()}.`
+                  : "Expired: make new codes."}
               </p>
             </li>
           ))}
@@ -621,7 +634,7 @@ function ChannelPairing({ agentId }: { agentId: string }) {
       {links && links.length > 0 && (
         <div className="mt-4">
           <p className="mb-1 text-sm" style={muted}>
-            Connected to your Havn account:
+            Connected to your Havn account (for all your agents):
           </p>
           <ul className="grid gap-1 text-sm" aria-label="connected accounts">
             {links.map((l) => (

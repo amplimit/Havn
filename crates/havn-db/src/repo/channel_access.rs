@@ -290,7 +290,11 @@ pub async fn revoke_invite(pool: &SqlitePool, id: Uuid) -> Result<()> {
 /// one applied. The claim is a single conditional UPDATE, so two senders
 /// racing for one code cannot both win. `None` too when `sender_id` is
 /// already admitted and the code links no one: the claim is rolled back
-/// and the code stays usable.
+/// and the code stays usable. With `links_only`, only a code made on the
+/// web is claimed. A code made on the web is refused with `Conflict` when
+/// the sender is linked to another user, who must unlink them first;
+/// linking a user's new sender takes back the access the user's codes
+/// gave their earlier one.
 pub async fn redeem(
     pool: &SqlitePool,
     channel: &str,
@@ -298,6 +302,7 @@ pub async fn redeem(
     sender_id: &str,
     code: &str,
     now: DateTime<Utc>,
+    links_only: bool,
 ) -> Result<Option<Invite>> {
     let Some(canonical) = normalize_code(code) else {
         return Ok(None);
@@ -308,6 +313,7 @@ pub async fn redeem(
         "UPDATE channel_invites SET used_by_sender = ?1, used_at = ?2 \
          WHERE code_hash = ?3 AND channel = ?4 AND account_id = ?5 \
            AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?2 \
+           AND (?6 = 0 OR user_id IS NOT NULL) \
          RETURNING {INVITE_COLUMNS}"
     ))
     .bind(sender_id)
@@ -315,6 +321,7 @@ pub async fn redeem(
     .bind(hash_code(&canonical))
     .bind(channel)
     .bind(account_id)
+    .bind(links_only)
     .fetch_optional(&mut *tx)
     .await?;
     let Some(row) = claimed else {
@@ -335,6 +342,27 @@ pub async fn redeem(
     let invite = Invite::try_from(row)?;
     match invite.user_id {
         Some(user) => {
+            let linked: Vec<(String, String)> = sqlx::query_as(
+                "SELECT sender_id, user_id FROM channel_links \
+                 WHERE channel = ?1 AND (sender_id = ?2 OR user_id = ?3)",
+            )
+            .bind(channel)
+            .bind(sender_id)
+            .bind(user.to_string())
+            .fetch_all(&mut *tx)
+            .await?;
+            if linked
+                .iter()
+                .any(|(s, u)| s == sender_id && *u != user.to_string())
+            {
+                tx.rollback().await?;
+                return Err(DbError::Conflict("channel_links.sender_id"));
+            }
+            // The user's earlier sender on this channel loses what the
+            // user's codes gave it.
+            for (old, _) in linked.iter().filter(|(s, _)| s != sender_id) {
+                revoke_link_access(&mut tx, channel, old, user).await?;
+            }
             sqlx::query(
                 "DELETE FROM channel_links WHERE channel = ?1 AND (sender_id = ?2 OR user_id = ?3)",
             )
@@ -435,23 +463,51 @@ pub async fn list_links(pool: &SqlitePool, user: Option<UserId>) -> Result<Vec<C
     rows.into_iter().map(ChannelLink::try_from).collect()
 }
 
-/// Remove `user`'s link of `sender_id` on `channel`; false when there was
-/// none. The sender stays admitted where they were.
+/// Take back from `sender_id` on `channel` the admissions that codes
+/// `user` made on the web gave it; admissions it had otherwise stay.
+async fn revoke_link_access(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    channel: &str,
+    sender_id: &str,
+    user: UserId,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM channel_allowlist WHERE channel = ?1 AND sender_id = ?2 \
+         AND invite_id IN (SELECT id FROM channel_invites WHERE user_id = ?3)",
+    )
+    .bind(channel)
+    .bind(sender_id)
+    .bind(user.to_string())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Remove `user`'s link of `sender_id` on `channel`, with the access the
+/// user's codes gave the sender; false when there was no such link. An
+/// admission the sender had otherwise (`allow_from`, an invite) stays.
 pub async fn unlink(
     pool: &SqlitePool,
     user: UserId,
     channel: &str,
     sender_id: &str,
 ) -> Result<bool> {
+    let mut tx = pool.begin().await?;
     let res = sqlx::query(
         "DELETE FROM channel_links WHERE channel = ?1 AND sender_id = ?2 AND user_id = ?3",
     )
     .bind(channel)
     .bind(sender_id)
     .bind(user.to_string())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(res.rows_affected() > 0)
+    if res.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    revoke_link_access(&mut tx, channel, sender_id, user).await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 pub async fn is_allowed(
@@ -617,7 +673,7 @@ mod tests {
         assert_eq!(code.invite.user_id, Some(alice));
         assert!(code.invite.expires_at <= Utc::now() + LINK_TTL);
         let now = Utc::now();
-        let used = redeem(&pool, "telegram", "bot", "tg:1", &code.code, now)
+        let used = redeem(&pool, "telegram", "bot", "tg:1", &code.code, now, false)
             .await
             .expect("redeem");
         assert_eq!(used.and_then(|i| i.user_id), Some(alice));
@@ -632,7 +688,7 @@ mod tests {
             .expect("linked");
         assert_eq!((link.user_id, link.user_name.as_str()), (alice, "Alice"));
         assert!(
-            redeem(&pool, "telegram", "bot", "tg:2", &code.code, now)
+            redeem(&pool, "telegram", "bot", "tg:2", &code.code, now, false)
                 .await
                 .expect("redeem")
                 .is_none(),
@@ -650,14 +706,14 @@ mod tests {
         let plain = create_invite(&pool, "telegram", "bot", DEFAULT_TTL)
             .await
             .expect("invite");
-        redeem(&pool, "telegram", "bot", "tg:1", &plain.code, now)
+        redeem(&pool, "telegram", "bot", "tg:1", &plain.code, now, false)
             .await
             .expect("redeem");
         let again = create_invite(&pool, "telegram", "bot", DEFAULT_TTL)
             .await
             .expect("invite");
         assert!(
-            redeem(&pool, "telegram", "bot", "tg:1", &again.code, now)
+            redeem(&pool, "telegram", "bot", "tg:1", &again.code, now, false)
                 .await
                 .expect("redeem")
                 .is_none()
@@ -671,7 +727,7 @@ mod tests {
             .await
             .expect("code");
         assert!(
-            redeem(&pool, "telegram", "bot", "tg:1", &a.code, now)
+            redeem(&pool, "telegram", "bot", "tg:1", &a.code, now, false)
                 .await
                 .expect("redeem")
                 .is_some()
@@ -687,20 +743,47 @@ mod tests {
         let a2 = create_link_code(&pool, "telegram", "bot", alice)
             .await
             .expect("code");
-        redeem(&pool, "telegram", "bot", "tg:2", &a2.code, now)
+        redeem(&pool, "telegram", "bot", "tg:2", &a2.code, now, false)
             .await
             .expect("redeem");
         assert_eq!(
             linked_user(&pool, "telegram", "tg:1").await.expect("link"),
             None
         );
-        // Bob links tg:2: it is Bob's now, and Alice has none.
+        // tg:1 lost what Alice's first code gave it; its invite stays.
+        assert!(
+            is_allowed(&pool, "telegram", "bot", "tg:1")
+                .await
+                .expect("allowed")
+        );
+        // Bob cannot take tg:2 over while it is Alice's; the code stays unused.
         let b = create_link_code(&pool, "telegram", "bot", bob)
             .await
             .expect("code");
-        redeem(&pool, "telegram", "bot", "tg:2", &b.code, now)
+        let taken = redeem(&pool, "telegram", "bot", "tg:2", &b.code, now, false).await;
+        assert!(matches!(taken, Err(DbError::Conflict(_))), "{taken:?}");
+        assert!(
+            !unlink(&pool, bob, "telegram", "tg:2")
+                .await
+                .expect("unlink"),
+            "not Bob's"
+        );
+        // Alice disconnects it: it loses what her code gave it.
+        assert!(
+            unlink(&pool, alice, "telegram", "tg:2")
+                .await
+                .expect("unlink")
+        );
+        assert!(
+            !is_allowed(&pool, "telegram", "bot", "tg:2")
+                .await
+                .expect("allowed")
+        );
+        // Then Bob's code links it to Bob.
+        redeem(&pool, "telegram", "bot", "tg:2", &b.code, now, false)
             .await
-            .expect("redeem");
+            .expect("redeem")
+            .expect("redeemed");
         assert_eq!(
             linked_user(&pool, "telegram", "tg:2")
                 .await
@@ -708,30 +791,38 @@ mod tests {
                 .map(|l| l.user_id),
             Some(bob)
         );
-        assert!(
-            list_links(&pool, Some(alice))
-                .await
-                .expect("links")
-                .is_empty()
-        );
         assert_eq!(list_links(&pool, None).await.expect("links").len(), 1);
-        assert!(
-            !unlink(&pool, alice, "telegram", "tg:2")
-                .await
-                .expect("unlink"),
-            "not Alice's"
-        );
-        assert!(
-            unlink(&pool, bob, "telegram", "tg:2")
-                .await
-                .expect("unlink")
-        );
-        assert!(
-            is_allowed(&pool, "telegram", "bot", "tg:2")
-                .await
-                .expect("allowed"),
-            "still admitted"
-        );
+    }
+
+    #[tokio::test]
+    async fn links_only_leaves_plain_invites_alone() {
+        let pool = connect_in_memory().await.expect("db");
+        let plain = create_invite(&pool, "telegram", "bot", DEFAULT_TTL)
+            .await
+            .expect("invite");
+        let now = Utc::now();
+        let skipped = redeem(&pool, "telegram", "bot", "tg:1", &plain.code, now, true)
+            .await
+            .expect("redeem");
+        assert!(skipped.is_none());
+        let used = redeem(&pool, "telegram", "bot", "tg:2", &plain.code, now, false)
+            .await
+            .expect("redeem");
+        assert!(used.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_expired_web_code_links_no_one() {
+        let pool = connect_in_memory().await.expect("db");
+        let alice = user(&pool, "Alice").await;
+        let code = create_link_code(&pool, "telegram", "bot", alice)
+            .await
+            .expect("code");
+        let later = Utc::now() + LINK_TTL + Duration::seconds(1);
+        let used = redeem(&pool, "telegram", "bot", "tg:1", &code.code, later, false)
+            .await
+            .expect("redeem");
+        assert!(used.is_none());
     }
 
     #[tokio::test]
@@ -748,6 +839,7 @@ mod tests {
             "tg:1",
             &code.code,
             Utc::now(),
+            false,
         )
         .await
         .expect("redeem");
@@ -838,7 +930,7 @@ mod tests {
             .expect("create");
         assert!(!is_allowed(&pool, "telegram", "bot", "tg:1").await.unwrap());
         let typed = created.code.to_lowercase();
-        let used = redeem(&pool, "telegram", "bot", "tg:1", &typed, Utc::now())
+        let used = redeem(&pool, "telegram", "bot", "tg:1", &typed, Utc::now(), false)
             .await
             .expect("redeem")
             .expect("valid code");
@@ -847,9 +939,17 @@ mod tests {
         assert_eq!(used.status(Utc::now()), InviteStatus::Used);
         assert!(is_allowed(&pool, "telegram", "bot", "tg:1").await.unwrap());
 
-        let again = redeem(&pool, "telegram", "bot", "tg:2", &created.code, Utc::now())
-            .await
-            .expect("redeem");
+        let again = redeem(
+            &pool,
+            "telegram",
+            "bot",
+            "tg:2",
+            &created.code,
+            Utc::now(),
+            false,
+        )
+        .await
+        .expect("redeem");
         assert!(
             again.is_none(),
             "a used code must not admit a second sender"
@@ -869,17 +969,33 @@ mod tests {
             .expect("create");
         let later = Utc::now() + Duration::hours(2);
         assert!(
-            redeem(&pool, "telegram", "bot", "tg:1", &created.code, later)
-                .await
-                .unwrap()
-                .is_none()
+            redeem(
+                &pool,
+                "telegram",
+                "bot",
+                "tg:1",
+                &created.code,
+                later,
+                false
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
         for (channel, account) in [("telegram", "other-bot"), ("slack", "bot")] {
             assert!(
-                redeem(&pool, channel, account, "tg:1", &created.code, Utc::now())
-                    .await
-                    .unwrap()
-                    .is_none(),
+                redeem(
+                    &pool,
+                    channel,
+                    account,
+                    "tg:1",
+                    &created.code,
+                    Utc::now(),
+                    false
+                )
+                .await
+                .unwrap()
+                .is_none(),
                 "{channel}/{account}"
             );
         }
@@ -890,10 +1006,18 @@ mod tests {
             .await
             .expect("second revoke is a no-op");
         assert!(
-            redeem(&pool, "telegram", "bot", "tg:1", &created.code, Utc::now())
-                .await
-                .unwrap()
-                .is_none()
+            redeem(
+                &pool,
+                "telegram",
+                "bot",
+                "tg:1",
+                &created.code,
+                Utc::now(),
+                false
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
         let invite = find_invite(&pool, created.invite.id)
             .await
@@ -930,6 +1054,7 @@ mod tests {
                             &format!("tg:{i}"),
                             &code,
                             Utc::now(),
+                            false,
                         )
                         .await
                         .expect("redeem")
@@ -957,8 +1082,8 @@ mod tests {
             .await
             .unwrap();
         let (ra, rb) = tokio::join!(
-            redeem(&pool, "telegram", "bot", "tg:1", &a.code, Utc::now()),
-            redeem(&pool, "telegram", "bot", "tg:1", &b.code, Utc::now()),
+            redeem(&pool, "telegram", "bot", "tg:1", &a.code, Utc::now(), false),
+            redeem(&pool, "telegram", "bot", "tg:1", &b.code, Utc::now(), false),
         );
         let (ra, rb) = (ra.expect("redeem"), rb.expect("redeem"));
         assert_eq!(usize::from(ra.is_some()) + usize::from(rb.is_some()), 1);
@@ -966,10 +1091,18 @@ mod tests {
         let row = find_invite(&pool, unused.invite.id).await.unwrap().unwrap();
         assert_eq!(row.status(Utc::now()), InviteStatus::Active);
         assert!(
-            redeem(&pool, "telegram", "bot", "tg:2", &unused.code, Utc::now())
-                .await
-                .unwrap()
-                .is_some()
+            redeem(
+                &pool,
+                "telegram",
+                "bot",
+                "tg:2",
+                &unused.code,
+                Utc::now(),
+                false
+            )
+            .await
+            .unwrap()
+            .is_some()
         );
     }
 
@@ -985,10 +1118,18 @@ mod tests {
             let created = create_invite(&pool, channel, account, DEFAULT_TTL)
                 .await
                 .unwrap();
-            redeem(&pool, channel, account, sender, &created.code, Utc::now())
-                .await
-                .unwrap()
-                .expect("valid");
+            redeem(
+                &pool,
+                channel,
+                account,
+                sender,
+                &created.code,
+                Utc::now(),
+                false,
+            )
+            .await
+            .unwrap()
+            .expect("valid");
         }
         assert_eq!(
             revoke_account(&pool, Some("telegram"), "bot")
@@ -1010,10 +1151,18 @@ mod tests {
         let created = create_invite(&pool, "telegram", "bot", DEFAULT_TTL)
             .await
             .expect("create");
-        redeem(&pool, "telegram", "bot", "tg:1", &created.code, Utc::now())
-            .await
-            .unwrap()
-            .expect("valid");
+        redeem(
+            &pool,
+            "telegram",
+            "bot",
+            "tg:1",
+            &created.code,
+            Utc::now(),
+            false,
+        )
+        .await
+        .unwrap()
+        .expect("valid");
         assert!(matches!(
             revoke_invite(&pool, created.invite.id).await,
             Err(DbError::Conflict(_))
@@ -1030,10 +1179,18 @@ mod tests {
         let created = create_invite(&pool, "telegram", "bot", DEFAULT_TTL)
             .await
             .expect("create");
-        redeem(&pool, "telegram", "bot", "tg:1", &created.code, Utc::now())
-            .await
-            .unwrap()
-            .expect("valid");
+        redeem(
+            &pool,
+            "telegram",
+            "bot",
+            "tg:1",
+            &created.code,
+            Utc::now(),
+            false,
+        )
+        .await
+        .unwrap()
+        .expect("valid");
         assert_eq!(count_allowed(&pool, "telegram", "bot").await.unwrap(), 1);
         revoke_sender(&pool, "telegram", "bot", "tg:1")
             .await
@@ -1054,7 +1211,7 @@ mod tests {
         let b = create_invite(&pool, "telegram", "bot", DEFAULT_TTL)
             .await
             .unwrap();
-        redeem(&pool, "telegram", "bot", "tg:1", &a.code, Utc::now())
+        redeem(&pool, "telegram", "bot", "tg:1", &a.code, Utc::now(), false)
             .await
             .unwrap()
             .expect("valid");

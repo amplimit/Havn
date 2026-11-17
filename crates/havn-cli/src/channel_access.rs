@@ -220,12 +220,14 @@ fn access_lines(
     lines
 }
 
-/// `lines` with the Havn user each sender is linked to (issue #182), and a
-/// line for each linked sender of `channel` no line names.
+/// `lines` with the Havn user each sender is linked to (issue #182), and,
+/// unless one account was asked for, a line for each linked sender of
+/// `channel` no line names. Names are quoted.
 fn with_links(
     mut lines: Vec<String>,
     links: &[channel_access::ChannelLink],
     channel: Option<&str>,
+    account: Option<&str>,
 ) -> Vec<String> {
     let mut named = std::collections::HashSet::new();
     for line in &mut lines {
@@ -240,9 +242,12 @@ fn with_links(
             .iter()
             .find(|l| l.channel == ch && l.sender_id == sender)
         {
-            line.push_str(&format!("  linked={}", link.user_name));
+            line.push_str(&format!("  linked={:?}", link.user_name));
             named.insert((ch, sender));
         }
+    }
+    if account.is_some() {
+        return lines;
     }
     for link in links
         .iter()
@@ -250,7 +255,7 @@ fn with_links(
     {
         if !named.contains(&(link.channel.clone(), link.sender_id.clone())) {
             lines.push(format!(
-                "{}  {}  linked={}  linked_at={}",
+                "{}  {}  linked={:?}  linked_at={}",
                 link.channel,
                 link.sender_id,
                 link.user_name,
@@ -277,7 +282,7 @@ pub async fn access_list(channel: Option<&str>, account: Option<&str>) -> anyhow
         channel,
         account,
     );
-    let lines = with_links(lines, &links, channel);
+    let lines = with_links(lines, &links, channel, account);
     if lines.is_empty() {
         println!("(no allowed senders)");
     }
@@ -382,18 +387,32 @@ mod tests {
                 link("telegram", "tg:9", "Bob"),
             ],
             Some("telegram"),
+            None,
         );
         assert_eq!(out[0], "telegram/bot  tg:1  source=config");
-        assert!(out[1].ends_with("  linked=Alice"), "{}", out[1]);
+        assert!(out[1].ends_with("  linked=\"Alice\""), "{}", out[1]);
         assert!(
-            out[2].starts_with("telegram  tg:9  linked=Bob  linked_at="),
+            out[2].starts_with("telegram  tg:9  linked=\"Bob\"  linked_at="),
             "{}",
             out[2]
         );
         assert_eq!(
-            with_links(Vec::new(), &[link("slack", "s:1", "C")], Some("telegram")).len(),
+            with_links(
+                Vec::new(),
+                &[link("slack", "s:1", "C")],
+                Some("telegram"),
+                None
+            )
+            .len(),
             0
         );
+        let one_account = with_links(
+            Vec::new(),
+            &[link("telegram", "tg:9", "Bob Smith")],
+            None,
+            Some("bot"),
+        );
+        assert!(one_account.is_empty(), "{one_account:?}");
     }
 
     fn config(toml: &str) -> CliConfig {
@@ -484,10 +503,18 @@ mod tests {
         let created = create_with(pool, channel, account, Duration::hours(1))
             .await
             .unwrap();
-        channel_access::redeem(pool, channel, account, sender, &created.code, Utc::now())
-            .await
-            .unwrap()
-            .expect("valid");
+        channel_access::redeem(
+            pool,
+            channel,
+            account,
+            sender,
+            &created.code,
+            Utc::now(),
+            false,
+        )
+        .await
+        .unwrap()
+        .expect("valid");
     }
 
     #[tokio::test]
@@ -565,10 +592,18 @@ mod tests {
         let created = create_with(&pool, "telegram", "bot", Duration::hours(1))
             .await
             .unwrap();
-        channel_access::redeem(&pool, "telegram", "bot", "tg:1", &created.code, Utc::now())
-            .await
-            .unwrap()
-            .expect("valid");
+        channel_access::redeem(
+            &pool,
+            "telegram",
+            "bot",
+            "tg:1",
+            &created.code,
+            Utc::now(),
+            false,
+        )
+        .await
+        .unwrap()
+        .expect("valid");
         let allowed = channel_access::list_allowed(&pool).await.unwrap();
         let lines = access_lines(&cfg, true, &allowed, None, None);
         assert_eq!(lines.len(), 2, "{lines:?}");

@@ -71,6 +71,7 @@ const PAIR_WELCOME: &str = "Hello! This bot needs pairing before you can use it.
                             pairing link you got. No code yet? Ask whoever runs this bot.";
 const PAIR_UNPAIRED: &str = "Not paired yet. Send your pairing code, or /help.";
 const PAIR_INVALID_CODE: &str = "That pairing code is not valid or has expired.";
+const PAIR_LINKED_ELSEWHERE: &str = "This chat account is already connected to another Havn                                      account. Disconnect it there first, then open the pairing                                      link again.";
 const PAIR_TOO_MANY_TRIES: &str =
     "Too many tries. Please wait a few minutes, then send your pairing code again.";
 const PAIR_HELP: &str = "This bot answers only people who have paired with it. To pair, send the \
@@ -1432,6 +1433,8 @@ enum Refusal {
     InvalidCode,
     /// A code past the attempts allowed, valid or not.
     TooManyTries,
+    /// A code made on the web, for a sender linked to another Havn user.
+    LinkedElsewhere,
     /// Anything else.
     Unpaired,
     /// Not a refusal: the code was accepted.
@@ -1453,6 +1456,10 @@ fn pairing_text(state: &AppState, channel: &str, account_id: &str, why: Refusal)
             own.and_then(|t| t.too_many_tries.clone()),
             PAIR_TOO_MANY_TRIES,
         ),
+        Refusal::LinkedElsewhere => (
+            own.and_then(|t| t.linked_elsewhere.clone()),
+            PAIR_LINKED_ELSEWHERE,
+        ),
         Refusal::Unpaired => (own.and_then(|t| t.unpaired.clone()), PAIR_UNPAIRED),
         Refusal::Paired => (own.and_then(|t| t.paired.clone()), INVITE_WELCOME_MESSAGE),
     };
@@ -1471,13 +1478,12 @@ fn linked_text(state: &AppState, channel: &str, account_id: &str, name: &str) ->
         .and_then(|accounts| accounts.get(account_id))
         .and_then(|t| t.linked.clone())
         .filter(|t| !t.trim().is_empty());
-    let text: String = set
-        .as_deref()
+    set.as_deref()
         .unwrap_or(LINKED_MESSAGE)
+        .replace("{name}", name)
         .chars()
         .take(MAX_PAIRING_TEXT_CHARS)
-        .collect();
-    text.replace("{name}", name)
+        .collect()
 }
 
 /// `text` as a command to a bot: `/name` or `/name@bot` (its name in
@@ -1573,7 +1579,7 @@ async fn sender_access(
             .filter(|(name, payload)| name == "start" && !payload.is_empty())
             .and_then(|(_, payload)| channel_access::normalize_code(payload))
         {
-            Some(code) => redeem_code(state, channel, agent_id, inb, &code).await,
+            Some(code) => redeem_code(state, channel, agent_id, inb, &code, true).await,
             None => SenderAccess::Allowed,
         };
     }
@@ -1597,17 +1603,20 @@ async fn sender_access(
             Refusal::InvalidCode
         });
     };
-    redeem_code(state, channel, agent_id, inb, &code).await
+    redeem_code(state, channel, agent_id, inb, &code, false).await
 }
 
 /// Redeem `code` for the sender of `inb`, within their attempts: they are
-/// admitted, and linked when it was made on the web.
+/// admitted, and linked when it was made on the web. With `links_only`
+/// (a sender already admitted), only a code made on the web is taken, so
+/// an invite meant for someone else is not used up.
 async fn redeem_code(
     state: &AppState,
     channel: &str,
     agent_id: havn_core::AgentId,
     inb: &ChannelInbound,
     code: &str,
+    links_only: bool,
 ) -> SenderAccess {
     let limiter_key = format!("{channel}|{}|{}", inb.account_id, inb.sender_id);
     match state.invite_attempt_limiter.check(&limiter_key) {
@@ -1631,10 +1640,14 @@ async fn redeem_code(
         &inb.sender_id,
         code,
         chrono::Utc::now(),
+        links_only,
     )
     .await
     {
         Ok(Some(invite)) => invite,
+        Err(havn_db::DbError::Conflict(_)) => {
+            return SenderAccess::Denied(Refusal::LinkedElsewhere);
+        }
         Ok(None) => {
             warn!(
                 channel,
@@ -1697,7 +1710,7 @@ async fn redeem_code(
         .await
         .ok()
         .flatten()
-        .map_or_else(|| user.to_string(), |u| u.display_name);
+        .map_or_else(|| "your Havn account".to_string(), |u| u.display_name);
     SenderAccess::Linked(name)
 }
 
@@ -1726,7 +1739,13 @@ pub async fn pairing_create(
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
     let agent_id = agent.id.to_string();
     let mut codes = Vec::new();
-    for binding in state.bindings.iter().filter(|b| b.agent_id == agent_id) {
+    // An account bound to several agents goes to the first; only the
+    // accounts whose messages reach this agent pair to it.
+    for binding in state.bindings.iter().filter(|b| {
+        b.agent_id == agent_id
+            && channel_router::agent_for_account(&state.bindings, &b.channel, &b.account_id)
+                == Some(agent_id.as_str())
+    }) {
         let Some(acct) = state
             .channels
             .get(&binding.channel)
@@ -2500,6 +2519,7 @@ mod tests {
                 "tg:5",
                 &code,
                 chrono::Utc::now(),
+                false,
             )
             .await
             .expect("redeem")
@@ -2539,6 +2559,7 @@ mod tests {
                 "tg:6",
                 &theirs,
                 chrono::Utc::now(),
+                false,
             )
             .await
             .expect("redeem");
@@ -2561,6 +2582,152 @@ mod tests {
             assert_eq!(
                 f.replies(),
                 vec![("tg:1".to_string(), PAIR_INVALID_CODE.to_string())]
+            );
+        }
+
+        fn as_user(id: havn_core::UserId) -> crate::auth::AuthedUser {
+            crate::auth::AuthedUser {
+                id,
+                display_name: "someone".into(),
+            }
+        }
+
+        #[tokio::test]
+        async fn codes_are_made_only_by_the_owner_for_accounts_that_reach_the_agent() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let agent = f.state.bindings[0].agent_id.clone();
+            let made = pairing_create(
+                State(f.state.clone()),
+                as_user(f.owner),
+                axum::extract::Path(agent.clone()),
+            )
+            .await
+            .expect("codes")
+            .0;
+            assert_eq!(made.len(), 1);
+            assert_eq!(made[0].account_id, "bot");
+            let stranger = havn_db::repo::users::create(
+                &f.state.db,
+                havn_db::repo::users::NewUser {
+                    display_name: "Stranger",
+                },
+            )
+            .await
+            .expect("user")
+            .id;
+            let refused = pairing_create(
+                State(f.state.clone()),
+                as_user(stranger),
+                axum::extract::Path(agent.clone()),
+            )
+            .await;
+            assert!(matches!(refused, Err(crate::api::ApiError::NotFound)));
+            // The stranger's own agent, bound second to the same account:
+            // its messages go to the first agent, so no code for it.
+            let theirs = agent_repo::create(
+                &f.state.db,
+                agent_repo::NewAgent {
+                    owner_id: stranger,
+                    team_id: None,
+                    name: "second",
+                    config: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("agent")
+            .id;
+            let mut bindings = (*f.state.bindings).clone();
+            bindings.push(ChannelBindingConfig {
+                agent_id: theirs.to_string(),
+                channel: "telegram".into(),
+                account_id: "bot".into(),
+            });
+            f.state.bindings = Arc::new(bindings);
+            let unbound = pairing_create(
+                State(f.state.clone()),
+                as_user(stranger),
+                axum::extract::Path(theirs.to_string()),
+            )
+            .await;
+            assert!(matches!(unbound, Err(crate::api::ApiError::BadRequest(_))));
+            // Removing someone else's link is not found.
+            let code = link_code(&f, "bot").await;
+            f.send("tg:1", &format!("/start {code}")).await;
+            let removed = links_remove(
+                State(f.state.clone()),
+                as_user(stranger),
+                axum::extract::Query(LinkQuery {
+                    channel: "telegram".into(),
+                    sender: "tg:1".into(),
+                }),
+            )
+            .await;
+            assert!(matches!(removed, Err(crate::api::ApiError::NotFound)));
+        }
+
+        #[tokio::test]
+        async fn disconnecting_takes_back_the_access_the_link_gave() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let code = link_code(&f, "bot").await;
+            f.send("tg:1", &format!("/start {code}")).await;
+            f.send("tg:1", "hello").await;
+            assert_eq!(f.forwarded(), vec!["tg:1".to_string()]);
+            links_remove(
+                State(f.state.clone()),
+                as_user(f.owner),
+                axum::extract::Query(LinkQuery {
+                    channel: "telegram".into(),
+                    sender: "tg:1".into(),
+                }),
+            )
+            .await
+            .expect("removed");
+            f.send("tg:1", "hello again").await;
+            assert!(f.forwarded().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_sender_linked_to_someone_else_is_not_taken_over() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let code = link_code(&f, "bot").await;
+            f.send("tg:1", &format!("/start {code}")).await;
+            f.replies();
+            let mallory = havn_db::repo::users::create(
+                &f.state.db,
+                havn_db::repo::users::NewUser {
+                    display_name: "Mallory",
+                },
+            )
+            .await
+            .expect("user")
+            .id;
+            let theirs = channel_access::create_link_code(&f.state.db, "telegram", "bot", mallory)
+                .await
+                .expect("code")
+                .code;
+            f.send("tg:1", &format!("/start {theirs}")).await;
+            assert_eq!(
+                f.replies(),
+                vec![("tg:1".to_string(), PAIR_LINKED_ELSEWHERE.to_string())]
+            );
+            let link = channel_access::linked_user(&f.state.db, "telegram", "tg:1")
+                .await
+                .expect("db")
+                .expect("linked");
+            assert_eq!(link.user_id, f.owner);
+        }
+
+        #[tokio::test]
+        async fn an_admitted_sender_does_not_use_up_an_invite() {
+            let mut f = fixture(DmPolicy::Allowlist, &["tg:toml"]).await;
+            let plain = f.invite("bot").await;
+            f.send("tg:toml", &format!("/start {plain}")).await;
+            assert!(f.forwarded().is_empty());
+            f.replies();
+            f.send("tg:new", &plain).await;
+            assert!(
+                f.allowed("tg:new").await,
+                "the invite was still there for its person"
             );
         }
 

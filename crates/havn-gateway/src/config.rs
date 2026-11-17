@@ -353,6 +353,9 @@ pub struct PairingTexts {
     pub invalid_code: Option<String>,
     /// The answer to a code sent after too many tries.
     pub too_many_tries: Option<String>,
+    /// The answer to a pairing code made on the web when the sender is
+    /// connected to another Havn account.
+    pub linked_elsewhere: Option<String>,
     /// The answer to `/help`.
     pub help: Option<String>,
     /// The answer to a code accepted.

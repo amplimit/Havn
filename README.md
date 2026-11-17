@@ -637,8 +637,10 @@ A Havn user can connect their own Telegram account (or another chat app's) to th
 
 - A linked sender who owns the agent may use the admin commands (`/model`, `/approve`, ...) without being listed in `admins`; `admins` stays for people without a Havn account.
 - A linked sender may write to the bots of every agent of the same user without another code.
-- A sender is one user's, and a user has one sender per channel: linking again replaces the earlier link. A sender who can already write to the bot links with the link (`/start <code>`) too.
-- Links are listed, and removed, under **chat apps** on any agent's settings page (`GET` and `DELETE /me/channel-links`); removing one leaves the sender admitted where they were. `havn access list` shows who each sender is linked to. Creating a code and linking and unlinking are audited as `channel_link.code_created`, `channel_link.created` and `channel_link.removed`.
+- A sender is one user's, and a user has one sender per channel: linking again replaces the earlier link, and the earlier sender loses what the user's codes gave it. A sender linked to another user is refused ("already connected to another Havn account"); that user disconnects it first. A sender who can already write to the bot links with the link (`/start <code>`) too; a plain invite code sent that way is left for its person.
+- Links are listed, and removed, under **chat apps** on any agent's settings page (`GET` and `DELETE /me/channel-links`). Disconnecting takes back the access the user's codes gave the sender; an admission they had otherwise (`allow_from`, an invite) stays.
+- An account bound to several agents (`[[bindings]]`) sends its messages to the first; only that agent's owner can make codes for it.
+- Links are per channel, so an adapter's sender ids must be the same person on every account of the channel, as Telegram's user ids are. `havn access list` shows who each sender is linked to. Creating a code and linking and unlinking are audited as `channel_link.code_created`, `channel_link.created` and `channel_link.removed`.
 - Codes made with `havn invite create` keep working as before: they admit a sender and link them to no one.
 
 The link needs the bot's username on the account; without it the page shows only the code:

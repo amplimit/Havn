@@ -1237,11 +1237,22 @@ async fn ask_for_approval(
         .await;
     }
     if let Some((channel, account, _)) = crate::channel_id_codec::decode(&request.channel_id) {
-        let admins = ctx
+        let listed = ctx
             .channels
             .get(channel)
             .and_then(|entry| entry.accounts.iter().find(|a| a.id == account))
             .is_some_and(|acct| !acct.admins.is_empty());
+        // The agent's owner with a chat account of this channel connected
+        // is an admin there too (issue #182).
+        let owner_linked = match havn_db::repo::agents::find_by_id(&ctx.db, agent_id).await {
+            Ok(Some(agent)) => {
+                havn_db::repo::channel_access::list_links(&ctx.db, Some(agent.owner_id))
+                    .await
+                    .is_ok_and(|links| links.iter().any(|l| l.channel == channel))
+            }
+            _ => false,
+        };
+        let admins = listed || owner_linked;
         let message = OutboundMessage {
             conversation: None,
             channel_id: request.channel_id,
@@ -4149,6 +4160,7 @@ mod tests {
             "tg:1",
             &invite.code,
             chrono::Utc::now(),
+            false,
         )
         .await
         .expect("redeem")
