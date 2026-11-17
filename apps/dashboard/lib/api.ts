@@ -211,6 +211,9 @@ export type ConversationResponse = {
   /** Messages of the chat not answered yet, the one being answered included. */
   waiting?: number;
   uninitialised: boolean;
+  /** The chat's own model and thinking choice, when it has them. */
+  model?: string;
+  thinking?: string;
 };
 
 /** One of the caller's chats with an agent. */
@@ -292,12 +295,52 @@ export type RoleView = {
   created_at: string;
 };
 
+/** How a model thinks, as its admin set it. */
+export type ThinkingSpec = {
+  style: "toggle" | "effort" | "budget";
+  /** For `effort`: the levels it takes. */
+  levels?: string[];
+  /** For `budget`: the token budgets offered. */
+  budgets?: number[];
+  /** A chat's choice when it made none. */
+  default?: string;
+  /** It always thinks: off is not offered. */
+  mandatory?: boolean;
+};
+
+/** What a chat may choose for a model with `spec`, off first unless it must think. */
+export function thinkingChoices(spec: ThinkingSpec): string[] {
+  const out = spec.mandatory ? [] : ["off"];
+  if (spec.style === "toggle") out.push("on");
+  if (spec.style === "effort") out.push(...(spec.levels ?? []));
+  if (spec.style === "budget") out.push(...(spec.budgets ?? []).map(String));
+  return out;
+}
+
 export type ModelEntry = {
   id: string;
   label?: string;
   max_output_tokens?: number;
   /** It takes images: pictures sent in a chat are shown to it. */
   vision?: boolean;
+  /** How it thinks; absent, it is not asked to. */
+  thinking?: ThinkingSpec;
+};
+
+/** What a model check found. */
+export type ModelCheck = {
+  outcome: "reasoning" | "no_reasoning" | "error";
+  reasoning?: string;
+  reply?: string;
+  error?: string;
+};
+
+/** The models an agent may use, for a chat's model menu. */
+export type AgentModels = {
+  /** The agent's own model; null for the gateway's default. */
+  agent_model: string | null;
+  default_model: string | null;
+  models: ModelEntry[];
 };
 
 export type ModelsView = {
@@ -566,6 +609,11 @@ export const api = {
 
   models: {
     get: () => request<ModelsView>("/llm/models"),
+    /** A very short request to `entry`, saved or not, with its thinking at its default. */
+    check: (entry: ModelEntry) =>
+      request<ModelCheck>("/llm/models/check", { method: "POST", body: JSON.stringify({ entry }) }),
+    /** The models agent `agentId` may use. */
+    forAgent: (agentId: string) => request<AgentModels>(`/agents/${agentId}/models`),
     /** Replaces the whole list; the gateway writes it to config.toml. */
     put: (body: {
       version: string;
@@ -639,6 +687,12 @@ export const api = {
     delete: (agentId: string, chat: string) =>
       request<void>(`/agents/${agentId}/chats/${encodeURIComponent(chat)}`, {
         method: "DELETE",
+      }),
+    /** A chat's own model and thinking choice; `null` goes back to the default. */
+    settings: (agentId: string, chat: string, settings: { model?: string | null; thinking?: string | null }) =>
+      request<void>(`/agents/${agentId}/chats/${encodeURIComponent(chat)}`, {
+        method: "PATCH",
+        body: JSON.stringify(settings),
       }),
     /** What reply `turn` of `chat` did on the way. */
     trace: (agentId: string, chat: string, turn: string) =>
