@@ -430,7 +430,7 @@ An agent's owner can browse the files in its workspace from the dashboard (the a
 browse = true   # default false
 ```
 
-The dashboard's **settings** page turns it on or off and writes it to config.toml (with `trust_header` on, only the file can); it applies at once. With it on, every agent's page is there unless its owner turns it off on the agent's settings page (`PUT /agents/{id}/workspace/access`); with it off, no agent's is, and an agent's settings cannot turn it on. Only the owner can browse, and not from another site's page. Links in the workspace are listed with where they point and never followed; the agent's database and `.havn` are never listed or sent; files over 50 MB are not sent; images are shown in place and everything else is sent as a download. Changes are audited as `workspace.browse.changed` and `agent.workspace_browse.changed`.
+The dashboard's **settings** page turns it on or off and writes it to config.toml (with `trust_header` on, only the file can); it applies at once. With it on, every agent's page is there unless its owner turns it off on the agent's settings page (`PUT /agents/{id}/workspace/access`); with it off, no agent's is, and an agent's settings cannot turn it on. Only the owner can browse, and not from another site's page. Links in the workspace are listed with where they point and never followed; the agent's database and `.havn` are never listed or sent (by name: a copy the agent makes elsewhere is shown like any file, as the agent can read them anyway); files over 50 MB are not sent; images are shown in place and everything else is sent as a download. Changes are audited as `workspace.browse.changed` and `agent.workspace_browse.changed`.
 
 ### Multi-user mode behind an SSO proxy
 

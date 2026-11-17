@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, use, useCallback, useEffect, useState } from "react";
+import { Suspense, use, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Download, File, Folder, Link2 } from "lucide-react";
@@ -57,6 +57,8 @@ function Workspace({ id, path }: { id: string; path: string }) {
   const [listing, setListing] = useState<WorkspaceListing | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<Preview | null>(null);
+  // The file clicked last: an answer for one clicked before is dropped.
+  const shown = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -86,6 +88,10 @@ function Workspace({ id, path }: { id: string; path: string }) {
 
   async function show(entry: WorkspaceEntry) {
     const full = path ? `${path}/${entry.name}` : entry.name;
+    shown.current = full;
+    const settle = (p: Preview) => {
+      if (shown.current === full) setPreview(p);
+    };
     if (IMAGE.test(entry.name)) {
       setPreview({ path: full, kind: "image" });
       return;
@@ -98,13 +104,18 @@ function Workspace({ id, path }: { id: string; path: string }) {
       const resp = await fetch(workspaceFileUrl(id, full), { credentials: "same-origin" });
       if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
       const bytes = new Uint8Array(await resp.arrayBuffer());
-      if (bytes.subarray(0, 8192).includes(0)) {
-        setPreview({ path: full, kind: "none", why: "not text" });
+      // It may have grown since it was listed.
+      if (bytes.length > MAX_PREVIEW_BYTES) {
+        settle({ path: full, kind: "none", why: "too large to show here" });
         return;
       }
-      setPreview({ path: full, kind: "text", text: new TextDecoder().decode(bytes) });
+      if (bytes.subarray(0, 8192).includes(0)) {
+        settle({ path: full, kind: "none", why: "not text" });
+        return;
+      }
+      settle({ path: full, kind: "text", text: new TextDecoder().decode(bytes) });
     } catch (e) {
-      setPreview({ path: full, kind: "none", why: e instanceof Error ? e.message : String(e) });
+      settle({ path: full, kind: "none", why: e instanceof Error ? e.message : String(e) });
     }
   }
 

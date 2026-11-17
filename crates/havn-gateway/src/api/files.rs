@@ -542,13 +542,23 @@ pub async fn inbox_file(
     .map_err(|e| ApiError::Internal(format!("reading the inbox: {e}")))?
     .ok_or(ApiError::NotFound)?;
     let image = crate::llm_proxy::image_type(&bytes);
+    let response = file_response(&name, Vec::new(), image);
+    Ok(streamed(response, bytes, reading))
+}
+
+/// `response` with `bytes` as its body, sent in pieces; the reading slot
+/// goes with the last piece, so the files held in memory stay bounded
+/// while they are sent.
+fn streamed(
+    mut response: axum::response::Response,
+    bytes: Vec<u8>,
+    reading: tokio::sync::OwnedSemaphorePermit,
+) -> axum::response::Response {
     let bytes = axum::body::Bytes::from(bytes);
     let pieces: Vec<axum::body::Bytes> = (0..bytes.len())
         .step_by(64 * 1024)
         .map(|at| bytes.slice(at..(at + 64 * 1024).min(bytes.len())))
         .collect();
-    let mut response = file_response(&name, Vec::new(), image);
-    // The slot goes with the last piece.
     let body = futures_util::stream::unfold(
         (pieces.into_iter(), reading),
         |(mut pieces, reading)| async move {
@@ -561,7 +571,7 @@ pub async fn inbox_file(
         .headers_mut()
         .remove(axum::http::header::CONTENT_LENGTH);
     *response.body_mut() = axum::body::Body::from_stream(body);
-    Ok(response)
+    response
 }
 
 // ---- Browsing an agent's workspace (issue #177) ----
@@ -608,11 +618,11 @@ fn access_of(state: &AppState, agent: &havn_db::repo::agents::Agent) -> AccessVi
     let gateway = state
         .workspace_browse
         .load(std::sync::atomic::Ordering::Relaxed);
+    // On unless set; a value that is not a boolean counts as off.
     let own = agent
         .config
         .get(AGENT_SWITCH)
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
+        .is_none_or(|v| v.as_bool() == Some(true));
     AccessView {
         gateway,
         agent: own,
@@ -746,7 +756,7 @@ fn path_names(path: &str) -> Result<Vec<String>, ApiError> {
         return Err(ApiError::BadRequest("path too deep".into()));
     }
     for (i, name) in names.iter().enumerate() {
-        if name == "." || name == ".." || name.contains('\0') || name.contains('\\') {
+        if name == "." || name == ".." || name.contains('\0') {
             return Err(ApiError::BadRequest(format!("bad path component {name:?}")));
         }
         if i == 0 && internal(name) {
@@ -894,7 +904,7 @@ pub async fn workspace_file(
     // Files held at once: each is read whole.
     static READING: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
         std::sync::OnceLock::new();
-    let _reading = READING
+    let reading = READING
         .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)))
         .clone()
         .acquire_owned()
@@ -921,7 +931,13 @@ pub async fn workspace_file(
     })?
     .ok_or(ApiError::NotFound)?;
     let image = crate::llm_proxy::image_type(&bytes);
-    Ok(file_response(&name, bytes, image))
+    let mut response = file_response(&name, Vec::new(), image);
+    // The agent may change it at any moment, and browsing may be turned off.
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(streamed(response, bytes, reading))
 }
 
 #[cfg(test)]
@@ -1028,7 +1044,7 @@ mod tests {
                 "{hidden}"
             );
         }
-        for bad in ["notes/..", "./notes", "a\\b"] {
+        for bad in ["notes/..", "./notes", "a\0b"] {
             assert!(
                 matches!(list(&state, bad).await, Err(ApiError::BadRequest(_))),
                 "{bad}"
@@ -1061,6 +1077,21 @@ mod tests {
         };
         let md = file(&state, "notes/a.md").await.unwrap();
         assert!(header(&md, axum::http::header::CONTENT_DISPOSITION).starts_with("attachment;"));
+        assert_eq!(header(&md, axum::http::header::CACHE_CONTROL), "no-store");
+        let body = axum::body::to_bytes(md.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"hello");
+        std::fs::write(ws.join("back\\slash.md"), "b").unwrap();
+        assert!(
+            file(&state, "back\\slash.md").await.is_ok(),
+            "a backslash is part of a name"
+        );
+        nix_fifo(&ws.join("pipe"));
+        assert!(
+            matches!(file(&state, "pipe").await, Err(ApiError::BadRequest(_))),
+            "a FIFO is refused without blocking"
+        );
         let png = file(&state, "pic.png").await.unwrap();
         assert!(header(&png, axum::http::header::CONTENT_DISPOSITION).starts_with("inline;"));
         assert_eq!(header(&png, axum::http::header::CONTENT_TYPE), "image/png");
@@ -1096,6 +1127,58 @@ mod tests {
         ));
     }
 
+    fn nix_fifo(path: &std::path::Path) {
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    }
+
+    #[tokio::test]
+    async fn only_the_dashboard_of_a_gateway_without_trust_header_flips_the_gateway_switch() {
+        let (state, user_id) = crate::auth::tests::state_with(true).await;
+        let user = AuthedUser {
+            id: user_id,
+            display_name: "operator".into(),
+        };
+        let refused =
+            browse_put(State(state.clone()), user, Json(BrowsePut { browse: true })).await;
+        assert!(matches!(refused, Err(ApiError::Forbidden(_))));
+        assert!(
+            !state
+                .workspace_browse
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        let (state, user_id) = crate::auth::tests::state_with(false).await;
+        let user = AuthedUser {
+            id: user_id,
+            display_name: "operator".into(),
+        };
+        let view = browse_put(State(state.clone()), user, Json(BrowsePut { browse: true }))
+            .await
+            .unwrap()
+            .0;
+        assert!(view.browse && view.editable);
+        assert!(
+            state
+                .workspace_browse
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        let _ = std::fs::remove_file(&state.config_path);
+    }
+
+    #[test]
+    fn a_switch_that_is_not_a_boolean_is_off() {
+        let on = |config: serde_json::Value| {
+            config
+                .get(AGENT_SWITCH)
+                .is_none_or(|v| v.as_bool() == Some(true))
+        };
+        assert!(on(serde_json::json!({})));
+        assert!(on(serde_json::json!({AGENT_SWITCH: true})));
+        assert!(!on(serde_json::json!({AGENT_SWITCH: false})));
+        assert!(!on(serde_json::json!({AGENT_SWITCH: "off"})));
+    }
+
     #[test]
     fn the_gateway_switch_is_written_to_config_toml_keeping_the_rest() {
         let dir = tempfile::tempdir().unwrap();
@@ -1113,6 +1196,16 @@ mod tests {
         let parsed: crate::config::GatewayConfig =
             toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(!parsed.workspace.browse);
+        for written in [
+            "workspace = { browse = false }\n",
+            "workspace.browse = false\n",
+        ] {
+            std::fs::write(&path, written).unwrap();
+            crate::config::write_workspace_browse(&path, true).unwrap();
+            let parsed: crate::config::GatewayConfig =
+                toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(parsed.workspace.browse, "{written}");
+        }
     }
 
     #[test]

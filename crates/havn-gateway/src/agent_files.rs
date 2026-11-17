@@ -249,14 +249,16 @@ impl WorkspaceDir {
         Ok(files)
     }
 
-    /// Names and metadata of the first `max` entries directly in this
-    /// directory, of any type, without following links, and whether there
-    /// were more.
+    /// Names and metadata of the entries among the first `max` directly in
+    /// this directory, of any type, without following links, and whether
+    /// there were more. Every entry counts towards `max`, a name that is not
+    /// UTF-8 (left out) too, so a directory with millions of them costs at
+    /// most `max` lookups.
     pub fn entries(&self, max: usize) -> io::Result<(Vec<(String, Metadata)>, bool)> {
         let mut found = Vec::new();
         let mut more = false;
-        for entry in std::fs::read_dir(self.proc_path())? {
-            if found.len() == max {
+        for (seen, entry) in std::fs::read_dir(self.proc_path())?.enumerate() {
+            if seen == max {
                 more = true;
                 break;
             }

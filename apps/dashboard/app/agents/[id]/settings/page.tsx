@@ -581,8 +581,8 @@ function WorkspaceAccessEditor({ agentId }: { agentId: string }) {
       <label className="inline-flex items-center gap-2 text-sm">
         <input
           type="checkbox"
-          checked={view.enabled}
-          disabled={saving || !view.gateway}
+          checked={view.agent}
+          disabled={saving || (!view.gateway && !view.agent)}
           onChange={(e) => void toggle(e.target.checked)}
         />
         let me browse this agent&apos;s workspace
@@ -590,7 +590,8 @@ function WorkspaceAccessEditor({ agentId }: { agentId: string }) {
       {!view.gateway && (
         <p className="mt-1 text-xs" style={{ color: "var(--color-body)" }}>
           Workspace browsing is off for this gateway; it is turned on in the gateway&apos;s
-          settings ([workspace] browse in config.toml).
+          settings ([workspace] browse in config.toml). You can still turn it off here, so
+          this agent stays closed when the gateway allows it.
         </p>
       )}
     </section>
