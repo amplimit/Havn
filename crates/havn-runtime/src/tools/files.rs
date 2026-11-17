@@ -584,10 +584,11 @@ fn glob_regex(glob: &str) -> Result<regex::Regex, String> {
                         && j > first
                         && chars[j - 1] != '-'
                         && chars.get(j + 1).is_some_and(|n| *n != ']' && *n != '-');
-                    if !range && c.is_ascii_punctuation() {
-                        re.push('\\');
+                    if range {
+                        re.push('-');
+                    } else {
+                        re.push_str(&regex::escape(&c.to_string()));
                     }
-                    re.push(c);
                     j += 1;
                 }
                 re.push(']');
@@ -1409,6 +1410,7 @@ mod tests {
         assert!(m("[&&]", "&") && m("[~~]", "~"));
         assert!(m("[\\]]", "\\]"));
         assert!(m("[一二]月.md", "二月.md"));
+        assert!(m("[<>]x", "<x") && m("[<>]x", ">x"));
     }
 
     #[tokio::test]
