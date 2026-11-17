@@ -11,6 +11,8 @@ use sha2::{Digest as _, Sha256};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+use havn_core::UserId;
+
 use crate::repo::parse_db_uuid;
 use crate::{DbError, Result};
 
@@ -24,6 +26,8 @@ const _: () = assert!(CODE_BYTES * 8 >= 80);
 
 /// Default lifetime of an unused invite.
 pub const DEFAULT_TTL: Duration = Duration::hours(24);
+/// Lifetime of a pairing code made on the web, which links its sender.
+pub const LINK_TTL: Duration = Duration::minutes(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InviteStatus {
@@ -55,6 +59,8 @@ pub struct Invite {
     pub used_by_sender: Option<String>,
     pub used_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// The Havn user a code made on the web links its sender to.
+    pub user_id: Option<UserId>,
 }
 
 impl Invite {
@@ -174,18 +180,40 @@ pub async fn create_invite(
     account_id: &str,
     ttl: Duration,
 ) -> Result<CreatedInvite> {
+    create_code(pool, channel, account_id, ttl, None).await
+}
+
+/// A pairing code that, redeemed, also links its sender to `user` (issue
+/// #182); it lasts [`LINK_TTL`].
+pub async fn create_link_code(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    user: UserId,
+) -> Result<CreatedInvite> {
+    create_code(pool, channel, account_id, LINK_TTL, Some(user)).await
+}
+
+async fn create_code(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    ttl: Duration,
+    user: Option<UserId>,
+) -> Result<CreatedInvite> {
     let code = generate_code()?;
     let id = Uuid::now_v7();
     let expires_at = Utc::now() + ttl;
     sqlx::query(
-        "INSERT INTO channel_invites (id, code_hash, channel, account_id, expires_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO channel_invites (id, code_hash, channel, account_id, expires_at, user_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )
     .bind(id.to_string())
     .bind(hash_code(&code))
     .bind(channel)
     .bind(account_id)
     .bind(timestamp(expires_at))
+    .bind(user.map(|u| u.to_string()))
     .execute(pool)
     .await?;
     let invite = find_invite(pool, id).await?.ok_or(DbError::NotFound)?;
@@ -196,7 +224,7 @@ pub async fn create_invite(
 }
 
 const INVITE_COLUMNS: &str = "id, channel, account_id, created_at, expires_at, \
-                              used_by_sender, used_at, revoked_at";
+                              used_by_sender, used_at, revoked_at, user_id";
 
 pub async fn find_invite(pool: &SqlitePool, id: Uuid) -> Result<Option<Invite>> {
     let row: Option<InviteRow> = sqlx::query_as(&format!(
@@ -255,12 +283,14 @@ pub async fn revoke_invite(pool: &SqlitePool, id: Uuid) -> Result<()> {
 }
 
 /// Consume the invite matching `code` for this `(channel, account_id)`
-/// and admit `sender_id`. `None` when the code is malformed, unknown,
-/// for another account, used, revoked or expired; those cases are not
-/// told apart so a caller cannot leak which one applied. The claim is a
-/// single conditional UPDATE, so two senders racing for one code cannot
-/// both win. `None` too when `sender_id` is already admitted: the claim
-/// is rolled back and the code stays usable.
+/// and admit `sender_id`; a code made on the web also links the sender to
+/// its user, replacing the links either had on this channel. `None` when
+/// the code is malformed, unknown, for another account, used, revoked or
+/// expired; those cases are not told apart so a caller cannot leak which
+/// one applied. The claim is a single conditional UPDATE, so two senders
+/// racing for one code cannot both win. `None` too when `sender_id` is
+/// already admitted and the code links no one: the claim is rolled back
+/// and the code stays usable.
 pub async fn redeem(
     pool: &SqlitePool,
     channel: &str,
@@ -302,13 +332,126 @@ pub async fn redeem(
     .bind(&row.id)
     .execute(&mut *tx)
     .await?;
-    if inserted.rows_affected() == 0 {
-        tx.rollback().await?;
-        return Ok(None);
-    }
     let invite = Invite::try_from(row)?;
+    match invite.user_id {
+        Some(user) => {
+            sqlx::query(
+                "DELETE FROM channel_links WHERE channel = ?1 AND (sender_id = ?2 OR user_id = ?3)",
+            )
+            .bind(channel)
+            .bind(sender_id)
+            .bind(user.to_string())
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO channel_links (channel, sender_id, user_id, linked_at) VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(channel)
+            .bind(sender_id)
+            .bind(user.to_string())
+            .bind(&now_ts)
+            .execute(&mut *tx)
+            .await?;
+        }
+        None if inserted.rows_affected() == 0 => {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        None => {}
+    }
     tx.commit().await?;
     Ok(Some(invite))
+}
+
+/// A channel sender linked to a Havn user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelLink {
+    pub channel: String,
+    pub sender_id: String,
+    pub user_id: UserId,
+    /// The user's name, for listings.
+    pub user_name: String,
+    pub linked_at: DateTime<Utc>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct LinkRow {
+    channel: String,
+    sender_id: String,
+    user_id: String,
+    user_name: String,
+    linked_at: DateTime<Utc>,
+}
+
+impl TryFrom<LinkRow> for ChannelLink {
+    type Error = DbError;
+    fn try_from(r: LinkRow) -> Result<Self> {
+        Ok(Self {
+            user_id: UserId::from_uuid(parse_db_uuid(&r.user_id, "channel_links.user_id")?),
+            channel: r.channel,
+            sender_id: r.sender_id,
+            user_name: r.user_name,
+            linked_at: r.linked_at,
+        })
+    }
+}
+
+const LINK_SELECT: &str = "SELECT l.channel, l.sender_id, l.user_id, u.display_name AS user_name, \
+                           l.linked_at FROM channel_links l JOIN users u ON u.id = l.user_id";
+
+/// The user `sender_id` on `channel` is linked to.
+pub async fn linked_user(
+    pool: &SqlitePool,
+    channel: &str,
+    sender_id: &str,
+) -> Result<Option<ChannelLink>> {
+    let row: Option<LinkRow> = sqlx::query_as(&format!(
+        "{LINK_SELECT} WHERE l.channel = ?1 AND l.sender_id = ?2"
+    ))
+    .bind(channel)
+    .bind(sender_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(ChannelLink::try_from).transpose()
+}
+
+/// Every link, or `user`'s, by channel and sender.
+pub async fn list_links(pool: &SqlitePool, user: Option<UserId>) -> Result<Vec<ChannelLink>> {
+    let rows: Vec<LinkRow> = match user {
+        Some(user) => {
+            sqlx::query_as(&format!(
+                "{LINK_SELECT} WHERE l.user_id = ?1 ORDER BY l.channel, l.sender_id"
+            ))
+            .bind(user.to_string())
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query_as(&format!("{LINK_SELECT} ORDER BY l.channel, l.sender_id"))
+                .fetch_all(pool)
+                .await?
+        }
+    };
+    rows.into_iter().map(ChannelLink::try_from).collect()
+}
+
+/// Remove `user`'s link of `sender_id` on `channel`; false when there was
+/// none. The sender stays admitted where they were.
+pub async fn unlink(
+    pool: &SqlitePool,
+    user: UserId,
+    channel: &str,
+    sender_id: &str,
+) -> Result<bool> {
+    let res = sqlx::query(
+        "DELETE FROM channel_links WHERE channel = ?1 AND sender_id = ?2 AND user_id = ?3",
+    )
+    .bind(channel)
+    .bind(sender_id)
+    .bind(user.to_string())
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 pub async fn is_allowed(
@@ -400,6 +543,7 @@ struct InviteRow {
     used_by_sender: Option<String>,
     used_at: Option<DateTime<Utc>>,
     revoked_at: Option<DateTime<Utc>>,
+    user_id: Option<String>,
 }
 
 impl TryFrom<InviteRow> for Invite {
@@ -414,6 +558,11 @@ impl TryFrom<InviteRow> for Invite {
             used_by_sender: r.used_by_sender,
             used_at: r.used_at,
             revoked_at: r.revoked_at,
+            user_id: r
+                .user_id
+                .as_deref()
+                .map(|u| parse_db_uuid(u, "channel_invites.user_id").map(UserId::from_uuid))
+                .transpose()?,
         })
     }
 }
@@ -450,6 +599,164 @@ mod tests {
 
     use super::*;
     use crate::connect_in_memory;
+
+    async fn user(pool: &SqlitePool, name: &str) -> UserId {
+        crate::repo::users::create(pool, crate::repo::users::NewUser { display_name: name })
+            .await
+            .expect("user")
+            .id
+    }
+
+    #[tokio::test]
+    async fn a_web_code_admits_and_links_its_sender() {
+        let pool = connect_in_memory().await.expect("db");
+        let alice = user(&pool, "Alice").await;
+        let code = create_link_code(&pool, "telegram", "bot", alice)
+            .await
+            .expect("code");
+        assert_eq!(code.invite.user_id, Some(alice));
+        assert!(code.invite.expires_at <= Utc::now() + LINK_TTL);
+        let now = Utc::now();
+        let used = redeem(&pool, "telegram", "bot", "tg:1", &code.code, now)
+            .await
+            .expect("redeem");
+        assert_eq!(used.and_then(|i| i.user_id), Some(alice));
+        assert!(
+            is_allowed(&pool, "telegram", "bot", "tg:1")
+                .await
+                .expect("allowed")
+        );
+        let link = linked_user(&pool, "telegram", "tg:1")
+            .await
+            .expect("link")
+            .expect("linked");
+        assert_eq!((link.user_id, link.user_name.as_str()), (alice, "Alice"));
+        assert!(
+            redeem(&pool, "telegram", "bot", "tg:2", &code.code, now)
+                .await
+                .expect("redeem")
+                .is_none(),
+            "once only"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_admitted_sender_still_links_and_linking_again_replaces() {
+        let pool = connect_in_memory().await.expect("db");
+        let alice = user(&pool, "Alice").await;
+        let bob = user(&pool, "Bob").await;
+        let now = Utc::now();
+        // Admitted by a plain invite first: a second plain invite does nothing.
+        let plain = create_invite(&pool, "telegram", "bot", DEFAULT_TTL)
+            .await
+            .expect("invite");
+        redeem(&pool, "telegram", "bot", "tg:1", &plain.code, now)
+            .await
+            .expect("redeem");
+        let again = create_invite(&pool, "telegram", "bot", DEFAULT_TTL)
+            .await
+            .expect("invite");
+        assert!(
+            redeem(&pool, "telegram", "bot", "tg:1", &again.code, now)
+                .await
+                .expect("redeem")
+                .is_none()
+        );
+        assert_eq!(
+            linked_user(&pool, "telegram", "tg:1").await.expect("link"),
+            None
+        );
+        // A web code links them though.
+        let a = create_link_code(&pool, "telegram", "bot", alice)
+            .await
+            .expect("code");
+        assert!(
+            redeem(&pool, "telegram", "bot", "tg:1", &a.code, now)
+                .await
+                .expect("redeem")
+                .is_some()
+        );
+        assert_eq!(
+            linked_user(&pool, "telegram", "tg:1")
+                .await
+                .expect("link")
+                .map(|l| l.user_id),
+            Some(alice)
+        );
+        // Alice links another Telegram account: it replaces the first.
+        let a2 = create_link_code(&pool, "telegram", "bot", alice)
+            .await
+            .expect("code");
+        redeem(&pool, "telegram", "bot", "tg:2", &a2.code, now)
+            .await
+            .expect("redeem");
+        assert_eq!(
+            linked_user(&pool, "telegram", "tg:1").await.expect("link"),
+            None
+        );
+        // Bob links tg:2: it is Bob's now, and Alice has none.
+        let b = create_link_code(&pool, "telegram", "bot", bob)
+            .await
+            .expect("code");
+        redeem(&pool, "telegram", "bot", "tg:2", &b.code, now)
+            .await
+            .expect("redeem");
+        assert_eq!(
+            linked_user(&pool, "telegram", "tg:2")
+                .await
+                .expect("link")
+                .map(|l| l.user_id),
+            Some(bob)
+        );
+        assert!(
+            list_links(&pool, Some(alice))
+                .await
+                .expect("links")
+                .is_empty()
+        );
+        assert_eq!(list_links(&pool, None).await.expect("links").len(), 1);
+        assert!(
+            !unlink(&pool, alice, "telegram", "tg:2")
+                .await
+                .expect("unlink"),
+            "not Alice's"
+        );
+        assert!(
+            unlink(&pool, bob, "telegram", "tg:2")
+                .await
+                .expect("unlink")
+        );
+        assert!(
+            is_allowed(&pool, "telegram", "bot", "tg:2")
+                .await
+                .expect("allowed"),
+            "still admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_web_code_works_only_for_its_account() {
+        let pool = connect_in_memory().await.expect("db");
+        let alice = user(&pool, "Alice").await;
+        let code = create_link_code(&pool, "telegram", "bot", alice)
+            .await
+            .expect("code");
+        let other = redeem(
+            &pool,
+            "telegram",
+            "other-bot",
+            "tg:1",
+            &code.code,
+            Utc::now(),
+        )
+        .await
+        .expect("redeem");
+        assert!(other.is_none());
+        assert_eq!(
+            linked_user(&pool, "telegram", "tg:1").await.expect("link"),
+            None
+        );
+    }
 
     #[test]
     fn generated_codes_are_canonical_and_distinct() {
