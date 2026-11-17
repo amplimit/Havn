@@ -355,22 +355,30 @@ pub async fn set_chat_model(pool: &SqlitePool, chat: &str, model: Option<&str>) 
     Ok(res.rows_affected() > 0)
 }
 
-/// Whether turn `turn` is on chat `chat`'s branch: the path to its head.
-pub async fn on_branch(pool: &SqlitePool, chat: &str, turn: &str) -> Result<bool> {
-    let found: Option<(i64,)> = sqlx::query_as(
-        "WITH RECURSIVE path(id, parent_id) AS ( \
-             SELECT c.id, c.parent_id FROM conversations c JOIN chats h ON h.head = c.id \
+/// Turns a branch is followed back at most, so a cycle an agent wrote into
+/// its own database cannot keep a query going.
+const MAX_BRANCH_DEPTH: u32 = 100_000;
+
+/// The ids of chat `chat`'s branch: the path to its head.
+pub async fn branch_ids(
+    pool: &SqlitePool,
+    chat: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let ids: Vec<(String,)> = sqlx::query_as(
+        "WITH RECURSIVE path(id, parent_id, depth) AS ( \
+             SELECT c.id, c.parent_id, 1 FROM conversations c JOIN chats h ON h.head = c.id \
              WHERE h.id = ?1 \
-             UNION ALL \
-             SELECT c.id, c.parent_id FROM conversations c JOIN path p ON c.id = p.parent_id \
+             UNION \
+             SELECT c.id, c.parent_id, p.depth + 1 FROM conversations c \
+             JOIN path p ON c.id = p.parent_id WHERE p.depth < ?2 \
          ) \
-         SELECT 1 FROM path WHERE id = ?2",
+         SELECT id FROM path",
     )
     .bind(chat)
-    .bind(turn)
-    .fetch_optional(pool)
+    .bind(MAX_BRANCH_DEPTH)
+    .fetch_all(pool)
     .await?;
-    Ok(found.is_some())
+    Ok(ids.into_iter().map(|(id,)| id).collect())
 }
 
 /// The last `limit` turns of chat `chat`'s branch, oldest first: the path
@@ -1414,10 +1422,18 @@ mod tests {
         let last_question = branch(&pool, &chat, 100).await.expect("branch")[2]
             .id
             .clone();
-        assert!(on_branch(&pool, &chat, &last_question).await.expect("db"));
+        assert!(
+            branch_ids(&pool, &chat)
+                .await
+                .expect("db")
+                .contains(&last_question)
+        );
         assert_eq!(undo(&pool, &chat).await.expect("db").as_deref(), Some("q2"));
         assert!(
-            !on_branch(&pool, &chat, &last_question).await.expect("db"),
+            !branch_ids(&pool, &chat)
+                .await
+                .expect("db")
+                .contains(&last_question),
             "taken back"
         );
         assert_eq!(said(&pool, &chat).await, ["q1", "a1"]);

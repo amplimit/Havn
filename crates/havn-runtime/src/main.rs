@@ -2738,12 +2738,19 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                     .await
                     .map_err(|e| e.to_string())?;
                 let mut turns = Vec::with_capacity(hits.len());
+                // Each chat's branch, read once.
+                let mut branches: HashMap<String, std::collections::HashSet<String>> =
+                    HashMap::new();
                 for t in hits {
                     // A turn on its chat's branch is shown by opening the
                     // chat; one on another, by moving the chat to it.
-                    let on_branch = conversations::on_branch(&ctx.pool, &t.chat, &t.id)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    if !branches.contains_key(&t.chat) {
+                        let ids = conversations::branch_ids(&ctx.pool, &t.chat)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        branches.insert(t.chat.clone(), ids);
+                    }
+                    let on_branch = branches.get(&t.chat).is_some_and(|ids| ids.contains(&t.id));
                     turns.push(serde_json::json!({
                         "id": t.id,
                         "chat": t.chat,
