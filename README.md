@@ -577,7 +577,7 @@ A message that is only a command is answered by the gateway or the agent and nev
 | `/whoami` | who the gateway takes you for, and whether you may use the admin commands |
 | `/help` (`/commands`) | lists them |
 
-`/model`, `/think`, `/agent_model`, `/usage`, `/approve` and `/deny` spend the agent owner's credentials or let a step through, so only admins may use them: in the dashboard, the agent's owner; in a channel, the senders listed in the account's `admins` (none by default):
+`/model`, `/think`, `/agent_model`, `/usage`, `/approve` and `/deny` spend the agent owner's credentials or let a step through, so only admins may use them: in the dashboard, the agent's owner; in a channel, the agent's owner once they connected that chat account to their Havn account (see [Connecting a chat account](#connecting-a-chat-account)), and the senders listed in the account's `admins` (none by default):
 
 ```toml
 [[channels.telegram.accounts]]
@@ -630,6 +630,26 @@ havn access revoke --all --account acme-bot [--channel telegram]   # every invit
 `access revoke` applies to the sender's next message, and the agent can no longer message them either. Entries in `allow_from` can only be removed from the config file; `access revoke` warns when a sender it removed is still listed there.
 
 Invited senders are stored per account and outlive config edits. If an account is removed or switched to `open`, its grants stop applying but are kept, and apply again if the account comes back as `allowlist`. The gateway warns about such grants at start-up and `access list` marks them; clear them with `havn access revoke --all`.
+
+### Connecting a chat account
+
+A Havn user can connect their own Telegram account (or another chat app's) to their Havn account, without the operator. On an agent's settings page, **chat apps** > **connect** makes a pairing code for each channel account the agent is bound to; it works once, for 10 minutes. The person sends it to the bot, or opens the link shown beside it, which sends `/start <code>`. The gateway then admits the sender as an invite does, links the sender to the Havn user who made the code, and replies "Connected to Havn account <name>."
+
+- A linked sender who owns the agent may use the admin commands (`/model`, `/approve`, ...) without being listed in `admins`; `admins` stays for people without a Havn account.
+- A linked sender may write to the bots of every agent of the same user without another code.
+- A sender is one user's, and a user has one sender per channel: linking again replaces the earlier link. A sender who can already write to the bot links with the link (`/start <code>`) too.
+- Links are listed, and removed, under **chat apps** on any agent's settings page (`GET` and `DELETE /me/channel-links`); removing one leaves the sender admitted where they were. `havn access list` shows who each sender is linked to. Creating a code and linking and unlinking are audited as `channel_link.code_created`, `channel_link.created` and `channel_link.removed`.
+- Codes made with `havn invite create` keep working as before: they admit a sender and link them to no one.
+
+The link needs the bot's username on the account; without it the page shows only the code:
+
+```toml
+[[channels.telegram.accounts]]
+id           = "acme-bot"
+bot_username = "acme_bot"    # the Telegram bot's username, for https://t.me/acme_bot?start=<code>
+```
+
+The reply to a link can be set like the other texts, with `{name}` for the account's name: `linked = "已连接到 Havn 账号 {name}。"` under `[channel_texts.<channel>.<account>]`.
 
 ## Capability Packs
 

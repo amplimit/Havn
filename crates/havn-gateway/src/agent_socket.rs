@@ -4126,6 +4126,7 @@ mod tests {
                     dm_policy: crate::config::DmPolicy::Allowlist,
                     allow_from: Vec::new(),
                     admins: Vec::new(),
+                    bot_username: None,
                 }],
             },
         );

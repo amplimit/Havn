@@ -220,12 +220,56 @@ fn access_lines(
     lines
 }
 
+/// `lines` with the Havn user each sender is linked to (issue #182), and a
+/// line for each linked sender of `channel` no line names.
+fn with_links(
+    mut lines: Vec<String>,
+    links: &[channel_access::ChannelLink],
+    channel: Option<&str>,
+) -> Vec<String> {
+    let mut named = std::collections::HashSet::new();
+    for line in &mut lines {
+        let mut words = line.split_whitespace();
+        let ch = words
+            .next()
+            .and_then(|w| w.split('/').next())
+            .unwrap_or("")
+            .to_string();
+        let sender = words.next().unwrap_or("").to_string();
+        if let Some(link) = links
+            .iter()
+            .find(|l| l.channel == ch && l.sender_id == sender)
+        {
+            line.push_str(&format!("  linked={}", link.user_name));
+            named.insert((ch, sender));
+        }
+    }
+    for link in links
+        .iter()
+        .filter(|l| channel.is_none_or(|c| c == l.channel))
+    {
+        if !named.contains(&(link.channel.clone(), link.sender_id.clone())) {
+            lines.push(format!(
+                "{}  {}  linked={}  linked_at={}",
+                link.channel,
+                link.sender_id,
+                link.user_name,
+                ts(link.linked_at)
+            ));
+        }
+    }
+    lines
+}
+
 pub async fn access_list(channel: Option<&str>, account: Option<&str>) -> anyhow::Result<()> {
     let cfg = paths::load_config()?;
     let pool = open_db_pub().await?;
     let allowed = channel_access::list_allowed(&pool)
         .await
         .context("listing allowed senders")?;
+    let links = channel_access::list_links(&pool, None)
+        .await
+        .context("listing linked senders")?;
     let lines = access_lines(
         &cfg,
         paths::config_path().is_some(),
@@ -233,6 +277,7 @@ pub async fn access_list(channel: Option<&str>, account: Option<&str>) -> anyhow
         channel,
         account,
     );
+    let lines = with_links(lines, &links, channel);
     if lines.is_empty() {
         println!("(no allowed senders)");
     }
@@ -316,6 +361,40 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn linked_senders_are_named() {
+        let link = |ch: &str, sender: &str, name: &str| channel_access::ChannelLink {
+            channel: ch.into(),
+            sender_id: sender.into(),
+            user_id: havn_core::UserId::new(),
+            user_name: name.into(),
+            linked_at: chrono::Utc::now(),
+        };
+        let lines = vec![
+            "telegram/bot  tg:1  source=config".to_string(),
+            "telegram/bot  tg:2  source=invite  invite=-  registered=x".to_string(),
+        ];
+        let out = with_links(
+            lines,
+            &[
+                link("telegram", "tg:2", "Alice"),
+                link("telegram", "tg:9", "Bob"),
+            ],
+            Some("telegram"),
+        );
+        assert_eq!(out[0], "telegram/bot  tg:1  source=config");
+        assert!(out[1].ends_with("  linked=Alice"), "{}", out[1]);
+        assert!(
+            out[2].starts_with("telegram  tg:9  linked=Bob  linked_at="),
+            "{}",
+            out[2]
+        );
+        assert_eq!(
+            with_links(Vec::new(), &[link("slack", "s:1", "C")], Some("telegram")).len(),
+            0
+        );
+    }
 
     fn config(toml: &str) -> CliConfig {
         toml::from_str(toml).expect("config")

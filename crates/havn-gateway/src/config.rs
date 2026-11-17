@@ -193,6 +193,10 @@ pub struct ChannelAccount {
     /// chat.
     #[serde(default)]
     pub admins: Vec<String>,
+    /// The bot's username on its platform (Telegram: `acme_bot`), for the
+    /// pairing links the dashboard shows (`https://t.me/acme_bot?start=`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_username: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -353,6 +357,9 @@ pub struct PairingTexts {
     pub help: Option<String>,
     /// The answer to a code accepted.
     pub paired: Option<String>,
+    /// The answer to a pairing code made on the web, which links the
+    /// sender to a Havn account; `{name}` is the account's name.
+    pub linked: Option<String>,
 }
 
 /// Channel id, then account id, to the account's texts.
@@ -1066,6 +1073,7 @@ mod tests {
                     dm_policy: DmPolicy::Allowlist,
                     allow_from: Vec::new(),
                     admins: Vec::new(),
+                    bot_username: None,
                 }],
             },
         );
@@ -1091,6 +1099,7 @@ mod tests {
                     dm_policy: DmPolicy::Allowlist,
                     allow_from: Vec::new(),
                     admins: Vec::new(),
+                    bot_username: None,
                 }],
             },
         );
