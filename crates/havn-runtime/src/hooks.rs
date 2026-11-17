@@ -308,6 +308,18 @@ impl HookSet {
         self.rules.is_empty()
     }
 
+    /// The patterns of the rules about `file_read`, deny and ask alike:
+    /// `file_find` and `file_search` leave out the files they match, as
+    /// reading them would be refused or wait for approval.
+    pub fn guarded_reads(&self) -> Vec<String> {
+        self.rules
+            .iter()
+            .filter(|rule| rule.covers("file_read"))
+            .flat_map(|rule| rule.deny.iter().chain(&rule.ask))
+            .map(|p| p.as_str().to_string())
+            .collect()
+    }
+
     /// Tool names that rules target but `known` does not contain. A
     /// typo here would otherwise leave a rule that never fires.
     pub fn unknown_tools<'a>(&'a self, known: &[&str]) -> Vec<&'a str> {
@@ -386,6 +398,22 @@ mod tests {
 ",
         );
         assert!(matches!(edit_only.veto("file_write", "x"), Veto::Allow));
+    }
+
+    #[test]
+    fn file_read_rules_are_the_guarded_reads() {
+        let set = set_with(
+            "pre_tool_use:
+  - tool: file_read
+    deny: ['^secrets/']
+    ask: ['\\.env$']
+  - tool: file_*
+    deny: ['^private/']
+  - tool: shell
+    deny: ['rm']
+",
+        );
+        assert_eq!(set.guarded_reads(), ["^secrets/", "\\.env$", "^private/"]);
     }
 
     #[test]

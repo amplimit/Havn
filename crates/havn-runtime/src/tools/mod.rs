@@ -156,6 +156,8 @@ impl ToolRegistry {
             Arc::new(files::FileReadTool),
             Arc::new(files::FileWriteTool),
             Arc::new(files::FileEditTool),
+            Arc::new(files::FileFindTool),
+            Arc::new(files::FileSearchTool),
         ];
         if policy.permissions.can_use_shell {
             tools.push(Arc::new(shell::ShellTool));
@@ -296,7 +298,8 @@ impl ToolRegistry {
     /// True iff the named tool is disabled in this execution context by
     /// `policy.context_toolsets[context].disabled`.
     /// Disabling `file_write` disables `file_edit` too: both change files,
-    /// and a policy written before `file_edit` existed means both.
+    /// and a policy written before `file_edit` existed means both. Likewise
+    /// disabling `file_read` disables `file_find` and `file_search`.
     fn disabled_in(&self, context: &str, tool_name: &str) -> bool {
         // Scheduled runs, heartbeats and other agents' queries answer no
         // one's chat message: there are no past chats of theirs to search.
@@ -313,10 +316,11 @@ impl ToolRegistry {
             .0
             .get(context)
             .is_some_and(|entry| {
-                entry
-                    .disabled
-                    .iter()
-                    .any(|d| d == tool_name || (d == "file_write" && tool_name == "file_edit"))
+                entry.disabled.iter().any(|d| {
+                    d == tool_name
+                        || (d == "file_write" && tool_name == "file_edit")
+                        || (d == "file_read" && matches!(tool_name, "file_find" | "file_search"))
+                })
             })
     }
 
@@ -446,6 +450,21 @@ impl ToolRegistry {
             }
         }
 
+        // Finding and searching files leave out the files a rule about
+        // file_read guards; the registry says which, whatever the model
+        // sent in that field.
+        let mut input = input;
+        if matches!(name, "file_find" | "file_search")
+            && let Some(obj) = input.as_object_mut()
+        {
+            let guarded = self
+                .hooks
+                .as_ref()
+                .map(|h| h.load().guarded_reads())
+                .unwrap_or_default();
+            obj.insert(files::GUARDED_READS.into(), serde_json::json!(guarded));
+        }
+
         tool.execute(ctx, input).await
     }
 }
@@ -459,6 +478,7 @@ impl ToolRegistry {
 /// | `shell` | `command` |
 /// | `web_fetch` | `url` |
 /// | `file_read` / `file_write` / `file_edit` | `path` |
+/// | `file_find` / `file_search` | `path`, `glob` and `pattern` |
 /// | `memory_search` | `query` |
 /// | other | concatenated values, lossy fallback |
 ///
@@ -475,6 +495,9 @@ fn flatten_input_for_hook(tool: &str, input: &serde_json::Value) -> String {
         "shell" => pick("command"),
         "web_fetch" => pick("url"),
         "file_read" | "file_write" | "file_edit" => pick("path"),
+        "file_find" | "file_search" => {
+            format!("{} {} {}", pick("path"), pick("glob"), pick("pattern"))
+        }
         "memory_search" => pick("query"),
         "memory_remember" | "memory_forget" => pick("key"),
         "subagent_spawn" => pick("task"),
@@ -531,6 +554,8 @@ mod tests {
             "file_read",
             "file_write",
             "file_edit",
+            "file_find",
+            "file_search",
             "shell",
             "skill_manage",
         ] {
@@ -555,6 +580,10 @@ mod tests {
         // Always-on tools still present.
         assert!(names.contains(&"memory_remember".into()));
         assert!(names.contains(&"file_read".into()));
+        assert!(
+            names.contains(&"file_find".into()) && names.contains(&"file_search".into()),
+            "found without shell"
+        );
     }
 
     // ---- context layer (per call) -----------------------------------------

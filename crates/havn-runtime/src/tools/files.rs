@@ -1,5 +1,5 @@
-//! `file_read`, `file_write` and `file_edit` tools — workspace-scoped
-//! filesystem access.
+//! `file_read`, `file_write`, `file_edit`, `file_find` and `file_search`
+//! tools — workspace-scoped filesystem access.
 //!
 //! Path safety: reject absolute paths and any `..` parent-traversal
 //! component. Landlock and the namespace spawner's minimal rootfs add
@@ -502,6 +502,579 @@ fn git(workspace: &Path) -> tokio::process::Command {
 
 /// Join a user-provided path under `workspace`, rejecting absolute paths and
 /// any component that could escape the workspace (`..`, root, prefix).
+/// The field of a `file_find` or `file_search` input in which the registry
+/// passes the patterns of the hook rules about `file_read`.
+pub const GUARDED_READS: &str = "guarded_reads";
+
+/// Most directory entries one `file_find` or `file_search` looks at.
+const MAX_WALK_ENTRIES: usize = 50_000;
+/// Largest file `file_search` reads.
+const MAX_SEARCH_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// Results returned unless the call asks for fewer, and the most it may ask for.
+const DEFAULT_RESULTS: usize = 100;
+const MAX_RESULTS: usize = 500;
+/// Characters of a matching line shown, and the most lines of context.
+const MAX_LINE_CHARS: usize = 300;
+const MAX_CONTEXT_LINES: usize = 3;
+/// Links named in a result's notes.
+const MAX_LINKS_NAMED: usize = 5;
+/// Bytes looked at to tell a binary file.
+const BINARY_SNIFF_BYTES: usize = 8192;
+
+/// Whether `rel` (a path within the workspace, `/`-separated) is left out
+/// of finds and searches: version control, and the runtime's own state
+/// (the agent's database and `.havn`).
+fn hidden(rel: &str) -> bool {
+    let top = rel.split('/').next().unwrap_or("");
+    rel.split('/').any(|part| part == ".git")
+        || top == ".havn"
+        || top == "agent.db"
+        || top.starts_with("agent.db-")
+}
+
+/// A glob as a regex over workspace paths: `**` crosses directories, `*`
+/// and `?` do not, `{a,b}` is either, `[...]` a set. A glob without `/`
+/// matches a file's name in any directory. Case is ignored.
+fn glob_regex(glob: &str) -> Result<regex::Regex, String> {
+    let mut re = String::from(if glob.contains('/') { "^" } else { "^(?:.*/)?" });
+    let chars: Vec<char> = glob.trim_start_matches("./").chars().collect();
+    let mut i = 0;
+    let mut braces = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '*' if chars.get(i + 1) == Some(&'*') => {
+                i += 1;
+                if chars.get(i + 1) == Some(&'/') {
+                    i += 1;
+                    re.push_str("(?:.*/)?");
+                } else {
+                    re.push_str(".*");
+                }
+            }
+            '*' => re.push_str("[^/]*"),
+            '?' => re.push_str("[^/]"),
+            '{' => {
+                braces += 1;
+                re.push_str("(?:");
+            }
+            '}' if braces > 0 => {
+                braces -= 1;
+                re.push(')');
+            }
+            ',' if braces > 0 => re.push('|'),
+            '[' => {
+                let Some(end) = chars[i + 1..].iter().position(|c| *c == ']') else {
+                    return Err(format!("unclosed '[' in {glob:?}"));
+                };
+                let set: String = chars[i + 1..i + 1 + end].iter().collect();
+                let set = set
+                    .strip_prefix('!')
+                    .map_or(set.clone(), |s| format!("^{s}"));
+                re.push('[');
+                re.push_str(&set.replace('\\', "\\\\"));
+                re.push(']');
+                i += end + 1;
+            }
+            c => re.push_str(&regex::escape(&c.to_string())),
+        }
+        i += 1;
+    }
+    if braces > 0 {
+        return Err(format!("unclosed '{{' in {glob:?}"));
+    }
+    re.push('$');
+    regex::RegexBuilder::new(&re)
+        .case_insensitive(true)
+        .build()
+        .map_err(|e| format!("bad glob {glob:?}: {e}"))
+}
+
+/// A file a walk found.
+struct Found {
+    rel: String,
+    path: PathBuf,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+/// What a walk saw besides files.
+#[derive(Default)]
+struct Walked {
+    /// Links met, never followed.
+    links: Vec<String>,
+    /// Files that would have been in the result, left out because a hook
+    /// rule about `file_read` guards them.
+    guarded: usize,
+    /// It stopped at [`MAX_WALK_ENTRIES`].
+    stopped: bool,
+}
+
+/// The patterns in [`GUARDED_READS`] of `input`; a pattern that does not
+/// compile guards everything, as a rule that cannot be checked.
+fn guards_of(input: &Value) -> Vec<regex::Regex> {
+    input
+        .get(GUARDED_READS)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|p| {
+            regex::Regex::new(p).unwrap_or_else(|_| regex::Regex::new("").expect("empty regex"))
+        })
+        .collect()
+}
+
+/// The directory or file `user_path` names in `workspace` (the whole
+/// workspace when empty), refused when it, or a link on the way, leads
+/// out of it.
+fn start_of(workspace: &Path, user_path: Option<&str>) -> Result<(PathBuf, String), String> {
+    let user_path = user_path
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && *p != ".");
+    let Some(user_path) = user_path else {
+        return Ok((workspace.to_path_buf(), String::new()));
+    };
+    let joined = safe_join(workspace, user_path)?;
+    let root = workspace
+        .canonicalize()
+        .map_err(|e| format!("workspace: {e}"))?;
+    let real = joined
+        .canonicalize()
+        .map_err(|_| format!("not found: {user_path}"))?;
+    if !real.starts_with(&root) || is_link_on_way(workspace, user_path) {
+        return Err(format!(
+            "{user_path} leads out of the workspace or through a link"
+        ));
+    }
+    let rel = user_path
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string();
+    if hidden(&rel) {
+        return Err(format!("{user_path} is not searched"));
+    }
+    Ok((joined, rel))
+}
+
+/// Whether a component of `user_path` under `workspace` is a link.
+fn is_link_on_way(workspace: &Path, user_path: &str) -> bool {
+    let mut at = workspace.to_path_buf();
+    Path::new(user_path).components().any(|c| {
+        at.push(c);
+        std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink())
+    })
+}
+
+/// Every file under `start` (`rel` within the workspace), in name order,
+/// handed to `each` until it returns false; links are noted, not followed.
+fn walk(start: &Path, rel: &str, each: &mut dyn FnMut(Found) -> bool) -> Walked {
+    let mut walked = Walked::default();
+    let mut seen = 0usize;
+    let mut stack: Vec<(PathBuf, String)> = vec![(start.to_path_buf(), rel.to_string())];
+    while let Some((path, rel)) = stack.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            walked.links.push(rel);
+            continue;
+        }
+        if meta.is_file() {
+            let found = Found {
+                rel,
+                path,
+                size: meta.len(),
+                modified: meta.modified().ok(),
+            };
+            if !each(found) {
+                return walked;
+            }
+            continue;
+        }
+        if !meta.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        let mut children: Vec<(PathBuf, String)> = entries
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                let child = if rel.is_empty() {
+                    name
+                } else {
+                    format!("{rel}/{name}")
+                };
+                (!hidden(&child)).then(|| (e.path(), child))
+            })
+            .collect();
+        seen += children.len();
+        if seen > MAX_WALK_ENTRIES {
+            walked.stopped = true;
+            return walked;
+        }
+        // Popped from the end: reversed, they come out in name order.
+        children.sort_by(|a, b| b.1.cmp(&a.1));
+        stack.extend(children);
+    }
+    walked
+}
+
+/// The `limit` a call asks for, within bounds.
+fn limit_of(input: &Value) -> usize {
+    input
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map_or(DEFAULT_RESULTS, |n| {
+            usize::try_from(n).unwrap_or(MAX_RESULTS)
+        })
+        .clamp(1, MAX_RESULTS)
+}
+
+/// `bytes` as a person reads a size.
+fn size_text(bytes: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let b = bytes as f64;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if b < 1024.0 * 1024.0 {
+        format!("{:.1} KB", b / 1024.0)
+    } else {
+        format!("{:.1} MB", b / 1024.0 / 1024.0)
+    }
+}
+
+/// The notes closing a result: links not followed, a walk cut short.
+fn walk_notes(walked: &Walked, out: &mut String) {
+    if !walked.links.is_empty() {
+        let named: Vec<&str> = walked
+            .links
+            .iter()
+            .take(MAX_LINKS_NAMED)
+            .map(String::as_str)
+            .collect();
+        let more = walked.links.len().saturating_sub(MAX_LINKS_NAMED);
+        out.push_str(&format!(
+            "\n(links not followed: {}{})",
+            named.join(", "),
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        ));
+    }
+    if walked.guarded > 0 {
+        out.push_str(&format!(
+            "\n({} file(s) left out: the agent's rules guard reading them)",
+            walked.guarded
+        ));
+    }
+    if walked.stopped {
+        out.push_str(&format!(
+            "\n(stopped after {MAX_WALK_ENTRIES} entries: give a path to look in)"
+        ));
+    }
+}
+
+pub struct FileFindTool;
+
+#[async_trait]
+impl Tool for FileFindTool {
+    fn name(&self) -> &'static str {
+        "file_find"
+    }
+
+    fn description(&self) -> &'static str {
+        "Find files in the agent's workspace by name, with a glob: '*.xlsx' \
+         (a name in any folder), 'reports/2026-*', '**/*.{md,txt}'. Case is \
+         ignored. Returns paths with size and modified time, newest first. \
+         Links are listed, not followed; .git and the agent's own database \
+         are left out. Use file_search to find text in files."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "description": "Glob for the files' paths or names." },
+                "path": { "type": "string", "description": "Folder to look in, relative to the workspace; the whole workspace when absent." },
+                "limit": { "type": "integer", "description": "Most files listed (default 100, at most 500)." }
+            },
+            "required": ["pattern"]
+        })
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, input: Value) -> ToolResult {
+        let Some(pattern) = input.get("pattern").and_then(Value::as_str) else {
+            return ToolResult::Error("missing required field: pattern".into());
+        };
+        let glob = match glob_regex(pattern) {
+            Ok(g) => g,
+            Err(e) => return ToolResult::Error(e),
+        };
+        let (start, rel) = match start_of(
+            &ctx.workspace_dir,
+            input.get("path").and_then(Value::as_str),
+        ) {
+            Ok(s) => s,
+            Err(e) => return ToolResult::Error(e),
+        };
+        let limit = limit_of(&input);
+        let guards = guards_of(&input);
+        let found = tokio::task::spawn_blocking(move || {
+            let mut matches: Vec<Found> = Vec::new();
+            let mut guarded = 0usize;
+            let mut walked = walk(&start, &rel, &mut |f| {
+                if glob.is_match(&f.rel) {
+                    if guards.iter().any(|g| g.is_match(&f.rel)) {
+                        guarded += 1;
+                    } else {
+                        matches.push(f);
+                    }
+                }
+                true
+            });
+            walked.guarded = guarded;
+            (matches, walked)
+        })
+        .await;
+        let Ok((mut matches, walked)) = found else {
+            return ToolResult::Error("the search stopped unexpectedly".into());
+        };
+        matches.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.rel.cmp(&b.rel)));
+        let total = matches.len();
+        let mut out = if total == 0 {
+            format!("no files match {pattern:?}")
+        } else {
+            matches
+                .iter()
+                .take(limit)
+                .map(|f| {
+                    let when = f.modified.map_or_else(String::new, |m| {
+                        chrono::DateTime::<chrono::Utc>::from(m)
+                            .format("%Y-%m-%d %H:%M UTC")
+                            .to_string()
+                    });
+                    format!("{}  {}  {}", f.rel, size_text(f.size), when)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        if total > limit {
+            out.push_str(&format!(
+                "\n({} more not shown: narrow the pattern or the path)",
+                total - limit
+            ));
+        }
+        walk_notes(&walked, &mut out);
+        ToolResult::Ok(out)
+    }
+}
+
+pub struct FileSearchTool;
+
+#[async_trait]
+impl Tool for FileSearchTool {
+    fn name(&self) -> &'static str {
+        "file_search"
+    }
+
+    fn description(&self) -> &'static str {
+        "Find text in the files of the agent's workspace: a literal string, \
+         or a regular expression with regex set. Look in one folder or file \
+         with path, and only in files whose names match a glob with glob \
+         ('*.md'). Returns path:line: text for each matching line, with \
+         context lines when asked. Binary files, files over 2 MB, links, \
+         .git and the agent's own database are skipped, and the result says \
+         so. The text beside a document sent to the agent (inbox/*.txt) is \
+         searched like any file."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "description": "Text to find; a regular expression when regex is true." },
+                "regex": { "type": "boolean", "description": "Treat pattern as a regular expression." },
+                "ignore_case": { "type": "boolean", "description": "Ignore letter case." },
+                "path": { "type": "string", "description": "Folder or file to look in, relative to the workspace; the whole workspace when absent." },
+                "glob": { "type": "string", "description": "Only files whose paths or names match this glob." },
+                "context": { "type": "integer", "description": "Lines shown before and after each match (0 to 3, default 0)." },
+                "limit": { "type": "integer", "description": "Most matching lines listed (default 100, at most 500)." }
+            },
+            "required": ["pattern"]
+        })
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, input: Value) -> ToolResult {
+        let Some(pattern) = input.get("pattern").and_then(Value::as_str) else {
+            return ToolResult::Error("missing required field: pattern".into());
+        };
+        if pattern.is_empty() {
+            return ToolResult::Error("pattern must be non-empty".into());
+        }
+        let flag = |k: &str| input.get(k).and_then(Value::as_bool).unwrap_or(false);
+        let source = if flag("regex") {
+            pattern.to_string()
+        } else {
+            regex::escape(pattern)
+        };
+        let needle = match regex::RegexBuilder::new(&source)
+            .case_insensitive(flag("ignore_case"))
+            .size_limit(1 << 20)
+            .build()
+        {
+            Ok(r) => r,
+            Err(e) => return ToolResult::Error(format!("bad regex: {e}")),
+        };
+        let only = match input.get("glob").and_then(Value::as_str) {
+            Some(g) if !g.is_empty() => match glob_regex(g) {
+                Ok(r) => Some(r),
+                Err(e) => return ToolResult::Error(e),
+            },
+            _ => None,
+        };
+        let (start, rel) = match start_of(
+            &ctx.workspace_dir,
+            input.get("path").and_then(Value::as_str),
+        ) {
+            Ok(s) => s,
+            Err(e) => return ToolResult::Error(e),
+        };
+        let limit = limit_of(&input);
+        let context = input
+            .get("context")
+            .and_then(Value::as_u64)
+            .map_or(0, |n| usize::try_from(n).unwrap_or(MAX_CONTEXT_LINES))
+            .min(MAX_CONTEXT_LINES);
+        let guards = guards_of(&input);
+        let searched = tokio::task::spawn_blocking(move || {
+            let scope = Scope {
+                start: &start,
+                rel: &rel,
+                guards: &guards,
+                only: only.as_ref(),
+            };
+            search(&scope, &needle, context, limit)
+        })
+        .await;
+        match searched {
+            Ok(out) => ToolResult::Ok(out),
+            Err(_) => ToolResult::Error("the search stopped unexpectedly".into()),
+        }
+    }
+}
+
+/// `text` within [`MAX_LINE_CHARS`].
+fn line_text(text: &str) -> String {
+    let text = text.trim_end_matches('\r');
+    if text.chars().count() <= MAX_LINE_CHARS {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(MAX_LINE_CHARS).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// Where a search looks.
+struct Scope<'a> {
+    start: &'a Path,
+    rel: &'a str,
+    guards: &'a [regex::Regex],
+    /// Only files whose paths match this glob.
+    only: Option<&'a regex::Regex>,
+}
+
+/// The lines matching `needle` in the files of `scope`, as
+/// `path:line: text`, context lines as `path-line- text`.
+fn search(scope: &Scope<'_>, needle: &regex::Regex, context: usize, limit: usize) -> String {
+    let only = scope.only;
+    let mut out: Vec<String> = Vec::new();
+    let mut matched = 0usize;
+    let mut cut = false;
+    let (mut binary, mut large, mut files) = (0usize, 0usize, 0usize);
+    let mut guarded = 0usize;
+    let mut walked = walk(scope.start, scope.rel, &mut |f| {
+        if only.is_some_and(|g| !g.is_match(&f.rel)) {
+            return true;
+        }
+        if scope.guards.iter().any(|g| g.is_match(&f.rel)) {
+            guarded += 1;
+            return true;
+        }
+        if f.size > MAX_SEARCH_FILE_BYTES {
+            large += 1;
+            return true;
+        }
+        let Ok(bytes) = std::fs::read(&f.path) else {
+            return true;
+        };
+        if bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
+            binary += 1;
+            return true;
+        }
+        let Ok(text) = String::from_utf8(bytes) else {
+            binary += 1;
+            return true;
+        };
+        files += 1;
+        let lines: Vec<&str> = text.lines().collect();
+        let mut shown_to = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            if !needle.is_match(line) {
+                continue;
+            }
+            if matched == limit {
+                cut = true;
+                return false;
+            }
+            matched += 1;
+            let from = i.saturating_sub(context).max(shown_to);
+            if context > 0 && from > shown_to && !out.is_empty() {
+                out.push("--".into());
+            }
+            for (j, l) in lines.iter().enumerate().take(i).skip(from) {
+                out.push(format!("{}-{}- {}", f.rel, j + 1, line_text(l)));
+            }
+            out.push(format!("{}:{}: {}", f.rel, i + 1, line_text(line)));
+            let to = (i + 1 + context).min(lines.len());
+            for (j, l) in lines.iter().enumerate().take(to).skip(i + 1) {
+                if needle.is_match(l) {
+                    break;
+                }
+                out.push(format!("{}-{}- {}", f.rel, j + 1, line_text(l)));
+            }
+            shown_to = to.max(i + 1);
+        }
+        true
+    });
+    walked.guarded = guarded;
+    let mut text = if matched == 0 {
+        format!("no matches in {files} file(s)")
+    } else {
+        out.join("\n")
+    };
+    if cut {
+        text.push_str(&format!(
+            "\n(stopped at {limit} matching lines: narrow the pattern, the path or the glob)"
+        ));
+    }
+    if binary > 0 || large > 0 {
+        let mut skipped = Vec::new();
+        if binary > 0 {
+            skipped.push(format!("{binary} binary file(s)"));
+        }
+        if large > 0 {
+            skipped.push(format!("{large} file(s) over 2 MB"));
+        }
+        text.push_str(&format!("\n(skipped {})", skipped.join(" and ")));
+    }
+    walk_notes(&walked, &mut text);
+    text
+}
+
 fn safe_join(workspace: &Path, user_path: &str) -> Result<PathBuf, String> {
     if user_path.is_empty() {
         return Err("path must be non-empty".into());
@@ -542,6 +1115,243 @@ mod tests {
             policy: Arc::new(Policy::default()),
             embedder: None,
         }
+    }
+
+    async fn put(ctx: &ToolCtx, rel: &str, content: &[u8]) {
+        let path = ctx.workspace_dir.join(rel);
+        tokio::fs::create_dir_all(path.parent().expect("parent"))
+            .await
+            .expect("dir");
+        tokio::fs::write(path, content).await.expect("write");
+    }
+
+    fn text_of(r: ToolResult) -> String {
+        match r {
+            ToolResult::Ok(s) => s,
+            ToolResult::Error(e) => panic!("tool error: {e}"),
+        }
+    }
+
+    #[test]
+    fn globs_match_names_anywhere_and_paths_from_the_root() {
+        let m = |g: &str, p: &str| glob_regex(g).expect("glob").is_match(p);
+        assert!(m("*.xlsx", "a/b/Report.XLSX"));
+        assert!(m("*.xlsx", "q.xlsx"));
+        assert!(!m("*.xlsx", "q.xlsx.txt"));
+        assert!(m("reports/2026-*", "reports/2026-03.md"));
+        assert!(!m("reports/2026-*", "old/reports/2026-03.md"));
+        assert!(!m("reports/*", "reports/a/b.md"));
+        assert!(m("**/*.{md,txt}", "notes.md"));
+        assert!(m("**/*.{md,txt}", "a/b/notes.txt"));
+        assert!(m("data/[!x]?.csv", "data/ab.csv"));
+        assert!(!m("data/[!x]?.csv", "data/xb.csv"));
+        assert!(m("报告*", "资料/报告-三月.docx"));
+        assert!(glob_regex("a{b").is_err());
+        assert!(glob_regex("a[b").is_err());
+    }
+
+    #[tokio::test]
+    async fn file_find_lists_newest_first_and_leaves_out_internal_files() {
+        let ctx = ctx().await;
+        put(&ctx, "old.md", b"old").await;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        put(&ctx, "notes/new.md", b"new").await;
+        put(&ctx, "agent.db", b"db").await;
+        put(&ctx, "agent.db-wal", b"db").await;
+        put(&ctx, ".git/HEAD.md", b"x").await;
+        put(&ctx, ".havn/home/secret.md", b"x").await;
+        let out = text_of(FileFindTool.execute(&ctx, json!({"pattern": "*.md"})).await);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out}");
+        assert!(lines[0].starts_with("notes/new.md  3 B  "), "{out}");
+        assert!(lines[1].starts_with("old.md  "), "{out}");
+        let all = text_of(FileFindTool.execute(&ctx, json!({"pattern": "**"})).await);
+        assert!(
+            !all.contains("agent.db") && !all.contains(".havn") && !all.contains(".git"),
+            "{all}"
+        );
+        let within = text_of(
+            FileFindTool
+                .execute(&ctx, json!({"pattern": "*", "path": "notes"}))
+                .await,
+        );
+        assert_eq!(within.lines().count(), 1, "{within}");
+        let few = text_of(
+            FileFindTool
+                .execute(&ctx, json!({"pattern": "*.md", "limit": 1}))
+                .await,
+        );
+        assert!(few.contains("(1 more not shown"), "{few}");
+        for bad in ["../x", "/etc", ".havn", "agent.db"] {
+            assert!(
+                matches!(
+                    FileFindTool
+                        .execute(&ctx, json!({"pattern": "*", "path": bad}))
+                        .await,
+                    ToolResult::Error(_)
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn links_are_named_and_never_followed() {
+        let ctx = ctx().await;
+        let outside = tempfile::tempdir().expect("dir");
+        std::fs::write(outside.path().join("secret.md"), "password hunter2").expect("write");
+        std::os::unix::fs::symlink(outside.path(), ctx.workspace_dir.join("out")).expect("link");
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.md"),
+            ctx.workspace_dir.join("s.md"),
+        )
+        .expect("link");
+        put(&ctx, "in.md", b"hunter2 is here too").await;
+        let found = text_of(FileFindTool.execute(&ctx, json!({"pattern": "*.md"})).await);
+        assert!(!found.contains("secret.md"), "{found}");
+        assert!(found.contains("links not followed: out, s.md"), "{found}");
+        let hits = text_of(
+            FileSearchTool
+                .execute(&ctx, json!({"pattern": "hunter2"}))
+                .await,
+        );
+        assert_eq!(
+            hits.lines().next(),
+            Some("in.md:1: hunter2 is here too"),
+            "{hits}"
+        );
+        assert!(!hits.contains("password"), "{hits}");
+        for path in ["out", "out/secret.md", "s.md"] {
+            assert!(
+                matches!(
+                    FileSearchTool
+                        .execute(&ctx, json!({"pattern": "x", "path": path}))
+                        .await,
+                    ToolResult::Error(_)
+                ),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn files_the_rules_guard_from_reading_are_left_out() {
+        let ctx = ctx().await;
+        put(&ctx, "secrets/key.md", b"token abc").await;
+        put(&ctx, "notes.md", b"token def").await;
+        let guarded = |mut input: Value| {
+            input[GUARDED_READS] = json!(["^secrets/"]);
+            input
+        };
+        let found = text_of(
+            FileFindTool
+                .execute(&ctx, guarded(json!({"pattern": "*.md"})))
+                .await,
+        );
+        assert!(found.starts_with("notes.md  "), "{found}");
+        assert!(!found.contains("secrets/key.md"), "{found}");
+        assert!(
+            found.contains("(1 file(s) left out: the agent's rules guard reading them)"),
+            "{found}"
+        );
+        let other = text_of(
+            FileFindTool
+                .execute(&ctx, guarded(json!({"pattern": "notes.*"})))
+                .await,
+        );
+        assert!(
+            !other.contains("left out"),
+            "a guarded file the pattern misses is not counted: {other}"
+        );
+        let hits = text_of(
+            FileSearchTool
+                .execute(&ctx, guarded(json!({"pattern": "token"})))
+                .await,
+        );
+        assert_eq!(hits.lines().next(), Some("notes.md:1: token def"), "{hits}");
+        assert!(!hits.contains("abc"), "{hits}");
+        let unchecked = text_of(
+            FileSearchTool
+                .execute(&ctx, json!({"pattern": "token", GUARDED_READS: ["("]}))
+                .await,
+        );
+        assert!(
+            unchecked.starts_with("no matches"),
+            "a rule that does not compile guards all: {unchecked}"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_search_finds_text_with_context_and_says_what_it_skipped() {
+        let ctx = ctx().await;
+        put(
+            &ctx,
+            "inbox/合同.txt",
+            "甲方：张三\n乙方：李四\n金额：一百万\n签署日期：三月\n".as_bytes(),
+        )
+        .await;
+        put(&ctx, "notes.md", b"alpha\nBeta\ngamma\n").await;
+        put(&ctx, "pic.png", b"\x89PNG\0\0binary").await;
+        put(&ctx, "big.log", &vec![b'a'; 2 * 1024 * 1024 + 1]).await;
+        let out = text_of(
+            FileSearchTool
+                .execute(&ctx, json!({"pattern": "乙方", "context": 1}))
+                .await,
+        );
+        assert!(out.starts_with("inbox/合同.txt-1- 甲方：张三\ninbox/合同.txt:2: 乙方：李四\ninbox/合同.txt-3- 金额：一百万"), "{out}");
+        assert!(
+            out.contains("(skipped 1 binary file(s) and 1 file(s) over 2 MB)"),
+            "{out}"
+        );
+        let none = text_of(
+            FileSearchTool
+                .execute(&ctx, json!({"pattern": "beta"}))
+                .await,
+        );
+        assert!(none.starts_with("no matches in 2 file(s)"), "{none}");
+        let folded = text_of(
+            FileSearchTool
+                .execute(
+                    &ctx,
+                    json!({"pattern": "beta", "ignore_case": true, "glob": "*.md"}),
+                )
+                .await,
+        );
+        assert_eq!(folded.lines().next(), Some("notes.md:2: Beta"), "{folded}");
+        let re = text_of(
+            FileSearchTool
+                .execute(
+                    &ctx,
+                    json!({"pattern": "^(alpha|gamma)$", "regex": true, "path": "notes.md"}),
+                )
+                .await,
+        );
+        assert_eq!(re, "notes.md:1: alpha\nnotes.md:3: gamma");
+        let literal = text_of(
+            FileSearchTool
+                .execute(&ctx, json!({"pattern": "a|b"}))
+                .await,
+        );
+        assert!(
+            literal.starts_with("no matches"),
+            "a literal, not a regex: {literal}"
+        );
+        let cut = text_of(
+            FileSearchTool
+                .execute(
+                    &ctx,
+                    json!({"pattern": "a", "path": "notes.md", "limit": 1}),
+                )
+                .await,
+        );
+        assert!(cut.contains("(stopped at 1 matching lines"), "{cut}");
+        assert!(matches!(
+            FileSearchTool
+                .execute(&ctx, json!({"pattern": "(", "regex": true}))
+                .await,
+            ToolResult::Error(_)
+        ));
     }
 
     #[tokio::test]
