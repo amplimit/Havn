@@ -1337,6 +1337,7 @@ async fn handle_heartbeat(ctx: Ctx) {
         &augmented,
         None,
         None,
+        None,
     )
     .await
     {
@@ -1775,6 +1776,30 @@ async fn chat_command(ctx: &Ctx, command: &havn_proto::ChatCommand) -> (Option<S
                 ),
             )
         }
+        ChatCommandKind::Think { choice } => {
+            let chat = match conversations::chat_for(&ctx.pool, scope, requested, "").await {
+                Ok(chat) => chat,
+                Err(e) => return failed(e),
+            };
+            let text = match choice.as_deref() {
+                None => match conversations::chat_thinking(&ctx.pool, &chat).await {
+                    Ok(Some(t)) => format!("(This chat thinks: {t}. /think default goes back to its model's own setting.)"),
+                    Ok(None) => "(This chat thinks as its model is set to. /think off, on, a level or a budget changes it for this chat.)".into(),
+                    Err(e) => return failed(e),
+                },
+                Some(choice) => {
+                    let kept = (choice != "default").then_some(choice);
+                    if let Err(e) = conversations::set_chat_thinking(&ctx.pool, &chat, kept).await {
+                        return failed(e);
+                    }
+                    match kept {
+                        Some(t) => format!("(This chat thinks: {t}, from its next reply on, where its model takes it.)"),
+                        None => "(This chat thinks as its model is set to again.)".into(),
+                    }
+                }
+            };
+            (Some(chat), text)
+        }
         ChatCommandKind::Status { agent } => {
             let chat = match existing().await {
                 Ok(chat) => chat,
@@ -1806,8 +1831,11 @@ async fn chat_command(ctx: &Ctx, command: &havn_proto::ChatCommand) -> (Option<S
             (
                 chat,
                 format!(
-                    "Agent: {agent}\nModel: {model}\nThis chat: {chat_line}\nReplies being \
-                     written or waiting: {waiting}"
+                    "Agent: {agent}\nModel: {model}\nThinking: {}\nThis chat: {chat_line}\nReplies \
+                     being written or waiting: {waiting}",
+                    info.as_ref()
+                        .and_then(|i| i.thinking.as_deref())
+                        .unwrap_or("as the model is set")
                 ),
             )
         }
@@ -1865,7 +1893,7 @@ async fn title_chat(
             model: model.as_str().into(),
             messages: serde_json::json!([{ "role": "user", "content": message }]),
             // Room for a reasoning model's thinking before its answer.
-            options: serde_json::json!({ "max_tokens": TITLE_MAX_TOKENS, "system": TITLE_PROMPT }),
+            options: serde_json::json!({ "max_tokens": TITLE_MAX_TOKENS, "system": TITLE_PROMPT, "thinking": "off" }),
             billing_user_id: None,
             reply: None,
         };
@@ -2138,6 +2166,13 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         _ => user_text,
     };
 
+    // The chat's own thinking choice, when one was made.
+    let chat_thinking = conversations::chat_thinking(&ctx.pool, &chat)
+        .await
+        .unwrap_or_else(|e| {
+            warn!(error = %e, "could not read the chat's thinking; using its model's");
+            None
+        });
     // The chat's own model, when `/model` set one.
     let chat_model = match conversations::chat_model(&ctx.pool, &chat).await {
         Ok(model) => model.map(Arc::new),
@@ -2180,6 +2215,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
                             &augmented,
                             Some(stop),
                             chat_model,
+                            chat_thinking,
                         ),
                     ),
                 ),
@@ -2277,6 +2313,7 @@ async fn run_tool_loop(
     system_prompt: &SystemPrompt,
     stop: Option<tokio_util::sync::CancellationToken>,
     model: Option<Arc<String>>,
+    thinking: Option<String>,
 ) -> anyhow::Result<String> {
     let mut handle = ctx.parent_handle();
     handle.stop = stop;
@@ -2286,7 +2323,10 @@ async fn run_tool_loop(
     tool_loop::TURN_MODEL
         .scope(
             Arc::clone(&handle.model),
-            tool_loop::run(&handle, context, messages, system_prompt),
+            tool_loop::TURN_THINKING.scope(
+                thinking,
+                tool_loop::run(&handle, context, messages, system_prompt),
+            ),
         )
         .await
 }
@@ -2611,7 +2651,7 @@ async fn summarize(ctx: &Ctx, chat: &str, flush: bool) -> anyhow::Result<bool> {
         request_id: uuid::Uuid::now_v7().to_string(),
         model: ctx.model().as_str().into(),
         messages: serde_json::json!([{ "role": "user", "content": transcript }]),
-        options: serde_json::json!({ "max_tokens": 2048, "system": SUMMARY_PROMPT }),
+        options: serde_json::json!({ "max_tokens": 2048, "system": SUMMARY_PROMPT, "thinking": "off" }),
         billing_user_id: None,
         reply: None,
     };
@@ -2758,10 +2798,19 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                 // back to it shows the reply running. Every message has its
                 // chat before it is admitted, so the chat's key counts it.
                 let waiting = chat.as_deref().map_or(0, |c| ctx.turns.waiting(c));
+                // The chat's own model and thinking, for the composer.
+                let settings = match &chat {
+                    Some(chat) => conversations::chat_info(&ctx.pool, chat)
+                        .await
+                        .map_err(|e| e.to_string())?,
+                    None => None,
+                };
                 Ok(serde_json::json!({
                     "conversation": chat,
                     "turns": rows_within_budget(turns, MAX_DATA_REPLY_BYTES, true)?,
                     "waiting": waiting,
+                    "model": settings.as_ref().and_then(|s| s.model.clone()),
+                    "thinking": settings.and_then(|s| s.thinking),
                 }))
             }
             DataQuery::Chats { channel_id, limit } => {
@@ -2813,6 +2862,27 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                     }));
                 }
                 Ok(serde_json::json!({ "chats": chats, "turns": turns }))
+            }
+            DataQuery::ChatSettings {
+                channel_id,
+                conversation,
+                model,
+                thinking,
+            } => {
+                let chat = conversations::chat_for(&ctx.pool, &channel_id, Some(&conversation), "")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if let Some(model) = model {
+                    conversations::set_chat_model(&ctx.pool, &chat, model.as_deref())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                if let Some(thinking) = thinking {
+                    conversations::set_chat_thinking(&ctx.pool, &chat, thinking.as_deref())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(serde_json::json!({ "found": true }))
             }
             DataQuery::TurnTrace {
                 channel_id,

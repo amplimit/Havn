@@ -210,6 +210,10 @@ pub enum ChatCommandKind {
     /// The agent's own model from now on, for every chat that has none of
     /// its own; empty for the gateway's default. The gateway saved it.
     AgentModel { model: String },
+    /// How much the chat's model thinks (issue #190): `choice` from its
+    /// next turn on (`default` for the model's own), or, without one,
+    /// what it is now.
+    Think { choice: Option<String> },
     /// Report on the chat: its model, title, turns, replies waiting.
     Status {
         /// The agent's name, which the runtime does not know.
@@ -507,6 +511,18 @@ pub enum DataQuery {
         channel_id: String,
         conversation: String,
         turn: String,
+    },
+    /// Set chat `conversation` of `channel_id`'s own model and thinking
+    /// choice (issue #190), making the chat when it has no message yet:
+    /// for each, absent keeps it, `null` goes back to the default.
+    /// `{"found": true}`.
+    ChatSettings {
+        channel_id: String,
+        conversation: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<Option<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking: Option<Option<String>>,
     },
     /// Search the chats of `channel_id` (issue #175): `{"chats": [...],
     /// "turns": [...]}`, the chats whose title has every word of `query`

@@ -212,6 +212,7 @@ async fn run_consolidation(
         options: serde_json::json!({
             "max_tokens": 4096,
             "system": SYSTEM_PROMPT,
+            "thinking": "off",
         }),
         billing_user_id: None,
         reply: None,

@@ -288,6 +288,8 @@ pub struct ChatInfo {
     pub title: String,
     /// Its own model, when it has one.
     pub model: Option<String>,
+    /// Its own thinking choice, when it has one.
+    pub thinking: Option<String>,
     /// Turns of its branch, up to its head.
     pub turns: i64,
 }
@@ -295,21 +297,22 @@ pub struct ChatInfo {
 /// Chat `chat`'s title, own model and length, or `None` when there is no
 /// such chat.
 pub async fn chat_info(pool: &SqlitePool, chat: &str) -> Result<Option<ChatInfo>> {
-    let found: Option<(String, Option<String>, i64)> = sqlx::query_as(
+    let found: Option<(String, Option<String>, Option<String>, i64)> = sqlx::query_as(
         "WITH RECURSIVE path(id, parent_id) AS ( \
              SELECT c.id, c.parent_id FROM conversations c JOIN chats h ON h.head = c.id \
              WHERE h.id = ?1 \
              UNION ALL \
              SELECT c.id, c.parent_id FROM conversations c JOIN path p ON c.id = p.parent_id \
          ) \
-         SELECT title, model, (SELECT COUNT(*) FROM path) FROM chats WHERE id = ?1",
+         SELECT title, model, thinking, (SELECT COUNT(*) FROM path) FROM chats WHERE id = ?1",
     )
     .bind(chat)
     .fetch_optional(pool)
     .await?;
-    Ok(found.map(|(title, model, turns)| ChatInfo {
+    Ok(found.map(|(title, model, thinking, turns)| ChatInfo {
         title,
         model,
+        thinking,
         turns,
     }))
 }
@@ -354,6 +357,31 @@ pub async fn set_trace(pool: &SqlitePool, turn: &str, trace: &str) -> Result<()>
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Set chat `chat`'s own thinking choice, or clear it with `None`. False
+/// when there is no such chat.
+pub async fn set_chat_thinking(
+    pool: &SqlitePool,
+    chat: &str,
+    thinking: Option<&str>,
+) -> Result<bool> {
+    let res = sqlx::query("UPDATE chats SET thinking = ?2 WHERE id = ?1")
+        .bind(chat)
+        .bind(thinking)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Chat `chat`'s own thinking choice, when it has one.
+pub async fn chat_thinking(pool: &SqlitePool, chat: &str) -> Result<Option<String>> {
+    let found: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT thinking FROM chats WHERE id = ?1")
+            .bind(chat)
+            .fetch_optional(pool)
+            .await?;
+    Ok(found.and_then(|(thinking,)| thinking))
 }
 
 /// Chat `chat`'s own model, when it has one.
@@ -1519,6 +1547,26 @@ mod tests {
             chat_model(&pool, &chat).await.expect("db").as_deref(),
             Some("deepseek:deepseek-chat")
         );
+        assert!(
+            set_chat_thinking(&pool, &chat, Some("high"))
+                .await
+                .expect("db")
+        );
+        assert_eq!(
+            chat_thinking(&pool, &chat).await.expect("db").as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            chat_info(&pool, &chat)
+                .await
+                .expect("db")
+                .expect("chat")
+                .thinking
+                .as_deref(),
+            Some("high")
+        );
+        assert!(set_chat_thinking(&pool, &chat, None).await.expect("db"));
+        assert_eq!(chat_thinking(&pool, &chat).await.expect("db"), None);
         assert!(set_chat_model(&pool, &chat, None).await.expect("db"));
         assert_eq!(
             chat_info(&pool, &chat)

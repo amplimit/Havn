@@ -36,6 +36,9 @@ tokio::task_local! {
     /// The model of the turn whose tool loop runs (a chat's own, or the
     /// agent's when the turn began): a subagent it spawns uses it too.
     pub static TURN_MODEL: Arc<String>;
+    /// The chat's thinking choice for the turn whose tool loop runs (issue
+    /// #190); `None` for its model's default.
+    pub static TURN_THINKING: Option<String>;
     /// What the conversation turn whose tool loop runs did on the way:
     /// its reasoning and tool calls, kept with its reply (issue #178).
     pub static TRACE: Arc<std::sync::Mutex<Trace>>;
@@ -493,6 +496,9 @@ async fn call_llm(
 ) -> anyhow::Result<LlmResponse> {
     let request_id = Uuid::now_v7().to_string();
     let mut options = serde_json::json!({ "max_tokens": handle.max_tokens });
+    if let Ok(Some(thinking)) = TURN_THINKING.try_with(Clone::clone) {
+        options["thinking"] = Value::String(thinking);
+    }
     if let Some(prompt) = system_prompt.as_text() {
         options["system"] = Value::String(prompt.to_string());
     }

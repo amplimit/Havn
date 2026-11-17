@@ -810,6 +810,97 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn a_models_thinking_resolves_within_its_choices() {
+        use crate::llm_proxy::Reasoning;
+        let effort = ThinkingSpec {
+            style: ThinkingStyle::Effort,
+            levels: vec!["low".into(), "high".into()],
+            budgets: Vec::new(),
+            default: Some("low".into()),
+            mandatory: false,
+        };
+        assert_eq!(effort.choices(), ["off", "low", "high"]);
+        assert_eq!(effort.resolve(None), Reasoning::Effort("low".into()));
+        assert_eq!(
+            effort.resolve(Some("high")),
+            Reasoning::Effort("high".into())
+        );
+        assert_eq!(effort.resolve(Some("off")), Reasoning::Off);
+        assert_eq!(
+            effort.resolve(Some("4096")),
+            Reasoning::Effort("low".into()),
+            "not its choice"
+        );
+        let mandatory = ThinkingSpec {
+            style: ThinkingStyle::Budget,
+            levels: Vec::new(),
+            budgets: vec![1024, 8192],
+            default: None,
+            mandatory: true,
+        };
+        assert_eq!(mandatory.choices(), ["1024", "8192"]);
+        assert_eq!(
+            mandatory.resolve(Some("off")),
+            Reasoning::Budget(1024),
+            "it must think"
+        );
+        assert_eq!(mandatory.resolve(Some("8192")), Reasoning::Budget(8192));
+        let toggle = ThinkingSpec {
+            style: ThinkingStyle::Toggle,
+            levels: Vec::new(),
+            budgets: Vec::new(),
+            default: None,
+            mandatory: false,
+        };
+        assert_eq!(
+            toggle.resolve(None),
+            Reasoning::Off,
+            "off unless the default says on"
+        );
+        assert_eq!(toggle.resolve(Some("on")), Reasoning::On);
+    }
+
+    #[test]
+    fn thinking_is_checked_and_written_to_config_toml() {
+        let mut c = ModelCatalog::default();
+        c.models.push(ModelEntry {
+            id: "openrouter:deepseek/deepseek-v4.1-flash".into(),
+            label: None,
+            max_output_tokens: None,
+            vision: false,
+            thinking: Some(ThinkingSpec {
+                style: ThinkingStyle::Effort,
+                levels: vec!["low".into(), "medium".into(), "high".into()],
+                budgets: Vec::new(),
+                default: Some("medium".into()),
+                mandatory: false,
+            }),
+        });
+        c.validate().expect("valid");
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").expect("write");
+        write_to_file(&path, &c).expect("written");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("thinking = { style = \"effort\""), "{text}");
+        assert_eq!(read_from_file(&path).expect("read back"), c);
+
+        let mut bad = c.clone();
+        bad.models[0].thinking.as_mut().expect("thinking").default = Some("max".into());
+        assert!(bad.validate().is_err(), "a default it does not offer");
+        let mut bad = c.clone();
+        bad.models[0].id = "openai:gpt-5".into();
+        let spec = bad.models[0].thinking.as_mut().expect("thinking");
+        spec.style = ThinkingStyle::Budget;
+        spec.budgets = vec![1024];
+        spec.default = None;
+        assert!(
+            bad.validate().is_err(),
+            "an OpenAI endpoint takes no budget"
+        );
+    }
+
     fn entry(id: &str) -> ModelEntry {
         ModelEntry {
             id: id.into(),
