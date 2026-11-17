@@ -792,9 +792,10 @@ export const api = {
         body: JSON.stringify(settings),
       }),
     /** What reply `turn` of `chat` did on the way. */
-    trace: (agentId: string, chat: string, turn: string) =>
+    trace: (agentId: string, chat: string, turn: string, scope?: string) =>
       request<TurnTrace>(
-        `/agents/${agentId}/chats/${encodeURIComponent(chat)}/turns/${encodeURIComponent(turn)}/trace`,
+        `/agents/${agentId}/chats/${encodeURIComponent(chat)}/turns/${encodeURIComponent(turn)}/trace` +
+          (scope ? `?scope=${encodeURIComponent(scope)}` : ""),
       ),
     /** Continue `chat` from the branch of `turn`, at its newest turn. */
     branch: (agentId: string, chat: string, turn: string, scope?: string) =>

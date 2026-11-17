@@ -139,6 +139,7 @@ pub async fn turn_trace(
     State(state): State<AppState>,
     user: AuthedUser,
     Path((id, chat, turn)): Path<(String, String, String)>,
+    Query(q): Query<ScopeQuery>,
 ) -> Result<Json<TraceView>, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
     let row: TraceRow = crate::api::agents::agent_data(
@@ -146,7 +147,7 @@ pub async fn turn_trace(
         user.id,
         agent.id,
         havn_proto::DataQuery::TurnTrace {
-            channel_id: session(&user, agent.id),
+            channel_id: scope_of(&state, &user, agent.id, q.scope.as_deref()).await?,
             conversation: chat_param(Some(chat))?.unwrap_or_default(),
             turn: chat_param(Some(turn))?.unwrap_or_default(),
         },
@@ -228,6 +229,12 @@ where
     D: serde::Deserializer<'de>,
 {
     Option::<String>::deserialize(d).map(Some)
+}
+
+/// `?scope=`: a channel chat's scope, as in [`ConversationQuery::scope`].
+#[derive(Debug, Deserialize)]
+pub struct ScopeQuery {
+    pub scope: Option<String>,
 }
 
 /// A channel chat scope of `user` with an agent (issue #184): a sender
@@ -470,10 +477,14 @@ struct Moved {
     moved: bool,
     busy: bool,
     was_active: bool,
+    #[serde(default)]
+    title: Option<String>,
 }
 
-/// What the chat app is told when a chat of its moves to the web.
-const MOVED_NOTICE: &str = "This chat continues in Havn's web chat now.";
+/// What the chat app is told when its current chat moves to the web; an
+/// earlier chat is named, so it is not taken for the current one.
+const MOVED_NOTICE_EARLIER: &str =
+    "Your earlier chat \"{title}\" continues in Havn's web chat now.";
 const MOVED_NOTICE_NEW: &str =
     "This chat continues in Havn's web chat now. Your next message here starts a new chat.";
 
@@ -522,11 +533,17 @@ pub async fn chat_move(
     }
     let notice = havn_proto::channel::ChannelMessageContent::Text {
         text: if moved.was_active {
-            MOVED_NOTICE_NEW
+            MOVED_NOTICE_NEW.to_string()
         } else {
-            MOVED_NOTICE
-        }
-        .into(),
+            MOVED_NOTICE_EARLIER.replace(
+                "{title}",
+                moved
+                    .title
+                    .as_deref()
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or("untitled"),
+            )
+        },
     };
     if let Err(e) = state
         .channel_router

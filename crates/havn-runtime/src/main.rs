@@ -1157,6 +1157,12 @@ where
                     handle_skill_pin(req, ctx).await;
                 });
             }
+            // A chat moves in order with the messages around it: a message
+            // gets its chat and is admitted before the next frame is read,
+            // so a move never lands between the two (issue #184).
+            GatewayToAgent::DataRequest(req) if matches!(req.query, DataQuery::MoveChat { .. }) => {
+                handle_data_request(req, ctx.clone()).await;
+            }
             GatewayToAgent::DataRequest(req) => {
                 let ctx = ctx.clone();
                 work.spawn(async move {
@@ -2946,10 +2952,18 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                 let moved = conversations::move_chat(&ctx.pool, &from, &conversation, &to)
                     .await
                     .map_err(|e| e.to_string())?;
+                let title = match moved {
+                    Some(_) => conversations::chat_info(&ctx.pool, &conversation)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .map(|info| info.title),
+                    None => None,
+                };
                 Ok(serde_json::json!({
                     "moved": moved.is_some(),
                     "busy": false,
                     "was_active": moved.unwrap_or(false),
+                    "title": title,
                 }))
             }
             DataQuery::DeleteChat {

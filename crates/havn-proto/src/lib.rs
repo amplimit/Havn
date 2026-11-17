@@ -555,9 +555,10 @@ pub enum DataQuery {
     },
     /// Move chat `conversation` from scope `from` to scope `to` (issue
     /// #184: a channel chat continued on the web), unless a reply runs or
-    /// waits in it: `{"moved": bool, "busy": bool, "was_active": bool}`;
-    /// `was_active` when it was `from`'s active chat, which `from` then has
-    /// none of.
+    /// waits in it: `{"moved": bool, "busy": bool, "was_active": bool,
+    /// "title": string}`; `was_active` when it was `from`'s active chat,
+    /// which `from` then has none of. Handled in order with inbound
+    /// messages.
     MoveChat {
         from: String,
         conversation: String,

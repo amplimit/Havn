@@ -387,8 +387,9 @@ export default function ChatPage({
         if (cancelled) return;
         if (!chatIdRef.current && r.conversation) selectChat(r.conversation);
         // A reply still running when the page was left shows again; the
-        // agent's count is the count.
-        if (r.waiting !== undefined) setWaiting(r.waiting);
+        // agent's count is the count. A chat-app chat's replies are the
+        // app's to show.
+        if (r.waiting !== undefined) setWaiting(scope ? 0 : r.waiting);
         if (r.turns.length === 0) return;
         const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
         setBubbles((prev) => mergeStored(prev, stored, since));
@@ -499,6 +500,16 @@ export default function ChatPage({
             // sent again to a reconnecting tab, so keep one card per id.
             setApprovals((prev) => (prev.some((a) => a.id === msg.id) ? prev : [...prev, msg]));
             return;
+          }
+          // The socket carries the web chats; a chat-app chat on screen
+          // shows none of it, and the web chats' list keeps up.
+          if (scopeRef.current) {
+            if (msg.type === "agent_message" && msg.conversation) {
+              const due = waitingElsewhere.current.get(msg.conversation) ?? 0;
+              if (!msg.broadcast && due > 0) waitingElsewhere.current.set(msg.conversation, due - 1);
+              void refreshChats();
+            }
+            if (msg.type !== "approval_closed") return;
           }
           if (msg.type === "approval_closed") {
             setApprovals((prev) => prev.filter((a) => a.id !== msg.id));
@@ -1179,6 +1190,7 @@ export default function ChatPage({
                 bubble={b}
                 found={b.turn !== undefined && b.turn === found}
                 chatId={chat}
+                scope={scope}
                 busy={pending || wsState !== "open"}
                 onUpload={uploadFiles}
                 onEdit={
@@ -1192,7 +1204,7 @@ export default function ChatPage({
                 }
                 onVersion={(turn) => void showVersion(turn)}
                 onRetry={
-                  b.role === "agent" && !b.turn
+                  b.role === "agent" && !b.turn && !scope
                     ? () => {
                         // Find the most recent user bubble before this
                         // agent reply and re-send its content. Both the
@@ -1284,7 +1296,7 @@ export default function ChatPage({
         {scope ? (
           <ChannelChatBar
             channel={channelChats.find((c) => c.id === chat && c.scope === scope)?.channel ?? "the chat app"}
-            onMove={() => void continueOnWeb()}
+            onMove={continueOnWeb}
           />
         ) : (
         <Composer
@@ -1320,7 +1332,7 @@ function appName(channel: string): string {
  * In place of the composer for a channel chat: it lives in its app and
  * continues there, or moves to the web for good.
  */
-function ChannelChatBar({ channel, onMove }: { channel: string; onMove: () => void }) {
+function ChannelChatBar({ channel, onMove }: { channel: string; onMove: () => Promise<void> }) {
   const [moving, setMoving] = useState(false);
   return (
     <div
@@ -1340,7 +1352,7 @@ function ChannelChatBar({ channel, onMove }: { channel: string; onMove: () => vo
         disabled={moving}
         onClick={() => {
           setMoving(true);
-          onMove();
+          void onMove().finally(() => setMoving(false));
         }}
       >
         continue on the web
@@ -1644,6 +1656,7 @@ function Bubble({
   found,
   agentId,
   chatId,
+  scope,
   onRetry,
   onEdit,
   onUpload,
@@ -1654,6 +1667,8 @@ function Bubble({
   agentId: string;
   /** The chat it is in, once it has one. */
   chatId?: string | null;
+  /** A chat-app chat's scope, when the bubble is in one. */
+  scope?: string | null;
   /** A reply is due: branching waits for it. */
   busy: boolean;
   /** The message a search led to: marked for a moment. */
@@ -1702,7 +1717,7 @@ function Bubble({
       }
     >
       {bubble.role === "agent" && bubble.trace && bubble.turn && chatId && (bubble.trace.thought || bubble.trace.steps > 0) && (
-        <TraceFold agentId={agentId} chat={chatId} turn={bubble.turn} summary={bubble.trace} />
+        <TraceFold agentId={agentId} chat={chatId} turn={bubble.turn} summary={bubble.trace} scope={scope} />
       )}
       {message && message.files.length > 0 && (
         <AttachmentCards agentId={agentId} files={message.files} align="end" />
@@ -2460,11 +2475,14 @@ function TraceFold({
   chat,
   turn,
   summary,
+  scope,
 }: {
   agentId: string;
   chat: string;
   turn: string;
   summary: TraceSummary;
+  /** A chat-app chat's scope. */
+  scope?: string | null;
 }) {
   const [trace, setTrace] = useState<TurnTrace | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -2479,7 +2497,7 @@ function TraceFold({
       style={{ maxWidth: "min(85%, 720px)", ...muted }}
       onToggle={(e) => {
         if (!e.currentTarget.open || trace) return;
-        api.chats.trace(agentId, chat, turn).then(setTrace, (err: unknown) =>
+        api.chats.trace(agentId, chat, turn, scope ?? undefined).then(setTrace, (err: unknown) =>
           setError(err instanceof Error ? err.message : String(err)),
         );
       }}
