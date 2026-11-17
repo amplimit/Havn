@@ -6,6 +6,7 @@ import {
   api,
   type AgentView,
   type ChatCommand,
+  type ChatSearch,
   type ChatSummary,
   type ConversationTurn,
   type EmbeddingStatus,
@@ -111,6 +112,8 @@ function sizeBytes(size: string): number {
   return Math.round(Number(m[1]) * unit);
 }
 const HISTORY_LIMIT = 100;
+// How long after showing a found message new bubbles leave the view where it is.
+const JUMP_HOLD_MS = 2000;
 const RECONNECT_MS = 1500;
 
 function turnBubbles(turns: ConversationTurn[], nextId: () => number): Bubble[] {
@@ -239,6 +242,20 @@ export default function ChatPage({
   const chatIdRef = useRef<string | null>(null);
   // `/undo`s sent whose answer has not come: the chat reloads with it.
   const undoing = useRef(0);
+  // A found message to show once its chat is on screen (`branched` once
+  // its chat was moved to the message's branch), and the one shown; when
+  // a jump scrolled, so the next updates do not scroll away from it.
+  const jumpTo = useRef<{
+    chat: string;
+    turn: string;
+    /** It is on the chat's branch, so the chat stays on it. */
+    onBranch: boolean;
+    /** The chat is being, or was, moved to its branch. */
+    branching: boolean;
+    branched: boolean;
+  } | null>(null);
+  const [found, setFound] = useState<string | null>(null);
+  const jumpedAt = useRef(0);
   const [chats, setChats] = useState<ChatSummary[]>([]);
   // For the socket's handler, which outlives a render.
   const chatsRef = useRef<ChatSummary[]>([]);
@@ -589,14 +606,61 @@ export default function ChatPage({
   }, [id, me?.ws_token]);
 
   // Auto-scroll to bottom on new bubbles or when the typing
-  // indicator appears.
+  // indicator appears; not while a found message is to be shown, nor right
+  // after it was (the chat's file cards arrive just after its messages).
   useEffect(() => {
+    const jump = jumpTo.current;
+    if ((jump && jump.chat === chatIdRef.current) || Date.now() - jumpedAt.current < JUMP_HOLD_MS) {
+      return;
+    }
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     scrollRef.current?.scrollTo({
       top: scrollRef.current.scrollHeight,
       behavior: reduce ? "auto" : "smooth",
     });
   }, [bubbles.length, pending]);
+
+  // A found message, once its chat's messages are on screen: scrolled to
+  // and marked; on another branch, the chat moves to it first; older than
+  // what is loaded, the user is told.
+  useEffect(() => {
+    const jump = jumpTo.current;
+    if (!jump || jump.branching || chatIdRef.current !== jump.chat || bubbles.length === 0) return;
+    const el = scrollRef.current?.querySelector(`[data-turn="${CSS.escape(jump.turn)}"]`);
+    if (el) {
+      jumpTo.current = null;
+      jumpedAt.current = Date.now();
+      const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      el.scrollIntoView({ block: "center", behavior: reduce ? "auto" : "smooth" });
+      setFound(jump.turn);
+      setTimeout(() => setFound((f) => (f === jump.turn ? null : f)), 4000);
+      return;
+    }
+    if (jump.branched || jump.onBranch) {
+      jumpTo.current = null;
+      pushBubble("system", "That message is further back than this chat shows.");
+      return;
+    }
+    if (waiting > 0) {
+      jumpTo.current = null;
+      pushBubble("system", "That message is on another version of this chat; wait for the reply, then open it again.");
+      return;
+    }
+    // Decided once the chat is on the message's branch, whatever arrives
+    // meanwhile.
+    jump.branching = true;
+    void showVersion(jump.turn).then((moved) => {
+      if (jumpTo.current !== jump) return;
+      if (!moved) {
+        jumpTo.current = null;
+        return;
+      }
+      jump.branching = false;
+      jump.branched = true;
+      setBubbles((prev) => [...prev]);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bubbles]);
 
   // As the reply being written grows, follow it, unless the user scrolled
   // up to read.
@@ -749,13 +813,14 @@ export default function ChatPage({
   }
 
   // Show the branch of version `turn`.
-  async function showVersion(turn: string) {
+  // Whether the chat moved to the branch of `turn`.
+  async function showVersion(turn: string): Promise<boolean> {
     const current = chatIdRef.current;
-    if (!current) return;
+    if (!current) return false;
     try {
       await api.chats.branch(id, current, turn);
       const r = await api.conversation.list(id, HISTORY_LIMIT, current);
-      if (chatIdRef.current !== current) return;
+      if (chatIdRef.current !== current) return false;
       const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
       // Notes of replies on other branches stay with them.
       setBubbles((prev) =>
@@ -766,8 +831,24 @@ export default function ChatPage({
             .map((b) => underAnchor(b, stored)),
         ].sort((a, b) => a.ts - b.ts),
       );
+      return true;
     } catch (e) {
       pushBubble("system", `error: ${e instanceof Error ? e.message : String(e)}`);
+      return false;
+    }
+  }
+
+  // Show chat `target`, and in it the found message `turn` (see the
+  // effect above); a found title only opens its chat.
+  function openFound(target: string, turn: string | null, onBranch = true) {
+    jumpTo.current = turn
+      ? { chat: target, turn, onBranch, branching: false, branched: false }
+      : null;
+    if (target === chatIdRef.current) {
+      // Already on screen: the effect runs on what is shown.
+      setBubbles((prev) => [...prev]);
+    } else {
+      openChatById(target);
     }
   }
 
@@ -775,6 +856,8 @@ export default function ChatPage({
   // whichever chat asked.
   function openChatById(next: string | null) {
     setShowChats(false);
+    // A found message of another chat is no longer to be shown.
+    if (jumpTo.current && jumpTo.current.chat !== next) jumpTo.current = null;
     if (next !== null && next === chatIdRef.current) return;
     const previous = chatIdRef.current;
     const target = next ?? newChatId();
@@ -866,6 +949,11 @@ export default function ChatPage({
         onOpen={openChatById}
         onRename={renameChat}
         onDelete={deleteChat}
+        onFound={(chat, turn, onBranch) => {
+          setShowChats(false);
+          openFound(chat, turn, onBranch);
+        }}
+        agentId={id}
         className={showChats ? "flex w-full" : "hidden"}
       />
       <div className={`${showChats ? "hidden" : "flex"} min-w-0 flex-1 flex-col md:flex`}>
@@ -978,6 +1066,7 @@ export default function ChatPage({
                 key={b.id}
                 agentId={id}
                 bubble={b}
+                found={b.turn !== undefined && b.turn === found}
                 busy={pending || wsState !== "open"}
                 onUpload={uploadFiles}
                 onEdit={
@@ -1096,21 +1185,53 @@ export default function ChatPage({
 }
 
 function ChatList({
+  agentId,
   chats,
   current,
   onOpen,
   onRename,
   onDelete,
+  onFound,
   className,
 }: {
+  agentId: string;
   chats: ChatSummary[];
   current: string | null;
   onOpen: (chat: string | null) => void;
   onRename: (chat: ChatSummary) => void;
   onDelete: (chat: ChatSummary) => void;
+  /** A search result: its chat, and the message to show. */
+  onFound: (chat: string, turn: string | null, onBranch?: boolean) => void;
   className: string;
 }) {
   const fresh = current !== null && !chats.some((c) => c.id === current);
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<ChatSearch | null>(null);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  // A search once typing pauses; a newer one replaces it.
+  useEffect(() => {
+    const q = query.trim();
+    if (!q) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      api.chats.search(agentId, q).then(
+        (r) => {
+          if (!cancelled) {
+            setResults(r);
+            setSearchError(null);
+          }
+        },
+        (e: unknown) => {
+          if (!cancelled) setSearchError(e instanceof Error ? e.message : String(e));
+        },
+      );
+    }, 300);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [agentId, query]);
+  const searching = query.trim() !== "";
   const itemStyle = (on: boolean) =>
     on ? { backgroundColor: "var(--color-surface-muted)" } : undefined;
   return (
@@ -1127,7 +1248,32 @@ function ChatList({
           <MessageSquarePlus size={16} className="shrink-0" aria-hidden="true" />
           new chat
         </button>
+        <input
+          type="search"
+          className="input mt-2 w-full text-sm"
+          placeholder="search chats"
+          aria-label="search chats"
+          value={query}
+          maxLength={200}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            // A new search shows nothing found by the last one.
+            setResults(null);
+            setSearchError(null);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") setQuery("");
+          }}
+        />
       </div>
+      {searching ? (
+        <SearchResults
+          query={query.trim()}
+          results={results}
+          error={searchError}
+          onFound={onFound}
+        />
+      ) : (
       <nav aria-label="chats" className="flex-1 overflow-y-auto px-2 pb-3">
         <ul className="flex flex-col gap-0.5">
           {fresh && (
@@ -1179,13 +1325,124 @@ function ChatList({
           )}
         </ul>
       </nav>
+      )}
     </aside>
+  );
+}
+
+/** `text` with each occurrence of a word of `query` marked. */
+function Marked({ text, query }: { text: string; query: string }) {
+  const words = query
+    .split(/\s+/)
+    .filter((w) => w.length > 0)
+    .map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  if (words.length === 0) return <>{text}</>;
+  const parts = text.split(new RegExp(`(${words.join("|")})`, "gi"));
+  return (
+    <>
+      {parts.map((part, i) =>
+        i % 2 === 1 ? (
+          <mark key={i} style={{ backgroundColor: "var(--color-highlight, #fde68a)", color: "inherit" }}>
+            {part}
+          </mark>
+        ) : (
+          part
+        ),
+      )}
+    </>
+  );
+}
+
+function SearchResults({
+  query,
+  results,
+  error,
+  onFound,
+}: {
+  query: string;
+  results: ChatSearch | null;
+  error: string | null;
+  onFound: (chat: string, turn: string | null, onBranch?: boolean) => void;
+}) {
+  const muted = { color: "var(--color-body)" };
+  if (error) {
+    return (
+      <p className="px-4 text-xs" role="alert" style={{ color: "var(--color-ruby)" }}>
+        {error}
+      </p>
+    );
+  }
+  if (!results) {
+    return (
+      <p className="px-4 text-xs" style={muted}>
+        searching…
+      </p>
+    );
+  }
+  if (results.chats.length === 0 && results.turns.length === 0) {
+    return (
+      <p className="px-4 text-xs" style={muted}>
+        nothing found
+      </p>
+    );
+  }
+  return (
+    <nav aria-label="search results" className="flex-1 overflow-y-auto px-2 pb-3">
+      {results.chats.length > 0 && (
+        <>
+          <h3 className="px-2 pt-1 text-xs uppercase" style={muted}>
+            titles
+          </h3>
+          <ul className="flex flex-col gap-0.5">
+            {results.chats.map((c) => (
+              <li key={c.id}>
+                <button
+                  type="button"
+                  className="w-full truncate rounded px-2 py-1.5 text-left text-sm"
+                  onClick={() => onFound(c.id, null)}
+                  title={c.title}
+                >
+                  <Marked text={c.title || "untitled"} query={query} />
+                </button>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {results.turns.length > 0 && (
+        <>
+          <h3 className="px-2 pt-2 text-xs uppercase" style={muted}>
+            messages
+          </h3>
+          <ul className="flex flex-col gap-1">
+            {results.turns.map((t) => (
+              <li key={t.id}>
+                <button
+                  type="button"
+                  className="w-full rounded px-2 py-1.5 text-left"
+                  onClick={() => onFound(t.chat, t.id, t.on_branch)}
+                >
+                  <span className="block truncate text-xs" style={muted}>
+                    {t.title || "untitled"} · {t.role === "user" ? "you" : "agent"} ·{" "}
+                    {new Date(t.created_at).toLocaleDateString()}
+                  </span>
+                  <span className="line-clamp-3 block text-sm">
+                    <Marked text={t.excerpt} query={query} />
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </nav>
   );
 }
 
 function Bubble({
   bubble,
   busy,
+  found,
   agentId,
   onRetry,
   onEdit,
@@ -1197,6 +1454,8 @@ function Bubble({
   agentId: string;
   /** A reply is due: branching waits for it. */
   busy: boolean;
+  /** The message a search led to: marked for a moment. */
+  found?: boolean;
   onRetry?: () => void;
   onEdit?: (text: string, files: Attachment[]) => void;
   onUpload: (picked: File[], room: number, done: (a: Attachment) => void) => Promise<void>;
@@ -1231,7 +1490,15 @@ function Bubble({
   // a below-bubble action row (copy / retry).
   const isSystem = bubble.role === "system";
   return (
-    <div className={`flex flex-col gap-1.5 ${align}`}>
+    <div
+      className={`flex flex-col gap-1.5 ${align}`}
+      data-turn={bubble.turn}
+      style={
+        found
+          ? { outline: "2px solid var(--color-stripe-purple)", outlineOffset: 4, borderRadius: 8 }
+          : undefined
+      }
+    >
       {message && message.files.length > 0 && (
         <AttachmentCards agentId={agentId} files={message.files} align="end" />
       )}

@@ -501,6 +501,14 @@ pub enum DataQuery {
     },
     /// The chats of `channel_id`, most recently used first.
     Chats { channel_id: String, limit: u32 },
+    /// Search the chats of `channel_id` (issue #175): `{"chats": [...],
+    /// "turns": [...]}`, the chats whose title has every word of `query`
+    /// and the user and assistant turns that do, each with an excerpt.
+    SearchChats {
+        channel_id: String,
+        query: String,
+        limit: u32,
+    },
     /// Rename chat `conversation` of `channel_id`: `{"found": bool}`.
     RenameChat {
         channel_id: String,

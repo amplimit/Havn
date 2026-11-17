@@ -1939,6 +1939,9 @@ fn clean_title(text: &str) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
+/// Characters of a found turn the dashboard's search shows.
+const SEARCH_EXCERPT_CHARS: usize = 160;
+
 /// Characters of a taken-back message `/undo` quotes.
 const UNDO_EXCERPT_CHARS: usize = 60;
 
@@ -2720,6 +2723,45 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                     MAX_DATA_REPLY_BYTES,
                     false,
                 )?))
+            }
+            DataQuery::SearchChats {
+                channel_id,
+                query,
+                limit,
+            } => {
+                let limit = limit.min(MAX_DATA_ROWS);
+                let chats = conversations::chats_titled(&ctx.pool, &channel_id, &query, limit)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let terms: Vec<&str> = query.split_whitespace().collect();
+                let hits = conversations::search_chats(&ctx.pool, &channel_id, &query, limit)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let mut turns = Vec::with_capacity(hits.len());
+                // Each chat's branch, read once.
+                let mut branches: HashMap<String, std::collections::HashSet<String>> =
+                    HashMap::new();
+                for t in hits {
+                    // A turn on its chat's branch is shown by opening the
+                    // chat; one on another, by moving the chat to it.
+                    if !branches.contains_key(&t.chat) {
+                        let ids = conversations::branch_ids(&ctx.pool, &t.chat)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        branches.insert(t.chat.clone(), ids);
+                    }
+                    let on_branch = branches.get(&t.chat).is_some_and(|ids| ids.contains(&t.id));
+                    turns.push(serde_json::json!({
+                        "id": t.id,
+                        "chat": t.chat,
+                        "title": t.title,
+                        "role": t.role.as_str(),
+                        "excerpt": tools::memory::excerpt(&t.content, &terms, SEARCH_EXCERPT_CHARS),
+                        "created_at": t.created_at,
+                        "on_branch": on_branch,
+                    }));
+                }
+                Ok(serde_json::json!({ "chats": chats, "turns": turns }))
             }
             DataQuery::RenameChat {
                 channel_id,

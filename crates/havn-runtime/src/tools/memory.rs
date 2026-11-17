@@ -381,8 +381,8 @@ impl Tool for ConversationSearchTool {
 
     fn description(&self) -> &'static str {
         "Search the earlier chats of the person you are talking to, \
-         including turns no longer in the conversation you see. Every word \
-         of `query` must appear in a turn; words of three or more \
+         including turns no longer in the conversation you see, and their \
+         titles. Every word of `query` must appear in a turn or a title; words of three or more \
          characters match anywhere inside text, so for Chinese or \
          Japanese give a few words rather than a whole sentence. Returns up \
          to 10 turns with their chat title, date and turn id. Pass `turn` \
@@ -432,10 +432,38 @@ impl Tool for ConversationSearchTool {
                 Ok(hits) => hits,
                 Err(e) => return ToolResult::Error(format!("conversation_search failed: {e}")),
             };
-        if hits.is_empty() {
+        let titled =
+            match conversations::chats_titled(&ctx.agent_db, &scope, query, SEARCH_LIMIT).await {
+                Ok(chats) => chats,
+                Err(e) => return ToolResult::Error(format!("conversation_search failed: {e}")),
+            };
+        if hits.is_empty() && titled.is_empty() {
             return ToolResult::Ok("(no matches)".into());
         }
         let mut out = String::new();
+        if !titled.is_empty() {
+            out.push_str("Chats titled so:\n");
+            for chat in &titled {
+                let here = if current.as_deref() == Some(chat.id.as_str()) {
+                    " (this chat)"
+                } else {
+                    ""
+                };
+                match &chat.first_turn {
+                    Some(turn) => writeln!(
+                        out,
+                        "- chat {:?}{here}, last used {}: it starts at turn {turn}",
+                        chat.title,
+                        chat.updated_at.get(..10).unwrap_or(&chat.updated_at),
+                    ),
+                    None => writeln!(out, "- chat {:?}{here}: no messages yet", chat.title),
+                }
+                .ok();
+            }
+            if !hits.is_empty() {
+                out.push_str("Turns:\n");
+            }
+        }
         for hit in &hits {
             writeln!(
                 out,
@@ -491,7 +519,7 @@ fn show_around(turns: &[ChatTurn], asked: &str, current: Option<&str>) -> String
 
 /// At most `max` characters of `content`, around the first of `terms` it
 /// contains (ignoring case).
-fn excerpt(content: &str, terms: &[&str], max: usize) -> String {
+pub(crate) fn excerpt(content: &str, terms: &[&str], max: usize) -> String {
     let chars: Vec<char> = content.chars().collect();
     if chars.len() <= max {
         return content.to_string();
