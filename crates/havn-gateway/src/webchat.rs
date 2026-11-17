@@ -195,6 +195,10 @@ pub enum ServerMessage {
         call: String,
         text: String,
         at: usize,
+        /// The call's reasoning (issue #178), not its reply: shown apart,
+        /// and the reply replaces it too.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        thinking: bool,
     },
     /// The tool call the reply being written is about to make.
     Step {
@@ -407,6 +411,10 @@ impl WebChatRouter {
 
     /// Show the tabs of `session_id` the text a model call of the reply
     /// being written has added; a tab with no room for it misses it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the frame's fields; a struct for one caller would only rename them"
+    )]
     pub async fn reply_text(
         &self,
         agent_id: AgentId,
@@ -415,6 +423,7 @@ impl WebChatRouter {
         call: &str,
         text: String,
         at: usize,
+        thinking: bool,
     ) -> Result<(), DeliverError> {
         self.show_to_session(
             agent_id,
@@ -424,6 +433,7 @@ impl WebChatRouter {
                 call: call.to_string(),
                 text,
                 at,
+                thinking,
             },
         )
         .await

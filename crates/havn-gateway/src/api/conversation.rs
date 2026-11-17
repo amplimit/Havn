@@ -41,6 +41,10 @@ pub struct TurnView {
     /// Its versions (issue #129): the turns in its place on other
     /// branches, itself included, oldest first.
     pub versions: Vec<String>,
+    /// For a reply: the model's reasoning and the tool calls of its turn
+    /// (issue #178).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,6 +134,7 @@ pub async fn list(
             content: t.content,
             created_at: t.created_at,
             versions: t.versions,
+            trace: t.trace.and_then(|raw| serde_json::from_str(&raw).ok()),
         })
         .collect();
     Ok(Json(ConversationResponse {

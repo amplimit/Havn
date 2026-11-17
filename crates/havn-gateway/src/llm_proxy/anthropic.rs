@@ -102,6 +102,17 @@ impl LlmProvider for AnthropicProvider {
                         .unwrap_or_default(),
                 });
             }
+            if event
+                .pointer("/delta/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("thinking_delta")
+                && let Some(piece) = event
+                    .pointer("/delta/thinking")
+                    .and_then(serde_json::Value::as_str)
+                && !piece.is_empty()
+            {
+                text(TextEvent::Reasoning(piece));
+            }
             if let Some(piece) = message.add(&event) {
                 text(TextEvent::Text(&piece));
             }

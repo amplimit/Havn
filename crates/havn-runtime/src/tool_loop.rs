@@ -36,6 +36,52 @@ tokio::task_local! {
     /// The model of the turn whose tool loop runs (a chat's own, or the
     /// agent's when the turn began): a subagent it spawns uses it too.
     pub static TURN_MODEL: Arc<String>;
+    /// What the conversation turn whose tool loop runs did on the way:
+    /// its reasoning and tool calls, kept with its reply (issue #178).
+    pub static TRACE: Arc<std::sync::Mutex<Trace>>;
+}
+
+/// Entries one turn's trace keeps at most, and characters of each part.
+const TRACE_ENTRIES: usize = 60;
+const TRACE_THINKING_CHARS: usize = 8_000;
+const TRACE_INPUT_CHARS: usize = 1_500;
+const TRACE_RESULT_CHARS: usize = 2_000;
+
+/// A turn's reasoning and tool calls, in order.
+#[derive(Debug, Default)]
+pub struct Trace {
+    pub items: Vec<Value>,
+    /// Entries that did not fit.
+    pub left_out: usize,
+}
+
+impl Trace {
+    fn push(&mut self, item: Value) {
+        if self.items.len() < TRACE_ENTRIES {
+            self.items.push(item);
+        } else {
+            self.left_out += 1;
+        }
+    }
+}
+
+/// `text` cut to `max` characters, marked when cut.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push_str("\u{2026}");
+    out
+}
+
+/// Add to the running turn's trace, when one is kept.
+fn trace(item: Value) {
+    let _ = TRACE.try_with(|t| {
+        t.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(item);
+    });
 }
 
 /// Shared map of in-flight LLM requests keyed by request_id. Both the
@@ -203,10 +249,31 @@ pub async fn run_typed(
             .and_then(Value::as_str)
             .unwrap_or("end_turn")
             .to_string();
-        let content = provider_response
+        let mut content = provider_response
             .get("content")
             .cloned()
             .unwrap_or(Value::Array(Vec::new()));
+        // The model's reasoning is kept for the dashboard, never sent back.
+        if let Some(blocks) = content.as_array_mut() {
+            for block in blocks.iter() {
+                if context == crate::tools::context::WEBCHAT
+                    && block.get("type").and_then(Value::as_str) == Some("thinking")
+                    && let Some(text) = block.get("thinking").and_then(Value::as_str)
+                    && !text.trim().is_empty()
+                {
+                    trace(serde_json::json!({
+                        "kind": "thinking",
+                        "text": clip(text.trim(), TRACE_THINKING_CHARS),
+                    }));
+                }
+            }
+            blocks.retain(|b| {
+                !matches!(
+                    b.get("type").and_then(Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+            });
+        }
 
         // Always append the assistant turn so the next call has context.
         messages.push(serde_json::json!({ "role": "assistant", "content": content.clone() }));
@@ -325,6 +392,16 @@ async fn execute_tool_uses(
             ToolResult::Ok(s) => (s, false),
             ToolResult::Error(s) => (s, true),
         };
+        if context == crate::tools::context::WEBCHAT {
+            let input = block.get("input").cloned().unwrap_or(Value::Null);
+            trace(serde_json::json!({
+                "kind": "step",
+                "tool": name,
+                "input": clip(&input.to_string(), TRACE_INPUT_CHARS),
+                "result": clip(&text, TRACE_RESULT_CHARS),
+                "error": is_error,
+            }));
+        }
         out.push(serde_json::json!({
             "type": "tool_result",
             "tool_use_id": id,

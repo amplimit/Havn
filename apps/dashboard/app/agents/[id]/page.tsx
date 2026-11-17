@@ -12,6 +12,7 @@ import {
   type EmbeddingStatus,
   type MeView,
   type SentFile,
+  type TurnTrace,
 } from "@/lib/api";
 import { openChat, type ChatHandle } from "@/lib/websocket";
 import { Markdown } from "@/components/Markdown";
@@ -47,6 +48,8 @@ type Bubble = {
   /** The stored turn it shows, with its versions; absent until stored. */
   turn?: string;
   versions?: string[];
+  /** For a reply: what its turn did on the way. */
+  trace?: TurnTrace;
   /** A file the agent sent, to download. */
   file?: { url: string; name: string; caption?: string };
   /** A note of what a reply saved to or forgot from memory, and that
@@ -126,6 +129,7 @@ function turnBubbles(turns: ConversationTurn[], nextId: () => number): Bubble[] 
       ts: new Date(t.created_at).getTime(),
       turn: t.id,
       versions: t.versions,
+      trace: t.trace,
     }));
 }
 
@@ -227,7 +231,7 @@ export default function ChatPage({
   // The tool call the reply being written in this chat is making.
   const [step, setStep] = useState<Step | null>(null);
   // The text of the reply being written, by model call, as it arrives.
-  const [live, setLive] = useState<{ call: string; text: string }[]>([]);
+  const [live, setLive] = useState<{ call: string; text: string; thinking: string }[]>([]);
   // Calls whose text is no longer shown: their reply came or was stopped;
   // and those shown now. Kept apart from `live` so a call ends at once.
   const doneCalls = useRef(new Set<string>());
@@ -476,20 +480,24 @@ export default function ChatPage({
             }
             if (doneCalls.current.has(msg.call)) return;
             liveCalls.current.add(msg.call);
-            setStep(null);
+            // The call's reasoning or its reply, each pieced together alike.
+            const key = msg.thinking ? "thinking" : "text";
+            if (!msg.thinking) setStep(null);
             setLive((prev) => {
               const i = prev.findIndex((p) => p.call === msg.call);
+              const entry = i < 0 ? { call: msg.call, text: "", thinking: "" } : prev[i];
+              let value: string;
               if (msg.at === 0) {
-                if (i < 0) return [...prev, { call: msg.call, text: msg.text }];
-                const next = [...prev];
-                next[i] = { call: msg.call, text: msg.text };
-                return next;
+                value = msg.text;
+              } else if (i >= 0 && entry[key].length === msg.at) {
+                value = entry[key] + msg.text;
+              } else {
+                // A piece that does not follow what is shown waits for the
+                // next whole text.
+                return prev;
               }
-              // A piece that does not follow what is shown waits for the
-              // next whole text.
-              if (i < 0 || prev[i].text.length !== msg.at) return prev;
-              const next = [...prev];
-              next[i] = { call: msg.call, text: prev[i].text + msg.text };
+              const next = i < 0 ? [...prev, entry] : [...prev];
+              next[i < 0 ? next.length - 1 : i] = { ...entry, [key]: value };
               return next;
             });
             return;
@@ -665,7 +673,7 @@ export default function ChatPage({
   // As the reply being written grows, follow it, unless the user scrolled
   // up to read.
   const atBottom = useRef(true);
-  const liveLength = live.reduce((n, p) => n + p.text.length, 0);
+  const liveLength = live.reduce((n, p) => n + p.text.length + p.thinking.length, 0);
   useEffect(() => {
     const el = scrollRef.current;
     if (el && liveLength > 0 && atBottom.current) el.scrollTo({ top: el.scrollHeight });
@@ -1157,6 +1165,9 @@ export default function ChatPage({
                 </div>
               </div>
             ))}
+            {pending && live.some((p) => p.thinking.trim() !== "") && (
+              <LiveThinking text={live.map((p) => p.thinking.trim()).filter(Boolean).join("\n\n")} />
+            )}
             {pending && live.some((p) => p.text.trim() !== "") && (
               <LiveBubble text={live.map((p) => p.text.trim()).filter(Boolean).join("\n\n")} />
             )}
@@ -1499,6 +1510,9 @@ function Bubble({
           : undefined
       }
     >
+      {bubble.role === "agent" && bubble.trace && bubble.trace.items.length > 0 && (
+        <TraceFold trace={bubble.trace} />
+      )}
       {message && message.files.length > 0 && (
         <AttachmentCards agentId={agentId} files={message.files} align="end" />
       )}
@@ -2139,6 +2153,86 @@ function ActionRow({
  * `agent_message` arrives (parent flips `pending` to false).
  */
 /** The reply as the model writes it, before the reply itself comes. */
+/** The reasoning of the reply being written, as it arrives. */
+function LiveThinking({ text }: { text: string }) {
+  const box = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = box.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [text]);
+  return (
+    <div className="flex flex-col items-start">
+      <div
+        className="w-full px-3 py-2 text-xs"
+        style={{ maxWidth: "min(85%, 720px)", color: "var(--color-body)" }}
+        aria-live="off"
+      >
+        <div className="mb-1 font-medium">thinking…</div>
+        <div
+          ref={box}
+          className="overflow-y-auto border-l-2 pl-3"
+          style={{ maxHeight: 160, whiteSpace: "pre-wrap", borderColor: "var(--color-border-default)" }}
+        >
+          {text}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** How long, in words a person reads: "12 s", "3 min". */
+function took(ms: number): string {
+  const s = Math.max(1, Math.round(ms / 1000));
+  return s < 60 ? `${s} s` : `${Math.round(s / 60)} min`;
+}
+
+/**
+ * What a reply's turn did on the way, folded into one line: the model's
+ * reasoning and each tool call, with its input and result, when opened.
+ */
+function TraceFold({ trace }: { trace: TurnTrace }) {
+  const steps = trace.items.filter((i) => i.kind === "step").length;
+  const thought = trace.items.some((i) => i.kind === "thinking");
+  const parts = [
+    thought ? "thought" : null,
+    steps > 0 ? `${steps} step${steps === 1 ? "" : "s"}` : null,
+  ].filter(Boolean);
+  const muted = { color: "var(--color-body)" };
+  return (
+    <details className="text-xs" style={{ maxWidth: "min(85%, 720px)", ...muted }}>
+      <summary className="cursor-pointer select-none">
+        {parts.join(" · ")} · {took(trace.ms)}
+      </summary>
+      <ol className="mt-2 flex flex-col gap-2 border-l-2 pl-3" style={{ borderColor: "var(--color-border-default)" }}>
+        {trace.items.map((item, i) =>
+          item.kind === "thinking" ? (
+            <li key={i} style={{ whiteSpace: "pre-wrap" }}>
+              {item.text}
+            </li>
+          ) : (
+            <li key={i}>
+              <div className="font-mono" style={{ color: item.error ? "var(--color-ruby)" : "var(--color-deep-navy)" }}>
+                {item.tool}
+                {item.error && " (failed)"}
+              </div>
+              <pre className="mt-1 overflow-x-auto font-mono" style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                {item.input}
+              </pre>
+              <pre
+                className="mt-1 overflow-y-auto font-mono"
+                style={{ maxHeight: 200, whiteSpace: "pre-wrap", wordBreak: "break-word", opacity: 0.85 }}
+              >
+                {item.result}
+              </pre>
+            </li>
+          ),
+        )}
+        {(trace.left_out ?? 0) > 0 && <li>…and {trace.left_out} more, not kept.</li>}
+      </ol>
+    </details>
+  );
+}
+
 function LiveBubble({ text }: { text: string }) {
   return (
     <div className="flex flex-col items-start">

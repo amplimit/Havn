@@ -139,6 +139,9 @@ pub fn is_event_stream(response: &reqwest::Response) -> bool {
 pub enum TextEvent<'a> {
     /// The next piece of the reply's text.
     Text(&'a str),
+    /// The next piece of the model's reasoning before it (issue #178):
+    /// shown in the web chat, never part of the reply.
+    Reasoning(&'a str),
     /// The call starts over on another credential: what it passed so far
     /// is not the reply.
     Restart,

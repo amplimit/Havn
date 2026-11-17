@@ -2141,6 +2141,8 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     .await;
 
     let memory_changes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let turn_trace = Arc::new(std::sync::Mutex::new(tool_loop::Trace::default()));
+    let started = std::time::Instant::now();
     let final_text = match tools::gateway::CONVERSATION
         .scope(
             msg.channel_id.clone(),
@@ -2148,13 +2150,16 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
                 chat.clone(),
                 tools::memory::MEMORY_CHANGES.scope(
                     Arc::clone(&memory_changes),
-                    run_tool_loop(
-                        &ctx,
-                        crate::tools::context::WEBCHAT,
-                        &mut messages,
-                        &augmented,
-                        Some(stop),
-                        chat_model,
+                    tool_loop::TRACE.scope(
+                        Arc::clone(&turn_trace),
+                        run_tool_loop(
+                            &ctx,
+                            crate::tools::context::WEBCHAT,
+                            &mut messages,
+                            &augmented,
+                            Some(stop),
+                            chat_model,
+                        ),
                     ),
                 ),
             ),
@@ -2172,21 +2177,39 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     // exist only in-memory for this iteration).
     // Under the turn it answers, also when the user moved to another
     // branch meanwhile.
-    let reply_turn =
-        match conversations::record_reply(&ctx.pool, &chat, &answered, &final_text).await {
-            // Facts are flushed to memory from the owner's dashboard chats only:
-            // memory is the agent's, and a channel may be someone else.
-            Ok(Some(turn)) => {
-                summarize_when_due(&ctx, &chat, msg.channel == "webchat");
-                Some(turn)
+    let reply_turn = match conversations::record_reply(&ctx.pool, &chat, &answered, &final_text)
+        .await
+    {
+        // Facts are flushed to memory from the owner's dashboard chats only:
+        // memory is the agent's, and a channel may be someone else.
+        Ok(Some(turn)) => {
+            summarize_when_due(&ctx, &chat, msg.channel == "webchat");
+            // What the turn did on the way, kept with its reply.
+            let kept = std::mem::take(
+                &mut *turn_trace
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            if !kept.items.is_empty() {
+                let trace = serde_json::json!({
+                    "ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "items": kept.items,
+                    "left_out": kept.left_out,
+                });
+                if let Err(e) = conversations::set_trace(&ctx.pool, &turn, &trace.to_string()).await
+                {
+                    warn!(error = %e, "could not keep the turn's trace");
+                }
             }
-            // The chat was deleted while it ran: its reply goes nowhere.
-            Ok(None) => return,
-            Err(e) => {
-                warn!(error = %e, "could not persist assistant turn");
-                None
-            }
-        };
+            Some(turn)
+        }
+        // The chat was deleted while it ran: its reply goes nowhere.
+        Ok(None) => return,
+        Err(e) => {
+            warn!(error = %e, "could not persist assistant turn");
+            None
+        }
+    };
 
     let outbound = OutboundMessage {
         conversation: Some(chat.clone()),

@@ -173,6 +173,20 @@ export type SkillListResponse = {
   uninitialised: boolean;
 };
 
+/** One part of what a reply's turn did on the way. */
+export type TraceItem =
+  | { kind: "thinking"; text: string }
+  | { kind: "step"; tool: string; input: string; result: string; error: boolean };
+
+/** What a reply's turn did on the way: the model's reasoning and its tool calls. */
+export type TurnTrace = {
+  /** How long the turn took. */
+  ms: number;
+  items: TraceItem[];
+  /** Parts not kept. */
+  left_out?: number;
+};
+
 export type ConversationTurn = {
   id: string;
   role: "user" | "assistant" | "system" | "tool";
@@ -181,6 +195,8 @@ export type ConversationTurn = {
   /** Its versions: the turns in its place on other branches, itself
    * included, oldest first. */
   versions: string[];
+  /** For a reply: what its turn did on the way. */
+  trace?: TurnTrace;
 };
 
 export type ConversationResponse = {
