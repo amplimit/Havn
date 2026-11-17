@@ -542,6 +542,23 @@ export type TitlesView = {
   model: string;
 };
 
+/** A one-time code that links a chat-app account to the caller (issue #182). */
+export type PairingCode = {
+  channel: string;
+  account_id: string;
+  code: string;
+  /** Opens the bot with the code, when the bot's username is known. */
+  link?: string;
+  expires_at: string;
+};
+
+/** A chat-app account linked to the caller. */
+export type ChannelLinkView = {
+  channel: string;
+  sender_id: string;
+  linked_at: string;
+};
+
 /** Whether an agent's workspace can be browsed (issue #177). */
 export type WorkspaceAccess = {
   /** `[workspace] browse` in the gateway's config.toml. */
@@ -584,6 +601,16 @@ export function workspaceFileUrl(agentId: string, path: string): string {
 export const api = {
   me: () => request<MeView>("/me"),
   timezone: () => request<TimezoneView>("/me/timezone"),
+  channels: {
+    pair: (agentId: string) =>
+      request<PairingCode[]>(`/agents/${agentId}/pairing`, { method: "POST" }),
+    links: () => request<ChannelLinkView[]>("/me/channel-links"),
+    unlink: (channel: string, sender: string) =>
+      request<void>(
+        `/me/channel-links?channel=${encodeURIComponent(channel)}&sender=${encodeURIComponent(sender)}`,
+        { method: "DELETE" },
+      ),
+  },
   workspace: {
     access: (agentId: string) => request<WorkspaceAccess>(`/agents/${agentId}/workspace/access`),
     setAccess: (agentId: string, enabled: boolean) =>

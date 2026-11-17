@@ -789,6 +789,7 @@ mod tests {
                     dm_policy,
                     allow_from: allow_from.iter().map(|s| (*s).to_string()).collect(),
                     admins: Vec::new(),
+                    bot_username: None,
                 }],
             },
         );

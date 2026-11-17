@@ -31,6 +31,8 @@ import {
   type ApprovalsView,
   type TitlesView,
   type WorkspaceAccess,
+  type PairingCode,
+  type ChannelLinkView,
   type MyDomainsView,
   type TimezoneView,
 } from "@/lib/api";
@@ -303,6 +305,7 @@ export default function SettingsPage({
       <ScheduledTasks agentId={id} />
       <TitlesEditor agentId={id} />
       <WorkspaceAccessEditor agentId={id} />
+      <ChannelPairing agentId={id} />
       <ApprovalsEditor agentId={id} />
 
       <McpEditor agentId={id} />
@@ -530,6 +533,123 @@ function BootstrapFileEditor({
         )}
       </div>
     </div>
+  );
+}
+
+/**
+ * Connect the caller's chat-app accounts (Telegram, ...) to their Havn
+ * account through this agent's bots, and see or remove those links.
+ */
+function ChannelPairing({ agentId }: { agentId: string }) {
+  const [codes, setCodes] = useState<PairingCode[] | null>(null);
+  const [links, setLinks] = useState<ChannelLinkView[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const loadLinks = useCallback(() => {
+    api.channels.links().then(setLinks, (e: unknown) =>
+      setError(e instanceof Error ? e.message : String(e)),
+    );
+  }, []);
+  useEffect(loadLinks, [loadLinks]);
+  // While codes are shown: a code redeemed in the chat app shows up as a
+  // link, and one past its time as expired.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!codes) return;
+    const timer = setInterval(() => {
+      setNow(Date.now());
+      loadLinks();
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [codes, loadLinks]);
+  async function connect() {
+    setBusy(true);
+    setError(null);
+    try {
+      setCodes(await api.channels.pair(agentId));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function remove(link: ChannelLinkView) {
+    setError(null);
+    try {
+      await api.channels.unlink(link.channel, link.sender_id);
+      loadLinks();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+  const muted = { color: "var(--color-body)" };
+  return (
+    <section className="mt-10 card px-4 py-4" aria-labelledby="pairing-title">
+      <h2 id="pairing-title" className="display-h3 mb-2">
+        chat apps
+      </h2>
+      <p className="mb-3 text-sm" style={muted}>
+        Connect your Telegram account to your Havn account: then this agent&apos;s bot (and your
+        other agents&apos; bots) answers you without a code from the server, and you can use the
+        admin commands there, such as /model and /approve.
+      </p>
+      {error && (
+        <p className="mb-2 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
+          {error}
+        </p>
+      )}
+      <button type="button" className="btn-ghost" disabled={busy} onClick={() => void connect()}>
+        {codes ? "make new codes" : "connect"}
+      </button>
+      {codes && (
+        <ul className="mt-3 grid gap-2 text-sm" aria-label="pairing codes">
+          {codes.map((c) => (
+            <li key={`${c.channel}/${c.account_id}`} className="rounded border px-3 py-2" style={{ borderColor: "var(--color-hairline)" }}>
+              <p className="font-mono text-xs" style={muted}>
+                {c.channel} / {c.account_id}
+              </p>
+              {c.link ? (
+                <p>
+                  Open{" "}
+                  <a href={c.link} target="_blank" rel="noreferrer" className="underline">
+                    {c.link}
+                  </a>{" "}
+                  and press Start, or send the bot this code:
+                </p>
+              ) : (
+                <p>Send the bot this code:</p>
+              )}
+              <p className="font-mono text-base tracking-wider" aria-label="pairing code">
+                {c.code}
+              </p>
+              <p className="text-xs" style={muted}>
+                {Date.parse(c.expires_at) > now
+                  ? `Works once, until ${new Date(c.expires_at).toLocaleTimeString()}.`
+                  : "Expired: make new codes."}
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
+      {links && links.length > 0 && (
+        <div className="mt-4">
+          <p className="mb-1 text-sm" style={muted}>
+            Connected to your Havn account (for all your agents):
+          </p>
+          <ul className="grid gap-1 text-sm" aria-label="connected accounts">
+            {links.map((l) => (
+              <li key={`${l.channel}/${l.sender_id}`} className="flex flex-wrap items-center gap-3">
+                <span className="font-mono">{l.sender_id}</span>
+                <span style={muted}>{l.channel}</span>
+                <button type="button" className="text-xs underline" onClick={() => void remove(l)}>
+                  disconnect
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
   );
 }
 
