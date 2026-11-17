@@ -433,6 +433,7 @@ pub(crate) mod tests {
             ),
             llm: Arc::new(crate::config::LlmConfig::default()),
             workspace_browse: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            channel_texts: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
             models: Arc::new(arc_swap::ArcSwap::from_pointee(
                 crate::model_catalog::ModelCatalog::default(),
             )),

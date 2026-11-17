@@ -113,6 +113,10 @@ pub struct GatewayConfig {
     /// What the dashboard may show of agents' workspaces (issue #177).
     #[serde(default)]
     pub workspace: WorkspaceConfig,
+    /// What channel bots tell senders who are not paired yet, per channel
+    /// and account (issue #183), hot-reloaded.
+    #[serde(default)]
+    pub channel_texts: ChannelTexts,
     /// Backend of the `web_search` tool.
     ///
     /// TOML form:
@@ -331,6 +335,29 @@ pub struct NetworkConfig {
     /// owner about each new domain) or `all` (every public address).
     pub default_egress: String,
 }
+
+/// `[channel_texts.<channel>.<account>]`: what an `allowlist` bot tells a
+/// sender who is not paired yet; each text left out is the default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PairingTexts {
+    /// The answer to `/start`.
+    pub welcome: Option<String>,
+    /// The answer to any other message.
+    pub unpaired: Option<String>,
+    /// The answer to a code that is wrong, used or expired.
+    pub invalid_code: Option<String>,
+    /// The answer to a code sent after too many tries.
+    pub too_many_tries: Option<String>,
+    /// The answer to `/help`.
+    pub help: Option<String>,
+    /// The answer to a code accepted.
+    pub paired: Option<String>,
+}
+
+/// Channel id, then account id, to the account's texts.
+pub type ChannelTexts =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, PairingTexts>>;
 
 /// `[workspace]`: whether owners may browse their agents' workspaces from
 /// the dashboard. Off unless turned on; with it on, each agent's page is on
@@ -558,6 +585,7 @@ impl Default for GatewayConfig {
             network: NetworkConfig::default(),
             llm: LlmConfig::default(),
             workspace: WorkspaceConfig::default(),
+            channel_texts: ChannelTexts::default(),
             search: SearchConfig::default(),
             fetch: FetchConfig::default(),
             channels: std::collections::BTreeMap::new(),
@@ -656,6 +684,7 @@ impl GatewayConfig {
         let raw = std::fs::read_to_string(path)?;
         let mut parsed: Self = toml::from_str(&raw)?;
         parsed.validate_channel_ids()?;
+        parsed.warn_channel_texts();
         parsed.validate_llm()?;
         parsed.validate_search()?;
         if !matches!(
@@ -796,6 +825,27 @@ impl GatewayConfig {
             })?;
         }
         Ok(())
+    }
+
+    /// Warn about `[channel_texts]` for an account the config does not
+    /// declare (a typo leaves its bot with the defaults). Texts too long
+    /// for a chat message are cut when sent.
+    pub fn warn_channel_texts(&self) {
+        for (channel, accounts) in &self.channel_texts {
+            for account in accounts.keys() {
+                let declared = self
+                    .channels
+                    .get(channel)
+                    .is_some_and(|entry| entry.accounts.iter().any(|a| &a.id == account));
+                if !declared {
+                    tracing::warn!(
+                        channel = %channel,
+                        account = %account,
+                        "[channel_texts] names an account not in [[channels.<channel>.accounts]]; its texts are not used"
+                    );
+                }
+            }
+        }
     }
 
     /// Resolve the config path the watcher should target. Mirrors the

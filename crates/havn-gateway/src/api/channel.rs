@@ -51,14 +51,31 @@ use crate::secret_ref;
 /// against this header.
 const ADAPTER_TOKEN_HEADER: &str = "x-adapter-token";
 
-/// Cooldown between rejection messages to the same sender on the same
-/// account. Prevents the bot from becoming a traffic reflector if an
-/// unauthorized sender spams it. 5 minutes matches the replay-buffer
-/// window.
-const DM_REJECT_COOLDOWN: Duration = Duration::from_secs(300);
+/// Answers to one sender who is not paired, per account, within
+/// [`DM_REPLY_WINDOW`]: every message is answered, but a stranger cannot
+/// make the bot send more than this.
+const DM_REPLY_LIMIT: u32 = 3;
+const DM_REPLY_WINDOW: Duration = Duration::from_secs(60);
+/// Senders the reply limiter tracks at once per account; past it, new
+/// senders to that account get no answer until older windows end. Per
+/// account, so a flood at one bot does not silence another's.
+const DM_REPLY_MAX_KEYS: usize = 10_000;
+/// Characters of a configured text sent: below every platform's message
+/// limit (Telegram's is 4096).
+const MAX_PAIRING_TEXT_CHARS: usize = 2000;
 
-const DM_REJECT_MESSAGE: &str =
-    "This bot is not available to you. Please contact the system administrator.";
+/// What an `allowlist` bot tells a sender who is not paired (issue #183),
+/// unless `[channel_texts]` says otherwise.
+const PAIR_WELCOME: &str = "Hello! This bot needs pairing before you can use it. Send the pairing \
+                            code you were given (it looks like 7K3M-QX9P-2HWD-RT4B), or open the \
+                            pairing link you got. No code yet? Ask whoever runs this bot.";
+const PAIR_UNPAIRED: &str = "Not paired yet. Send your pairing code, or /help.";
+const PAIR_INVALID_CODE: &str = "That pairing code is not valid or has expired.";
+const PAIR_TOO_MANY_TRIES: &str =
+    "Too many tries. Please wait a few minutes, then send your pairing code again.";
+const PAIR_HELP: &str = "This bot answers only people who have paired with it. To pair, send the \
+                         pairing code you were given (it looks like 7K3M-QX9P-2HWD-RT4B), or open \
+                         the pairing link you got. Codes come from whoever runs this bot.";
 
 /// Sent back when an inbound message could not be handed to the agent.
 const AGENT_UNREACHABLE_MESSAGE: &str =
@@ -68,7 +85,7 @@ const AGENT_UNREACHABLE_MESSAGE: &str =
 const GATEWAY_RESTARTING_MESSAGE: &str =
     "The service is restarting and did not take your message. Please send it again in a minute.";
 
-const INVITE_WELCOME_MESSAGE: &str = "Your invite code was accepted. You can now message this bot.";
+const INVITE_WELCOME_MESSAGE: &str = "Paired. You can now message this bot.";
 
 /// Invite-code attempts allowed per sender and account within
 /// [`INVITE_ATTEMPT_WINDOW`]. Codes carry 80 bits, so this is not what
@@ -81,14 +98,16 @@ const INVITE_ATTEMPT_WINDOW: Duration = Duration::from_secs(900);
 /// limiter only bounds DB load; the codes' 80 bits keep them secret.
 const INVITE_LIMITER_MAX_KEYS: usize = 10_000;
 
-/// Rate-limits rejection messages to unauthorized senders. Without
-/// this an attacker who floods a bot endpoint would trigger equally
-/// many outbound "access denied" replies (reflector amplification).
+/// Rate-limits the answers to senders who are not paired: at most
+/// [`DM_REPLY_LIMIT`] per sender within [`DM_REPLY_WINDOW`]. Without it,
+/// someone flooding a bot would get the bot to send as many answers
+/// (reflector amplification).
 ///
-/// Key: `"{channel}|{account_id}|{sender_id}"`.
+/// Key: `"{channel}|{account_id}|{sender_id}"`; the senders of each
+/// `"{channel}|{account_id}"` are counted apart.
 #[derive(Debug, Clone, Default)]
 pub struct DmRejectLimiter {
-    last_reject: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    accounts: Arc<std::sync::Mutex<HashMap<String, HashMap<String, (Instant, u32)>>>>,
 }
 
 impl DmRejectLimiter {
@@ -97,22 +116,31 @@ impl DmRejectLimiter {
         Self::default()
     }
 
-    /// Returns `true` if a rejection should be sent (cooldown expired
-    /// or first rejection for this sender). Lazily prunes stale entries
-    /// when the map exceeds 1 000 keys.
+    /// Whether to answer this message from `key`'s sender.
     pub fn should_send(&self, key: &str) -> bool {
-        let now = Instant::now();
-        let mut map = self.last_reject.lock().unwrap_or_else(|e| e.into_inner());
-        if map.len() > 1000 {
-            map.retain(|_, v| now.duration_since(*v) < DM_REJECT_COOLDOWN * 2);
-        }
-        match map.get(key) {
-            Some(last) if now.duration_since(*last) < DM_REJECT_COOLDOWN => false,
-            _ => {
-                map.insert(key.to_string(), now);
-                true
+        self.should_send_at(key, Instant::now())
+    }
+
+    fn should_send_at(&self, key: &str, now: Instant) -> bool {
+        let (account, sender) = key.rsplit_once('|').unwrap_or(("", key));
+        let mut accounts = self.accounts.lock().unwrap_or_else(|e| e.into_inner());
+        let map = accounts.entry(account.to_string()).or_default();
+        if map.len() >= DM_REPLY_MAX_KEYS && !map.contains_key(sender) {
+            map.retain(|_, (start, _)| now.duration_since(*start) < DM_REPLY_WINDOW);
+            if map.len() >= DM_REPLY_MAX_KEYS {
+                return false;
             }
         }
+        let (start, count) = map.entry(sender.to_string()).or_insert((now, 0));
+        if now.duration_since(*start) >= DM_REPLY_WINDOW {
+            *start = now;
+            *count = 0;
+        }
+        if *count >= DM_REPLY_LIMIT {
+            return false;
+        }
+        *count += 1;
+        true
     }
 }
 
@@ -988,7 +1016,7 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
     let access = sender_access(state, channel, agent_id, &inb).await;
     if access == SenderAccess::Admitted {
         let welcome = ChannelMessageContent::Text {
-            text: INVITE_WELCOME_MESSAGE.into(),
+            text: pairing_text(state, channel, &inb.account_id, Refusal::Paired),
         };
         if let Err(e) = state
             .channel_router
@@ -1007,17 +1035,18 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
         return;
     }
 
-    if access == SenderAccess::Denied {
+    if let SenderAccess::Denied(why) = access {
         warn!(
             channel,
             account = %inb.account_id,
             sender = %inb.sender_id,
-            "dm_policy: rejecting inbound from unauthorized sender"
+            ?why,
+            "dm_policy: not forwarding a message from a sender who is not paired"
         );
         let limiter_key = format!("{channel}|{}|{}", inb.account_id, inb.sender_id);
         if state.dm_reject_limiter.should_send(&limiter_key) {
             let rejection = ChannelMessageContent::Text {
-                text: DM_REJECT_MESSAGE.into(),
+                text: pairing_text(state, channel, &inb.account_id, why),
             };
             if let Err(e) = state
                 .channel_router
@@ -1354,8 +1383,59 @@ enum SenderAccess {
     Allowed,
     /// The message redeemed an invite: welcome the sender, do not forward.
     Admitted,
-    /// Reject as an unauthorized sender.
-    Denied,
+    /// Not forwarded: the sender is not paired; how it is answered.
+    Denied(Refusal),
+}
+
+/// What a sender who is not paired is told (issue #183).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// `/start` without a code.
+    Welcome,
+    /// `/help`.
+    Help,
+    /// A code that is wrong, used, expired or for another bot.
+    InvalidCode,
+    /// A code past the attempts allowed, valid or not.
+    TooManyTries,
+    /// Anything else.
+    Unpaired,
+    /// Not a refusal: the code was accepted.
+    Paired,
+}
+
+/// The text `why` gets on account `account_id` of `channel`: the one in
+/// `[channel_texts]`, or the default.
+fn pairing_text(state: &AppState, channel: &str, account_id: &str, why: Refusal) -> String {
+    let texts = state.channel_texts.load();
+    let own = texts
+        .get(channel)
+        .and_then(|accounts| accounts.get(account_id));
+    let (set, default) = match why {
+        Refusal::Welcome => (own.and_then(|t| t.welcome.clone()), PAIR_WELCOME),
+        Refusal::Help => (own.and_then(|t| t.help.clone()), PAIR_HELP),
+        Refusal::InvalidCode => (own.and_then(|t| t.invalid_code.clone()), PAIR_INVALID_CODE),
+        Refusal::TooManyTries => (
+            own.and_then(|t| t.too_many_tries.clone()),
+            PAIR_TOO_MANY_TRIES,
+        ),
+        Refusal::Unpaired => (own.and_then(|t| t.unpaired.clone()), PAIR_UNPAIRED),
+        Refusal::Paired => (own.and_then(|t| t.paired.clone()), INVITE_WELCOME_MESSAGE),
+    };
+    set.filter(|t| !t.trim().is_empty()).map_or_else(
+        || default.to_string(),
+        |t| t.chars().take(MAX_PAIRING_TEXT_CHARS).collect(),
+    )
+}
+
+/// `text` as a command to a bot: `/name` or `/name@bot` (its name in
+/// lower case), then the rest.
+fn bot_command(text: &str) -> Option<(String, &str)> {
+    let text = text.trim();
+    let word = text.split_whitespace().next()?;
+    let name = word.strip_prefix('/')?;
+    let name = name.split_once('@').map_or(name, |(n, _)| n);
+    Some((name.to_ascii_lowercase(), text[word.len()..].trim()))
 }
 
 /// Reply to the sender's message `message_id` with `text`.
@@ -1386,9 +1466,9 @@ async fn tell_sender(
 /// `dm_policy = "open"` admits everyone. `allowlist` admits TOML
 /// `allow_from` and the DB `channel_allowlist` (read per message, so a
 /// revocation applies to the next one). Anyone else may redeem an invite
-/// code for this account; a failed or rate-limited attempt is `Denied`
-/// exactly like any other message, so the sender cannot tell whether a
-/// code exists.
+/// code for this account, sent as it is or as `/start <code>`; a wrong,
+/// used, expired or rate-limited one gets the same answer, so the sender
+/// cannot tell which.
 async fn sender_access(
     state: &AppState,
     channel: &str,
@@ -1400,7 +1480,7 @@ async fn sender_access(
         .get(channel)
         .and_then(|entry| entry.accounts.iter().find(|a| a.id == inb.account_id))
     else {
-        return SenderAccess::Denied;
+        return SenderAccess::Denied(Refusal::Unpaired);
     };
     match acct.dm_policy {
         DmPolicy::Open => return SenderAccess::Allowed,
@@ -1414,15 +1494,28 @@ async fn sender_access(
         Ok(false) => {}
         Err(e) => {
             warn!(channel, account = %inb.account_id, error = %e, "dm_policy: allowlist lookup failed; rejecting");
-            return SenderAccess::Denied;
+            return SenderAccess::Denied(Refusal::Unpaired);
         }
     }
 
     let ChannelMessageContent::Text { text } = &inb.content else {
-        return SenderAccess::Denied;
+        return SenderAccess::Denied(Refusal::Unpaired);
     };
-    let Some(code) = channel_access::normalize_code(text) else {
-        return SenderAccess::Denied;
+    // `/start` alone welcomes; `/start <code>`, from a pairing link,
+    // pairs; `/help` explains. Any other text that reads as a code pairs.
+    let candidate = match bot_command(text) {
+        Some((name, "")) if name == "start" => return SenderAccess::Denied(Refusal::Welcome),
+        Some((name, payload)) if name == "start" => payload,
+        Some((name, _)) if name == "help" => return SenderAccess::Denied(Refusal::Help),
+        Some(_) => return SenderAccess::Denied(Refusal::Unpaired),
+        None => text.as_str(),
+    };
+    let Some(code) = channel_access::normalize_code(candidate) else {
+        return SenderAccess::Denied(if candidate == text.as_str() {
+            Refusal::Unpaired
+        } else {
+            Refusal::InvalidCode
+        });
     };
     let limiter_key = format!("{channel}|{}|{}", inb.account_id, inb.sender_id);
     match state.invite_attempt_limiter.check(&limiter_key) {
@@ -1436,7 +1529,7 @@ async fn sender_access(
                     "invite: too many attempts from this sender; ignoring codes for the rest of the window"
                 );
             }
-            return SenderAccess::Denied;
+            return SenderAccess::Denied(Refusal::TooManyTries);
         }
     }
     let invite = match channel_access::redeem(
@@ -1457,11 +1550,11 @@ async fn sender_access(
                 sender = %inb.sender_id,
                 "invite: failed attempt (unknown, used, revoked, expired or other-account code)"
             );
-            return SenderAccess::Denied;
+            return SenderAccess::Denied(Refusal::InvalidCode);
         }
         Err(e) => {
             warn!(channel, account = %inb.account_id, error = %e, "invite: redeem failed; rejecting");
-            return SenderAccess::Denied;
+            return SenderAccess::Denied(Refusal::InvalidCode);
         }
     };
     info!(
@@ -1523,18 +1616,48 @@ mod tests {
     }
 
     #[test]
-    fn dm_reject_limiter_allows_first_then_blocks() {
+    fn a_sender_gets_a_few_answers_a_minute() {
         let limiter = DmRejectLimiter::new();
-        assert!(limiter.should_send("telegram|bot|tg:1"));
-        assert!(!limiter.should_send("telegram|bot|tg:1"));
+        let start = Instant::now();
+        for _ in 0..DM_REPLY_LIMIT {
+            assert!(limiter.should_send_at("telegram|bot|tg:1", start));
+        }
+        assert!(!limiter.should_send_at("telegram|bot|tg:1", start));
+        assert!(
+            limiter.should_send_at("telegram|bot|tg:2", start),
+            "senders are counted apart"
+        );
+        assert!(limiter.should_send_at("telegram|bot|tg:1", start + DM_REPLY_WINDOW));
     }
 
     #[test]
-    fn dm_reject_limiter_independent_keys() {
+    fn a_flood_of_new_senders_is_bounded_per_account() {
         let limiter = DmRejectLimiter::new();
-        assert!(limiter.should_send("telegram|bot|tg:1"));
-        assert!(limiter.should_send("telegram|bot|tg:2"));
-        assert!(!limiter.should_send("telegram|bot|tg:1"));
+        let start = Instant::now();
+        for i in 0..DM_REPLY_MAX_KEYS {
+            assert!(limiter.should_send_at(&format!("telegram|bot|flood:{i}"), start));
+        }
+        assert!(!limiter.should_send_at("telegram|bot|tg:new", start));
+        assert!(
+            limiter.should_send_at("telegram|other-bot|tg:new", start),
+            "a flood at one bot does not silence another"
+        );
+        assert!(limiter.should_send_at("telegram|bot|tg:new", start + DM_REPLY_WINDOW));
+    }
+
+    #[test]
+    fn bot_commands_are_read_with_or_without_the_bot_name() {
+        assert_eq!(bot_command("/start"), Some(("start".to_string(), "")));
+        assert_eq!(
+            bot_command(" /start@acme_bot  7K3M-QX9P "),
+            Some(("start".to_string(), "7K3M-QX9P"))
+        );
+        assert_eq!(
+            bot_command("/HELP@acme_bot"),
+            Some(("help".to_string(), ""))
+        );
+        assert_eq!(bot_command("hello /start"), None);
+        assert_eq!(bot_command(""), None);
     }
 
     #[test]
@@ -1859,7 +1982,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn reused_and_other_account_codes_are_rejected_like_any_message() {
+        async fn reused_and_other_account_codes_are_not_valid() {
             let mut f = fixture(DmPolicy::Allowlist, &[]).await;
             let code = f.invite("bot").await;
             f.send("tg:1", &code).await;
@@ -1867,20 +1990,92 @@ mod tests {
             f.send("tg:2", &code).await;
             let other = f.invite("other-bot").await;
             f.send("tg:3", &other).await;
-            f.send("tg:4", "not a code").await;
+            f.send("tg:4", "AAAA-AAAA-AAAA-AAAA").await;
             assert!(f.forwarded().is_empty());
             let replies = f.replies();
             assert_eq!(replies.len(), 3);
             assert!(
-                replies.iter().all(|(_, text)| text == DM_REJECT_MESSAGE),
-                "a failed code gets the same reply as any other message: {replies:?}"
+                replies.iter().all(|(_, text)| text == PAIR_INVALID_CODE),
+                "a used, other-account or unknown code gets the same answer: {replies:?}"
             );
             assert!(!f.allowed("tg:2").await);
             assert!(!f.allowed("tg:3").await);
         }
 
         #[tokio::test]
-        async fn expired_code_is_rejected_like_any_message() {
+        async fn a_sender_who_is_not_paired_is_guided() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            f.send("tg:1", "/start").await;
+            f.send("tg:2", "/help@bot").await;
+            f.send("tg:3", "hello there").await;
+            f.send("tg:4", "/start not-a-code").await;
+            f.send("tg:5", "/model").await;
+            assert!(f.forwarded().is_empty());
+            assert_eq!(
+                f.replies(),
+                vec![
+                    ("tg:1".to_string(), PAIR_WELCOME.to_string()),
+                    ("tg:2".to_string(), PAIR_HELP.to_string()),
+                    ("tg:3".to_string(), PAIR_UNPAIRED.to_string()),
+                    ("tg:4".to_string(), PAIR_INVALID_CODE.to_string()),
+                    ("tg:5".to_string(), PAIR_UNPAIRED.to_string()),
+                ]
+            );
+            // Every message is answered, a few a minute.
+            for _ in 0..DM_REPLY_LIMIT + 2 {
+                f.send("tg:6", "hi").await;
+            }
+            assert_eq!(f.replies().len(), DM_REPLY_LIMIT as usize);
+        }
+
+        #[tokio::test]
+        async fn a_pairing_link_pairs_with_start_and_its_code() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let code = f.invite("bot").await;
+            f.send("tg:1", &format!("/start {}", code.replace('-', "")))
+                .await;
+            assert!(f.allowed("tg:1").await);
+            assert_eq!(
+                f.replies(),
+                vec![("tg:1".to_string(), INVITE_WELCOME_MESSAGE.to_string())]
+            );
+            assert!(f.forwarded().is_empty());
+            f.send("tg:1", "/start").await;
+            assert_eq!(
+                f.forwarded(),
+                vec!["tg:1".to_string()],
+                "a paired /start goes to the agent"
+            );
+        }
+
+        #[tokio::test]
+        async fn texts_set_in_config_are_used_and_follow_a_reload() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let texts: crate::config::GatewayConfig = toml::from_str(
+                "[channel_texts.telegram.bot]\nwelcome = \"欢迎！请发送配对码。\"\nunpaired = \"   \"\n",
+            )
+            .expect("config");
+            f.state.channel_texts.store(Arc::new(texts.channel_texts));
+            f.send("tg:1", "/start").await;
+            f.send("tg:2", "hi").await;
+            assert_eq!(
+                f.replies(),
+                vec![
+                    ("tg:1".to_string(), "欢迎！请发送配对码。".to_string()),
+                    ("tg:2".to_string(), PAIR_UNPAIRED.to_string()),
+                ],
+                "a blank text keeps the default"
+            );
+            f.state.channel_texts.store(Arc::new(Default::default()));
+            f.send("tg:3", "/start").await;
+            assert_eq!(
+                f.replies(),
+                vec![("tg:3".to_string(), PAIR_WELCOME.to_string())]
+            );
+        }
+
+        #[tokio::test]
+        async fn an_expired_code_is_not_valid() {
             let mut f = fixture(DmPolicy::Allowlist, &[]).await;
             let code = channel_access::create_invite(
                 &f.state.db,
@@ -1895,7 +2090,7 @@ mod tests {
             assert!(f.forwarded().is_empty());
             assert_eq!(
                 f.replies(),
-                vec![("tg:1".to_string(), DM_REJECT_MESSAGE.to_string())]
+                vec![("tg:1".to_string(), PAIR_INVALID_CODE.to_string())]
             );
             assert!(!f.allowed("tg:1").await);
         }
@@ -1957,6 +2152,51 @@ mod tests {
                 f.forwarded(),
                 vec!["tg:toml".to_string(), "tg:db".to_string()]
             );
+        }
+
+        #[tokio::test]
+        async fn start_codes_and_bare_codes_share_one_budget() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            for _ in 0..INVITE_ATTEMPT_LIMIT {
+                f.send("tg:1", "/start AAAA-AAAA-AAAA-AAAA").await;
+            }
+            f.replies();
+            // Its answers for this minute are used up; the attempts are
+            // what is counted here.
+            f.state.dm_reject_limiter = DmRejectLimiter::new();
+            let code = f.invite("bot").await;
+            f.send("tg:1", &code).await;
+            assert!(!f.allowed("tg:1").await);
+            assert_eq!(
+                f.replies(),
+                vec![("tg:1".to_string(), PAIR_TOO_MANY_TRIES.to_string())],
+                "a valid code past the tries is told to wait, not that it is invalid"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_link_code_may_be_lower_case_with_dashes() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let code = f.invite("bot").await;
+            f.send("tg:1", &format!("/Start@bot {}", code.to_lowercase()))
+                .await;
+            assert!(f.allowed("tg:1").await);
+            f.replies();
+            f.send("tg:1", "/help").await;
+            let replies = f.replies();
+            assert!(
+                replies.iter().any(|(_, t)| t.contains("/new"))
+                    && !replies.iter().any(|(_, t)| t == PAIR_HELP),
+                "a paired /help lists the commands, not how to pair: {replies:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn open_accounts_send_start_to_the_agent() {
+            let mut f = fixture(DmPolicy::Open, &[]).await;
+            f.send("tg:1", "/start").await;
+            assert_eq!(f.forwarded(), vec!["tg:1".to_string()]);
+            assert!(f.replies().is_empty());
         }
 
         #[tokio::test]
