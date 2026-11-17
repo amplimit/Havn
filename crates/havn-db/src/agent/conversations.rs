@@ -355,6 +355,24 @@ pub async fn set_chat_model(pool: &SqlitePool, chat: &str, model: Option<&str>) 
     Ok(res.rows_affected() > 0)
 }
 
+/// Whether turn `turn` is on chat `chat`'s branch: the path to its head.
+pub async fn on_branch(pool: &SqlitePool, chat: &str, turn: &str) -> Result<bool> {
+    let found: Option<(i64,)> = sqlx::query_as(
+        "WITH RECURSIVE path(id, parent_id) AS ( \
+             SELECT c.id, c.parent_id FROM conversations c JOIN chats h ON h.head = c.id \
+             WHERE h.id = ?1 \
+             UNION ALL \
+             SELECT c.id, c.parent_id FROM conversations c JOIN path p ON c.id = p.parent_id \
+         ) \
+         SELECT 1 FROM path WHERE id = ?2",
+    )
+    .bind(chat)
+    .bind(turn)
+    .fetch_optional(pool)
+    .await?;
+    Ok(found.is_some())
+}
+
 /// The last `limit` turns of chat `chat`'s branch, oldest first: the path
 /// to its head. Their `versions` are left empty; see [`with_versions`].
 pub async fn branch(pool: &SqlitePool, chat: &str, limit: u32) -> Result<Vec<BranchTurn>> {
@@ -1393,7 +1411,15 @@ mod tests {
                 .expect("record")
                 .expect("chat");
         }
+        let last_question = branch(&pool, &chat, 100).await.expect("branch")[2]
+            .id
+            .clone();
+        assert!(on_branch(&pool, &chat, &last_question).await.expect("db"));
         assert_eq!(undo(&pool, &chat).await.expect("db").as_deref(), Some("q2"));
+        assert!(
+            !on_branch(&pool, &chat, &last_question).await.expect("db"),
+            "taken back"
+        );
         assert_eq!(said(&pool, &chat).await, ["q1", "a1"]);
         let info = chat_info(&pool, &chat).await.expect("db").expect("chat");
         assert_eq!((info.title.as_str(), info.turns), ("q1", 2));

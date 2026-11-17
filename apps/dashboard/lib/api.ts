@@ -31,6 +31,8 @@ export type ChatSearch = {
     role: "user" | "assistant";
     excerpt: string;
     created_at: string;
+    /** On its chat's current branch; off it, opening it moves the chat. */
+    on_branch: boolean;
   }[];
 };
 

@@ -2734,26 +2734,26 @@ async fn handle_data_request(req: DataRequest, ctx: Ctx) {
                     .await
                     .map_err(|e| e.to_string())?;
                 let terms: Vec<&str> = query.split_whitespace().collect();
-                let turns: Vec<serde_json::Value> = conversations::search_chats(
-                    &ctx.pool,
-                    &channel_id,
-                    &query,
-                    limit,
-                )
-                .await
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .map(|t| {
-                    serde_json::json!({
+                let hits = conversations::search_chats(&ctx.pool, &channel_id, &query, limit)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let mut turns = Vec::with_capacity(hits.len());
+                for t in hits {
+                    // A turn on its chat's branch is shown by opening the
+                    // chat; one on another, by moving the chat to it.
+                    let on_branch = conversations::on_branch(&ctx.pool, &t.chat, &t.id)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    turns.push(serde_json::json!({
                         "id": t.id,
                         "chat": t.chat,
                         "title": t.title,
                         "role": t.role.as_str(),
                         "excerpt": tools::memory::excerpt(&t.content, &terms, SEARCH_EXCERPT_CHARS),
                         "created_at": t.created_at,
-                    })
-                })
-                .collect();
+                        "on_branch": on_branch,
+                    }));
+                }
                 Ok(serde_json::json!({ "chats": chats, "turns": turns }))
             }
             DataQuery::RenameChat {

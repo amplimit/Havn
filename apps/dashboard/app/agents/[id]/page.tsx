@@ -245,7 +245,15 @@ export default function ChatPage({
   // A found message to show once its chat is on screen (`branched` once
   // its chat was moved to the message's branch), and the one shown; when
   // a jump scrolled, so the next updates do not scroll away from it.
-  const jumpTo = useRef<{ chat: string; turn: string; branched: boolean } | null>(null);
+  const jumpTo = useRef<{
+    chat: string;
+    turn: string;
+    /** It is on the chat's branch, so the chat stays on it. */
+    onBranch: boolean;
+    /** The chat is being, or was, moved to its branch. */
+    branching: boolean;
+    branched: boolean;
+  } | null>(null);
   const [found, setFound] = useState<string | null>(null);
   const jumpedAt = useRef(0);
   const [chats, setChats] = useState<ChatSummary[]>([]);
@@ -601,7 +609,10 @@ export default function ChatPage({
   // indicator appears; not while a found message is to be shown, nor right
   // after it was (the chat's file cards arrive just after its messages).
   useEffect(() => {
-    if (jumpTo.current || Date.now() - jumpedAt.current < JUMP_HOLD_MS) return;
+    const jump = jumpTo.current;
+    if ((jump && jump.chat === chatIdRef.current) || Date.now() - jumpedAt.current < JUMP_HOLD_MS) {
+      return;
+    }
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     scrollRef.current?.scrollTo({
       top: scrollRef.current.scrollHeight,
@@ -614,7 +625,7 @@ export default function ChatPage({
   // what is loaded, the user is told.
   useEffect(() => {
     const jump = jumpTo.current;
-    if (!jump || chatIdRef.current !== jump.chat || bubbles.length === 0) return;
+    if (!jump || jump.branching || chatIdRef.current !== jump.chat || bubbles.length === 0) return;
     const el = scrollRef.current?.querySelector(`[data-turn="${CSS.escape(jump.turn)}"]`);
     if (el) {
       jumpTo.current = null;
@@ -625,7 +636,7 @@ export default function ChatPage({
       setTimeout(() => setFound((f) => (f === jump.turn ? null : f)), 4000);
       return;
     }
-    if (jump.branched) {
+    if (jump.branched || jump.onBranch) {
       jumpTo.current = null;
       pushBubble("system", "That message is further back than this chat shows.");
       return;
@@ -635,8 +646,19 @@ export default function ChatPage({
       pushBubble("system", "That message is on another version of this chat; wait for the reply, then open it again.");
       return;
     }
-    jump.branched = true;
-    void showVersion(jump.turn);
+    // Decided once the chat is on the message's branch, whatever arrives
+    // meanwhile.
+    jump.branching = true;
+    void showVersion(jump.turn).then((moved) => {
+      if (jumpTo.current !== jump) return;
+      if (!moved) {
+        jumpTo.current = null;
+        return;
+      }
+      jump.branching = false;
+      jump.branched = true;
+      setBubbles((prev) => [...prev]);
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bubbles]);
 
@@ -791,13 +813,14 @@ export default function ChatPage({
   }
 
   // Show the branch of version `turn`.
-  async function showVersion(turn: string) {
+  // Whether the chat moved to the branch of `turn`.
+  async function showVersion(turn: string): Promise<boolean> {
     const current = chatIdRef.current;
-    if (!current) return;
+    if (!current) return false;
     try {
       await api.chats.branch(id, current, turn);
       const r = await api.conversation.list(id, HISTORY_LIMIT, current);
-      if (chatIdRef.current !== current) return;
+      if (chatIdRef.current !== current) return false;
       const stored = turnBubbles(r.turns, () => bubbleIdRef.current++);
       // Notes of replies on other branches stay with them.
       setBubbles((prev) =>
@@ -808,15 +831,19 @@ export default function ChatPage({
             .map((b) => underAnchor(b, stored)),
         ].sort((a, b) => a.ts - b.ts),
       );
+      return true;
     } catch (e) {
       pushBubble("system", `error: ${e instanceof Error ? e.message : String(e)}`);
+      return false;
     }
   }
 
   // Show chat `target`, and in it the found message `turn` (see the
   // effect above); a found title only opens its chat.
-  function openFound(target: string, turn: string | null) {
-    jumpTo.current = turn ? { chat: target, turn, branched: false } : null;
+  function openFound(target: string, turn: string | null, onBranch = true) {
+    jumpTo.current = turn
+      ? { chat: target, turn, onBranch, branching: false, branched: false }
+      : null;
     if (target === chatIdRef.current) {
       // Already on screen: the effect runs on what is shown.
       setBubbles((prev) => [...prev]);
@@ -829,6 +856,8 @@ export default function ChatPage({
   // whichever chat asked.
   function openChatById(next: string | null) {
     setShowChats(false);
+    // A found message of another chat is no longer to be shown.
+    if (jumpTo.current && jumpTo.current.chat !== next) jumpTo.current = null;
     if (next !== null && next === chatIdRef.current) return;
     const previous = chatIdRef.current;
     const target = next ?? newChatId();
@@ -920,9 +949,9 @@ export default function ChatPage({
         onOpen={openChatById}
         onRename={renameChat}
         onDelete={deleteChat}
-        onFound={(chat, turn) => {
+        onFound={(chat, turn, onBranch) => {
           setShowChats(false);
-          void openFound(chat, turn);
+          openFound(chat, turn, onBranch);
         }}
         agentId={id}
         className={showChats ? "flex w-full" : "hidden"}
@@ -1172,7 +1201,7 @@ function ChatList({
   onRename: (chat: ChatSummary) => void;
   onDelete: (chat: ChatSummary) => void;
   /** A search result: its chat, and the message to show. */
-  onFound: (chat: string, turn: string | null) => void;
+  onFound: (chat: string, turn: string | null, onBranch?: boolean) => void;
   className: string;
 }) {
   const fresh = current !== null && !chats.some((c) => c.id === current);
@@ -1333,7 +1362,7 @@ function SearchResults({
   query: string;
   results: ChatSearch | null;
   error: string | null;
-  onFound: (chat: string, turn: string | null) => void;
+  onFound: (chat: string, turn: string | null, onBranch?: boolean) => void;
 }) {
   const muted = { color: "var(--color-body)" };
   if (error) {
@@ -1391,7 +1420,7 @@ function SearchResults({
                 <button
                   type="button"
                   className="w-full rounded px-2 py-1.5 text-left"
-                  onClick={() => onFound(t.chat, t.id)}
+                  onClick={() => onFound(t.chat, t.id, t.on_branch)}
                 >
                   <span className="block truncate text-xs" style={muted}>
                     {t.title || "untitled"} · {t.role === "user" ? "you" : "agent"} ·{" "}
