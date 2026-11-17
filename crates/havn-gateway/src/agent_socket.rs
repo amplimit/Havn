@@ -2970,6 +2970,31 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn a_streamed_text_is_sent_in_pieces_and_whole_after_a_restart() {
+        let mut s = Streamed::default();
+        assert_eq!(s.next(false), None, "nothing yet");
+        assert_eq!(s.next(true), None, "an empty text is not sent whole");
+        s.whole.push_str("héllo");
+        assert_eq!(s.next(false), Some((0, "héllo".into())));
+        s.whole.push_str(" wörld");
+        assert_eq!(
+            s.next(false),
+            Some((5, " wörld".into())),
+            "after the UTF-16 units sent"
+        );
+        assert_eq!(s.next(false), None);
+        assert_eq!(s.next(true), Some((0, "héllo wörld".into())));
+        s.whole.clear();
+        s.restart = true;
+        assert_eq!(
+            s.next(false),
+            Some((0, String::new())),
+            "a restart clears the tabs"
+        );
+        assert_eq!(s.next(false), None);
+    }
+
+    #[test]
     fn the_title_model_is_the_teams_then_the_gateways_when_allowed() {
         let entry = |id: &str| -> crate::model_catalog::ModelEntry {
             serde_json::from_value(serde_json::json!({ "id": id })).expect("entry")

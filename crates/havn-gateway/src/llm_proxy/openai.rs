@@ -936,6 +936,46 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_is_kept_apart_and_not_sent_back() {
+        // DeepSeek streams `reasoning_content`, OpenRouter `reasoning`.
+        let chunks = [
+            json!({"choices": [{"delta": {"reasoning_content": "The user wants "}}]}),
+            json!({"choices": [{"delta": {"reasoning": "a number."}}]}),
+            json!({"choices": [{"delta": {"content": "42"}}]}),
+            json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+        ];
+        let reasoning: Vec<&str> = chunks.iter().filter_map(reasoning_piece).collect();
+        assert_eq!(reasoning, ["The user wants ", "a number."]);
+        let mut reply = StreamedReply::default();
+        let pieces: Vec<String> = chunks.iter().filter_map(|c| reply.add(c)).collect();
+        assert_eq!(pieces, ["42"], "reasoning is not reply text");
+        let response = openai_to_anthropic(&reply.whole()).expect("translate");
+        assert_eq!(response.content[0]["type"], "thinking");
+        assert_eq!(response.content[0]["thinking"], "The user wants a number.");
+        assert_eq!(response.content[1]["text"], "42");
+
+        // A call that does not stream gives it in the message.
+        let raw = json!({"choices": [{"message": {"role": "assistant", "content": "ok", "reasoning_content": "think"}, "finish_reason": "stop"}]});
+        let response = openai_to_anthropic(&raw).expect("translate");
+        assert_eq!(response.content[0]["thinking"], "think");
+
+        // Sent back in a later call, a thinking block is left out.
+        let r = req(
+            vec![AnthropicMessage {
+                role: "assistant".into(),
+                content: json!([
+                    {"type": "thinking", "thinking": "secret"},
+                    {"type": "text", "text": "42"},
+                ]),
+            }],
+            None,
+        );
+        let body = anthropic_to_openai(&r, "max_tokens").expect("translate");
+        assert_eq!(body["messages"][0]["content"], "42");
+        assert!(!body.to_string().contains("secret"));
+    }
+
+    #[test]
     fn parses_openai_tool_call_response_to_anthropic_tool_use() {
         let raw = json!({
             "id": "chatcmpl-x",
