@@ -35,11 +35,12 @@ impl LlmProvider for AnthropicProvider {
         api_key: &str,
         request: &AnthropicRequest,
     ) -> Result<AnthropicResponse, ProviderError> {
+        let body = request_body(request)?;
         let resp = http
             .post(format!("{base_url}/v1/messages"))
             .header("x-api-key", api_key)
             .header("anthropic-version", VERSION)
-            .json(request)
+            .json(&body)
             .send()
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
@@ -64,8 +65,7 @@ impl LlmProvider for AnthropicProvider {
         request: &AnthropicRequest,
         text: &TextSink,
     ) -> Result<AnthropicResponse, ProviderError> {
-        let mut body = serde_json::to_value(request)
-            .map_err(|e| ProviderError::Translation(format!("request build: {e}")))?;
+        let mut body = request_body(request)?;
         body["stream"] = serde_json::Value::Bool(true);
         let resp = http
             .post(format!("{base_url}/v1/messages"))
@@ -242,6 +242,28 @@ impl StreamedMessage {
     }
 }
 
+/// The request as the Messages API takes it, with `thinking` when the
+/// model is asked to think (issue #190): a budget below `max_tokens`, and
+/// no temperature, which thinking does not take.
+fn request_body(request: &AnthropicRequest) -> Result<serde_json::Value, ProviderError> {
+    let mut body = serde_json::to_value(request)
+        .map_err(|e| ProviderError::Translation(format!("request build: {e}")))?;
+    if let Some(budget) = request
+        .reasoning
+        .as_ref()
+        .and_then(super::Reasoning::budget)
+    {
+        let budget = budget
+            .min(request.max_tokens.saturating_sub(1024))
+            .max(1024);
+        body["thinking"] = serde_json::json!({"type": "enabled", "budget_tokens": budget});
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("temperature");
+        }
+    }
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
@@ -411,6 +433,7 @@ mod tests {
         AnthropicRequest {
             model: "claude-test".into(),
             max_tokens: 16,
+            reasoning: None,
             messages: vec![AnthropicMessage {
                 role: "user".into(),
                 content: serde_json::json!("hi"),
@@ -419,5 +442,33 @@ mod tests {
             temperature: None,
             tools: None,
         }
+    }
+
+    #[test]
+    fn thinking_is_asked_for_with_a_budget_under_max_tokens() {
+        let mut r = AnthropicRequest {
+            model: "claude-x".into(),
+            max_tokens: 16000,
+            reasoning: Some(super::super::Reasoning::Effort("medium".into())),
+            messages: Vec::new(),
+            system: None,
+            temperature: Some(0.2),
+            tools: None,
+        };
+        let body = request_body(&r).expect("body");
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8192})
+        );
+        assert!(body.get("temperature").is_none());
+        r.reasoning = Some(super::super::Reasoning::Budget(60000));
+        assert_eq!(
+            request_body(&r).expect("body")["thinking"]["budget_tokens"],
+            14976
+        );
+        r.reasoning = Some(super::super::Reasoning::Off);
+        assert!(request_body(&r).expect("body").get("thinking").is_none());
+        r.reasoning = None;
+        assert_eq!(request_body(&r).expect("body")["temperature"], 0.2);
     }
 }

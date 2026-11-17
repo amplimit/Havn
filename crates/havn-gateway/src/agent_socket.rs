@@ -2083,6 +2083,21 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                 return;
             }
             ar.model = entry.model().to_string();
+            // How much the model thinks (issue #190): the chat's choice, or
+            // the model's default, within what the model takes.
+            ar.reasoning = entry.thinking.as_ref().map(|spec| {
+                spec.resolve(
+                    req.options
+                        .get("thinking")
+                        .and_then(serde_json::Value::as_str),
+                )
+            });
+            // Anthropic wants room for the reply after the thinking budget.
+            if entry.provider() == "anthropic"
+                && let Some(budget) = ar.reasoning.as_ref().and_then(llm_proxy::Reasoning::budget)
+            {
+                ar.max_tokens = ar.max_tokens.max(budget.saturating_add(4096));
+            }
             // An agent without egress must not get the provider to fetch
             // URLs for it (a way to send data out through the query string).
             if !egress_allowed && let Some(reason) = llm_proxy::provider_side_fetch(&ar) {
@@ -2515,6 +2530,7 @@ fn build_anthropic_request(req: &LlmRequest) -> anyhow::Result<AnthropicRequest>
     Ok(AnthropicRequest {
         model: req.model.clone(),
         max_tokens,
+        reasoning: None,
         messages,
         system,
         temperature,
@@ -3166,6 +3182,7 @@ mod tests {
                     label: None,
                     max_output_tokens: None,
                     vision: false,
+                    thinking: None,
                 }],
             }));
     }
@@ -3346,6 +3363,7 @@ mod tests {
                         label: None,
                         max_output_tokens: None,
                         vision: false,
+                        thinking: None,
                     })
                     .collect(),
             }));

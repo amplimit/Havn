@@ -845,6 +845,7 @@ async fn answer(
     let mut request = AnthropicRequest {
         model: String::new(),
         max_tokens: ANSWER_MAX_TOKENS,
+        reasoning: None,
         messages: vec![AnthropicMessage {
             role: "user".into(),
             content: Value::String(format!(
@@ -1873,6 +1874,7 @@ mod tests {
             label: None,
             max_output_tokens: None,
             vision: false,
+            thinking: None,
         };
         let catalog = ModelCatalog {
             default_model: Some("openrouter:cheap/model".into()),

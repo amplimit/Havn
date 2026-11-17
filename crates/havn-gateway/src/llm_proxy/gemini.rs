@@ -158,6 +158,22 @@ impl LlmProvider for GeminiProvider {
                     body: error.to_string(),
                 });
             }
+            for part in chunk
+                .pointer("/candidates/0/content/parts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if part
+                    .get("thought")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    && let Some(piece) = part.get("text").and_then(Value::as_str)
+                    && !piece.is_empty()
+                {
+                    text(TextEvent::Reasoning(piece));
+                }
+            }
             for piece in reply.add(&chunk) {
                 text(TextEvent::Text(&piece));
             }
@@ -191,6 +207,17 @@ fn anthropic_to_gemini(req: &AnthropicRequest) -> Result<Value, String> {
     });
     if let Some(t) = req.temperature {
         body["generationConfig"]["temperature"] = json!(t);
+    }
+    // How much to think (issue #190), with the thoughts returned.
+    if let Some(r) = &req.reasoning {
+        body["generationConfig"]["thinkingConfig"] = match r {
+            super::Reasoning::Off => json!({"thinkingBudget": 0}),
+            super::Reasoning::On => json!({"thinkingBudget": -1, "includeThoughts": true}),
+            super::Reasoning::Budget(n) => json!({"thinkingBudget": n, "includeThoughts": true}),
+            super::Reasoning::Effort(level) => {
+                json!({"thinkingLevel": level, "includeThoughts": true})
+            }
+        };
     }
     if let Some(sys) = req.system.as_ref().filter(|s| !s.is_empty()) {
         body["systemInstruction"] = json!({"parts": [{"text": sys}]});
@@ -451,7 +478,17 @@ fn gemini_to_anthropic(raw: &Value, model: &str) -> Result<AnthropicResponse, St
     let mut tool_call_counter: u64 = 0;
     for part in &parts {
         if let Some(text) = part.get("text").and_then(Value::as_str) {
-            if !text.is_empty() {
+            // A thought (asked for with `includeThoughts`) is reasoning, not
+            // the reply.
+            if part
+                .get("thought")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                if !text.is_empty() {
+                    content_blocks.push(json!({"type": "thinking", "thinking": text}));
+                }
+            } else if !text.is_empty() {
                 content_blocks.push(json!({"type": "text", "text": text}));
             }
         } else if let Some(fc) = part.get("functionCall") {
@@ -573,6 +610,7 @@ mod tests {
         AnthropicRequest {
             model: "gemini-2.5-flash".into(),
             max_tokens: 256,
+            reasoning: None,
             messages,
             system: system.map(String::from),
             temperature: None,

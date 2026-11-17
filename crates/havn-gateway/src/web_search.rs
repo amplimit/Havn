@@ -976,6 +976,7 @@ mod tests {
                     label: None,
                     max_output_tokens: None,
                     vision: false,
+                    thinking: None,
                 })
                 .collect(),
         }

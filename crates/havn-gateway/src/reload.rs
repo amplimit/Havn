@@ -441,6 +441,7 @@ mod tests {
             label: None,
             max_output_tokens: None,
             vision: false,
+            thinking: None,
         }];
         new.llm.default_model = Some("openai:gpt-5".into());
         new.llm.title_model = Some("openai:gpt-5".into());
