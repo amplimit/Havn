@@ -79,6 +79,23 @@ fn clip(text: &str, max: usize) -> String {
     out
 }
 
+/// Take the thinking blocks out of the assistant messages of `messages`.
+fn drop_thinking(messages: &mut [Value]) {
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+            blocks.retain(|b| {
+                !matches!(
+                    b.get("type").and_then(Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+            });
+        }
+    }
+}
+
 /// Add to the running turn's trace, when one is kept; `chars` is the
 /// length of its text.
 fn trace(item: Value, chars: usize) {
@@ -278,6 +295,9 @@ pub async fn run_typed(
             }
         }
 
+        // Only the newest assistant message keeps its thinking: Anthropic's
+        // tools need that one back, and older ones only fill the frame.
+        drop_thinking(messages);
         // Always append the assistant turn so the next call has context.
         messages.push(serde_json::json!({ "role": "assistant", "content": content.clone() }));
         last_text = extract_text(&content).unwrap_or_default();
@@ -774,6 +794,22 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn only_the_newest_assistant_message_keeps_its_thinking() {
+        let mut messages = vec![
+            serde_json::json!({"role": "user", "content": "q"}),
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "old", "signature": "s"},
+                {"type": "tool_use", "id": "t1", "name": "shell", "input": {}}
+            ]}),
+            serde_json::json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}),
+        ];
+        drop_thinking(&mut messages);
+        assert_eq!(messages[1]["content"].as_array().map(Vec::len), Some(1));
+        assert_eq!(messages[1]["content"][0]["type"], "tool_use");
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+    }
 
     #[test]
     fn a_step_names_what_a_call_works_on_never_its_content() {
