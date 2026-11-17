@@ -432,6 +432,7 @@ pub(crate) mod tests {
                 havn_proto::LIVENESS_PING_INTERVAL,
             ),
             llm: Arc::new(crate::config::LlmConfig::default()),
+            workspace_browse: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             models: Arc::new(arc_swap::ArcSwap::from_pointee(
                 crate::model_catalog::ModelCatalog::default(),
             )),

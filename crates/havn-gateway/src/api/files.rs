@@ -564,6 +564,366 @@ pub async fn inbox_file(
     Ok(response)
 }
 
+// ---- Browsing an agent's workspace (issue #177) ----
+
+/// Entries one listing shows.
+const MAX_LISTED: usize = 2000;
+/// Largest workspace file sent.
+const MAX_BROWSE_BYTES: u64 = 50 * 1024 * 1024;
+/// Folders deep a path may go.
+const MAX_BROWSE_DEPTH: usize = 64;
+/// Characters of a link's target shown.
+const MAX_LINK_TARGET: usize = 200;
+/// The agent config key of its owner's switch.
+const AGENT_SWITCH: &str = "workspace_browse";
+
+/// Whether `name`, at the workspace's top level, is the runtime's own:
+/// the agent's database and `.havn`, never shown or sent.
+fn internal(name: &str) -> bool {
+    name == ".havn" || name == "agent.db" || name.starts_with("agent.db-")
+}
+
+/// Refuse a request another site's page made.
+fn same_site(headers: &HeaderMap) -> Result<(), ApiError> {
+    if headers
+        .get("sec-fetch-site")
+        .is_some_and(|v| v.as_bytes() == b"cross-site")
+    {
+        return Err(ApiError::Forbidden("not from another site".into()));
+    }
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct AccessView {
+    /// `[workspace] browse` in config.toml.
+    pub gateway: bool,
+    /// The owner's switch for this agent (on unless turned off).
+    pub agent: bool,
+    /// Both: the workspace page is there.
+    pub enabled: bool,
+}
+
+fn access_of(state: &AppState, agent: &havn_db::repo::agents::Agent) -> AccessView {
+    let gateway = state
+        .workspace_browse
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let own = agent
+        .config
+        .get(AGENT_SWITCH)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    AccessView {
+        gateway,
+        agent: own,
+        enabled: gateway && own,
+    }
+}
+
+/// `GET /agents/{id}/workspace/access`.
+pub async fn access_get(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path(id): Path<String>,
+) -> Result<Json<AccessView>, ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    Ok(Json(access_of(&state, &agent)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessPut {
+    pub enabled: bool,
+}
+
+/// `PUT /agents/{id}/workspace/access`: the owner turns the agent's
+/// workspace page on or off; on only while the gateway allows it.
+pub async fn access_put(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path(id): Path<String>,
+    Json(req): Json<AccessPut>,
+) -> Result<Json<AccessView>, ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    if req.enabled && !access_of(&state, &agent).gateway {
+        return Err(ApiError::Forbidden(
+            "workspace browsing is off for this gateway ([workspace] browse in config.toml)".into(),
+        ));
+    }
+    let updated = havn_db::repo::agents::update_config(&state.db, agent.id, None, |current| {
+        let mut config = current.as_object().cloned().unwrap_or_default();
+        config.insert(AGENT_SWITCH.into(), serde_json::Value::Bool(req.enabled));
+        Ok::<_, std::convert::Infallible>(serde_json::Value::Object(config))
+    })
+    .await?;
+    let Ok(updated) = updated;
+    audit::record_agent_action(
+        &state.db,
+        user.id,
+        agent.id,
+        "agent.workspace_browse.changed",
+        serde_json::json!({ "enabled": req.enabled }),
+    )
+    .await;
+    Ok(Json(access_of(&state, &updated)))
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct BrowseView {
+    pub browse: bool,
+    /// The dashboard may change it: not with `trust_header`, where
+    /// config.toml is the operator's.
+    pub editable: bool,
+}
+
+/// `GET /settings/workspace`.
+pub async fn browse_get(State(state): State<AppState>, _user: AuthedUser) -> Json<BrowseView> {
+    Json(BrowseView {
+        browse: state
+            .workspace_browse
+            .load(std::sync::atomic::Ordering::Relaxed),
+        editable: state.trusted_proxies.is_none(),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowsePut {
+    pub browse: bool,
+}
+
+/// `PUT /settings/workspace`: turn workspace browsing on or off for the
+/// gateway, written to config.toml.
+pub async fn browse_put(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Json(req): Json<BrowsePut>,
+) -> Result<Json<BrowseView>, ApiError> {
+    if state.trusted_proxies.is_some() {
+        return Err(ApiError::Forbidden(
+            "with trust_header enabled, workspace browsing is set in config.toml".into(),
+        ));
+    }
+    {
+        let _writing = state.models_write.lock().await;
+        let path = state.config_path.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::config::write_workspace_browse(&path, req.browse)
+        })
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+        state
+            .workspace_browse
+            .store(req.browse, std::sync::atomic::Ordering::Relaxed);
+    }
+    audit::record_user_action(
+        &state.db,
+        user.id,
+        "workspace.browse.changed",
+        serde_json::json!({ "browse": req.browse }),
+    )
+    .await;
+    Ok(browse_get(State(state), user).await)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkspaceQuery {
+    /// A folder or file, `/`-separated, relative to the workspace; the
+    /// workspace itself when empty.
+    #[serde(default)]
+    pub path: String,
+}
+
+/// The names of `path`, each one checked.
+fn path_names(path: &str) -> Result<Vec<String>, ApiError> {
+    let names: Vec<String> = path
+        .split('/')
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .collect();
+    if names.len() > MAX_BROWSE_DEPTH {
+        return Err(ApiError::BadRequest("path too deep".into()));
+    }
+    for (i, name) in names.iter().enumerate() {
+        if name == "." || name == ".." || name.contains('\0') || name.contains('\\') {
+            return Err(ApiError::BadRequest(format!("bad path component {name:?}")));
+        }
+        if i == 0 && internal(name) {
+            return Err(ApiError::NotFound);
+        }
+    }
+    Ok(names)
+}
+
+/// The agent's workspace, with browsing allowed, opened.
+async fn browsable(
+    state: &AppState,
+    user: &AuthedUser,
+    id: &str,
+    headers: &HeaderMap,
+) -> Result<std::path::PathBuf, ApiError> {
+    same_site(headers)?;
+    let agent = crate::api::agents::resolve_agent(id, user, state).await?;
+    if !access_of(state, &agent).enabled {
+        return Err(ApiError::Forbidden(
+            "workspace browsing is off for this agent".into(),
+        ));
+    }
+    Ok(crate::api::agents::workspace_for(state, agent.id))
+}
+
+/// The folder `names` lead to, opened one folder at a time without
+/// following a link; `None` when one is missing or not a folder.
+fn open_folder(
+    workspace: &std::path::Path,
+    names: &[String],
+) -> std::io::Result<Option<WorkspaceDir>> {
+    let mut dir = WorkspaceDir::open(workspace)?;
+    for name in names {
+        match dir.subdir(name) {
+            Ok(Some(next)) => dir = next,
+            Ok(None) => return Ok(None),
+            // A link or a file where a folder was named.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some(dir))
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct WorkspaceEntry {
+    pub name: String,
+    /// `dir`, `file`, `link` or `other`.
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Unix seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified: Option<i64>,
+    /// Where a link points, as written; never followed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct WorkspaceListing {
+    pub path: String,
+    pub entries: Vec<WorkspaceEntry>,
+    /// More entries than were listed.
+    pub truncated: bool,
+}
+
+/// `GET /agents/{id}/workspace?path=` — a folder of the agent's workspace:
+/// folders first, then files, by name.
+pub async fn workspace_list(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path(id): Path<String>,
+    Query(q): Query<WorkspaceQuery>,
+    headers: HeaderMap,
+) -> Result<Json<WorkspaceListing>, ApiError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let workspace = browsable(&state, &user, &id, &headers).await?;
+    let names = path_names(&q.path)?;
+    let at_top = names.is_empty();
+    let path = names.join("/");
+    let listed = tokio::task::spawn_blocking(move || {
+        let Some(dir) = open_folder(&workspace, &names)? else {
+            return Ok(None);
+        };
+        let (found, truncated) = dir.entries(MAX_LISTED)?;
+        let mut entries: Vec<WorkspaceEntry> = found
+            .into_iter()
+            .filter(|(name, _)| !(at_top && internal(name)))
+            .map(|(name, meta)| {
+                let kind = if meta.file_type().is_symlink() {
+                    "link"
+                } else if meta.is_dir() {
+                    "dir"
+                } else if meta.is_file() {
+                    "file"
+                } else {
+                    "other"
+                };
+                let target = (kind == "link")
+                    .then(|| dir.link_target(&name).ok())
+                    .flatten()
+                    .map(|t| t.chars().take(MAX_LINK_TARGET).collect());
+                WorkspaceEntry {
+                    size: (kind == "file").then_some(meta.len()),
+                    modified: Some(meta.mtime()),
+                    name,
+                    kind,
+                    target,
+                }
+            })
+            .collect();
+        entries.sort_by(|a, b| (a.kind != "dir", &a.name).cmp(&(b.kind != "dir", &b.name)));
+        Ok::<_, std::io::Error>(Some((entries, truncated)))
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?
+    .map_err(|e| ApiError::Internal(format!("reading the workspace: {e}")))?;
+    let (entries, truncated) = listed.ok_or(ApiError::NotFound)?;
+    Ok(Json(WorkspaceListing {
+        path,
+        entries,
+        truncated,
+    }))
+}
+
+/// `GET /agents/{id}/workspace/file?path=` — a file of the agent's
+/// workspace: a PNG, JPEG, GIF or WebP image in place, anything else as a
+/// download; read without following links.
+pub async fn workspace_file(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path(id): Path<String>,
+    Query(q): Query<WorkspaceQuery>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
+    let workspace = browsable(&state, &user, &id, &headers).await?;
+    let mut names = path_names(&q.path)?;
+    let Some(name) = names.pop() else {
+        return Err(ApiError::BadRequest("path names no file".into()));
+    };
+    // Files held at once: each is read whole.
+    static READING: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let _reading = READING
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)))
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let read = name.clone();
+    let bytes = tokio::task::spawn_blocking(move || {
+        let Some(dir) = open_folder(&workspace, &names)? else {
+            return Ok(None);
+        };
+        match dir.read_bytes(&read, MAX_BROWSE_BYTES) {
+            // A link, a folder or another kind of entry is not sent.
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Ok(None),
+            other => other,
+        }
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?
+    // Not a regular file, or over the size sent.
+    .map_err(|e| match e.kind() {
+        std::io::ErrorKind::InvalidData => ApiError::BadRequest(e.to_string()),
+        _ => ApiError::Internal(format!("reading the workspace: {e}")),
+    })?
+    .ok_or(ApiError::NotFound)?;
+    let image = crate::llm_proxy::image_type(&bytes);
+    Ok(file_response(&name, bytes, image))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

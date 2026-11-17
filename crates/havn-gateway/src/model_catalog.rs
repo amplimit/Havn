@@ -546,7 +546,7 @@ fn write_checked(
 
 // Write a sibling file, flush it, give it the original's owner and mode,
 // and rename it over `target`.
-fn replace_file(target: &Path, contents: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn replace_file(target: &Path, contents: &[u8]) -> anyhow::Result<()> {
     use anyhow::Context as _;
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};

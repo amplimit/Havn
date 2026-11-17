@@ -175,6 +175,9 @@ struct AppState {
     /// calls.
     pub llm: Arc<config::LlmConfig>,
     pub models: Arc<ArcSwap<model_catalog::ModelCatalog>>,
+    /// `[workspace] browse`, hot-reloaded: whether owners may browse their
+    /// agents' workspaces (issue #177).
+    pub workspace_browse: Arc<std::sync::atomic::AtomicBool>,
     pub config_path: PathBuf,
     pub models_write: Arc<tokio::sync::Mutex<()>>,
     pub search: Arc<web_search::WebSearch>,
@@ -477,6 +480,7 @@ async fn serve() -> anyhow::Result<()> {
     let reload_handles = ReloadHandles::from_config(&cfg);
     let allowed_origins = reload_handles.allowed_origins.clone();
     let models = reload_handles.models.clone();
+    let workspace_browse = reload_handles.workspace_browse.clone();
     info!(
         allowed_origins = ?allowed_origins.load(),
         "webchat origin allowlist"
@@ -551,6 +555,7 @@ async fn serve() -> anyhow::Result<()> {
         ),
         llm: Arc::clone(&llm),
         models: models.clone(),
+        workspace_browse,
         config_path: config_path.clone(),
         models_write: Arc::new(tokio::sync::Mutex::new(())),
         search: Arc::clone(&search),
@@ -741,6 +746,16 @@ async fn serve() -> anyhow::Result<()> {
             post(api::files::upload).get(api::files::inbox_file),
         )
         .route("/agents/{id}/outbox", get(api::files::sent))
+        .route("/agents/{id}/workspace", get(api::files::workspace_list))
+        .route("/agents/{id}/workspace/file", get(api::files::workspace_file))
+        .route(
+            "/agents/{id}/workspace/access",
+            get(api::files::access_get).put(api::files::access_put),
+        )
+        .route(
+            "/settings/workspace",
+            get(api::files::browse_get).put(api::files::browse_put),
+        )
         .route("/agents/{id}/outbox/{file}", get(api::files::download))
         .route("/agents/{id}/memory", get(api::memory::list))
         .route(

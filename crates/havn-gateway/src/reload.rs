@@ -86,6 +86,10 @@ pub const RULES: &[ReloadRule] = &[
         kind: ReloadKind::Hot,
     },
     ReloadRule {
+        prefix: "workspace.browse",
+        kind: ReloadKind::Hot,
+    },
+    ReloadRule {
         prefix: "reload",
         kind: ReloadKind::Restart,
     },
@@ -190,6 +194,8 @@ fn walk(old: &Value, new: &Value, prefix: &str, out: &mut Vec<String>) {
 pub struct ReloadHandles {
     pub allowed_origins: Arc<ArcSwap<Vec<String>>>,
     pub models: Arc<ArcSwap<crate::model_catalog::ModelCatalog>>,
+    /// `[workspace] browse`.
+    pub workspace_browse: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ReloadHandles {
@@ -197,6 +203,7 @@ impl ReloadHandles {
         Self {
             allowed_origins: Arc::new(ArcSwap::from_pointee(cfg.allowed_origins.clone())),
             models: Arc::new(ArcSwap::from_pointee(cfg.llm.catalog())),
+            workspace_browse: Arc::new(std::sync::atomic::AtomicBool::new(cfg.workspace.browse)),
         }
     }
 
@@ -222,6 +229,13 @@ impl ReloadHandles {
                     "hot-reloaded the model list"
                 );
                 self.models.store(Arc::new(catalog));
+            } else if path.starts_with("workspace") {
+                self.workspace_browse
+                    .store(new.workspace.browse, std::sync::atomic::Ordering::Relaxed);
+                info!(
+                    browse = new.workspace.browse,
+                    "hot-reloaded workspace browsing"
+                );
             } else {
                 warn!(path, "hot path has no live applier — silently ignored");
             }
@@ -429,6 +443,26 @@ mod tests {
 
         let live = handles.allowed_origins.load();
         assert_eq!(&**live, &vec!["https://example.com".to_string()]);
+    }
+
+    #[test]
+    fn workspace_browsing_applies_in_place() {
+        let old = GatewayConfig::default();
+        let mut new = GatewayConfig::default();
+        new.workspace.browse = true;
+        let handles = ReloadHandles::from_config(&old);
+        let plan = ReloadPlan::build(&diff_paths(
+            &serde_json::to_value(&old).expect("old"),
+            &serde_json::to_value(&new).expect("new"),
+        ));
+        assert_eq!(plan.hot_paths, ["workspace.browse"]);
+        assert!(plan.restart_paths.is_empty(), "{:?}", plan.restart_paths);
+        handles.apply_hot(&new, &plan.hot_paths);
+        assert!(
+            handles
+                .workspace_browse
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     #[test]

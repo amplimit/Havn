@@ -249,6 +249,35 @@ impl WorkspaceDir {
         Ok(files)
     }
 
+    /// Names and metadata of the first `max` entries directly in this
+    /// directory, of any type, without following links, and whether there
+    /// were more.
+    pub fn entries(&self, max: usize) -> io::Result<(Vec<(String, Metadata)>, bool)> {
+        let mut found = Vec::new();
+        let mut more = false;
+        for entry in std::fs::read_dir(self.proc_path())? {
+            if found.len() == max {
+                more = true;
+                break;
+            }
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if let Ok(meta) = std::fs::symlink_metadata(self.child(&name)?) {
+                found.push((name, meta));
+            }
+        }
+        Ok((found, more))
+    }
+
+    /// Where the link `name` points, as written; never followed.
+    pub fn link_target(&self, name: &str) -> io::Result<String> {
+        Ok(std::fs::read_link(self.child(name)?)?
+            .to_string_lossy()
+            .into_owned())
+    }
+
     fn proc_path(&self) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", self.dir.as_raw_fd()))
     }
