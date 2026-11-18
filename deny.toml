@@ -34,6 +34,12 @@ ignore = [
     # child (`--convert-page`: nobody, no new privileges, memory, CPU and time limits),
     # never in the gateway. Re-evaluate when pdf-extract moves to skrifa.
     "RUSTSEC-2026-0192",
+    # chrono and chrono-tz are flagged unmaintained (RUSTSEC-2026-0543,
+    # RUSTSEC-2026-0555); no vulnerability is reported. Every crate uses them for
+    # timestamps and time zones; a move to a maintained library is tracked in an
+    # issue. Remove when it is done.
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0555",
 ]
 
 [licenses]
