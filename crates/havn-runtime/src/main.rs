@@ -51,7 +51,7 @@ use havn_proto::{
 use sqlx::SqlitePool;
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
-use tokio::sync::{Mutex, Notify, RwLock, Semaphore, mpsc};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -145,10 +145,6 @@ struct Ctx {
     /// allows it). Cloned cheaply per call.
     tools: ToolRegistry,
     tool_env: ToolCtx,
-    /// Live snapshot of the parent's most-recent message vec, refreshed
-    /// before each LLM call by the parent loop. Subagents `read()` it
-    /// once at spawn time when `context: "fork"`.
-    parent_messages: Arc<RwLock<Vec<serde_json::Value>>>,
     /// Idle anchor shared with the curator scheduler. Bumped on every
     /// inbound message so the scheduler can detect "user is in active
     /// conversation, don't disrupt" before firing a curator pass.
@@ -202,7 +198,7 @@ impl Ctx {
             registry: self.tools.clone(),
             tool_env: self.tool_env.clone(),
             max_iterations: self.tool_env.policy.tool_rounds.max.max(1),
-            messages_mirror: Some(Arc::clone(&self.parent_messages)),
+            messages_mirror: true,
             model: self.model(),
             max_tokens: self.max_tokens,
             billing_user_id: None,
@@ -309,6 +305,7 @@ async fn main() -> anyhow::Result<()> {
         gateway_tools,
         timezone,
         egress_proxy,
+        models,
     ): (
         Arc<Policy>,
         Option<String>,
@@ -321,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
         Vec<havn_proto::GatewayToolSpec>,
         Option<String>,
         Option<String>,
+        Vec<havn_proto::ModelChoice>,
     ) = match first_frame {
         Some(GatewayToAgent::Welcome {
             session_token: _,
@@ -335,6 +333,7 @@ async fn main() -> anyhow::Result<()> {
             gateway_tools,
             timezone,
             egress_proxy,
+            models,
         }) => {
             // Materialise the embedding provider from the
             // gateway-shipped JSON. Absent / null / "disabled"
@@ -426,6 +425,7 @@ async fn main() -> anyhow::Result<()> {
                 gateway_tools,
                 timezone,
                 egress_proxy,
+                models,
             )
         }
         Some(other) => return Err(anyhow!("expected Welcome, got {other:?}")),
@@ -712,7 +712,6 @@ async fn main() -> anyhow::Result<()> {
             }
         })
     };
-    let parent_messages = Arc::new(RwLock::new(Vec::<serde_json::Value>::new()));
 
     // 5b. Background memory aging pass (spec §9.4). Detached task; the
     //     runtime exits cleanly when its parent process dies, which kills
@@ -785,7 +784,7 @@ async fn main() -> anyhow::Result<()> {
             // Subagents do not republish their own state, and recursion
             // is forbidden by the registry layer (no `subagent_spawn` in
             // base_registry).
-            messages_mirror: None,
+            messages_mirror: false,
             model: Arc::clone(&session_model),
             max_tokens: session_max_tokens,
             // Subagents inherit the billing context per call (set when
@@ -794,7 +793,7 @@ async fn main() -> anyhow::Result<()> {
             stop: None,
             segments: None,
         },
-        parent_messages: Arc::clone(&parent_messages),
+        models: Arc::new(models),
         semaphore: Arc::new(Semaphore::new(subagent_tool::SUBAGENT_MAX_CONCURRENT)),
     });
 
@@ -839,7 +838,6 @@ async fn main() -> anyhow::Result<()> {
         workspace_dir,
         tools: parent_registry,
         tool_env,
-        parent_messages,
         last_inbound,
         model: Arc::new(std::sync::RwLock::new(session_model)),
         max_tokens: session_max_tokens,
@@ -2586,12 +2584,9 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     }
 }
 
-/// Parent-side wrapper around [`tool_loop::run`] that also keeps the
-/// [`Ctx::parent_messages`] snapshot fresh for any subagents the parent
-/// might spawn during this loop. The snapshot is updated before delegating
-/// so a `subagent_spawn` invoked in the model's first response sees the
-/// pre-call message vec — i.e., what the user just said, not stale state
-/// from a previous turn.
+/// Parent-side wrapper around [`tool_loop::run_typed`] with the turn's
+/// stop, model, thinking and partial replies; the loop keeps its messages
+/// for any subagent it forks ([`tool_loop::FORK_FROM`]).
 async fn run_tool_loop(
     ctx: &Ctx,
     context: &'static str,
@@ -3742,8 +3737,8 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
         registry: ctx.incoming_query_registry.clone(),
         tool_env: ctx.tool_env.clone(),
         max_iterations: max_iters,
-        // The temp loop is a closed system — no parent_messages to mirror.
-        messages_mirror: None,
+        // The temp loop is a closed system: no subagent forks from it.
+        messages_mirror: false,
         model: ctx.model(),
         max_tokens: ctx.max_tokens,
         // Caller pays. Every LlmRequest the loop emits carries this

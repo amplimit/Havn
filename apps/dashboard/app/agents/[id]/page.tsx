@@ -15,6 +15,7 @@ import {
   type EmbeddingStatus,
   type MeView,
   type SentFile,
+  type TraceItem,
   type TraceSummary,
   type TurnTrace,
 } from "@/lib/api";
@@ -2624,34 +2625,44 @@ function TraceFold({
           {error ?? "loading…"}
         </p>
       ) : (
-      <ol className="mt-2 flex flex-col gap-2 border-l-2 pl-3" style={{ borderColor: "var(--color-border-default)" }}>
-        {trace.items.map((item, i) =>
-          item.kind === "thinking" ? (
-            <li key={i} style={{ whiteSpace: "pre-wrap" }}>
-              {item.text}
-            </li>
-          ) : (
-            <li key={i}>
-              <div className="font-mono" style={{ color: item.error ? "var(--color-ruby)" : "var(--color-deep-navy)" }}>
-                {item.tool}
-                {item.error && " (failed)"}
-              </div>
-              <pre className="mt-1 overflow-x-auto font-mono" style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-                {item.input}
-              </pre>
-              <pre
-                className="mt-1 overflow-y-auto font-mono"
-                style={{ maxHeight: 200, whiteSpace: "pre-wrap", wordBreak: "break-word", opacity: 0.85 }}
-              >
-                {item.result}
-              </pre>
-            </li>
-          ),
-        )}
-        {trace.left_out > 0 && <li>…and {trace.left_out} more, not kept.</li>}
-      </ol>
+      <TraceList items={trace.items} leftOut={trace.left_out} />
       )}
     </details>
+  );
+}
+
+/** What a turn did, in order; a subagent's own steps under its call. */
+function TraceList({ items, leftOut }: { items: TraceItem[]; leftOut: number }) {
+  return (
+    <ol className="mt-2 flex flex-col gap-2 border-l-2 pl-3" style={{ borderColor: "var(--color-border-default)" }}>
+      {items.map((item, i) =>
+        item.kind === "thinking" ? (
+          <li key={i} style={{ whiteSpace: "pre-wrap" }}>
+            {item.text}
+          </li>
+        ) : (
+          <li key={i}>
+            <div className="font-mono" style={{ color: item.error ? "var(--color-ruby)" : "var(--color-deep-navy)" }}>
+              {item.tool}
+              {item.error && " (failed)"}
+            </div>
+            <pre className="mt-1 overflow-x-auto font-mono" style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+              {item.input}
+            </pre>
+            {item.steps && item.steps.length > 0 && (
+              <TraceList items={item.steps} leftOut={item.left_out ?? 0} />
+            )}
+            <pre
+              className="mt-1 overflow-y-auto font-mono"
+              style={{ maxHeight: 200, whiteSpace: "pre-wrap", wordBreak: "break-word", opacity: 0.85 }}
+            >
+              {item.result}
+            </pre>
+          </li>
+        ),
+      )}
+      {leftOut > 0 && <li>…and {leftOut} more, not kept.</li>}
+    </ol>
   );
 }
 

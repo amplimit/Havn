@@ -929,6 +929,118 @@ pub async fn titles_put(
     Ok(Json(titles_view(&state, &updated).await))
 }
 
+/// One capability that costs model calls (issue #222).
+#[derive(Debug, Serialize)]
+pub struct Capability {
+    pub enabled: bool,
+    /// Off by the owner's role, which the agent cannot turn on.
+    pub locked: bool,
+}
+
+/// What an agent may do beyond its own turn (issue #222): hand a task to a
+/// subagent, and ask the owner's other agents.
+#[derive(Debug, Serialize)]
+pub struct CapabilitiesView {
+    pub subagents: Capability,
+    pub agent_queries: Capability,
+}
+
+async fn capabilities_view(state: &AppState, agent: &Agent) -> CapabilitiesView {
+    let multi_user = state.trusted_proxies.is_some();
+    let policy = policy_resolver::for_session(&state.db, agent, multi_user).await;
+    let owner = policy_resolver::for_owner(&state.db, agent).await;
+    CapabilitiesView {
+        subagents: Capability {
+            enabled: policy.permissions.can_spawn_subagents,
+            locked: multi_user && !owner.permissions.can_spawn_subagents,
+        },
+        agent_queries: Capability {
+            enabled: policy.permissions.can_query_other_agents,
+            locked: multi_user && !owner.permissions.can_query_other_agents,
+        },
+    }
+}
+
+/// `GET /agents/{id}/capabilities`.
+pub async fn capabilities_get(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path(id): Path<String>,
+) -> Result<Json<CapabilitiesView>, ApiError> {
+    let agent = resolve_agent(&id, &user, &state).await?;
+    Ok(Json(capabilities_view(&state, &agent).await))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilitiesPut {
+    #[serde(default)]
+    pub subagents: Option<bool>,
+    #[serde(default)]
+    pub agent_queries: Option<bool>,
+}
+
+/// `PUT /agents/{id}/capabilities`: turn each named capability on or off
+/// for the agent, in its policy override. Applies on the agent's next
+/// start.
+pub async fn capabilities_put(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path(id): Path<String>,
+    Json(req): Json<CapabilitiesPut>,
+) -> Result<Json<CapabilitiesView>, ApiError> {
+    let agent = resolve_agent(&id, &user, &state).await?;
+    let view = capabilities_view(&state, &agent).await;
+    if req.subagents == Some(true) && view.subagents.locked {
+        return Err(ApiError::Forbidden(
+            "your role has subagents off; a team admin can turn them on".into(),
+        ));
+    }
+    if req.agent_queries == Some(true) && view.agent_queries.locked {
+        return Err(ApiError::Forbidden(
+            "your role does not let agents ask each other; a team admin can allow it".into(),
+        ));
+    }
+    let updated = repo::update_config(&state.db, agent.id, None, |current| {
+        let mut config = current.as_object().cloned().unwrap_or_default();
+        let mut policy = config
+            .get("policy")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut permissions = policy
+            .get("permissions")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for (key, value) in [
+            ("can_spawn_subagents", req.subagents),
+            ("can_query_other_agents", req.agent_queries),
+        ] {
+            if let Some(value) = value {
+                permissions.insert(key.into(), serde_json::Value::Bool(value));
+            }
+        }
+        policy.insert("permissions".into(), serde_json::Value::Object(permissions));
+        config.insert("policy".into(), serde_json::Value::Object(policy));
+        Ok::<_, std::convert::Infallible>(serde_json::Value::Object(config))
+    })
+    .await?;
+    let Ok(updated) = updated;
+    audit::record_agent_action(
+        &state.db,
+        user.id,
+        agent.id,
+        "agent.capabilities.changed",
+        serde_json::json!({
+            "subagents": req.subagents,
+            "agent_queries": req.agent_queries,
+        }),
+    )
+    .await;
+    Ok(Json(capabilities_view(&state, &updated).await))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{check_model, check_policy_override, embedding_env_passthrough};

@@ -176,7 +176,16 @@ export type SkillListResponse = {
 /** One part of what a reply's turn did on the way. */
 export type TraceItem =
   | { kind: "thinking"; text: string }
-  | { kind: "step"; tool: string; input: string; result: string; error: boolean };
+  | {
+      kind: "step";
+      tool: string;
+      input: string;
+      result: string;
+      error: boolean;
+      /** A subagent's own steps, for its call (issue #222). */
+      steps?: TraceItem[];
+      left_out?: number;
+    };
 
 /** What a reply's turn did on the way: the model's reasoning and its tool calls. */
 export type TurnTrace = {
@@ -542,6 +551,12 @@ export type TitlesView = {
   model: string;
 };
 
+/** One capability that costs model calls; locked when the owner's role has it off. */
+export type Capability = { enabled: boolean; locked: boolean };
+
+/** What an agent may do beyond its own turn (issue #222). */
+export type CapabilitiesView = { subagents: Capability; agent_queries: Capability };
+
 /** A one-time code that links a chat-app account to the caller (issue #182). */
 export type PairingCode = {
   channel: string;
@@ -647,6 +662,14 @@ export const api = {
       request<TitlesView>(`/agents/${agentId}/titles`, {
         method: "PUT",
         body: JSON.stringify({ enabled }),
+      }),
+  },
+  capabilities: {
+    get: (agentId: string) => request<CapabilitiesView>(`/agents/${agentId}/capabilities`),
+    put: (agentId: string, change: Partial<Record<keyof CapabilitiesView, boolean>>) =>
+      request<CapabilitiesView>(`/agents/${agentId}/capabilities`, {
+        method: "PUT",
+        body: JSON.stringify(change),
       }),
   },
   approvals: {

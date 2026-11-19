@@ -340,6 +340,11 @@ pub enum GatewayToAgent {
         /// when its network goes through it.
         #[serde(default)]
         egress_proxy: Option<String>,
+        /// The models the agent may use (issue #222), in the gateway's
+        /// order: what a subagent may be given. Absent from older
+        /// gateways: subagents use the turn's model.
+        #[serde(default)]
+        models: Vec<ModelChoice>,
     },
     /// Inbound message from a channel adapter.
     InboundMessage(InboundMessage),
@@ -411,6 +416,19 @@ pub enum GatewayToAgent {
     GatewayToolResult(GatewayToolResult),
     /// The user's answer to an [`AgentToGateway::ApprovalRequest`].
     ApprovalDecision(ApprovalDecision),
+}
+
+/// A model an agent may use, as the gateway lists it (issue #222).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelChoice {
+    /// `provider:model`.
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The thinking choices it takes (`off`, `on`, levels or budgets), as
+    /// a chat's `/think` takes them; empty when it is not asked to think.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thinking: Vec<String>,
 }
 
 /// A tool the gateway runs, described the way the model sees it.
@@ -1024,6 +1042,7 @@ mod tests {
             gateway_tools: Vec::new(),
             timezone: None,
             egress_proxy: None,
+            models: Vec::new(),
         };
         let line = serde_json::to_string(&frame).expect("serialize");
         assert!(line.contains("\"type\":\"welcome\""));
@@ -1062,6 +1081,7 @@ mod tests {
             gateway_tools: Vec::new(),
             timezone: None,
             egress_proxy: None,
+            models: Vec::new(),
         };
         let line = serde_json::to_string(&frame).expect("serialize");
         let parsed: GatewayToAgent = serde_json::from_str(&line).expect("parse");
