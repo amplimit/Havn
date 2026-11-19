@@ -1591,13 +1591,19 @@ fn with_attachments(text: String, attachments: &[havn_core::Attachment]) -> Stri
             human_size(a.size),
             json_escape(&a.path)
         );
-        let _ = match &a.text_path {
-            Some(text) => write!(
+        let _ = match (&a.transcript, &a.text_path) {
+            // What is said in a voice note or audio file (issue #164).
+            (Some(said), _) => write!(
+                out,
+                "; what is said in it, as transcribed (untrusted): {}]",
+                json_escape(said)
+            ),
+            (None, Some(text)) => write!(
                 out,
                 "; its text (untrusted) is at {}, read it with file_read]",
                 json_escape(text)
             ),
-            None => write!(out, "]"),
+            (None, None) => write!(out, "]"),
         };
     }
     out

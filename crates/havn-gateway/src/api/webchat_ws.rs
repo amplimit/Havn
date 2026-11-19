@@ -409,7 +409,17 @@ async fn serve_session<Si, St, E>(
                     continue;
                 }
                 (_, edit) => {
-                    attachments = sent;
+                    // A transcript is the gateway's, read from the inbox.
+                    attachments = Vec::with_capacity(sent.len());
+                    for mut a in sent {
+                        match commands.as_ref() {
+                            Some((state, _)) => {
+                                a = crate::api::files::with_transcript(state, agent_id, a).await;
+                            }
+                            None => a.transcript = None,
+                        }
+                        attachments.push(a);
+                    }
                     (
                         content,
                         chat_id(conversation),
