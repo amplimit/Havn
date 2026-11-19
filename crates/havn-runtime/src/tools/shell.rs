@@ -33,6 +33,9 @@ const TAIL_BYTES: usize = 64 * 1024;
 const DRAIN: Duration = Duration::from_secs(2);
 /// Ended background commands kept for their output to be read.
 const ENDED_KEPT: usize = 16;
+/// How long the last lines a shell printed as it ended are waited for, when
+/// what it left running holds its output open.
+const LAST_LINES: Duration = Duration::from_millis(200);
 /// How often a background command whose first process ended is checked
 /// for others of its group still running.
 const GROUP_POLL: Duration = Duration::from_secs(1);
@@ -137,7 +140,15 @@ impl Tool for ShellTool {
                 Err(e) => return ToolResult::Error(format!("exec failed: {e}")),
             };
             let (output, readers) = capture(&mut child);
-            let id = procs.watch(command, child.id(), Some(child), output, readers, stop);
+            let id = procs.watch(
+                command,
+                child.id(),
+                First::Running(child),
+                output,
+                readers,
+                stop,
+                0,
+            );
             return ToolResult::Ok(format!(
                 "started in the background as process {id}. Read what it prints with the \
                  process tool ({{\"action\": \"read\", \"id\": {id}}}), wait for it with \
@@ -160,22 +171,35 @@ impl Tool for ShellTool {
                 // as a background process, so the turn's stop, `kill` and
                 // the limit reach it.
                 if group_alive(pid) {
-                    let left = stop.map(|stop| {
-                        lock(&PROCS).watch(
-                            command,
-                            pid,
-                            None,
-                            Arc::clone(&output),
-                            readers,
-                            Some(stop),
-                        )
-                    });
-                    match left {
-                        Some(id) => {
+                    // The shell's last lines, printed as it ended.
+                    tokio::time::sleep(LAST_LINES).await;
+                    let mut procs = lock(&PROCS);
+                    let full = procs.running() >= limits.background.max(1) as usize;
+                    match stop {
+                        Some(stop) if !full => {
+                            let from = lock(&output).total;
+                            let id = procs.watch(
+                                command,
+                                pid,
+                                First::Ended(status),
+                                Arc::clone(&output),
+                                readers,
+                                Some(stop),
+                                from,
+                            );
                             let _ = writeln!(
                                 out,
                                 "[It left processes running: they go on as background process \
                                  {id}; read or end them with the process tool.]"
+                            );
+                        }
+                        Some(_) => {
+                            kill_group(pid);
+                            let _ = writeln!(
+                                out,
+                                "[It left processes running; they were ended, as {} commands \
+                                 run in the background already, the most allowed.]",
+                                limits.background.max(1)
                             );
                         }
                         None => {
@@ -204,7 +228,7 @@ impl Tool for ShellTool {
                 // Out of time: it and what it started end, and what it
                 // printed so far comes back.
                 drop(group);
-                let _ = child.wait().await;
+                let _ = tokio::time::timeout(DRAIN, child.wait()).await;
                 let _ = tokio::time::timeout(DRAIN, readers).await;
                 ToolResult::Error(format!(
                     "timed out after {seconds}s and was stopped. Run it with a longer \
@@ -281,8 +305,11 @@ impl Tool for ProcessTool {
             }
             "kill" => {
                 // The whole group, whatever its first process did: what it
-                // started may still run.
-                kill_group(pid);
+                // started may still run. Not one that ended, all of it:
+                // its id may be another's by now.
+                if ended.borrow().is_none() {
+                    kill_group(pid);
+                }
                 let mut ended = ended;
                 let _ = tokio::time::timeout(DRAIN * 2, ended.wait_for(Option::is_some)).await;
                 ToolResult::Ok(read(id))
@@ -396,6 +423,13 @@ fn exit_text(status: Option<std::process::ExitStatus>) -> String {
     }
 }
 
+/// The first process of a background command: still running, or ended
+/// (its shell, which left others running).
+enum First {
+    Running(Child),
+    Ended(std::process::ExitStatus),
+}
+
 /// A command going on in the background.
 struct Proc {
     command: String,
@@ -426,23 +460,29 @@ impl Procs {
     }
 
     /// Keep the command `command`, whose process group `pid` leads, going
-    /// in the background, `child` its first process when it still runs: it
-    /// counts as ended once all of its group is gone, and what it printed
-    /// is read (`readers`) by then. The turn's stop, when there is one,
-    /// ends it. Its id.
+    /// in the background, `first` its first process: it counts as ended
+    /// once all of its group is gone, and what it printed is read
+    /// (`readers`) by then. The turn's stop, when there is one, ends it.
+    /// Reads start at byte `from`. Its id.
+    #[allow(clippy::too_many_arguments)]
     fn watch(
         &mut self,
         command: &str,
         pid: Option<u32>,
-        child: Option<Child>,
+        first: First,
         output: Arc<Mutex<Output>>,
         readers: tokio::task::JoinHandle<()>,
         stop: Option<tokio_util::sync::CancellationToken>,
+        from: u64,
     ) -> u32 {
         let (ended_tx, ended) = watch::channel(None);
+        let (child, status) = match first {
+            First::Running(child) => (Some(child), None),
+            First::Ended(status) => (None, Some(status)),
+        };
         tokio::spawn(async move {
             let mut child = child;
-            let mut status = None;
+            let mut status = status;
             let mut stopped = false;
             loop {
                 if child.is_none() && !group_alive(pid) {
@@ -482,7 +522,7 @@ impl Procs {
                 command: command.to_string(),
                 started: Instant::now(),
                 output,
-                read: 0,
+                read: from,
                 pid,
                 ended,
             },
