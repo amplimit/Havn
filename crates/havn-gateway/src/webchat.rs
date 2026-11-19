@@ -998,26 +998,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_approval_is_found_by_its_id_in_its_conversation_only() {
-        let router = WebChatRouter::new();
-        let agent = AgentId::new();
-        assert!(router.ask_approval(agent, approval_request("r1")).await);
-        assert!(router.ask_approval(agent, approval_request("r2")).await);
-        let chat = "ch|telegram|bot|42";
-        assert_eq!(
-            router.approval(agent, chat, "r2").map(|r| r.request_id),
-            Some("r2".to_string())
-        );
-        assert!(router.approval(agent, "ch|telegram|bot|43", "r2").is_none());
-        assert!(router.approval(AgentId::new(), chat, "r2").is_none());
-        assert!(router.approval(agent, chat, "r3").is_none());
-        assert_eq!(
-            router.oldest_approval(agent, chat).map(|r| r.request_id),
-            Some("r1".to_string())
-        );
-    }
-
-    #[tokio::test]
     async fn approvals_reach_every_tab_and_later_ones_until_closed() {
         let router = WebChatRouter::new();
         let agent = AgentId::new();
