@@ -656,6 +656,19 @@ impl TryFrom<ChatTurnRow> for ChatTurn {
 /// (most Chinese words) are matched as substrings.
 const TRIGRAM_CHARS: usize = 3;
 
+/// Whether chat `chat` is one of a scope the owner writes from (issue
+/// #218).
+pub async fn chat_of_owner(pool: &SqlitePool, chat: &str) -> Result<bool> {
+    let (found,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM chats c JOIN owner_scopes o ON o.scope = c.scope \
+         WHERE c.id = ?1)",
+    )
+    .bind(chat)
+    .fetch_one(pool)
+    .await?;
+    Ok(found)
+}
+
 /// Note that the owner writes from `scope` (issue #218): their search
 /// covers its chats from then on.
 pub async fn note_owner_scope(pool: &SqlitePool, scope: &str) -> Result<()> {

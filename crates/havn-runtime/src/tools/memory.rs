@@ -99,16 +99,18 @@ const MAX_VALUE_BYTES: usize = havn_proto::MAX_MEMORY_VALUE_BYTES;
 
 pub struct MemoryRememberTool;
 
-/// Whether this turn may change the agent's memory (issue #218): not one
-/// answering someone other than its owner. Work no one asked for (a
-/// heartbeat, a scheduled task) may.
+/// Whether this turn may change the agent's memory (issue #218): one
+/// answering its owner, the heartbeat, or a task the owner scheduled.
+/// Anything else (someone else's chat, their scheduled task, another
+/// agent's question) may not.
 fn may_change_memory() -> bool {
     super::gateway::FROM_OWNER
         .try_with(|owner| *owner)
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
-const NOT_THE_OWNER: &str = "only your owner's conversations change your memory, and this one      is with someone else: nothing was saved or forgotten";
+const NOT_THE_OWNER: &str = "only your owner's conversations change your memory, and this one \
+                             is with someone else: nothing was saved or forgotten";
 
 #[async_trait]
 impl Tool for MemoryRememberTool {
@@ -638,7 +640,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_the_owner_s_turns_change_memory() {
-        assert!(may_change_memory(), "work no one asked for may");
+        assert!(!may_change_memory(), "unless the owner's, it may not");
         let refused = super::super::gateway::FROM_OWNER
             .scope(false, async { may_change_memory() })
             .await;
