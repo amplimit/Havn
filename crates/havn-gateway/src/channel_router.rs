@@ -21,9 +21,14 @@
 //! reconnect with `Resume{since_seq}`; the gateway replays buffered
 //! frames whose seq > since_seq. The seq counter is monotonic per
 //! account across reconnects so `since_seq` actually identifies a
-//! point in the stream. Overflow (more than [`REPLAY_MAX_FRAMES`] in
-//! the window) drops the oldest entry with a warn log; agents do not
-//! block on adapter availability (spec §3.2).
+//! point in the stream, and starts from the time an account is first seen
+//! (in microseconds), so it is past every seq a gateway that ran before
+//! gave: an adapter that kept its last seq across a gateway restart does
+//! not take new frames for ones it had. Replies are kept for an account
+//! before any adapter connected too (after a gateway restart, until the
+//! adapter is back). Overflow (more than [`REPLAY_MAX_FRAMES`] in the
+//! window) drops the oldest entry with a warn log; agents do not block on
+//! adapter availability (spec §3.2).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -101,16 +106,33 @@ struct ReplayEntry {
     inserted_at: Instant,
 }
 
+/// The first seq of an account: microseconds since the epoch, past the
+/// seqs of a gateway that ran before (unless it gave more than one frame
+/// a microsecond, or the clock went back).
+fn first_seq() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX / 2))
+        .max(1)
+}
+
+impl AccountState {
+    fn new(tx: Option<mpsc::Sender<ChannelFrame>>) -> Self {
+        Self {
+            tx,
+            next_seq: first_seq(),
+            replay: VecDeque::new(),
+            replaying: None,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum DeliverError {
-    /// No adapter has connected for this (channel, account) pair since
-    /// the gateway started: nothing is kept for one to resume.
-    #[error("no adapter has connected for {0:?}")]
-    NeverConnected(AccountKey),
     /// No adapter daemon is currently connected for this (channel,
-    /// account) pair. If one was connected before, the reply is kept in
-    /// the replay buffer for its `Resume`; the caller (agent_socket
+    /// account) pair. The reply is kept in the replay buffer for its
+    /// `Resume`; the caller (agent_socket
     /// outbound dispatch) should log. Agents do NOT block on adapter
     /// availability (spec §3.2).
     #[error("no adapter connected for {0:?}")]
@@ -138,23 +160,32 @@ impl ChannelRouter {
     /// are preserved — `Resume{since_seq}` from the adapter can then
     /// pull missed frames via [`Self::replay_since`].
     pub async fn register(&self, key: AccountKey, tx: mpsc::Sender<ChannelFrame>) {
+        self.register_as(key, tx, false).await;
+    }
+
+    /// [`Self::register`] for an adapter that resumes as it connects: until
+    /// its replay ([`Self::replay_since`], [`Self::replay_more`]) catches
+    /// up, new deliveries are only buffered, so none reaches it before the
+    /// ones it missed.
+    pub async fn register_resuming(&self, key: AccountKey, tx: mpsc::Sender<ChannelFrame>) {
+        self.register_as(key, tx, true).await;
+    }
+
+    async fn register_as(&self, key: AccountKey, tx: mpsc::Sender<ChannelFrame>, resuming: bool) {
         let mut map = self.inner.lock().await;
-        match map.get_mut(&key) {
-            Some(state) => {
-                state.tx = Some(tx);
-                state.replaying = None;
-            }
-            None => {
-                map.insert(
-                    key,
-                    AccountState {
-                        tx: Some(tx),
-                        next_seq: 1,
-                        replay: VecDeque::new(),
-                        replaying: None,
-                    },
-                );
-            }
+        let state = map.entry(key).or_insert_with(|| AccountState::new(None));
+        state.replaying = resuming.then(|| tx.clone());
+        state.tx = Some(tx);
+    }
+
+    /// Where a `Resume` from `since_seq` starts: there, unless it is a seq
+    /// this gateway never gave (at or past its next one), from a gateway
+    /// that ran before with its clock ahead or another instance: then from
+    /// the start of what is kept.
+    pub async fn resume_point(&self, key: &AccountKey, since_seq: u64) -> u64 {
+        match self.inner.lock().await.get(key) {
+            Some(state) if since_seq >= state.next_seq => 0,
+            _ => since_seq,
         }
     }
 
@@ -214,9 +245,11 @@ impl ChannelRouter {
         let key = AccountKey::new(channel, account_id);
         let (tx, frame, seq) = {
             let mut map = self.inner.lock().await;
+            // Kept before any adapter connected too: after a gateway
+            // restart, until the adapter is back to resume.
             let state = map
-                .get_mut(&key)
-                .ok_or_else(|| DeliverError::NeverConnected(key.clone()))?;
+                .entry(key.clone())
+                .or_insert_with(|| AccountState::new(None));
             let seq = state.next_seq;
             state.next_seq = state.next_seq.saturating_add(1);
             let frame = ChannelFrame::Outbound(ChannelOutbound {
@@ -265,10 +298,8 @@ impl ChannelRouter {
     /// [`REPLAY_WINDOW`] have already been evicted on every prior
     /// mutation, so the returned slice is the live replay set.
     ///
-    /// If no `AccountState` exists for `key`, returns an empty Vec
-    /// (cold-start reconnect — adapter is asking to resume a stream
-    /// that the gateway never saw, e.g. because the gateway itself
-    /// restarted). The caller logs a warn for that case.
+    /// If no `AccountState` exists for `key`, returns an empty Vec:
+    /// nothing was ever delivered for it.
     ///
     /// Starts a replay through `tx` when it is the registered sender:
     /// until [`Self::replay_more`] reports it caught up, new deliveries
@@ -485,12 +516,12 @@ mod tests {
             )
             .await
             .expect("deliver");
-        assert_eq!(seq, 1);
+        assert!(seq > 1_000_000_000_000_000, "from the time: {seq}");
 
         let got = rx.recv().await.expect("frame received");
         match got {
             ChannelFrame::Outbound(o) => {
-                assert_eq!(o.seq, 1);
+                assert_eq!(o.seq, seq);
                 assert_eq!(o.account_id, "alice-tg-bot");
                 assert_eq!(o.to, "tg:123");
                 assert_eq!(o.in_reply_to.as_deref(), Some("tg:msg-7"));
@@ -500,7 +531,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_returns_no_session_when_unregistered() {
+    async fn an_adapter_resuming_as_it_connects_gets_nothing_ahead_of_its_replay() {
+        let router = ChannelRouter::new();
+        let key = AccountKey::new("telegram", "alice");
+        let deliver = || {
+            router.deliver(
+                "telegram",
+                "alice",
+                "tg:1",
+                None,
+                ChannelMessageContent::Text { text: "x".into() },
+            )
+        };
+        let (old, _old_rx) = mpsc::channel(8);
+        router.register(key.clone(), old.clone()).await;
+        router.unregister(&key, &old).await;
+        let missed = deliver().await;
+        assert!(matches!(missed, Err(DeliverError::NoSession(_))));
+
+        let (tx, mut rx) = mpsc::channel(8);
+        router.register_resuming(key.clone(), tx.clone()).await;
+        // A reply before the replay starts waits for it.
+        deliver().await.expect("buffered for the replay");
+        assert!(rx.try_recv().is_err(), "nothing ahead of the replay");
+        let first = router.replay_since(&key, 0, &tx).await;
+        assert_eq!(first.len(), 2);
+        let last = seqs(&first)[1];
+        assert!(router.replay_more(&key, last, &tx).await.is_empty());
+        deliver().await.expect("live again");
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_seq_this_gateway_never_gave_resumes_from_the_start() {
+        let router = ChannelRouter::new();
+        let key = AccountKey::new("telegram", "alice");
+        let kept = router
+            .deliver(
+                "telegram",
+                "alice",
+                "tg:1",
+                None,
+                ChannelMessageContent::Text { text: "x".into() },
+            )
+            .await;
+        assert!(matches!(kept, Err(DeliverError::NoSession(_))));
+        assert_eq!(router.resume_point(&key, u64::MAX / 2).await, 0);
+        assert_eq!(router.resume_point(&key, 3).await, 3);
+        let unknown = AccountKey::new("telegram", "ghost");
+        assert_eq!(router.resume_point(&unknown, 9).await, 9);
+    }
+
+    #[tokio::test]
+    async fn a_reply_before_any_adapter_is_kept_for_its_resume() {
         let router = ChannelRouter::new();
         let r = router
             .deliver(
@@ -511,7 +594,14 @@ mod tests {
                 ChannelMessageContent::Text { text: "x".into() },
             )
             .await;
-        assert!(matches!(r, Err(DeliverError::NeverConnected(_))));
+        assert!(matches!(r, Err(DeliverError::NoSession(_))));
+        // The adapter connects after a gateway restart and resumes from a
+        // seq of the gateway that ran before, which is smaller.
+        let key = AccountKey::new("telegram", "alice");
+        let (tx, _rx) = mpsc::channel(8);
+        router.register(key.clone(), tx.clone()).await;
+        let kept = router.replay_since(&key, 5_000, &tx).await;
+        assert_eq!(kept.len(), 1);
     }
 
     #[tokio::test]
@@ -618,7 +708,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         router.register(key.clone(), tx.clone()).await;
         let first = router.replay_since(&key, 0, &tx).await;
-        assert_eq!(seqs(&first), vec![1, 2, 3, 4, 5]);
+        let base = seqs(&first)[0] - 1;
+        let at = |n: u64| base + n;
+        assert_eq!(seqs(&first), (1..=5).map(at).collect::<Vec<_>>());
         for _ in 0..3 {
             deliver()
                 .await
@@ -626,12 +718,12 @@ mod tests {
         }
         assert!(rx.try_recv().is_err(), "nothing bypasses the replay");
 
-        let more = router.replay_more(&key, 5, &tx).await;
-        assert_eq!(seqs(&more), vec![6, 7, 8]);
-        assert!(router.replay_more(&key, 8, &tx).await.is_empty());
+        let more = router.replay_more(&key, at(5), &tx).await;
+        assert_eq!(seqs(&more), (6..=8).map(at).collect::<Vec<_>>());
+        assert!(router.replay_more(&key, at(8), &tx).await.is_empty());
         deliver().await.expect("live again");
         match rx.try_recv() {
-            Ok(ChannelFrame::Outbound(o)) => assert_eq!(o.seq, 9),
+            Ok(ChannelFrame::Outbound(o)) => assert_eq!(o.seq, at(9)),
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -686,7 +778,7 @@ mod tests {
                 seqs.push(o.seq);
             }
         }
-        assert_eq!(seqs, vec![1, 2, 3]);
+        assert_eq!(seqs, vec![seqs[0], seqs[0] + 1, seqs[0] + 2]);
     }
 
     #[tokio::test]
@@ -699,7 +791,7 @@ mod tests {
         let key = AccountKey::new("telegram", "alice");
         let (tx1, _rx1) = mpsc::channel(8);
         router.register(key.clone(), tx1.clone()).await;
-        router
+        let first = router
             .deliver(
                 "telegram",
                 "alice",
@@ -723,7 +815,11 @@ mod tests {
             )
             .await
             .expect("deliver");
-        assert_eq!(seq, 2, "seq continues from prior count after reconnect");
+        assert_eq!(
+            seq,
+            first + 1,
+            "seq continues from prior count after reconnect"
+        );
         let _ = rx2.recv().await;
     }
 
@@ -758,8 +854,9 @@ mod tests {
         let key = AccountKey::new("telegram", "alice");
         let (tx, mut rx) = mpsc::channel(8);
         router.register(key.clone(), tx.clone()).await;
+        let mut delivered = Vec::new();
         for i in 0..3 {
-            router
+            let seq = router
                 .deliver(
                     "telegram",
                     "alice",
@@ -771,6 +868,7 @@ mod tests {
                 )
                 .await
                 .expect("deliver");
+            delivered.push(seq);
         }
         // Drain the in-flight frames the original tx received.
         for _ in 0..3 {
@@ -778,7 +876,7 @@ mod tests {
         }
 
         router.unregister(&key, &tx).await;
-        let replayed = router.replay_since(&key, 1, &tx).await;
+        let replayed = router.replay_since(&key, delivered[0], &tx).await;
         let seqs: Vec<u64> = replayed
             .iter()
             .filter_map(|f| match f {
@@ -788,7 +886,7 @@ mod tests {
             .collect();
         assert_eq!(
             seqs,
-            vec![2, 3],
+            delivered[1..],
             "replay returns frames strictly after since_seq"
         );
     }

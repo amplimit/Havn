@@ -285,6 +285,12 @@ pub struct ChannelQuery {
     /// credential row's `name` column and the `[[bindings]] account_id`
     /// references in gateway config (spec §3.4 / §3.5).
     pub account: String,
+    /// On the WebSocket upgrade: the last outbound seq the adapter had
+    /// (havn-channel-telegram issue #23). The replay of what came after it
+    /// starts as the adapter is registered, before any new reply goes to
+    /// it, which a `Resume` frame read later cannot promise.
+    #[serde(default)]
+    pub since: Option<u64>,
 }
 
 /// HTTP handler for the WebSocket upgrade. Authenticates the request
@@ -298,7 +304,8 @@ pub async fn handler(
     authenticate(&state, &q, &headers).await?;
     let account_id = q.account.clone();
     let channel_id = q.channel.clone();
-    Ok(ws.on_upgrade(move |socket| handle_session(socket, state, channel_id, account_id)))
+    let since = q.since;
+    Ok(ws.on_upgrade(move |socket| handle_session(socket, state, channel_id, account_id, since)))
 }
 
 /// `GET /api/v1/channel/files/:agent/:file?channel=&account=` — a file an
@@ -387,6 +394,7 @@ pub async fn upload(
     let account = ChannelQuery {
         channel: q.channel.clone(),
         account: q.account.clone(),
+        since: None,
     };
     authenticate(&state, &account, &headers).await?;
     channel_id_codec::validate_channel_id_part("sender_id", &q.sender)
@@ -740,11 +748,64 @@ const MAX_ACCOUNT_MISMATCHES: u32 = 10;
 /// frames (they stay in the replay buffer) instead of waiting.
 const ADAPTER_OUTBOUND_CAPACITY: usize = 64;
 
+/// Send the adapter of `key` (through `frame_tx`) the outbound frames kept
+/// after `since_seq`, and those delivered while it does, until the buffer
+/// has nothing newer (spec §3.2).
+async fn replay(
+    state: &AppState,
+    key: &AccountKey,
+    since_seq: u64,
+    frame_tx: &mpsc::Sender<ChannelFrame>,
+) {
+    // A seq of another gateway (one that ran before with a clock ahead,
+    // or another instance) resumes from the start of what is kept.
+    let since = state.channel_router.resume_point(key, since_seq).await;
+    let mut frames = state
+        .channel_router
+        .replay_since(key, since, frame_tx)
+        .await;
+    let mut replayed = 0usize;
+    let mut cursor = since;
+    'replay: loop {
+        for frame in frames {
+            if let ChannelFrame::Outbound(o) = &frame {
+                cursor = cursor.max(o.seq);
+            }
+            if frame_tx.send(frame).await.is_err() {
+                warn!(
+                    channel = %key.channel,
+                    account = %key.account_id,
+                    since_seq,
+                    "channel WS: outbound mpsc closed mid-replay"
+                );
+                break 'replay;
+            }
+            replayed += 1;
+        }
+        frames = state
+            .channel_router
+            .replay_more(key, cursor, frame_tx)
+            .await;
+        if frames.is_empty() {
+            break;
+        }
+    }
+    info!(
+        channel = %key.channel,
+        account = %key.account_id,
+        since_seq,
+        from = since,
+        replayed,
+        "channel WS: resume processed"
+    );
+}
+
 async fn handle_session(
     socket: WebSocket,
     state: AppState,
     channel_id: String,
     account_id: String,
+    since: Option<u64>,
 ) {
     info!(channel = %channel_id, account = %account_id, "channel WS opened");
 
@@ -761,7 +822,16 @@ async fn handle_session(
     if let Err(e) = frame_tx.try_send(commands) {
         warn!(channel = %channel_id, account = %account_id, error = %e, "could not send the command menu");
     }
-    state.channel_router.register(key.clone(), frame_tx).await;
+    // Resuming from `since`: new replies only wait in the buffer until the
+    // replay below has sent what came before them.
+    if since.is_some() {
+        state
+            .channel_router
+            .register_resuming(key.clone(), frame_tx)
+            .await;
+    } else {
+        state.channel_router.register(key.clone(), frame_tx).await;
+    }
 
     // Separate mpsc for raw WS control frames (Pong replies to
     // protocol-level Pings). Keeps `ChannelRouter` typed on
@@ -804,6 +874,12 @@ async fn handle_session(
         }
         let _ = tokio::time::timeout(WS_SEND_TIMEOUT, ws_sink.send(Message::Close(None))).await;
     });
+
+    if let Some(since) = since
+        && let Some(frame_tx) = registered.upgrade()
+    {
+        replay(&state, &key, since, &frame_tx).await;
+    }
 
     let mut mismatch_count: u32 = 0;
     let mut outbound_done = false;
@@ -881,51 +957,11 @@ async fn handle_session(
             }
             ChannelFrame::Resume(r) => {
                 // Spec §3.2: replay buffered outbound frames with
-                // seq > since_seq through the adapter's mpsc. Empty
-                // result is the cold-start case (no state, e.g.
-                // gateway restarted between disconnect and reconnect).
+                // seq > since_seq through the adapter's mpsc.
                 let Some(frame_tx) = registered.upgrade() else {
                     break;
                 };
-                // Deliveries arriving meanwhile are only buffered; keep
-                // replaying until the buffer has nothing newer.
-                let mut frames = state
-                    .channel_router
-                    .replay_since(&key, r.since_seq, &frame_tx)
-                    .await;
-                let mut replayed = 0usize;
-                let mut cursor = r.since_seq;
-                'replay: loop {
-                    for frame in frames {
-                        if let ChannelFrame::Outbound(o) = &frame {
-                            cursor = cursor.max(o.seq);
-                        }
-                        if frame_tx.send(frame).await.is_err() {
-                            warn!(
-                                channel = %channel_id,
-                                account = %account_id,
-                                since_seq = r.since_seq,
-                                "channel WS: outbound mpsc closed mid-replay"
-                            );
-                            break 'replay;
-                        }
-                        replayed += 1;
-                    }
-                    frames = state
-                        .channel_router
-                        .replay_more(&key, cursor, &frame_tx)
-                        .await;
-                    if frames.is_empty() {
-                        break;
-                    }
-                }
-                info!(
-                    channel = %channel_id,
-                    account = %account_id,
-                    since_seq = r.since_seq,
-                    replayed,
-                    "channel WS: resume processed"
-                );
+                replay(&state, &key, r.since_seq, &frame_tx).await;
             }
             ChannelFrame::Ping => {
                 // Application-level Pong via the raw mpsc — bypasses
