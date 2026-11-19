@@ -30,6 +30,7 @@ import {
   type CronJobView,
   type ApprovalsView,
   type TitlesView,
+  type CapabilitiesView,
   type WorkspaceAccess,
   type PairingCode,
   type ChannelLinkView,
@@ -304,6 +305,7 @@ export default function SettingsPage({
       <TimezoneEditor />
       <ScheduledTasks agentId={id} />
       <TitlesEditor agentId={id} />
+      <CapabilitiesEditor agentId={id} />
       <WorkspaceAccessEditor agentId={id} />
       <ChannelPairing agentId={id} />
       <ApprovalsEditor agentId={id} />
@@ -780,6 +782,93 @@ function TitlesEditor({ agentId }: { agentId: string }) {
           Your role has chat titles off; a team admin can turn them on.
         </p>
       )}
+    </section>
+  );
+}
+
+/** What the agent may do beyond its own turn: subagents, and asking other agents. */
+function CapabilitiesEditor({ agentId }: { agentId: string }) {
+  const [view, setView] = useState<CapabilitiesView | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    api.capabilities.get(agentId).then(
+      (v) => {
+        if (!cancelled) setView(v);
+      },
+      (e: unknown) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId]);
+  async function toggle(key: keyof CapabilitiesView, enabled: boolean) {
+    setSaving(true);
+    setError(null);
+    try {
+      setView(await api.capabilities.put(agentId, { [key]: enabled }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+  if (!view) return error ? <p className="mt-10 text-sm" role="alert">{error}</p> : null;
+  const rows: { key: keyof CapabilitiesView; label: string; about: string; locked: string }[] = [
+    {
+      key: "subagents",
+      label: "hand tasks to subagents",
+      about:
+        "The agent can split work into tasks that run at once, each on a model and thinking it picks, with or without the chat so far. They show in the chat's steps, not as chats of their own. Each costs model calls.",
+      locked: "Your role has subagents off; a team admin can turn them on.",
+    },
+    {
+      key: "agent_queries",
+      label: "ask your other agents",
+      about:
+        "The agent can put a question to another agent of yours and use its answer. The other agent answers from its own memory and tools, on its own model.",
+      locked: "Your role does not let agents ask each other; a team admin can allow it.",
+    },
+  ];
+  return (
+    <section className="mt-10 card px-4 py-4" aria-labelledby="capabilities-title">
+      <h2 id="capabilities-title" className="display-h3 mb-2">
+        working with other agents
+      </h2>
+      <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
+        Applies on the agent&apos;s next start.
+      </p>
+      {error && (
+        <p className="mb-2 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
+          {error}
+        </p>
+      )}
+      <div className="flex flex-col gap-4">
+        {rows.map((row) => (
+          <div key={row.key}>
+            <label className="inline-flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={view[row.key].enabled}
+                disabled={saving || (view[row.key].locked && !view[row.key].enabled)}
+                onChange={(e) => void toggle(row.key, e.target.checked)}
+              />
+              {row.label}
+            </label>
+            <p className="mt-1 text-xs" style={{ color: "var(--color-body)" }}>
+              {row.about}
+            </p>
+            {view[row.key].locked && (
+              <p className="mt-1 text-xs" style={{ color: "var(--color-body)" }}>
+                {row.locked}
+              </p>
+            )}
+          </div>
+        ))}
+      </div>
     </section>
   );
 }

@@ -647,12 +647,13 @@ async fn handle_connection(
     //    unavailable, ship `Policy::default()` rather than refuse the
     //    connection. Refusing here would just orphan the runtime; the
     //    spawner would retry into the same dead end.
-    let (policy, model, max_tokens, agent_name, gateway_tools): (
+    let (policy, model, max_tokens, agent_name, gateway_tools, models): (
         Policy,
         Option<String>,
         Option<u32>,
         Option<String>,
         Vec<GatewayToolSpec>,
+        Vec<havn_proto::ModelChoice>,
     ) = match agents_repo::find_by_id(&ctx.db, agent_id).await {
         Ok(Some(agent)) => {
             let model = agent
@@ -675,15 +676,16 @@ async fn handle_connection(
             // The model that titles chats, as the runtime uses it.
             policy.chat_titles.model = title_model(&policy, &ctx.models.load());
             let gateway_tools = gateway_tools_for(&ctx, &agent, &policy).await;
-            (policy, model, max_tokens, name, gateway_tools)
+            let models = model_choices(&policy, &ctx.models.load());
+            (policy, model, max_tokens, name, gateway_tools, models)
         }
         Ok(None) => {
             warn!(%agent_id, "agent not found at handshake; sending default policy");
-            (Policy::default(), None, None, None, Vec::new())
+            (Policy::default(), None, None, None, Vec::new(), Vec::new())
         }
         Err(e) => {
             warn!(%agent_id, error = %e, "policy lookup failed; sending default policy");
-            (Policy::default(), None, None, None, Vec::new())
+            (Policy::default(), None, None, None, Vec::new(), Vec::new())
         }
     };
 
@@ -718,6 +720,7 @@ async fn handle_connection(
         egress_proxy: egress_proxy_for(&ctx, agent_id).await,
         gateway_tools,
         timezone: Some(crate::timezone::for_agent(&ctx.db, agent_id).await),
+        models,
     };
     let write_welcome = write_frame(&mut write, &welcome);
     let sent = match tokio::time::timeout(AGENT_WRITE_TIMEOUT, write_welcome).await {
@@ -1364,6 +1367,28 @@ fn approval_buttons(id: &str) -> Vec<Vec<havn_core::Button>> {
         return Vec::new();
     }
     rows
+}
+
+/// The models an agent with `policy` may use, with the thinking each takes
+/// (issue #222).
+pub(crate) fn model_choices(
+    policy: &Policy,
+    catalog: &crate::model_catalog::ModelCatalog,
+) -> Vec<havn_proto::ModelChoice> {
+    catalog
+        .models
+        .iter()
+        .filter(|m| llm_proxy::model_allowed(&policy.allowed_models, &m.id))
+        .map(|m| havn_proto::ModelChoice {
+            id: m.id.clone(),
+            label: m.label.clone(),
+            thinking: m
+                .thinking
+                .as_ref()
+                .map(crate::model_catalog::ThinkingSpec::choices)
+                .unwrap_or_default(),
+        })
+        .collect()
 }
 
 /// The model that writes chat titles for an agent with `policy`: its

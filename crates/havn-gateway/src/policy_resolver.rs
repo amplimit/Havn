@@ -355,7 +355,13 @@ fn unguarded(policy: &mut Policy) {
 /// registry but their cgroup was still capped at the system default
 /// 512 MiB. Drift fix.
 pub async fn for_session(db: &SqlitePool, agent: &Agent, multi_user: bool) -> Policy {
-    let (owner, lists_read) = owner_policy(db, agent).await;
+    let (mut owner, lists_read) = owner_policy(db, agent).await;
+    // On a single-user gateway the agents may hand tasks to subagents
+    // unless their own policy turns it off (issue #222): what they cost is
+    // the one user's. Asking other agents stays off.
+    if !multi_user {
+        owner.permissions.can_spawn_subagents = true;
+    }
     let mut policy = match override_for(agent, &owner) {
         Some(p) if multi_user => p.clamp_to(&owner),
         Some(mut p) => {
@@ -579,6 +585,25 @@ mod tests {
                 "resource_limits": { "memory_mb": 4096, "pids_max": 4096 }
             }
         }))
+    }
+
+    #[tokio::test]
+    async fn single_user_agents_may_spawn_subagents_unless_turned_off() {
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let p = for_session(&db, &agent_with(json!({})), false).await;
+        assert!(p.permissions.can_spawn_subagents);
+        assert!(!p.permissions.can_query_other_agents);
+        let off = agent_with(json!({
+            "policy": { "permissions": { "can_spawn_subagents": false } }
+        }));
+        assert!(
+            !for_session(&db, &off, false)
+                .await
+                .permissions
+                .can_spawn_subagents
+        );
+        let p = for_session(&db, &agent_with(json!({})), true).await;
+        assert!(!p.permissions.can_spawn_subagents, "a team's role decides");
     }
 
     #[tokio::test]

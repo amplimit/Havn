@@ -45,6 +45,11 @@ tokio::task_local! {
     /// The stop of the turn whose tools run: a command it starts in the
     /// background ends with it (issue #215).
     pub static TURN_STOP: tokio_util::sync::CancellationToken;
+    /// The messages of the loop whose tools run, as of its last model
+    /// call: a subagent it forks starts from them. One per loop, so a
+    /// subagent never starts from another chat's turn running at the same
+    /// time.
+    pub static FORK_FROM: Arc<RwLock<Vec<Value>>>;
 }
 
 /// Entries one turn's trace keeps at most, characters of all its parts,
@@ -154,13 +159,10 @@ pub struct LoopHandle {
     /// policy's `tool_rounds.max` for a message, `tool_rounds.subagent`
     /// for a subagent's task or another agent's question (issue #219).
     pub max_iterations: u32,
-    /// When `Some`, the loop writes the current `messages` vec into this
-    /// mirror before every LLM call. The parent runtime sets this to its
-    /// `parent_messages` `RwLock` so that any `subagent_spawn` invoked in
-    /// the LLM's response sees an up-to-date view (not stale from a prior
-    /// turn). Subagents pass `None` — they don't republish their own
-    /// state and recursion is forbidden anyway.
-    pub messages_mirror: Option<Arc<RwLock<Vec<Value>>>>,
+    /// Whether the loop keeps its messages in [`FORK_FROM`] before every
+    /// model call, for a `subagent_spawn` in the reply to fork from. A
+    /// subagent's own loop does not: it cannot spawn one.
+    pub messages_mirror: bool,
     /// The agent's `config.model`, or empty for the gateway's default
     /// model. Subagents inherit the parent's model — same agent, same
     /// compute budget.
@@ -344,6 +346,21 @@ pub async fn run_typed(
     messages: &mut Vec<Value>,
     system_prompt: &SystemPrompt,
 ) -> Result<String, RunError> {
+    if handle.messages_mirror {
+        let mirror = Arc::new(RwLock::new(Vec::new()));
+        return FORK_FROM
+            .scope(mirror, rounds(handle, context, messages, system_prompt))
+            .await;
+    }
+    rounds(handle, context, messages, system_prompt).await
+}
+
+async fn rounds(
+    handle: &LoopHandle,
+    context: &'static str,
+    messages: &mut Vec<Value>,
+    system_prompt: &SystemPrompt,
+) -> Result<String, RunError> {
     // Every part the model wrote, in order (issue #212): the reply is all
     // of them, not only the last.
     let mut said: Vec<String> = Vec::new();
@@ -351,7 +368,9 @@ pub async fn run_typed(
         partial_text: said.join(SEGMENT_BREAK),
     };
     for iteration in 0..handle.max_iterations {
-        if let Some(mirror) = &handle.messages_mirror {
+        if handle.messages_mirror
+            && let Ok(mirror) = FORK_FROM.try_with(Arc::clone)
+        {
             *mirror.write().await = messages.clone();
         }
         let response = unless_stopped(
@@ -1250,7 +1269,7 @@ mod tests {
                 embedder: None,
             },
             max_iterations: 1,
-            messages_mirror: None,
+            messages_mirror: false,
             model: Arc::new(String::new()),
             max_tokens: DEFAULT_MAX_TOKENS,
             billing_user_id: None,
@@ -1363,7 +1382,7 @@ mod tests {
                 embedder: None,
             },
             max_iterations: 3,
-            messages_mirror: None,
+            messages_mirror: false,
             model: Arc::new("p:main".into()),
             max_tokens: DEFAULT_MAX_TOKENS,
             billing_user_id: None,
