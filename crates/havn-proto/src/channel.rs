@@ -165,9 +165,10 @@ pub enum ChannelMessageContent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caption: Option<String>,
     },
-    /// Voice / audio message. The adapter is responsible for STT (the
-    /// gateway / runtime / agent never sees raw audio bytes) — by the
-    /// time this lands at havn the transcript is already populated.
+    /// Voice / audio message, transcribed already. An adapter now sends a
+    /// voice note as an audio file (`attachments`), which the gateway
+    /// transcribes with `[transcription]` (issue #164); this stays for
+    /// adapters that transcribe on their own.
     /// `url` is preserved so a future multimodal agent could fetch the
     /// audio directly; today nothing in havn reads it.
     Audio {

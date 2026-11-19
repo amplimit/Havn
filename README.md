@@ -564,6 +564,25 @@ A model names each new chat from its first message, while the agent answers it (
 
 An agent can ask the person it is talking to to choose among 2 to 10 options with the `ask_choice` tool (a question of at most 300 characters, options of at most 100). The message lists the options numbered. Where they can be shown, a question of one answer gets a button per option and a question of several answers a poll: in the web chat buttons and checkboxes, in Telegram buttons and a native poll. Elsewhere the person replies with the number(s). A press or a vote sends `/choose <question> <numbers>`, which the gateway turns into the person's next message to the agent, in the chat of the question, as `[Chosen with a button, for "<question>": "<option>"]` or `[Chosen in the poll "<question>": "<option>", ...]`. A question is answered once (once its answer reached the agent), only from its own conversation, and for 24 hours, at most 20 waiting per conversation (the oldest goes); a later press says it was already answered or expired. In a chat app the answer goes to the chat in use, which may be a newer one than the question's; the answer names the question. Questions are kept in the gateway's memory, so a restart forgets them. In the web chat a question shows in the chat it was asked in while that chat is on screen, until the page is reloaded; one asked in a chat not on screen is answered by typing. Buttons and polls are only the gateway's: those an agent puts on a message of its own are dropped.
 
+### Voice messages
+
+Voice notes and audio files (Ogg/Opus, MP3, M4A, WAV, WebM, FLAC; at most 20 MB) that reach an agent's inbox, from a chat app or uploaded in the web chat, are transcribed by the gateway when `[transcription]` is set. The transcript is kept next to the file (`<file>.txt`), and the agent gets it with the file, marked as a transcript of user-supplied audio; without `[transcription]`, or when transcription fails, the agent gets the file and a line saying it was not transcribed. A transcript is never taken for a command: commands are typed. The section applies without a restart.
+
+```toml
+[transcription]
+kind        = "endpoint"                   # an OpenAI-compatible /audio/transcriptions
+base_url    = "https://api.openai.com/v1"  # default; Groq, a local whisper.cpp server, ...
+model       = "gpt-4o-mini-transcribe"     # default
+api_key_env = "OPENAI_API_KEY"             # default: the variable holding the key, in the gateway's environment (/etc/havn/havn.env)
+
+# or: a model of [[llm.models]] that takes audio, asked for a transcript on the
+# agent owner's credentials, within the agent's policy and budget
+# kind  = "model"
+# model = "openrouter:google/gemini-3.8-flash"
+```
+
+The key of an endpoint is read from the environment, never from config.toml; no key is sent when the variable is unset or empty (a local server). With `kind = "model"`, the model must be listed and allowed to the agent; OpenAI-compatible endpoints get the audio as an `input_audio` part and Gemini as inline data.
+
 ### Chat commands
 
 A message that is only a command is answered by the gateway or the agent and never reaches the model, in a channel conversation and in the dashboard chat (where typing `/` lists them). `/name@botname` works too; an unknown command, or a command given words it does not take, gets a short answer saying so.
