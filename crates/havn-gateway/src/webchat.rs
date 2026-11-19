@@ -61,13 +61,14 @@ pub struct WebChatRouter {
 struct PendingChoice {
     agent_id: AgentId,
     channel_id: String,
-    chat: Option<String>,
     asked: crate::choice::Asked,
     since: std::time::Instant,
 }
 
-/// Questions one agent may have waiting for an answer.
-const MAX_CHOICES_WAITING: usize = 100;
+/// Questions one conversation, and one agent, may have waiting; past
+/// that, the oldest goes.
+const MAX_CHOICES_WAITING: usize = 20;
+const MAX_AGENT_CHOICES_WAITING: usize = 1000;
 
 /// Unanswered chat commands kept per session; more are not sent.
 const MAX_COMMANDS_WAITING: usize = 16;
@@ -626,23 +627,42 @@ impl WebChatRouter {
         awaited
     }
 
-    /// Keep `asked`, a question of `agent_id` in conversation `channel_id`
-    /// (chat `chat`); its id, or `None` when the agent has too many
-    /// waiting.
+    /// Keep `asked`, a question of `agent_id` in conversation `channel_id`:
+    /// its id. The oldest of the conversation's, or the agent's, goes when
+    /// too many wait.
     pub fn ask_choice(
         &self,
         agent_id: AgentId,
         channel_id: String,
-        chat: Option<String>,
         asked: crate::choice::Asked,
-    ) -> Option<String> {
+    ) -> String {
         let mut choices = self
             .choices
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         choices.retain(|_, c| c.since.elapsed() < crate::choice::KEPT);
-        if choices.values().filter(|c| c.agent_id == agent_id).count() >= MAX_CHOICES_WAITING {
-            return None;
+        for (cap, same) in [
+            (
+                MAX_CHOICES_WAITING,
+                Box::new(|c: &PendingChoice| c.agent_id == agent_id && c.channel_id == channel_id)
+                    as Box<dyn Fn(&PendingChoice) -> bool>,
+            ),
+            (
+                MAX_AGENT_CHOICES_WAITING,
+                Box::new(|c: &PendingChoice| c.agent_id == agent_id),
+            ),
+        ] {
+            while choices.values().filter(|c| same(c)).count() >= cap {
+                let oldest = choices
+                    .iter()
+                    .filter(|(_, c)| same(c))
+                    .min_by_key(|(_, c)| c.since)
+                    .map(|(id, _)| id.clone());
+                match oldest {
+                    Some(id) => choices.remove(&id),
+                    None => break,
+                };
+            }
         }
         // The random end of a v7 id (its start is the time).
         let id = Uuid::now_v7().simple().to_string()[20..].to_string();
@@ -651,15 +671,14 @@ impl WebChatRouter {
             PendingChoice {
                 agent_id,
                 channel_id,
-                chat,
                 asked,
                 since: std::time::Instant::now(),
             },
         );
-        Some(id)
+        id
     }
 
-    /// Forget question `id`, which could not be asked.
+    /// Forget question `id`: it could not be asked, or it was answered.
     pub fn forget_choice(&self, id: &str) {
         self.choices
             .lock()
@@ -667,17 +686,17 @@ impl WebChatRouter {
             .remove(id);
     }
 
-    /// Answer question `id` of `agent_id` asked in conversation
-    /// `channel_id` with options `numbers`: the person's message to the
-    /// agent and the chat it goes to. It is answered once; a wrong answer
-    /// leaves it waiting.
+    /// The answer `numbers` to question `id` of `agent_id`, asked in
+    /// conversation `channel_id`, as the person's message to the agent.
+    /// The question waits until [`Self::forget_choice`], once the answer
+    /// reached the agent; a wrong answer leaves it waiting.
     pub fn answer_choice(
         &self,
         agent_id: AgentId,
         channel_id: &str,
         id: &str,
         numbers: &[usize],
-    ) -> Result<(String, Option<String>), String> {
+    ) -> Result<String, String> {
         let mut choices = self
             .choices
             .lock()
@@ -689,10 +708,7 @@ impl WebChatRouter {
         else {
             return Err("(That question was already answered, or it expired.)".into());
         };
-        let text = crate::choice::chosen(&pending.asked, numbers)?;
-        let chat = pending.chat.clone();
-        choices.remove(id);
-        Ok((text, chat))
+        crate::choice::chosen(&pending.asked, numbers)
     }
 
     /// Approval request `id` of `agent_id`, when it waits in conversation
@@ -930,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn a_question_is_answered_once_in_its_conversation() {
+    fn a_question_is_answered_in_its_conversation_until_forgotten() {
         let router = WebChatRouter::new();
         let agent = AgentId::new();
         let asked = crate::choice::read(&serde_json::json!({
@@ -938,9 +954,7 @@ mod tests {
         }))
         .expect("asked");
         let chat = "ch|telegram|bot|tg:1";
-        let id = router
-            .ask_choice(agent, chat.into(), Some("c1".into()), asked.clone())
-            .expect("id");
+        let id = router.ask_choice(agent, chat.into(), asked.clone());
         assert!(
             router
                 .answer_choice(agent, "ch|telegram|bot|tg:2", &id, &[1])
@@ -955,25 +969,31 @@ mod tests {
             router.answer_choice(agent, chat, &id, &[5]).is_err(),
             "not an option"
         );
-        let (text, to) = router
+        let text = router
             .answer_choice(agent, chat, &id, &[2])
             .expect("answered");
         assert!(text.contains("\"b\""), "{text}");
-        assert_eq!(to.as_deref(), Some("c1"));
+        // Until the answer reached the agent, the question waits.
+        assert!(router.answer_choice(agent, chat, &id, &[2]).is_ok());
+        router.forget_choice(&id);
         assert!(
             router.answer_choice(agent, chat, &id, &[2]).is_err(),
             "once"
         );
+        // Too many in a conversation: the oldest goes.
+        let first = router.ask_choice(agent, chat.into(), asked.clone());
         for _ in 0..MAX_CHOICES_WAITING {
-            assert!(
-                router
-                    .ask_choice(agent, chat.into(), None, asked.clone())
-                    .is_some()
-            );
+            router.ask_choice(agent, chat.into(), asked.clone());
         }
         assert!(
-            router.ask_choice(agent, chat.into(), None, asked).is_none(),
-            "too many"
+            router.answer_choice(agent, chat, &first, &[1]).is_err(),
+            "the oldest went"
+        );
+        let other = router.ask_choice(agent, "ch|telegram|bot|tg:9".into(), asked);
+        assert!(
+            router
+                .answer_choice(agent, "ch|telegram|bot|tg:9", &other, &[1])
+                .is_ok()
         );
     }
 

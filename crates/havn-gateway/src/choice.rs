@@ -119,9 +119,9 @@ pub fn text(asked: &Asked) -> String {
         out.push_str(&format!("\n{}. {option}", n + 1));
     }
     out.push_str(if asked.multiple {
-        "\n\n(Choose in the poll, or reply with the numbers.)"
+        "\n\n(Reply with the numbers of your choices.)"
     } else {
-        "\n\n(Press one, or reply with its number.)"
+        "\n\n(Reply with the number of your choice.)"
     });
     out
 }

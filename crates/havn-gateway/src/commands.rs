@@ -311,12 +311,9 @@ pub enum Action {
     Reply(String),
     /// Send this to the agent, which answers in the conversation.
     Agent(ChatCommand),
-    /// Send this to the agent as the sender's message, in chat
-    /// `conversation` when there is one.
-    Say {
-        text: String,
-        conversation: Option<String>,
-    },
+    /// Send this to the agent as the sender's message: the answer to
+    /// question `question`, forgotten once it reached the agent.
+    Say { text: String, question: String },
 }
 
 /// What to tell the sender when `frame` cannot reach the agent but did
@@ -393,7 +390,10 @@ pub async fn run(state: &AppState, asker: &Asker, command: &Command, args: &str)
                     .webchat_router
                     .answer_choice(asker.agent_id, &asker.scope, id, &numbers)
                 {
-                    Ok((text, conversation)) => Action::Say { text, conversation },
+                    Ok(text) => Action::Say {
+                        text,
+                        question: id.to_string(),
+                    },
                     Err(why) => Action::Reply(why),
                 }
             }

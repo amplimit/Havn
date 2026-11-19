@@ -1226,19 +1226,21 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
                         command_frame = Some(GatewayToAgent::ChatCommand(command));
                     }
                     // A choice: the person's message, in the question's chat.
-                    crate::commands::Action::Say { text, conversation } => {
-                        said = Some((text, conversation));
+                    crate::commands::Action::Say { text, question } => {
+                        said = Some((text, question));
                     }
                 }
             }
         },
     }
-    let (content, conversation) = match said {
-        Some((text, chat)) => (MessageContent::Text { text }, chat),
+    // An answer goes to the chat in use: an earlier one it was asked in
+    // does not come back with it. The answer names its question.
+    let (content, answered) = match said {
+        Some((text, question)) => (MessageContent::Text { text }, Some(question)),
         None => (content, None),
     };
     let msg = InboundMessage {
-        conversation,
+        conversation: None,
         branch,
         channel_id: encoded_channel_id,
         sender_id: inb.sender_id.clone(),
@@ -1369,7 +1371,14 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
     } else {
         GatewayToAgent::InboundMessage(msg)
     };
-    if let Err(e) = state.registry.send(agent_id, frame).await {
+    let sent = state.registry.send(agent_id, frame).await;
+    // An answer that reached the agent is not taken again.
+    if sent.is_ok()
+        && let Some(question) = answered
+    {
+        state.webchat_router.forget_choice(&question);
+    }
+    if let Err(e) = sent {
         restore_received(agent_id, channel, &inb.account_id, &inb.sender_id, carried);
         warn!(
             channel,

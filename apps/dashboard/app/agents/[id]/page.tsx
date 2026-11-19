@@ -577,6 +577,12 @@ export default function ChatPage({
             const current = chatIdRef.current;
             if (msg.conversation && current && msg.conversation !== current) return;
             pushBubble("system", msg.content);
+            // A choice the gateway answered (a question answered already,
+            // or expired) gets no reply.
+            if (choicesWaiting.current > 0) {
+              choicesWaiting.current -= 1;
+              setWaiting((n) => Math.max(0, n - 1));
+            }
             // What `/undo` took back leaves the screen; other answers leave
             // the chat as it is, messages still waiting included.
             if (undoing.current > 0) {
@@ -620,8 +626,12 @@ export default function ChatPage({
             // The stored turns, with their ids, for editing and versions.
             void catchUp();
           }
-          if (msg.type === "agent_message") {
+          // A question the agent asked comes in the middle of its turn,
+          // which goes on.
+          const asking = msg.type === "agent_message" && Boolean(msg.buttons?.length || msg.poll);
+          if (msg.type === "agent_message" && !asking) {
             if (!msg.broadcast) {
+              choicesWaiting.current = Math.max(0, choicesWaiting.current - 1);
               setWaiting((n) => Math.max(0, n - 1));
               setStep(null);
               endLive();
@@ -779,8 +789,12 @@ export default function ChatPage({
     pushBubble("you", shown);
     chatRef.current.send(data, chatIdRef.current ?? undefined);
     if (waiting === 0) clearLive();
+    choicesWaiting.current += 1;
     setWaiting((n) => n + 1);
   }
+  // Choices sent and not answered yet: the gateway's notice (a question
+  // answered already, or expired) answers one in place of the agent.
+  const choicesWaiting = useRef(0);
 
   function sendText(text: string, files: Attachment[] = []) {
     if ((!text.trim() && files.length === 0) || !chatRef.current || wsState !== "open") return;

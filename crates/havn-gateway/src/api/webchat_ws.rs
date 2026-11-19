@@ -180,13 +180,13 @@ async fn web_asker(
 
 /// Answer the chat command `parsed`, sent in chat `conversation` of a web
 /// chat session; what to send the agent as the sender's message instead
-/// (a choice, issue #204), and in which chat.
+/// (a choice, issue #204), and the question it answers.
 async fn web_command(
     state: &AppState,
     asker: &crate::commands::Asker,
     conversation: Option<String>,
     parsed: crate::commands::Parsed<'_>,
-) -> Option<(String, Option<String>)> {
+) -> Option<(String, String)> {
     let mut asker = asker.clone();
     asker.conversation = conversation;
     let session: SessionId = match asker.scope.parse() {
@@ -213,8 +213,8 @@ async fn web_command(
             "retry" => "(Answer again with the button under the reply.)".into(),
             _ => match crate::commands::run(state, &asker, command, args).await {
                 crate::commands::Action::Reply(text) => text,
-                crate::commands::Action::Say { text, conversation } => {
-                    return Some((text, conversation.or(asker.conversation)));
+                crate::commands::Action::Say { text, question } => {
+                    return Some((text, question));
                 }
                 crate::commands::Action::Agent(command) => {
                     let frame = GatewayToAgent::ChatCommand(command);
@@ -349,6 +349,8 @@ async fn serve_session<Si, St, E>(
             }
         };
         let mut attachments = Vec::new();
+        // The question a choice answers, forgotten once it reached the agent.
+        let mut answered = None;
         let (user_text, conversation, branch) = match parsed {
             ClientMessage::Send {
                 content,
@@ -360,15 +362,20 @@ async fn serve_session<Si, St, E>(
                 && commands.is_some()
                 && crate::commands::parse(&content).is_some() =>
             {
+                let chat = chat_id(conversation);
                 let said = match (commands.as_ref(), crate::commands::parse(&content)) {
                     (Some((state, asker)), Some(parsed)) => {
-                        web_command(state, asker, chat_id(conversation), parsed).await
+                        web_command(state, asker, chat.clone(), parsed).await
                     }
                     _ => None,
                 };
-                // A choice goes on as the person's message.
+                // A choice goes on as the person's message, in the chat it
+                // was made in.
                 match said {
-                    Some((text, chat)) => (text, chat, None),
+                    Some((text, question)) => {
+                        answered = Some(question);
+                        (text, chat, None)
+                    }
                     None => continue,
                 }
             }
@@ -464,10 +471,15 @@ async fn serve_session<Si, St, E>(
             raw: serde_json::Value::Null,
         };
 
-        if let Err(e) = registry
+        let sent = registry
             .send(agent_id, GatewayToAgent::InboundMessage(inbound))
-            .await
+            .await;
+        if sent.is_ok()
+            && let Some(question) = answered
         {
+            router.forget_choice(&question);
+        }
+        if let Err(e) = sent {
             warn!(%agent_id, error = ?e, "failed to forward InboundMessage");
             // Inform the user; the socket stays open in case the agent comes back.
             let _ = router

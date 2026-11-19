@@ -1853,13 +1853,7 @@ async fn run_ask_choice(
     }
     let id = ctx
         .webchat_router
-        .ask_choice(
-            agent_id,
-            channel_id.clone(),
-            call.chat.clone(),
-            asked.clone(),
-        )
-        .ok_or("too many questions wait for an answer; ask again later")?;
+        .ask_choice(agent_id, channel_id.clone(), asked.clone());
     let delivered = deliver_outbound(
         agent_id,
         OutboundMessage {
