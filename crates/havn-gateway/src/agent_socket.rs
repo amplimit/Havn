@@ -891,6 +891,7 @@ async fn oversized_reply(
                             channel_id: msg.channel_id,
                             content: havn_core::MessageContent::Text { text: notice },
                             reply_to: None,
+                            buttons: Vec::new(),
                         },
                     )
                     .await;
@@ -1236,23 +1237,45 @@ async fn ask_for_approval(
         )
         .await;
     }
-    if let Some((channel, account, _)) = crate::channel_id_codec::decode(&request.channel_id) {
-        let listed = ctx
+    if let Some((channel, account, sender)) = crate::channel_id_codec::decode(&request.channel_id)
+    {
+        let admins_of_account = ctx
             .channels
             .get(channel)
             .and_then(|entry| entry.accounts.iter().find(|a| a.id == account))
-            .is_some_and(|acct| !acct.admins.is_empty());
+            .map(|acct| acct.admins.clone())
+            .unwrap_or_default();
         // The agent's owner with a chat account of this channel connected
         // is an admin there too (issue #182).
-        let owner_linked = match havn_db::repo::agents::find_by_id(&ctx.db, agent_id).await {
-            Ok(Some(agent)) => {
-                havn_db::repo::channel_access::list_links(&ctx.db, Some(agent.owner_id))
-                    .await
-                    .is_ok_and(|links| links.iter().any(|l| l.channel == channel))
-            }
-            _ => false,
+        let owner = match havn_db::repo::agents::find_by_id(&ctx.db, agent_id).await {
+            Ok(Some(agent)) => Some(agent.owner_id),
+            _ => None,
         };
-        let admins = listed || owner_linked;
+        let owner_linked = match owner {
+            Some(owner) => havn_db::repo::channel_access::list_links(&ctx.db, Some(owner))
+                .await
+                .is_ok_and(|links| links.iter().any(|l| l.channel == channel)),
+            None => false,
+        };
+        let admins = !admins_of_account.is_empty() || owner_linked;
+        // The person in this chat decides with a press when they may
+        // (issue #203); the text says how by command either way.
+        let sender_admin = admins_of_account.iter().any(|id| id == sender)
+            || match owner {
+                Some(owner) => {
+                    havn_db::repo::channel_access::linked_user(&ctx.db, channel, sender)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|link| link.user_id == owner.to_string())
+                }
+                None => false,
+            };
+        let buttons = if sender_admin {
+            approval_buttons(&request.request_id)
+        } else {
+            Vec::new()
+        };
         let message = OutboundMessage {
             conversation: None,
             channel_id: request.channel_id,
@@ -1269,9 +1292,35 @@ async fn ask_for_approval(
                 ),
             },
             reply_to: None,
+            buttons: Vec::new(),
         };
         route_outbound(agent_id, message, ctx).await;
     }
+}
+
+/// Approve, approve for the chat and deny, for approval request `id`:
+/// each its command naming the request; none when one would not fit a
+/// button.
+fn approval_buttons(id: &str) -> Vec<Vec<havn_core::Button>> {
+    let button = |label: &str, data: String| havn_core::Button {
+        label: label.to_string(),
+        data,
+    };
+    let rows = vec![
+        vec![
+            button("Approve", format!("/approve {id}")),
+            button("Approve for this chat", format!("/approve always {id}")),
+        ],
+        vec![button("Deny", format!("/deny {id}"))],
+    ];
+    if rows
+        .iter()
+        .flatten()
+        .any(|b| b.data.len() > havn_core::MAX_BUTTON_DATA)
+    {
+        return Vec::new();
+    }
+    rows
 }
 
 /// The model that writes chat titles for an agent with `policy`: its
@@ -1513,7 +1562,14 @@ async fn deliver_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSo
         match translated {
             Some(content) => match ctx
                 .channel_router
-                .deliver(channel, account_id, sender_id, msg.reply_to, content)
+                .deliver_with_buttons(
+                    channel,
+                    account_id,
+                    sender_id,
+                    msg.reply_to,
+                    content,
+                    msg.buttons,
+                )
                 .await
             {
                 Ok(_) => true,
@@ -1705,6 +1761,7 @@ async fn run_send_file(
                 caption: sent.caption.clone(),
             },
             reply_to: None,
+            buttons: Vec::new(),
         },
         ctx,
     )
@@ -4173,6 +4230,7 @@ mod tests {
                 channel_id: crate::channel_id_codec::encode("telegram", "bot", sender),
                 content: havn_core::MessageContent::Text { text: "hi".into() },
                 reply_to: None,
+                buttons: Vec::new(),
             })
         };
         let mut bytes = Vec::new();

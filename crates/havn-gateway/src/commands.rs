@@ -597,25 +597,46 @@ async fn usage(state: &AppState, agent_id: AgentId, args: &str) -> String {
     }
 }
 
-async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> String {
-    let remember = match args.to_ascii_lowercase().as_str() {
-        "" => false,
-        "always" if approve => true,
-        _ => {
-            return if approve {
-                "(Send /approve, or /approve always to allow the same step for the rest of the \
-                 chat.)"
-                    .into()
-            } else {
-                "(Send /deny on its own.)".into()
-            };
+/// What `/approve` or `/deny` was given: whether to allow the step for
+/// the rest of the chat, and the request it names (issue #203, as a
+/// button sends it); `None` when the arguments are not those.
+fn decision_args(approve: bool, args: &str) -> Option<(bool, Option<&str>)> {
+    let mut remember = false;
+    let mut id = None;
+    for word in args.split_whitespace() {
+        if approve && !remember && id.is_none() && word.eq_ignore_ascii_case("always") {
+            remember = true;
+        } else if id.is_none() {
+            id = Some(word);
+        } else {
+            return None;
         }
+    }
+    Some((remember, id))
+}
+
+async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> String {
+    let Some((remember, id)) = decision_args(approve, args) else {
+        return if approve {
+            "(Send /approve, or /approve always to allow the same step for the rest of the \
+             chat.)"
+                .into()
+        } else {
+            "(Send /deny on its own.)".into()
+        };
     };
-    let Some(request) = state
-        .webchat_router
-        .oldest_approval(asker.agent_id, &asker.scope)
-    else {
-        return "(Nothing here is waiting for approval.)".into();
+    let waiting = match id {
+        Some(id) => state.webchat_router.approval(asker.agent_id, &asker.scope, id),
+        None => state
+            .webchat_router
+            .oldest_approval(asker.agent_id, &asker.scope),
+    };
+    let Some(request) = waiting else {
+        return if id.is_some() {
+            "(That step was already decided, or it ended.)".into()
+        } else {
+            "(Nothing here is waiting for approval.)".into()
+        };
     };
     let decided = crate::agent_socket::forward_decision(
         &state.registry,
@@ -644,6 +665,17 @@ async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_decision_may_name_its_request() {
+        assert_eq!(decision_args(true, ""), Some((false, None)));
+        assert_eq!(decision_args(true, "always"), Some((true, None)));
+        assert_eq!(decision_args(true, "ALWAYS r-1"), Some((true, Some("r-1"))));
+        assert_eq!(decision_args(true, "r-1"), Some((false, Some("r-1"))));
+        assert_eq!(decision_args(false, "r-1"), Some((false, Some("r-1"))));
+        assert_eq!(decision_args(true, "r-1 r-2"), None);
+        assert_eq!(decision_args(true, "always always x"), None);
+    }
 
     fn known(text: &str) -> Option<(&'static str, &str)> {
         match parse(text) {

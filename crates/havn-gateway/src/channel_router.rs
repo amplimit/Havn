@@ -184,6 +184,20 @@ impl ChannelRouter {
         in_reply_to: Option<String>,
         content: ChannelMessageContent,
     ) -> Result<u64, DeliverError> {
+        self.deliver_with_buttons(channel, account_id, sender_id, in_reply_to, content, Vec::new())
+            .await
+    }
+
+    /// [`Self::deliver`], with rows of buttons under the message.
+    pub async fn deliver_with_buttons(
+        &self,
+        channel: &str,
+        account_id: &str,
+        sender_id: &str,
+        in_reply_to: Option<String>,
+        content: ChannelMessageContent,
+        buttons: Vec<Vec<havn_core::Button>>,
+    ) -> Result<u64, DeliverError> {
         let key = AccountKey::new(channel, account_id);
         let (tx, frame, seq) = {
             let mut map = self.inner.lock().await;
@@ -198,6 +212,7 @@ impl ChannelRouter {
                 to: sender_id.to_string(),
                 in_reply_to,
                 content,
+                buttons,
             });
             // Buffered even while the adapter is away, so its `Resume`
             // after reconnecting gets it.

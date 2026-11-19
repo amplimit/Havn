@@ -599,6 +599,26 @@ impl WebChatRouter {
         awaited
     }
 
+    /// Approval request `id` of `agent_id`, when it waits in conversation
+    /// `channel_id`.
+    pub fn approval(
+        &self,
+        agent_id: AgentId,
+        channel_id: &str,
+        id: &str,
+    ) -> Option<havn_proto::ApprovalRequest> {
+        let mut pending = self.lock_approvals();
+        pending.retain(|_, p| p.since.elapsed() < APPROVAL_KEPT);
+        pending
+            .values()
+            .find(|p| {
+                p.agent_id == agent_id
+                    && p.request.channel_id == channel_id
+                    && p.request.request_id == id
+            })
+            .map(|p| p.request.clone())
+    }
+
     /// The approval request of `agent_id` that has waited longest in
     /// conversation `channel_id`.
     pub fn oldest_approval(
@@ -924,6 +944,7 @@ mod tests {
             channel_id: session_id.to_string(),
             content: MessageContent::Text { text: "hi".into() },
             reply_to: None,
+            buttons: Vec::new(),
         };
         router.deliver(agent_id, outbound).await.expect("deliver");
 
@@ -994,6 +1015,7 @@ mod tests {
                 text: "injected".into(),
             },
             reply_to: None,
+            buttons: Vec::new(),
         };
         let err = router
             .deliver(AgentId::new(), outbound)
@@ -1011,6 +1033,7 @@ mod tests {
             channel_id: Uuid::now_v7().to_string(),
             content: MessageContent::Text { text: "hi".into() },
             reply_to: None,
+            buttons: Vec::new(),
         };
         let err = router
             .deliver(AgentId::new(), outbound)
@@ -1027,6 +1050,7 @@ mod tests {
             channel_id: "not-a-uuid".into(),
             content: MessageContent::Text { text: "hi".into() },
             reply_to: None,
+            buttons: Vec::new(),
         };
         let err = router
             .deliver(AgentId::new(), outbound)
@@ -1055,6 +1079,7 @@ mod tests {
                 text: "hello".into(),
             },
             reply_to: None,
+            buttons: Vec::new(),
         };
         let n = router.broadcast(agent_id, outbound).await;
         assert_eq!(n, 2, "should reach both sessions for the target agent");
@@ -1086,6 +1111,7 @@ mod tests {
             content: MessageContent::Text { text: t.into() },
             reply_to: None,
         }
+        buttons: Vec::new(),
     }
 
     #[tokio::test]
@@ -1145,6 +1171,7 @@ mod tests {
             conversation: None,
             channel_id: session_id.to_string(),
             ..text(t)
+            buttons: Vec::new(),
         };
 
         router
@@ -1185,6 +1212,7 @@ mod tests {
             conversation: None,
             channel_id: session_id.to_string(),
             ..text(t)
+            buttons: Vec::new(),
         };
 
         router

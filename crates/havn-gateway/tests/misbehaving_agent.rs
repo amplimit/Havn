@@ -545,6 +545,7 @@ fn outbound(channel_id: &str, text: &str) -> AgentToGateway {
         channel_id: channel_id.into(),
         content: MessageContent::Text { text: text.into() },
         reply_to: None,
+        buttons: Vec::new(),
     })
 }
 
