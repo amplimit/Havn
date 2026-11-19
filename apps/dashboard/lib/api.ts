@@ -322,6 +322,7 @@ export type ModelEntry = {
   label?: string;
   max_output_tokens?: number;
   /** It takes images: pictures sent in a chat are shown to it. */
+  /** Shown images: always (true), never (false), or tried when unset. */
   vision?: boolean;
   /** How it thinks; absent, it is not asked to. */
   thinking?: ThinkingSpec;

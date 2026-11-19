@@ -23,7 +23,7 @@ export default function ModelsPage() {
   const [label, setLabel] = useState("");
   const [maxOutput, setMaxOutput] = useState("");
   const [makeDefault, setMakeDefault] = useState(false);
-  const [vision, setVision] = useState(false);
+  const [vision, setVision] = useState<"" | "yes" | "no">("");
 
   useEffect(() => {
     api.models
@@ -69,7 +69,7 @@ export default function ModelsPage() {
     const id = `${provider}:${name.trim()}`;
     const entry: ModelEntry = { id };
     if (label.trim()) entry.label = label.trim();
-    if (vision) entry.vision = true;
+    if (vision) entry.vision = vision === "yes";
     if (maxOutput.trim()) {
       const n = Number(maxOutput);
       if (!Number.isInteger(n) || n <= 0) {
@@ -87,7 +87,7 @@ export default function ModelsPage() {
       setLabel("");
       setMaxOutput("");
       setMakeDefault(false);
-      setVision(false);
+      setVision("");
     }
   }
 
@@ -246,10 +246,18 @@ export default function ModelsPage() {
               </label>
               <label
                 className="flex items-center gap-2 text-sm"
-                title="Pictures sent in a chat are shown to this model. Only tick it for a model that takes images."
+                title="Whether pictures sent in a chat are shown to this model. Tried, a model that refuses them is sent a note in their place."
               >
-                <input type="checkbox" checked={vision} onChange={(e) => setVision(e.target.checked)} />
-                sees images
+                images
+                <select
+                  className="input"
+                  value={vision}
+                  onChange={(e) => setVision(e.target.value as "" | "yes" | "no")}
+                >
+                  <option value="">tried</option>
+                  <option value="yes">shown</option>
+                  <option value="no">never shown</option>
+                </select>
               </label>
             </div>
             <div className="flex justify-end md:col-span-4">
@@ -287,7 +295,8 @@ export default function ModelsPage() {
                     max {m.max_output_tokens.toLocaleString()} output tokens
                   </span>
                 )}
-                {m.vision && <span className="pill pill-stopped">sees images</span>}
+                {m.vision === true && <span className="pill pill-stopped">sees images</span>}
+                {m.vision === false && <span className="pill pill-stopped">no images</span>}
                 {m.thinking && (
                   <span className="pill pill-stopped">
                     thinks: {thinkingChoices(m.thinking).join(" / ")}

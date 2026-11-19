@@ -384,9 +384,15 @@ enum ModelAction {
         /// Upper bound on the output tokens of one call.
         #[arg(long)]
         max_output_tokens: Option<u32>,
-        /// It takes images: pictures sent in a chat are shown to it.
-        #[arg(long)]
+        /// It takes images: pictures sent in a chat are always shown to it.
+        /// Without this or --no-vision, they are tried, and a model that
+        /// refuses them gets a note in their place.
+        #[arg(long, conflicts_with = "no_vision")]
         vision: bool,
+        /// It takes no images: pictures sent in a chat are never shown to
+        /// it, only a note saying so.
+        #[arg(long)]
+        no_vision: bool,
         /// Make it the model of agents that do not set one.
         #[arg(long)]
         default: bool,
@@ -678,8 +684,16 @@ async fn run_model(action: ModelAction) -> anyhow::Result<()> {
             label,
             max_output_tokens,
             vision,
+            no_vision,
             default,
-        } => model::add(&id, label.as_deref(), max_output_tokens, vision, default).await,
+        } => {
+            let sight = match (vision, no_vision) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            };
+            model::add(&id, label.as_deref(), max_output_tokens, sight, default).await
+        }
         ModelAction::Remove { id } => model::remove(&id).await,
         ModelAction::Default { id } => model::set_default(&id).await,
         ModelAction::Title { id } => model::set_title(id.as_deref()).await,

@@ -19,9 +19,11 @@ pub struct ModelEntry {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
-    /// It takes images (issue #106): files sent in a chat are shown to it.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub vision: bool,
+    /// Whether it takes images (issues #106, #202): pictures sent in a chat
+    /// are shown to it with `true`, never with `false`, and unset, tried:
+    /// a model that refuses them is then sent a note in their place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
     /// How it thinks, when it can (issue #190): absent, it is not asked to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingSpec>,
@@ -524,10 +526,11 @@ fn write_checked(
                     table.remove("max_output_tokens");
                 }
             }
-            if entry.vision {
-                table["vision"] = value(true);
-            } else {
-                table.remove("vision");
+            match entry.vision {
+                Some(sees) => table["vision"] = value(sees),
+                None => {
+                    table.remove("vision");
+                }
             }
             match &entry.thinking {
                 Some(thinking) => table["thinking"] = value(thinking.to_toml()),
@@ -766,7 +769,7 @@ pub async fn upgrade(
                         id,
                         label: None,
                         max_output_tokens: None,
-                        vision: false,
+                        vision: None,
                         thinking: None,
                     })
                     .collect(),
@@ -862,13 +865,44 @@ mod tests {
     }
 
     #[test]
+    fn each_vision_setting_is_written_and_read_back() {
+        let entry = |id: &str, vision: Option<bool>| ModelEntry {
+            id: id.into(),
+            label: None,
+            max_output_tokens: None,
+            vision,
+            thinking: None,
+        };
+        let mut c = ModelCatalog::default();
+        c.models = vec![
+            entry("openrouter:a/seeing", Some(true)),
+            entry("openrouter:a/blind", Some(false)),
+            entry("openrouter:a/tried", None),
+        ];
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").expect("write");
+        write_to_file(&path, &c).expect("written");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("vision = true"), "{text}");
+        assert!(text.contains("vision = false"), "{text}");
+        assert_eq!(text.matches("vision").count(), 2, "{text}");
+        assert_eq!(read_from_file(&path).expect("read back"), c);
+        // Unset again, the line goes.
+        c.models[1].vision = None;
+        write_to_file(&path, &c).expect("written");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(text.matches("vision").count(), 1, "{text}");
+    }
+
+    #[test]
     fn thinking_is_checked_and_written_to_config_toml() {
         let mut c = ModelCatalog::default();
         c.models.push(ModelEntry {
             id: "openrouter:deepseek/deepseek-v4.1-flash".into(),
             label: None,
             max_output_tokens: None,
-            vision: false,
+            vision: None,
             thinking: Some(ThinkingSpec {
                 style: ThinkingStyle::Effort,
                 levels: vec!["low".into(), "medium".into(), "high".into()],
@@ -906,7 +940,7 @@ mod tests {
             id: id.into(),
             label: None,
             max_output_tokens: None,
-            vision: false,
+            vision: None,
             thinking: None,
         }
     }

@@ -687,11 +687,70 @@ pub const MAX_IMAGE_SIDE: u32 = 8000;
 /// {"type": "workspace", "path": "inbox/<name>"}}`) rather than sending
 /// its bytes, which would not fit a frame; the gateway reads it here,
 /// through [`crate::agent_files`] so nothing the agent controls is
-/// followed. At most [`MAX_REQUEST_IMAGES`] of them, of at most
+/// followed. See [`send_seeing`] for a model that may not take them. At most [`MAX_REQUEST_IMAGES`] of them, of at most
 /// [`MAX_REQUEST_IMAGE_BYTES`] together, each read once, are shown, and
 /// only to a model with `vision`; every other one (not a PNG, JPEG, GIF or
 /// WebP by its first bytes, too large, missing, outside the inbox, one
 /// too many) becomes a line saying why. Blocking: it reads files.
+/// Whether `request` shows the model an image.
+pub fn shows_images(request: &AnthropicRequest) -> bool {
+    request.messages.iter().any(|m| {
+        m.content.as_array().is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("image"))
+        })
+    })
+}
+
+/// Whether the provider refused a request outright (a 4xx other than an
+/// authentication, payment, timeout or rate refusal), as one does that
+/// shows images to a model that takes none (issue #202): OpenRouter
+/// answers 404 "No endpoints found that support image input".
+pub fn refused_request(e: &ProxyError) -> bool {
+    matches!(
+        e,
+        ProxyError::Upstream { status, .. }
+            if (400..500).contains(status) && !matches!(status, 401 | 402 | 403 | 408 | 429)
+    )
+}
+
+/// Send `request` (by `send`) with the images its turn names in
+/// `workspace` shown when `show`. With `retry_blind`, a refusal of a
+/// request that showed images (a model that takes none, issue #202) sends
+/// it once more with each image a line saying the model cannot see it.
+/// The result, and whether the images were refused.
+pub async fn send_seeing<F, Fut>(
+    request: AnthropicRequest,
+    workspace: std::path::PathBuf,
+    show: bool,
+    retry_blind: bool,
+    mut send: F,
+) -> Result<(Result<AnthropicResponse, ProxyError>, bool), tokio::task::JoinError>
+where
+    F: FnMut(AnthropicRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<AnthropicResponse, ProxyError>>,
+{
+    // The request as the agent sent it, for the second try.
+    let blind = (show && retry_blind).then(|| request.clone());
+    let shown = tokio::task::spawn_blocking(move || {
+        let mut request = request;
+        resolve_workspace_images(&mut request, &workspace, show);
+        request
+    })
+    .await?;
+    let showed = shows_images(&shown);
+    let result = send(shown).await;
+    match (blind, &result) {
+        (Some(mut blind), Err(e)) if showed && refused_request(e) => {
+            // Without vision no file is read.
+            resolve_workspace_images(&mut blind, std::path::Path::new(""), false);
+            Ok((send(blind).await, true))
+        }
+        _ => Ok((result, false)),
+    }
+}
+
 pub fn resolve_workspace_images(
     request: &mut AnthropicRequest,
     workspace: &std::path::Path,
@@ -1230,6 +1289,137 @@ mod tests {
             assert_eq!(base64(input.as_bytes()), expected, "{input}");
         }
         assert_eq!(base64(&[0xff, 0xfe, 0xfd]), "//79");
+    }
+
+    fn answer() -> AnthropicResponse {
+        serde_json::from_value(serde_json::json!({
+            "id": "r", "model": "m", "role": "assistant", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }))
+        .expect("response")
+    }
+
+    fn picture_request(ws: &std::path::Path) -> AnthropicRequest {
+        std::fs::create_dir_all(ws.join("inbox")).expect("inbox");
+        std::fs::write(ws.join("inbox/a.png"), b"\x89PNG\r\n\x1a\nrest").expect("png");
+        AnthropicRequest {
+            model: "m".into(),
+            max_tokens: 10,
+            reasoning: None,
+            messages: vec![AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "look"},
+                    {"type": "image", "source": {"type": "workspace", "path": "inbox/a.png"}},
+                ]),
+            }],
+            system: None,
+            temperature: None,
+            tools: None,
+        }
+    }
+
+    /// A provider that refuses images, as OpenRouter does for a model
+    /// without them, and records what it was sent.
+    fn blind_provider(
+        sent: &std::sync::Mutex<Vec<AnthropicRequest>>,
+    ) -> impl FnMut(AnthropicRequest) -> std::future::Ready<Result<AnthropicResponse, ProxyError>> + '_
+    {
+        move |request| {
+            let refuse = shows_images(&request);
+            sent.lock().expect("lock").push(request);
+            std::future::ready(if refuse {
+                Err(ProxyError::Upstream {
+                    status: 404,
+                    message: "No endpoints found that support image input".into(),
+                })
+            } else {
+                Ok(answer())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_image_goes_again_as_a_note() {
+        let ws = tempfile::tempdir().expect("tmp");
+        let sent = std::sync::Mutex::new(Vec::new());
+        let (result, refused) = send_seeing(
+            picture_request(ws.path()),
+            ws.path().to_path_buf(),
+            true,
+            true,
+            blind_provider(&sent),
+        )
+        .await
+        .expect("join");
+        assert!(result.is_ok() && refused);
+        let sent = sent.into_inner().expect("lock");
+        assert_eq!(sent.len(), 2);
+        assert!(shows_images(&sent[0]));
+        assert!(!shows_images(&sent[1]));
+        let note = sent[1].messages[0].content[1]["text"]
+            .as_str()
+            .expect("note");
+        assert!(note.contains("cannot see images"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn no_second_try_without_leave_or_need() {
+        let ws = tempfile::tempdir().expect("tmp");
+        for (show, retry) in [(true, false), (false, true)] {
+            let sent = std::sync::Mutex::new(Vec::new());
+            let (result, refused) = send_seeing(
+                picture_request(ws.path()),
+                ws.path().to_path_buf(),
+                show,
+                retry,
+                blind_provider(&sent),
+            )
+            .await
+            .expect("join");
+            assert!(!refused);
+            assert_eq!(result.is_ok(), !show, "show {show}");
+            assert_eq!(
+                sent.lock().expect("lock").len(),
+                1,
+                "one try: {show} {retry}"
+            );
+        }
+        // A refusal that is not about images is not tried again.
+        let sent = std::sync::Mutex::new(0);
+        let (result, refused) = send_seeing(
+            picture_request(ws.path()),
+            ws.path().to_path_buf(),
+            true,
+            true,
+            |_| {
+                *sent.lock().expect("lock") += 1;
+                std::future::ready(Err::<AnthropicResponse, _>(ProxyError::Upstream {
+                    status: 429,
+                    message: "slow down".into(),
+                }))
+            },
+        )
+        .await
+        .expect("join");
+        assert!(result.is_err() && !refused);
+        assert_eq!(*sent.lock().expect("lock"), 1);
+    }
+
+    #[test]
+    fn only_outright_refusals_count() {
+        let upstream = |status| ProxyError::Upstream {
+            status,
+            message: String::new(),
+        };
+        for status in [400, 404, 415, 422] {
+            assert!(refused_request(&upstream(status)), "{status}");
+        }
+        for status in [401, 402, 403, 408, 429, 500, 503] {
+            assert!(!refused_request(&upstream(status)), "{status}");
+        }
+        assert!(!refused_request(&ProxyError::InvalidResponse("x".into())));
     }
 
     #[test]

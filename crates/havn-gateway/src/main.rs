@@ -600,6 +600,7 @@ async fn serve() -> anyhow::Result<()> {
         tokio::spawn(proxy.serve(listener));
     }
     let socket_ctx = AgentSocketCtx {
+        vision_refused: agent_socket::VisionRefused::default(),
         workspace_root: cfg.workspace_root.clone(),
         registry: registry.clone(),
         db: db.clone(),

@@ -946,7 +946,7 @@ mod tests {
                     id: "openai:gpt-5".into(),
                     label: None,
                     max_output_tokens: None,
-                    vision: false,
+                    vision: None,
                     thinking: None,
                 }],
             }));
