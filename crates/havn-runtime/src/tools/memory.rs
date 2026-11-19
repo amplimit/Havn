@@ -668,6 +668,9 @@ mod tests {
 
     #[tokio::test]
     async fn remember_then_search_roundtrip() {
+        // Writes are the owner's turns' (issue #218).
+        super::super::gateway::FROM_OWNER
+            .scope(true, async {
         let ctx = ctx().await;
         let store = MemoryRememberTool;
         let r = store
@@ -685,114 +688,146 @@ mod tests {
         assert!(body.contains("user.name"), "{body}");
         assert!(body.contains("Ada Lovelace"), "{body}");
         assert!(body.contains("[identity]"), "kind tag missing: {body}");
+                })
+            .await;
     }
 
     #[tokio::test]
     async fn remember_rejects_missing_kind() {
-        let ctx = ctx().await;
-        let store = MemoryRememberTool;
-        let r = store.execute(&ctx, json!({"key": "k", "value": "v"})).await;
-        assert!(r.is_error(), "{}", r.text());
-        assert!(r.text().contains("kind"));
+        // Writes are the owner's turns' (issue #218).
+        super::super::gateway::FROM_OWNER
+            .scope(true, async {
+                let ctx = ctx().await;
+                let store = MemoryRememberTool;
+                let r = store.execute(&ctx, json!({"key": "k", "value": "v"})).await;
+                assert!(r.is_error(), "{}", r.text());
+                assert!(r.text().contains("kind"));
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn remember_truncates_oversize_value_with_marker() {
-        // Audit-found: rejecting an oversize value forces the agent to
-        // re-call with a smaller value, wasting a turn. Truncation +
-        // explicit marker is gentler — the important prefix gets
-        // stored, and the LLM is told it happened.
-        let ctx = ctx().await;
-        let store = MemoryRememberTool;
-        let big = "x".repeat(8192);
-        let r = store
-            .execute(
-                &ctx,
-                json!({"key": "k", "value": big, "kind": "preference"}),
-            )
+        // Writes are the owner's turns' (issue #218).
+        super::super::gateway::FROM_OWNER
+            .scope(true, async {
+                // Audit-found: rejecting an oversize value forces the agent to
+                // re-call with a smaller value, wasting a turn. Truncation +
+                // explicit marker is gentler — the important prefix gets
+                // stored, and the LLM is told it happened.
+                let ctx = ctx().await;
+                let store = MemoryRememberTool;
+                let big = "x".repeat(8192);
+                let r = store
+                    .execute(
+                        &ctx,
+                        json!({"key": "k", "value": big, "kind": "preference"}),
+                    )
+                    .await;
+                assert!(!r.is_error(), "should accept oversized: {}", r.text());
+                assert!(
+                    r.text().contains("truncated"),
+                    "result should mention truncation: {}",
+                    r.text()
+                );
+                // The stored value should be capped and end with the sentinel.
+                let pool = &ctx.agent_db;
+                let row = havn_db::agent::memory::get(pool, "k")
+                    .await
+                    .expect("get")
+                    .expect("some");
+                assert!(row.value.len() <= 4096);
+                assert!(
+                    row.value
+                        .ends_with("(truncated to fit memory entry size cap)")
+                );
+            })
             .await;
-        assert!(!r.is_error(), "should accept oversized: {}", r.text());
-        assert!(
-            r.text().contains("truncated"),
-            "result should mention truncation: {}",
-            r.text()
-        );
-        // The stored value should be capped and end with the sentinel.
-        let pool = &ctx.agent_db;
-        let row = havn_db::agent::memory::get(pool, "k")
-            .await
-            .expect("get")
-            .expect("some");
-        assert!(row.value.len() <= 4096);
-        assert!(
-            row.value
-                .ends_with("(truncated to fit memory entry size cap)")
-        );
     }
 
     #[tokio::test]
     async fn search_filters_by_kind() {
-        let ctx = ctx().await;
-        let store = MemoryRememberTool;
-        store
-            .execute(
-                &ctx,
-                json!({"key": "p", "value": "user prefers vim", "kind": "preference"}),
-            )
+        // Writes are the owner's turns' (issue #218).
+        super::super::gateway::FROM_OWNER
+            .scope(true, async {
+                let ctx = ctx().await;
+                let store = MemoryRememberTool;
+                store
+                    .execute(
+                        &ctx,
+                        json!({"key": "p", "value": "user prefers vim", "kind": "preference"}),
+                    )
+                    .await;
+                store
+                    .execute(
+                        &ctx,
+                        json!({"key": "e", "value": "user shipped a release", "kind": "event"}),
+                    )
+                    .await;
+                let search = MemorySearchTool;
+                let r = search
+                    .execute(&ctx, json!({"query": "user", "kinds": ["preference"]}))
+                    .await;
+                assert!(!r.is_error());
+                let body = r.text();
+                assert!(body.contains("[preference]"), "{body}");
+                assert!(!body.contains("[event]"), "{body}");
+            })
             .await;
-        store
-            .execute(
-                &ctx,
-                json!({"key": "e", "value": "user shipped a release", "kind": "event"}),
-            )
-            .await;
-        let search = MemorySearchTool;
-        let r = search
-            .execute(&ctx, json!({"query": "user", "kinds": ["preference"]}))
-            .await;
-        assert!(!r.is_error());
-        let body = r.text();
-        assert!(body.contains("[preference]"), "{body}");
-        assert!(!body.contains("[event]"), "{body}");
     }
 
     #[tokio::test]
     async fn forget_soft_deletes_then_search_excludes() {
-        let ctx = ctx().await;
-        let store = MemoryRememberTool;
-        store
-            .execute(
-                &ctx,
-                json!({"key": "k1", "value": "secret", "kind": "preference"}),
-            )
-            .await;
-        let forget = MemoryForgetTool;
-        let r = forget.execute(&ctx, json!({"key": "k1"})).await;
-        assert!(!r.is_error(), "{}", r.text());
+        // Writes are the owner's turns' (issue #218).
+        super::super::gateway::FROM_OWNER
+            .scope(true, async {
+                let ctx = ctx().await;
+                let store = MemoryRememberTool;
+                store
+                    .execute(
+                        &ctx,
+                        json!({"key": "k1", "value": "secret", "kind": "preference"}),
+                    )
+                    .await;
+                let forget = MemoryForgetTool;
+                let r = forget.execute(&ctx, json!({"key": "k1"})).await;
+                assert!(!r.is_error(), "{}", r.text());
 
-        let search = MemorySearchTool;
-        let r = search.execute(&ctx, json!({"query": "secret"})).await;
-        assert_eq!(r.text(), "(no matches)");
+                let search = MemorySearchTool;
+                let r = search.execute(&ctx, json!({"query": "secret"})).await;
+                assert_eq!(r.text(), "(no matches)");
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn forget_idempotent_on_unknown_key() {
-        let ctx = ctx().await;
-        let forget = MemoryForgetTool;
-        let r = forget.execute(&ctx, json!({"key": "never-existed"})).await;
-        assert!(!r.is_error());
-        assert!(r.text().contains("no active entry"));
+        // Writes are the owner's turns' (issue #218).
+        super::super::gateway::FROM_OWNER
+            .scope(true, async {
+                let ctx = ctx().await;
+                let forget = MemoryForgetTool;
+                let r = forget.execute(&ctx, json!({"key": "never-existed"})).await;
+                assert!(!r.is_error());
+                assert!(r.text().contains("no active entry"));
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn search_no_matches_returns_friendly_message() {
-        let ctx = ctx().await;
-        let search = MemorySearchTool;
-        let r = search
-            .execute(&ctx, json!({"query": "nothing matches this"}))
+        // Writes are the owner's turns' (issue #218).
+        super::super::gateway::FROM_OWNER
+            .scope(true, async {
+                let ctx = ctx().await;
+                let search = MemorySearchTool;
+                let r = search
+                    .execute(&ctx, json!({"query": "nothing matches this"}))
+                    .await;
+                assert!(!r.is_error());
+                assert_eq!(r.text(), "(no matches)");
+            })
             .await;
-        assert!(!r.is_error());
-        assert_eq!(r.text(), "(no matches)");
     }
 
     const CHAT_A: &str = "00000000-0000-4000-8000-00000000000a";
@@ -826,140 +861,156 @@ mod tests {
 
     #[tokio::test]
     async fn conversation_search_finds_this_persons_earlier_chats_only() {
-        use conversations::Role;
-        let ctx = ctx().await;
-        let asked = chat_turn(&ctx, "alice", CHAT_A, Role::User, "我们下周去京都旅行").await;
-        chat_turn(
-            &ctx,
-            "alice",
-            CHAT_A,
-            Role::Assistant,
-            "好的，京都的红叶季很美",
-        )
-        .await;
-        chat_turn(&ctx, "bob", CHAT_B, Role::User, "京都的预算是多少").await;
+        // Writes are the owner's turns' (issue #218).
+        super::super::gateway::FROM_OWNER
+            .scope(true, async {
+                use conversations::Role;
+                let ctx = ctx().await;
+                let asked =
+                    chat_turn(&ctx, "alice", CHAT_A, Role::User, "我们下周去京都旅行").await;
+                chat_turn(
+                    &ctx,
+                    "alice",
+                    CHAT_A,
+                    Role::Assistant,
+                    "好的，京都的红叶季很美",
+                )
+                .await;
+                chat_turn(&ctx, "bob", CHAT_B, Role::User, "京都的预算是多少").await;
 
-        let r = search_as(&ctx, "alice", "elsewhere", json!({"query": "京都"})).await;
-        assert!(!r.is_error(), "{}", r.text());
-        assert!(r.text().contains("下周去京都旅行"), "{}", r.text());
-        assert!(r.text().contains("红叶季"), "{}", r.text());
-        assert!(
-            !r.text().contains("预算"),
-            "another person's chat: {}",
-            r.text()
-        );
-        assert!(
-            r.text().contains(&format!("(turn {asked})")),
-            "{}",
-            r.text()
-        );
+                let r = search_as(&ctx, "alice", "elsewhere", json!({"query": "京都"})).await;
+                assert!(!r.is_error(), "{}", r.text());
+                assert!(r.text().contains("下周去京都旅行"), "{}", r.text());
+                assert!(r.text().contains("红叶季"), "{}", r.text());
+                assert!(
+                    !r.text().contains("预算"),
+                    "another person's chat: {}",
+                    r.text()
+                );
+                assert!(
+                    r.text().contains(&format!("(turn {asked})")),
+                    "{}",
+                    r.text()
+                );
 
-        let r = search_as(&ctx, "alice", CHAT_A, json!({"turn": asked})).await;
-        assert!(r.text().contains("(this chat)"), "{}", r.text());
-        assert!(r.text().contains("> ["), "{}", r.text());
-        assert!(r.text().contains("红叶季"), "{}", r.text());
-        let r = search_as(&ctx, "bob", CHAT_B, json!({"turn": asked})).await;
-        assert!(r.is_error(), "{}", r.text());
+                let r = search_as(&ctx, "alice", CHAT_A, json!({"turn": asked})).await;
+                assert!(r.text().contains("(this chat)"), "{}", r.text());
+                assert!(r.text().contains("> ["), "{}", r.text());
+                assert!(r.text().contains("红叶季"), "{}", r.text());
+                let r = search_as(&ctx, "bob", CHAT_B, json!({"turn": asked})).await;
+                assert!(r.is_error(), "{}", r.text());
 
-        let r = ConversationSearchTool
-            .execute(&ctx, json!({"query": "京都"}))
+                let r = ConversationSearchTool
+                    .execute(&ctx, json!({"query": "京都"}))
+                    .await;
+                assert!(r.is_error(), "outside a chat: {}", r.text());
+            })
             .await;
-        assert!(r.is_error(), "outside a chat: {}", r.text());
     }
 
     #[tokio::test]
     async fn a_value_over_the_cap_is_cut_by_bytes() {
-        let ctx = ctx().await;
-        let new = |value| NewEntry {
-            key: "k",
-            value,
-            kind: Kind::Preference,
-            source: Source::UserTold,
-            ttl_days: None,
-        };
-        // 1500 three-byte characters: 4500 bytes, over the cap.
-        let long = "字".repeat(1500);
-        let (_, cut) = save(false, &ctx, new(&long)).await.expect("save");
-        assert!(cut);
-        let row = memory::get(&ctx.agent_db, "k")
-            .await
-            .expect("get")
-            .expect("row");
-        assert!(row.value.len() <= MAX_VALUE_BYTES, "{}", row.value.len());
-        assert!(row.value.ends_with("size cap)"));
-        // 1300 of them fit: kept whole, without a marker.
-        let fits = "字".repeat(1300);
-        let (_, cut) = save(true, &ctx, new(&fits)).await.expect("save");
-        assert!(!cut);
-        let row = memory::get(&ctx.agent_db, "k")
-            .await
-            .expect("get")
-            .expect("row");
-        assert_eq!(row.value, fits);
-        assert_eq!(row.ttl_days, None);
+        // Writes are the owner's turns' (issue #218).
+        super::super::gateway::FROM_OWNER
+            .scope(true, async {
+                let ctx = ctx().await;
+                let new = |value| NewEntry {
+                    key: "k",
+                    value,
+                    kind: Kind::Preference,
+                    source: Source::UserTold,
+                    ttl_days: None,
+                };
+                // 1500 three-byte characters: 4500 bytes, over the cap.
+                let long = "字".repeat(1500);
+                let (_, cut) = save(false, &ctx, new(&long)).await.expect("save");
+                assert!(cut);
+                let row = memory::get(&ctx.agent_db, "k")
+                    .await
+                    .expect("get")
+                    .expect("row");
+                assert!(row.value.len() <= MAX_VALUE_BYTES, "{}", row.value.len());
+                assert!(row.value.ends_with("size cap)"));
+                // 1300 of them fit: kept whole, without a marker.
+                let fits = "字".repeat(1300);
+                let (_, cut) = save(true, &ctx, new(&fits)).await.expect("save");
+                assert!(!cut);
+                let row = memory::get(&ctx.agent_db, "k")
+                    .await
+                    .expect("get")
+                    .expect("row");
+                assert_eq!(row.value, fits);
+                assert_eq!(row.ttl_days, None);
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn a_turn_notes_its_net_change_to_each_key() {
-        let ctx = ctx().await;
-        let noted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let remember = |key: &'static str, value: &'static str| {
-            let ctx = &ctx;
-            async move {
-                MemoryRememberTool
-                    .execute(
-                        ctx,
-                        json!({"key": key, "value": value, "kind": "preference"}),
-                    )
-                    .await
-            }
-        };
-        // Before the turn: an entry the turn repeats, and one it replaces.
-        remember("user.name", "Ana").await;
-        remember("pref.editor", "vim").await;
-        let vim = memory::get(&ctx.agent_db, "pref.editor")
-            .await
-            .unwrap()
-            .unwrap()
-            .id;
-        MEMORY_CHANGES
-            .scope(std::sync::Arc::clone(&noted), async {
+        // Writes are the owner's turns' (issue #218).
+        super::super::gateway::FROM_OWNER
+            .scope(true, async {
+                let ctx = ctx().await;
+                let noted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let remember = |key: &'static str, value: &'static str| {
+                    let ctx = &ctx;
+                    async move {
+                        MemoryRememberTool
+                            .execute(
+                                ctx,
+                                json!({"key": key, "value": value, "kind": "preference"}),
+                            )
+                            .await
+                    }
+                };
+                // Before the turn: an entry the turn repeats, and one it replaces.
                 remember("user.name", "Ana").await;
-                remember("pref.editor", "emacs").await;
-                remember("pref.editor", "helix").await;
-                remember("pref.font", "Iosevka").await;
-                MemoryForgetTool
-                    .execute(&ctx, json!({"key": "pref.font"}))
+                remember("pref.editor", "vim").await;
+                let vim = memory::get(&ctx.agent_db, "pref.editor")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id;
+                MEMORY_CHANGES
+                    .scope(std::sync::Arc::clone(&noted), async {
+                        remember("user.name", "Ana").await;
+                        remember("pref.editor", "emacs").await;
+                        remember("pref.editor", "helix").await;
+                        remember("pref.font", "Iosevka").await;
+                        MemoryForgetTool
+                            .execute(&ctx, json!({"key": "pref.font"}))
+                            .await;
+                        remember("pref.theme", "dark").await;
+                        MemoryForgetTool
+                            .execute(&ctx, json!({"key": "pref.theme"}))
+                            .await;
+                        MemoryForgetTool
+                            .execute(&ctx, json!({"key": "user.name"}))
+                            .await;
+                    })
                     .await;
-                remember("pref.theme", "dark").await;
-                MemoryForgetTool
-                    .execute(&ctx, json!({"key": "pref.theme"}))
-                    .await;
-                MemoryForgetTool
-                    .execute(&ctx, json!({"key": "user.name"}))
-                    .await;
+                let shown = changes(std::mem::take(&mut *noted.lock().unwrap()));
+                let by_key = |k: &str| shown.iter().find(|c| c.key == k).cloned();
+                let editor = by_key("pref.editor").expect("editor");
+                assert_eq!(editor.action, havn_proto::MemoryAction::Saved);
+                assert_eq!(editor.value, "helix");
+                assert_eq!(editor.before.as_deref(), Some(vim.as_str()));
+                let name = by_key("user.name").expect("name");
+                assert_eq!(name.action, havn_proto::MemoryAction::Forgot);
+                assert_eq!(name.value, "Ana");
+                assert!(name.after.is_none());
+                assert!(
+                    by_key("pref.font").is_none(),
+                    "saved then forgotten: {shown:?}"
+                );
+                assert!(
+                    by_key("pref.theme").is_none(),
+                    "saved then forgotten: {shown:?}"
+                );
+                assert_eq!(shown.len(), 2, "{shown:?}");
+                assert!(remember("..", "x").await.is_error());
             })
             .await;
-        let shown = changes(std::mem::take(&mut *noted.lock().unwrap()));
-        let by_key = |k: &str| shown.iter().find(|c| c.key == k).cloned();
-        let editor = by_key("pref.editor").expect("editor");
-        assert_eq!(editor.action, havn_proto::MemoryAction::Saved);
-        assert_eq!(editor.value, "helix");
-        assert_eq!(editor.before.as_deref(), Some(vim.as_str()));
-        let name = by_key("user.name").expect("name");
-        assert_eq!(name.action, havn_proto::MemoryAction::Forgot);
-        assert_eq!(name.value, "Ana");
-        assert!(name.after.is_none());
-        assert!(
-            by_key("pref.font").is_none(),
-            "saved then forgotten: {shown:?}"
-        );
-        assert!(
-            by_key("pref.theme").is_none(),
-            "saved then forgotten: {shown:?}"
-        );
-        assert_eq!(shown.len(), 2, "{shown:?}");
-        assert!(remember("..", "x").await.is_error());
     }
 
     #[test]
