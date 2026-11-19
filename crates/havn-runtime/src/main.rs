@@ -1343,18 +1343,19 @@ async fn handle_heartbeat(ctx: Ctx) {
         .collect();
 
     let augmented = augment_with_skills(&ctx, &ctx.system_prompt, &synthesised, None, false).await;
-    let final_text = match run_tool_loop(
-        &ctx,
-        crate::tools::context::HEARTBEAT,
-        &mut messages,
-        &augmented,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    {
+    let final_text = match tool_loop::as_text(
+        run_tool_loop(
+            &ctx,
+            crate::tools::context::HEARTBEAT,
+            &mut messages,
+            &augmented,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await,
+    ) {
         Ok(t) => t,
         Err(e) => {
             error!(error = %e, "heartbeat tool-use loop failed");
@@ -2371,7 +2372,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         .then(|| tool_loop::Segments::new(msg.channel_id.clone(), chat.clone()));
     // Where this turn's own messages start.
     let turn_start = messages.len();
-    let final_text = match tools::gateway::CONVERSATION
+    let (final_text, failed) = match tools::gateway::CONVERSATION
         .scope(
             msg.channel_id.clone(),
             tools::gateway::CHAT.scope(
@@ -2396,11 +2397,15 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         )
         .await
     {
-        Ok(text) => text,
-        Err(e) => {
+        Ok(text) => (text, None),
+        // A turn that failed (issue #217): not a reply.
+        Err(tool_loop::RunError::Llm(detail)) => (String::new(), Some(detail)),
+        Err(tool_loop::RunError::Infra(e)) => {
             error!(error = %e, "tool-use loop failed");
-            format!("(internal error: {e})")
+            (String::new(), Some(format!("internal error: {e}")))
         }
+        // Stopped, or out of rounds: what it said is the reply.
+        Err(other) => (tool_loop::as_text(Err(other)).unwrap_or_default(), None),
     };
 
     let (trimmed, answered_by) = {
@@ -2409,6 +2414,24 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (trace.trimmed, trace.fallback.clone())
     };
+    // A turn that failed is not kept as a reply (issue #217): the person is
+    // told plainly what kind of failure it was, the details go to the log
+    // (and, in the owner's web chat, under the message), and their message
+    // stays unanswered, for /retry or the button to answer.
+    if let Some(detail) = failed {
+        warn!(%chat, error = %detail, "the turn failed; its message stays unanswered");
+        let mut text = failure_text(&detail);
+        if msg.channel == "webchat" {
+            text.push_str(&format!("\n\nWhat failed, shown only here: {detail}"));
+        } else {
+            text.push_str(" Send /retry to try again.");
+        }
+        if trimmed {
+            compact_in_background(&ctx, &chat, &msg.channel_id, msg.channel == "webchat");
+        }
+        tell(&ctx, msg.channel_id.clone(), chat, &text).await;
+        return;
+    }
     // Which model answered, when the chat's was unavailable (issue #216):
     // part of the reply, as kept and as shown.
     let final_text = match answered_by {
@@ -2496,18 +2519,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     }
     // Compacted after the reply, and the person told (issue #214).
     if trimmed {
-        let (ctx, chat, channel_id) = (ctx.clone(), chat.clone(), msg.channel_id.clone());
-        let flush = msg.channel == "webchat";
-        // Only once a batch of turns is past the ones kept, so a chat that
-        // stays near the window is not compacted (nor the person told) on
-        // every turn.
-        tokio::spawn(async move {
-            match compact(&ctx, &chat, flush, COMPACT_KEEP).await {
-                Ok(Some(n)) if n > 0 => tell(&ctx, channel_id, chat, COMPACTED_NOTICE).await,
-                Ok(_) => {}
-                Err(e) => warn!(%chat, error = %e, "could not compact the chat"),
-            }
-        });
+        compact_in_background(&ctx, &chat, &msg.channel_id, msg.channel == "webchat");
     }
     let changes = tools::memory::changes(std::mem::take(
         &mut *memory_changes
@@ -2542,7 +2554,7 @@ async fn run_tool_loop(
     model: Option<Arc<String>>,
     thinking: Option<String>,
     segments: Option<tool_loop::Segments>,
-) -> anyhow::Result<String> {
+) -> Result<String, tool_loop::RunError> {
     let mut handle = ctx.parent_handle();
     handle.stop = stop;
     handle.segments = segments;
@@ -2559,7 +2571,7 @@ async fn run_tool_loop(
             Arc::clone(&handle.model),
             tool_loop::TURN_THINKING.scope(
                 thinking,
-                tool_loop::run(&handle, context, messages, system_prompt),
+                tool_loop::run_typed(&handle, context, messages, system_prompt),
             ),
         )
         .await
@@ -2846,6 +2858,43 @@ async fn tell(ctx: &Ctx, channel_id: String, chat: String, text: &str) {
     {
         warn!(error = ?e, "could not send a notice");
     }
+}
+
+/// Compact chat `chat` of conversation `channel_id` in the background, and
+/// tell the person when it was (issue #214): only once a batch of turns is
+/// past the ones kept, so a chat that stays near the window is not
+/// compacted (nor the person told) on every turn.
+fn compact_in_background(ctx: &Ctx, chat: &str, channel_id: &str, flush: bool) {
+    let (ctx, chat, channel_id) = (ctx.clone(), chat.to_string(), channel_id.to_string());
+    tokio::spawn(async move {
+        match compact(&ctx, &chat, flush, COMPACT_KEEP).await {
+            Ok(Some(n)) if n > 0 => tell(&ctx, channel_id, chat, COMPACTED_NOTICE).await,
+            Ok(_) => {}
+            Err(e) => warn!(%chat, error = %e, "could not compact the chat"),
+        }
+    });
+}
+
+/// What a person is told when their message could not be answered (issue
+/// #217), by the kind of failure `detail` says, without its details.
+fn failure_text(detail: &str) -> String {
+    let d = detail.to_ascii_lowercase();
+    let why = if d.contains("is unavailable") || d.contains("overloaded") || d.contains(" 429") {
+        "its provider is overloaded or cannot be reached right now. Try again in a minute."
+    } else if d.contains("no usable credential") {
+        "no API key works for its provider; the agent's owner can check them."
+    } else if d.contains("budget") {
+        "the token budget is used up for now."
+    } else if d.contains("not allowed") || d.contains("does not list") || d.contains("not one of") {
+        "the model asked for is not available to this agent."
+    } else if d.contains("too long") || d.contains("context") {
+        "the chat is longer than the model takes, even cut down. /compact or /new may help."
+    } else if d.starts_with("internal error") {
+        "something went wrong on the agent's side."
+    } else {
+        "the provider refused or failed the request."
+    };
+    format!("(The model could not answer: {why})")
 }
 
 /// What a person is told when their chat was compacted because it had
@@ -3759,6 +3808,23 @@ mod tests {
             with_attachments(String::new(), &[untranscribed])
                 .ends_with("; it was not transcribed, so what is said in it is not known]")
         );
+    }
+
+    #[test]
+    fn a_failure_is_told_by_its_kind_without_its_details() {
+        let unavailable = failure_text(
+            "the provider \"openrouter\" is unavailable (upstream 503: secret body) after 4 tries",
+        );
+        assert!(unavailable.contains("overloaded"), "{unavailable}");
+        assert!(!unavailable.contains("secret body"));
+        assert!(failure_text("no usable credential for provider \"openai\"").contains("API key"));
+        assert!(failure_text("token budget exhausted: daily cap").contains("budget"));
+        assert!(
+            failure_text("model \"x\" is not allowed by this agent's policy")
+                .contains("not available")
+        );
+        assert!(failure_text("internal error: channel closed").contains("agent's side"));
+        assert!(failure_text("upstream provider error: 400 — bad").contains("refused"));
     }
 
     #[test]
