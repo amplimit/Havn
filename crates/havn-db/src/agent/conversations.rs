@@ -351,6 +351,16 @@ pub async fn trace_of(pool: &SqlitePool, chat: &str, turn: &str) -> Result<Optio
 
 /// Keep `steps` with reply `turn`: its turn's messages, as JSON, for the
 /// model to read in later turns (issue #213).
+/// Mark reply `turn` as one that tells of a failure instead of answering
+/// (issue #217): later turns read it as no answer.
+pub async fn set_failed(pool: &SqlitePool, turn: &str) -> Result<()> {
+    sqlx::query("UPDATE conversations SET failed = 1 WHERE id = ?1")
+        .bind(turn)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn set_steps(pool: &SqlitePool, turn: &str, steps: &str) -> Result<()> {
     sqlx::query("UPDATE conversations SET steps = ?2 WHERE id = ?1")
         .bind(turn)
@@ -472,6 +482,7 @@ pub async fn branch(pool: &SqlitePool, chat: &str, limit: u32) -> Result<Vec<Bra
                 versions: Vec::new(),
                 trace: r.trace,
                 steps: None,
+                failed: false,
             })
         })
         .collect()
@@ -552,6 +563,9 @@ pub struct BranchTurn {
     /// For a reply: its turn's messages, for the model only (issue #213).
     #[serde(skip)]
     pub steps: Option<String>,
+    /// A reply that tells of a failure instead of answering (issue #217).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1079,6 +1093,7 @@ struct PathRow {
     created_at: DateTime<Utc>,
     summary: Option<String>,
     steps: Option<String>,
+    failed: bool,
 }
 
 /// Chat `chat`'s branch back to the newest turn with a summary, at most
@@ -1087,18 +1102,19 @@ struct PathRow {
 /// then still given.
 async fn since_summary(pool: &SqlitePool, chat: &str, limit: u32) -> Result<SinceSummary> {
     let rows: Vec<PathRow> = sqlx::query_as(
-        "WITH RECURSIVE path(id, parent_id, role, content, created_at, depth, summary, steps) AS ( \
+        "WITH RECURSIVE path(id, parent_id, role, content, created_at, depth, summary, steps, \
+                             failed) AS ( \
              SELECT c.id, c.parent_id, c.role, c.content, c.created_at, 1, CAST(NULL AS TEXT), \
-                    c.steps \
+                    c.steps, c.failed \
              FROM conversations c JOIN chats h ON h.head = c.id WHERE h.id = ?1 \
              UNION ALL \
              SELECT c.id, c.parent_id, c.role, c.content, c.created_at, p.depth + 1, s.summary, \
-                    c.steps \
+                    c.steps, c.failed \
              FROM conversations c JOIN path p ON c.id = p.parent_id \
              LEFT JOIN chat_summaries s ON s.turn_id = c.id \
              WHERE p.summary IS NULL AND p.depth <= ?2 \
          ) \
-         SELECT id, parent_id, role, content, created_at, summary, steps FROM path \
+         SELECT id, parent_id, role, content, created_at, summary, steps, failed FROM path \
          ORDER BY depth DESC",
     )
     .bind(chat)
@@ -1128,6 +1144,7 @@ async fn since_summary(pool: &SqlitePool, chat: &str, limit: u32) -> Result<Sinc
             // What the model reads: never a turn's trace, but its steps.
             trace: None,
             steps: row.steps,
+            failed: row.failed,
         });
     }
     let keep = limit as usize;
