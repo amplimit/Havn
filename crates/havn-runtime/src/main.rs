@@ -2436,7 +2436,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     let final_text = final_text_failed.take().unwrap_or(final_text);
     // Which model answered, when the chat's was unavailable (issue #216):
     // part of the reply, as kept and as shown.
-    let final_text = match answered_by {
+    let final_text = match answered_by.filter(|_| !failed) {
         Some(model) => {
             let mut text = final_text;
             if !text.is_empty() {
@@ -2451,16 +2451,16 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     // exist only in-memory for this iteration).
     // Under the turn it answers, also when the user moved to another
     // branch meanwhile.
-    let reply_turn = match conversations::record_reply(&ctx.pool, &chat, &answered, &final_text)
-        .await
-    {
+    let recorded = if failed {
+        conversations::record_failed_reply(&ctx.pool, &chat, &answered, &final_text).await
+    } else {
+        conversations::record_reply(&ctx.pool, &chat, &answered, &final_text).await
+    };
+    let reply_turn = match recorded {
         // Facts are flushed to memory from the owner's dashboard chats only:
         // memory is the agent's, and a channel may be someone else.
         Ok(Some(turn)) => {
             // What the turn said and did on the way, for later turns.
-            if failed && let Err(e) = conversations::set_failed(&ctx.pool, &turn).await {
-                warn!(error = %e, "could not mark the reply as failed");
-            }
             // What the turn did before it failed is kept too: later turns
             // know what ran.
             let said = if failed {
@@ -2906,6 +2906,11 @@ fn failure_text(detail: &str) -> (String, bool) {
             "its provider is overloaded or cannot be reached right now. Try again in a minute.",
             true,
         )
+    } else if d.contains("does not allow network egress") {
+        (
+            "this agent's policy does not let it reach the model's provider.",
+            false,
+        )
     } else if d.contains("llm requests in flight") {
         (
             "the agent is busy with other replies. Try again in a moment.",
@@ -3029,7 +3034,13 @@ async fn summarize(
         let mut read = 0;
         let mut through = due.through.clone();
         for (n, turn) in due.turns.iter().enumerate() {
-            let text: String = turn.content.chars().take(SUMMARY_TURN_CHARS).collect();
+            // A failed reply is no answer, not its failure (issue #217).
+            let content = if turn.failed {
+                NO_ANSWER
+            } else {
+                turn.content.as_str()
+            };
+            let text: String = content.chars().take(SUMMARY_TURN_CHARS).collect();
             let chars = text.chars().count();
             if n > 0 && read + chars > cap {
                 break;
