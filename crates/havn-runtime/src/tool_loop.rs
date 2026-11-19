@@ -144,9 +144,9 @@ pub struct LoopHandle {
     pub pending: Pending,
     pub registry: ToolRegistry,
     pub tool_env: ToolCtx,
-    /// Hard cap on the LLM ↔ tool round-trip count for this loop. The
-    /// parent uses [`crate::MAX_TOOL_ITERATIONS`]; subagents use the
-    /// tighter [`crate::tools::subagent::SUBAGENT_MAX_ITERATIONS`].
+    /// Hard cap on the LLM ↔ tool round-trip count for this loop: the
+    /// policy's `tool_rounds.max` for a message, `tool_rounds.subagent`
+    /// for a subagent's task or another agent's question (issue #219).
     pub max_iterations: u32,
     /// When `Some`, the loop writes the current `messages` vec into this
     /// mirror before every LLM call. The parent runtime sets this to its
@@ -275,8 +275,8 @@ static LLM_SLOTS: Semaphore = Semaphore::const_new(MAX_INFLIGHT_LLM_REQUESTS);
 /// Typed loop outcome — caller-distinguishable success vs. degraded paths.
 ///
 /// [`run`] flattens [`Self::Llm`] and [`Self::IterationCap`] into a
-/// single `String` (with `(LLM error: …)` / `(reached the N-iteration
-/// tool-use cap…)` sentinel prefixes) for callers that only have one
+/// single `String` (with `(LLM error: …)` / `(Stopped after N tool
+/// rounds…)` sentinel prefixes) for callers that only have one
 /// channel to surface a result, and re-bubbles [`Self::Infra`] as
 /// `Err(anyhow::Error)` so genuine infrastructure failures still
 /// propagate. [`run_typed`] returns the structured form so callers like
@@ -312,10 +312,7 @@ impl std::fmt::Display for RunError {
             Self::Stopped { .. } => write!(f, "stopped by the user"),
             Self::Llm(msg) => write!(f, "LLM error: {msg}"),
             Self::IterationCap { cap, .. } => {
-                write!(
-                    f,
-                    "reached the {cap}-iteration tool-use cap before finishing"
-                )
+                write!(f, "stopped after {cap} tool rounds, the limit")
             }
             Self::Infra(e) => write!(f, "infrastructure error: {e}"),
         }
@@ -434,6 +431,78 @@ pub async fn run_typed(
         messages.push(serde_json::json!({ "role": "user", "content": tool_results }));
     }
 
+    // The rounds are spent: the model is asked once more to sum up what it
+    // did and what is left (issue #219), told not to call tools. Its text
+    // is kept; a call it makes all the same is not run. The instruction is
+    // taken back after, whatever came of it: it is not part of the chat.
+    let asked = messages
+        .last_mut()
+        .filter(|m| m["role"] == "user")
+        .and_then(|m| m["content"].as_array_mut())
+        .map(|blocks| {
+            blocks.push(serde_json::json!({
+                "type": "text",
+                "text": format!(
+                    "[You have used the {} tool rounds allowed here. Do not call any tool now: \
+                     sum up what you did, what you found, and what is left to do.]",
+                    handle.max_iterations
+                ),
+            }));
+        })
+        .is_some();
+    if asked {
+        let summed = unless_stopped(
+            handle.stop.as_ref(),
+            call_llm(handle, context, messages, system_prompt),
+        )
+        .await;
+        if let Some(blocks) = messages
+            .last_mut()
+            .and_then(|m| m["content"].as_array_mut())
+        {
+            blocks.pop();
+        }
+        let summed = summed.ok_or_else(|| stopped(&said))?;
+        match summed {
+            Ok(response) => {
+                if response.trimmed {
+                    let _ = TRACE.try_with(|trace| {
+                        trace
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .trimmed = true;
+                    });
+                }
+                match response.outcome {
+                    LlmOutcome::Ok => {
+                        let mut content = response
+                            .provider_response
+                            .get("content")
+                            .cloned()
+                            .unwrap_or_else(|| Value::Array(Vec::new()));
+                        if let Some(blocks) = content.as_array_mut() {
+                            blocks.retain(|b| {
+                                b.get("type").and_then(Value::as_str) != Some("tool_use")
+                            });
+                        }
+                        let text = extract_text(&content).unwrap_or_default();
+                        let text = text.trim();
+                        if !text.is_empty() {
+                            said.push(text.to_string());
+                            messages.push(
+                                serde_json::json!({ "role": "assistant", "content": content }),
+                            );
+                        }
+                    }
+                    LlmOutcome::Error { message } => {
+                        warn!(error = %message, "the model could not sum up at the round limit");
+                    }
+                }
+            }
+            Err(e) => warn!(error = %e, "the model could not sum up at the round limit"),
+        }
+    }
+
     Err(RunError::IterationCap {
         cap: handle.max_iterations,
         partial_text: said.join(SEGMENT_BREAK),
@@ -460,7 +529,7 @@ pub async fn run(
         Err(RunError::Llm(msg)) => Ok(format!("(LLM error: {msg})")),
         Err(RunError::IterationCap { cap, partial_text }) => {
             warn!(max = cap, "tool-use loop hit iteration cap");
-            let note = format!("(reached the {cap}-iteration tool-use cap before finishing)");
+            let note = format!("(Stopped after {cap} tool rounds, the limit here.)");
             // What it said on the way stays part of the reply (issue #212).
             let said = partial_text.trim();
             Ok(if said.is_empty() {
@@ -1085,6 +1154,118 @@ mod tests {
             matches!(response.outcome, LlmOutcome::Error { .. }),
             "{:?}",
             response.outcome
+        );
+    }
+
+    #[tokio::test]
+    async fn at_the_round_limit_the_model_sums_up() {
+        use crate::tools::{ToolCtx, ToolRegistry};
+        let (tx, mut rx) = mpsc::channel(8);
+        let (pending, _) = maps();
+        let policy = Arc::new(havn_core::Policy::default());
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite");
+        let handle = LoopHandle {
+            writer_tx: tx,
+            pending: Arc::clone(&pending),
+            registry: ToolRegistry::standard(&policy),
+            tool_env: ToolCtx {
+                workspace_dir: std::path::PathBuf::from("/tmp"),
+                agent_db: pool,
+                policy: Arc::clone(&policy),
+                embedder: None,
+            },
+            max_iterations: 1,
+            messages_mirror: None,
+            model: Arc::new(String::new()),
+            max_tokens: DEFAULT_MAX_TOKENS,
+            billing_user_id: None,
+            stop: None,
+            segments: None,
+        };
+        // A gateway that answers a tool call first, then the summing up.
+        let gateway = tokio::spawn({
+            let pending = Arc::clone(&pending);
+            async move {
+                let mut asked = Vec::new();
+                for content in [
+                    serde_json::json!([{"type": "tool_use", "id": "t1", "name": "no_such_tool", "input": {}}]),
+                    serde_json::json!([{"type": "text", "text": "I looked once; the rest is left."}]),
+                ] {
+                    let Some(AgentToGateway::LlmRequest(req)) = rx.recv().await else {
+                        panic!("no request");
+                    };
+                    asked.push(req.messages.clone());
+                    let stop = if content[0]["type"] == "tool_use" {
+                        "tool_use"
+                    } else {
+                        "end_turn"
+                    };
+                    let reply = LlmResponse {
+                        request_id: req.request_id.clone(),
+                        outcome: LlmOutcome::Ok,
+                        provider_response: serde_json::json!({"content": content, "stop_reason": stop}),
+                        usage: None,
+                        trimmed: false,
+                    };
+                    loop {
+                        if let Some(answer) = pending.lock().await.remove(&req.request_id) {
+                            let _ = answer.send(reply);
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }
+                asked
+            }
+        });
+        let mut messages = vec![serde_json::json!({"role": "user", "content": "do it"})];
+        let prompt = crate::system_prompt::BootstrapFiles::default().system_prompt(None);
+        let ended = run_typed(
+            &handle,
+            crate::tools::context::WEBCHAT,
+            &mut messages,
+            &prompt,
+        )
+        .await;
+        let asked = gateway.await.expect("gateway");
+        match ended {
+            Err(RunError::IterationCap { cap, partial_text }) => {
+                assert_eq!(cap, 1);
+                assert_eq!(partial_text, "I looked once; the rest is left.");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // The model was told the rounds were spent, after the results.
+        let last = asked[1]
+            .as_array()
+            .and_then(|m| m.last())
+            .cloned()
+            .unwrap_or_default();
+        let told = last["content"]
+            .as_array()
+            .and_then(|b| b.last())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            told["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("tool rounds allowed here")
+        );
+        assert_eq!(
+            messages.last().map(|m| m["role"].clone()),
+            Some(serde_json::json!("assistant"))
+        );
+        // The instruction is not kept in the chat.
+        let results = &messages[messages.len() - 2];
+        assert!(
+            results["content"]
+                .as_array()
+                .is_some_and(|b| b.iter().all(|b| b["type"] == "tool_result"))
         );
     }
 

@@ -278,8 +278,8 @@ fn translate_message_to_openai(
 
     // For assistant turns, tool_use blocks fold into a single message with
     // tool_calls; text blocks concatenate into `content`. For user turns,
-    // tool_result blocks each emit a separate `role: "tool"` message after
-    // any text content.
+    // tool_result blocks each emit a separate `role: "tool"` message,
+    // before any text content: they must follow the tool_calls they answer.
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut thinking = String::new();
@@ -405,6 +405,11 @@ fn translate_message_to_openai(
         }
     }
 
+    // Tool results first, as their own messages, right after the assistant
+    // tool_calls they answer (OpenAI pairs them by id, and refuses anything
+    // in between); the turn's text, if any, follows them.
+    out.append(&mut tool_results);
+
     // Emit the primary message for this turn.
     if m.role == "assistant" && !tool_calls.is_empty() {
         let mut msg = json!({"role": "assistant"});
@@ -426,12 +431,6 @@ fn translate_message_to_openai(
         out.push(json!({"role": &m.role, "content": parts}));
     } else if !text_parts.is_empty() {
         out.push(json!({"role": &m.role, "content": text_parts.join("\n")}));
-    }
-
-    // Tool results follow as their own messages so OpenAI can pair them
-    // with the prior assistant tool_calls by id.
-    for tr in tool_results {
-        out.push(tr);
     }
 
     Ok(())
@@ -878,6 +877,34 @@ mod tests {
         assert_eq!(messages[0]["role"], "tool");
         assert_eq!(messages[0]["tool_call_id"], "tu_1");
         assert_eq!(messages[0]["content"], "file1\nfile2");
+    }
+
+    #[test]
+    fn tool_results_come_right_after_their_calls_and_text_after_them() {
+        let r = req(
+            vec![
+                AnthropicMessage {
+                    role: "assistant".into(),
+                    content: json!([{"type": "tool_use", "id": "tu_1", "name": "shell", "input": {}}]),
+                },
+                AnthropicMessage {
+                    role: "user".into(),
+                    content: json!([
+                        {"type": "tool_result", "tool_use_id": "tu_1", "content": "done"},
+                        {"type": "text", "text": "now sum up"}
+                    ]),
+                },
+            ],
+            None,
+        );
+        let body = anthropic_to_openai(&r, "max_tokens", "openai").expect("translate");
+        let roles: Vec<&str> = body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter_map(|m| m["role"].as_str())
+            .collect();
+        assert_eq!(roles, ["assistant", "tool", "user"]);
     }
 
     #[test]
