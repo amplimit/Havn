@@ -52,7 +52,22 @@ pub struct WebChatRouter {
     /// When chat commands were sent to an agent for a session and not
     /// answered yet: an agent's notice is shown only as such an answer.
     command_replies: Arc<std::sync::Mutex<HashMap<(AgentId, SessionId), Vec<std::time::Instant>>>>,
+    /// Questions agents asked with `ask_choice` (issue #204), by id, until
+    /// answered or [`crate::choice::KEPT`] passes.
+    choices: Arc<std::sync::Mutex<HashMap<String, PendingChoice>>>,
 }
+
+#[derive(Debug, Clone)]
+struct PendingChoice {
+    agent_id: AgentId,
+    channel_id: String,
+    chat: Option<String>,
+    asked: crate::choice::Asked,
+    since: std::time::Instant,
+}
+
+/// Questions one agent may have waiting for an answer.
+const MAX_CHOICES_WAITING: usize = 100;
 
 /// Unanswered chat commands kept per session; more are not sent.
 const MAX_COMMANDS_WAITING: usize = 16;
@@ -145,6 +160,14 @@ pub enum ServerMessage {
         /// The chat it answers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<String>,
+        /// Buttons under it (issue #204): a press sends the button's data
+        /// as the next message.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        buttons: Vec<Vec<havn_core::Button>>,
+        /// A question of several answers: the chosen numbers go after its
+        /// `answer` as the next message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        poll: Option<havn_core::Poll>,
     },
     /// Soft error visible to the user (e.g. agent disconnected).
     Error { message: String },
@@ -389,6 +412,8 @@ impl WebChatRouter {
                 content: text,
                 broadcast: false,
                 conversation,
+                buttons: msg.buttons,
+                poll: msg.poll,
             },
             MessageContent::File {
                 url,
@@ -404,6 +429,8 @@ impl WebChatRouter {
                 content: format!("(unsupported content variant: {other:?})"),
                 broadcast: false,
                 conversation,
+                buttons: Vec::new(),
+                poll: None,
             },
         };
         self.send_to_session(agent_id, session_id, server_msg).await
@@ -599,6 +626,74 @@ impl WebChatRouter {
         awaited
     }
 
+    /// Keep `asked`, a question of `agent_id` in conversation `channel_id`
+    /// (chat `chat`); its id, or `None` when the agent has too many
+    /// waiting.
+    pub fn ask_choice(
+        &self,
+        agent_id: AgentId,
+        channel_id: String,
+        chat: Option<String>,
+        asked: crate::choice::Asked,
+    ) -> Option<String> {
+        let mut choices = self
+            .choices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        choices.retain(|_, c| c.since.elapsed() < crate::choice::KEPT);
+        if choices.values().filter(|c| c.agent_id == agent_id).count() >= MAX_CHOICES_WAITING {
+            return None;
+        }
+        let id = Uuid::new_v4().simple().to_string()[..12].to_string();
+        choices.insert(
+            id.clone(),
+            PendingChoice {
+                agent_id,
+                channel_id,
+                chat,
+                asked,
+                since: std::time::Instant::now(),
+            },
+        );
+        Some(id)
+    }
+
+    /// Forget question `id`, which could not be asked.
+    pub fn forget_choice(&self, id: &str) {
+        self.choices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+    }
+
+    /// Answer question `id` of `agent_id` asked in conversation
+    /// `channel_id` with options `numbers`: the person's message to the
+    /// agent and the chat it goes to. It is answered once; a wrong answer
+    /// leaves it waiting.
+    pub fn answer_choice(
+        &self,
+        agent_id: AgentId,
+        channel_id: &str,
+        id: &str,
+        numbers: &[usize],
+    ) -> Result<(String, Option<String>), String> {
+        let mut choices = self
+            .choices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        choices.retain(|_, c| c.since.elapsed() < crate::choice::KEPT);
+        let Some(pending) = choices
+            .get(id)
+            .filter(|c| c.agent_id == agent_id && c.channel_id == channel_id)
+        else {
+            return Err("(That question was already answered, or it expired.)".into());
+        };
+        let text = crate::choice::chosen(&pending.asked, numbers)?;
+        let chat = pending.chat.clone();
+        choices.remove(id);
+        Ok((text, chat))
+    }
+
     /// Approval request `id` of `agent_id`, when it waits in conversation
     /// `channel_id`.
     pub fn approval(
@@ -757,11 +852,15 @@ impl WebChatRouter {
                 content: text,
                 broadcast: true,
                 conversation,
+                buttons: Vec::new(),
+                poll: None,
             },
             other => ServerMessage::AgentMessage {
                 content: format!("(unsupported content variant: {other:?})"),
                 broadcast: true,
                 conversation,
+                buttons: Vec::new(),
+                poll: None,
             },
         };
         self.fan_out(agent_id, server_msg).await
@@ -827,6 +926,54 @@ mod tests {
             input: "{}".into(),
             reason: "rule".into(),
         }
+    }
+
+    #[test]
+    fn a_question_is_answered_once_in_its_conversation() {
+        let router = WebChatRouter::new();
+        let agent = AgentId::new();
+        let asked = crate::choice::read(&serde_json::json!({
+            "question": "Which?", "options": ["a", "b"]
+        }))
+        .expect("asked");
+        let chat = "ch|telegram|bot|tg:1";
+        let id = router
+            .ask_choice(agent, chat.into(), Some("c1".into()), asked.clone())
+            .expect("id");
+        assert!(
+            router
+                .answer_choice(agent, "ch|telegram|bot|tg:2", &id, &[1])
+                .is_err()
+        );
+        assert!(
+            router
+                .answer_choice(AgentId::new(), chat, &id, &[1])
+                .is_err()
+        );
+        assert!(
+            router.answer_choice(agent, chat, &id, &[5]).is_err(),
+            "not an option"
+        );
+        let (text, to) = router
+            .answer_choice(agent, chat, &id, &[2])
+            .expect("answered");
+        assert!(text.contains("\"b\""), "{text}");
+        assert_eq!(to.as_deref(), Some("c1"));
+        assert!(
+            router.answer_choice(agent, chat, &id, &[2]).is_err(),
+            "once"
+        );
+        for _ in 0..MAX_CHOICES_WAITING {
+            assert!(
+                router
+                    .ask_choice(agent, chat.into(), None, asked.clone())
+                    .is_some()
+            );
+        }
+        assert!(
+            router.ask_choice(agent, chat.into(), None, asked).is_none(),
+            "too many"
+        );
     }
 
     #[tokio::test]
@@ -965,6 +1112,7 @@ mod tests {
             content: MessageContent::Text { text: "hi".into() },
             reply_to: None,
             buttons: Vec::new(),
+            poll: None,
         };
         router.deliver(agent_id, outbound).await.expect("deliver");
 
@@ -1036,6 +1184,7 @@ mod tests {
             },
             reply_to: None,
             buttons: Vec::new(),
+            poll: None,
         };
         let err = router
             .deliver(AgentId::new(), outbound)
@@ -1054,6 +1203,7 @@ mod tests {
             content: MessageContent::Text { text: "hi".into() },
             reply_to: None,
             buttons: Vec::new(),
+            poll: None,
         };
         let err = router
             .deliver(AgentId::new(), outbound)
@@ -1071,6 +1221,7 @@ mod tests {
             content: MessageContent::Text { text: "hi".into() },
             reply_to: None,
             buttons: Vec::new(),
+            poll: None,
         };
         let err = router
             .deliver(AgentId::new(), outbound)
@@ -1100,6 +1251,7 @@ mod tests {
             },
             reply_to: None,
             buttons: Vec::new(),
+            poll: None,
         };
         let n = router.broadcast(agent_id, outbound).await;
         assert_eq!(n, 2, "should reach both sessions for the target agent");
@@ -1131,6 +1283,7 @@ mod tests {
             content: MessageContent::Text { text: t.into() },
             reply_to: None,
             buttons: Vec::new(),
+            poll: None,
         }
     }
 

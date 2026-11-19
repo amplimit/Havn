@@ -179,18 +179,19 @@ async fn web_asker(
 }
 
 /// Answer the chat command `parsed`, sent in chat `conversation` of a web
-/// chat session.
+/// chat session; what to send the agent as the sender's message instead
+/// (a choice, issue #204), and in which chat.
 async fn web_command(
     state: &AppState,
     asker: &crate::commands::Asker,
     conversation: Option<String>,
     parsed: crate::commands::Parsed<'_>,
-) {
+) -> Option<(String, Option<String>)> {
     let mut asker = asker.clone();
     asker.conversation = conversation;
     let session: SessionId = match asker.scope.parse() {
         Ok(s) => s,
-        Err(_) => return,
+        Err(_) => return None,
     };
     let reply = match parsed {
         refused @ (crate::commands::Parsed::Unknown(_) | crate::commands::Parsed::Misused(_)) => {
@@ -207,11 +208,14 @@ async fn web_command(
                 if let Err(e) = state.registry.send(asker.agent_id, stop).await {
                     warn!(agent_id = %asker.agent_id, error = ?e, "failed to forward StopTurn");
                 }
-                return;
+                return None;
             }
             "retry" => "(Answer again with the button under the reply.)".into(),
             _ => match crate::commands::run(state, &asker, command, args).await {
                 crate::commands::Action::Reply(text) => text,
+                crate::commands::Action::Say { text, conversation } => {
+                    return Some((text, conversation.or(asker.conversation)));
+                }
                 crate::commands::Action::Agent(command) => {
                     let frame = GatewayToAgent::ChatCommand(command);
                     let saved = crate::commands::saved_already(&frame);
@@ -223,7 +227,7 @@ async fn web_command(
                             .into()
                     } else {
                         match state.registry.send(asker.agent_id, frame).await {
-                            Ok(()) => return,
+                            Ok(()) => return None,
                             Err(e) => {
                                 state
                                     .webchat_router
@@ -249,6 +253,7 @@ async fn web_command(
     {
         debug!(error = ?e, "no tab took a command's answer");
     }
+    None
 }
 
 /// Serve one tab until the browser closes it, the socket fails, or the
@@ -355,12 +360,17 @@ async fn serve_session<Si, St, E>(
                 && commands.is_some()
                 && crate::commands::parse(&content).is_some() =>
             {
-                if let (Some((state, asker)), Some(parsed)) =
-                    (commands.as_ref(), crate::commands::parse(&content))
-                {
-                    web_command(state, asker, chat_id(conversation), parsed).await;
+                let said = match (commands.as_ref(), crate::commands::parse(&content)) {
+                    (Some((state, asker)), Some(parsed)) => {
+                        web_command(state, asker, chat_id(conversation), parsed).await
+                    }
+                    _ => None,
+                };
+                // A choice goes on as the person's message.
+                match said {
+                    Some((text, chat)) => (text, chat, None),
+                    None => continue,
                 }
-                continue;
             }
             ClientMessage::Send {
                 content,
@@ -590,6 +600,7 @@ mod tests {
                         },
                         reply_to: None,
                         buttons: Vec::new(),
+                        poll: None,
                     },
                 )
                 .await

@@ -10,6 +10,7 @@ mod audit;
 mod auth;
 mod channel_id_codec;
 mod channel_router;
+mod choice;
 mod commands;
 mod config;
 mod credential_resolver;

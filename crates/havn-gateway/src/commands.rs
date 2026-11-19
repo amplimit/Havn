@@ -204,11 +204,22 @@ fn word_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
+/// `/choose`, what a button or a poll of `ask_choice` sends (issue #204):
+/// not listed with the others, as no one types it.
+pub const CHOOSE: Command = Command {
+    name: "choose",
+    aliases: &[],
+    args: "<question> <numbers>",
+    about: "Answer a question the agent asked with buttons or a poll",
+    admin: false,
+};
+
 /// The command named `name` (lowercase), by its name or an alias.
 #[must_use]
 pub fn find(name: &str) -> Option<&'static Command> {
     COMMANDS
         .iter()
+        .chain(std::iter::once(&CHOOSE))
         .find(|c| c.name == name || c.aliases.contains(&name))
 }
 
@@ -300,6 +311,12 @@ pub enum Action {
     Reply(String),
     /// Send this to the agent, which answers in the conversation.
     Agent(ChatCommand),
+    /// Send this to the agent as the sender's message, in chat
+    /// `conversation` when there is one.
+    Say {
+        text: String,
+        conversation: Option<String>,
+    },
 }
 
 /// What to tell the sender when `frame` cannot reach the agent but did
@@ -370,6 +387,18 @@ pub async fn run(state: &AppState, asker: &Asker, command: &Command, args: &str)
             })
         }
         "usage" => Action::Reply(usage(state, asker.agent_id, args).await),
+        "choose" => match crate::choice::read_answer(args) {
+            Some((id, numbers)) => {
+                match state
+                    .webchat_router
+                    .answer_choice(asker.agent_id, &asker.scope, id, &numbers)
+                {
+                    Ok((text, conversation)) => Action::Say { text, conversation },
+                    Err(why) => Action::Reply(why),
+                }
+            }
+            None => Action::Reply("(Choose with the buttons or the poll.)".into()),
+        },
         "approve" | "deny" => {
             Action::Reply(decide(state, asker, command.name == "approve", args).await)
         }
@@ -626,7 +655,9 @@ async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> S
         };
     };
     let waiting = match id {
-        Some(id) => state.webchat_router.approval(asker.agent_id, &asker.scope, id),
+        Some(id) => state
+            .webchat_router
+            .approval(asker.agent_id, &asker.scope, id),
         None => state
             .webchat_router
             .oldest_approval(asker.agent_id, &asker.scope),

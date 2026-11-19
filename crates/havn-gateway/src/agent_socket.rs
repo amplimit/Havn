@@ -892,6 +892,7 @@ async fn oversized_reply(
                             content: havn_core::MessageContent::Text { text: notice },
                             reply_to: None,
                             buttons: Vec::new(),
+                            poll: None,
                         },
                     )
                     .await;
@@ -1290,6 +1291,7 @@ async fn ask_for_approval(
             },
             reply_to: None,
             buttons,
+            poll: None,
         };
         route_outbound(agent_id, message, ctx).await;
     }
@@ -1559,13 +1561,14 @@ async fn deliver_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSo
         match translated {
             Some(content) => match ctx
                 .channel_router
-                .deliver_with_buttons(
+                .deliver_with(
                     channel,
                     account_id,
                     sender_id,
                     msg.reply_to,
                     content,
                     msg.buttons,
+                    msg.poll,
                 )
                 .await
             {
@@ -1626,7 +1629,11 @@ async fn gateway_tools_for(
 ) -> Vec<GatewayToolSpec> {
     // Every agent may set its owner's time zone and send files to the
     // conversation it answers.
-    let mut tools = vec![crate::timezone::spec(), crate::outbox::spec()];
+    let mut tools = vec![
+        crate::timezone::spec(),
+        crate::outbox::spec(),
+        crate::choice::spec(),
+    ];
     if policy.permissions.can_search_web {
         match ctx
             .search
@@ -1681,6 +1688,7 @@ async fn run_gateway_tool(
         crate::web_search::TOOL_NAME => run_web_search(agent_id, call, ctx).await,
         crate::web_fetch::TOOL_NAME => run_web_fetch(agent_id, call, ctx).await,
         crate::outbox::TOOL_NAME => run_send_file(agent_id, call, ctx).await,
+        crate::choice::TOOL_NAME => run_ask_choice(agent_id, call, ctx).await,
         other => Err(format!("the gateway has no tool named {other:?}")),
     }
 }
@@ -1759,6 +1767,7 @@ async fn run_send_file(
             },
             reply_to: None,
             buttons: Vec::new(),
+            poll: None,
         },
         ctx,
     )
@@ -1785,6 +1794,64 @@ async fn run_send_file(
         "sent {:?} ({} bytes) to the conversation",
         sent.name, sent.size
     ))
+}
+
+/// `ask_choice` (issue #204): keep the question and send its conversation
+/// the options, as buttons or a poll where the app shows them.
+async fn run_ask_choice(
+    agent_id: AgentId,
+    call: &GatewayToolCall,
+    ctx: &AgentSocketCtx,
+) -> Result<String, String> {
+    let asked = crate::choice::read(&call.input)?;
+    let channel_id = call
+        .conversation
+        .clone()
+        .ok_or("ask_choice works only while answering someone's message")?;
+    if let Some((channel, account, sender)) = crate::channel_id_codec::decode(&channel_id) {
+        channel_send_permitted(ctx, agent_id, channel, account, sender)
+            .await
+            .map_err(|r| format!("this conversation cannot be asked ({})", r.as_str()))?;
+    } else if channel_id.parse::<crate::webchat::SessionId>().is_err() {
+        return Err("ask_choice works only while answering someone's message".into());
+    }
+    let id = ctx
+        .webchat_router
+        .ask_choice(
+            agent_id,
+            channel_id.clone(),
+            call.chat.clone(),
+            asked.clone(),
+        )
+        .ok_or("too many questions wait for an answer; ask again later")?;
+    let delivered = deliver_outbound(
+        agent_id,
+        OutboundMessage {
+            conversation: call.chat.clone(),
+            channel_id,
+            content: havn_core::MessageContent::Text {
+                text: crate::choice::text(&asked),
+            },
+            reply_to: None,
+            buttons: crate::choice::buttons(&asked, &id),
+            poll: crate::choice::poll(&asked, &id),
+        },
+        ctx,
+    )
+    .await;
+    if !delivered {
+        ctx.webchat_router.forget_choice(&id);
+        return Err(
+            "the question could not be delivered: the conversation's app is not \
+                    connected"
+                .into(),
+        );
+    }
+    Ok(
+        "Asked. Their choice comes as their next message, marked as one; end your turn \
+        now, without answering for them."
+            .into(),
+    )
 }
 
 async fn run_set_timezone(
@@ -4248,6 +4315,7 @@ mod tests {
                 content: havn_core::MessageContent::Text { text: "hi".into() },
                 reply_to: None,
                 buttons: Vec::new(),
+                poll: None,
             })
         };
         let mut bytes = Vec::new();

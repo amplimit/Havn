@@ -16,7 +16,7 @@ pub use ids::{
 };
 pub use message::{
     Attachment, Branch, Button, INBOX_DIR, InboundMessage, MAX_BUTTON_DATA, MessageContent,
-    OutboundMessage,
+    OutboundMessage, Poll,
 };
 pub use policy::{
     AGENT_CGROUP_PARENT, AGENT_CGROUP_PREFIX, AdminVisibility, BudgetExhaustAction, BudgetPolicy,

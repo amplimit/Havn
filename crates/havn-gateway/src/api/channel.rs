@@ -1160,6 +1160,8 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
     let mut new_chat = false;
     let mut branch = None;
     let mut command_frame = None;
+    let mut content = content;
+    let mut conversation = None;
     match parsed {
         None => {}
         Some(
@@ -1223,12 +1225,20 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
                     crate::commands::Action::Agent(command) => {
                         command_frame = Some(GatewayToAgent::ChatCommand(command));
                     }
+                    // A choice: the person's message, in the question's chat.
+                    crate::commands::Action::Say {
+                        text,
+                        conversation: chat,
+                    } => {
+                        content = MessageContent::Text { text };
+                        conversation = chat;
+                    }
                 }
             }
         },
     }
     let msg = InboundMessage {
-        conversation: None,
+        conversation,
         branch,
         channel_id: encoded_channel_id,
         sender_id: inb.sender_id.clone(),
