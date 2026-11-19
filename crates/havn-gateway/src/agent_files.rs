@@ -101,6 +101,40 @@ impl WorkspaceDir {
         Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     }
 
+    /// The first `max_bytes` of the regular file `name` as UTF-8 (lossily),
+    /// and whether there is more. `Ok(None)` when it does not exist.
+    pub fn read_text_start(
+        &self,
+        name: &str,
+        max_bytes: u64,
+    ) -> io::Result<Option<(String, bool)>> {
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(NOFOLLOW_FLAGS)
+            .open(self.child(name)?)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let meta = file.metadata()?;
+        require_regular(name, &meta)?;
+        let mut bytes = Vec::new();
+        io::Read::by_ref(&mut file)
+            .take(max_bytes)
+            .read_to_end(&mut bytes)?;
+        let more = meta.len() > bytes.len() as u64;
+        // A character cut at the end is left out, not mangled.
+        let text = match std::str::from_utf8(&bytes) {
+            Ok(text) => text.to_string(),
+            Err(e) if e.error_len().is_none() => {
+                String::from_utf8_lossy(&bytes[..e.valid_up_to()]).into_owned()
+            }
+            Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
+        };
+        Ok(Some((text, more)))
+    }
+
     /// Replace the contents of the regular file `name`, creating it if
     /// needed.
     pub fn write_text(&self, name: &str, contents: &str) -> io::Result<()> {

@@ -607,6 +607,7 @@ async fn serve() -> anyhow::Result<()> {
     }
     let socket_ctx = AgentSocketCtx {
         vision_refused: agent_socket::VisionRefused::default(),
+        attachments: reload_handles.attachments.clone(),
         workspace_root: cfg.workspace_root.clone(),
         registry: registry.clone(),
         db: db.clone(),

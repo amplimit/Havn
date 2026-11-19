@@ -136,6 +136,8 @@ pub struct AgentSocketCtx {
     /// (issue #202), as their entries are: they are sent notes in place of
     /// images until the entry changes or the gateway restarts.
     pub vision_refused: VisionRefused,
+    /// `[attachments]`, hot-reloaded (issue #211).
+    pub attachments: Arc<arc_swap::ArcSwap<crate::config::AttachmentLimits>>,
     /// True when agents run under `NamespaceSpawner`, each in its own
     /// `agent-<id>` cgroup. The gateway then accepts a connection for an
     /// agent only from a process in that cgroup. With the unisolated
@@ -2396,7 +2398,10 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                     }
                 }
             };
-            let result = match llm_proxy::send_seeing(ar, workspace, show, try_blind, send).await {
+            let limits = (**ctx.attachments.load()).clone();
+            let result = match llm_proxy::send_seeing(ar, workspace, limits, show, try_blind, send)
+                .await
+            {
                 Ok(seen) => {
                     if seen.model_takes_none
                         && ctx
@@ -2415,7 +2420,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                     seen.result
                 }
                 Err(e) => {
-                    warn!(%agent_id, error = %e, "could not read the images of an LLM request");
+                    warn!(%agent_id, error = %e, "could not read the files of an LLM request");
                     let _ = ctx
                         .registry
                         .send(
@@ -2423,7 +2428,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                             GatewayToAgent::LlmResponse(LlmResponse {
                                 request_id,
                                 outcome: LlmOutcome::Error {
-                                    message: format!("reading the turn's images failed: {e}"),
+                                    message: format!("reading the turn's files failed: {e}"),
                                 },
                                 provider_response: serde_json::Value::Null,
                                 usage: None,
@@ -3275,6 +3280,7 @@ mod tests {
         let webchat_router = WebChatRouter::new();
         AgentSocketCtx {
             vision_refused: VisionRefused::default(),
+            attachments: Arc::default(),
             workspace_root: std::env::temp_dir(),
             cron_scheduler: CronScheduler::new(
                 db.clone(),

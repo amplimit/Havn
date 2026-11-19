@@ -98,6 +98,10 @@ pub const RULES: &[ReloadRule] = &[
         kind: ReloadKind::Hot,
     },
     ReloadRule {
+        prefix: "attachments",
+        kind: ReloadKind::Hot,
+    },
+    ReloadRule {
         prefix: "reload",
         kind: ReloadKind::Restart,
     },
@@ -208,6 +212,8 @@ pub struct ReloadHandles {
     pub channel_texts: Arc<ArcSwap<crate::config::ChannelTexts>>,
     /// `[transcription]`.
     pub transcription: Arc<ArcSwap<Option<crate::transcribe::Transcription>>>,
+    /// `[attachments]`.
+    pub attachments: Arc<ArcSwap<crate::config::AttachmentLimits>>,
 }
 
 impl ReloadHandles {
@@ -218,6 +224,7 @@ impl ReloadHandles {
             workspace_browse: Arc::new(std::sync::atomic::AtomicBool::new(cfg.workspace.browse)),
             channel_texts: Arc::new(ArcSwap::from_pointee(cfg.channel_texts.clone())),
             transcription: Arc::new(ArcSwap::from_pointee(cfg.transcription.clone())),
+            attachments: Arc::new(ArcSwap::from_pointee(cfg.attachments.clone())),
         }
     }
 
@@ -250,6 +257,9 @@ impl ReloadHandles {
                     on = new.transcription.is_some(),
                     "hot-reloaded the transcription of audio"
                 );
+            } else if path.starts_with("attachments") {
+                self.attachments.store(Arc::new(new.attachments.clone()));
+                info!(limits = ?new.attachments, "hot-reloaded the limits of attachments");
             } else if path.starts_with("channel_texts") {
                 new.warn_channel_texts();
                 self.channel_texts
