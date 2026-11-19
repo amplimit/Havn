@@ -94,14 +94,14 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "approve",
         aliases: &[],
-        args: "[always]",
+        args: "[always] [id]",
         about: "Let the step waiting for approval run",
         admin: true,
     },
     Command {
         name: "deny",
         aliases: &[],
-        args: "",
+        args: "[id]",
         about: "Refuse the step waiting for approval",
         admin: true,
     },
@@ -622,11 +622,13 @@ async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> S
              chat.)"
                 .into()
         } else {
-            "(Send /deny on its own.)".into()
+            "(Send /deny, or /deny with the id of the step.)".into()
         };
     };
     let waiting = match id {
-        Some(id) => state.webchat_router.approval(asker.agent_id, &asker.scope, id),
+        Some(id) => state
+            .webchat_router
+            .approval(asker.agent_id, &asker.scope, id),
         None => state
             .webchat_router
             .oldest_approval(asker.agent_id, &asker.scope),
@@ -665,6 +667,16 @@ async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approve_and_deny_take_an_id() {
+        assert_eq!(known("/deny r-1"), Some(("deny", "r-1")));
+        assert_eq!(
+            known("/approve always r-1"),
+            Some(("approve", "always r-1"))
+        );
+        assert_eq!(known("/deny"), Some(("deny", "")));
+    }
 
     #[test]
     fn a_decision_may_name_its_request() {
