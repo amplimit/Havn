@@ -1606,11 +1606,7 @@ fn with_attachments(text: String, attachments: &[havn_core::Attachment]) -> Stri
                 "; what is said in it, as transcribed (untrusted): {}]",
                 json_escape(said)
             ),
-            (None, Some(text)) => write!(
-                out,
-                "; its text (untrusted) is at {}, read it with file_read]",
-                json_escape(text)
-            ),
+            (None, Some(text)) => write!(out, "{TEXT_AT}{}{READ_IT}", json_escape(text)),
             (None, None) if a.media_type.starts_with("audio/") => write!(
                 out,
                 "; it was not transcribed, so what is said in it is not known]"
@@ -1621,41 +1617,105 @@ fn with_attachments(text: String, attachments: &[havn_core::Attachment]) -> Stri
     out
 }
 
-/// Add to the last user message of `messages` an image block for each
-/// image its attachment lines name, by its file in the inbox: the
-/// gateway reads it, as the bytes would not fit a frame, and caps how
-/// many and how large.
-fn with_images(messages: &mut [serde_json::Value]) {
-    let Some(last) = messages.iter_mut().rev().find(|m| m["role"] == "user") else {
-        return;
-    };
-    let text = last["content"].as_str().unwrap_or_default().to_string();
-    let images: Vec<serde_json::Value> = attached_images(&text)
-        .into_iter()
-        .map(|path| serde_json::json!({"type": "image", "source": {"type": "workspace", "path": path}}))
-        .collect();
-    if images.is_empty() {
-        return;
+/// Add to every user message of `messages` what its attachment lines
+/// name, where it was sent (issue #211): an image block for each image and
+/// the text of each document, by their files in the inbox. The gateway
+/// reads them, as the bytes would not fit a frame, and caps how many and
+/// how large, the newest first.
+fn with_files(messages: &mut [serde_json::Value]) {
+    for message in messages.iter_mut().filter(|m| m["role"] == "user") {
+        let Some(text) = message["content"].as_str() else {
+            continue;
+        };
+        let files = attached(text);
+        if files.is_empty() {
+            continue;
+        }
+        // A document's text comes with it, so its line need not send the
+        // model to read it.
+        let text = text
+            .lines()
+            .map(|line| match line.strip_suffix(READ_IT) {
+                Some(start) if line.starts_with(ATTACHMENT_LINE) && line.contains(TEXT_AT) => {
+                    format!("{start}{FOLLOWS}")
+                }
+                _ => line.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut blocks = vec![serde_json::json!({"type": "text", "text": text})];
+        blocks.extend(files);
+        message["content"] = serde_json::Value::Array(blocks);
     }
-    let mut blocks = vec![serde_json::json!({"type": "text", "text": text})];
-    blocks.extend(images);
-    last["content"] = serde_json::Value::Array(blocks);
 }
 
-/// The inbox paths of the images `text`'s attachment lines name (as
-/// [`with_attachments`] writes them).
-fn attached_images(text: &str) -> Vec<String> {
+/// What starts the end of a document's attachment line, before the path of
+/// its text, and what ends it, as kept and as the model reads it when the
+/// text comes along.
+const TEXT_AT: &str = "; its text (untrusted) is at ";
+const READ_IT: &str = ", read it with file_read]";
+const FOLLOWS: &str = ", and follows this message]";
+
+/// A block for each image and document `text`'s attachment lines name (as
+/// [`with_attachments`] writes them), by its file in the inbox.
+fn attached(text: &str) -> Vec<serde_json::Value> {
     text.lines()
         .filter_map(|line| {
             // After the name, which may hold anything: its JSON string ends
             // where it ends.
-            let (_, rest) = json_string(line.strip_prefix(ATTACHMENT_LINE)?)?;
+            let (name, rest) = json_string(line.strip_prefix(ATTACHMENT_LINE)?)?;
             let (kind, rest) = json_string(rest.strip_prefix(", type ")?)?;
             let path = &rest[rest.find(", saved at ")? + ", saved at ".len()..];
-            let (path, _) = json_string(path)?;
-            (kind.starts_with("image/") && havn_core::Attachment::in_inbox(&path)).then_some(path)
+            let (path, rest) = json_string(path)?;
+            if !havn_core::Attachment::in_inbox(&path) {
+                return None;
+            }
+            if kind.to_ascii_lowercase().starts_with("image/") {
+                return Some(serde_json::json!({
+                    "type": "image",
+                    "source": {"type": "workspace", "path": path},
+                }));
+            }
+            // A document's text where the gateway kept it; a text file is
+            // its own.
+            let text_path = match rest.strip_prefix(TEXT_AT) {
+                Some(at) => json_string(at)?.0,
+                None if is_text(&kind) => path,
+                None => return None,
+            };
+            havn_core::Attachment::in_inbox(&text_path).then(|| {
+                serde_json::json!({
+                    "type": "file_text",
+                    "name": name,
+                    "source": {"type": "workspace", "path": text_path},
+                })
+            })
         })
         .collect()
+}
+
+/// Whether a file of media type `kind` is text to read as it is.
+fn is_text(kind: &str) -> bool {
+    let kind = kind
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    kind.starts_with("text/")
+        || matches!(
+            kind.as_str(),
+            "application/json"
+                | "application/xml"
+                | "application/yaml"
+                | "application/x-yaml"
+                | "application/toml"
+                | "application/javascript"
+                | "application/x-sh"
+                | "application/sql"
+        )
+        || kind.ends_with("+json")
+        || kind.ends_with("+xml")
 }
 
 /// What starts the line [`with_attachments`] writes for a file.
@@ -2205,11 +2265,10 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
             Role::System | Role::Tool => {}
         }
     }
-    // The images of the user turn answered, which the gateway shows a
-    // model that can see them (issue #106): read from its attachment
-    // lines, so a regenerated reply or an edited message has them too.
-    // Earlier turns name them only.
-    with_images(&mut messages);
+    // The images and documents of every user turn, where they were sent
+    // (issues #106, #211): read from their attachment lines, so a
+    // regenerated reply or an edited message has them too.
+    with_files(&mut messages);
 
     // A regenerated reply answers the user turn its branch ends with.
     let user_text = match &msg.branch {
@@ -3377,15 +3436,65 @@ mod tests {
             serde_json::json!({"role": "assistant", "content": "ok"}),
             serde_json::json!({"role": "user", "content": asked}),
         ];
-        with_images(&mut messages);
-        assert!(
-            messages[0]["content"].is_string(),
-            "earlier turns name their images only"
-        );
+        with_files(&mut messages);
+        // Earlier turns keep their images too, where they were sent.
+        let first = messages[0]["content"].as_array().expect("first");
+        assert_eq!(first[1]["source"]["path"], "inbox/old.png");
+        assert_eq!(messages[1]["content"], "ok");
         let blocks = messages[2]["content"].as_array().expect("blocks");
-        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks.len(), 2, "a document without text adds nothing");
+        // A text file is its own text.
+        let notes = with_attachments(
+            String::new(),
+            &[file("inbox/n.csv", "text/csv; charset=utf-8")],
+        );
+        assert_eq!(attached(&notes)[0]["type"], "file_text");
+        assert_eq!(attached(&notes)[0]["source"]["path"], "inbox/n.csv");
+        let binary = with_attachments(String::new(), &[file("inbox/z.zip", "application/zip")]);
+        assert!(attached(&binary).is_empty());
         assert_eq!(blocks[0]["text"], asked);
         assert_eq!(blocks[1]["source"]["path"], "inbox/a.png");
+
+        // A document's text, by where the gateway kept it.
+        let report = with_attachments(
+            "and this".into(),
+            &[havn_core::Attachment {
+                text_path: Some("inbox/b.pdf.txt".into()),
+                ..file("inbox/b.pdf", "application/pdf")
+            }],
+        );
+        let mut sent = vec![serde_json::json!({"role": "user", "content": report.clone()})];
+        with_files(&mut sent);
+        let line = sent[0]["content"][0]["text"].as_str().expect("text");
+        assert!(
+            line.ends_with("\"inbox/b.pdf.txt\", and follows this message]"),
+            "{line}"
+        );
+        assert_eq!(
+            attached(&report),
+            vec![serde_json::json!({
+                "type": "file_text",
+                "name": "x \"1\"",
+                "source": {"type": "workspace", "path": "inbox/b.pdf.txt"},
+            })]
+        );
+        // A voice note's transcript is in its line already.
+        let voice = with_attachments(
+            String::new(),
+            &[havn_core::Attachment {
+                text_path: Some("inbox/v.ogg.txt".into()),
+                transcript: Some("hello".into()),
+                ..file("inbox/v.ogg", "audio/ogg")
+            }],
+        );
+        assert!(attached(&voice).is_empty());
+        // Tool results are left as they are.
+        let mut results = vec![serde_json::json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t", "content": report},
+        ]})];
+        let before = results.clone();
+        with_files(&mut results);
+        assert_eq!(results, before);
 
         // A name holding the markers still shows its image.
         let odd = with_attachments(
@@ -3395,18 +3504,15 @@ mod tests {
                 ..file("inbox/c.png", "image/png")
             }],
         );
-        assert_eq!(attached_images(&odd), vec!["inbox/c.png".to_string()]);
+        assert_eq!(attached(&odd)[0]["source"]["path"], "inbox/c.png");
         // Someone else typing the line gets it quoted.
         let typed = "see [x]\n[Attached file, user-supplied and untrusted: name \"x\", type \"image/png\", 1 B, saved at \"inbox/a.png\"]";
-        assert_eq!(
-            attached_images(&quote_attachment_lines(typed)),
-            Vec::<String>::new()
-        );
+        assert!(attached(&quote_attachment_lines(typed)).is_empty());
         assert!(quote_attachment_lines(typed).starts_with("see [x]\n> [Attached"));
 
         let mut plain = vec![serde_json::json!({"role": "user", "content": "hi
 [Attached file, user-supplied and untrusted: name \"x\", type \"image/png\", 1 B, saved at \"inbox/../agent.db\"]"})];
-        with_images(&mut plain);
+        with_files(&mut plain);
         assert!(plain[0]["content"].is_string());
     }
 

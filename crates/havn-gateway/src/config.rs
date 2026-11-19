@@ -121,6 +121,10 @@ pub struct GatewayConfig {
     /// unset, they are not. Hot-reloaded.
     #[serde(default)]
     pub transcription: Option<crate::transcribe::Transcription>,
+    /// How much of what people sent (images, documents' text) a request
+    /// carries (issue #211). Hot-reloaded.
+    #[serde(default)]
+    pub attachments: AttachmentLimits,
     /// Backend of the `web_search` tool.
     ///
     /// TOML form:
@@ -382,6 +386,41 @@ pub struct WorkspaceConfig {
     pub browse: bool,
 }
 
+/// How much of what people sent stays in front of the model (issue #211):
+/// every request carries the images and documents' text of the chat where
+/// they were sent, the newest first, up to these; older ones are named
+/// only.
+///
+/// ```toml
+/// [attachments]
+/// images         = 10          # images in a request
+/// image_bytes    = 10000000    # their bytes in all
+/// document_chars = 100000      # documents' text in a request, as shown
+/// file_chars     = 30000       # one document's text
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AttachmentLimits {
+    pub images: usize,
+    pub image_bytes: u64,
+    pub document_chars: usize,
+    pub file_chars: usize,
+}
+
+impl Default for AttachmentLimits {
+    fn default() -> Self {
+        Self {
+            // Every request of a turn carries them again: kept to what a
+            // modest context window and a home uplink take.
+            images: 10,
+            // Gemini takes 20 MB of base64 in a request.
+            image_bytes: 10_000_000,
+            document_chars: 100_000,
+            file_chars: 30_000,
+        }
+    }
+}
+
 /// Set `[workspace] browse` in the config file at `path`, keeping the rest
 /// of the file as it is.
 pub fn write_workspace_browse(path: &std::path::Path, browse: bool) -> anyhow::Result<()> {
@@ -601,6 +640,7 @@ impl Default for GatewayConfig {
             workspace: WorkspaceConfig::default(),
             channel_texts: ChannelTexts::default(),
             transcription: None,
+            attachments: AttachmentLimits::default(),
             search: SearchConfig::default(),
             fetch: FetchConfig::default(),
             channels: std::collections::BTreeMap::new(),
