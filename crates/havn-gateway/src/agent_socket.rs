@@ -908,6 +908,7 @@ async fn oversized_reply(
                             reply_to: None,
                             buttons: Vec::new(),
                             poll: None,
+                            partial: false,
                         },
                     )
                     .await;
@@ -1310,6 +1311,7 @@ async fn ask_for_approval(
             reply_to: None,
             buttons,
             poll: None,
+            partial: false,
         };
         route_outbound(agent_id, message, ctx).await;
     }
@@ -1605,6 +1607,7 @@ async fn deliver_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSo
                     content,
                     msg.buttons,
                     msg.poll,
+                    msg.partial,
                 )
                 .await
             {
@@ -1804,6 +1807,7 @@ async fn run_send_file(
             reply_to: None,
             buttons: Vec::new(),
             poll: None,
+            partial: false,
         },
         ctx,
     )
@@ -1865,6 +1869,7 @@ async fn run_ask_choice(
             reply_to: None,
             buttons: crate::choice::buttons(&asked, &id),
             poll: crate::choice::poll(&asked, &id),
+            partial: false,
         },
         ctx,
     )
@@ -3198,6 +3203,7 @@ mod tests {
             conversation: None,
             buttons: approval_buttons(id),
             poll: None,
+            partial: false,
         };
         msg = from_agent(msg);
         assert!(msg.buttons.is_empty(), "an agent's buttons are dropped");
@@ -4394,6 +4400,7 @@ mod tests {
                 reply_to: None,
                 buttons: Vec::new(),
                 poll: None,
+                partial: false,
             })
         };
         let mut bytes = Vec::new();

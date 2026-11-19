@@ -123,6 +123,10 @@ pub struct OutboundMessage {
     /// that shows polls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll: Option<Poll>,
+    /// A part of a reply with more to come (issue #212): the text a model
+    /// wrote before calling a tool, sent as it was written.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
     /// Optional message ID to thread / reply to.
     pub reply_to: Option<String>,
     /// The chat a reply belongs to, when it answers one.

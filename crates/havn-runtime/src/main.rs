@@ -28,6 +28,7 @@ mod sandbox;
 #[cfg(target_os = "linux")]
 mod seccomp;
 mod skills;
+mod steps;
 mod system_prompt;
 mod tool_loop;
 mod tools;
@@ -213,6 +214,7 @@ impl Ctx {
             max_tokens: self.max_tokens,
             billing_user_id: None,
             stop: None,
+            segments: None,
         }
     }
 }
@@ -797,6 +799,7 @@ async fn main() -> anyhow::Result<()> {
             // the parent's loop is itself running an IncomingQuery).
             billing_user_id: None,
             stop: None,
+            segments: None,
         },
         parent_messages: Arc::clone(&parent_messages),
         semaphore: Arc::new(Semaphore::new(subagent_tool::SUBAGENT_MAX_CONCURRENT)),
@@ -1096,6 +1099,7 @@ where
                     reply_to: None,
                     buttons: Vec::new(),
                     poll: None,
+                    partial: false,
                 };
                 if let Err(e) = ctx.writer_tx.try_send(AgentToGateway::CommandReply(reply)) {
                     warn!(error = %e, "could not answer a chat command");
@@ -1354,6 +1358,7 @@ async fn handle_heartbeat(ctx: Ctx) {
         None,
         None,
         None,
+        None,
     )
     .await
     {
@@ -1370,7 +1375,9 @@ async fn handle_heartbeat(ctx: Ctx) {
         warn!(error = %e, "could not persist heartbeat assistant turn");
     }
 
-    if final_text.trim() == HEARTBEAT_OK {
+    // The reply is all the model said, so what it said before calling a
+    // tool comes first (issue #212).
+    if final_text.trim().ends_with(HEARTBEAT_OK) {
         debug!("heartbeat tick: agent returned HEARTBEAT_OK — suppressed");
         return;
     }
@@ -1384,6 +1391,7 @@ async fn handle_heartbeat(ctx: Ctx) {
         reply_to: None,
         buttons: Vec::new(),
         poll: None,
+        partial: false,
     };
     if let Err(e) = ctx
         .writer_tx
@@ -2054,6 +2062,7 @@ fn send_text(ctx: &Ctx, channel_id: String, conversation: Option<String>, text: 
         reply_to: None,
         buttons: Vec::new(),
         poll: None,
+        partial: false,
     };
     // Never wait on a full writer queue: the reader loop calls this, and
     // replies it must route would stall behind it.
@@ -2169,16 +2178,33 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     // Initial messages array from persisted history (already includes the user
     // turn we just wrote). Each entry is a JSON value so we can append
     // assistant `content` arrays containing `tool_use` blocks verbatim later.
-    let mut messages: Vec<serde_json::Value> = history
+    // A reply comes back with what its turn said and did on the way
+    // (issue #213), the older ones cut down.
+    let replies: Vec<(&str, Option<&str>)> = history
         .iter()
-        .filter_map(|t| match t.role {
-            Role::User => Some(serde_json::json!({ "role": "user", "content": t.content })),
-            Role::Assistant => {
-                Some(serde_json::json!({ "role": "assistant", "content": t.content }))
-            }
-            Role::System | Role::Tool => None,
-        })
+        .filter(|t| t.role == Role::Assistant)
+        .map(|t| (t.content.as_str(), t.steps.as_deref()))
         .collect();
+    let mut replies = steps::messages_of_replies(&replies).into_iter();
+    let mut messages: Vec<serde_json::Value> = Vec::with_capacity(history.len());
+    for t in &history {
+        match t.role {
+            Role::User => {
+                messages.push(serde_json::json!({ "role": "user", "content": t.content }));
+            }
+            Role::Assistant => {
+                let reply = replies.next().unwrap_or_default();
+                // A history cut short can start with a reply: as its text,
+                // since a model takes no tool call before anyone spoke.
+                if messages.is_empty() {
+                    messages.extend(steps::plain(&t.content));
+                } else {
+                    messages.extend(reply);
+                }
+            }
+            Role::System | Role::Tool => {}
+        }
+    }
     // The images of the user turn answered, which the gateway shows a
     // model that can see them (issue #106): read from its attachment
     // lines, so a regenerated reply or an edited message has them too.
@@ -2229,6 +2255,12 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     let memory_changes = Arc::new(std::sync::Mutex::new(Vec::new()));
     let turn_trace = Arc::new(std::sync::Mutex::new(tool_loop::Trace::default()));
     let started = std::time::Instant::now();
+    // A chat app gets what the model says before each tool call as it is
+    // said (issue #212); the web chat shows it as it is written already.
+    let segments = (msg.channel != "webchat")
+        .then(|| tool_loop::Segments::new(msg.channel_id.clone(), chat.clone()));
+    // Where this turn's own messages start.
+    let turn_start = messages.len();
     let final_text = match tools::gateway::CONVERSATION
         .scope(
             msg.channel_id.clone(),
@@ -2246,6 +2278,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
                             Some(stop),
                             chat_model,
                             chat_thinking,
+                            segments.clone(),
                         ),
                     ),
                 ),
@@ -2270,6 +2303,13 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         // Facts are flushed to memory from the owner's dashboard chats only:
         // memory is the agent's, and a channel may be someone else.
         Ok(Some(turn)) => {
+            // What the turn said and did on the way, for later turns.
+            if let Some(kept) =
+                steps::of_turn(messages.get(turn_start..).unwrap_or_default(), &final_text)
+                && let Err(e) = conversations::set_steps(&ctx.pool, &turn, &kept).await
+            {
+                warn!(error = %e, "could not keep the turn's steps");
+            }
             summarize_when_due(&ctx, &chat, msg.channel == "webchat");
             // What the turn did on the way, kept with its reply.
             let kept = std::mem::take(
@@ -2299,13 +2339,19 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         }
     };
 
+    // A chat app got the parts said before the tools already.
+    let text = match &segments {
+        Some(segments) => segments.rest_of(&final_text),
+        None => final_text,
+    };
     let outbound = OutboundMessage {
         conversation: Some(chat.clone()),
         channel_id: msg.channel_id.clone(),
-        content: MessageContent::Text { text: final_text },
+        content: MessageContent::Text { text },
         reply_to: None,
         buttons: Vec::new(),
         poll: None,
+        partial: false,
     };
     if let Err(e) = ctx
         .writer_tx
@@ -2346,9 +2392,11 @@ async fn run_tool_loop(
     stop: Option<tokio_util::sync::CancellationToken>,
     model: Option<Arc<String>>,
     thinking: Option<String>,
+    segments: Option<tool_loop::Segments>,
 ) -> anyhow::Result<String> {
     let mut handle = ctx.parent_handle();
     handle.stop = stop;
+    handle.segments = segments;
     if let Some(model) = model {
         handle.model = model;
     }
@@ -3188,6 +3236,7 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
         // against `billing_user_id` instead of this agent's owner.
         billing_user_id: Some(query.billing_user_id.clone()),
         stop: None,
+        segments: None,
     };
 
     // Use the typed runner so degraded outcomes (LLM error, iteration

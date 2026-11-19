@@ -1134,6 +1134,7 @@ mod tests {
             reply_to: None,
             buttons: Vec::new(),
             poll: None,
+            partial: false,
         };
         router.deliver(agent_id, outbound).await.expect("deliver");
 
@@ -1206,6 +1207,7 @@ mod tests {
             reply_to: None,
             buttons: Vec::new(),
             poll: None,
+            partial: false,
         };
         let err = router
             .deliver(AgentId::new(), outbound)
@@ -1225,6 +1227,7 @@ mod tests {
             reply_to: None,
             buttons: Vec::new(),
             poll: None,
+            partial: false,
         };
         let err = router
             .deliver(AgentId::new(), outbound)
@@ -1243,6 +1246,7 @@ mod tests {
             reply_to: None,
             buttons: Vec::new(),
             poll: None,
+            partial: false,
         };
         let err = router
             .deliver(AgentId::new(), outbound)
@@ -1273,6 +1277,7 @@ mod tests {
             reply_to: None,
             buttons: Vec::new(),
             poll: None,
+            partial: false,
         };
         let n = router.broadcast(agent_id, outbound).await;
         assert_eq!(n, 2, "should reach both sessions for the target agent");
@@ -1305,6 +1310,7 @@ mod tests {
             reply_to: None,
             buttons: Vec::new(),
             poll: None,
+            partial: false,
         }
     }
 

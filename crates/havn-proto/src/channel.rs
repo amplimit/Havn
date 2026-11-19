@@ -122,6 +122,10 @@ pub struct ChannelOutbound {
     /// back as the poll's `answer` and the chosen numbers, as a press does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll: Option<havn_core::Poll>,
+    /// A part of a reply with more to come (issue #212): the agent is
+    /// still working, so an adapter keeps showing that it is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
 }
 
 /// Adapter → gateway: replay request after reconnect.
@@ -263,6 +267,7 @@ mod tests {
             content: ChannelMessageContent::Text { text: "hi".into() },
             buttons: Vec::new(),
             poll: None,
+            partial: false,
         });
         let s = serde_json::to_string(&frame).expect("serialize");
         let parsed: ChannelFrame = serde_json::from_str(&s).expect("parse");
@@ -284,6 +289,7 @@ mod tests {
             content: ChannelMessageContent::Text { text: "t".into() },
             buttons,
             poll: None,
+            partial: false,
         };
         let plain = serde_json::to_string(&outbound(Vec::new())).expect("json");
         assert!(!plain.contains("buttons"), "{plain}");

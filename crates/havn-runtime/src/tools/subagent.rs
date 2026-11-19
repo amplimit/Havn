@@ -180,7 +180,12 @@ impl Tool for SubagentSpawnTool {
             Vec::with_capacity(1)
         } else {
             let snapshot = self.bridge.parent_messages.read().await.clone();
-            let start = snapshot.len().saturating_sub(FORK_HISTORY_DEPTH);
+            let mut start = snapshot.len().saturating_sub(FORK_HISTORY_DEPTH);
+            // Not from a tool's result: the call it answers would be cut
+            // off, and a model takes no result without its call.
+            while snapshot.get(start).is_some_and(answers_a_call) {
+                start += 1;
+            }
             snapshot[start..].to_vec()
         };
         messages.push(serde_json::json!({
@@ -209,11 +214,41 @@ impl Tool for SubagentSpawnTool {
     }
 }
 
+/// Whether `message` is the results of tool calls made in the message
+/// before it.
+fn answers_a_call(message: &Value) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("user")
+        && message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+            })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn a_fork_starts_after_results_cut_from_their_calls() {
+        let result = serde_json::json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+        ]});
+        assert!(answers_a_call(&result));
+        assert!(!answers_a_call(
+            &serde_json::json!({"role": "user", "content": "hi"})
+        ));
+        assert!(!answers_a_call(
+            &serde_json::json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "x", "input": {}},
+            ]})
+        ));
+    }
 
     #[test]
     fn schema_declares_required_task() {
@@ -288,6 +323,7 @@ mod tests {
                 max_tokens: crate::tool_loop::DEFAULT_MAX_TOKENS,
                 billing_user_id: None,
                 stop: None,
+                segments: None,
             },
             parent_messages: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             semaphore: Arc::new(Semaphore::new(SUBAGENT_MAX_CONCURRENT)),
