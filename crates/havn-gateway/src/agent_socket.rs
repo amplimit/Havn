@@ -965,7 +965,9 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
         AgentToGateway::Hello { .. } => {
             warn!(%agent_id, "duplicate Hello after handshake — ignoring");
         }
-        AgentToGateway::OutboundMessage(msg) => route_outbound(agent_id, msg, ctx).await,
+        AgentToGateway::OutboundMessage(msg) => {
+            route_outbound(agent_id, from_agent(msg), ctx).await;
+        }
         AgentToGateway::ChatTitled(titled) => {
             if let Ok(session) = titled.channel_id.parse::<crate::webchat::SessionId>()
                 && crate::channel_id_codec::decode(&titled.channel_id).is_none()
@@ -985,6 +987,7 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
             }
         }
         AgentToGateway::CommandReply(msg) => {
+            let msg = from_agent(msg);
             // A web chat shows it as a notice; a channel as any message.
             match msg.channel_id.parse::<crate::webchat::SessionId>() {
                 Ok(session) if crate::channel_id_codec::decode(&msg.channel_id).is_none() => {
@@ -1297,10 +1300,26 @@ async fn ask_for_approval(
     }
 }
 
+/// A message an agent sent, without buttons: they are the gateway's, which
+/// makes each stand for a command the person can see (issue #203); an
+/// agent's could pass an approval off as something else.
+fn from_agent(mut msg: OutboundMessage) -> OutboundMessage {
+    msg.buttons.clear();
+    msg
+}
+
 /// Approve, approve for the chat and deny, for approval request `id`:
-/// each its command naming the request; none when one would not fit a
-/// button.
+/// each its command naming the request; none when the id (the runtime's)
+/// would not read back as one, or not fit a button.
 fn approval_buttons(id: &str) -> Vec<Vec<havn_core::Button>> {
+    let plain = !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '-'))
+        && !id.eq_ignore_ascii_case("always");
+    if !plain {
+        return Vec::new();
+    }
     let button = |label: &str, data: String| havn_core::Button {
         label: label.to_string(),
         data,
@@ -3131,6 +3150,20 @@ mod tests {
             approval_buttons(&"x".repeat(60)).is_empty(),
             "too long for a button"
         );
+        for odd in ["always", "ALWAYS", "a b", "a\nb", ""] {
+            assert!(approval_buttons(odd).is_empty(), "{odd:?}");
+        }
+        let mut msg = OutboundMessage {
+            channel_id: "ch|telegram|bot|tg:1".into(),
+            content: havn_core::MessageContent::Text {
+                text: "Done!".into(),
+            },
+            reply_to: None,
+            conversation: None,
+            buttons: approval_buttons(id),
+        };
+        msg = from_agent(msg);
+        assert!(msg.buttons.is_empty(), "an agent's buttons are dropped");
     }
     use havn_db::connect_in_memory;
     use havn_db::repo::agents::{NewAgent, create as create_agent};
