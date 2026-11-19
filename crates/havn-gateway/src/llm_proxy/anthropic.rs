@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use super::provider::{
     LlmProvider, ProviderError, Sse, TextEvent, TextSink, cut_short, is_event_stream, pass_text,
-    status_error,
+    retry_after, status_error,
 };
 use super::{AnthropicRequest, AnthropicResponse};
 
@@ -53,8 +53,9 @@ impl LlmProvider for AnthropicProvider {
                 .map_err(|e| ProviderError::Translation(e.to_string()));
         }
 
+        let wait = retry_after(resp.headers());
         let body = resp.text().await.unwrap_or_default();
-        Err(status_error(status.as_u16(), body))
+        Err(status_error(status.as_u16(), body, wait))
     }
 
     async fn stream(
@@ -77,8 +78,9 @@ impl LlmProvider for AnthropicProvider {
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
+            let wait = retry_after(resp.headers());
             let body = resp.text().await.unwrap_or_default();
-            return Err(status_error(status.as_u16(), body));
+            return Err(status_error(status.as_u16(), body, wait));
         }
         if !is_event_stream(&resp) {
             let response = resp
@@ -95,6 +97,7 @@ impl LlmProvider for AnthropicProvider {
                 .map_err(|e| ProviderError::Translation(format!("stream event decode: {e}")))?;
             if event.get("type").and_then(serde_json::Value::as_str) == Some("error") {
                 return Err(ProviderError::Upstream {
+                    retry_after: None,
                     status: 529,
                     body: event
                         .get("error")

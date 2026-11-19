@@ -2403,10 +2403,27 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         }
     };
 
-    let trimmed = turn_trace
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .trimmed;
+    let (trimmed, answered_by) = {
+        let trace = turn_trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (trace.trimmed, trace.fallback.clone())
+    };
+    // Which model answered, when the chat's was unavailable (issue #216):
+    // part of the reply, as kept and as shown.
+    let final_text = match answered_by {
+        Some(model) => {
+            let mut text = final_text;
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&format!(
+                "(Answered by {model}: the chat's model was unavailable.)"
+            ));
+            text
+        }
+        None => final_text,
+    };
     // Persist assistant turn (visible reply only — intermediate tool turns
     // exist only in-memory for this iteration).
     // Under the turn it answers, also when the user moved to another

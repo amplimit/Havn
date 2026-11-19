@@ -874,7 +874,8 @@ async fn answer(
         .await;
         match result {
             Ok(response) => return Ok((response_text(&response.content), model.id.clone())),
-            Err(ProxyError::NoCredential(_)) if i + 1 < call.models.len() => {}
+            Err(ProxyError::NoCredential(_) | ProxyError::Unavailable { .. })
+                if i + 1 < call.models.len() => {}
             Err(e) => return Err(format!("answering from {url} failed: {e}")),
         }
     }
@@ -1876,6 +1877,7 @@ mod tests {
             vision: None,
             thinking: None,
             context_window: None,
+            fallback: Vec::new(),
         };
         let catalog = ModelCatalog {
             default_model: Some("openrouter:cheap/model".into()),

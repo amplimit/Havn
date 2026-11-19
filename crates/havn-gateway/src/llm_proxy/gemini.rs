@@ -76,16 +76,19 @@ impl LlmProvider for GeminiProvider {
 
         let status = resp.status();
         if !status.is_success() {
+            let wait = super::provider::retry_after(resp.headers());
             let body_text = resp.text().await.unwrap_or_default();
             return Err(match status.as_u16() {
                 401 | 403 => ProviderError::Unauthorized { body: body_text },
                 402 | 429 => ProviderError::QuotaOrRateLimit {
                     status: status.as_u16(),
                     body: body_text,
+                    retry_after: wait,
                 },
                 500..=599 => ProviderError::Upstream {
                     status: status.as_u16(),
                     body: body_text,
+                    retry_after: wait,
                 },
                 other => ProviderError::BadRequest {
                     status: other,
@@ -131,10 +134,11 @@ impl LlmProvider for GeminiProvider {
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
+            let wait = super::provider::retry_after(resp.headers());
             let body_text = resp.text().await.unwrap_or_default();
             return Err(match status.as_u16() {
                 403 => ProviderError::Unauthorized { body: body_text },
-                code => status_error(code, body_text),
+                code => status_error(code, body_text, wait),
             });
         }
         if !is_event_stream(&resp) {
@@ -154,6 +158,7 @@ impl LlmProvider for GeminiProvider {
                 .map_err(|e| ProviderError::Translation(format!("stream chunk decode: {e}")))?;
             if let Some(error) = chunk.get("error") {
                 return Err(ProviderError::Upstream {
+                    retry_after: None,
                     status: 502,
                     body: error.to_string(),
                 });

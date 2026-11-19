@@ -23,6 +23,9 @@ pub struct ModelEntry {
     /// is known to take.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
+    /// Models that answer in its place when it is unavailable (issue #216).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +118,7 @@ pub async fn add(
         vision,
         thinking: None,
         context_window,
+        fallback: Vec::new(),
     });
     let default_model = if make_default {
         Some(id)

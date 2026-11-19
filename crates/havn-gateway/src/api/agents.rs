@@ -949,6 +949,7 @@ mod tests {
                     vision: None,
                     thinking: None,
                     context_window: None,
+                    fallback: Vec::new(),
                 }],
             }));
         assert!(check_model(&state, None).is_ok());
