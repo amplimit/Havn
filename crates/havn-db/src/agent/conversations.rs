@@ -100,6 +100,28 @@ pub async fn record_reply(
     parent: &str,
     reply: &str,
 ) -> Result<Option<String>> {
+    record_reply_as(pool, chat, parent, reply, false).await
+}
+
+/// [`record_reply`] for a reply that tells of a failure instead of
+/// answering (issue #217), marked so in the same write: later turns read it
+/// as no answer.
+pub async fn record_failed_reply(
+    pool: &SqlitePool,
+    chat: &str,
+    parent: &str,
+    reply: &str,
+) -> Result<Option<String>> {
+    record_reply_as(pool, chat, parent, reply, true).await
+}
+
+async fn record_reply_as(
+    pool: &SqlitePool,
+    chat: &str,
+    parent: &str,
+    reply: &str,
+    failed: bool,
+) -> Result<Option<String>> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let head: Option<(Option<String>,)> = sqlx::query_as("SELECT head FROM chats WHERE id = ?1")
         .bind(chat)
@@ -126,6 +148,12 @@ pub async fn record_reply(
         Some(parent)
     };
     let id = insert_turn(&mut tx, chat, Role::Assistant, reply, after).await?;
+    if failed {
+        sqlx::query("UPDATE conversations SET failed = 1 WHERE id = ?1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+    }
     if continues {
         set_head(&mut tx, chat, Some(&id)).await?;
     }
@@ -472,6 +500,7 @@ pub async fn branch(pool: &SqlitePool, chat: &str, limit: u32) -> Result<Vec<Bra
                 versions: Vec::new(),
                 trace: r.trace,
                 steps: None,
+                failed: false,
             })
         })
         .collect()
@@ -552,6 +581,9 @@ pub struct BranchTurn {
     /// For a reply: its turn's messages, for the model only (issue #213).
     #[serde(skip)]
     pub steps: Option<String>,
+    /// A reply that tells of a failure instead of answering (issue #217).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1079,6 +1111,7 @@ struct PathRow {
     created_at: DateTime<Utc>,
     summary: Option<String>,
     steps: Option<String>,
+    failed: bool,
 }
 
 /// Chat `chat`'s branch back to the newest turn with a summary, at most
@@ -1087,18 +1120,19 @@ struct PathRow {
 /// then still given.
 async fn since_summary(pool: &SqlitePool, chat: &str, limit: u32) -> Result<SinceSummary> {
     let rows: Vec<PathRow> = sqlx::query_as(
-        "WITH RECURSIVE path(id, parent_id, role, content, created_at, depth, summary, steps) AS ( \
+        "WITH RECURSIVE path(id, parent_id, role, content, created_at, depth, summary, steps, \
+                             failed) AS ( \
              SELECT c.id, c.parent_id, c.role, c.content, c.created_at, 1, CAST(NULL AS TEXT), \
-                    c.steps \
+                    c.steps, c.failed \
              FROM conversations c JOIN chats h ON h.head = c.id WHERE h.id = ?1 \
              UNION ALL \
              SELECT c.id, c.parent_id, c.role, c.content, c.created_at, p.depth + 1, s.summary, \
-                    c.steps \
+                    c.steps, c.failed \
              FROM conversations c JOIN path p ON c.id = p.parent_id \
              LEFT JOIN chat_summaries s ON s.turn_id = c.id \
              WHERE p.summary IS NULL AND p.depth <= ?2 \
          ) \
-         SELECT id, parent_id, role, content, created_at, summary, steps FROM path \
+         SELECT id, parent_id, role, content, created_at, summary, steps, failed FROM path \
          ORDER BY depth DESC",
     )
     .bind(chat)
@@ -1128,6 +1162,7 @@ async fn since_summary(pool: &SqlitePool, chat: &str, limit: u32) -> Result<Sinc
             // What the model reads: never a turn's trace, but its steps.
             trace: None,
             steps: row.steps,
+            failed: row.failed,
         });
     }
     let keep = limit as usize;
@@ -1304,11 +1339,21 @@ mod tests {
             .expect("reply");
         let steps = r#"[{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"file_read","input":{}}]}]"#;
         set_steps(&pool, &a, steps).await.expect("steps");
-        let context = context(&pool, &chat, 40, 20).await.expect("context");
-        let reply = context.turns.last().expect("reply");
+        let given = context(&pool, &chat, 40, 20).await.expect("context");
+        let reply = given.turns.last().expect("reply");
         assert_eq!(reply.content, "It says hello.");
         assert_eq!(reply.steps.as_deref(), Some(steps));
-        assert!(context.turns[0].steps.is_none());
+        assert!(given.turns[0].steps.is_none());
+        assert!(!reply.failed);
+        // A failed reply comes back marked, a sibling version of the other.
+        let failed = record_failed_reply(&pool, &chat, &q, "(The model could not answer.)")
+            .await
+            .expect("record")
+            .expect("reply");
+        let context_now = context(&pool, &chat, 40, 20).await.expect("context");
+        let last = context_now.turns.last().expect("reply");
+        assert_eq!(last.id, failed);
+        assert!(last.failed);
         // Never sent to the dashboard.
         assert!(
             !serde_json::to_string(reply)

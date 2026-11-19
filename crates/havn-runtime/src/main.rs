@@ -1026,7 +1026,7 @@ where
                     }
                     Err(e) => {
                         error!(error = %e, "could not find the message's chat");
-                        send_text(&ctx, msg.channel_id, None, format!("(internal error: {e})"));
+                        send_text(&ctx, msg.channel_id, None, SIDE_ERROR.to_string());
                         continue;
                     }
                 }
@@ -1343,18 +1343,19 @@ async fn handle_heartbeat(ctx: Ctx) {
         .collect();
 
     let augmented = augment_with_skills(&ctx, &ctx.system_prompt, &synthesised, None, false).await;
-    let final_text = match run_tool_loop(
-        &ctx,
-        crate::tools::context::HEARTBEAT,
-        &mut messages,
-        &augmented,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    {
+    let final_text = match tool_loop::as_text(
+        run_tool_loop(
+            &ctx,
+            crate::tools::context::HEARTBEAT,
+            &mut messages,
+            &augmented,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await,
+    ) {
         Ok(t) => t,
         Err(e) => {
             error!(error = %e, "heartbeat tool-use loop failed");
@@ -2233,12 +2234,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         }
         Err(e) => {
             error!(error = %e, "could not record the user turn");
-            send_text(
-                &ctx,
-                msg.channel_id,
-                Some(chat),
-                format!("(internal error: {e})"),
-            );
+            send_text(&ctx, msg.channel_id, Some(chat), SIDE_ERROR.to_string());
             return;
         }
     };
@@ -2276,12 +2272,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
             Ok(c) => (c.summary, c.turns),
             Err(e) => {
                 error!(error = %e, "could not load conversation history");
-                send_text(
-                    &ctx,
-                    msg.channel_id,
-                    Some(chat),
-                    format!("(internal error: {e})"),
-                );
+                send_text(&ctx, msg.channel_id, Some(chat), SIDE_ERROR.to_string());
                 return;
             }
         };
@@ -2294,7 +2285,14 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     let replies: Vec<(&str, Option<&str>)> = history
         .iter()
         .filter(|t| t.role == Role::Assistant)
-        .map(|t| (steps::without_note(&t.content), t.steps.as_deref()))
+        .map(|t| {
+            let said = if t.failed {
+                NO_ANSWER
+            } else {
+                steps::without_note(&t.content)
+            };
+            (said, t.steps.as_deref())
+        })
         .collect();
     let mut replies = steps::messages_of_replies(&replies).into_iter();
     let mut messages: Vec<serde_json::Value> = Vec::with_capacity(history.len());
@@ -2308,7 +2306,12 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
                 // A history cut short can start with a reply: as its text,
                 // since a model takes no tool call before anyone spoke.
                 if messages.is_empty() {
-                    messages.extend(steps::plain(steps::without_note(&t.content)));
+                    let said = if t.failed {
+                        NO_ANSWER
+                    } else {
+                        steps::without_note(&t.content)
+                    };
+                    messages.extend(steps::plain(said));
                 } else {
                     messages.extend(reply);
                 }
@@ -2371,7 +2374,8 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         .then(|| tool_loop::Segments::new(msg.channel_id.clone(), chat.clone()));
     // Where this turn's own messages start.
     let turn_start = messages.len();
-    let final_text = match tools::gateway::CONVERSATION
+    let mut final_text_failed: Option<String> = None;
+    let (final_text, failed) = match tools::gateway::CONVERSATION
         .scope(
             msg.channel_id.clone(),
             tools::gateway::CHAT.scope(
@@ -2396,11 +2400,15 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         )
         .await
     {
-        Ok(text) => text,
-        Err(e) => {
+        Ok(text) => (text, None),
+        // A turn that failed (issue #217): not a reply.
+        Err(tool_loop::RunError::Llm(detail)) => (String::new(), Some(detail)),
+        Err(tool_loop::RunError::Infra(e)) => {
             error!(error = %e, "tool-use loop failed");
-            format!("(internal error: {e})")
+            (String::new(), Some(format!("internal error: {e}")))
         }
+        // Stopped, or out of rounds: what it said is the reply.
+        Err(other) => (tool_loop::as_text(Err(other)).unwrap_or_default(), None),
     };
 
     let (trimmed, answered_by) = {
@@ -2409,9 +2417,26 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (trace.trimmed, trace.fallback.clone())
     };
+    // A turn that failed (issue #217): the person is told plainly what kind
+    // of failure it was, the details go to the log and, in the owner's web
+    // chat, under the message. It is kept as a failed reply, so its steps
+    // and the chat's branches stay, and later turns read it as no answer;
+    // /retry or the button answers the message again.
+    let failed = failed.is_some_and(|detail| {
+        warn!(%chat, error = %detail, "the turn failed");
+        let (mut text, again) = failure_text(&detail);
+        if msg.channel == "webchat" {
+            text.push_str(&format!("\n\nWhat failed, shown only here: {detail}"));
+        } else if again {
+            text.push_str(" Send /retry to try again.");
+        }
+        final_text_failed.replace(text);
+        true
+    });
+    let final_text = final_text_failed.take().unwrap_or(final_text);
     // Which model answered, when the chat's was unavailable (issue #216):
     // part of the reply, as kept and as shown.
-    let final_text = match answered_by {
+    let final_text = match answered_by.filter(|_| !failed) {
         Some(model) => {
             let mut text = final_text;
             if !text.is_empty() {
@@ -2426,17 +2451,25 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     // exist only in-memory for this iteration).
     // Under the turn it answers, also when the user moved to another
     // branch meanwhile.
-    let reply_turn = match conversations::record_reply(&ctx.pool, &chat, &answered, &final_text)
-        .await
-    {
+    let recorded = if failed {
+        conversations::record_failed_reply(&ctx.pool, &chat, &answered, &final_text).await
+    } else {
+        conversations::record_reply(&ctx.pool, &chat, &answered, &final_text).await
+    };
+    let reply_turn = match recorded {
         // Facts are flushed to memory from the owner's dashboard chats only:
         // memory is the agent's, and a channel may be someone else.
         Ok(Some(turn)) => {
             // What the turn said and did on the way, for later turns.
-            if let Some(kept) = steps::of_turn(
-                messages.get(turn_start..).unwrap_or_default(),
-                steps::without_note(&final_text),
-            ) && let Err(e) = conversations::set_steps(&ctx.pool, &turn, &kept).await
+            // What the turn did before it failed is kept too: later turns
+            // know what ran.
+            let said = if failed {
+                ""
+            } else {
+                steps::without_note(&final_text)
+            };
+            if let Some(kept) = steps::of_turn(messages.get(turn_start..).unwrap_or_default(), said)
+                && let Err(e) = conversations::set_steps(&ctx.pool, &turn, &kept).await
             {
                 warn!(error = %e, "could not keep the turn's steps");
             }
@@ -2496,18 +2529,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     }
     // Compacted after the reply, and the person told (issue #214).
     if trimmed {
-        let (ctx, chat, channel_id) = (ctx.clone(), chat.clone(), msg.channel_id.clone());
-        let flush = msg.channel == "webchat";
-        // Only once a batch of turns is past the ones kept, so a chat that
-        // stays near the window is not compacted (nor the person told) on
-        // every turn.
-        tokio::spawn(async move {
-            match compact(&ctx, &chat, flush, COMPACT_KEEP).await {
-                Ok(Some(n)) if n > 0 => tell(&ctx, channel_id, chat, COMPACTED_NOTICE).await,
-                Ok(_) => {}
-                Err(e) => warn!(%chat, error = %e, "could not compact the chat"),
-            }
-        });
+        compact_in_background(&ctx, &chat, &msg.channel_id, msg.channel == "webchat");
     }
     let changes = tools::memory::changes(std::mem::take(
         &mut *memory_changes
@@ -2542,7 +2564,7 @@ async fn run_tool_loop(
     model: Option<Arc<String>>,
     thinking: Option<String>,
     segments: Option<tool_loop::Segments>,
-) -> anyhow::Result<String> {
+) -> Result<String, tool_loop::RunError> {
     let mut handle = ctx.parent_handle();
     handle.stop = stop;
     handle.segments = segments;
@@ -2559,7 +2581,7 @@ async fn run_tool_loop(
             Arc::clone(&handle.model),
             tool_loop::TURN_THINKING.scope(
                 thinking,
-                tool_loop::run(&handle, context, messages, system_prompt),
+                tool_loop::run_typed(&handle, context, messages, system_prompt),
             ),
         )
         .await
@@ -2848,6 +2870,75 @@ async fn tell(ctx: &Ctx, channel_id: String, chat: String, text: &str) {
     }
 }
 
+/// Compact chat `chat` of conversation `channel_id` in the background, and
+/// tell the person when it was (issue #214): only once a batch of turns is
+/// past the ones kept, so a chat that stays near the window is not
+/// compacted (nor the person told) on every turn.
+fn compact_in_background(ctx: &Ctx, chat: &str, channel_id: &str, flush: bool) {
+    let (ctx, chat, channel_id) = (ctx.clone(), chat.to_string(), channel_id.to_string());
+    tokio::spawn(async move {
+        match compact(&ctx, &chat, flush, COMPACT_KEEP).await {
+            Ok(Some(n)) if n > 0 => tell(&ctx, channel_id, chat, COMPACTED_NOTICE).await,
+            Ok(_) => {}
+            Err(e) => warn!(%chat, error = %e, "could not compact the chat"),
+        }
+    });
+}
+
+/// What a person is told when the agent itself failed before it could
+/// ask its model (issue #217): the details go to the log.
+const SIDE_ERROR: &str =
+    "(Something went wrong on the agent's side; please try again in a moment.)";
+
+/// What a reply that failed reads as to later turns (issue #217): no
+/// answer, not the failure.
+const NO_ANSWER: &str = "(No answer was given to this message.)";
+
+/// What a person is told when their message could not be answered (issue
+/// #217), by the kind of failure `detail` says, without its details; and
+/// whether trying again may help.
+fn failure_text(detail: &str) -> (String, bool) {
+    let d = detail.to_ascii_lowercase();
+    let (why, again) = if d.starts_with("internal error") {
+        ("something went wrong on the agent's side.", true)
+    } else if d.contains("is unavailable") || d.contains("overloaded") || d.contains(" 429") {
+        (
+            "its provider is overloaded or cannot be reached right now. Try again in a minute.",
+            true,
+        )
+    } else if d.contains("does not allow network egress") {
+        (
+            "this agent's policy does not let it reach the model's provider.",
+            false,
+        )
+    } else if d.contains("llm requests in flight") {
+        (
+            "the agent is busy with other replies. Try again in a moment.",
+            true,
+        )
+    } else if d.contains("no usable credential") || d.contains("credential encryption") {
+        (
+            "no API key works for its provider; the agent's owner can check them.",
+            false,
+        )
+    } else if d.contains("token budget") || d.contains("budget exhausted") {
+        ("the token budget is used up for now.", false)
+    } else if d.contains("not allowed") || d.contains("does not list") || d.contains("not one of") {
+        ("the model asked for is not available to this agent.", false)
+    } else if d.contains("too long")
+        || d.contains("context")
+        || d.contains("limit for one llm request")
+    {
+        (
+            "the chat is longer than the model takes, even cut down. /compact or /new may help.",
+            false,
+        )
+    } else {
+        ("the provider refused or failed the request.", true)
+    };
+    (format!("(The model could not answer: {why})"), again)
+}
+
 /// What a person is told when their chat was compacted because it had
 /// grown past the model's context window.
 const COMPACTED_NOTICE: &str = "(This chat has grown longer than the model takes at once, so \
@@ -2943,7 +3034,13 @@ async fn summarize(
         let mut read = 0;
         let mut through = due.through.clone();
         for (n, turn) in due.turns.iter().enumerate() {
-            let text: String = turn.content.chars().take(SUMMARY_TURN_CHARS).collect();
+            // A failed reply is no answer, not its failure (issue #217).
+            let content = if turn.failed {
+                NO_ANSWER
+            } else {
+                turn.content.as_str()
+            };
+            let text: String = content.chars().take(SUMMARY_TURN_CHARS).collect();
             let chars = text.chars().count();
             if n > 0 && read + chars > cap {
                 break;
@@ -3759,6 +3856,37 @@ mod tests {
             with_attachments(String::new(), &[untranscribed])
                 .ends_with("; it was not transcribed, so what is said in it is not known]")
         );
+    }
+
+    #[test]
+    fn a_failure_is_told_by_its_kind_without_its_details() {
+        let told = |d: &str| failure_text(d).0;
+        let (unavailable, again) = failure_text(
+            "the provider \"openrouter\" is unavailable (upstream 503: secret body) after 4 tries",
+        );
+        assert!(unavailable.contains("overloaded") && again, "{unavailable}");
+        assert!(!unavailable.contains("secret body"));
+        let (key, again) = failure_text("no usable credential for provider \"openai\"");
+        assert!(key.contains("API key") && !again);
+        assert!(told("token budget exhausted: daily cap").contains("budget"));
+        assert!(
+            told("model \"x\" is not allowed by this agent's policy").contains("not available")
+        );
+        assert!(told("internal error: the context budget is wrong").contains("agent's side"));
+        assert!(told("upstream provider error: 400 — Budget 0 is invalid").contains("refused"));
+        assert!(
+            told(
+                "the conversation is 9 bytes over the 4194304-byte limit for one LLM request, \
+                 even without its tool results"
+            )
+            .contains("/compact")
+        );
+        assert!(told("this agent has 16 LLM requests in flight").contains("busy"));
+    }
+
+    #[test]
+    fn a_failed_reply_reads_back_as_no_answer() {
+        assert!(!NO_ANSWER.contains("could not answer"));
     }
 
     #[test]

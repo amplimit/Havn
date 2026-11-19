@@ -536,7 +536,14 @@ pub async fn run(
     messages: &mut Vec<Value>,
     system_prompt: &SystemPrompt,
 ) -> anyhow::Result<String> {
-    match run_typed(handle, context, messages, system_prompt).await {
+    as_text(run_typed(handle, context, messages, system_prompt).await)
+}
+
+/// A loop's outcome as the one text a caller with one channel shows: an
+/// LLM error, the round limit or a stop said in the text; an
+/// infrastructure failure an error.
+pub fn as_text(outcome: Result<String, RunError>) -> anyhow::Result<String> {
+    match outcome {
         Ok(text) => Ok(text),
         Err(RunError::Llm(msg)) => Ok(format!("(LLM error: {msg})")),
         Err(RunError::IterationCap { cap, partial_text }) => {
