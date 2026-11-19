@@ -13,8 +13,9 @@ pub struct ModelEntry {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub vision: bool,
+    /// Shown images: always, never, or tried when unset (issue #202).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
     /// How it thinks (issue #190), passed through as the gateway has it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<serde_json::Value>,
@@ -79,7 +80,11 @@ pub async fn list() -> anyhow::Result<()> {
             .max_output_tokens
             .map(|n| format!("  max_output_tokens={n}"))
             .unwrap_or_default();
-        let vision = if m.vision { "  sees images" } else { "" };
+        let vision = match m.vision {
+            Some(true) => "  sees images",
+            Some(false) => "  no images",
+            None => "",
+        };
         println!("{}{label}{limit}{vision}{default}{title}", m.id);
     }
     Ok(())
@@ -89,7 +94,7 @@ pub async fn add(
     id: &str,
     label: Option<&str>,
     max_output_tokens: Option<u32>,
-    vision: bool,
+    vision: Option<bool>,
     make_default: bool,
 ) -> anyhow::Result<()> {
     let gw = Gateway::from_env()?;
