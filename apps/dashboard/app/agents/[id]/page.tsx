@@ -20,7 +20,13 @@ import {
 } from "@/lib/api";
 import { openChat, type ChatHandle } from "@/lib/websocket";
 import { Markdown } from "@/components/Markdown";
-import type { Attachment, MemoryChange, ServerMessage } from "@/lib/protocol";
+import type {
+  Attachment,
+  ChoiceButton,
+  ChoicePoll,
+  MemoryChange,
+  ServerMessage,
+} from "@/lib/protocol";
 import {
   BookOpen,
   Brain,
@@ -61,6 +67,11 @@ type Bubble = {
    * reply's stored turn, which it stays under. */
   memory?: MemoryChange[];
   anchor?: string;
+  /** A question the agent asked (issue #204): buttons, or a poll of
+   * several answers, and whether it was answered here. */
+  buttons?: ChoiceButton[][];
+  poll?: ChoicePoll;
+  answered?: boolean;
 };
 
 const AGENT_POLL_MS = 5000;
@@ -192,10 +203,12 @@ function mergeStored(prev: Bubble[], fetched: Bubble[], since: number): Bubble[]
   const shown = new Map(prev.flatMap((b) => (b.turn ? [[b.turn, b.id] as const] : [])));
   const stored = fetched.map((s) => (s.turn && shown.has(s.turn) ? { ...s, id: shown.get(s.turn)! } : s));
   const recent = stored.filter((s) => s.ts >= since - CLOCK_SKEW_MS);
+  // A question the agent asked is not a stored turn: it stays (issue #204).
   const kept = prev
     .filter(
       (b) =>
         b.role === "system" ||
+        Boolean(b.buttons?.length || b.poll) ||
         (b.ts >= since && !recent.some((s) => s.role === b.role && s.content === b.content)),
     )
     .map((b) => underAnchor(b, stored));
@@ -619,7 +632,7 @@ export default function ChatPage({
             endLive();
           }
           if (msg.type === "agent_message") {
-            pushBubble("agent", msg.content);
+            pushBubble("agent", msg.content, { buttons: msg.buttons, poll: msg.poll });
           } else if (msg.type === "error") {
             pushBubble("system", `error: ${msg.message}`);
           }
@@ -751,11 +764,22 @@ export default function ChatPage({
     setLive([]);
   }
 
-  function pushBubble(role: Bubble["role"], content: string) {
+  function pushBubble(role: Bubble["role"], content: string, extra: Partial<Bubble> = {}) {
     setBubbles((prev) => [
       ...prev,
-      { id: bubbleIdRef.current++, role, content, ts: Date.now() },
+      { ...extra, id: bubbleIdRef.current++, role, content, ts: Date.now() },
     ]);
+  }
+
+  // Answer a question the agent asked: what the button or the poll sends,
+  // shown as what was chosen.
+  function choose(bubbleId: number, data: string, shown: string) {
+    if (!chatRef.current || wsState !== "open") return;
+    setBubbles((prev) => prev.map((b) => (b.id === bubbleId ? { ...b, answered: true } : b)));
+    pushBubble("you", shown);
+    chatRef.current.send(data, chatIdRef.current ?? undefined);
+    if (waiting === 0) clearLive();
+    setWaiting((n) => n + 1);
   }
 
   function sendText(text: string, files: Attachment[] = []) {
@@ -1203,6 +1227,12 @@ export default function ChatPage({
                   b.role === "agent" && b.turn && !scope ? () => regenerate(idx, b.turn!) : undefined
                 }
                 onVersion={(turn) => void showVersion(turn)}
+                onChoose={
+                  // A chat-app chat is answered in its app.
+                  !scope && (b.buttons?.length || b.poll)
+                    ? (data, shown) => choose(b.id, data, shown)
+                    : undefined
+                }
                 onRetry={
                   b.role === "agent" && !b.turn && !scope
                     ? () => {
@@ -1650,6 +1680,72 @@ function SearchResults({
   );
 }
 
+/** The buttons of a question the agent asked, or the options of its
+ * poll to tick; answered once (issue #204). */
+function Choices({
+  bubble,
+  onChoose,
+}: {
+  bubble: Bubble;
+  onChoose: (data: string, shown: string) => void;
+}) {
+  const [ticked, setTicked] = useState<number[]>([]);
+  const done = bubble.answered === true;
+  if (bubble.poll) {
+    const poll = bubble.poll;
+    return (
+      <div className="flex flex-col gap-1.5" style={{ maxWidth: "min(85%, 720px)" }}>
+        {poll.options.map((option, n) => (
+          <label key={n} className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              disabled={done}
+              checked={ticked.includes(n + 1)}
+              onChange={(e) =>
+                setTicked((prev) =>
+                  e.target.checked ? [...prev, n + 1] : prev.filter((x) => x !== n + 1),
+                )
+              }
+            />
+            {option}
+          </label>
+        ))}
+        <div>
+          <button
+            type="button"
+            className="btn-secondary"
+            disabled={done}
+            onClick={() => {
+              const numbers = [...ticked].sort((a, b) => a - b);
+              const shown = numbers.length
+                ? numbers.map((n) => poll.options[n - 1]).join(", ")
+                : "none of these";
+              onChoose(`${poll.answer} ${numbers.join(",")}`.trim(), `Chose: ${shown}`);
+            }}
+          >
+            send
+          </button>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="flex flex-wrap gap-1.5" style={{ maxWidth: "min(85%, 720px)" }}>
+      {(bubble.buttons ?? []).flat().map((button) => (
+        <button
+          key={button.data}
+          type="button"
+          className="btn-secondary"
+          disabled={done}
+          onClick={() => onChoose(button.data, `Chose: ${button.label}`)}
+        >
+          {button.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function Bubble({
   bubble,
   busy,
@@ -1662,6 +1758,7 @@ function Bubble({
   onUpload,
   onRegenerate,
   onVersion,
+  onChoose,
 }: {
   bubble: Bubble;
   agentId: string;
@@ -1678,6 +1775,8 @@ function Bubble({
   onUpload: (picked: File[], room: number, done: (a: Attachment) => void) => Promise<void>;
   onRegenerate?: () => void;
   onVersion: (turn: string) => void;
+  /** Answer the question it asks: what to send, and what to show sent. */
+  onChoose?: (data: string, shown: string) => void;
 }) {
   const [editing, setEditing] = useState(false);
   const align =
@@ -1756,6 +1855,7 @@ function Bubble({
         )}
       </div>
       )}
+      {onChoose && <Choices bubble={bubble} onChoose={onChoose} />}
       {!isSystem && (
         <ActionRow
           text={message ? message.text : bubble.content}

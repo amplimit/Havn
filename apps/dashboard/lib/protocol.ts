@@ -12,9 +12,23 @@ export type ClientMessage =
   | { type: "stop"; conversation?: string }
   | { type: "decide"; id: string; approve: boolean; remember: boolean };
 
+/** A button under a message: pressed, its `data` is sent as the next message. */
+export type ChoiceButton = { label: string; data: string };
+
+/** A question of several answers: the chosen numbers (from 1, comma-separated) go after `answer`. */
+export type ChoicePoll = { question: string; options: string[]; answer: string };
+
 export type ServerMessage =
-  /** `broadcast`: sent on its own (heartbeat, cron), not a reply; `conversation`: the chat it answers. */
-  | { type: "agent_message"; content: string; broadcast?: boolean; conversation?: string }
+  /** `broadcast`: sent on its own (heartbeat, cron), not a reply; `conversation`: the chat it answers;
+   * `buttons` and `poll`: a question the agent asked (issue #204). */
+  | {
+      type: "agent_message";
+      content: string;
+      broadcast?: boolean;
+      conversation?: string;
+      buttons?: ChoiceButton[][];
+      poll?: ChoicePoll;
+    }
   | { type: "error"; message: string }
   /** A tool call waits for the owner's approval; `conversation` when it came from a channel. */
   | {
