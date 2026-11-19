@@ -132,6 +132,10 @@ pub struct AgentSocketCtx {
     /// call, whatever the agent's config asks for, and provider base URLs.
     pub llm: Arc<crate::config::LlmConfig>,
     pub models: Arc<arc_swap::ArcSwap<crate::model_catalog::ModelCatalog>>,
+    /// The models without `vision` set whose provider refused images
+    /// (issue #202), as their entries are: they are sent notes in place of
+    /// images until the entry changes or the gateway restarts.
+    pub vision_refused: VisionRefused,
     /// True when agents run under `NamespaceSpawner`, each in its own
     /// `agent-<id>` cgroup. The gateway then accepts a connection for an
     /// agent only from a process in that cgroup. With the unisolated
@@ -167,6 +171,17 @@ pub struct AgentSocketCtx {
     pub egress_proxy: Option<(havn_spawner::network::AgentSubnetPool, u16)>,
     /// Rate of the `set_timezone` gateway tool, per owner.
     pub timezone_rate: Arc<crate::web_search::UserRate>,
+}
+
+/// Model entries, by id and hash, whose provider refused images.
+pub type VisionRefused = Arc<std::sync::Mutex<std::collections::HashSet<(String, u64)>>>;
+
+/// The key of `entry` in [`VisionRefused`]: an edited entry is tried again.
+fn vision_key(entry: &crate::model_catalog::ModelEntry) -> (String, u64) {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::hash::DefaultHasher::new();
+    entry.hash(&mut hasher);
+    (entry.id.clone(), hasher.finish())
 }
 
 /// Bind the Unix-socket listener and accept agent connections forever.
@@ -2133,38 +2148,21 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                     .await;
                 return;
             }
-            // Images the turn names in the agent's inbox, read here.
+            // Images the turn names in the agent's inbox, read where it is
+            // sent: shown to a model that takes them, tried with one whose
+            // entry does not say (issue #202).
             let workspace = ctx
                 .workspace_root
                 .join(agent_id.to_string())
                 .join("workspace");
-            let vision = entry.vision;
-            ar = match tokio::task::spawn_blocking(move || {
-                llm_proxy::resolve_workspace_images(&mut ar, &workspace, vision);
-                ar
-            })
-            .await
-            {
-                Ok(ar) => ar,
-                Err(e) => {
-                    warn!(%agent_id, error = %e, "could not read the images of an LLM request");
-                    let _ = ctx
-                        .registry
-                        .send(
-                            agent_id,
-                            GatewayToAgent::LlmResponse(LlmResponse {
-                                request_id,
-                                outcome: LlmOutcome::Error {
-                                    message: format!("reading the turn's images failed: {e}"),
-                                },
-                                provider_response: serde_json::Value::Null,
-                                usage: None,
-                            }),
-                        )
-                        .await;
-                    return;
-                }
-            };
+            let key = vision_key(&entry);
+            let refused_before = ctx
+                .vision_refused
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&key);
+            let show = entry.vision.unwrap_or(!refused_before);
+            let try_blind = entry.vision.is_none();
             let Some(ring) = ctx.keyring.as_ref() else {
                 let _ = ctx
                     .registry
@@ -2223,33 +2221,75 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                 agent_team: agent.team_id,
                 budget: policy.budget.clone(),
             };
-            let result = match &reply {
-                Some(reply) => {
-                    llm_proxy::stream_with_provider(
-                        &ctx.db,
-                        &ctx.http,
-                        ring,
-                        &billing,
-                        entry.provider(),
-                        entry.max_output_tokens,
-                        &ar,
-                        &ctx.llm,
-                        reply.sink.as_ref(),
-                    )
-                    .await
+            let reply_text = reply.as_ref();
+            let ctx_ref = &ctx;
+            let (billing_ref, entry_ref) = (&billing, &entry);
+            let send = move |request: AnthropicRequest| async move {
+                match reply_text {
+                    Some(reply) => {
+                        llm_proxy::stream_with_provider(
+                            &ctx_ref.db,
+                            &ctx_ref.http,
+                            ring,
+                            billing_ref,
+                            entry_ref.provider(),
+                            entry_ref.max_output_tokens,
+                            &request,
+                            &ctx_ref.llm,
+                            reply.sink.as_ref(),
+                        )
+                        .await
+                    }
+                    None => {
+                        llm_proxy::complete_with_provider(
+                            &ctx_ref.db,
+                            &ctx_ref.http,
+                            ring,
+                            billing_ref,
+                            entry_ref.provider(),
+                            entry_ref.max_output_tokens,
+                            &request,
+                            &ctx_ref.llm,
+                        )
+                        .await
+                    }
                 }
-                None => {
-                    llm_proxy::complete_with_provider(
-                        &ctx.db,
-                        &ctx.http,
-                        ring,
-                        &billing,
-                        entry.provider(),
-                        entry.max_output_tokens,
-                        &ar,
-                        &ctx.llm,
-                    )
-                    .await
+            };
+            let result = match llm_proxy::send_seeing(ar, workspace, show, try_blind, send).await {
+                Ok(seen) => {
+                    if seen.model_takes_none
+                        && ctx
+                            .vision_refused
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(key)
+                    {
+                        warn!(
+                            model = %entry.id,
+                            "the provider refused images for this model; it is sent a note in their \
+                             place from now on (until its entry changes or the gateway restarts). \
+                             Set `vision = false` on it in [[llm.models]] to skip the first try"
+                        );
+                    }
+                    seen.result
+                }
+                Err(e) => {
+                    warn!(%agent_id, error = %e, "could not read the images of an LLM request");
+                    let _ = ctx
+                        .registry
+                        .send(
+                            agent_id,
+                            GatewayToAgent::LlmResponse(LlmResponse {
+                                request_id,
+                                outcome: LlmOutcome::Error {
+                                    message: format!("reading the turn's images failed: {e}"),
+                                },
+                                provider_response: serde_json::Value::Null,
+                                usage: None,
+                            }),
+                        )
+                        .await;
+                    return;
                 }
             };
             match result {
@@ -3057,6 +3097,7 @@ mod tests {
         let registry = AgentRegistry::new();
         let webchat_router = WebChatRouter::new();
         AgentSocketCtx {
+            vision_refused: VisionRefused::default(),
             workspace_root: std::env::temp_dir(),
             cron_scheduler: CronScheduler::new(
                 db.clone(),
@@ -3194,7 +3235,7 @@ mod tests {
                     id: "openrouter:cheap/model".into(),
                     label: None,
                     max_output_tokens: None,
-                    vision: false,
+                    vision: None,
                     thinking: None,
                 }],
             }));
@@ -3375,7 +3416,7 @@ mod tests {
                         id: (*id).into(),
                         label: None,
                         max_output_tokens: None,
-                        vision: false,
+                        vision: None,
                         thinking: None,
                     })
                     .collect(),
