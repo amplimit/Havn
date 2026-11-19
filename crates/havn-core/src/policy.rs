@@ -34,6 +34,32 @@ pub struct Policy {
     pub chat_titles: ChatTitles,
     /// Tool rounds a message may take (issue #219).
     pub tool_rounds: ToolRounds,
+    /// How long shell commands may run, and how many in the background
+    /// (issue #215).
+    pub shell: ShellLimits,
+}
+
+/// How long shell commands may run, and how many in the background (issue
+/// #215). A limit of 0 counts as 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ShellLimits {
+    /// Seconds a command runs when it does not say.
+    pub timeout_seconds: u32,
+    /// Seconds a command may ask for at most.
+    pub max_timeout_seconds: u32,
+    /// Commands running in the background at once.
+    pub background: u32,
+}
+
+impl Default for ShellLimits {
+    fn default() -> Self {
+        Self {
+            timeout_seconds: 300,
+            max_timeout_seconds: 1800,
+            background: 8,
+        }
+    }
 }
 
 /// Tool rounds one message may take (issue #219): the model calling tools
@@ -94,6 +120,7 @@ impl Default for Policy {
             hooks: HookPolicy::default(),
             chat_titles: ChatTitles::default(),
             tool_rounds: ToolRounds::default(),
+            shell: ShellLimits::default(),
         }
     }
 }
@@ -632,6 +659,17 @@ impl Policy {
                 max: self.tool_rounds.max.min(ceiling.tool_rounds.max),
                 subagent: self.tool_rounds.subagent.min(ceiling.tool_rounds.subagent),
             },
+            shell: ShellLimits {
+                timeout_seconds: self
+                    .shell
+                    .timeout_seconds
+                    .min(ceiling.shell.timeout_seconds),
+                max_timeout_seconds: self
+                    .shell
+                    .max_timeout_seconds
+                    .min(ceiling.shell.max_timeout_seconds),
+                background: self.shell.background.min(ceiling.shell.background),
+            },
         }
     }
 
@@ -746,6 +784,14 @@ impl Policy {
             tool_rounds: ToolRounds {
                 max: self.tool_rounds.max.max(other.tool_rounds.max),
                 subagent: self.tool_rounds.subagent.max(other.tool_rounds.subagent),
+            },
+            shell: ShellLimits {
+                timeout_seconds: self.shell.timeout_seconds.max(other.shell.timeout_seconds),
+                max_timeout_seconds: self
+                    .shell
+                    .max_timeout_seconds
+                    .max(other.shell.max_timeout_seconds),
+                background: self.shell.background.max(other.shell.background),
             },
         }
     }
@@ -905,6 +951,19 @@ mod tests {
                 subagent: 50
             }
         );
+    }
+
+    #[test]
+    fn shell_limits_default_and_narrow() {
+        let policy: Policy = serde_json::from_str("{}").expect("empty policy");
+        assert_eq!(policy.shell, ShellLimits::default());
+        let mut tight = Policy::default();
+        tight.shell.max_timeout_seconds = 600;
+        tight.shell.background = 2;
+        let clamped = Policy::default().clamp_to(&tight);
+        assert_eq!(clamped.shell.max_timeout_seconds, 600);
+        assert_eq!(clamped.shell.background, 2);
+        assert_eq!(clamped.shell.timeout_seconds, 300);
     }
 
     #[test]

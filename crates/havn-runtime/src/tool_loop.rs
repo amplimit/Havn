@@ -42,6 +42,9 @@ tokio::task_local! {
     /// What the conversation turn whose tool loop runs did on the way:
     /// its reasoning and tool calls, kept with its reply (issue #178).
     pub static TRACE: Arc<std::sync::Mutex<Trace>>;
+    /// The stop of the turn whose tools run: a command it starts in the
+    /// background ends with it (issue #215).
+    pub static TURN_STOP: tokio_util::sync::CancellationToken;
 }
 
 /// Entries one turn's trace keeps at most, characters of all its parts,
@@ -418,10 +421,16 @@ pub async fn run_typed(
             segments.send(&handle.writer_tx, text).await;
         }
 
-        let tool_results = unless_stopped(
-            handle.stop.as_ref(),
-            execute_tool_uses(handle, context, &content),
-        )
+        let tool_results = unless_stopped(handle.stop.as_ref(), async {
+            match &handle.stop {
+                Some(stop) => {
+                    TURN_STOP
+                        .scope(stop.clone(), execute_tool_uses(handle, context, &content))
+                        .await
+                }
+                None => execute_tool_uses(handle, context, &content).await,
+            }
+        })
         .await
         .ok_or_else(|| stopped(&said))?;
         if tool_results.is_empty() {
