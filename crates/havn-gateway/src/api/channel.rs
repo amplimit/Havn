@@ -1275,6 +1275,8 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
         Some((text, question)) => (MessageContent::Text { text }, Some(question)),
         None => (content, None),
     };
+    // Whether the owner writes, through a linked account (issue #221).
+    let from_owner = owner_linked(state, channel, agent_id, &inb.sender_id).await;
     let msg = InboundMessage {
         conversation: None,
         branch,
@@ -1285,6 +1287,7 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
         timestamp: inb.timestamp,
         attachments: Vec::new(),
         raw: inb.raw.unwrap_or(serde_json::Value::Null),
+        from_owner,
     };
 
     // Parity with WebChat: a message to a stopped agent should wake it, not

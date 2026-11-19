@@ -31,6 +31,10 @@ pub struct InboundMessage {
     /// Original platform payload, preserved verbatim for adapter-specific features.
     #[serde(default)]
     pub raw: serde_json::Value,
+    /// From the agent's owner: the dashboard's web chat, or a chat-app
+    /// sender linked to the owner (issue #221). Told to the model.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub from_owner: bool,
 }
 
 /// A file sent with a message (issue #106), saved in the agent's

@@ -525,6 +525,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             attachments: Vec::new(),
             raw: serde_json::Value::Null,
+            from_owner: false,
         })
     }
 
