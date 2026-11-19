@@ -2256,8 +2256,8 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                 }
             };
             let result = match llm_proxy::send_seeing(ar, workspace, show, try_blind, send).await {
-                Ok((result, refused)) => {
-                    if refused
+                Ok(seen) => {
+                    if seen.model_takes_none
                         && ctx
                             .vision_refused
                             .lock()
@@ -2271,7 +2271,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                              Set `vision = false` on it in [[llm.models]] to skip the first try"
                         );
                     }
-                    result
+                    seen.result
                 }
                 Err(e) => {
                     warn!(%agent_id, error = %e, "could not read the images of an LLM request");

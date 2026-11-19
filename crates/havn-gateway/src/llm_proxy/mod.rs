@@ -682,31 +682,34 @@ pub const MAX_REQUEST_IMAGE_BYTES: u64 = 12_000_000;
 /// Largest side of an image shown, in pixels: providers refuse larger.
 pub const MAX_IMAGE_SIDE: u32 = 8000;
 
-/// Put the images an agent's turn refers to in `request` (issue #106).
-/// The runtime names a file of its inbox (`{"type": "image", "source":
-/// {"type": "workspace", "path": "inbox/<name>"}}`) rather than sending
-/// its bytes, which would not fit a frame; the gateway reads it here,
-/// through [`crate::agent_files`] so nothing the agent controls is
-/// followed. See [`send_seeing`] for a model that may not take them. At most [`MAX_REQUEST_IMAGES`] of them, of at most
-/// [`MAX_REQUEST_IMAGE_BYTES`] together, each read once, are shown, and
-/// only to a model with `vision`; every other one (not a PNG, JPEG, GIF or
-/// WebP by its first bytes, too large, missing, outside the inbox, one
-/// too many) becomes a line saying why. Blocking: it reads files.
 /// Whether `request` shows the model an image.
 pub fn shows_images(request: &AnthropicRequest) -> bool {
+    has_block(request, |b| {
+        b.get("type").and_then(serde_json::Value::as_str) == Some("image")
+    })
+}
+
+/// Whether `request` names an image of the agent's workspace.
+fn names_workspace_images(request: &AnthropicRequest) -> bool {
+    has_block(request, |b| {
+        b.get("type").and_then(serde_json::Value::as_str) == Some("image")
+            && b.pointer("/source/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("workspace")
+    })
+}
+
+fn has_block(request: &AnthropicRequest, found: impl Fn(&serde_json::Value) -> bool) -> bool {
     request.messages.iter().any(|m| {
-        m.content.as_array().is_some_and(|blocks| {
-            blocks
-                .iter()
-                .any(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("image"))
-        })
+        m.content
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().any(&found))
     })
 }
 
 /// Whether the provider refused a request outright (a 4xx other than an
-/// authentication, payment, timeout or rate refusal), as one does that
-/// shows images to a model that takes none (issue #202): OpenRouter
-/// answers 404 "No endpoints found that support image input".
+/// authentication, payment, timeout or rate refusal): one that shows
+/// images is then tried again without them (issue #202).
 pub fn refused_request(e: &ProxyError) -> bool {
     matches!(
         e,
@@ -715,24 +718,59 @@ pub fn refused_request(e: &ProxyError) -> bool {
     )
 }
 
+/// What providers say when a model takes no images, lowercased: OpenRouter
+/// ("No endpoints found that support image input"), OpenAI ("image_url is
+/// only supported by certain models") and others.
+const NO_IMAGE_INPUT: &[&str] = &[
+    "support image input",
+    "image_url is only supported",
+    "does not support image",
+    "doesn't support image",
+    "image input is not supported",
+    "images are not supported",
+    "does not support vision",
+];
+
+/// Whether the provider's refusal says the model takes no images, rather
+/// than that something else (the image, the context, a tool) was wrong.
+pub fn refused_images(e: &ProxyError) -> bool {
+    match e {
+        ProxyError::Upstream { message, .. } if refused_request(e) => {
+            let message = message.to_ascii_lowercase();
+            NO_IMAGE_INPUT.iter().any(|phrase| message.contains(phrase))
+        }
+        _ => false,
+    }
+}
+
+/// How a request with images went (issue #202).
+#[derive(Debug)]
+pub struct Seen {
+    pub result: Result<AnthropicResponse, ProxyError>,
+    /// The provider refused it with images, saying the model takes none,
+    /// and took it without them: the model may be sent notes from now on.
+    pub model_takes_none: bool,
+}
+
 /// Send `request` (by `send`) with the images its turn names in
-/// `workspace` shown when `show`. With `retry_blind`, a refusal of a
-/// request that showed images (a model that takes none, issue #202) sends
-/// it once more with each image a line saying the model cannot see it.
-/// The result, and whether the images were refused.
+/// `workspace` shown when `show`. With `retry_blind`, a request that showed
+/// images and was refused outright goes once more with each image a line
+/// saying the model cannot see it; if that is refused too, the first
+/// refusal is the result.
 pub async fn send_seeing<F, Fut>(
     request: AnthropicRequest,
     workspace: std::path::PathBuf,
     show: bool,
     retry_blind: bool,
     mut send: F,
-) -> Result<(Result<AnthropicResponse, ProxyError>, bool), tokio::task::JoinError>
+) -> Result<Seen, tokio::task::JoinError>
 where
     F: FnMut(AnthropicRequest) -> Fut,
     Fut: std::future::Future<Output = Result<AnthropicResponse, ProxyError>>,
 {
-    // The request as the agent sent it, for the second try.
-    let blind = (show && retry_blind).then(|| request.clone());
+    // The request as the agent sent it, for the second try; only when it
+    // has images to leave out.
+    let blind = (show && retry_blind && names_workspace_images(&request)).then(|| request.clone());
     let shown = tokio::task::spawn_blocking(move || {
         let mut request = request;
         resolve_workspace_images(&mut request, &workspace, show);
@@ -741,16 +779,43 @@ where
     .await?;
     let showed = shows_images(&shown);
     let result = send(shown).await;
-    match (blind, &result) {
-        (Some(mut blind), Err(e)) if showed && refused_request(e) => {
-            // Without vision no file is read.
-            resolve_workspace_images(&mut blind, std::path::Path::new(""), false);
-            Ok((send(blind).await, true))
-        }
-        _ => Ok((result, false)),
+    let (Some(mut blind), Err(first)) = (blind, &result) else {
+        return Ok(Seen {
+            result,
+            model_takes_none: false,
+        });
+    };
+    if !showed || !refused_request(first) {
+        return Ok(Seen {
+            result,
+            model_takes_none: false,
+        });
+    }
+    // Without vision no file is read.
+    resolve_workspace_images(&mut blind, std::path::Path::new(""), false);
+    match send(blind).await {
+        Ok(answer) => Ok(Seen {
+            model_takes_none: refused_images(first),
+            result: Ok(answer),
+        }),
+        Err(_) => Ok(Seen {
+            result,
+            model_takes_none: false,
+        }),
     }
 }
 
+/// Put the images an agent's turn refers to in `request` (issue #106).
+/// The runtime names a file of its inbox (`{"type": "image", "source":
+/// {"type": "workspace", "path": "inbox/<name>"}}`) rather than sending
+/// its bytes, which would not fit a frame; the gateway reads it here,
+/// through [`crate::agent_files`] so nothing the agent controls is
+/// followed. At most [`MAX_REQUEST_IMAGES`] of them, of at most
+/// [`MAX_REQUEST_IMAGE_BYTES`] together, each read once, are shown, and
+/// only to a model with `vision`; every other one (not a PNG, JPEG, GIF or
+/// WebP by its first bytes, too large, missing, outside the inbox, one
+/// too many) becomes a line saying why. Blocking: it reads files. See
+/// [`send_seeing`] for a model that may not take them.
 pub fn resolve_workspace_images(
     request: &mut AnthropicRequest,
     workspace: &std::path::Path,
@@ -1344,7 +1409,7 @@ mod tests {
     async fn a_refused_image_goes_again_as_a_note() {
         let ws = tempfile::tempdir().expect("tmp");
         let sent = std::sync::Mutex::new(Vec::new());
-        let (result, refused) = send_seeing(
+        let seen = send_seeing(
             picture_request(ws.path()),
             ws.path().to_path_buf(),
             true,
@@ -1353,7 +1418,7 @@ mod tests {
         )
         .await
         .expect("join");
-        assert!(result.is_ok() && refused);
+        assert!(seen.result.is_ok() && seen.model_takes_none);
         let sent = sent.into_inner().expect("lock");
         assert_eq!(sent.len(), 2);
         assert!(shows_images(&sent[0]));
@@ -1369,7 +1434,7 @@ mod tests {
         let ws = tempfile::tempdir().expect("tmp");
         for (show, retry) in [(true, false), (false, true)] {
             let sent = std::sync::Mutex::new(Vec::new());
-            let (result, refused) = send_seeing(
+            let seen = send_seeing(
                 picture_request(ws.path()),
                 ws.path().to_path_buf(),
                 show,
@@ -1378,8 +1443,8 @@ mod tests {
             )
             .await
             .expect("join");
-            assert!(!refused);
-            assert_eq!(result.is_ok(), !show, "show {show}");
+            assert!(!seen.model_takes_none);
+            assert_eq!(seen.result.is_ok(), !show, "show {show}");
             assert_eq!(
                 sent.lock().expect("lock").len(),
                 1,
@@ -1388,7 +1453,7 @@ mod tests {
         }
         // A refusal that is not about images is not tried again.
         let sent = std::sync::Mutex::new(0);
-        let (result, refused) = send_seeing(
+        let seen = send_seeing(
             picture_request(ws.path()),
             ws.path().to_path_buf(),
             true,
@@ -1403,8 +1468,78 @@ mod tests {
         )
         .await
         .expect("join");
-        assert!(result.is_err() && !refused);
+        assert!(seen.result.is_err() && !seen.model_takes_none);
         assert_eq!(*sent.lock().expect("lock"), 1);
+    }
+
+    #[tokio::test]
+    async fn only_a_refusal_of_images_that_goes_without_them_is_learned() {
+        let ws = tempfile::tempdir().expect("tmp");
+        // The image was what was wrong (a broken file): retried, not learned.
+        let seen = send_seeing(
+            picture_request(ws.path()),
+            ws.path().to_path_buf(),
+            true,
+            true,
+            |request| {
+                std::future::ready(if shows_images(&request) {
+                    Err(ProxyError::Upstream {
+                        status: 400,
+                        message: "Invalid image data".into(),
+                    })
+                } else {
+                    Ok(answer())
+                })
+            },
+        )
+        .await
+        .expect("join");
+        assert!(seen.result.is_ok() && !seen.model_takes_none);
+        // Refused either way (the context is too long): the first refusal
+        // is the answer, and nothing is learned.
+        let tries = std::sync::Mutex::new(0);
+        let seen = send_seeing(
+            picture_request(ws.path()),
+            ws.path().to_path_buf(),
+            true,
+            true,
+            |_| {
+                let mut n = tries.lock().expect("lock");
+                *n += 1;
+                std::future::ready(Err::<AnthropicResponse, _>(ProxyError::Upstream {
+                    status: 400,
+                    message: format!("context too long ({n})"),
+                }))
+            },
+        )
+        .await
+        .expect("join");
+        assert!(!seen.model_takes_none);
+        let message = seen.result.expect_err("refused").to_string();
+        assert!(message.contains("(1)"), "the first refusal: {message}");
+        assert_eq!(*tries.lock().expect("lock"), 2);
+    }
+
+    #[test]
+    fn a_refusal_of_image_input_is_told_apart() {
+        let upstream = |status, message: &str| ProxyError::Upstream {
+            status,
+            message: message.into(),
+        };
+        assert!(refused_images(&upstream(
+            404,
+            "No endpoints found that support image input"
+        )));
+        assert!(refused_images(&upstream(
+            400,
+            "Invalid content type. image_url is only supported by certain models."
+        )));
+        assert!(!refused_images(&upstream(400, "Invalid image data")));
+        assert!(!refused_images(&upstream(400, "prompt is too long")));
+        assert!(!refused_images(&upstream(
+            429,
+            "does not support image right now"
+        )));
     }
 
     #[test]
