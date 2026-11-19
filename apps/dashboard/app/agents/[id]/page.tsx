@@ -2685,6 +2685,7 @@ function stepText({ tool, detail }: Step): string {
     web_search: "Searching the web",
     web_fetch: "Reading a page",
     shell: "Running",
+    process: "Checking a background command",
     file_read: "Reading",
     file_write: "Writing",
     file_edit: "Editing",

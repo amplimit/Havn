@@ -1,23 +1,45 @@
-//! `shell` tool — run a bash command in the agent's process context.
+//! `shell` and `process` tools — run commands in the agent's environment.
 //!
 //! Under `NamespaceSpawner` the shell runs inside the agent's namespaces,
 //! cgroup, Landlock and seccomp confinement (spec §4.1), in the Landlock
 //! domain of tool processes (`sandbox::confine_tool`). Under the dev-only
 //! `SubprocessSpawner` it inherits whatever the runtime can do on the
 //! host.
+//!
+//! A command runs for the policy's `shell.timeout_seconds`, or as long as
+//! it asks up to `shell.max_timeout_seconds` (issue #215); on a timeout
+//! what it printed so far comes back. One started with `background: true`
+//! goes on after the call, as a process the `process` tool lists, reads,
+//! waits on and kills; the turn's stop ends the ones it started.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::process::Command;
-use tokio::time::timeout;
+use tokio::io::AsyncReadExt as _;
+use tokio::process::{Child, Command};
+use tokio::sync::watch;
 
 use super::{Tool, ToolCtx, ToolResult};
 
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+/// Output kept of a command: its first bytes and its last.
+const HEAD_BYTES: usize = 192 * 1024;
+const TAIL_BYTES: usize = 64 * 1024;
+/// How long output is still read after a command ended: a process it left
+/// running may hold its pipes open.
+const DRAIN: Duration = Duration::from_secs(2);
+/// Ended background commands kept for their output to be read.
+const ENDED_KEPT: usize = 16;
+/// How often a background command whose first process ended is checked
+/// for others of its group still running.
+const GROUP_POLL: Duration = Duration::from_secs(1);
+/// Seconds `process wait` waits when it does not say.
+const DEFAULT_WAIT_SECONDS: u64 = 30;
+/// Characters of a command shown in a list.
+const COMMAND_SHOWN: usize = 80;
 
 pub struct ShellTool;
 
@@ -28,17 +50,28 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &'static str {
-        "Run a bash command in the agent's environment. The command runs via \
-         `sh -c` with the workspace as the working directory. 60-second \
-         timeout. Stdout + stderr are returned (up to 256 KB total) along \
-         with the exit code."
+        "Run a shell command in the agent's environment, with the workspace as the working \
+         directory: `bash -c` when bash is installed, else `sh -c`. It runs for up to \
+         `timeout_seconds` (300 by default, at most the policy's limit, 1800 unless set); \
+         stdout and stderr come back as they were printed (the first 192 KB and the last \
+         64 KB) with the exit code, and on a timeout what it printed so far. With \
+         `background: true` it goes on after the call (a server, a long build): you get a \
+         process id to read, wait on or kill with the `process` tool."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "Bash one-liner." }
+                "command": { "type": "string", "description": "The command." },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "description": "How long it may run; 300 when not given."
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Go on after the call, as a process of the `process` tool."
+                }
             },
             "required": ["command"]
         })
@@ -51,8 +84,29 @@ impl Tool for ShellTool {
         if command.trim().is_empty() {
             return ToolResult::Error("command must be non-empty".into());
         }
+        let limits = ctx.policy.shell;
+        let most = u64::from(limits.max_timeout_seconds.max(1));
+        let seconds = input
+            .get("timeout_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| u64::from(limits.timeout_seconds.max(1)))
+            .clamp(1, most);
+        let background = input
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        // What ends a background command: the stop of the turn that started
+        // it. A heartbeat, a cron job or another agent's question has none.
+        let stop = crate::tool_loop::TURN_STOP.try_with(Clone::clone).ok();
+        if background && stop.is_none() {
+            return ToolResult::Error(
+                "background commands are for conversations, whose stop ends them; run it in \
+                 the foreground with a timeout_seconds"
+                    .into(),
+            );
+        }
 
-        let mut cmd = Command::new("sh");
+        let mut cmd = Command::new(shell_program());
         cmd.arg("-c")
             .arg(command)
             .current_dir(&ctx.workspace_dir)
@@ -61,64 +115,481 @@ impl Tool for ShellTool {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         // A group of its own, so a timeout or a stopped turn ends every
-        // process the command started, not only `sh`.
+        // process the command started, not only the shell.
         #[cfg(unix)]
         cmd.process_group(0);
         #[cfg(target_os = "linux")]
         crate::sandbox::confine_tool(&mut cmd);
 
-        let child = match cmd.spawn() {
+        if background {
+            // Counted and started under one lock: loops running at once
+            // cannot together go past the limit.
+            let mut procs = lock(&PROCS);
+            if procs.running() >= limits.background.max(1) as usize {
+                return ToolResult::Error(format!(
+                    "{} commands are running in the background already, the most allowed: end \
+                     one with the process tool (action \"kill\") first",
+                    limits.background.max(1)
+                ));
+            }
+            let mut child = match cmd.spawn() {
+                Ok(child) => child,
+                Err(e) => return ToolResult::Error(format!("exec failed: {e}")),
+            };
+            let (output, readers) = capture(&mut child);
+            let id = procs.watch(command, child.id(), Some(child), output, readers, stop);
+            return ToolResult::Ok(format!(
+                "started in the background as process {id}. Read what it prints with the \
+                 process tool ({{\"action\": \"read\", \"id\": {id}}}), wait for it with \
+                 \"wait\", end it with \"kill\"."
+            ));
+        }
+        let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => return ToolResult::Error(format!("exec failed: {e}")),
         };
-        let mut group = GroupKill(child.id());
-        let output = match timeout(COMMAND_TIMEOUT, child.wait_with_output()).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => return ToolResult::Error(format!("exec failed: {e}")),
-            Err(_) => {
-                return ToolResult::Error(format!(
-                    "timed out after {}s",
-                    COMMAND_TIMEOUT.as_secs()
-                ));
+        let (output, readers) = capture(&mut child);
+        let pid = child.id();
+        let mut group = GroupKill(pid);
+        let waited = tokio::time::timeout(Duration::from_secs(seconds), child.wait()).await;
+        match waited {
+            Ok(Ok(status)) => {
+                group.0 = None;
+                let mut out = format!("exit={}\n", exit_text(Some(status)));
+                // What it left running (a server started with `&`) goes on
+                // as a background process, so the turn's stop, `kill` and
+                // the limit reach it.
+                if group_alive(pid) {
+                    let left = stop.map(|stop| {
+                        lock(&PROCS).watch(
+                            command,
+                            pid,
+                            None,
+                            Arc::clone(&output),
+                            readers,
+                            Some(stop),
+                        )
+                    });
+                    match left {
+                        Some(id) => {
+                            let _ = writeln!(
+                                out,
+                                "[It left processes running: they go on as background process \
+                                 {id}; read or end them with the process tool.]"
+                            );
+                        }
+                        None => {
+                            kill_group(pid);
+                            let _ = writeln!(
+                                out,
+                                "[It left processes running; they were ended, as nothing here \
+                                 would end them later.]"
+                            );
+                        }
+                    }
+                } else {
+                    let _ = tokio::time::timeout(DRAIN, readers).await;
+                }
+                out.push_str(&printed(&output));
+                if status.success() {
+                    ToolResult::Ok(out)
+                } else {
+                    // Non-zero exit is still "the tool ran"; an error, so
+                    // the model sees `is_error=true` and can react.
+                    ToolResult::Error(out)
+                }
             }
+            Ok(Err(e)) => ToolResult::Error(format!("exec failed: {e}")),
+            Err(_) => {
+                // Out of time: it and what it started end, and what it
+                // printed so far comes back.
+                drop(group);
+                let _ = child.wait().await;
+                let _ = tokio::time::timeout(DRAIN, readers).await;
+                ToolResult::Error(format!(
+                    "timed out after {seconds}s and was stopped. Run it with a longer \
+                     timeout_seconds (at most {most}), or with background: true. What it printed \
+                     so far:\n{}",
+                    printed(&output)
+                ))
+            }
+        }
+    }
+}
+
+/// The background commands, by id: the `process` tool's.
+pub struct ProcessTool;
+
+#[async_trait]
+impl Tool for ProcessTool {
+    fn name(&self) -> &'static str {
+        "process"
+    }
+
+    fn description(&self) -> &'static str {
+        "Commands started with the shell tool's `background: true`. `list` names them; `read` \
+         gives what one printed since the last read, and whether it is still running; `wait` \
+         waits up to `seconds` (30 by default) for it to end, then reads; `kill` ends it and \
+         what it started. A stopped reply ends the commands it started."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["list", "read", "wait", "kill"] },
+                "id": { "type": "integer", "description": "The process, for read, wait and kill." },
+                "seconds": { "type": "integer", "description": "How long wait waits." }
+            },
+            "required": ["action"]
+        })
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, input: Value) -> ToolResult {
+        let action = input.get("action").and_then(Value::as_str).unwrap_or("");
+        if action == "list" {
+            return ToolResult::Ok(list());
+        }
+        let Some(id) = input
+            .get("id")
+            .and_then(Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok())
+        else {
+            return ToolResult::Error(format!("{action:?} needs the process's id"));
         };
-        // It finished: what it left running in the background (a server
-        // started with `&`) is the agent's to keep.
-        group.0 = None;
-
-        let mut combined = Vec::with_capacity(output.stdout.len() + output.stderr.len());
-        combined.extend_from_slice(&output.stdout);
-        if !output.stderr.is_empty() {
-            combined.extend_from_slice(b"\n--- stderr ---\n");
-            combined.extend_from_slice(&output.stderr);
+        let Some((ended, pid)) = with_proc(id, |p| (p.ended.clone(), p.pid)) else {
+            return ToolResult::Error(format!(
+                "there is no process {id}; `list` names the ones there are"
+            ));
+        };
+        match action {
+            "read" => ToolResult::Ok(read(id)),
+            "wait" => {
+                let most = u64::from(ctx.policy.shell.max_timeout_seconds.max(1));
+                let seconds = input
+                    .get("seconds")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(DEFAULT_WAIT_SECONDS)
+                    .clamp(1, most);
+                let mut ended = ended;
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(seconds),
+                    ended.wait_for(Option::is_some),
+                )
+                .await;
+                ToolResult::Ok(read(id))
+            }
+            "kill" => {
+                // The whole group, whatever its first process did: what it
+                // started may still run.
+                kill_group(pid);
+                let mut ended = ended;
+                let _ = tokio::time::timeout(DRAIN * 2, ended.wait_for(Option::is_some)).await;
+                ToolResult::Ok(read(id))
+            }
+            other => ToolResult::Error(format!(
+                "unknown action {other:?}: list, read, wait or kill"
+            )),
         }
-        let truncated = combined.len() > MAX_OUTPUT_BYTES;
-        let slice = &combined[..combined.len().min(MAX_OUTPUT_BYTES)];
-        let text = String::from_utf8_lossy(slice).into_owned();
+    }
+}
 
-        let exit = output
-            .status
-            .code()
-            .map_or_else(|| "(killed by signal)".to_string(), |c| c.to_string());
+/// bash where it is installed, else sh: the path run.
+fn shell_program() -> &'static str {
+    static FOUND: LazyLock<&'static str> = LazyLock::new(|| {
+        ["/bin/bash", "/usr/bin/bash"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .unwrap_or("/bin/sh")
+    });
+    &FOUND
+}
 
-        let header = format!("exit={exit}\n");
-        let mut out = header;
-        out.push_str(&text);
-        if truncated {
-            write!(
-                out,
-                "\n\n[output truncated at {MAX_OUTPUT_BYTES} bytes; full size {} bytes]",
-                combined.len()
-            )
-            .ok();
+/// What a command printed, stdout and stderr as they came: its first
+/// [`HEAD_BYTES`], and its last [`TAIL_BYTES`] past them.
+#[derive(Default)]
+struct Output {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    total: u64,
+}
+
+impl Output {
+    fn push(&mut self, bytes: &[u8]) {
+        let room = HEAD_BYTES.saturating_sub(self.head.len()).min(bytes.len());
+        let (first, rest) = bytes.split_at(room);
+        self.head.extend_from_slice(first);
+        self.tail.extend(rest);
+        let excess = self.tail.len().saturating_sub(TAIL_BYTES);
+        self.tail.drain(..excess);
+        self.total += bytes.len() as u64;
+    }
+
+    /// What it printed from byte `from` on, saying where bytes were not
+    /// kept, and where the next read starts.
+    fn since(&self, from: u64) -> (String, u64) {
+        let head_len = self.head.len() as u64;
+        let tail_start = self.total - self.tail.len() as u64;
+        let mut text = String::new();
+        if from < head_len {
+            text.push_str(&String::from_utf8_lossy(
+                &self.head[usize::try_from(from).unwrap_or(0)..],
+            ));
         }
+        let skipped = tail_start.saturating_sub(from.max(head_len));
+        if skipped > 0 {
+            let _ = write!(text, "\n[... {skipped} bytes of output not kept ...]\n");
+        }
+        let skip = usize::try_from(from.max(tail_start) - tail_start).unwrap_or(usize::MAX);
+        let rest: Vec<u8> = self.tail.iter().skip(skip).copied().collect();
+        text.push_str(&String::from_utf8_lossy(&rest));
+        (text, self.total)
+    }
+}
 
-        if output.status.success() {
-            ToolResult::Ok(out)
+/// All `output` holds.
+fn printed(output: &Arc<Mutex<Output>>) -> String {
+    lock(output).since(0).0
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Read what `child` prints into an [`Output`], until its pipes close.
+fn capture(child: &mut Child) -> (Arc<Mutex<Output>>, tokio::task::JoinHandle<()>) {
+    let output = Arc::new(Mutex::new(Output::default()));
+    let mut readers = Vec::new();
+    if let Some(pipe) = child.stdout.take() {
+        readers.push(read_into(pipe, Arc::clone(&output)));
+    }
+    if let Some(pipe) = child.stderr.take() {
+        readers.push(read_into(pipe, Arc::clone(&output)));
+    }
+    let done = tokio::spawn(async move {
+        for reader in readers {
+            let _ = reader.await;
+        }
+    });
+    (output, done)
+}
+
+fn read_into<R>(mut pipe: R, output: Arc<Mutex<Output>>) -> tokio::task::JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut buf = vec![0_u8; 16 * 1024];
+        loop {
+            match pipe.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => lock(&output).push(&buf[..n]),
+            }
+        }
+    })
+}
+
+fn exit_text(status: Option<std::process::ExitStatus>) -> String {
+    match status.and_then(|s| s.code()) {
+        Some(code) => code.to_string(),
+        None => "(killed by signal)".into(),
+    }
+}
+
+/// A command going on in the background.
+struct Proc {
+    command: String,
+    started: Instant,
+    output: Arc<Mutex<Output>>,
+    /// Where the next read starts.
+    read: u64,
+    pid: Option<u32>,
+    /// Its exit, once it ended.
+    ended: watch::Receiver<Option<String>>,
+}
+
+#[derive(Default)]
+struct Procs {
+    next: u32,
+    all: BTreeMap<u32, Proc>,
+}
+
+static PROCS: LazyLock<Mutex<Procs>> = LazyLock::new(Mutex::default);
+
+impl Procs {
+    /// Commands still running: their first process, or any it started.
+    fn running(&self) -> usize {
+        self.all
+            .values()
+            .filter(|p| p.ended.borrow().is_none())
+            .count()
+    }
+
+    /// Keep the command `command`, whose process group `pid` leads, going
+    /// in the background, `child` its first process when it still runs: it
+    /// counts as ended once all of its group is gone, and what it printed
+    /// is read (`readers`) by then. The turn's stop, when there is one,
+    /// ends it. Its id.
+    fn watch(
+        &mut self,
+        command: &str,
+        pid: Option<u32>,
+        child: Option<Child>,
+        output: Arc<Mutex<Output>>,
+        readers: tokio::task::JoinHandle<()>,
+        stop: Option<tokio_util::sync::CancellationToken>,
+    ) -> u32 {
+        let (ended_tx, ended) = watch::channel(None);
+        tokio::spawn(async move {
+            let mut child = child;
+            let mut status = None;
+            let mut stopped = false;
+            loop {
+                if child.is_none() && !group_alive(pid) {
+                    break;
+                }
+                let stopping = async {
+                    match &stop {
+                        Some(stop) if !stopped => stop.cancelled().await,
+                        _ => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    waited = async {
+                        match child.as_mut() {
+                            Some(first) => first.wait().await.ok(),
+                            None => std::future::pending().await,
+                        }
+                    }, if child.is_some() => {
+                        status = waited;
+                        child = None;
+                    }
+                    () = stopping => {
+                        stopped = true;
+                        kill_group(pid);
+                    }
+                    () = tokio::time::sleep(GROUP_POLL), if child.is_none() => {}
+                }
+            }
+            let _ = tokio::time::timeout(DRAIN, readers).await;
+            let _ = ended_tx.send(Some(exit_text(status)));
+        });
+        self.next += 1;
+        let id = self.next;
+        self.all.insert(
+            id,
+            Proc {
+                command: command.to_string(),
+                started: Instant::now(),
+                output,
+                read: 0,
+                pid,
+                ended,
+            },
+        );
+        // The oldest ended ones go.
+        let ended: Vec<u32> = self
+            .all
+            .iter()
+            .filter(|(_, p)| p.ended.borrow().is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        for old in ended.iter().take(ended.len().saturating_sub(ENDED_KEPT)) {
+            self.all.remove(old);
+        }
+        id
+    }
+}
+
+fn with_proc<T>(id: u32, f: impl FnOnce(&mut Proc) -> T) -> Option<T> {
+    lock(&PROCS).all.get_mut(&id).map(f)
+}
+
+/// What process `id` printed since the last read, and how it is.
+fn read(id: u32) -> String {
+    with_proc(id, |p| {
+        let (text, next) = lock(&p.output).since(p.read);
+        p.read = next;
+        let state = match p.ended.borrow().as_ref() {
+            Some(exit) => format!("ended, exit={exit}"),
+            None => format!("running for {}s", p.started.elapsed().as_secs()),
+        };
+        if text.is_empty() {
+            format!("process {id}: {state}; nothing new printed")
         } else {
-            // Non-zero exit is still "the tool ran"; surface as Error so the LLM
-            // sees `is_error=true` and can react.
-            ToolResult::Error(out)
+            format!("process {id}: {state}; printed since the last read:\n{text}")
+        }
+    })
+    .unwrap_or_else(|| format!("there is no process {id}"))
+}
+
+fn list() -> String {
+    let procs = lock(&PROCS);
+    if procs.all.is_empty() {
+        return "No background commands.".into();
+    }
+    let mut out = String::new();
+    for (id, p) in &procs.all {
+        let state = match p.ended.borrow().as_ref() {
+            Some(exit) => format!("ended, exit={exit}"),
+            None => format!("running for {}s", p.started.elapsed().as_secs()),
+        };
+        let mut command: String = p.command.chars().take(COMMAND_SHOWN).collect();
+        if p.command.chars().count() > COMMAND_SHOWN {
+            command.push('…');
+        }
+        let _ = writeln!(out, "{id}: {state}: {command}");
+    }
+    out
+}
+
+/// Whether a process of the group `pid` leads still runs, a zombie not
+/// counted (its parent may be slow to reap it). A group's id is not given
+/// to another process while any of its own is alive.
+fn group_alive(pid: Option<u32>) -> bool {
+    let Some(pgid) = pid else {
+        return false;
+    };
+    #[cfg(target_os = "linux")]
+    if let Ok(dir) = std::fs::read_dir("/proc") {
+        return dir.flatten().any(|entry| {
+            let name = entry.file_name();
+            let Some(n) = name
+                .to_str()
+                .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+            else {
+                return false;
+            };
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{n}/stat")) else {
+                return false;
+            };
+            // After the command's name, in parentheses: state, ppid, pgrp.
+            let Some((_, rest)) = stat.rsplit_once(')') else {
+                return false;
+            };
+            let mut fields = rest.split_whitespace();
+            let state = fields.next().unwrap_or("Z");
+            let group = fields.nth(1).and_then(|g| g.parse::<u32>().ok());
+            state != "Z" && state != "X" && group == Some(pgid)
+        });
+    }
+    #[cfg(unix)]
+    if let Ok(pgid) = i32::try_from(pgid) {
+        // SAFETY: kill with signal 0 sends nothing; it only checks.
+        return unsafe { libc::kill(-pgid, 0) } == 0;
+    }
+    false
+}
+
+/// End the process group `pid` leads.
+fn kill_group(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
+        // SAFETY: kill has no memory-safety preconditions. The group is
+        // the command's own (process_group(0)); once all of it has exited
+        // the call fails with ESRCH and does nothing.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
         }
     }
 }
@@ -129,15 +600,7 @@ struct GroupKill(Option<u32>);
 
 impl Drop for GroupKill {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.0.and_then(|pid| i32::try_from(pid).ok()) {
-            // SAFETY: kill has no memory-safety preconditions. The group
-            // is the command's own (process_group(0)); once all of it has
-            // exited the call fails with ESRCH and does nothing.
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
-        }
+        kill_group(self.0);
     }
 }
 
@@ -219,6 +682,169 @@ mod tests {
             .await;
         assert!(r.is_error());
         assert!(r.text().contains("non-empty"));
+    }
+
+    fn id_of(started: &str) -> u64 {
+        let rest = started.split("process ").nth(1).expect("an id");
+        rest.split('.')
+            .next()
+            .and_then(|n| n.trim().parse().ok())
+            .expect("a number")
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_command_returns_what_it_printed() {
+        let r = ShellTool
+            .execute(
+                &ctx().await,
+                json!({"command": "echo started; sleep 30", "timeout_seconds": 1}),
+            )
+            .await;
+        assert!(r.is_error());
+        assert!(r.text().contains("timed out after 1s"), "{}", r.text());
+        assert!(r.text().contains("started"), "{}", r.text());
+    }
+
+    #[tokio::test]
+    async fn a_background_command_is_read_waited_on_and_killed() {
+        let ctx = ctx().await;
+        let stop = tokio_util::sync::CancellationToken::new();
+        let started = crate::tool_loop::TURN_STOP
+            .scope(
+                stop,
+                ShellTool.execute(
+                    &ctx,
+                    json!({"command": "echo ready; sleep 30", "background": true}),
+                ),
+            )
+            .await;
+        assert!(!started.is_error(), "{}", started.text());
+        let id = id_of(started.text());
+        let mut seen = String::new();
+        for _ in 0..50 {
+            seen.push_str(
+                ProcessTool
+                    .execute(&ctx, json!({"action": "read", "id": id}))
+                    .await
+                    .text(),
+            );
+            if seen.contains("ready") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(seen.contains("ready"), "{seen}");
+        assert!(seen.contains("running"), "{seen}");
+        let again = ProcessTool
+            .execute(&ctx, json!({"action": "read", "id": id}))
+            .await;
+        assert!(again.text().contains("nothing new"), "{}", again.text());
+        assert!(
+            ProcessTool
+                .execute(&ctx, json!({"action": "list"}))
+                .await
+                .text()
+                .contains("sleep 30")
+        );
+        let killed = ProcessTool
+            .execute(&ctx, json!({"action": "kill", "id": id}))
+            .await;
+        assert!(killed.text().contains("ended"), "{}", killed.text());
+        let unknown = ProcessTool
+            .execute(&ctx, json!({"action": "read", "id": 999_999}))
+            .await;
+        assert!(unknown.is_error());
+    }
+
+    #[tokio::test]
+    async fn background_needs_a_turn_to_end_it() {
+        let r = ShellTool
+            .execute(
+                &ctx().await,
+                json!({"command": "sleep 1", "background": true}),
+            )
+            .await;
+        assert!(r.is_error());
+        assert!(r.text().contains("conversations"), "{}", r.text());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn what_a_command_leaves_running_is_tracked_and_stopped() {
+        let ctx = ctx().await;
+        let stop = tokio_util::sync::CancellationToken::new();
+        let r = crate::tool_loop::TURN_STOP
+            .scope(
+                stop.clone(),
+                ShellTool.execute(
+                    &ctx,
+                    json!({"command": "sleep 30 > /dev/null 2>&1 & echo left"}),
+                ),
+            )
+            .await;
+        assert!(r.text().contains("background process"), "{}", r.text());
+        let after = r.text().split("background process").nth(1).unwrap_or("");
+        let id: u64 = after
+            .trim_start()
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("an id");
+        let running = ProcessTool
+            .execute(&ctx, json!({"action": "read", "id": id}))
+            .await;
+        assert!(running.text().contains("running"), "{}", running.text());
+        stop.cancel();
+        let waited = ProcessTool
+            .execute(&ctx, json!({"action": "wait", "id": id, "seconds": 5}))
+            .await;
+        assert!(waited.text().contains("ended"), "{}", waited.text());
+    }
+
+    #[tokio::test]
+    async fn a_stopped_turn_ends_the_commands_it_started() {
+        let ctx = ctx().await;
+        let stop = tokio_util::sync::CancellationToken::new();
+        let started = crate::tool_loop::TURN_STOP
+            .scope(
+                stop.clone(),
+                ShellTool.execute(&ctx, json!({"command": "sleep 30", "background": true})),
+            )
+            .await;
+        let id = id_of(started.text());
+        stop.cancel();
+        let waited = ProcessTool
+            .execute(&ctx, json!({"action": "wait", "id": id, "seconds": 5}))
+            .await;
+        assert!(waited.text().contains("ended"), "{}", waited.text());
+    }
+
+    #[tokio::test]
+    async fn commands_run_in_bash_when_it_is_there() {
+        if !shell_program().ends_with("bash") {
+            return;
+        }
+        let r = ShellTool
+            .execute(
+                &ctx().await,
+                json!({"command": "[[ 1 == 1 ]] && echo bashy"}),
+            )
+            .await;
+        assert!(r.text().contains("bashy"), "{}", r.text());
+    }
+
+    #[test]
+    fn long_output_keeps_its_start_and_its_end() {
+        let mut output = Output::default();
+        output.push(b"START");
+        output.push(&vec![b'x'; HEAD_BYTES + TAIL_BYTES]);
+        output.push(b"END");
+        let (all, next) = output.since(0);
+        assert!(all.starts_with("START"));
+        assert!(all.ends_with("END"));
+        assert!(all.contains("bytes of output not kept"));
+        assert_eq!(next, output.total);
+        assert_eq!(output.since(next).0, "");
     }
 
     #[tokio::test]

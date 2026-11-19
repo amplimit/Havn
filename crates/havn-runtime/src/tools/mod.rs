@@ -62,7 +62,6 @@ pub struct ToolCtx {
     pub agent_db: SqlitePool,
     /// Active policy snapshot. Registry building consults `permissions`;
     /// tools may read it for finer checks.
-    #[allow(dead_code, reason = "no tool reads it yet")]
     pub policy: Arc<Policy>,
     /// Hybrid-retrieval embedding provider (spec §9.4 v0.7). `None`
     /// when the operator hasn't enabled embeddings — `memory_remember`
@@ -161,6 +160,7 @@ impl ToolRegistry {
         ];
         if policy.permissions.can_use_shell {
             tools.push(Arc::new(shell::ShellTool));
+            tools.push(Arc::new(shell::ProcessTool));
         }
         if policy.permissions.can_install_skills {
             tools.push(Arc::new(skill_manage::SkillManageTool));
@@ -299,7 +299,8 @@ impl ToolRegistry {
     /// `policy.context_toolsets[context].disabled`.
     /// Disabling `file_write` disables `file_edit` too: both change files,
     /// and a policy written before `file_edit` existed means both. Likewise
-    /// disabling `file_read` disables `file_find` and `file_search`.
+    /// disabling `file_read` disables `file_find` and `file_search`, and
+    /// disabling `shell` disables `process`, which reaches what it started.
     fn disabled_in(&self, context: &str, tool_name: &str) -> bool {
         // Scheduled runs, heartbeats and other agents' queries answer no
         // one's chat message: there are no past chats of theirs to search.
@@ -320,6 +321,7 @@ impl ToolRegistry {
                     d == tool_name
                         || (d == "file_write" && tool_name == "file_edit")
                         || (d == "file_read" && matches!(tool_name, "file_find" | "file_search"))
+                        || (d == "shell" && tool_name == "process")
                 })
             })
     }
@@ -628,6 +630,9 @@ mod tests {
         assert!(!cron.contains(&"file_write".into()));
         assert!(web.contains(&"shell".into()));
         assert!(web.contains(&"file_write".into()));
+        // What reaches the shell's processes goes with it (issue #215).
+        assert!(!cron.contains(&"process".into()));
+        assert!(web.contains(&"process".into()));
     }
 
     #[tokio::test]

@@ -209,10 +209,13 @@ fn cut_results(message: &mut Value, max: usize) {
         if let Some(Value::String(text)) = block.get_mut("content") {
             let total = text.chars().count();
             if total > max {
-                let kept: String = text.chars().take(max).collect();
+                // Its start and its end: a command's errors come last.
+                let tail = max / 4;
+                let head: String = text.chars().take(max - tail).collect();
+                let end: String = text.chars().skip(total - tail).collect();
                 *text = format!(
-                    "{kept}\n[{} more characters of this result are not kept; run the tool \
-                     again if they are needed]",
+                    "{head}\n[{} more characters of this result are not kept; run the tool \
+                     again if they are needed]\n{end}",
                     total - max
                 );
             }
@@ -282,7 +285,7 @@ mod tests {
         assert!(first.iter().all(|b| b["type"] != "thinking"));
         assert_eq!(first[0]["text"], "Checking the file.");
         let result = steps[1]["content"][0]["content"].as_str().unwrap();
-        assert!(result.starts_with(&"x".repeat(MAX_RESULT_CHARS)));
+        assert!(result.starts_with(&"x".repeat(MAX_RESULT_CHARS - MAX_RESULT_CHARS / 4)));
         assert!(result.contains("10000 more characters"));
     }
 
