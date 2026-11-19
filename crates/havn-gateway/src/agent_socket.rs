@@ -1300,11 +1300,13 @@ async fn ask_for_approval(
     }
 }
 
-/// A message an agent sent, without buttons: they are the gateway's, which
+/// A message an agent sent, without buttons or a poll: they are the
+/// gateway's, which
 /// makes each stand for a command the person can see (issue #203); an
 /// agent's could pass an approval off as something else.
 fn from_agent(mut msg: OutboundMessage) -> OutboundMessage {
     msg.buttons.clear();
+    msg.poll = None;
     msg
 }
 
@@ -3161,6 +3163,7 @@ mod tests {
             reply_to: None,
             conversation: None,
             buttons: approval_buttons(id),
+            poll: None,
         };
         msg = from_agent(msg);
         assert!(msg.buttons.is_empty(), "an agent's buttons are dropped");

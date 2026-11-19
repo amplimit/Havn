@@ -1160,8 +1160,8 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
     let mut new_chat = false;
     let mut branch = None;
     let mut command_frame = None;
-    let mut content = content;
-    let mut conversation = None;
+    // A choice to send as the person's message, and the chat it goes to.
+    let mut said = None;
     match parsed {
         None => {}
         Some(
@@ -1226,17 +1226,17 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
                         command_frame = Some(GatewayToAgent::ChatCommand(command));
                     }
                     // A choice: the person's message, in the question's chat.
-                    crate::commands::Action::Say {
-                        text,
-                        conversation: chat,
-                    } => {
-                        content = MessageContent::Text { text };
-                        conversation = chat;
+                    crate::commands::Action::Say { text, conversation } => {
+                        said = Some((text, conversation));
                     }
                 }
             }
         },
     }
+    let (content, conversation) = match said {
+        Some((text, chat)) => (MessageContent::Text { text }, chat),
+        None => (content, None),
+    };
     let msg = InboundMessage {
         conversation,
         branch,

@@ -644,7 +644,8 @@ impl WebChatRouter {
         if choices.values().filter(|c| c.agent_id == agent_id).count() >= MAX_CHOICES_WAITING {
             return None;
         }
-        let id = Uuid::new_v4().simple().to_string()[..12].to_string();
+        // The random end of a v7 id (its start is the time).
+        let id = Uuid::now_v7().simple().to_string()[20..].to_string();
         choices.insert(
             id.clone(),
             PendingChoice {
