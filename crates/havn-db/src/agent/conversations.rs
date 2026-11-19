@@ -656,7 +656,18 @@ impl TryFrom<ChatTurnRow> for ChatTurn {
 /// (most Chinese words) are matched as substrings.
 const TRIGRAM_CHARS: usize = 3;
 
-/// The user and assistant turns of `scope`'s chats that contain every
+/// Note that the owner writes from `scope` (issue #218): their search
+/// covers its chats from then on.
+pub async fn note_owner_scope(pool: &SqlitePool, scope: &str) -> Result<()> {
+    sqlx::query("INSERT OR IGNORE INTO owner_scopes (scope) VALUES (?1)")
+        .bind(scope)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The user and assistant turns of `scope`'s chats (with `owner`, of
+/// every scope the owner writes from) that contain every
 /// whitespace-separated term of `query`, best matches first (newest
 /// first when no term is long enough to rank by), at most `limit`.
 /// Turns of every branch count. Other scopes' chats, scheduled runs and
@@ -664,6 +675,7 @@ const TRIGRAM_CHARS: usize = 3;
 pub async fn search_chats(
     pool: &SqlitePool,
     scope: &str,
+    owner: bool,
     query: &str,
     limit: u32,
 ) -> Result<Vec<ChatTurn>> {
@@ -677,12 +689,14 @@ pub async fn search_chats(
         "SELECT c.id, c.channel_id AS chat, h.title, c.role, c.content, c.created_at ",
     );
     if long.is_empty() {
-        sql.push_str("FROM conversations c JOIN chats h ON h.id = c.channel_id WHERE h.scope = ?");
+        sql.push_str(
+            "FROM conversations c JOIN chats h ON h.id = c.channel_id WHERE (h.scope = ? OR (? AND h.scope IN (SELECT scope FROM owner_scopes)))",
+        );
     } else {
         sql.push_str(
             "FROM conversations_fts f JOIN conversations c ON c.rowid = f.rowid \
              JOIN chats h ON h.id = c.channel_id \
-             WHERE conversations_fts MATCH ? AND h.scope = ?",
+             WHERE conversations_fts MATCH ? AND (h.scope = ? OR (? AND h.scope IN (SELECT scope FROM owner_scopes)))",
         );
     }
     sql.push_str(" AND c.role IN ('user', 'assistant')");
@@ -702,7 +716,7 @@ pub async fn search_chats(
             .collect();
         q = q.bind(phrases.join(" AND "));
     }
-    q = q.bind(scope);
+    q = q.bind(scope).bind(owner);
     for term in &short {
         let escaped = term
             .replace('\\', "\\\\")
@@ -721,17 +735,21 @@ pub async fn search_chats(
 pub async fn around(
     pool: &SqlitePool,
     scope: &str,
+    owner: bool,
     turn: &str,
     context: u32,
 ) -> Result<Option<Vec<ChatTurn>>> {
     const SELECT: &str = "SELECT c.id, c.channel_id AS chat, h.title, c.role, c.content, \
                           c.created_at FROM conversations c JOIN chats h ON h.id = c.channel_id";
-    let found: Option<ChatTurnRow> =
-        sqlx::query_as(&format!("{SELECT} WHERE c.id = ?1 AND h.scope = ?2"))
-            .bind(turn)
-            .bind(scope)
-            .fetch_optional(pool)
-            .await?;
+    let found: Option<ChatTurnRow> = sqlx::query_as(&format!(
+        "{SELECT} WHERE c.id = ?1 AND (h.scope = ?2 OR (?3 AND h.scope IN \
+             (SELECT scope FROM owner_scopes)))"
+    ))
+    .bind(turn)
+    .bind(scope)
+    .bind(owner)
+    .fetch_optional(pool)
+    .await?;
     let Some(found) = found else {
         return Ok(None);
     };
@@ -798,6 +816,7 @@ pub struct TitledChat {
 pub async fn chats_titled(
     pool: &SqlitePool,
     scope: &str,
+    owner: bool,
     query: &str,
     limit: u32,
 ) -> Result<Vec<TitledChat>> {
@@ -810,13 +829,16 @@ pub async fn chats_titled(
                 (SELECT t.id FROM conversations t WHERE t.channel_id = c.id \
                    AND t.parent_id IS NULL AND t.role = 'user' \
                  ORDER BY t.created_at, t.rowid LIMIT 1) AS first_turn \
-         FROM chats c WHERE c.scope = ?",
+         FROM chats c \
+         WHERE (c.scope = ? OR (? AND c.scope IN (SELECT scope FROM owner_scopes)))",
     );
     for _ in &terms {
         sql.push_str(" AND c.title LIKE ? ESCAPE '\\'");
     }
     sql.push_str(" ORDER BY c.updated_at DESC, c.rowid DESC LIMIT ?");
-    let mut q = sqlx::query_as::<_, TitledChat>(&sql).bind(scope);
+    let mut q = sqlx::query_as::<_, TitledChat>(&sql)
+        .bind(scope)
+        .bind(owner);
     for term in &terms {
         let escaped = term
             .replace('\\', "\\\\")
@@ -1962,13 +1984,15 @@ mod tests {
         .await;
         say(&pool, "me", &chat(2), Role::User, "the quick brown fox").await;
 
-        let two = search_chats(&pool, "me", "颜色", 10).await.expect("search");
+        let two = search_chats(&pool, "me", false, "颜色", 10)
+            .await
+            .expect("search");
         assert_eq!(contents(&two), vec!["我最喜欢的颜色是青绿色"]);
-        let three = search_chats(&pool, "me", "青绿色", 10)
+        let three = search_chats(&pool, "me", false, "青绿色", 10)
             .await
             .expect("search");
         assert_eq!(contents(&three), vec!["我最喜欢的颜色是青绿色"]);
-        let words = search_chats(&pool, "me", "Teal colour", 10)
+        let words = search_chats(&pool, "me", false, "Teal colour", 10)
             .await
             .expect("search");
         assert_eq!(
@@ -1977,11 +2001,13 @@ mod tests {
         );
         assert_eq!(words[0].chat, chat(1));
         assert_eq!(words[0].title, "我最喜欢的颜色是青绿色");
-        let mixed = search_chats(&pool, "me", "fox 色", 10)
+        let mixed = search_chats(&pool, "me", false, "fox 色", 10)
             .await
             .expect("search");
         assert!(mixed.is_empty(), "every term must match: {mixed:?}");
-        let wild = search_chats(&pool, "me", "%", 10).await.expect("search");
+        let wild = search_chats(&pool, "me", false, "%", 10)
+            .await
+            .expect("search");
         assert!(wild.is_empty(), "LIKE wildcards are literal: {wild:?}");
     }
 
@@ -2006,36 +2032,42 @@ mod tests {
             .await
             .expect("chat");
         let theirs = chat_for(&pool, "t", None, "My budget").await.expect("chat");
-        let found = chats_titled(&pool, "s", "BUDGET", 10).await.expect("db");
+        let found = chats_titled(&pool, "s", false, "BUDGET", 10)
+            .await
+            .expect("db");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, budget);
         assert_eq!(found[0].first_turn.as_deref(), Some(first.as_str()));
-        let found = chats_titled(&pool, "s", "预算 march", 10)
+        let found = chats_titled(&pool, "s", false, "预算 march", 10)
             .await
             .expect("db");
         assert_eq!(
             found.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             [budget.as_str()]
         );
-        let found = chats_titled(&pool, "s", "kyoto", 10).await.expect("db");
+        let found = chats_titled(&pool, "s", false, "kyoto", 10)
+            .await
+            .expect("db");
         assert_eq!(
             found.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             [other.as_str()]
         );
         assert_eq!(found[0].first_turn, None, "no message yet");
         assert!(
-            chats_titled(&pool, "s", "%", 10)
+            chats_titled(&pool, "s", false, "%", 10)
                 .await
                 .expect("db")
                 .is_empty()
         );
         assert!(
-            chats_titled(&pool, "s", "  ", 10)
+            chats_titled(&pool, "s", false, "  ", 10)
                 .await
                 .expect("db")
                 .is_empty()
         );
-        let mine = chats_titled(&pool, "t", "budget", 10).await.expect("db");
+        let mine = chats_titled(&pool, "t", false, "budget", 10)
+            .await
+            .expect("db");
         assert_eq!(
             mine.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             [theirs.as_str()]
@@ -2064,10 +2096,40 @@ mod tests {
         record(&pool, "cron:job", Role::User, "salary report task")
             .await
             .expect("record");
-        let hits = search_chats(&pool, "bob", "salary", 10)
+        let hits = search_chats(&pool, "bob", false, "salary", 10)
             .await
             .expect("search");
         assert_eq!(contents(&hits), vec!["what is the salary band"]);
+        // The owner's search covers every scope they wrote from (issue
+        // #218), and no other: alice is not the owner.
+        note_owner_scope(&pool, "bob").await.expect("note");
+        note_owner_scope(&pool, "tg:bob").await.expect("note");
+        note_owner_scope(&pool, "bob").await.expect("again");
+        say(
+            &pool,
+            "tg:bob",
+            &chat(5),
+            Role::User,
+            "my salary on Telegram",
+        )
+        .await;
+        let found = search_chats(&pool, "bob", true, "salary", 10)
+            .await
+            .expect("search");
+        let mut owners = contents(&found);
+        owners.sort_unstable();
+        assert_eq!(
+            owners,
+            vec!["my salary on Telegram", "what is the salary band"]
+        );
+        let theirs = search_chats(&pool, "bob", false, "salary", 10)
+            .await
+            .expect("search");
+        assert_eq!(contents(&theirs), vec!["what is the salary band"]);
+        let titled = chats_titled(&pool, "bob", true, "x", 10)
+            .await
+            .expect("titled");
+        assert!(titled.iter().all(|c| c.id != chat(3)));
     }
 
     #[tokio::test]
@@ -2249,7 +2311,7 @@ mod tests {
             .await
             .expect("reply");
 
-        let turns = around(&pool, "me", &q2, 1)
+        let turns = around(&pool, "me", false, &q2, 1)
             .await
             .expect("around")
             .expect("found");
@@ -2258,7 +2320,7 @@ mod tests {
             vec!["a1", "q2", "a2"]
         );
         assert!(
-            around(&pool, "other", &q2, 1)
+            around(&pool, "other", false, &q2, 1)
                 .await
                 .expect("around")
                 .is_none()

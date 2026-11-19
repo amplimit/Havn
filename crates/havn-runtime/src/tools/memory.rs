@@ -99,6 +99,17 @@ const MAX_VALUE_BYTES: usize = havn_proto::MAX_MEMORY_VALUE_BYTES;
 
 pub struct MemoryRememberTool;
 
+/// Whether this turn may change the agent's memory (issue #218): not one
+/// answering someone other than its owner. Work no one asked for (a
+/// heartbeat, a scheduled task) may.
+fn may_change_memory() -> bool {
+    super::gateway::FROM_OWNER
+        .try_with(|owner| *owner)
+        .unwrap_or(true)
+}
+
+const NOT_THE_OWNER: &str = "only your owner's conversations change your memory, and this one      is with someone else: nothing was saved or forgotten";
+
 #[async_trait]
 impl Tool for MemoryRememberTool {
     fn name(&self) -> &'static str {
@@ -149,6 +160,9 @@ impl Tool for MemoryRememberTool {
     }
 
     async fn execute(&self, ctx: &ToolCtx, input: Value) -> ToolResult {
+        if !may_change_memory() {
+            return ToolResult::Error(NOT_THE_OWNER.into());
+        }
         let Some(key) = input.get("key").and_then(Value::as_str) else {
             return ToolResult::Error("missing required field: key".into());
         };
@@ -412,8 +426,13 @@ impl Tool for ConversationSearchTool {
             );
         };
         let current = super::gateway::CHAT.try_with(Clone::clone).ok();
+        let owner = super::gateway::FROM_OWNER
+            .try_with(|owner| *owner)
+            .unwrap_or(false);
         if let Some(turn) = input.get("turn").and_then(Value::as_str) {
-            return match conversations::around(&ctx.agent_db, &scope, turn, CONTEXT_TURNS).await {
+            return match conversations::around(&ctx.agent_db, &scope, owner, turn, CONTEXT_TURNS)
+                .await
+            {
                 Ok(Some(turns)) => ToolResult::Ok(show_around(&turns, turn, current.as_deref())),
                 Ok(None) => ToolResult::Error(format!("no turn {turn:?} in these chats")),
                 Err(e) => ToolResult::Error(format!("conversation_search failed: {e}")),
@@ -428,12 +447,16 @@ impl Tool for ConversationSearchTool {
             return ToolResult::Error("give `query` (words to look for) or `turn`".into());
         }
         let hits =
-            match conversations::search_chats(&ctx.agent_db, &scope, query, SEARCH_LIMIT).await {
+            match conversations::search_chats(&ctx.agent_db, &scope, owner, query, SEARCH_LIMIT)
+                .await
+            {
                 Ok(hits) => hits,
                 Err(e) => return ToolResult::Error(format!("conversation_search failed: {e}")),
             };
         let titled =
-            match conversations::chats_titled(&ctx.agent_db, &scope, query, SEARCH_LIMIT).await {
+            match conversations::chats_titled(&ctx.agent_db, &scope, owner, query, SEARCH_LIMIT)
+                .await
+            {
                 Ok(chats) => chats,
                 Err(e) => return ToolResult::Error(format!("conversation_search failed: {e}")),
             };
@@ -575,6 +598,9 @@ impl Tool for MemoryForgetTool {
     }
 
     async fn execute(&self, ctx: &ToolCtx, input: Value) -> ToolResult {
+        if !may_change_memory() {
+            return ToolResult::Error(NOT_THE_OWNER.into());
+        }
         let Some(key) = input.get("key").and_then(Value::as_str) else {
             return ToolResult::Error("missing required field: key".into());
         };
@@ -609,6 +635,19 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[tokio::test]
+    async fn only_the_owner_s_turns_change_memory() {
+        assert!(may_change_memory(), "work no one asked for may");
+        let refused = super::super::gateway::FROM_OWNER
+            .scope(false, async { may_change_memory() })
+            .await;
+        assert!(!refused);
+        let owner = super::super::gateway::FROM_OWNER
+            .scope(true, async { may_change_memory() })
+            .await;
+        assert!(owner);
+    }
     use havn_core::Policy;
     use havn_db::agent::connect_in_memory;
     use std::sync::Arc;
