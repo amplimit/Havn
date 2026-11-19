@@ -268,6 +268,35 @@ mod tests {
     }
 
     #[test]
+    fn buttons_are_sent_only_when_there_are_some() {
+        let outbound = |buttons: Vec<Vec<havn_core::Button>>| ChannelOutbound {
+            seq: 1,
+            account_id: "a".into(),
+            to: "tg:1".into(),
+            in_reply_to: None,
+            content: ChannelMessageContent::Text { text: "t".into() },
+            buttons,
+        };
+        let plain = serde_json::to_string(&outbound(Vec::new())).expect("json");
+        assert!(!plain.contains("buttons"), "{plain}");
+        let pressed = serde_json::to_string(&outbound(vec![vec![havn_core::Button {
+            label: "Approve".into(),
+            data: "/approve r1".into(),
+        }]]))
+        .expect("json");
+        assert!(
+            pressed.contains(r#""buttons":[[{"label":"Approve","data":"/approve r1"}]]"#),
+            "{pressed}"
+        );
+        // A frame from before buttons still reads.
+        let old: ChannelOutbound = serde_json::from_str(
+            r#"{"seq":1,"account_id":"a","to":"tg:1","content":{"type":"text","text":"t"}}"#,
+        )
+        .expect("old frame");
+        assert!(old.buttons.is_empty());
+    }
+
+    #[test]
     fn resume_round_trips() {
         let frame = ChannelFrame::Resume(ChannelResume {
             account_id: "alice-tg-bot".into(),

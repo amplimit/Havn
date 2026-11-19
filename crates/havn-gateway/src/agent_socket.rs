@@ -1237,8 +1237,7 @@ async fn ask_for_approval(
         )
         .await;
     }
-    if let Some((channel, account, sender)) = crate::channel_id_codec::decode(&request.channel_id)
-    {
+    if let Some((channel, account, sender)) = crate::channel_id_codec::decode(&request.channel_id) {
         let admins_of_account = ctx
             .channels
             .get(channel)
@@ -1262,13 +1261,11 @@ async fn ask_for_approval(
         // (issue #203); the text says how by command either way.
         let sender_admin = admins_of_account.iter().any(|id| id == sender)
             || match owner {
-                Some(owner) => {
-                    havn_db::repo::channel_access::linked_user(&ctx.db, channel, sender)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some_and(|link| link.user_id == owner.to_string())
-                }
+                Some(owner) => havn_db::repo::channel_access::linked_user(&ctx.db, channel, sender)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|link| link.user_id == owner),
                 None => false,
             };
         let buttons = if sender_admin {
@@ -1292,7 +1289,7 @@ async fn ask_for_approval(
                 ),
             },
             reply_to: None,
-            buttons: Vec::new(),
+            buttons,
         };
         route_outbound(agent_id, message, ctx).await;
     }
@@ -3048,6 +3045,26 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn approval_buttons_name_their_request() {
+        let id = "0198e1c2-7a4b-7c3d-9e8f-0a1b2c3d4e5f";
+        let rows = approval_buttons(id);
+        let data: Vec<&str> = rows.iter().flatten().map(|b| b.data.as_str()).collect();
+        assert_eq!(
+            data,
+            [
+                format!("/approve {id}"),
+                format!("/approve always {id}"),
+                format!("/deny {id}")
+            ]
+        );
+        assert!(data.iter().all(|d| d.len() <= havn_core::MAX_BUTTON_DATA));
+        assert!(
+            approval_buttons(&"x".repeat(60)).is_empty(),
+            "too long for a button"
+        );
+    }
     use havn_db::connect_in_memory;
     use havn_db::repo::agents::{NewAgent, create as create_agent};
     use havn_db::repo::users::{NewUser, create as create_user};
