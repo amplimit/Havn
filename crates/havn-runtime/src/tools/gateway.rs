@@ -32,6 +32,9 @@ tokio::task_local! {
     /// The chat of [`CONVERSATION`] the turn runs in; what "for this
     /// conversation" approvals are remembered for.
     pub static CHAT: String;
+    /// The turn answers the agent's owner (issue #218): their search
+    /// covers the chats of every scope they write from.
+    pub static FROM_OWNER: bool;
 }
 
 pub struct GatewayTool {

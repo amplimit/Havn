@@ -101,10 +101,11 @@ pub fn platform_context(agent_name: &str, agent_id: &str, tool_names: &[String])
     ctx
 }
 
-/// Added to the prompt of a turn that answers the agent's owner in the
-/// dashboard (issue #105): there the person is the owner, so what they
-/// say about themselves is the owner's to keep. Channels may be anyone,
-/// and scheduled runs, heartbeats and other agents' queries are no one.
+/// Added to the prompt of a turn that answers the agent's owner (issue
+/// #105), in the dashboard or on a chat-app account linked to them (issue
+/// #218): what they say about themselves is the owner's to keep. Anyone
+/// else on a channel, and scheduled runs, heartbeats and other agents'
+/// queries, do not get it.
 pub const SAVE_UNPROMPTED: &str = "## Saving without being asked\n\n\
      You are talking with your owner. People mention lasting things about themselves in \
      passing, inside other requests, and do not ask you to remember them. When your owner \
