@@ -32,6 +32,30 @@ pub struct Policy {
     pub hooks: HookPolicy,
     /// Chats titled by a model (issue #179).
     pub chat_titles: ChatTitles,
+    /// Tool rounds a message may take (issue #219).
+    pub tool_rounds: ToolRounds,
+}
+
+/// Tool rounds one message may take (issue #219): the model calling tools
+/// and reading what they return, before it must answer. At the limit it
+/// sums up what it did and what is left. A limit of 0 counts as 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ToolRounds {
+    /// A message to the agent.
+    pub max: u32,
+    /// A subagent's task, another agent's question, a heartbeat or a cron
+    /// job: work nobody waits on.
+    pub subagent: u32,
+}
+
+impl Default for ToolRounds {
+    fn default() -> Self {
+        Self {
+            max: 100,
+            subagent: 30,
+        }
+    }
 }
 
 /// Whether a model writes each new chat's title, and which.
@@ -69,6 +93,7 @@ impl Default for Policy {
             mcp_servers: HashMap::new(),
             hooks: HookPolicy::default(),
             chat_titles: ChatTitles::default(),
+            tool_rounds: ToolRounds::default(),
         }
     }
 }
@@ -603,6 +628,10 @@ impl Policy {
                     ceiling.chat_titles.model.clone()
                 },
             },
+            tool_rounds: ToolRounds {
+                max: self.tool_rounds.max.min(ceiling.tool_rounds.max),
+                subagent: self.tool_rounds.subagent.min(ceiling.tool_rounds.subagent),
+            },
         }
     }
 
@@ -713,6 +742,10 @@ impl Policy {
                     .min_by_key(|t| !t.enabled)
                     .map(|t| t.model.clone())
                     .unwrap_or_default(),
+            },
+            tool_rounds: ToolRounds {
+                max: self.tool_rounds.max.max(other.tool_rounds.max),
+                subagent: self.tool_rounds.subagent.max(other.tool_rounds.subagent),
             },
         }
     }
@@ -840,6 +873,39 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn tool_rounds_default_narrow_and_widen() {
+        let policy: Policy = serde_json::from_str("{}").expect("empty policy");
+        assert_eq!(
+            policy.tool_rounds,
+            ToolRounds {
+                max: 100,
+                subagent: 30
+            }
+        );
+        let mut tight = Policy::default();
+        tight.tool_rounds = ToolRounds {
+            max: 40,
+            subagent: 50,
+        };
+        let clamped = Policy::default().clamp_to(&tight);
+        assert_eq!(
+            clamped.tool_rounds,
+            ToolRounds {
+                max: 40,
+                subagent: 30
+            }
+        );
+        let widened = tight.widen_with(&Policy::default());
+        assert_eq!(
+            widened.tool_rounds,
+            ToolRounds {
+                max: 100,
+                subagent: 50
+            }
+        );
+    }
 
     #[test]
     fn chat_titles_are_off_where_the_ceiling_has_them_off() {

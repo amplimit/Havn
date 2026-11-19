@@ -40,12 +40,6 @@ use crate::tools::{Tool, ToolCtx, ToolResult, context};
 /// Bounds a buggy / prompt-injected parent that asks for thousands at once.
 pub const SUBAGENT_MAX_CONCURRENT: usize = 8;
 
-/// Per-subagent iteration cap. Tighter than the parent's cap because a
-/// subagent's job is by definition a bounded sub-task — if it's going past
-/// 15 round trips it should hand back to the parent rather than spin its
-/// own deeper loop. (Mirrors the constant previously declared in main.rs.)
-pub const SUBAGENT_MAX_ITERATIONS: u32 = 15;
-
 /// Default snapshot depth — number of most-recent parent turns the subagent
 /// inherits when `context: "fork"` (the default). Tuned tight so token
 /// overhead stays bounded; the user-facing rationale is in spec §4.5.
@@ -317,7 +311,7 @@ mod tests {
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 registry,
                 tool_env: env,
-                max_iterations: SUBAGENT_MAX_ITERATIONS,
+                max_iterations: 15,
                 messages_mirror: None,
                 model: Arc::new(String::new()),
                 max_tokens: crate::tool_loop::DEFAULT_MAX_TOKENS,

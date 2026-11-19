@@ -9,8 +9,8 @@
 //! - Multi-iteration **tool-use loop** (spec §9.2, Anthropic Messages API):
 //!   call LLM → if `stop_reason == "tool_use"`, dispatch each `tool_use` block
 //!   through the [`tools::ToolRegistry`], append a `tool_result` user turn,
-//!   call LLM again. Iterations are capped at [`MAX_TOOL_ITERATIONS`] to
-//!   bound runaway loops.
+//!   call LLM again. Rounds are capped by the policy's `tool_rounds`
+//!   (issue #219), and the model sums up at the cap.
 //! - Heartbeat and cron ticks, the skill library and its curator, and
 //!   same-process subagents (`subagent_spawn`).
 
@@ -122,16 +122,6 @@ const MIN_SUMMARY_INPUT_CHARS: usize = 4000;
 const MAX_SUMMARY_INPUT_CHARS: usize = 60_000;
 /// Lasting facts one summary pass may save to memory.
 const MAX_FLUSHED_FACTS: usize = 5;
-/// Hard cap on the number of LLM ↔ tool round trips per inbound message.
-/// Bounds runaway loops from buggy tool calls or model mis-behaviour.
-///
-/// Sized for real agentic workflows: a single OpenClaw-style `gh-issues`
-/// pass commonly fires 10+ tool calls (curl, git, gh, file ops). Hermes
-/// defaults to 90 in its main loop. 30 is the conservative middle ground —
-/// generous enough that a buggy `[SILENT]` cron task fails fast, tight
-/// enough that legitimate work finishes.
-const MAX_TOOL_ITERATIONS: u32 = 30;
-
 #[derive(Clone)]
 struct Ctx {
     writer_tx: mpsc::Sender<AgentToGateway>,
@@ -211,7 +201,7 @@ impl Ctx {
             pending: Arc::clone(&self.pending),
             registry: self.tools.clone(),
             tool_env: self.tool_env.clone(),
-            max_iterations: MAX_TOOL_ITERATIONS,
+            max_iterations: self.tool_env.policy.tool_rounds.max.max(1),
             messages_mirror: Some(Arc::clone(&self.parent_messages)),
             model: self.model(),
             max_tokens: self.max_tokens,
@@ -791,7 +781,7 @@ async fn main() -> anyhow::Result<()> {
                 .without("set_timezone")
                 .without("schedule"),
             tool_env: tool_env.clone(),
-            max_iterations: subagent_tool::SUBAGENT_MAX_ITERATIONS,
+            max_iterations: policy.tool_rounds.subagent.max(1),
             // Subagents do not republish their own state, and recursion
             // is forbidden by the registry layer (no `subagent_spawn` in
             // base_registry).
@@ -1439,7 +1429,9 @@ async fn handle_cron(tick: CronTick, ctx: Ctx) {
     let mut messages = vec![serde_json::json!({ "role": "user", "content": tick.prompt.clone() })];
 
     let augmented = augment_with_skills(&ctx, &ctx.cron_prompt, &tick.prompt, None, false).await;
-    let handle = ctx.parent_handle();
+    let mut handle = ctx.parent_handle();
+    // A job nobody waits on gets the tighter limit (issue #219).
+    handle.max_iterations = ctx.tool_env.policy.tool_rounds.subagent.max(1);
     let run = tool_loop::TURN_MODEL
         .scope(
             Arc::clone(&handle.model),
@@ -1985,11 +1977,12 @@ async fn chat_command(ctx: &Ctx, command: &havn_proto::ChatCommand) -> (Option<S
             (
                 chat,
                 format!(
-                    "Agent: {agent}\nModel: {model}\nThinking: {}\nThis chat: {chat_line}\nReplies \
-                     being written or waiting: {waiting}",
+                    "Agent: {agent}\nModel: {model}\nThinking: {}\nTool rounds a message may take: \
+                     {}\nThis chat: {chat_line}\nReplies being written or waiting: {waiting}",
                     info.as_ref()
                         .and_then(|i| i.thinking.as_deref())
-                        .unwrap_or("as the model is set")
+                        .unwrap_or("as the model is set"),
+                    ctx.tool_env.policy.tool_rounds.max.max(1)
                 ),
             )
         }
@@ -2537,6 +2530,11 @@ async fn run_tool_loop(
     let mut handle = ctx.parent_handle();
     handle.stop = stop;
     handle.segments = segments;
+    // A tick nobody waits on gets the tighter limit: a runaway one costs
+    // the square of its rounds (issue #219).
+    if context != crate::tools::context::WEBCHAT {
+        handle.max_iterations = ctx.tool_env.policy.tool_rounds.subagent.max(1);
+    }
     if let Some(model) = model {
         handle.model = model;
     }
@@ -3444,10 +3442,9 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
         "content": query.prompt,
     })];
 
-    // Cap iteration count tighter than the parent's MAX so a target
-    // can't burn the caller's token budget with a 30-iteration spiral.
-    // 15 mirrors the subagent ceiling (spec §4.5 rule 5).
-    let max_iters: u32 = MAX_TOOL_ITERATIONS.min(15);
+    // As a subagent's task: a target cannot burn the caller's token budget
+    // with as many rounds as its own messages get (spec §4.5 rule 5).
+    let max_iters: u32 = ctx.tool_env.policy.tool_rounds.subagent.max(1);
 
     let handle = LoopHandle {
         writer_tx: ctx.writer_tx.clone(),
@@ -3500,7 +3497,7 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
             // is informative.
             (
                 AgentQueryOutcome::Error {
-                    message: format!("target hit the {cap}-iteration cap before finishing"),
+                    message: format!("target stopped after {cap} tool rounds, its limit"),
                 },
                 partial_text,
             )
