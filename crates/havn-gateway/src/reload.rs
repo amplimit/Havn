@@ -94,6 +94,10 @@ pub const RULES: &[ReloadRule] = &[
         kind: ReloadKind::Hot,
     },
     ReloadRule {
+        prefix: "transcription",
+        kind: ReloadKind::Hot,
+    },
+    ReloadRule {
         prefix: "reload",
         kind: ReloadKind::Restart,
     },
@@ -202,6 +206,8 @@ pub struct ReloadHandles {
     pub workspace_browse: Arc<std::sync::atomic::AtomicBool>,
     /// `[channel_texts]`.
     pub channel_texts: Arc<ArcSwap<crate::config::ChannelTexts>>,
+    /// `[transcription]`.
+    pub transcription: Arc<ArcSwap<Option<crate::transcribe::Transcription>>>,
 }
 
 impl ReloadHandles {
@@ -211,6 +217,7 @@ impl ReloadHandles {
             models: Arc::new(ArcSwap::from_pointee(cfg.llm.catalog())),
             workspace_browse: Arc::new(std::sync::atomic::AtomicBool::new(cfg.workspace.browse)),
             channel_texts: Arc::new(ArcSwap::from_pointee(cfg.channel_texts.clone())),
+            transcription: Arc::new(ArcSwap::from_pointee(cfg.transcription.clone())),
         }
     }
 
@@ -236,6 +243,13 @@ impl ReloadHandles {
                     "hot-reloaded the model list"
                 );
                 self.models.store(Arc::new(catalog));
+            } else if path.starts_with("transcription") {
+                self.transcription
+                    .store(Arc::new(new.transcription.clone()));
+                info!(
+                    on = new.transcription.is_some(),
+                    "hot-reloaded the transcription of audio"
+                );
             } else if path.starts_with("channel_texts") {
                 new.warn_channel_texts();
                 self.channel_texts

@@ -43,9 +43,14 @@ pub struct Attachment {
     pub name: String,
     pub media_type: String,
     pub size: u64,
-    /// Where its text is, when it was extracted (a PDF, say).
+    /// Where its text is, when it was extracted (a PDF, say), or the
+    /// transcript of an audio file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_path: Option<String>,
+    /// An audio file's transcript (issue #164), as the gateway made it;
+    /// shown to the agent with the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
 }
 
 /// Where the files people send are saved, in an agent's workspace.

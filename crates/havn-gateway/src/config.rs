@@ -117,6 +117,10 @@ pub struct GatewayConfig {
     /// and account (issue #183), hot-reloaded.
     #[serde(default)]
     pub channel_texts: ChannelTexts,
+    /// How voice notes and audio files are transcribed (issue #164);
+    /// unset, they are not. Hot-reloaded.
+    #[serde(default)]
+    pub transcription: Option<crate::transcribe::Transcription>,
     /// Backend of the `web_search` tool.
     ///
     /// TOML form:
@@ -596,6 +600,7 @@ impl Default for GatewayConfig {
             llm: LlmConfig::default(),
             workspace: WorkspaceConfig::default(),
             channel_texts: ChannelTexts::default(),
+            transcription: None,
             search: SearchConfig::default(),
             fetch: FetchConfig::default(),
             channels: std::collections::BTreeMap::new(),

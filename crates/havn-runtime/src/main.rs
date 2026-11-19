@@ -3304,6 +3304,7 @@ mod tests {
             media_type: media.into(),
             size: 10,
             text_path: None,
+            transcript: None,
         };
         let asked = with_attachments(
             "what is in it?".into(),
@@ -3358,6 +3359,7 @@ mod tests {
             media_type: "application/pdf".into(),
             size: 1_572_864,
             text_path: Some("inbox/20261115-120000-report.pdf.txt".into()),
+            transcript: None,
         };
         let csv = havn_core::Attachment {
             path: "inbox/20261115-120000-data.csv".into(),
@@ -3365,6 +3367,7 @@ mod tests {
             media_type: "text/csv".into(),
             size: 300,
             text_path: None,
+            transcript: None,
         };
         let text = with_attachments("Summarise these".into(), &[pdf, csv.clone()]);
         assert_eq!(

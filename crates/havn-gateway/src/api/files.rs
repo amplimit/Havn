@@ -237,6 +237,7 @@ pub async fn receive(
         media_type,
         size: body.len() as u64,
         text_path,
+        transcript: None,
     };
     Ok(attachment)
 }

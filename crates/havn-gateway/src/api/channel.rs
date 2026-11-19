@@ -2134,6 +2134,7 @@ mod tests {
                 media_type: "image/png".into(),
                 size: 3,
                 text_path: None,
+                transcript: None,
             };
             {
                 let mut waiting = received().lock().expect("lock");
@@ -2176,6 +2177,7 @@ mod tests {
                 media_type: "application/pdf".into(),
                 size: 9,
                 text_path: Some("inbox/3-b.pdf.txt".into()),
+                transcript: None,
             };
             restore_received(agent, "telegram", "bot", "tg:7", vec![file.clone()]);
             let taken = take_received(
