@@ -117,6 +117,11 @@ pub struct ChannelOutbound {
     /// sender who pressed it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buttons: Vec<Vec<havn_core::Button>>,
+    /// A question answered by choosing several options (issue #204), for
+    /// an adapter that shows polls in place of the text; the answer comes
+    /// back as the poll's `answer` and the chosen numbers, as a press does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll: Option<havn_core::Poll>,
 }
 
 /// Adapter → gateway: replay request after reconnect.
@@ -256,6 +261,7 @@ mod tests {
             in_reply_to: Some("tg:chat:123:msg:7".into()),
             content: ChannelMessageContent::Text { text: "hi".into() },
             buttons: Vec::new(),
+            poll: None,
         });
         let s = serde_json::to_string(&frame).expect("serialize");
         let parsed: ChannelFrame = serde_json::from_str(&s).expect("parse");
@@ -276,6 +282,7 @@ mod tests {
             in_reply_to: None,
             content: ChannelMessageContent::Text { text: "t".into() },
             buttons,
+            poll: None,
         };
         let plain = serde_json::to_string(&outbound(Vec::new())).expect("json");
         assert!(!plain.contains("buttons"), "{plain}");

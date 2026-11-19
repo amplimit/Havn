@@ -96,6 +96,17 @@ pub struct Button {
 /// Longest `data` of a [`Button`], in bytes: what Telegram takes.
 pub const MAX_BUTTON_DATA: usize = 64;
 
+/// A question answered by choosing several options (issue #204), for a
+/// channel that shows it as a poll; the message's text lists the options
+/// too. The answer comes back as `answer`, a space and the numbers of the
+/// options chosen (from 1), comma-separated, from the person who chose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Poll {
+    pub question: String,
+    pub options: Vec<String>,
+    pub answer: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundMessage {
     pub channel_id: String,
@@ -103,6 +114,10 @@ pub struct OutboundMessage {
     /// Rows of buttons under it, for a channel that shows them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buttons: Vec<Vec<Button>>,
+    /// A question to answer by choosing several options, for a channel
+    /// that shows polls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll: Option<Poll>,
     /// Optional message ID to thread / reply to.
     pub reply_to: Option<String>,
     /// The chat a reply belongs to, when it answers one.

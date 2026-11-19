@@ -179,18 +179,19 @@ async fn web_asker(
 }
 
 /// Answer the chat command `parsed`, sent in chat `conversation` of a web
-/// chat session.
+/// chat session; what to send the agent as the sender's message instead
+/// (a choice, issue #204), and the question it answers.
 async fn web_command(
     state: &AppState,
     asker: &crate::commands::Asker,
     conversation: Option<String>,
     parsed: crate::commands::Parsed<'_>,
-) {
+) -> Option<(String, String)> {
     let mut asker = asker.clone();
     asker.conversation = conversation;
     let session: SessionId = match asker.scope.parse() {
         Ok(s) => s,
-        Err(_) => return,
+        Err(_) => return None,
     };
     let reply = match parsed {
         refused @ (crate::commands::Parsed::Unknown(_) | crate::commands::Parsed::Misused(_)) => {
@@ -207,11 +208,14 @@ async fn web_command(
                 if let Err(e) = state.registry.send(asker.agent_id, stop).await {
                     warn!(agent_id = %asker.agent_id, error = ?e, "failed to forward StopTurn");
                 }
-                return;
+                return None;
             }
             "retry" => "(Answer again with the button under the reply.)".into(),
             _ => match crate::commands::run(state, &asker, command, args).await {
                 crate::commands::Action::Reply(text) => text,
+                crate::commands::Action::Say { text, question } => {
+                    return Some((text, question));
+                }
                 crate::commands::Action::Agent(command) => {
                     let frame = GatewayToAgent::ChatCommand(command);
                     let saved = crate::commands::saved_already(&frame);
@@ -223,7 +227,7 @@ async fn web_command(
                             .into()
                     } else {
                         match state.registry.send(asker.agent_id, frame).await {
-                            Ok(()) => return,
+                            Ok(()) => return None,
                             Err(e) => {
                                 state
                                     .webchat_router
@@ -249,6 +253,7 @@ async fn web_command(
     {
         debug!(error = ?e, "no tab took a command's answer");
     }
+    None
 }
 
 /// Serve one tab until the browser closes it, the socket fails, or the
@@ -344,6 +349,8 @@ async fn serve_session<Si, St, E>(
             }
         };
         let mut attachments = Vec::new();
+        // The question a choice answers, forgotten once it reached the agent.
+        let mut answered = None;
         let (user_text, conversation, branch) = match parsed {
             ClientMessage::Send {
                 content,
@@ -355,12 +362,22 @@ async fn serve_session<Si, St, E>(
                 && commands.is_some()
                 && crate::commands::parse(&content).is_some() =>
             {
-                if let (Some((state, asker)), Some(parsed)) =
-                    (commands.as_ref(), crate::commands::parse(&content))
-                {
-                    web_command(state, asker, chat_id(conversation), parsed).await;
+                let chat = chat_id(conversation);
+                let said = match (commands.as_ref(), crate::commands::parse(&content)) {
+                    (Some((state, asker)), Some(parsed)) => {
+                        web_command(state, asker, chat.clone(), parsed).await
+                    }
+                    _ => None,
+                };
+                // A choice goes on as the person's message, in the chat it
+                // was made in.
+                match said {
+                    Some((text, question)) => {
+                        answered = Some(question);
+                        (text, chat, None)
+                    }
+                    None => continue,
                 }
-                continue;
             }
             ClientMessage::Send {
                 content,
@@ -454,10 +471,15 @@ async fn serve_session<Si, St, E>(
             raw: serde_json::Value::Null,
         };
 
-        if let Err(e) = registry
+        let sent = registry
             .send(agent_id, GatewayToAgent::InboundMessage(inbound))
-            .await
+            .await;
+        if sent.is_ok()
+            && let Some(question) = answered
         {
+            router.forget_choice(&question);
+        }
+        if let Err(e) = sent {
             warn!(%agent_id, error = ?e, "failed to forward InboundMessage");
             // Inform the user; the socket stays open in case the agent comes back.
             let _ = router
@@ -590,6 +612,7 @@ mod tests {
                         },
                         reply_to: None,
                         buttons: Vec::new(),
+                        poll: None,
                     },
                 )
                 .await
