@@ -113,6 +113,9 @@ const SUMMARY_BATCH: u32 = 20;
 const MAX_SUMMARY_CHARS: usize = 6000;
 /// Characters of each turn the summariser reads.
 const SUMMARY_TURN_CHARS: usize = 4000;
+/// Least characters of turns a summary pass asks for when the model's
+/// context window is small (issue #214): one turn is read in any case.
+const MIN_SUMMARY_INPUT_CHARS: usize = 4000;
 /// Characters of turns one summary pass reads at most, so one batch of
 /// long turns does not exceed a small model's context; the rest wait
 /// for the next pass.
@@ -1805,6 +1808,61 @@ async fn chat_command(ctx: &Ctx, command: &havn_proto::ChatCommand) -> (Option<S
         )
     };
     match &command.command {
+        ChatCommandKind::Compact => {
+            let chat = match existing().await {
+                Ok(Some(chat)) => chat,
+                Ok(None) => return (None, "(There is nothing here to compact.)".into()),
+                Err(e) => return failed(e),
+            };
+            if ctx.turns.waiting(&chat) > 0 {
+                return (
+                    Some(chat),
+                    "(A reply is still being written here. Wait for it, or send /stop, then \
+                     /compact.)"
+                        .into(),
+                );
+            }
+            match conversations::summary_due(&ctx.pool, &chat, COMPACT_KEEP, 1, MAX_SUMMARY_FOLD)
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return (
+                        Some(chat),
+                        "(This chat is short enough: there is nothing to compact.)".into(),
+                    );
+                }
+                Err(e) => return failed(e),
+            }
+            // The summary is the model's to write, and its answer comes
+            // through the frames this command was read with: it is written
+            // meanwhile, and the person told when it is done.
+            let (ctx, channel_id, which) = (ctx.clone(), scope.clone(), chat.clone());
+            tokio::spawn(async move {
+                let text = match compact(&ctx, &which, false, 1).await {
+                    Ok(Some(n)) if n > 0 => {
+                        "(Compacted: the earlier part of this chat is kept as a summary from now \
+                         on; the last few turns stay as they are.)"
+                    }
+                    Ok(Some(_)) => "(This chat is short enough: there is nothing to compact.)",
+                    Ok(None) => {
+                        "(This chat is being summarised already, or could not be a moment ago; \
+                         try again in a few minutes.)"
+                    }
+                    Err(e) => {
+                        warn!(chat = %which, error = %e, "could not compact the chat");
+                        "(Could not compact this chat right now; please try again in a moment.)"
+                    }
+                };
+                tell(&ctx, channel_id, which, text).await;
+            });
+            (
+                Some(chat),
+                "(Compacting the earlier part of this chat into a summary; you will be told when \
+                 it is done.)"
+                    .into(),
+            )
+        }
         ChatCommandKind::Undo => {
             let chat = match existing().await {
                 Ok(Some(chat)) => chat,
@@ -2352,6 +2410,10 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         }
     };
 
+    let trimmed = turn_trace
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .trimmed;
     // Persist assistant turn (visible reply only — intermediate tool turns
     // exist only in-memory for this iteration).
     // Under the turn it answers, also when the user moved to another
@@ -2369,7 +2431,11 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
             {
                 warn!(error = %e, "could not keep the turn's steps");
             }
-            summarize_when_due(&ctx, &chat, msg.channel == "webchat");
+            // A chat the gateway had to cut to fit the model is compacted
+            // after the reply (issue #214); others are summarised when due.
+            if !trimmed {
+                summarize_when_due(&ctx, &chat, msg.channel == "webchat");
+            }
             // What the turn did on the way, kept with its reply.
             let kept = std::mem::take(
                 &mut *turn_trace
@@ -2418,6 +2484,21 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         .await
     {
         error!(error = ?e, "failed to enqueue OutboundMessage");
+    }
+    // Compacted after the reply, and the person told (issue #214).
+    if trimmed {
+        let (ctx, chat, channel_id) = (ctx.clone(), chat.clone(), msg.channel_id.clone());
+        let flush = msg.channel == "webchat";
+        // Only once a batch of turns is past the ones kept, so a chat that
+        // stays near the window is not compacted (nor the person told) on
+        // every turn.
+        tokio::spawn(async move {
+            match compact(&ctx, &chat, flush, COMPACT_KEEP).await {
+                Ok(Some(n)) if n > 0 => tell(&ctx, channel_id, chat, COMPACTED_NOTICE).await,
+                Ok(_) => {}
+                Err(e) => warn!(%chat, error = %e, "could not compact the chat"),
+            }
+        });
     }
     let changes = tools::memory::changes(std::mem::take(
         &mut *memory_changes
@@ -2685,6 +2766,79 @@ impl Drop for SummaryPass {
     }
 }
 
+/// Turns a compacted chat keeps whole (issue #214).
+const COMPACT_KEEP: u32 = 6;
+
+/// Fold every turn of chat `chat` but the last [`COMPACT_KEEP`] into its
+/// summary now (issue #214), once `batch` turns are past them, and with
+/// `flush` the facts to keep into memory: how many passes folded turns,
+/// or `None` when its summary is being written already or failed a short
+/// while ago. A pass that fails after others did ends it.
+async fn compact(ctx: &Ctx, chat: &str, flush: bool, batch: u32) -> anyhow::Result<Option<u32>> {
+    if SUMMARY_FAILED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(chat)
+        .is_some_and(|at| at.elapsed() < SUMMARY_RETRY)
+    {
+        return Ok(None);
+    }
+    if !SUMMARIZING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(chat.to_string())
+    {
+        return Ok(None);
+    }
+    let _pass = SummaryPass(chat.to_string());
+    let mut folded = 0;
+    for _ in 0..MAX_SUMMARY_PASSES {
+        match summarize(ctx, chat, flush, COMPACT_KEEP, batch).await {
+            Ok(true) => folded += 1,
+            Ok(false) => break,
+            Err(e) => {
+                SUMMARY_FAILED
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(chat.to_string(), std::time::Instant::now());
+                if folded == 0 {
+                    return Err(e);
+                }
+                warn!(%chat, error = %e, "a compaction pass failed after others");
+                break;
+            }
+        }
+    }
+    info!(%chat, passes = folded, "compacted the chat");
+    Ok(Some(folded))
+}
+
+/// Send chat `chat` of conversation `channel_id` a line from the agent,
+/// not kept in it.
+async fn tell(ctx: &Ctx, channel_id: String, chat: String, text: &str) {
+    let notice = OutboundMessage {
+        conversation: Some(chat),
+        channel_id,
+        content: MessageContent::Text { text: text.into() },
+        reply_to: None,
+        buttons: Vec::new(),
+        poll: None,
+        partial: false,
+    };
+    if let Err(e) = ctx
+        .writer_tx
+        .send(AgentToGateway::OutboundMessage(notice))
+        .await
+    {
+        warn!(error = ?e, "could not send a notice");
+    }
+}
+
+/// What a person is told when their chat was compacted because it had
+/// grown past the model's context window.
+const COMPACTED_NOTICE: &str = "(This chat has grown longer than the model takes at once, so \
+     its earlier part is kept as a summary from now on. /new starts a fresh chat.)";
+
 /// Fold the oldest turns of chat `chat` into its summary in the
 /// background, once enough have gone past the window (issue #105); with
 /// `flush`, save the lasting facts they state to memory first.
@@ -2714,7 +2868,7 @@ fn summarize_when_due(ctx: &Ctx, chat: &str, flush: bool) {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(chat);
         for _ in 0..MAX_SUMMARY_PASSES {
-            match summarize(&ctx, chat, flush).await {
+            match summarize(&ctx, chat, flush, HISTORY_WINDOW, SUMMARY_BATCH).await {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(e) => {
@@ -2748,53 +2902,68 @@ Answer with JSON only: {\"summary\": \"...\", \"remember\": [{\"key\": \
 \"user.editor\", \"value\": \"...\", \"kind\": \"identity|preference|project|event\"}]}";
 
 /// One pass: true when it folded turns into the summary.
-async fn summarize(ctx: &Ctx, chat: &str, flush: bool) -> anyhow::Result<bool> {
+async fn summarize(
+    ctx: &Ctx,
+    chat: &str,
+    flush: bool,
+    window: u32,
+    batch: u32,
+) -> anyhow::Result<bool> {
     use std::fmt::Write as _;
-    let Some(due) = conversations::summary_due(
-        &ctx.pool,
-        chat,
-        HISTORY_WINDOW,
-        SUMMARY_BATCH,
-        MAX_SUMMARY_FOLD,
-    )
-    .await?
+    let Some(due) =
+        conversations::summary_due(&ctx.pool, chat, window, batch, MAX_SUMMARY_FOLD).await?
     else {
         return Ok(false);
     };
-    let mut transcript = String::new();
-    if let Some(previous) = &due.previous {
-        writeln!(transcript, "Summary so far:\n{previous}\n")?;
-    }
-    transcript.push_str("Turns to add:\n");
-    // The turns read, and the last of them: what the summary covers.
-    let mut read = 0;
-    let mut through = due.through.clone();
-    for (n, turn) in due.turns.iter().enumerate() {
-        let text: String = turn.content.chars().take(SUMMARY_TURN_CHARS).collect();
-        let chars = text.chars().count();
-        if n > 0 && read + chars > MAX_SUMMARY_INPUT_CHARS {
-            break;
+    // A summary is written from turns read whole: when the gateway had to
+    // cut the request to fit the model (issue #214), it is asked again
+    // with fewer turns, and what it covers is what it read.
+    let mut cap = MAX_SUMMARY_INPUT_CHARS;
+    let (response, through) = loop {
+        let mut transcript = String::new();
+        if let Some(previous) = &due.previous {
+            writeln!(transcript, "Summary so far:\n{previous}\n")?;
         }
-        through.clone_from(&turn.id);
-        read += chars;
-        if matches!(turn.role, Role::User | Role::Assistant) {
-            writeln!(
-                transcript,
-                "\n[{}] {}:\n{text}",
-                turn.created_at.format("%Y-%m-%d %H:%M"),
-                turn.role.as_str()
-            )?;
+        transcript.push_str("Turns to add:\n");
+        // The turns read, and the last of them: what the summary covers.
+        let mut read = 0;
+        let mut through = due.through.clone();
+        for (n, turn) in due.turns.iter().enumerate() {
+            let text: String = turn.content.chars().take(SUMMARY_TURN_CHARS).collect();
+            let chars = text.chars().count();
+            if n > 0 && read + chars > cap {
+                break;
+            }
+            through.clone_from(&turn.id);
+            read += chars;
+            if matches!(turn.role, Role::User | Role::Assistant) {
+                writeln!(
+                    transcript,
+                    "\n[{}] {}:\n{text}",
+                    turn.created_at.format("%Y-%m-%d %H:%M"),
+                    turn.role.as_str()
+                )?;
+            }
         }
-    }
-    let request = havn_proto::LlmRequest {
-        request_id: uuid::Uuid::now_v7().to_string(),
-        model: ctx.model().as_str().into(),
-        messages: serde_json::json!([{ "role": "user", "content": transcript }]),
-        options: serde_json::json!({ "max_tokens": 2048, "system": SUMMARY_PROMPT, "thinking": "off" }),
-        billing_user_id: None,
-        reply: None,
+        let request = havn_proto::LlmRequest {
+            request_id: uuid::Uuid::now_v7().to_string(),
+            model: ctx.model().as_str().into(),
+            messages: serde_json::json!([{ "role": "user", "content": transcript }]),
+            options: serde_json::json!({ "max_tokens": 2048, "system": SUMMARY_PROMPT, "thinking": "off" }),
+            billing_user_id: None,
+            reply: None,
+        };
+        let response = tool_loop::request_llm(&ctx.writer_tx, &ctx.pending, request).await?;
+        if !response.trimmed {
+            break (response, through);
+        }
+        if cap <= MIN_SUMMARY_INPUT_CHARS {
+            return Err(anyhow!(
+                "the chat's turns do not fit the model's context window even a few at a time"
+            ));
+        }
+        cap = (cap / 2).max(MIN_SUMMARY_INPUT_CHARS);
     };
-    let response = tool_loop::request_llm(&ctx.writer_tx, &ctx.pending, request).await?;
     let text = match response.outcome {
         havn_proto::LlmOutcome::Ok => curator::extract_text(&response.provider_response)
             .ok_or_else(|| anyhow!("the summary had no text"))?,

@@ -27,6 +27,10 @@ pub struct ModelEntry {
     /// How it thinks, when it can (issue #190): absent, it is not asked to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingSpec>,
+    /// Tokens it takes in one request, input and output (issue #214);
+    /// unset, what its family is known to take ([`ModelEntry::context`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
 }
 
 /// How a model can be asked to think, as its admin set it.
@@ -201,7 +205,108 @@ impl ThinkingSpec {
     }
 }
 
+/// What model families take in a request, by the start of the model's
+/// name (after any `vendor/`), the longest that matches; [`DEFAULT_CONTEXT`]
+/// for the rest.
+const KNOWN_CONTEXTS: &[(&str, u32)] = &[
+    ("claude", 200_000),
+    ("gemini", 1_000_000),
+    ("gpt-4-1", 1_000_000),
+    ("gpt-4-1106", 128_000),
+    ("gpt-4-0125", 128_000),
+    ("gpt-4o", 128_000),
+    ("gpt-4-turbo", 128_000),
+    ("gpt-5", 400_000),
+    ("gpt-oss", 128_000),
+    ("o1", 200_000),
+    ("o3", 200_000),
+    ("o4", 200_000),
+    ("deepseek", 128_000),
+    ("kimi", 256_000),
+    ("grok", 256_000),
+    ("mistral", 128_000),
+    ("codestral", 256_000),
+    ("devstral", 128_000),
+    ("magistral", 128_000),
+    ("ministral", 128_000),
+    ("pixtral", 128_000),
+    ("minimax", 200_000),
+    ("qwen", 128_000),
+    ("glm", 128_000),
+    ("llama", 128_000),
+];
+/// What a model of no known family is taken to take: little, so a local
+/// model with a small context is not overfilled.
+pub const DEFAULT_CONTEXT: u32 = 32_000;
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn a_model_takes_its_set_window_else_its_family_s() {
+        let entry = |id: &str, window: Option<u32>| ModelEntry {
+            id: id.into(),
+            label: None,
+            max_output_tokens: None,
+            vision: None,
+            thinking: None,
+            context_window: window,
+        };
+        assert_eq!(
+            entry("anthropic:claude-sonnet-4-6", None).context(),
+            200_000
+        );
+        assert_eq!(
+            entry("openrouter:google/gemini-3.8-flash", None).context(),
+            1_000_000
+        );
+        assert_eq!(
+            entry("openrouter:deepseek/deepseek-v4.1-flash-1017", None).context(),
+            128_000
+        );
+        assert_eq!(
+            entry("ollama:some-local-model", None).context(),
+            DEFAULT_CONTEXT
+        );
+        assert_eq!(entry("openai:gpt-4.1-mini", None).context(), 1_000_000);
+        assert_eq!(
+            entry("openrouter:qwen/qwen3-coder", None).context(),
+            128_000
+        );
+        assert_eq!(entry("openai:o3-mini", None).context(), 200_000);
+        // A name that only holds a family's name elsewhere is not of it.
+        assert_eq!(entry("openai:olmo3", None).context(), DEFAULT_CONTEXT);
+        assert_eq!(
+            entry("anthropic:claude-sonnet-4-6", Some(64_000)).context(),
+            64_000
+        );
+    }
+}
+
 impl ModelEntry {
+    /// Tokens it takes in one request: `context_window`, else what its
+    /// family takes, else [`DEFAULT_CONTEXT`].
+    #[must_use]
+    pub fn context(&self) -> u32 {
+        self.context_window.unwrap_or_else(|| {
+            let model = self.model();
+            let bare = model.rsplit('/').next().unwrap_or(model);
+            let name = bare.to_ascii_lowercase().replace('.', "-");
+            KNOWN_CONTEXTS
+                .iter()
+                .filter(|(prefix, _)| {
+                    name.strip_prefix(prefix).is_some_and(|rest| {
+                        rest.is_empty()
+                            || rest.starts_with(['-', ':', '@'])
+                            || rest.starts_with(|c: char| c.is_ascii_digit())
+                    })
+                })
+                .max_by_key(|(prefix, _)| prefix.len())
+                .map_or(DEFAULT_CONTEXT, |(_, tokens)| *tokens)
+        })
+    }
+
     #[must_use]
     pub fn provider(&self) -> &str {
         split_model_ref(&self.id).map_or("", |(provider, _)| provider)
@@ -538,6 +643,12 @@ fn write_checked(
                     table.remove("thinking");
                 }
             }
+            match entry.context_window {
+                Some(n) => table["context_window"] = value(i64::from(n)),
+                None => {
+                    table.remove("context_window");
+                }
+            }
             models.push(table);
         }
         llm.insert("models", Item::ArrayOfTables(models));
@@ -771,6 +882,7 @@ pub async fn upgrade(
                         max_output_tokens: None,
                         vision: None,
                         thinking: None,
+                        context_window: None,
                     })
                     .collect(),
             };
@@ -872,6 +984,7 @@ mod tests {
             max_output_tokens: None,
             vision,
             thinking: None,
+            context_window: None,
         };
         let mut c = ModelCatalog::default();
         c.models = vec![
@@ -893,6 +1006,12 @@ mod tests {
         write_to_file(&path, &c).expect("written");
         let text = std::fs::read_to_string(&path).expect("read");
         assert_eq!(text.matches("vision").count(), 1, "{text}");
+        // A context window set is written and read back (issue #214).
+        c.models[2].context_window = Some(20_000);
+        write_to_file(&path, &c).expect("written");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("context_window = 20000"), "{text}");
+        assert_eq!(read_from_file(&path).expect("read back"), c);
     }
 
     #[test]
@@ -910,6 +1029,7 @@ mod tests {
                 default: Some("medium".into()),
                 mandatory: false,
             }),
+            context_window: None,
         });
         c.validate().expect("valid");
         let dir = tempfile::tempdir().expect("dir");
@@ -942,6 +1062,7 @@ mod tests {
             max_output_tokens: None,
             vision: None,
             thinking: None,
+            context_window: None,
         }
     }
 
