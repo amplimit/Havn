@@ -34,10 +34,20 @@ pub enum ProviderError {
     /// HTTP 401 — key revoked. Disable the credential and try next.
     Unauthorized { body: String },
     /// HTTP 402 / 429 — quota exhausted or rate-limited. Try next; do NOT
-    /// disable (the key may be fine again tomorrow / next minute).
-    QuotaOrRateLimit { status: u16, body: String },
-    /// HTTP 5xx — upstream is broken. Try next.
-    Upstream { status: u16, body: String },
+    /// disable (the key may be fine again tomorrow / next minute). A 429 is
+    /// tried again first, after `retry_after` when the provider said
+    /// (issue #216).
+    QuotaOrRateLimit {
+        status: u16,
+        body: String,
+        retry_after: Option<std::time::Duration>,
+    },
+    /// HTTP 5xx — upstream is broken. Tried again, then the next.
+    Upstream {
+        status: u16,
+        body: String,
+        retry_after: Option<std::time::Duration>,
+    },
     /// HTTP 4xx other than 401/402/429 — caller's request is malformed.
     /// Fatal; do not iterate.
     BadRequest { status: u16, body: String },
@@ -53,8 +63,8 @@ impl std::fmt::Display for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unauthorized { body } => write!(f, "401 unauthorized: {body}"),
-            Self::QuotaOrRateLimit { status, body } => write!(f, "{status}: {body}"),
-            Self::Upstream { status, body } => write!(f, "upstream {status}: {body}"),
+            Self::QuotaOrRateLimit { status, body, .. } => write!(f, "{status}: {body}"),
+            Self::Upstream { status, body, .. } => write!(f, "upstream {status}: {body}"),
             Self::BadRequest { status, body } => write!(f, "{status}: {body}"),
             Self::Transport(s) => write!(f, "transport: {s}"),
             Self::Translation(s) => write!(f, "translation: {s}"),
@@ -152,16 +162,40 @@ pub type TextSink = dyn Fn(TextEvent<'_>) + Send + Sync;
 
 /// The error an unsuccessful HTTP status stands for.
 #[must_use]
-pub fn status_error(status: u16, body: String) -> ProviderError {
+pub fn status_error(
+    status: u16,
+    body: String,
+    retry_after: Option<std::time::Duration>,
+) -> ProviderError {
     match status {
         401 => ProviderError::Unauthorized { body },
-        402 | 429 => ProviderError::QuotaOrRateLimit { status, body },
-        500..=599 => ProviderError::Upstream { status, body },
+        402 | 429 => ProviderError::QuotaOrRateLimit {
+            status,
+            body,
+            retry_after,
+        },
+        500..=599 => ProviderError::Upstream {
+            status,
+            body,
+            retry_after,
+        },
         other => ProviderError::BadRequest {
             status: other,
             body,
         },
     }
+}
+
+/// How long a response's `Retry-After` header asks to wait, in seconds
+/// (the form providers use; an HTTP date is not read). A value no wait can
+/// hold (negative, not a number, too large) is none.
+#[must_use]
+pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .and_then(|secs| std::time::Duration::try_from_secs_f64(secs).ok())
 }
 
 /// A stream that stopped before the provider said the reply was done:
@@ -328,14 +362,30 @@ pub(super) fn classify(err: ProviderError) -> super::Attempt {
         ProviderError::Unauthorized { body } => super::Attempt::Disable {
             reason: format!("401 unauthorized: {body}"),
         },
-        ProviderError::QuotaOrRateLimit { status, body } => super::Attempt::TryNext {
+        // A rate limit or an overload passes: tried again (issue #216). A
+        // quota (402) does not.
+        ProviderError::QuotaOrRateLimit {
+            status,
+            body,
+            retry_after,
+        } => super::Attempt::TryNext {
             reason: format!("{status}: {body}"),
+            again: (status == 429).then(|| retry_after.unwrap_or_default()),
+            transient: status == 429,
         },
-        ProviderError::Upstream { status, body } => super::Attempt::TryNext {
+        ProviderError::Upstream {
+            status,
+            body,
+            retry_after,
+        } => super::Attempt::TryNext {
             reason: format!("upstream {status}: {body}"),
+            again: Some(retry_after.unwrap_or_default()),
+            transient: true,
         },
         ProviderError::Transport(s) => super::Attempt::TryNext {
             reason: format!("transport: {s}"),
+            again: Some(std::time::Duration::ZERO),
+            transient: true,
         },
         ProviderError::BadRequest { status, body } => {
             super::Attempt::Fatal(super::ProxyError::Upstream {
@@ -352,6 +402,29 @@ pub(super) fn classify(err: ProviderError) -> super::Attempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_retry_after_no_wait_can_hold_is_none() {
+        let header = |v: &str| -> reqwest::header::HeaderMap {
+            [(reqwest::header::RETRY_AFTER, v.parse().expect("value"))]
+                .into_iter()
+                .collect()
+        };
+        assert_eq!(
+            retry_after(&header("2.5")),
+            Some(std::time::Duration::from_millis(2500))
+        );
+        for odd in [
+            "1e20",
+            "99999999999999999999",
+            "-1",
+            "NaN",
+            "inf",
+            "Wed, 21 Oct 2026 07:28:00 GMT",
+        ] {
+            assert_eq!(retry_after(&header(odd)), None, "{odd}");
+        }
+    }
 
     #[test]
     fn output_limits_match_by_longest_prefix() {

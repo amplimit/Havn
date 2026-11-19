@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 
 use super::provider::{
     LlmProvider, ProviderError, Sse, TextEvent, TextSink, cut_short, is_event_stream, pass_text,
-    status_error,
+    retry_after, status_error,
 };
 use super::{AnthropicMessage, AnthropicRequest, AnthropicResponse, AnthropicUsage};
 
@@ -107,8 +107,9 @@ impl LlmProvider for OpenAiProvider {
 
         let status = resp.status();
         if !status.is_success() {
+            let wait = retry_after(resp.headers());
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(status_error(status.as_u16(), body_text));
+            return Err(status_error(status.as_u16(), body_text, wait));
         }
 
         let raw: Value = resp
@@ -145,8 +146,9 @@ impl LlmProvider for OpenAiProvider {
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
+            let wait = retry_after(resp.headers());
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(status_error(status.as_u16(), body_text));
+            return Err(status_error(status.as_u16(), body_text, wait));
         }
         if !is_event_stream(&resp) {
             let raw: Value = resp
@@ -171,6 +173,7 @@ impl LlmProvider for OpenAiProvider {
                 .map_err(|e| ProviderError::Translation(format!("stream chunk decode: {e}")))?;
             if let Some(error) = chunk.get("error") {
                 return Err(ProviderError::Upstream {
+                    retry_after: None,
                     status: 502,
                     body: error.to_string(),
                 });

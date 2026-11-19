@@ -31,6 +31,10 @@ pub struct ModelEntry {
     /// unset, what its family is known to take ([`ModelEntry::context`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
+    /// Models, by id, that answer in its place when it fails for now on
+    /// every credential (issue #216), the first the agent's policy allows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback: Vec<String>,
 }
 
 /// How a model can be asked to think, as its admin set it.
@@ -252,6 +256,7 @@ mod context_tests {
             vision: None,
             thinking: None,
             context_window: window,
+            fallback: Vec::new(),
         };
         assert_eq!(
             entry("anthropic:claude-sonnet-4-6", None).context(),
@@ -351,6 +356,11 @@ impl ModelCatalog {
             }
             if !seen.insert(entry.id.as_str()) {
                 anyhow::bail!("[[llm.models]] lists {:?} more than once", entry.id);
+            }
+            // A fallback that is not listed (removed since) is passed over
+            // when one is picked; one naming its own model is a mistake.
+            if entry.fallback.contains(&entry.id) {
+                anyhow::bail!("[[llm.models]] {:?} names itself as its fallback", entry.id);
             }
             if entry.max_output_tokens == Some(0) {
                 anyhow::bail!(
@@ -649,6 +659,15 @@ fn write_checked(
                     table.remove("context_window");
                 }
             }
+            if entry.fallback.is_empty() {
+                table.remove("fallback");
+            } else {
+                let mut list = toml_edit::Array::new();
+                for id in &entry.fallback {
+                    list.push(id.as_str());
+                }
+                table["fallback"] = value(list);
+            }
             models.push(table);
         }
         llm.insert("models", Item::ArrayOfTables(models));
@@ -883,6 +902,7 @@ pub async fn upgrade(
                         vision: None,
                         thinking: None,
                         context_window: None,
+                        fallback: Vec::new(),
                     })
                     .collect(),
             };
@@ -985,6 +1005,7 @@ mod tests {
             vision,
             thinking: None,
             context_window: None,
+            fallback: Vec::new(),
         };
         let mut c = ModelCatalog::default();
         c.models = vec![
@@ -1008,10 +1029,29 @@ mod tests {
         assert_eq!(text.matches("vision").count(), 1, "{text}");
         // A context window set is written and read back (issue #214).
         c.models[2].context_window = Some(20_000);
+        c.models[2].fallback = vec!["openrouter:a/seeing".into()];
         write_to_file(&path, &c).expect("written");
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(text.contains("context_window = 20000"), "{text}");
+        assert!(
+            text.contains("fallback = [\"openrouter:a/seeing\"]"),
+            "{text}"
+        );
         assert_eq!(read_from_file(&path).expect("read back"), c);
+    }
+
+    #[test]
+    fn a_fallback_must_be_another_model() {
+        let mut c = ModelCatalog::default();
+        c.models = vec![entry("openrouter:a/main"), entry("openrouter:a/spare")];
+        c.models[0].fallback = vec!["openrouter:a/spare".into()];
+        assert!(c.validate().is_ok());
+        // One removed since is passed over, not refused: the model it was
+        // can be removed.
+        c.models[0].fallback = vec!["openrouter:a/gone".into()];
+        assert!(c.validate().is_ok());
+        c.models[0].fallback = vec!["openrouter:a/main".into()];
+        assert!(c.validate().is_err());
     }
 
     #[test]
@@ -1030,6 +1070,7 @@ mod tests {
                 mandatory: false,
             }),
             context_window: None,
+            fallback: Vec::new(),
         });
         c.validate().expect("valid");
         let dir = tempfile::tempdir().expect("dir");
@@ -1063,6 +1104,7 @@ mod tests {
             vision: None,
             thinking: None,
             context_window: None,
+            fallback: Vec::new(),
         }
     }
 

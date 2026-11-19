@@ -76,6 +76,7 @@ fn map_proxy_error(e: ProxyError) -> ApiError {
     error!(error = %e, "anthropic proxy failed");
     match e {
         ProxyError::NoCredential(p) => ApiError::NoCredential(p),
+        e @ ProxyError::Unavailable { .. } => ApiError::Upstream(e.to_string()),
         ProxyError::Upstream { status, message } => {
             ApiError::Upstream(format!("status {status}: {message}"))
         }

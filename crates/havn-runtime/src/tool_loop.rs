@@ -64,6 +64,9 @@ pub struct Trace {
     /// The gateway left part of a request out for it to fit the model's
     /// context window (issue #214): the chat is due to be compacted.
     pub trimmed: bool,
+    /// The model that answers in place of the turn's, which was
+    /// unavailable (issue #216): the turn's later calls go to it.
+    pub fallback: Option<String>,
     chars: usize,
 }
 
@@ -713,15 +716,32 @@ async fn call_llm(
             channel_id,
             conversation: crate::tools::gateway::CHAT.try_with(Clone::clone).ok(),
         });
-    let build = |messages: &[Value]| LlmRequest {
+    // A model that answers in place of the turn's goes on for the turn
+    // (issue #216), without thinking: it may not take the turn's reasoning
+    // so far, nor its own replies of this turn without any.
+    let fallback = TRACE
+        .try_with(|trace| {
+            trace
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .fallback
+                .clone()
+        })
+        .ok()
+        .flatten();
+    if fallback.is_some() {
+        options["thinking"] = Value::String("off".into());
+    }
+    let mut model = fallback.unwrap_or_else(|| handle.model.as_str().to_string());
+    let build = |messages: &[Value], model: &str| LlmRequest {
         request_id: request_id.clone(),
-        model: handle.model.as_str().into(),
+        model: model.into(),
         messages: Value::Array(messages.to_vec()),
         options: options.clone(),
         billing_user_id: handle.billing_user_id.clone(),
         reply: reply.clone(),
     };
-    let mut llm_req = build(messages);
+    let mut llm_req = build(messages, &model);
     // The frame adds its `"type"` tag to the request's own JSON.
     let budget = MAX_FRAME_BYTES - FRAME_TAG_BYTES;
     let size = serde_json::to_vec(&llm_req)?.len();
@@ -739,13 +759,14 @@ async fn call_llm(
                 provider_response: Value::Null,
                 usage: None,
                 trimmed: false,
+                fallback: None,
             });
         }
         warn!(
             size,
             "conversation over the frame limit; removed old tool results"
         );
-        llm_req = build(messages);
+        llm_req = build(messages, &model);
     }
 
     // A stopped turn drops this future: the gateway is told, and stops
@@ -754,10 +775,43 @@ async fn call_llm(
         writer_tx: &handle.writer_tx,
         request_id: llm_req.reply.is_some().then(|| request_id.clone()),
     };
-    let response = request_llm(&handle.writer_tx, &handle.pending, llm_req).await;
+    let mut response = request_llm(&handle.writer_tx, &handle.pending, llm_req).await;
+    // The model was down: its fallback answers, a few in turn at most.
+    let mut asked = vec![model.clone()];
+    while let Ok(answer) = &response
+        && matches!(answer.outcome, LlmOutcome::Error { .. })
+        && let Some(next) = answer.fallback.clone()
+        && !asked.contains(&next)
+        && asked.len() <= MAX_FALLBACKS
+    {
+        warn!(from = %model, to = %next, "the model is unavailable; asking its fallback");
+        model.clone_from(&next);
+        asked.push(next);
+        let mut retry = build(messages, &model);
+        retry.request_id = Uuid::now_v7().to_string();
+        // Another model may not take the turn's reasoning so far (an
+        // Anthropic model with thinking on wants its own in the last
+        // assistant turn): it answers without thinking.
+        retry.options["thinking"] = Value::String("off".into());
+        cancel.request_id = retry.reply.is_some().then(|| retry.request_id.clone());
+        response = request_llm(&handle.writer_tx, &handle.pending, retry).await;
+        // It answered: the turn's later calls go to it, and the person is
+        // told.
+        if matches!(&response, Ok(answer) if matches!(answer.outcome, LlmOutcome::Ok)) {
+            let _ = TRACE.try_with(|trace| {
+                trace
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .fallback = Some(model.clone());
+            });
+        }
+    }
     cancel.request_id = None;
     response
 }
+
+/// Fallback models one call goes through at most (issue #216).
+const MAX_FALLBACKS: usize = 3;
 
 /// Sends [`AgentToGateway::LlmCancel`] for its call when dropped before
 /// the call's answer came.
@@ -924,6 +978,7 @@ async fn oversized_frame(
                     provider_response: Value::Null,
                     usage: None,
                     trimmed: false,
+                    fallback: None,
                 });
             }
             None
@@ -1219,6 +1274,7 @@ mod tests {
                         provider_response: serde_json::json!({"content": content, "stop_reason": stop}),
                         usage: None,
                         trimmed: false,
+                        fallback: None,
                     };
                     loop {
                         if let Some(answer) = pending.lock().await.remove(&req.request_id) {
@@ -1276,6 +1332,109 @@ mod tests {
                 .as_array()
                 .is_some_and(|b| b.iter().all(|b| b["type"] == "tool_result"))
         );
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_model_gives_way_to_its_fallback_for_the_turn() {
+        use crate::tools::{ToolCtx, ToolRegistry};
+        let (tx, mut rx) = mpsc::channel(8);
+        let (pending, _) = maps();
+        let policy = Arc::new(havn_core::Policy::default());
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite");
+        let handle = LoopHandle {
+            writer_tx: tx,
+            pending: Arc::clone(&pending),
+            registry: ToolRegistry::standard(&policy),
+            tool_env: ToolCtx {
+                workspace_dir: std::path::PathBuf::from("/tmp"),
+                agent_db: pool,
+                policy: Arc::clone(&policy),
+                embedder: None,
+            },
+            max_iterations: 3,
+            messages_mirror: None,
+            model: Arc::new("p:main".into()),
+            max_tokens: DEFAULT_MAX_TOKENS,
+            billing_user_id: None,
+            stop: None,
+            segments: None,
+        };
+        let gateway = tokio::spawn({
+            let pending = Arc::clone(&pending);
+            async move {
+                let mut models = Vec::new();
+                for n in 0..3 {
+                    let Some(AgentToGateway::LlmRequest(req)) = rx.recv().await else {
+                        panic!("no request");
+                    };
+                    models.push(req.model.clone());
+                    let reply = match n {
+                        0 => LlmResponse {
+                            request_id: req.request_id.clone(),
+                            outcome: LlmOutcome::Error {
+                                message: "unavailable".into(),
+                            },
+                            provider_response: Value::Null,
+                            usage: None,
+                            trimmed: false,
+                            fallback: Some("p:spare".into()),
+                        },
+                        1 => LlmResponse {
+                            request_id: req.request_id.clone(),
+                            outcome: LlmOutcome::Ok,
+                            provider_response: serde_json::json!({"stop_reason": "tool_use", "content": [
+                                {"type": "tool_use", "id": "t1", "name": "no_such_tool", "input": {}}
+                            ]}),
+                            usage: None,
+                            trimmed: false,
+                            fallback: None,
+                        },
+                        _ => LlmResponse {
+                            request_id: req.request_id.clone(),
+                            outcome: LlmOutcome::Ok,
+                            provider_response: serde_json::json!({"stop_reason": "end_turn", "content": [
+                                {"type": "text", "text": "done"}
+                            ]}),
+                            usage: None,
+                            trimmed: false,
+                            fallback: None,
+                        },
+                    };
+                    loop {
+                        if let Some(answer) = pending.lock().await.remove(&req.request_id) {
+                            let _ = answer.send(reply);
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }
+                models
+            }
+        });
+        let trace = Arc::new(std::sync::Mutex::new(Trace::default()));
+        let mut messages = vec![serde_json::json!({"role": "user", "content": "go"})];
+        let prompt = crate::system_prompt::BootstrapFiles::default().system_prompt(None);
+        let text = TRACE
+            .scope(
+                Arc::clone(&trace),
+                run_typed(
+                    &handle,
+                    crate::tools::context::WEBCHAT,
+                    &mut messages,
+                    &prompt,
+                ),
+            )
+            .await
+            .expect("answered");
+        assert_eq!(text, "done");
+        // The fallback answered, and the turn's next call went to it.
+        let models = gateway.await.expect("gateway");
+        assert_eq!(models, ["p:main", "p:spare", "p:spare"]);
+        assert_eq!(trace.lock().unwrap().fallback.as_deref(), Some("p:spare"));
     }
 
     #[tokio::test]

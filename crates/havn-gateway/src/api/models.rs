@@ -322,6 +322,7 @@ mod tests {
                     vision: None,
                     thinking: None,
                     context_window: None,
+                    fallback: Vec::new(),
                 })
                 .collect(),
         })

@@ -534,6 +534,7 @@ mod tests {
             vision: None,
             thinking: None,
             context_window: None,
+            fallback: Vec::new(),
         }];
         new.llm.default_model = Some("openai:gpt-5".into());
         new.llm.title_model = Some("openai:gpt-5".into());

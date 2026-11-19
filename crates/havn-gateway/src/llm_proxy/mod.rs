@@ -218,6 +218,14 @@ impl AnthropicUsage {
 pub enum ProxyError {
     #[error("no usable credential for provider {0:?}")]
     NoCredential(String),
+    /// Every credential failed for a while (issue #216): rate-limited,
+    /// overloaded or unreachable, tried again first.
+    #[error("the provider {provider:?} is unavailable ({reason}) after {tries} tries")]
+    Unavailable {
+        provider: String,
+        reason: String,
+        tries: u32,
+    },
     #[error("upstream provider error: {status} — {message}")]
     Upstream { status: u16, message: String },
     #[error("transport: {0}")]
@@ -235,9 +243,14 @@ pub enum ProxyError {
 /// Outcome of a single attempt against one credential. Drives the fallback loop.
 pub(crate) enum Attempt {
     Ok(AnthropicResponse),
-    /// Try next credential; do not disable this one.
+    /// Try next credential; do not disable this one. A failure that passes
+    /// (`transient`: a rate limit, an overload, the network) is tried again
+    /// on the same credential first after `again`, the wait the provider
+    /// asked for, when it is `Some` (issue #216).
     TryNext {
         reason: String,
+        again: Option<std::time::Duration>,
+        transient: bool,
     },
     /// Try next credential, and disable this one (401 unauthorized — key revoked).
     Disable {
@@ -396,6 +409,10 @@ async fn complete_through(
     let mut exhausted: Option<String> = None;
     let mut db_failure: Option<havn_db::DbError> = None;
     let mut sent = false;
+    // The last failure that passes, the calls made, and since when.
+    let mut passing: Option<String> = None;
+    let mut tries = 0_u32;
+    let started = std::time::Instant::now();
     for cred in chain {
         let caps = Caps {
             agent_tokens,
@@ -457,14 +474,44 @@ async fn complete_through(
         let granted = u32::try_from(reserved.tokens_out).unwrap_or(request.max_tokens);
         let attempt_request = with_max_tokens(request, granted.min(request.max_tokens));
 
-        // What an earlier credential streamed is not the reply.
-        if let Some(text) = text
-            && sent
-        {
-            text(provider::TextEvent::Restart);
-        }
-        sent = true;
-        match try_one(http, keyring, route, &cred, &attempt_request, text).await {
+        // Tried again on a failure that passes, with backoff, within a
+        // budget of time; then the next credential.
+        let mut again = 0;
+        let attempt = loop {
+            // What an earlier try streamed is not the reply.
+            if let Some(text) = text
+                && sent
+            {
+                text(provider::TextEvent::Restart);
+            }
+            sent = true;
+            tries += 1;
+            let attempt = try_one(http, keyring, route, &cred, &attempt_request, text).await;
+            if let Attempt::TryNext {
+                reason,
+                again: Some(asked),
+                transient: true,
+            } = &attempt
+            {
+                let wait = backoff(again, *asked);
+                if again < RETRIES
+                    && asked <= &MAX_RETRY_AFTER
+                    && started.elapsed() + wait < RETRY_BUDGET
+                {
+                    again += 1;
+                    warn!(
+                        credential_id = %cred.id,
+                        %reason,
+                        wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                        "provider failed for now; trying again"
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            }
+            break attempt;
+        };
+        match attempt {
             Attempt::Ok(resp) => {
                 if resp.usage.unreported {
                     warn!(
@@ -494,9 +541,14 @@ async fn complete_through(
                     .await
                     .map_err(|e| warn!(error = %e, "failed to disable credential"));
             }
-            Attempt::TryNext { reason } => {
+            Attempt::TryNext {
+                reason, transient, ..
+            } => {
                 guard.release().await;
                 warn!(credential_id = %cred.id, %reason, "skipping credential, trying next");
+                if transient {
+                    passing = Some(reason);
+                }
             }
             Attempt::Fatal(e) => {
                 guard.release().await;
@@ -508,10 +560,63 @@ async fn complete_through(
     if let Some(e) = db_failure {
         return Err(ProxyError::Db(e));
     }
+    if let Some(reason) = passing {
+        // What a try streamed is not the reply: another model may give it.
+        if let Some(text) = text
+            && sent
+        {
+            text(provider::TextEvent::Restart);
+        }
+        return Err(ProxyError::Unavailable {
+            provider: route.name.to_string(),
+            reason: short_reason(&reason),
+            tries,
+        });
+    }
     Err(exhausted.map_or_else(
         || ProxyError::NoCredential(route.name.to_string()),
         ProxyError::BudgetExhausted,
     ))
+}
+
+/// Tries again of a call on one credential after a failure that passes,
+/// the longest wait a provider may ask for that is waited, and the time
+/// they all may take (issue #216).
+const RETRIES: u32 = 3;
+const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+/// The first wait when the provider names none; it doubles each time.
+#[cfg(not(test))]
+const RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(test)]
+const RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// How long to wait before try `again` (0 for the first again): what the
+/// provider `asked`, else the base doubled for each try, with up to a
+/// quarter more at random so callers that failed together do not all come
+/// back at once.
+fn backoff(again: u32, asked: std::time::Duration) -> std::time::Duration {
+    let wait = if asked.is_zero() {
+        RETRY_BASE.saturating_mul(1 << again.min(10))
+    } else {
+        asked
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()));
+    let quarter = u64::try_from(wait.as_millis() / 4).unwrap_or(0).max(1);
+    wait + std::time::Duration::from_millis(nanos % quarter)
+}
+
+/// The start of a provider's failure, for a person to read: its status and
+/// the first of its words.
+fn short_reason(reason: &str) -> String {
+    let line = reason.lines().next().unwrap_or_default();
+    let mut short: String = line.chars().take(120).collect();
+    if line.chars().count() > 120 {
+        short.push('…');
+    }
+    short
 }
 
 /// Owns a reservation row until it is settled, released or kept. Dropped
@@ -2674,6 +2779,7 @@ mod tests {
                         return Err(ProviderError::Upstream {
                             status: 500,
                             body: "down".into(),
+                            retry_after: None,
                         });
                     }
                     Reply::Unreported => AnthropicUsage::unreported(),
@@ -2830,9 +2936,36 @@ mod tests {
             let err = call(&f, &provider, &ask(300))
                 .await
                 .expect_err("upstream down");
-            assert!(matches!(err, ProxyError::NoCredential(_)), "{err}");
-            assert_eq!(provider.seen().len(), 1);
+            // Tried again, then said for what it is.
+            assert!(
+                matches!(err, ProxyError::Unavailable { tries: 4, .. }),
+                "{err}"
+            );
+            assert!(err.to_string().contains("upstream 500"), "{err}");
+            assert_eq!(provider.seen().len(), 4);
             assert!(rows(&f.db).await.is_empty());
+        }
+
+        #[test]
+        fn backoff_doubles_or_takes_what_the_provider_asked() {
+            let first = backoff(0, Duration::ZERO);
+            let third = backoff(2, Duration::ZERO);
+            assert!(first >= RETRY_BASE && first <= RETRY_BASE * 5 / 4 + Duration::from_millis(1));
+            assert!(third >= RETRY_BASE * 4);
+            let asked = backoff(0, Duration::from_secs(7));
+            assert!(asked >= Duration::from_secs(7) && asked < Duration::from_secs(9));
+            let headers: reqwest::header::HeaderMap =
+                [(reqwest::header::RETRY_AFTER, "3".parse().expect("value"))]
+                    .into_iter()
+                    .collect();
+            assert_eq!(
+                provider::retry_after(&headers),
+                Some(Duration::from_secs(3))
+            );
+            assert_eq!(
+                provider::retry_after(&reqwest::header::HeaderMap::new()),
+                None
+            );
         }
 
         #[tokio::test]

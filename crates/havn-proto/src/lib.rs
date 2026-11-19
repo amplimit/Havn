@@ -837,6 +837,11 @@ pub struct LlmResponse {
     /// (issue #214): the chat should be compacted.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trimmed: bool,
+    /// The model failed for now (rate-limited, overloaded, unreachable) on
+    /// every credential, and this one, of its `fallback` list and allowed,
+    /// may answer in its place (issue #216): the runtime asks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
