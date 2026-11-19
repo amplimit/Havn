@@ -132,9 +132,10 @@ pub fn plain(content: &str) -> Vec<Value> {
     vec![json!({ "role": "assistant", "content": content })]
 }
 
-/// Give the tool calls of `messages` ids of their own, the same in their
-/// results: ids a provider made up repeat across turns (`call_0`), or do
-/// not suit another provider the chat moves to.
+/// Give each tool call of `messages` an id of its own, and its results the
+/// same: ids a provider made up repeat, across turns and from one round to
+/// the next (`call_0`), or do not suit another provider the chat moves to.
+/// A result answers the latest call with its id.
 fn with_own_ids(messages: &mut [Value]) {
     let mut ids = std::collections::HashMap::new();
     for message in messages.iter_mut() {
@@ -142,16 +143,22 @@ fn with_own_ids(messages: &mut [Value]) {
             continue;
         };
         for block in blocks {
-            let key = match block_type(block) {
-                Some("tool_use") => "id",
-                Some("tool_result") => "tool_use_id",
-                _ => continue,
-            };
-            if let Some(Value::String(id)) = block.get_mut(key) {
-                let own = ids
-                    .entry(id.clone())
-                    .or_insert_with(|| format!("toolu_{}", uuid::Uuid::now_v7().simple()));
-                id.clone_from(own);
+            match block_type(block) {
+                Some("tool_use") => {
+                    if let Some(Value::String(id)) = block.get_mut("id") {
+                        let own = format!("toolu_{}", uuid::Uuid::now_v7().simple());
+                        ids.insert(id.clone(), own.clone());
+                        *id = own;
+                    }
+                }
+                Some("tool_result") => {
+                    if let Some(Value::String(id)) = block.get_mut("tool_use_id")
+                        && let Some(own) = ids.get(id.as_str())
+                    {
+                        id.clone_from(own);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -350,6 +357,28 @@ It says x.",
         let again: Vec<Value> =
             serde_json::from_str(&of_turn(&turn(), "It says x.").unwrap()).unwrap();
         assert_ne!(again[0]["content"][1]["id"], call, "unique across turns");
+
+        // The same made-up id in two rounds of one turn.
+        let mut twice = turn();
+        twice.insert(
+            2,
+            json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "file_read", "input": {"path": "b.txt"}},
+            ]}),
+        );
+        twice.insert(
+            3,
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "y", "is_error": false},
+            ]}),
+        );
+        let steps: Vec<Value> =
+            serde_json::from_str(&of_turn(&twice, "It says x.").unwrap()).unwrap();
+        let first = steps[0]["content"][1]["id"].as_str().unwrap();
+        let second = steps[2]["content"][0]["id"].as_str().unwrap();
+        assert_ne!(first, second, "unique within a turn");
+        assert_eq!(steps[1]["content"][0]["tool_use_id"], first);
+        assert_eq!(steps[3]["content"][0]["tool_use_id"], second);
     }
 
     #[test]
