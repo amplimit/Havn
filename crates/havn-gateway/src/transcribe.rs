@@ -135,13 +135,14 @@ pub async fn transcribe(
             MAX_AUDIO_BYTES / (1024 * 1024)
         ));
     }
-    let _turn = RUNNING
-        .acquire()
-        .await
-        .map_err(|e| format!("transcription is closed: {e}"))?;
     // The name it is sent with says its format, whatever it was sent as.
     let file = format!("audio.{format}");
+    // Waiting for a turn counts within the limit too.
     let work = async {
+        let _turn = RUNNING
+            .acquire()
+            .await
+            .map_err(|e| format!("transcription is closed: {e}"))?;
         match how {
             Transcription::Endpoint {
                 base_url,
