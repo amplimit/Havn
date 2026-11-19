@@ -23,6 +23,25 @@ const STEPS_BUDGET: usize = 200_000;
 /// What ends steps whose turn wrote nothing after its last tool call.
 const ENDED: &str = "(The turn ended here.)";
 
+/// The line a reply ends with when a fallback model answered it (issue
+/// #216): kept with the reply, so it shows alike live and stored, and left
+/// out of what later turns read, so the model does not take it for its own.
+#[must_use]
+pub fn fallback_note(model: &str) -> String {
+    format!("(Answered by {model}: the chat's model was unavailable.)")
+}
+
+/// `reply` without its [`fallback_note`].
+#[must_use]
+pub fn without_note(reply: &str) -> &str {
+    match reply.rfind("(Answered by ") {
+        Some(at) if reply.ends_with(": the chat's model was unavailable.)") => {
+            reply[..at].trim_end()
+        }
+        _ => reply,
+    }
+}
+
 /// The steps of a turn, from its `messages` (those the tool loop added
 /// after the history), as JSON to keep; `None` for a turn that called no
 /// tool, whose reply is all there is. `reply` is the reply kept, which can
@@ -267,6 +286,14 @@ mod tests {
             ]}),
             json!({"role": "assistant", "content": [{"type": "text", "text": "It says x."}]}),
         ]
+    }
+
+    #[test]
+    fn the_fallback_note_is_not_read_back() {
+        let reply = format!("pong\n\n{}", fallback_note("p:spare"));
+        assert_eq!(without_note(&reply), "pong");
+        assert_eq!(without_note("plain"), "plain");
+        assert_eq!(without_note(&fallback_note("p:spare")), "");
     }
 
     #[test]

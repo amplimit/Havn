@@ -2294,7 +2294,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     let replies: Vec<(&str, Option<&str>)> = history
         .iter()
         .filter(|t| t.role == Role::Assistant)
-        .map(|t| (t.content.as_str(), t.steps.as_deref()))
+        .map(|t| (steps::without_note(&t.content), t.steps.as_deref()))
         .collect();
     let mut replies = steps::messages_of_replies(&replies).into_iter();
     let mut messages: Vec<serde_json::Value> = Vec::with_capacity(history.len());
@@ -2308,7 +2308,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
                 // A history cut short can start with a reply: as its text,
                 // since a model takes no tool call before anyone spoke.
                 if messages.is_empty() {
-                    messages.extend(steps::plain(&t.content));
+                    messages.extend(steps::plain(steps::without_note(&t.content)));
                 } else {
                     messages.extend(reply);
                 }
@@ -2417,9 +2417,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
             if !text.is_empty() {
                 text.push_str("\n\n");
             }
-            text.push_str(&format!(
-                "(Answered by {model}: the chat's model was unavailable.)"
-            ));
+            text.push_str(&steps::fallback_note(&model));
             text
         }
         None => final_text,
@@ -2435,9 +2433,10 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         // memory is the agent's, and a channel may be someone else.
         Ok(Some(turn)) => {
             // What the turn said and did on the way, for later turns.
-            if let Some(kept) =
-                steps::of_turn(messages.get(turn_start..).unwrap_or_default(), &final_text)
-                && let Err(e) = conversations::set_steps(&ctx.pool, &turn, &kept).await
+            if let Some(kept) = steps::of_turn(
+                messages.get(turn_start..).unwrap_or_default(),
+                steps::without_note(&final_text),
+            ) && let Err(e) = conversations::set_steps(&ctx.pool, &turn, &kept).await
             {
                 warn!(error = %e, "could not keep the turn's steps");
             }

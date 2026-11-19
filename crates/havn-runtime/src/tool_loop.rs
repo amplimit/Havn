@@ -717,8 +717,9 @@ async fn call_llm(
             conversation: crate::tools::gateway::CHAT.try_with(Clone::clone).ok(),
         });
     // A model that answers in place of the turn's goes on for the turn
-    // (issue #216).
-    let mut model = TRACE
+    // (issue #216), without thinking: it may not take the turn's reasoning
+    // so far, nor its own replies of this turn without any.
+    let fallback = TRACE
         .try_with(|trace| {
             trace
                 .lock()
@@ -727,8 +728,11 @@ async fn call_llm(
                 .clone()
         })
         .ok()
-        .flatten()
-        .unwrap_or_else(|| handle.model.as_str().to_string());
+        .flatten();
+    if fallback.is_some() {
+        options["thinking"] = Value::String("off".into());
+    }
+    let mut model = fallback.unwrap_or_else(|| handle.model.as_str().to_string());
     let build = |messages: &[Value], model: &str| LlmRequest {
         request_id: request_id.clone(),
         model: model.into(),
