@@ -3411,7 +3411,13 @@ mod tests {
 
         assert_eq!(
             tools_of(agent).await,
-            ["set_timezone", "send_file", "web_fetch", "schedule"],
+            [
+                "set_timezone",
+                "send_file",
+                "ask_choice",
+                "web_fetch",
+                "schedule"
+            ],
             "no search backend yet"
         );
         add_openrouter_key(&ctx, owner).await;
@@ -3420,6 +3426,7 @@ mod tests {
             [
                 "set_timezone",
                 "send_file",
+                "ask_choice",
                 "web_search",
                 "web_fetch",
                 "schedule"
@@ -3427,7 +3434,7 @@ mod tests {
         );
         assert_eq!(
             tools_of(denied).await,
-            ["set_timezone", "send_file", "schedule"],
+            ["set_timezone", "send_file", "ask_choice", "schedule"],
             "policy denies search and fetch"
         );
     }
