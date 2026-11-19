@@ -2143,6 +2143,10 @@ mod tests {
             .await
             .expect("titled");
         assert!(titled.iter().all(|c| c.id != chat(3)));
+        // A task scheduled in a chat is the owner's when its scope is.
+        assert!(chat_of_owner(&pool, &chat(5)).await.expect("db"));
+        assert!(!chat_of_owner(&pool, &chat(3)).await.expect("db"));
+        assert!(!chat_of_owner(&pool, "no such chat").await.expect("db"));
     }
 
     #[tokio::test]
