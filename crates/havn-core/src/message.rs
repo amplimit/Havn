@@ -84,10 +84,25 @@ pub enum Branch {
     },
 }
 
+/// A button under a message (issues #203, #204). Pressed, its `data` comes
+/// back as what the person who pressed it sent, so it is a command they
+/// could have typed and gets the same checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Button {
+    pub label: String,
+    pub data: String,
+}
+
+/// Longest `data` of a [`Button`], in bytes: what Telegram takes.
+pub const MAX_BUTTON_DATA: usize = 64;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundMessage {
     pub channel_id: String,
     pub content: MessageContent,
+    /// Rows of buttons under it, for a channel that shows them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buttons: Vec<Vec<Button>>,
     /// Optional message ID to thread / reply to.
     pub reply_to: Option<String>,
     /// The chat a reply belongs to, when it answers one.

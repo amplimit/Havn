@@ -110,6 +110,13 @@ pub struct ChannelOutbound {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
     pub content: ChannelMessageContent,
+    /// Rows of buttons under the message (issues #203, #204), for an
+    /// adapter that shows them; one that does not shows the text alone,
+    /// which says how to answer by typing. A press comes back as a
+    /// `ChannelInbound` with the button's `data` as its text, from the
+    /// sender who pressed it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buttons: Vec<Vec<havn_core::Button>>,
 }
 
 /// Adapter → gateway: replay request after reconnect.
@@ -248,6 +255,7 @@ mod tests {
             to: "tg:123456789".into(),
             in_reply_to: Some("tg:chat:123:msg:7".into()),
             content: ChannelMessageContent::Text { text: "hi".into() },
+            buttons: Vec::new(),
         });
         let s = serde_json::to_string(&frame).expect("serialize");
         let parsed: ChannelFrame = serde_json::from_str(&s).expect("parse");
@@ -257,6 +265,35 @@ mod tests {
             }
             other => panic!("expected Outbound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn buttons_are_sent_only_when_there_are_some() {
+        let outbound = |buttons: Vec<Vec<havn_core::Button>>| ChannelOutbound {
+            seq: 1,
+            account_id: "a".into(),
+            to: "tg:1".into(),
+            in_reply_to: None,
+            content: ChannelMessageContent::Text { text: "t".into() },
+            buttons,
+        };
+        let plain = serde_json::to_string(&outbound(Vec::new())).expect("json");
+        assert!(!plain.contains("buttons"), "{plain}");
+        let pressed = serde_json::to_string(&outbound(vec![vec![havn_core::Button {
+            label: "Approve".into(),
+            data: "/approve r1".into(),
+        }]]))
+        .expect("json");
+        assert!(
+            pressed.contains(r#""buttons":[[{"label":"Approve","data":"/approve r1"}]]"#),
+            "{pressed}"
+        );
+        // A frame from before buttons still reads.
+        let old: ChannelOutbound = serde_json::from_str(
+            r#"{"seq":1,"account_id":"a","to":"tg:1","content":{"type":"text","text":"t"}}"#,
+        )
+        .expect("old frame");
+        assert!(old.buttons.is_empty());
     }
 
     #[test]

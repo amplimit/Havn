@@ -1094,6 +1094,7 @@ where
                     channel_id: command.channel_id,
                     content: MessageContent::Text { text },
                     reply_to: None,
+                    buttons: Vec::new(),
                 };
                 if let Err(e) = ctx.writer_tx.try_send(AgentToGateway::CommandReply(reply)) {
                     warn!(error = %e, "could not answer a chat command");
@@ -1380,6 +1381,7 @@ async fn handle_heartbeat(ctx: Ctx) {
         channel_id: "broadcast".into(),
         content: MessageContent::Text { text: final_text },
         reply_to: None,
+        buttons: Vec::new(),
     };
     if let Err(e) = ctx
         .writer_tx
@@ -2038,6 +2040,7 @@ fn send_text(ctx: &Ctx, channel_id: String, conversation: Option<String>, text: 
         channel_id,
         content: MessageContent::Text { text },
         reply_to: None,
+        buttons: Vec::new(),
     };
     // Never wait on a full writer queue: the reader loop calls this, and
     // replies it must route would stall behind it.
@@ -2288,6 +2291,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         channel_id: msg.channel_id.clone(),
         content: MessageContent::Text { text: final_text },
         reply_to: None,
+        buttons: Vec::new(),
     };
     if let Err(e) = ctx
         .writer_tx

@@ -906,6 +906,7 @@ async fn oversized_reply(
                             channel_id: msg.channel_id,
                             content: havn_core::MessageContent::Text { text: notice },
                             reply_to: None,
+                            buttons: Vec::new(),
                         },
                     )
                     .await;
@@ -978,7 +979,9 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
         AgentToGateway::Hello { .. } => {
             warn!(%agent_id, "duplicate Hello after handshake — ignoring");
         }
-        AgentToGateway::OutboundMessage(msg) => route_outbound(agent_id, msg, ctx).await,
+        AgentToGateway::OutboundMessage(msg) => {
+            route_outbound(agent_id, from_agent(msg), ctx).await;
+        }
         AgentToGateway::ChatTitled(titled) => {
             if let Ok(session) = titled.channel_id.parse::<crate::webchat::SessionId>()
                 && crate::channel_id_codec::decode(&titled.channel_id).is_none()
@@ -998,6 +1001,7 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
             }
         }
         AgentToGateway::CommandReply(msg) => {
+            let msg = from_agent(msg);
             // A web chat shows it as a notice; a channel as any message.
             match msg.channel_id.parse::<crate::webchat::SessionId>() {
                 Ok(session) if crate::channel_id_codec::decode(&msg.channel_id).is_none() => {
@@ -1251,23 +1255,42 @@ async fn ask_for_approval(
         )
         .await;
     }
-    if let Some((channel, account, _)) = crate::channel_id_codec::decode(&request.channel_id) {
-        let listed = ctx
+    if let Some((channel, account, sender)) = crate::channel_id_codec::decode(&request.channel_id) {
+        let admins_of_account = ctx
             .channels
             .get(channel)
             .and_then(|entry| entry.accounts.iter().find(|a| a.id == account))
-            .is_some_and(|acct| !acct.admins.is_empty());
+            .map(|acct| acct.admins.clone())
+            .unwrap_or_default();
         // The agent's owner with a chat account of this channel connected
         // is an admin there too (issue #182).
-        let owner_linked = match havn_db::repo::agents::find_by_id(&ctx.db, agent_id).await {
-            Ok(Some(agent)) => {
-                havn_db::repo::channel_access::list_links(&ctx.db, Some(agent.owner_id))
-                    .await
-                    .is_ok_and(|links| links.iter().any(|l| l.channel == channel))
-            }
-            _ => false,
+        let owner = match havn_db::repo::agents::find_by_id(&ctx.db, agent_id).await {
+            Ok(Some(agent)) => Some(agent.owner_id),
+            _ => None,
         };
-        let admins = listed || owner_linked;
+        let owner_linked = match owner {
+            Some(owner) => havn_db::repo::channel_access::list_links(&ctx.db, Some(owner))
+                .await
+                .is_ok_and(|links| links.iter().any(|l| l.channel == channel)),
+            None => false,
+        };
+        let admins = !admins_of_account.is_empty() || owner_linked;
+        // The person in this chat decides with a press when they may
+        // (issue #203); the text says how by command either way.
+        let sender_admin = admins_of_account.iter().any(|id| id == sender)
+            || match owner {
+                Some(owner) => havn_db::repo::channel_access::linked_user(&ctx.db, channel, sender)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|link| link.user_id == owner),
+                None => false,
+            };
+        let buttons = if sender_admin {
+            approval_buttons(&request.request_id)
+        } else {
+            Vec::new()
+        };
         let message = OutboundMessage {
             conversation: None,
             channel_id: request.channel_id,
@@ -1284,9 +1307,51 @@ async fn ask_for_approval(
                 ),
             },
             reply_to: None,
+            buttons,
         };
         route_outbound(agent_id, message, ctx).await;
     }
+}
+
+/// A message an agent sent, without buttons: they are the gateway's, which
+/// makes each stand for a command the person can see (issue #203); an
+/// agent's could pass an approval off as something else.
+fn from_agent(mut msg: OutboundMessage) -> OutboundMessage {
+    msg.buttons.clear();
+    msg
+}
+
+/// Approve, approve for the chat and deny, for approval request `id`:
+/// each its command naming the request; none when the id (the runtime's)
+/// would not read back as one, or not fit a button.
+fn approval_buttons(id: &str) -> Vec<Vec<havn_core::Button>> {
+    let plain = !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '-'))
+        && !id.eq_ignore_ascii_case("always");
+    if !plain {
+        return Vec::new();
+    }
+    let button = |label: &str, data: String| havn_core::Button {
+        label: label.to_string(),
+        data,
+    };
+    let rows = vec![
+        vec![
+            button("Approve", format!("/approve {id}")),
+            button("Approve for this chat", format!("/approve always {id}")),
+        ],
+        vec![button("Deny", format!("/deny {id}"))],
+    ];
+    if rows
+        .iter()
+        .flatten()
+        .any(|b| b.data.len() > havn_core::MAX_BUTTON_DATA)
+    {
+        return Vec::new();
+    }
+    rows
 }
 
 /// The model that writes chat titles for an agent with `policy`: its
@@ -1528,7 +1593,14 @@ async fn deliver_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSo
         match translated {
             Some(content) => match ctx
                 .channel_router
-                .deliver(channel, account_id, sender_id, msg.reply_to, content)
+                .deliver_with_buttons(
+                    channel,
+                    account_id,
+                    sender_id,
+                    msg.reply_to,
+                    content,
+                    msg.buttons,
+                )
                 .await
             {
                 Ok(_) => true,
@@ -1720,6 +1792,7 @@ async fn run_send_file(
                 caption: sent.caption.clone(),
             },
             reply_to: None,
+            buttons: Vec::new(),
         },
         ctx,
     )
@@ -3031,6 +3104,40 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn approval_buttons_name_their_request() {
+        let id = "0198e1c2-7a4b-7c3d-9e8f-0a1b2c3d4e5f";
+        let rows = approval_buttons(id);
+        let data: Vec<&str> = rows.iter().flatten().map(|b| b.data.as_str()).collect();
+        assert_eq!(
+            data,
+            [
+                format!("/approve {id}"),
+                format!("/approve always {id}"),
+                format!("/deny {id}")
+            ]
+        );
+        assert!(data.iter().all(|d| d.len() <= havn_core::MAX_BUTTON_DATA));
+        assert!(
+            approval_buttons(&"x".repeat(60)).is_empty(),
+            "too long for a button"
+        );
+        for odd in ["always", "ALWAYS", "a b", "a\nb", ""] {
+            assert!(approval_buttons(odd).is_empty(), "{odd:?}");
+        }
+        let mut msg = OutboundMessage {
+            channel_id: "ch|telegram|bot|tg:1".into(),
+            content: havn_core::MessageContent::Text {
+                text: "Done!".into(),
+            },
+            reply_to: None,
+            conversation: None,
+            buttons: approval_buttons(id),
+        };
+        msg = from_agent(msg);
+        assert!(msg.buttons.is_empty(), "an agent's buttons are dropped");
+    }
     use havn_db::connect_in_memory;
     use havn_db::repo::agents::{NewAgent, create as create_agent};
     use havn_db::repo::users::{NewUser, create as create_user};
@@ -4214,6 +4321,7 @@ mod tests {
                 channel_id: crate::channel_id_codec::encode("telegram", "bot", sender),
                 content: havn_core::MessageContent::Text { text: "hi".into() },
                 reply_to: None,
+                buttons: Vec::new(),
             })
         };
         let mut bytes = Vec::new();

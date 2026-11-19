@@ -589,6 +589,7 @@ mod tests {
                             text: format!("m{i}"),
                         },
                         reply_to: None,
+                        buttons: Vec::new(),
                     },
                 )
                 .await

@@ -575,7 +575,7 @@ A message that is only a command is answered by the gateway or the agent and nev
 | `/think [off\|on\|level\|tokens\|default]` | shows or sets how much this chat's model thinks, within what its `thinking` offers |
 | `/agent_model [name\|number\|default]` | sets the agent's model, as its settings page does, for every chat without one of its own |
 | `/usage [days]` | the agent's model calls and tokens, per model (30 days by default) |
-| `/approve [always]`, `/deny` | answer the step of this conversation waiting for approval |
+| `/approve [always] [id]`, `/deny [id]` | answer the step of this conversation waiting for approval: the one named by its request id, else the one that waited longest |
 | `/disconnect` | in a chat app, ends this account's link to a Havn account (see [Connecting a chat account](#connecting-a-chat-account)) |
 | `/whoami` | who the gateway takes you for, and whether you may use the admin commands |
 | `/help` (`/commands`) | lists them |
@@ -588,6 +588,8 @@ id = "acme-bot"
 allow_from = ["tg:123456789", "tg:987654321"]
 admins = ["tg:123456789"]
 ```
+
+In a chat app whose adapter shows buttons (Telegram), the message saying a step waits for approval carries **Approve**, **Approve for this chat** and **Deny** when the person in that chat may decide: a press sends `/approve <id>`, `/approve always <id>` or `/deny <id>` for that request, as if typed, with the same checks; the bot takes the buttons off the message once one is pressed. A request decided meanwhile (in the web chat, or by another press) answers that it was already decided. Adapters without buttons show the text, which says how to answer by command.
 
 A Telegram adapter that knows the command list sets it as the bot's command menu (`setMyCommands`) when it connects, so typing `/` in Telegram shows them.
 

@@ -599,6 +599,26 @@ impl WebChatRouter {
         awaited
     }
 
+    /// Approval request `id` of `agent_id`, when it waits in conversation
+    /// `channel_id`.
+    pub fn approval(
+        &self,
+        agent_id: AgentId,
+        channel_id: &str,
+        id: &str,
+    ) -> Option<havn_proto::ApprovalRequest> {
+        let mut pending = self.lock_approvals();
+        pending.retain(|_, p| p.since.elapsed() < APPROVAL_KEPT);
+        pending
+            .values()
+            .find(|p| {
+                p.agent_id == agent_id
+                    && p.request.channel_id == channel_id
+                    && p.request.request_id == id
+            })
+            .map(|p| p.request.clone())
+    }
+
     /// The approval request of `agent_id` that has waited longest in
     /// conversation `channel_id`.
     pub fn oldest_approval(
@@ -810,6 +830,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_approval_is_found_by_its_id_in_its_conversation_only() {
+        let router = WebChatRouter::new();
+        let agent = AgentId::new();
+        assert!(router.ask_approval(agent, approval_request("r1")).await);
+        assert!(router.ask_approval(agent, approval_request("r2")).await);
+        let chat = "ch|telegram|bot|42";
+        assert_eq!(
+            router.approval(agent, chat, "r2").map(|r| r.request_id),
+            Some("r2".to_string())
+        );
+        assert!(router.approval(agent, "ch|telegram|bot|43", "r2").is_none());
+        assert!(router.approval(AgentId::new(), chat, "r2").is_none());
+        assert!(router.approval(agent, chat, "r3").is_none());
+        assert_eq!(
+            router.oldest_approval(agent, chat).map(|r| r.request_id),
+            Some("r1".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn approvals_reach_every_tab_and_later_ones_until_closed() {
         let router = WebChatRouter::new();
         let agent = AgentId::new();
@@ -924,6 +964,7 @@ mod tests {
             channel_id: session_id.to_string(),
             content: MessageContent::Text { text: "hi".into() },
             reply_to: None,
+            buttons: Vec::new(),
         };
         router.deliver(agent_id, outbound).await.expect("deliver");
 
@@ -994,6 +1035,7 @@ mod tests {
                 text: "injected".into(),
             },
             reply_to: None,
+            buttons: Vec::new(),
         };
         let err = router
             .deliver(AgentId::new(), outbound)
@@ -1011,6 +1053,7 @@ mod tests {
             channel_id: Uuid::now_v7().to_string(),
             content: MessageContent::Text { text: "hi".into() },
             reply_to: None,
+            buttons: Vec::new(),
         };
         let err = router
             .deliver(AgentId::new(), outbound)
@@ -1027,6 +1070,7 @@ mod tests {
             channel_id: "not-a-uuid".into(),
             content: MessageContent::Text { text: "hi".into() },
             reply_to: None,
+            buttons: Vec::new(),
         };
         let err = router
             .deliver(AgentId::new(), outbound)
@@ -1055,6 +1099,7 @@ mod tests {
                 text: "hello".into(),
             },
             reply_to: None,
+            buttons: Vec::new(),
         };
         let n = router.broadcast(agent_id, outbound).await;
         assert_eq!(n, 2, "should reach both sessions for the target agent");
@@ -1085,6 +1130,7 @@ mod tests {
             channel_id: "broadcast".into(),
             content: MessageContent::Text { text: t.into() },
             reply_to: None,
+            buttons: Vec::new(),
         }
     }
 
