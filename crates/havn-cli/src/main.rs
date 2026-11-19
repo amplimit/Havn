@@ -393,6 +393,11 @@ enum ModelAction {
         /// it, only a note saying so.
         #[arg(long)]
         no_vision: bool,
+        /// Tokens it takes in one request, input and output. Without it,
+        /// what its family is known to take (32000 for an unknown one, such
+        /// as a local model).
+        #[arg(long)]
+        context_window: Option<u32>,
         /// Make it the model of agents that do not set one.
         #[arg(long)]
         default: bool,
@@ -685,6 +690,7 @@ async fn run_model(action: ModelAction) -> anyhow::Result<()> {
             max_output_tokens,
             vision,
             no_vision,
+            context_window,
             default,
         } => {
             let sight = match (vision, no_vision) {
@@ -692,7 +698,15 @@ async fn run_model(action: ModelAction) -> anyhow::Result<()> {
                 (_, true) => Some(false),
                 _ => None,
             };
-            model::add(&id, label.as_deref(), max_output_tokens, sight, default).await
+            model::add(
+                &id,
+                label.as_deref(),
+                max_output_tokens,
+                sight,
+                context_window,
+                default,
+            )
+            .await
         }
         ModelAction::Remove { id } => model::remove(&id).await,
         ModelAction::Default { id } => model::set_default(&id).await,

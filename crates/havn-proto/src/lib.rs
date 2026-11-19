@@ -214,6 +214,9 @@ pub enum ChatCommandKind {
     /// next turn on (`default` for the model's own), or, without one,
     /// what it is now.
     Think { choice: Option<String> },
+    /// Fold all but the last few turns of the chat into its summary now
+    /// (issue #214).
+    Compact,
     /// Report on the chat: its model, title, turns, replies waiting.
     Status {
         /// The agent's name, which the runtime does not know.
@@ -829,6 +832,11 @@ pub struct LlmResponse {
     #[serde(default)]
     pub provider_response: serde_json::Value,
     pub usage: Option<LlmUsage>,
+    /// The gateway left out part of the request (its oldest messages,
+    /// files or long results) for it to fit the model's context window
+    /// (issue #214): the chat should be compacted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trimmed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

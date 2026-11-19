@@ -57,6 +57,13 @@ pub const COMMANDS: &[Command] = &[
         admin: false,
     },
     Command {
+        name: "compact",
+        aliases: &[],
+        args: "",
+        about: "Summarise the earlier part of this chat to make room",
+        admin: false,
+    },
+    Command {
         name: "status",
         aliases: &[],
         args: "",
@@ -358,6 +365,7 @@ pub async fn run(state: &AppState, asker: &Asker, command: &Command, args: &str)
             }
         )),
         "undo" => to_agent(ChatCommandKind::Undo),
+        "compact" => to_agent(ChatCommandKind::Compact),
         // The gateway does it before a chat-app message gets here.
         "disconnect" => Action::Reply(
             "(Chat-app accounts are disconnected on an agent's settings page, under chat apps.)"
@@ -763,13 +771,13 @@ mod tests {
     #[test]
     fn unknown_and_misused_commands_are_answered_by_the_gateway() {
         assert!(matches!(
-            parse("/compact"),
-            Some(Parsed::Unknown("compact"))
+            parse("/teleport"),
+            Some(Parsed::Unknown("teleport"))
         ));
         assert!(matches!(parse("/Foo@bot"), Some(Parsed::Unknown("Foo"))));
         assert!(matches!(
-            parse("/compact please"),
-            Some(Parsed::Unknown("compact"))
+            parse("/teleport please"),
+            Some(Parsed::Unknown("teleport"))
         ));
         let misused = parse("/stop now please").expect("a command");
         assert!(matches!(misused, Parsed::Misused(c) if c.name == "stop"));

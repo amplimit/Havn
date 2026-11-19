@@ -1875,6 +1875,7 @@ mod tests {
             max_output_tokens: None,
             vision: None,
             thinking: None,
+            context_window: None,
         };
         let catalog = ModelCatalog {
             default_model: Some("openrouter:cheap/model".into()),

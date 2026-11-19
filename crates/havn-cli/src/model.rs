@@ -19,6 +19,10 @@ pub struct ModelEntry {
     /// How it thinks (issue #190), passed through as the gateway has it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<serde_json::Value>,
+    /// Tokens it takes in one request (issue #214); unset, what its family
+    /// is known to take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +99,7 @@ pub async fn add(
     label: Option<&str>,
     max_output_tokens: Option<u32>,
     vision: Option<bool>,
+    context_window: Option<u32>,
     make_default: bool,
 ) -> anyhow::Result<()> {
     let gw = Gateway::from_env()?;
@@ -109,6 +114,7 @@ pub async fn add(
         max_output_tokens,
         vision,
         thinking: None,
+        context_window,
     });
     let default_model = if make_default {
         Some(id)

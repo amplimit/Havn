@@ -58,6 +58,9 @@ pub struct Trace {
     pub items: Vec<Value>,
     /// Entries that did not fit.
     pub left_out: usize,
+    /// The gateway left part of a request out for it to fit the model's
+    /// context window (issue #214): the chat is due to be compacted.
+    pub trimmed: bool,
     chars: usize,
 }
 
@@ -355,6 +358,14 @@ pub async fn run_typed(
         .await
         .ok_or_else(|| stopped(&said))?
         .map_err(RunError::Infra)?;
+        if response.trimmed {
+            let _ = TRACE.try_with(|trace| {
+                trace
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .trimmed = true;
+            });
+        }
         let provider_response = match response.outcome {
             LlmOutcome::Ok => response.provider_response,
             LlmOutcome::Error { message } => return Err(RunError::Llm(message)),
@@ -649,6 +660,7 @@ async fn call_llm(
                 },
                 provider_response: Value::Null,
                 usage: None,
+                trimmed: false,
             });
         }
         warn!(
@@ -833,6 +845,7 @@ async fn oversized_frame(
                     },
                     provider_response: Value::Null,
                     usage: None,
+                    trimmed: false,
                 });
             }
             None

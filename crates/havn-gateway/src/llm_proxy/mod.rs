@@ -751,17 +751,24 @@ pub struct Seen {
     /// The provider refused it with images, saying the model takes none,
     /// and took it without them: the model may be sent notes from now on.
     pub model_takes_none: bool,
+    /// Part of it was left out for it to fit the model's context window
+    /// (issue #214).
+    pub trimmed: bool,
 }
 
 /// Send `request` (by `send`) with the images its turn names in
-/// `workspace` shown when `show`. With `retry_blind`, a request that showed
-/// images and was refused outright goes once more with each image a line
-/// saying the model cannot see it; if that is refused too, the first
+/// `workspace` shown when `show`, fitted to a context window of `context`
+/// tokens ([`fit_context`]). A request the provider refuses as too long
+/// goes once more, fitted tighter. With `retry_blind`, a request that
+/// showed images and was refused outright goes once more with each image a
+/// line saying the model cannot see it; if that is refused too, the first
 /// refusal is the result.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_seeing<F, Fut>(
     request: AnthropicRequest,
     workspace: std::path::PathBuf,
     limits: crate::config::AttachmentLimits,
+    context: u32,
     show: bool,
     retry_blind: bool,
     mut send: F,
@@ -771,7 +778,7 @@ where
     Fut: std::future::Future<Output = Result<AnthropicResponse, ProxyError>>,
 {
     let limits_blind = limits.clone();
-    let (shown, blind) = tokio::task::spawn_blocking(move || {
+    let (shown, blind, again, trimmed) = tokio::task::spawn_blocking(move || {
         let mut request = request;
         // Documents' text goes to every model (issue #211).
         resolve_workspace_texts(&mut request, &workspace, &limits);
@@ -780,34 +787,329 @@ where
         let blind =
             (show && retry_blind && names_workspace_images(&request)).then(|| request.clone());
         resolve_workspace_images(&mut request, &workspace, show, &limits);
-        (request, blind)
+        // Kept for a second try, fitted tighter, when the provider finds it
+        // too long after all: only one that comes near the window can be.
+        let near = context_tokens(&request) * 2 > window_budget(&request, context, FIT_SHARE);
+        let again = near.then(|| request.clone());
+        let trimmed = fit_context(&mut request, context, FIT_SHARE);
+        (request, blind, again, trimmed)
     })
     .await?;
+    let mut trimmed = trimmed;
     let showed = shows_images(&shown);
     let result = send(shown).await;
+    if let (Err(e), Some(again)) = (&result, again)
+        && too_long(e)
+    {
+        let tighter = tokio::task::spawn_blocking(move || {
+            let mut again = again;
+            fit_context(&mut again, context, RETRY_SHARE);
+            again
+        })
+        .await?;
+        // Too long, whatever the second try gives: the chat needs
+        // compacting.
+        return Ok(Seen {
+            result: send(tighter).await,
+            model_takes_none: false,
+            trimmed: true,
+        });
+    }
     let (Some(mut blind), Err(first)) = (blind, &result) else {
         return Ok(Seen {
             result,
             model_takes_none: false,
+            trimmed,
         });
     };
     if !showed || !refused_request(first) {
         return Ok(Seen {
             result,
             model_takes_none: false,
+            trimmed,
         });
     }
     // Without vision no file is read.
     resolve_workspace_images(&mut blind, std::path::Path::new(""), false, &limits_blind);
+    trimmed |= fit_context(&mut blind, context, FIT_SHARE);
     match send(blind).await {
         Ok(answer) => Ok(Seen {
             model_takes_none: refused_images(first),
             result: Ok(answer),
+            trimmed,
         }),
         Err(_) => Ok(Seen {
             result,
             model_takes_none: false,
+            trimmed,
         }),
+    }
+}
+
+/// Percent of a model's context window a request may fill, its output
+/// aside (issue #214): the count is an estimate. A request the provider
+/// still refuses as too long goes again within [`RETRY_SHARE`].
+const FIT_SHARE: u64 = 85;
+const RETRY_SHARE: u64 = 60;
+/// ASCII bytes counted as a token when fitting: tokenizers give about 4
+/// for English and 3 for code.
+const FIT_ASCII_BYTES_PER_TOKEN: u64 = 3;
+/// Characters an older long text (a tool's result, a file's text, a long
+/// message) is cut to when a request does not fit.
+const FIT_TEXT_CHARS: usize = 2_000;
+/// The newest messages, the work at hand, left whole when fitting.
+const FIT_KEEP: usize = 2;
+/// Why something is left out when fitting.
+const LEFT_OUT: &str = "the chat is longer than the model takes at once";
+
+/// Tokens of `request` as fitting counts them.
+fn context_tokens(request: &AnthropicRequest) -> u64 {
+    fixed_tokens(request) + request.messages.iter().map(message_tokens).sum::<u64>()
+}
+
+/// Tokens of `request`'s system prompt and tools.
+fn fixed_tokens(request: &AnthropicRequest) -> u64 {
+    let mut count = Count::default();
+    if let Some(system) = &request.system {
+        count.text(system);
+    }
+    if let Some(tools) = &request.tools {
+        count.walk(tools, false);
+    }
+    count.fit_tokens()
+}
+
+fn message_tokens(message: &AnthropicMessage) -> u64 {
+    let mut count = Count::default();
+    count.text(&message.role);
+    count.walk(&message.content, true);
+    count.fit_tokens()
+}
+
+/// Tokens `request` may take in a context window of `context`, `share`
+/// percent of it, less what it asks to write.
+fn window_budget(request: &AnthropicRequest, context: u32, share: u64) -> u64 {
+    (u64::from(context) * share / 100).saturating_sub(u64::from(request.max_tokens))
+}
+
+/// Fit `request` to `share` percent of a context window of `context`
+/// tokens, its output aside (issue #214), its output first lowered to half
+/// of that when it would take more. Past it, in this order, until it fits:
+/// in the turns before the one at hand (from the person's last message
+/// that answers no tool call), from the oldest on, files shown (images,
+/// documents, audio) become a line, then long texts (tool results, files'
+/// text, messages) are cut to [`FIT_TEXT_CHARS`], then the oldest turns
+/// are left out, the request saying that they are; then in the turn at
+/// hand, its files, then its long texts, the newest [`FIT_KEEP`] messages
+/// last. Whether the turns before were cut: compacting the chat then
+/// helps.
+pub fn fit_context(request: &mut AnthropicRequest, context: u32, share: u64) -> bool {
+    let room = u64::from(context) * share / 100;
+    if u64::from(request.max_tokens) * 2 > room {
+        request.max_tokens = u32::try_from(room / 2).unwrap_or(u32::MAX).max(1);
+    }
+    let budget = window_budget(request, context, share);
+    let fixed = fixed_tokens(request);
+    let mut sizes: Vec<u64> = request.messages.iter().map(message_tokens).collect();
+    let over = |sizes: &[u64]| fixed + sizes.iter().sum::<u64>() > budget;
+    if !over(&sizes) {
+        return false;
+    }
+    // Where the turn at hand starts.
+    let turn = request.messages.iter().rposition(starts_turn).unwrap_or(0);
+    let mut history = false;
+    let shrink = |request: &mut AnthropicRequest,
+                  sizes: &mut Vec<u64>,
+                  range: std::ops::Range<usize>,
+                  stage: Stage|
+     -> bool {
+        let mut changed = false;
+        for n in range {
+            if !over(sizes) {
+                break;
+            }
+            let message = &mut request.messages[n];
+            let cut = match stage {
+                Stage::Files => without_files(&mut message.content),
+                Stage::Texts => cut_texts(&mut message.content),
+            };
+            if cut {
+                sizes[n] = message_tokens(message);
+                changed = true;
+            }
+        }
+        changed
+    };
+    for stage in [Stage::Files, Stage::Texts] {
+        history |= shrink(request, &mut sizes, 0..turn, stage);
+    }
+    // The turn at hand's older steps are cut before earlier turns go: the
+    // conversation outweighs a long result read a while ago.
+    let newest = request.messages.len().saturating_sub(FIT_KEEP).max(turn);
+    for stage in [Stage::Files, Stage::Texts] {
+        shrink(request, &mut sizes, turn..newest, stage);
+    }
+    // The oldest turns go, whole.
+    if over(&sizes) && turn > 0 {
+        let mut left = fixed + sizes.iter().sum::<u64>();
+        let mut cut = 0;
+        while left > budget && cut < turn {
+            left -= sizes[cut];
+            cut += 1;
+        }
+        let start = (cut..=turn)
+            .find(|&n| starts_turn(&request.messages[n]))
+            .unwrap_or(turn);
+        if start > 0 {
+            request.messages.drain(..start);
+            sizes.drain(..start);
+            history = true;
+            let note = format!("(Earlier messages are left out here: {LEFT_OUT}.)");
+            if let Some(first) = request.messages.first_mut() {
+                match &mut first.content {
+                    serde_json::Value::String(text) => *text = format!("{note}\n\n{text}"),
+                    serde_json::Value::Array(blocks) => {
+                        blocks.insert(0, serde_json::json!({"type": "text", "text": note}));
+                    }
+                    _ => {}
+                }
+                sizes[0] = message_tokens(first);
+            }
+        }
+    }
+    // The turn at hand last, its newest messages after the rest of it.
+    let turn = request.messages.iter().rposition(starts_turn).unwrap_or(0);
+    let len = request.messages.len();
+    let newest = len.saturating_sub(FIT_KEEP).max(turn);
+    for stage in [Stage::Files, Stage::Texts] {
+        shrink(request, &mut sizes, turn..newest, stage);
+    }
+    for stage in [Stage::Files, Stage::Texts] {
+        shrink(request, &mut sizes, newest..len, stage);
+    }
+    history
+}
+
+#[derive(Clone, Copy)]
+enum Stage {
+    Files,
+    Texts,
+}
+
+/// Whether `message` starts a turn: the person's, answering no tool call.
+/// A request starts at one, so a model's reasoning and its calls stay
+/// with the turn they belong to.
+fn starts_turn(message: &AnthropicMessage) -> bool {
+    message.role == "user"
+        && !message.content.as_array().is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("tool_result"))
+        })
+}
+
+/// `content` with every file shown (an image, a document, audio) a line
+/// saying it is left out; whether there was one.
+fn without_files(content: &mut serde_json::Value) -> bool {
+    let Some(blocks) = content.as_array_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for block in blocks {
+        match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("image" | "document" | "audio") => {
+                *block = serde_json::json!({
+                    "type": "text",
+                    "text": format!("(A file shown here earlier is left out: {LEFT_OUT}.)"),
+                });
+                changed = true;
+            }
+            Some("tool_result") => {
+                if let Some(inner) = block.get_mut("content") {
+                    changed |= without_files(inner);
+                }
+            }
+            _ => {}
+        }
+    }
+    changed
+}
+
+/// `content` with each long text cut to [`FIT_TEXT_CHARS`]; whether one
+/// was.
+fn cut_texts(content: &mut serde_json::Value) -> bool {
+    // Its start and its end are kept: a message asks at its end as often
+    // as not, and a tool's result ends with how it ended.
+    fn cut(text: &mut String) -> bool {
+        let total = text.chars().count();
+        // Not again: a text cut once keeps what it says was left out.
+        if total <= FIT_TEXT_CHARS || text.contains(&format!("{LEFT_OUT}.]")) {
+            return false;
+        }
+        let tail = FIT_TEXT_CHARS / 4;
+        let head = FIT_TEXT_CHARS - tail;
+        let start: String = text.chars().take(head).collect();
+        let end: String = text.chars().skip(total - tail).collect();
+        *text = format!(
+            "{start}\n[{} more characters are left out here: {LEFT_OUT}.]\n{end}",
+            total - FIT_TEXT_CHARS
+        );
+        true
+    }
+    match content {
+        serde_json::Value::String(text) => cut(text),
+        serde_json::Value::Array(blocks) => {
+            let mut changed = false;
+            for block in blocks {
+                match block.get("type").and_then(serde_json::Value::as_str) {
+                    Some("text") => {
+                        if let Some(serde_json::Value::String(text)) = block.get_mut("text") {
+                            changed |= cut(text);
+                        }
+                    }
+                    Some("tool_result") => {
+                        if let Some(inner) = block.get_mut("content") {
+                            changed |= cut_texts(inner);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// What providers say when a request is longer than the model takes,
+/// lowercased.
+const TOO_LONG: &[&str] = &[
+    "context length",
+    "context_length",
+    "context window",
+    "maximum context",
+    "prompt is too long",
+    "too many tokens",
+    "input is too long",
+    "input too long",
+    "reduce the length",
+    "token limit",
+    "exceeds the maximum",
+    "request too large",
+    "context limit",
+    "context size",
+    "exceed context",
+    "exceeds the context",
+];
+
+/// Whether the provider refused a request as longer than the model takes.
+pub fn too_long(e: &ProxyError) -> bool {
+    match e {
+        ProxyError::Upstream { status, message } if matches!(status, 400 | 413 | 422) => {
+            let message = message.to_ascii_lowercase();
+            TOO_LONG.iter().any(|phrase| message.contains(phrase))
+        }
+        _ => false,
     }
 }
 
@@ -1185,93 +1487,97 @@ pub(crate) fn base64(bytes: &[u8]) -> String {
 /// without its base64 data; a document block as at least [`IMAGE_TOKENS`]
 /// with its data included, or [`URL_DOCUMENT_TOKENS`] when it comes from a
 /// URL. Tool inputs are plain data the model wrote and are counted as text.
-fn input_token_estimate(request: &AnthropicRequest) -> i64 {
-    #[derive(Default)]
-    struct Count {
-        ascii: u64,
-        other: u64,
-        fixed: u64,
-    }
+#[derive(Default)]
+struct Count {
+    ascii: u64,
+    other: u64,
+    fixed: u64,
+}
 
-    impl Count {
-        fn text(&mut self, s: &str) {
-            for c in s.chars() {
-                match c.len_utf8() {
-                    1 => self.ascii += 1,
-                    4 => self.other += 4,
-                    _ => self.other += 1,
-                }
+impl Count {
+    fn text(&mut self, s: &str) {
+        for c in s.chars() {
+            match c.len_utf8() {
+                1 => self.ascii += 1,
+                4 => self.other += 4,
+                _ => self.other += 1,
             }
         }
+    }
 
-        fn tokens(&self) -> u64 {
-            self.ascii.div_ceil(ASCII_BYTES_PER_TOKEN) + self.other + self.fixed
-        }
+    fn tokens(&self) -> u64 {
+        self.ascii.div_ceil(ASCII_BYTES_PER_TOKEN) + self.other + self.fixed
+    }
 
-        fn walk(&mut self, value: &serde_json::Value, blocks: bool) {
-            match value {
-                serde_json::Value::String(s) => self.text(s),
-                serde_json::Value::Array(items) => {
-                    for item in items {
-                        self.walk(item, blocks);
-                    }
+    /// Tokens as fitting a request to a context window counts them: closer
+    /// to what tokenizers give than [`Self::tokens`], which over-reserves.
+    fn fit_tokens(&self) -> u64 {
+        self.ascii.div_ceil(FIT_ASCII_BYTES_PER_TOKEN) + self.other + self.fixed
+    }
+
+    fn walk(&mut self, value: &serde_json::Value, blocks: bool) {
+        match value {
+            serde_json::Value::String(s) => self.text(s),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    self.walk(item, blocks);
                 }
-                serde_json::Value::Object(map) => {
-                    let kind = map.get("type").and_then(serde_json::Value::as_str);
-                    let url_source = map
-                        .get("source")
-                        .and_then(|source| source.get("type"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("url");
-                    let (blocks, floor) = match kind {
-                        _ if !blocks => (false, None),
-                        Some("tool_use") => (false, None),
-                        Some("document") if url_source => (true, Some(URL_DOCUMENT_TOKENS)),
-                        Some("image" | "document") => (true, Some(IMAGE_TOKENS)),
-                        Some("audio") => {
-                            let bytes = map
-                                .get("source")
-                                .and_then(|source| source.get("data"))
-                                .and_then(serde_json::Value::as_str)
-                                .map_or(0, str::len) as u64;
-                            (
-                                true,
-                                Some((bytes / AUDIO_BASE64_BYTES_PER_TOKEN).max(MIN_AUDIO_TOKENS)),
-                            )
-                        }
-                        _ => (true, None),
-                    };
-                    let mut inner = Self::default();
-                    for (key, item) in map {
-                        inner.text(key);
-                        match (kind, key.as_str(), item) {
-                            (
-                                Some("image" | "audio"),
-                                "source",
-                                serde_json::Value::Object(source),
-                            ) if floor.is_some() => {
-                                for (k, v) in source.iter().filter(|(k, _)| *k != "data") {
-                                    inner.text(k);
-                                    inner.walk(v, false);
-                                }
+            }
+            serde_json::Value::Object(map) => {
+                let kind = map.get("type").and_then(serde_json::Value::as_str);
+                let url_source = map
+                    .get("source")
+                    .and_then(|source| source.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("url");
+                let (blocks, floor) = match kind {
+                    _ if !blocks => (false, None),
+                    Some("tool_use") => (false, None),
+                    Some("document") if url_source => (true, Some(URL_DOCUMENT_TOKENS)),
+                    Some("image" | "document") => (true, Some(IMAGE_TOKENS)),
+                    Some("audio") => {
+                        let bytes = map
+                            .get("source")
+                            .and_then(|source| source.get("data"))
+                            .and_then(serde_json::Value::as_str)
+                            .map_or(0, str::len) as u64;
+                        (
+                            true,
+                            Some((bytes / AUDIO_BASE64_BYTES_PER_TOKEN).max(MIN_AUDIO_TOKENS)),
+                        )
+                    }
+                    _ => (true, None),
+                };
+                let mut inner = Self::default();
+                for (key, item) in map {
+                    inner.text(key);
+                    match (kind, key.as_str(), item) {
+                        (Some("image" | "audio"), "source", serde_json::Value::Object(source))
+                            if floor.is_some() =>
+                        {
+                            for (k, v) in source.iter().filter(|(k, _)| *k != "data") {
+                                inner.text(k);
+                                inner.walk(v, false);
                             }
-                            _ => inner.walk(item, blocks),
                         }
-                    }
-                    match floor {
-                        Some(floor) => self.fixed += inner.tokens().max(floor),
-                        None => {
-                            self.ascii += inner.ascii;
-                            self.other += inner.other;
-                            self.fixed += inner.fixed;
-                        }
+                        _ => inner.walk(item, blocks),
                     }
                 }
-                _ => self.ascii += 4,
+                match floor {
+                    Some(floor) => self.fixed += inner.tokens().max(floor),
+                    None => {
+                        self.ascii += inner.ascii;
+                        self.other += inner.other;
+                        self.fixed += inner.fixed;
+                    }
+                }
             }
+            _ => self.ascii += 4,
         }
     }
+}
 
+fn input_token_estimate(request: &AnthropicRequest) -> i64 {
     let mut count = Count::default();
     if let Some(system) = &request.system {
         count.text(system);
@@ -1518,6 +1824,247 @@ mod tests {
         }
     }
 
+    fn turn(role: &str, content: serde_json::Value) -> AnthropicMessage {
+        AnthropicMessage {
+            role: role.into(),
+            content,
+        }
+    }
+
+    fn long_chat() -> AnthropicRequest {
+        let big = "word ".repeat(6_000);
+        let mut messages = Vec::new();
+        for n in 0..6 {
+            messages.push(turn(
+                "user",
+                serde_json::json!(format!("question {n}: {big}")),
+            ));
+            messages.push(turn(
+                "assistant",
+                serde_json::json!([{"type": "tool_use", "id": format!("t{n}"), "name": "shell", "input": {}}]),
+            ));
+            messages.push(turn(
+                "user",
+                serde_json::json!([{"type": "tool_result", "tool_use_id": format!("t{n}"), "content": big.clone()}]),
+            ));
+            messages.push(turn("assistant", serde_json::json!(format!("answer {n}"))));
+        }
+        messages.push(turn("user", serde_json::json!("and now?")));
+        AnthropicRequest {
+            model: "m".into(),
+            max_tokens: 1_000,
+            reasoning: None,
+            messages,
+            system: Some("system".into()),
+            temperature: None,
+            tools: None,
+        }
+    }
+
+    #[test]
+    fn a_request_that_fits_is_left_alone() {
+        let mut request = long_chat();
+        let before = serde_json::to_string(&request.messages).expect("json");
+        assert!(!fit_context(&mut request, 1_000_000, FIT_SHARE));
+        assert_eq!(
+            serde_json::to_string(&request.messages).expect("json"),
+            before
+        );
+    }
+
+    #[test]
+    fn long_texts_are_cut_before_messages_go() {
+        let mut request = long_chat();
+        let whole = context_tokens(&request);
+        // Room for the chat once its long texts are cut, not before.
+        let context = u32::try_from(whole / 3).expect("small");
+        assert!(fit_context(&mut request, context, FIT_SHARE));
+        assert!(context_tokens(&request) <= window_budget(&request, context, FIT_SHARE));
+        assert_eq!(request.messages.len(), 25, "no message left out");
+        // Fitting again cuts nothing twice.
+        let once_cut = serde_json::to_string(&request.messages).expect("json");
+        fit_context(&mut request, context, FIT_SHARE);
+        assert_eq!(
+            serde_json::to_string(&request.messages).expect("json"),
+            once_cut
+        );
+        let first = request.messages[0].content.as_str().unwrap_or_default();
+        assert!(
+            first.contains("more characters are left out here"),
+            "{first}"
+        );
+        // The newest are whole.
+        assert_eq!(request.messages[24].content, "and now?");
+    }
+
+    #[test]
+    fn the_oldest_turns_go_and_the_request_starts_at_a_turn() {
+        let mut request = long_chat();
+        assert!(fit_context(&mut request, 8_000, FIT_SHARE));
+        let first = &request.messages[0];
+        assert_eq!(first.role, "user");
+        assert!(starts_turn(first));
+        let note = match &first.content {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        assert!(
+            note.contains("Earlier messages are left out here"),
+            "{note}"
+        );
+        assert!(request.messages.len() < 25);
+        assert_eq!(
+            request.messages.last().map(|m| m.content.clone()),
+            Some(serde_json::json!("and now?"))
+        );
+        // No result is left without its call.
+        let calls: Vec<String> = request
+            .messages
+            .iter()
+            .filter_map(|m| m.content.as_array())
+            .flatten()
+            .filter(|b| b["type"] == "tool_use")
+            .map(|b| b["id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        for result in request
+            .messages
+            .iter()
+            .filter_map(|m| m.content.as_array())
+            .flatten()
+            .filter(|b| b["type"] == "tool_result")
+        {
+            assert!(
+                calls.contains(
+                    &result["tool_use_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn files_shown_earlier_go_first() {
+        let image = serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}});
+        let mut request = AnthropicRequest {
+            messages: vec![
+                turn(
+                    "user",
+                    serde_json::json!([{"type": "text", "text": "look"}, image.clone(), image.clone()]),
+                ),
+                turn("assistant", serde_json::json!("seen")),
+                turn(
+                    "user",
+                    serde_json::json!([{"type": "text", "text": "and this"}, image]),
+                ),
+            ],
+            ..long_chat()
+        };
+        request.max_tokens = 10;
+        let context =
+            u32::try_from(context_tokens(&request) * 100 / FIT_SHARE).expect("small") - 5_000;
+        assert!(fit_context(&mut request, context, FIT_SHARE));
+        let first = request.messages[0].content.as_array().expect("blocks");
+        assert_eq!(first[1]["type"], "text");
+        assert_eq!(
+            request.messages[2].content[1]["type"], "image",
+            "the newest stays"
+        );
+    }
+
+    #[test]
+    fn a_long_turn_at_hand_is_cut_last_and_keeps_its_question() {
+        let big = "word ".repeat(6_000);
+        let mut request = AnthropicRequest {
+            messages: vec![
+                turn("user", serde_json::json!("earlier")),
+                turn("assistant", serde_json::json!("ok")),
+                turn("user", serde_json::json!("the task")),
+                turn(
+                    "assistant",
+                    serde_json::json!([{"type": "tool_use", "id": "a", "name": "shell", "input": {}}]),
+                ),
+                turn(
+                    "user",
+                    serde_json::json!([{"type": "tool_result", "tool_use_id": "a", "content": big.clone()}]),
+                ),
+                turn(
+                    "assistant",
+                    serde_json::json!([{"type": "tool_use", "id": "b", "name": "shell", "input": {}}]),
+                ),
+                turn(
+                    "user",
+                    serde_json::json!([{"type": "tool_result", "tool_use_id": "b", "content": big}]),
+                ),
+            ],
+            ..long_chat()
+        };
+        request.max_tokens = 10;
+        // The turn's own results are what is too long: the earlier turn
+        // goes, the question stays, the results are cut, the older first.
+        let history = fit_context(&mut request, 4_000, FIT_SHARE);
+        assert!(history, "the earlier turn was left out");
+        assert!(starts_turn(&request.messages[0]));
+        let first = request.messages[0].content.as_str().unwrap_or_default();
+        assert!(first.ends_with("the task"), "{first}");
+        let older = request.messages[2].content[0]["content"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(older.contains("more characters are left out here"));
+    }
+
+    #[test]
+    fn a_short_request_gets_no_note_and_a_window_too_small_lowers_the_output() {
+        let mut request = AnthropicRequest {
+            messages: vec![turn(
+                "user",
+                serde_json::json!(format!("{} What do you make of it?", "word ".repeat(9_000))),
+            )],
+            ..long_chat()
+        };
+        request.max_tokens = 8_192;
+        assert!(
+            !fit_context(&mut request, 8_000, FIT_SHARE),
+            "no earlier turn to cut"
+        );
+        assert_eq!(request.max_tokens, 3_400);
+        let only = request.messages[0].content.as_str().unwrap_or_default();
+        assert!(!only.contains("Earlier messages"));
+        assert!(only.contains("more characters are left out here"));
+        // Its end is kept: what it asks.
+        assert!(only.ends_with("What do you make of it?"));
+    }
+
+    #[test]
+    fn a_refusal_for_length_is_told_apart() {
+        let refused = |status: u16, message: &str| ProxyError::Upstream {
+            status,
+            message: message.into(),
+        };
+        assert!(too_long(&refused(
+            400,
+            "prompt is too long: 210000 tokens > 200000 maximum"
+        )));
+        assert!(too_long(&refused(
+            400,
+            "This model's maximum context length is 128000 tokens"
+        )));
+        assert!(too_long(&refused(
+            400,
+            "input length and `max_tokens` exceed context limit: 190000 + 16000 > 200000"
+        )));
+        assert!(too_long(&refused(
+            400,
+            "the request exceeds the available context size"
+        )));
+        assert!(!too_long(&refused(
+            400,
+            "image_url is only supported by certain models"
+        )));
+        assert!(!too_long(&refused(429, "too many tokens per minute")));
+    }
+
     #[test]
     fn past_the_limit_the_oldest_images_are_left_out() {
         let ws = tempfile::tempdir().expect("tmp");
@@ -1738,6 +2285,7 @@ mod tests {
             picture_request(ws.path()),
             ws.path().to_path_buf(),
             crate::config::AttachmentLimits::default(),
+            200_000,
             true,
             true,
             blind_provider(&sent),
@@ -1764,6 +2312,7 @@ mod tests {
                 picture_request(ws.path()),
                 ws.path().to_path_buf(),
                 crate::config::AttachmentLimits::default(),
+                200_000,
                 show,
                 retry,
                 blind_provider(&sent),
@@ -1784,6 +2333,7 @@ mod tests {
             picture_request(ws.path()),
             ws.path().to_path_buf(),
             crate::config::AttachmentLimits::default(),
+            200_000,
             true,
             true,
             |_| {
@@ -1808,6 +2358,7 @@ mod tests {
             picture_request(ws.path()),
             ws.path().to_path_buf(),
             crate::config::AttachmentLimits::default(),
+            200_000,
             true,
             true,
             |request| {
@@ -1831,6 +2382,7 @@ mod tests {
             picture_request(ws.path()),
             ws.path().to_path_buf(),
             crate::config::AttachmentLimits::default(),
+            200_000,
             true,
             true,
             |_| {

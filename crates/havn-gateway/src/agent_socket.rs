@@ -841,6 +841,7 @@ async fn oversized_reply(
                 },
                 provider_response: serde_json::Value::Null,
                 usage: resp.usage,
+                trimmed: false,
             }))
         }
         GatewayToAgent::AgentQueryResult(result)
@@ -1083,6 +1084,7 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
                     },
                     provider_response: serde_json::Value::Null,
                     usage: None,
+                    trimmed: false,
                 });
                 refuse(ctx, agent_id, refusal).await;
                 return;
@@ -2179,6 +2181,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                 },
                 provider_response: serde_json::Value::Null,
                 usage: None,
+                trimmed: false,
             };
             let _ = ctx
                 .registry
@@ -2195,6 +2198,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                 },
                 provider_response: serde_json::Value::Null,
                 usage: None,
+                trimmed: false,
             };
             let _ = ctx
                 .registry
@@ -2224,6 +2228,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                                 outcome: LlmOutcome::Error { message },
                                 provider_response: serde_json::Value::Null,
                                 usage: None,
+                                trimmed: false,
                             }),
                         )
                         .await;
@@ -2246,6 +2251,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                             },
                             provider_response: serde_json::Value::Null,
                             usage: None,
+                            trimmed: false,
                         }),
                     )
                     .await;
@@ -2286,6 +2292,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                             },
                             provider_response: serde_json::Value::Null,
                             usage: None,
+                            trimmed: false,
                         }),
                     )
                     .await;
@@ -2320,6 +2327,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                             },
                             provider_response: serde_json::Value::Null,
                             usage: None,
+                            trimmed: false,
                         }),
                     )
                     .await;
@@ -2399,8 +2407,20 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                 }
             };
             let limits = (**ctx.attachments.load()).clone();
-            let result = match llm_proxy::send_seeing(ar, workspace, limits, show, try_blind, send)
-                .await
+            let context = entry.context();
+            // What the model is asked to write, as it will be sent: the
+            // room for its input is the rest of the window.
+            let mut ar = ar;
+            ar.max_tokens = llm_proxy::provider::clamp_max_tokens(
+                &ar.model,
+                entry.max_output_tokens,
+                ar.max_tokens,
+                ctx.llm.max_tokens_ceiling,
+            );
+            let (result, trimmed) = match llm_proxy::send_seeing(
+                ar, workspace, limits, context, show, try_blind, send,
+            )
+            .await
             {
                 Ok(seen) => {
                     if seen.model_takes_none
@@ -2417,7 +2437,15 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                              Set `vision = false` on it in [[llm.models]] to skip the first try"
                         );
                     }
-                    seen.result
+                    if seen.trimmed {
+                        info!(
+                            %agent_id,
+                            model = %entry.id,
+                            context,
+                            "left part of an LLM request out to fit the model's context window"
+                        );
+                    }
+                    (seen.result, seen.trimmed)
                 }
                 Err(e) => {
                     warn!(%agent_id, error = %e, "could not read the files of an LLM request");
@@ -2432,6 +2460,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                                 },
                                 provider_response: serde_json::Value::Null,
                                 usage: None,
+                                trimmed: false,
                             }),
                         )
                         .await;
@@ -2450,6 +2479,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                         provider_response: serde_json::to_value(&resp)
                             .unwrap_or(serde_json::Value::Null),
                         usage: Some(usage),
+                        trimmed,
                     }
                 }
                 Err(e) => LlmResponse {
@@ -2459,6 +2489,9 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                     },
                     provider_response: serde_json::Value::Null,
                     usage: None,
+                    // Refused as too long even fitted: compacting the chat
+                    // is what is left (issue #214).
+                    trimmed: trimmed || llm_proxy::too_long(&e),
                 },
             }
         }
@@ -2469,6 +2502,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
             },
             provider_response: serde_json::Value::Null,
             usage: None,
+            trimmed: false,
         },
     };
 
@@ -3420,6 +3454,7 @@ mod tests {
                     max_output_tokens: None,
                     vision: None,
                     thinking: None,
+                    context_window: None,
                 }],
             }));
     }
@@ -3608,6 +3643,7 @@ mod tests {
                         max_output_tokens: None,
                         vision: None,
                         thinking: None,
+                        context_window: None,
                     })
                     .collect(),
             }));
@@ -3791,6 +3827,7 @@ mod tests {
                 outcome: LlmOutcome::Ok,
                 provider_response: serde_json::json!({ "content": big }),
                 usage: None,
+                trimmed: false,
             }),
             GatewayToAgent::AgentQueryResult(AgentQueryResult {
                 request_id: "q".into(),
@@ -3859,6 +3896,7 @@ mod tests {
             outcome: LlmOutcome::Ok,
             provider_response: serde_json::Value::Null,
             usage: None,
+            trimmed: false,
         }))
         .await
         .expect("queue");
@@ -3925,6 +3963,7 @@ mod tests {
             outcome: LlmOutcome::Ok,
             provider_response: serde_json::json!({ "content": "x".repeat(1024) }),
             usage: None,
+            trimmed: false,
         }))
         .await
         .expect("queue");
