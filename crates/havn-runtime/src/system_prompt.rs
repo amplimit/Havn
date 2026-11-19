@@ -83,6 +83,14 @@ pub fn platform_context(agent_name: &str, agent_id: &str, tool_names: &[String])
          person refers to something said earlier, in this chat or another one, look it \
          up with conversation_search instead of guessing.\n\
          \n\
+         How you answer: answer what you already know first. Where part of the answer \
+         needs checking or doing, say in a sentence what you will check, call the tool, \
+         and go on from what it returned; then answer the rest. In a chat, the text you \
+         write before and between tool calls reaches the person as you write it, so keep \
+         it to what they should read. Your earlier replies in a chat come back to you with \
+         the tools they called and what those returned: use them rather than calling a \
+         tool again, unless what it returned may have changed since.\n\
+         \n\
          Skills: When you solve a complex task successfully, use skill_manage to save the \
          procedure as a reusable skill. Skills are retrieved automatically when relevant to \
          future conversations.\n\

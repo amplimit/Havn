@@ -507,6 +507,7 @@ impl CronScheduler {
                 reply_to: None,
                 buttons: Vec::new(),
                 poll: None,
+                partial: false,
             })),
             (RunOutcome::Success, None) if job.deliver == "webchat" => {
                 let outbound = OutboundMessage {
@@ -516,6 +517,7 @@ impl CronScheduler {
                     reply_to: None,
                     buttons: Vec::new(),
                     poll: None,
+                    partial: false,
                 };
                 let n = self.webchat_router.broadcast(agent_id, outbound).await;
                 debug!(%job_id, sessions = n, "cron output broadcast");
@@ -542,6 +544,7 @@ impl CronScheduler {
                     reply_to: None,
                     buttons: Vec::new(),
                     poll: None,
+                    partial: false,
                 };
                 if target.is_some() {
                     Ok(Some(notice))

@@ -349,6 +349,17 @@ pub async fn trace_of(pool: &SqlitePool, chat: &str, turn: &str) -> Result<Optio
     Ok(found.and_then(|(trace,)| trace))
 }
 
+/// Keep `steps` with reply `turn`: its turn's messages, as JSON, for the
+/// model to read in later turns (issue #213).
+pub async fn set_steps(pool: &SqlitePool, turn: &str, steps: &str) -> Result<()> {
+    sqlx::query("UPDATE conversations SET steps = ?2 WHERE id = ?1")
+        .bind(turn)
+        .bind(steps)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Keep `trace`, what reply `turn` did on the way, with it.
 pub async fn set_trace(pool: &SqlitePool, turn: &str, trace: &str) -> Result<()> {
     sqlx::query("UPDATE conversations SET trace = ?2 WHERE id = ?1")
@@ -460,6 +471,7 @@ pub async fn branch(pool: &SqlitePool, chat: &str, limit: u32) -> Result<Vec<Bra
                 created_at: r.created_at,
                 versions: Vec::new(),
                 trace: r.trace,
+                steps: None,
             })
         })
         .collect()
@@ -537,6 +549,9 @@ pub struct BranchTurn {
     /// For a reply: what its turn did on the way, as JSON (issue #178).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace: Option<String>,
+    /// For a reply: its turn's messages, for the model only (issue #213).
+    #[serde(skip)]
+    pub steps: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1063,6 +1078,7 @@ struct PathRow {
     content: String,
     created_at: DateTime<Utc>,
     summary: Option<String>,
+    steps: Option<String>,
 }
 
 /// Chat `chat`'s branch back to the newest turn with a summary, at most
@@ -1071,16 +1087,19 @@ struct PathRow {
 /// then still given.
 async fn since_summary(pool: &SqlitePool, chat: &str, limit: u32) -> Result<SinceSummary> {
     let rows: Vec<PathRow> = sqlx::query_as(
-        "WITH RECURSIVE path(id, parent_id, role, content, created_at, depth, summary) AS ( \
-             SELECT c.id, c.parent_id, c.role, c.content, c.created_at, 1, CAST(NULL AS TEXT) \
+        "WITH RECURSIVE path(id, parent_id, role, content, created_at, depth, summary, steps) AS ( \
+             SELECT c.id, c.parent_id, c.role, c.content, c.created_at, 1, CAST(NULL AS TEXT), \
+                    c.steps \
              FROM conversations c JOIN chats h ON h.head = c.id WHERE h.id = ?1 \
              UNION ALL \
-             SELECT c.id, c.parent_id, c.role, c.content, c.created_at, p.depth + 1, s.summary \
+             SELECT c.id, c.parent_id, c.role, c.content, c.created_at, p.depth + 1, s.summary, \
+                    c.steps \
              FROM conversations c JOIN path p ON c.id = p.parent_id \
              LEFT JOIN chat_summaries s ON s.turn_id = c.id \
              WHERE p.summary IS NULL AND p.depth <= ?2 \
          ) \
-         SELECT id, parent_id, role, content, created_at, summary FROM path ORDER BY depth DESC",
+         SELECT id, parent_id, role, content, created_at, summary, steps FROM path \
+         ORDER BY depth DESC",
     )
     .bind(chat)
     .bind(limit)
@@ -1106,8 +1125,9 @@ async fn since_summary(pool: &SqlitePool, chat: &str, limit: u32) -> Result<Sinc
             content: row.content,
             created_at: row.created_at,
             versions: Vec::new(),
-            // What the model reads: never a turn's trace.
+            // What the model reads: never a turn's trace, but its steps.
             trace: None,
+            steps: row.steps,
         });
     }
     let keep = limit as usize;
@@ -1267,6 +1287,35 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_reply_s_steps_come_back_with_the_history() {
+        let pool = connect_in_memory().await.expect("connect");
+        let chat = chat_for(&pool, "s", None, "what is in the file?")
+            .await
+            .expect("chat");
+        let q = record_in_chat(&pool, &chat, Role::User, "what is in the file?")
+            .await
+            .expect("db")
+            .expect("chat");
+        let a = record_reply(&pool, &chat, &q, "It says hello.")
+            .await
+            .expect("record")
+            .expect("reply");
+        let steps = r#"[{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"file_read","input":{}}]}]"#;
+        set_steps(&pool, &a, steps).await.expect("steps");
+        let context = context(&pool, &chat, 40, 20).await.expect("context");
+        let reply = context.turns.last().expect("reply");
+        assert_eq!(reply.content, "It says hello.");
+        assert_eq!(reply.steps.as_deref(), Some(steps));
+        assert!(context.turns[0].steps.is_none());
+        // Never sent to the dashboard.
+        assert!(
+            !serde_json::to_string(reply)
+                .expect("json")
+                .contains("tool_use")
+        );
+    }
 
     #[tokio::test]
     async fn a_chat_moves_to_another_scope_and_leaves_its_place() {

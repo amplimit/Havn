@@ -192,6 +192,7 @@ impl ChannelRouter {
             content,
             Vec::new(),
             None,
+            false,
         )
         .await
     }
@@ -208,6 +209,7 @@ impl ChannelRouter {
         content: ChannelMessageContent,
         buttons: Vec<Vec<havn_core::Button>>,
         poll: Option<havn_core::Poll>,
+        partial: bool,
     ) -> Result<u64, DeliverError> {
         let key = AccountKey::new(channel, account_id);
         let (tx, frame, seq) = {
@@ -225,6 +227,7 @@ impl ChannelRouter {
                 content,
                 buttons,
                 poll,
+                partial,
             });
             // Buffered even while the adapter is away, so its `Resume`
             // after reconnecting gets it.

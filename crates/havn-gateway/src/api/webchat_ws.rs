@@ -623,6 +623,7 @@ mod tests {
                         reply_to: None,
                         buttons: Vec::new(),
                         poll: None,
+                        partial: false,
                     },
                 )
                 .await

@@ -168,7 +168,77 @@ pub struct LoopHandle {
     /// Cancelled when the user stops the turn: the loop ends at once,
     /// dropping the model call or tool call in flight.
     pub stop: Option<tokio_util::sync::CancellationToken>,
+    /// Where the text the model writes before calling a tool goes at once
+    /// (issue #212): a chat app's conversation, which gets it as a message
+    /// while the tools run. `None` keeps it for the reply alone.
+    pub segments: Option<Segments>,
 }
+
+/// A chat app's conversation, which gets each part of a reply as it is
+/// written (issue #212), and what it got.
+#[derive(Clone)]
+pub struct Segments {
+    pub channel_id: String,
+    pub chat: String,
+    pub sent: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Segments {
+    #[must_use]
+    pub fn new(channel_id: String, chat: String) -> Self {
+        Self {
+            channel_id,
+            chat,
+            sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Send `text`, a part of the reply with more to come.
+    async fn send(&self, writer_tx: &mpsc::Sender<AgentToGateway>, text: &str) {
+        let outbound = havn_core::OutboundMessage {
+            channel_id: self.channel_id.clone(),
+            conversation: Some(self.chat.clone()),
+            content: havn_core::MessageContent::Text {
+                text: text.to_string(),
+            },
+            reply_to: None,
+            buttons: Vec::new(),
+            poll: None,
+            partial: true,
+        };
+        if writer_tx
+            .send(AgentToGateway::OutboundMessage(outbound))
+            .await
+            .is_ok()
+        {
+            self.sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(text.to_string());
+        }
+    }
+
+    /// What of `reply` (every part, joined) was not sent yet: all of it
+    /// when it does not start with what was.
+    #[must_use]
+    pub fn rest_of(&self, reply: &str) -> String {
+        let sent = self
+            .sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .join(SEGMENT_BREAK);
+        if sent.is_empty() {
+            return reply.to_string();
+        }
+        match reply.strip_prefix(&sent) {
+            Some(rest) => rest.trim_start().to_string(),
+            None => reply.to_string(),
+        }
+    }
+}
+
+/// What separates the parts of a reply.
+pub const SEGMENT_BREAK: &str = "\n\n";
 
 /// Default output-token budget for an agent LLM call when the agent's
 /// `config.max_tokens` does not set one. Sized for tool use: a `file_write`
@@ -268,9 +338,11 @@ pub async fn run_typed(
     messages: &mut Vec<Value>,
     system_prompt: &SystemPrompt,
 ) -> Result<String, RunError> {
-    let mut last_text = String::new();
-    let stopped = |text: &str| RunError::Stopped {
-        partial_text: text.to_string(),
+    // Every part the model wrote, in order (issue #212): the reply is all
+    // of them, not only the last.
+    let mut said: Vec<String> = Vec::new();
+    let stopped = |said: &[String]| RunError::Stopped {
+        partial_text: said.join(SEGMENT_BREAK),
     };
     for iteration in 0..handle.max_iterations {
         if let Some(mirror) = &handle.messages_mirror {
@@ -281,7 +353,7 @@ pub async fn run_typed(
             call_llm(handle, context, messages, system_prompt),
         )
         .await
-        .ok_or_else(|| stopped(&last_text))?
+        .ok_or_else(|| stopped(&said))?
         .map_err(RunError::Infra)?;
         let provider_response = match response.outcome {
             LlmOutcome::Ok => response.provider_response,
@@ -322,10 +394,20 @@ pub async fn run_typed(
         drop_thinking(messages);
         // Always append the assistant turn so the next call has context.
         messages.push(serde_json::json!({ "role": "assistant", "content": content.clone() }));
-        last_text = extract_text(&content).unwrap_or_default();
+        let text = extract_text(&content).unwrap_or_default();
+        let text = text.trim();
+        if !text.is_empty() {
+            said.push(text.to_string());
+        }
 
         if stop_reason != "tool_use" {
-            return Ok(last_text);
+            return Ok(said.join(SEGMENT_BREAK));
+        }
+        // What it said before calling a tool reaches a chat app now.
+        if !text.is_empty()
+            && let Some(segments) = &handle.segments
+        {
+            segments.send(&handle.writer_tx, text).await;
         }
 
         let tool_results = unless_stopped(
@@ -333,17 +415,17 @@ pub async fn run_typed(
             execute_tool_uses(handle, context, &content),
         )
         .await
-        .ok_or_else(|| stopped(&last_text))?;
+        .ok_or_else(|| stopped(&said))?;
         if tool_results.is_empty() {
             warn!(iteration, "stop_reason=tool_use but no tool_use blocks");
-            return Ok(last_text);
+            return Ok(said.join(SEGMENT_BREAK));
         }
         messages.push(serde_json::json!({ "role": "user", "content": tool_results }));
     }
 
     Err(RunError::IterationCap {
         cap: handle.max_iterations,
-        partial_text: last_text,
+        partial_text: said.join(SEGMENT_BREAK),
     })
 }
 
@@ -365,11 +447,16 @@ pub async fn run(
     match run_typed(handle, context, messages, system_prompt).await {
         Ok(text) => Ok(text),
         Err(RunError::Llm(msg)) => Ok(format!("(LLM error: {msg})")),
-        Err(RunError::IterationCap { cap, .. }) => {
+        Err(RunError::IterationCap { cap, partial_text }) => {
             warn!(max = cap, "tool-use loop hit iteration cap");
-            Ok(format!(
-                "(reached the {cap}-iteration tool-use cap before finishing)"
-            ))
+            let note = format!("(reached the {cap}-iteration tool-use cap before finishing)");
+            // What it said on the way stays part of the reply (issue #212).
+            let said = partial_text.trim();
+            Ok(if said.is_empty() {
+                note
+            } else {
+                format!("{said}{SEGMENT_BREAK}{note}")
+            })
         }
         // Infrastructure failures (mpsc closed, oneshot dropped) propagate
         // as Err — the v0.6 wrapper raised these too, and downstream
@@ -800,7 +887,7 @@ async fn oversized_frame(
 }
 
 /// Concatenate `text` blocks from an Anthropic content array.
-fn extract_text(content: &Value) -> Option<String> {
+pub(crate) fn extract_text(content: &Value) -> Option<String> {
     let blocks = content.as_array()?;
     let mut text = String::new();
     for block in blocks {
