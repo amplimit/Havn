@@ -73,7 +73,49 @@ pub enum TraceItem {
         result: String,
         #[serde(default)]
         error: bool,
+        /// A subagent's own steps, for its call (issue #222).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        steps: Vec<TraceItem>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        left_out: u64,
     },
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// `item` with its texts within [`MAX_TRACE_PART`] and, at the top level,
+/// a subagent's steps within [`MAX_TRACE_ITEMS`]; a subagent's own steps
+/// have none.
+fn bounded(item: TraceItem, top: bool) -> TraceItem {
+    let cut = |s: String| -> String { s.chars().take(MAX_TRACE_PART).collect() };
+    match item {
+        TraceItem::Thinking { text } => TraceItem::Thinking { text: cut(text) },
+        TraceItem::Step {
+            tool,
+            input,
+            result,
+            error,
+            steps,
+            left_out,
+        } => TraceItem::Step {
+            tool: cut(tool),
+            input: cut(input),
+            result: cut(result),
+            error,
+            steps: if top {
+                steps
+                    .into_iter()
+                    .take(MAX_TRACE_ITEMS)
+                    .map(|s| bounded(s, false))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            left_out: if top { left_out } else { 0 },
+        },
+    }
 }
 
 /// What a reply's turn did on the way.
@@ -93,27 +135,13 @@ const MAX_TRACE_ITEMS: usize = 100;
 /// cut to size; `None` when it is not a trace.
 fn trace_view(raw: &str) -> Option<TraceView> {
     let trace: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let cut = |s: String| -> String { s.chars().take(MAX_TRACE_PART).collect() };
     let items = trace
         .get("items")?
         .as_array()?
         .iter()
         .take(MAX_TRACE_ITEMS)
         .filter_map(|item| serde_json::from_value::<TraceItem>(item.clone()).ok())
-        .map(|item| match item {
-            TraceItem::Thinking { text } => TraceItem::Thinking { text: cut(text) },
-            TraceItem::Step {
-                tool,
-                input,
-                result,
-                error,
-            } => TraceItem::Step {
-                tool: cut(tool),
-                input: cut(input),
-                result: cut(result),
-                error,
-            },
-        })
+        .map(|item| bounded(item, true))
         .collect();
     Some(TraceView {
         ms: trace
@@ -739,6 +767,42 @@ mod trace_tests {
             TraceItem::Thinking { text } => assert_eq!(text.len(), MAX_TRACE_PART),
             TraceItem::Step { .. } => panic!("a thinking part"),
         }
+    }
+
+    #[test]
+    fn a_subagent_s_steps_come_with_its_call_one_level_deep() {
+        let raw = serde_json::json!({"ms": 1, "items": [{
+            "kind": "step", "tool": "subagent_spawn", "input": "{}", "result": "done",
+            "left_out": 3,
+            "steps": [
+                {"kind": "thinking", "text": "plan"},
+                {"kind": "step", "tool": "shell", "input": "{}", "result": "ok",
+                 "steps": [{"kind": "thinking", "text": "deeper"}], "left_out": 9},
+            ],
+        }]})
+        .to_string();
+        let view = trace_view(&raw).expect("a trace");
+        let TraceItem::Step {
+            steps, left_out, ..
+        } = &view.items[0]
+        else {
+            panic!("a step");
+        };
+        assert_eq!((steps.len(), *left_out), (2, 3));
+        let TraceItem::Step {
+            steps: deeper,
+            left_out: more,
+            ..
+        } = &steps[1]
+        else {
+            panic!("a step");
+        };
+        assert!(
+            deeper.is_empty() && *more == 0,
+            "nothing below a subagent's steps"
+        );
+        let shown = serde_json::to_value(&view.items[0]).expect("json");
+        assert!(shown["steps"][1].get("steps").is_none());
     }
 }
 

@@ -176,7 +176,16 @@ export type SkillListResponse = {
 /** One part of what a reply's turn did on the way. */
 export type TraceItem =
   | { kind: "thinking"; text: string }
-  | { kind: "step"; tool: string; input: string; result: string; error: boolean };
+  | {
+      kind: "step";
+      tool: string;
+      input: string;
+      result: string;
+      error: boolean;
+      /** A subagent's own steps, for its call (issue #222). */
+      steps?: TraceItem[];
+      left_out?: number;
+    };
 
 /** What a reply's turn did on the way: the model's reasoning and its tool calls. */
 export type TurnTrace = {

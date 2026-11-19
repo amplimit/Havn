@@ -108,12 +108,16 @@ impl Bridge {
     /// The model `wanted` names: its id or its label, in any case.
     fn model(&self, wanted: &str) -> Option<&havn_proto::ModelChoice> {
         let lower = wanted.to_lowercase();
-        self.models.iter().find(|m| {
-            m.id.to_lowercase() == lower
-                || m.label
-                    .as_deref()
-                    .is_some_and(|l| l.to_lowercase() == lower)
-        })
+        self.models
+            .iter()
+            .find(|m| m.id.to_lowercase() == lower)
+            .or_else(|| {
+                self.models.iter().find(|m| {
+                    m.label
+                        .as_deref()
+                        .is_some_and(|l| l.to_lowercase() == lower)
+                })
+            })
     }
 
     /// The models, one per line, with the thinking each takes.
@@ -145,6 +149,9 @@ fn thinking_for(model: Option<&havn_proto::ModelChoice>, wanted: &str) -> Result
         // gateway): the gateway applies what the model takes.
         return Ok(wanted.to_string());
     };
+    if model.thinking.is_empty() && wanted.eq_ignore_ascii_case("off") {
+        return Ok("off".to_string());
+    }
     if model.thinking.is_empty() {
         return Err(format!(
             "{} is not asked to think; leave thinking out",
@@ -182,7 +189,7 @@ impl Tool for SubagentSpawnTool {
     fn description(&self) -> &'static str {
         "Spawn a subagent to handle a self-contained sub-task in parallel with other work. \
          The subagent runs as the same agent (shares your persona, user knowledge, and memory) \
-         and by default sees the last 10 conversation turns. Use this when you have multiple \
+         and by default sees the last 10 messages of the conversation. Use this when you have multiple \
          independent items to handle at once (review N PRs, summarise N papers, check N \
          endpoints). Call subagent_spawn multiple times in a single assistant turn to run \
          them concurrently. Each returns its final assistant text. You may give one a model \
@@ -219,7 +226,7 @@ impl Tool for SubagentSpawnTool {
                     "enum": ["fork", "isolated"],
                     "default": "fork",
                     "description": "Whether it sees the conversation so far. fork (default): \
-                                    the last 10 turns of it. isolated: none, only the system \
+                                    its last 10 messages. isolated: none, only the system \
                                     prompt; use for fully independent work like 'review PR #3'."
                 },
                 "model": model,
@@ -246,6 +253,7 @@ impl Tool for SubagentSpawnTool {
         let turn_model = tool_loop::TURN_MODEL
             .try_with(Arc::clone)
             .unwrap_or_else(|_| Arc::clone(&self.bridge.child_handle.model));
+        let turn_model_id = turn_model.to_string();
         let chosen = match parsed
             .model
             .as_deref()
@@ -283,12 +291,13 @@ impl Tool for SubagentSpawnTool {
                 }
             }
             // The turn's own choice goes with the turn's model only.
-            None if chosen.is_none() => tool_loop::TURN_THINKING
+            None if *model == turn_model_id => tool_loop::TURN_THINKING
                 .try_with(Clone::clone)
                 .ok()
                 .flatten(),
             None => None,
         };
+        let other_model = *model != turn_model_id;
 
         // Capacity gate — silently waits, but logs if the wait was non-trivial
         // so operators can tune SUBAGENT_MAX_CONCURRENT if it shows up.
@@ -322,7 +331,27 @@ impl Tool for SubagentSpawnTool {
             while snapshot.get(start).is_some_and(answers_a_call) {
                 start += 1;
             }
-            snapshot[start..].to_vec()
+            let mut forked = snapshot[start..].to_vec();
+            // Reasoning is the turn's model's own: another model is given
+            // the conversation without it.
+            if other_model {
+                for message in &mut forked {
+                    if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+                        blocks.retain(|b| {
+                            !matches!(
+                                b.get("type").and_then(Value::as_str),
+                                Some("thinking" | "redacted_thinking")
+                            )
+                        });
+                    }
+                }
+                forked.retain(|m| {
+                    m.get("content")
+                        .and_then(Value::as_array)
+                        .is_none_or(|blocks| !blocks.is_empty())
+                });
+            }
+            forked
         };
         messages.push(serde_json::json!({
             "role": "user",
@@ -337,6 +366,21 @@ impl Tool for SubagentSpawnTool {
             "subagent spawned"
         );
 
+        // What it ran with heads its answer, so the step shows it.
+        let ran_with = format!(
+            "[Subagent on {}, thinking {}, {}]\n",
+            if model.is_empty() {
+                "the default model"
+            } else {
+                model.as_str()
+            },
+            thinking.as_deref().unwrap_or("as its model is set"),
+            if parsed.context == ContextHint::Isolated {
+                "without the conversation"
+            } else {
+                "with the conversation so far"
+            }
+        );
         let mut handle = self.bridge.child_handle.clone();
         handle.model = Arc::clone(&model);
         let prompt = Arc::clone(&self.bridge.parent_system_prompt);
@@ -348,10 +392,10 @@ impl Tool for SubagentSpawnTool {
             ),
         );
         match run.await {
-            Ok(text) => ToolResult::Ok(text),
+            Ok(text) => ToolResult::Ok(format!("{ran_with}{text}")),
             Err(e) => {
                 warn!(error = %e, "subagent loop failed");
-                ToolResult::Error(format!("subagent failed: {e}"))
+                ToolResult::Error(format!("{ran_with}subagent failed: {e}"))
             }
         }
     }
@@ -420,6 +464,7 @@ mod tests {
         assert!(thinking_for(Some(deepseek), "on").is_err());
         let mini = bridge.model("openai:gpt-5-mini");
         assert!(thinking_for(mini, "low").is_err(), "it does not think");
+        assert_eq!(thinking_for(mini, "OFF"), Ok("off".into()));
         assert_eq!(
             thinking_for(None, "on"),
             Ok("on".into()),

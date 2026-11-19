@@ -406,7 +406,7 @@ async fn rounds(
         // turn's messages, as Anthropic's thinking with tools needs; the
         // adapters of other providers leave it out, and later turns are
         // built from the stored replies, which never hold it.
-        if context == crate::tools::context::WEBCHAT {
+        if traced(context) {
             for block in content.as_array().into_iter().flatten() {
                 if block.get("type").and_then(Value::as_str) == Some("thinking")
                     && let Some(text) = block.get("thinking").and_then(Value::as_str)
@@ -621,51 +621,112 @@ async fn execute_tool_uses(
     let Some(blocks) = assistant_content.as_array() else {
         return Vec::new();
     };
+    let calls: Vec<&Value> = blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .collect();
     let mut out = Vec::new();
-    for block in blocks {
-        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
-            continue;
+    let mut at = 0;
+    while at < calls.len() {
+        // Subagents asked for side by side run at once (issue #222); every
+        // other call runs alone, in order.
+        let mut end = at + 1;
+        if is_subagent(calls[at]) {
+            while end < calls.len() && is_subagent(calls[end]) {
+                end += 1;
+            }
         }
-        let id = block.get("id").and_then(Value::as_str).unwrap_or("");
-        let name = block.get("name").and_then(Value::as_str).unwrap_or("");
-        let input = block.get("input").cloned().unwrap_or(Value::Null);
-
-        debug!(name, id, context, "tool call");
-        if context == crate::tools::context::WEBCHAT {
-            show_step(handle, name, &input);
+        let done = futures_util::future::join_all(
+            calls[at..end]
+                .iter()
+                .map(|block| execute_tool_use(handle, context, block)),
+        )
+        .await;
+        for (result, step) in done {
+            if let Some((item, chars)) = step {
+                trace(item, chars);
+            }
+            out.push(result);
         }
-        let result = handle
-            .registry
-            .execute_for(context, name, input, &handle.tool_env)
-            .await;
-        let (text, is_error) = match result {
-            ToolResult::Ok(s) => (s, false),
-            ToolResult::Error(s) => (s, true),
-        };
-        if context == crate::tools::context::WEBCHAT {
-            let input = block.get("input").cloned().unwrap_or(Value::Null);
-            let input = clip(&input.to_string(), TRACE_INPUT_CHARS);
-            let result = clip(&text, TRACE_RESULT_CHARS);
-            let chars = input.chars().count() + result.chars().count();
-            trace(
-                serde_json::json!({
-                    "kind": "step",
-                    "tool": name,
-                    "input": input,
-                    "result": result,
-                    "error": is_error,
-                }),
-                chars,
-            );
-        }
-        out.push(serde_json::json!({
-            "type": "tool_result",
-            "tool_use_id": id,
-            "content": text,
-            "is_error": is_error,
-        }));
+        at = end;
     }
     out
+}
+
+fn is_subagent(block: &Value) -> bool {
+    block.get("name").and_then(Value::as_str) == Some("subagent_spawn")
+}
+
+/// Whether a loop in `context` shows and keeps its steps: a turn answering
+/// someone, and a subagent it hands a task to (issue #222).
+fn traced(context: &'static str) -> bool {
+    context == crate::tools::context::WEBCHAT || context == crate::tools::context::SUBAGENT
+}
+
+/// One tool call: its `tool_result`, and the step it adds to the turn's
+/// trace when it keeps one. A subagent keeps a trace of its own (its model
+/// may fall back, or its request be trimmed, without the turn's), and its
+/// steps go with its call's.
+async fn execute_tool_use(
+    handle: &LoopHandle,
+    context: &'static str,
+    block: &Value,
+) -> (Value, Option<(Value, usize)>) {
+    let id = block.get("id").and_then(Value::as_str).unwrap_or("");
+    let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+    let input = block.get("input").cloned().unwrap_or(Value::Null);
+
+    debug!(name, id, context, "tool call");
+    if traced(context) {
+        show_step(handle, name, &input);
+    }
+    let call = handle
+        .registry
+        .execute_for(context, name, input, &handle.tool_env);
+    let (result, inner) = if is_subagent(block) {
+        let own = Arc::new(std::sync::Mutex::new(Trace::default()));
+        let result = TRACE.scope(Arc::clone(&own), call).await;
+        let own = std::mem::take(
+            &mut *own
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        (result, Some(own))
+    } else {
+        (call.await, None)
+    };
+    let (text, is_error) = match result {
+        ToolResult::Ok(s) => (s, false),
+        ToolResult::Error(s) => (s, true),
+    };
+    let step = traced(context).then(|| {
+        let input = block.get("input").cloned().unwrap_or(Value::Null);
+        let input = clip(&input.to_string(), TRACE_INPUT_CHARS);
+        let result = clip(&text, TRACE_RESULT_CHARS);
+        let mut chars = input.chars().count() + result.chars().count();
+        let mut item = serde_json::json!({
+            "kind": "step",
+            "tool": name,
+            "input": input,
+            "result": result,
+            "error": is_error,
+        });
+        if let Some(inner) = inner.filter(|t| !t.items.is_empty() || t.left_out > 0) {
+            chars += inner.chars;
+            item["steps"] = Value::Array(inner.items);
+            if inner.left_out > 0 {
+                item["left_out"] = Value::from(inner.left_out);
+            }
+        }
+        (item, chars)
+    });
+    let result = serde_json::json!({
+        "type": "tool_result",
+        "tool_use_id": id,
+        "content": text,
+        "is_error": is_error,
+    });
+    (result, step)
 }
 
 /// Tell the conversation the turn answers which tool it is about to call
