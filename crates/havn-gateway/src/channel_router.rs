@@ -184,8 +184,15 @@ impl ChannelRouter {
         in_reply_to: Option<String>,
         content: ChannelMessageContent,
     ) -> Result<u64, DeliverError> {
-        self.deliver_with_buttons(channel, account_id, sender_id, in_reply_to, content, Vec::new())
-            .await
+        self.deliver_with_buttons(
+            channel,
+            account_id,
+            sender_id,
+            in_reply_to,
+            content,
+            Vec::new(),
+        )
+        .await
     }
 
     /// [`Self::deliver`], with rows of buttons under the message.
