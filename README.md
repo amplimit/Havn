@@ -581,7 +581,7 @@ api_key_env = "OPENAI_API_KEY"             # default: the variable holding the k
 # model = "openrouter:google/gemini-3.8-flash"
 ```
 
-The key of an endpoint is read from the environment, never from config.toml; no key is sent when the variable is unset or empty (a local server). With `kind = "model"`, the model must be listed and allowed to the agent; OpenAI-compatible endpoints get the audio as an `input_audio` part and Gemini as inline data.
+The key of an endpoint is read from the environment, never from config.toml; no key is sent when the variable is unset or empty (a local server). With `kind = "model"`, use an OpenRouter or Gemini model that takes audio (Anthropic models take none, and OpenAI's own API only WAV and MP3, while Telegram voice notes are Ogg/Opus); the model must be listed and allowed to the agent, and its tokens count against the agent's budget. A transcription that takes longer than 90 seconds is given up; at most four run at once.
 
 ### Chat commands
 

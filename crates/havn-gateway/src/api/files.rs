@@ -217,10 +217,11 @@ pub async fn receive(
     let mut transcript = None;
     let how = (**state.transcription.load()).clone();
     if text_path.is_none()
+        && body.len() <= crate::transcribe::MAX_AUDIO_BYTES
         && let Some(how) = how
         && let Some(format) = crate::transcribe::audio_format(&media_type, &name)
     {
-        match transcribe_for(state, agent_id, &how, body.to_vec(), &name, format).await {
+        match transcribe_for(state, agent_id, &how, body.to_vec(), format).await {
             Ok(text) => {
                 text_path = save_text(state, agent_id, &stored.file, text.clone()).await;
                 transcript = Some(text);
@@ -273,7 +274,7 @@ async fn save_text(
     }
 }
 
-/// Transcribe audio file `name` of agent `agent_id` with `how`: a model
+/// Transcribe audio of agent `agent_id` with `how`: a model
 /// is asked on the agent owner's credentials, within the agent's policy
 /// and budget.
 async fn transcribe_for(
@@ -281,7 +282,6 @@ async fn transcribe_for(
     agent_id: havn_core::AgentId,
     how: &crate::transcribe::Transcription,
     bytes: Vec<u8>,
-    name: &str,
     format: &str,
 ) -> Result<String, String> {
     let agent = havn_db::repo::agents::find_by_id(&state.db, agent_id)
@@ -305,7 +305,7 @@ async fn transcribe_for(
         },
         allowed: &policy.allowed_models,
     };
-    crate::transcribe::transcribe(how, &state.http, call, bytes, name, format).await
+    crate::transcribe::transcribe(how, &state.http, call, bytes, format).await
 }
 
 /// `attachment`, a file of agent `agent_id`'s inbox a web chat message
@@ -317,16 +317,16 @@ pub async fn with_transcript(
     mut attachment: Attachment,
 ) -> Attachment {
     attachment.transcript = None;
-    let Some(text) = attachment.text_path.clone() else {
-        return attachment;
-    };
     if crate::transcribe::audio_format(&attachment.media_type, &attachment.name).is_none() {
         return attachment;
     }
-    let Some(name) = text
+    // Where the gateway kept it, next to the file: not a path the page
+    // names.
+    let Some(name) = attachment
+        .path
         .strip_prefix(INBOX_DIR)
         .and_then(|rest| rest.strip_prefix('/'))
-        .map(str::to_string)
+        .map(|file| format!("{file}.txt"))
     else {
         return attachment;
     };

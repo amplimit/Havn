@@ -62,6 +62,11 @@ const ASCII_BYTES_PER_TOKEN: u64 = 2;
 /// Claude bills at most about 1,600 tokens for an image at standard
 /// resolution and about 4,800 at high resolution.
 const IMAGE_TOKENS: u64 = 5_000;
+/// What a model counts for audio, from its base64 size: about 32 tokens a
+/// second (Gemini), Opus at about 2 KB a second, so a token for about 85
+/// base64 bytes; at least [`MIN_AUDIO_TOKENS`] (issue #164).
+const AUDIO_BASE64_BYTES_PER_TOKEN: u64 = 85;
+const MIN_AUDIO_TOKENS: u64 = 1_000;
 
 /// Least tokens reserved for a URL-sourced document, whose size the
 /// gateway cannot see: a large PDF runs to 100k-300k tokens. A base64
@@ -1067,15 +1072,28 @@ fn input_token_estimate(request: &AnthropicRequest) -> i64 {
                         Some("tool_use") => (false, None),
                         Some("document") if url_source => (true, Some(URL_DOCUMENT_TOKENS)),
                         Some("image" | "document") => (true, Some(IMAGE_TOKENS)),
+                        Some("audio") => {
+                            let bytes = map
+                                .get("source")
+                                .and_then(|source| source.get("data"))
+                                .and_then(serde_json::Value::as_str)
+                                .map_or(0, str::len) as u64;
+                            (
+                                true,
+                                Some((bytes / AUDIO_BASE64_BYTES_PER_TOKEN).max(MIN_AUDIO_TOKENS)),
+                            )
+                        }
                         _ => (true, None),
                     };
                     let mut inner = Self::default();
                     for (key, item) in map {
                         inner.text(key);
                         match (kind, key.as_str(), item) {
-                            (Some("image"), "source", serde_json::Value::Object(source))
-                                if floor.is_some() =>
-                            {
+                            (
+                                Some("image" | "audio"),
+                                "source",
+                                serde_json::Value::Object(source),
+                            ) if floor.is_some() => {
                                 for (k, v) in source.iter().filter(|(k, _)| *k != "data") {
                                     inner.text(k);
                                     inner.walk(v, false);
@@ -2089,6 +2107,14 @@ mod tests {
             let base64 = json!([{"type": "image", "source": {"type": "base64",
                 "media_type": "image/png", "data": "A".repeat(1_000_000)}}]);
             assert_eq!(estimate(base64), 2 + image);
+            // A minute of Opus is about 160 KB of base64: some 1,900 tokens,
+            // not the 80,000 its text would count.
+            let minute = json!([{"type": "audio", "source": {"type": "base64",
+                "media_type": "audio/ogg", "data": "A".repeat(160_000)}}]);
+            assert_eq!(estimate(minute), 2 + 160_000 / 85);
+            let short = json!([{"type": "audio", "source": {"type": "base64",
+                "media_type": "audio/ogg", "data": "A".repeat(100)}}]);
+            assert_eq!(estimate(short), 2 + 1_000);
             let url = json!([{"type": "image", "source": {"type": "url",
                 "url": "https://example.test/a.png"}}]);
             assert_eq!(estimate(url), 2 + image);

@@ -58,8 +58,11 @@ fn default_key_env() -> String {
 pub const MAX_AUDIO_BYTES: usize = 20 * 1024 * 1024;
 /// Most of a transcript kept, in characters.
 pub const MAX_TRANSCRIPT_CHARS: usize = 20_000;
-/// How long a transcription may take.
-const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+/// How long a transcription may take: within what a channel adapter waits
+/// for its upload to be answered.
+const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+/// Transcriptions running at once; more wait their turn.
+static RUNNING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 /// The audio format of a file with media type `media_type` and name
 /// `name`, as the endpoints and models name it; `None` when it is not
@@ -117,14 +120,13 @@ pub struct ModelCall<'a> {
     pub allowed: &'a [String],
 }
 
-/// Transcribe `bytes`, file `name` in audio `format`: the transcript, cut
+/// Transcribe `bytes`, audio in `format`: the transcript, cut
 /// to [`MAX_TRANSCRIPT_CHARS`]; why not, for a log.
 pub async fn transcribe(
     how: &Transcription,
     http: &reqwest::Client,
     call: ModelCall<'_>,
     bytes: Vec<u8>,
-    name: &str,
     format: &str,
 ) -> Result<String, String> {
     if bytes.len() > MAX_AUDIO_BYTES {
@@ -133,14 +135,25 @@ pub async fn transcribe(
             MAX_AUDIO_BYTES / (1024 * 1024)
         ));
     }
-    let text = match how {
-        Transcription::Endpoint {
-            base_url,
-            model,
-            api_key_env,
-        } => endpoint(http, base_url, model, api_key_env, bytes, name).await?,
-        Transcription::Model { model } => by_model(http, call, model, bytes, format).await?,
+    let _turn = RUNNING
+        .acquire()
+        .await
+        .map_err(|e| format!("transcription is closed: {e}"))?;
+    // The name it is sent with says its format, whatever it was sent as.
+    let file = format!("audio.{format}");
+    let work = async {
+        match how {
+            Transcription::Endpoint {
+                base_url,
+                model,
+                api_key_env,
+            } => endpoint(http, base_url, model, api_key_env, bytes, &file).await,
+            Transcription::Model { model } => by_model(http, call, model, bytes, format).await,
+        }
     };
+    let text = tokio::time::timeout(TIMEOUT, work)
+        .await
+        .map_err(|_| format!("transcription took longer than {}s", TIMEOUT.as_secs()))??;
     let text = text.trim();
     if text.is_empty() {
         return Err("the transcript is empty".into());
@@ -204,6 +217,23 @@ async fn by_model(
     format: &str,
 ) -> Result<String, String> {
     let entry = call.models.resolve(model)?.clone();
+    // What each API takes (issue #164): Anthropic no audio, OpenAI's own
+    // `input_audio` only WAV and MP3.
+    match entry.provider() {
+        "anthropic" => {
+            return Err(format!(
+                "{} takes no audio: use an OpenRouter or Gemini model that does",
+                entry.id
+            ));
+        }
+        "openai" if !matches!(format, "wav" | "mp3") => {
+            return Err(format!(
+                "{} takes WAV and MP3 audio only, not {format}: use an OpenRouter or Gemini model",
+                entry.id
+            ));
+        }
+        _ => {}
+    }
     if !llm_proxy::model_allowed(call.allowed, &entry.id) {
         return Err(format!(
             "the transcription model {:?} is not allowed by this agent's policy",
