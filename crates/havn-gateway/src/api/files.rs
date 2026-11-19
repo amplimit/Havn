@@ -204,29 +204,30 @@ pub async fn receive(
     if let Some(kind) = text_kind {
         match crate::web_fetch::document_text(kind, &body).await {
             Ok((text, _)) if !text.trim().is_empty() => {
-                let workspace = crate::api::agents::workspace_for(state, agent_id);
-                let text_name = format!("{}.txt", stored.file);
-                let written = text_name.clone();
-                let saved = tokio::task::spawn_blocking(move || {
-                    let inbox = inbox(&workspace)?;
-                    inbox.require_free(text.len() as u64 + MIN_FREE_BYTES)?;
-                    inbox.create_new(&written, text.as_bytes())
-                })
-                .await;
-                match saved {
-                    Ok(Ok(true)) => text_path = Some(format!("{INBOX_DIR}/{text_name}")),
-                    Ok(Ok(false)) => {}
-                    Ok(Err(e)) => {
-                        tracing::warn!(agent_id = %agent_id, error = %e, "could not save a document's text")
-                    }
-                    Err(e) => {
-                        tracing::warn!(agent_id = %agent_id, error = %e, "could not save a document's text")
-                    }
-                }
+                text_path = save_text(state, agent_id, &stored.file, text).await;
             }
             Ok(_) => {}
             Err(e) => {
                 tracing::info!(agent_id = %agent_id, error = %e, "no text read from an uploaded document")
+            }
+        }
+    }
+    // An audio file's transcript (issue #164), kept as its text and shown
+    // to the agent with it.
+    let mut transcript = None;
+    let how = (**state.transcription.load()).clone();
+    if text_path.is_none()
+        && body.len() <= crate::transcribe::MAX_AUDIO_BYTES
+        && let Some(how) = how
+        && let Some(format) = crate::transcribe::audio_format(&media_type, &name)
+    {
+        match transcribe_for(state, agent_id, &how, body.to_vec(), format).await {
+            Ok(text) => {
+                text_path = save_text(state, agent_id, &stored.file, text.clone()).await;
+                transcript = Some(text);
+            }
+            Err(why) => {
+                tracing::info!(agent_id = %agent_id, why, "an audio file was not transcribed");
             }
         }
     }
@@ -237,8 +238,111 @@ pub async fn receive(
         media_type,
         size: body.len() as u64,
         text_path,
+        transcript,
     };
     Ok(attachment)
+}
+
+/// Keep `text`, the text of inbox file `file`, next to it as `<file>.txt`:
+/// its path, or `None` when it could not be saved.
+async fn save_text(
+    state: &AppState,
+    agent_id: havn_core::AgentId,
+    file: &str,
+    text: String,
+) -> Option<String> {
+    let workspace = crate::api::agents::workspace_for(state, agent_id);
+    let text_name = format!("{file}.txt");
+    let written = text_name.clone();
+    let saved = tokio::task::spawn_blocking(move || {
+        let inbox = inbox(&workspace)?;
+        inbox.require_free(text.len() as u64 + MIN_FREE_BYTES)?;
+        inbox.create_new(&written, text.as_bytes())
+    })
+    .await;
+    match saved {
+        Ok(Ok(true)) => Some(format!("{INBOX_DIR}/{text_name}")),
+        Ok(Ok(false)) => None,
+        Ok(Err(e)) => {
+            tracing::warn!(agent_id = %agent_id, error = %e, "could not save a file's text");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(agent_id = %agent_id, error = %e, "could not save a file's text");
+            None
+        }
+    }
+}
+
+/// Transcribe audio of agent `agent_id` with `how`: a model
+/// is asked on the agent owner's credentials, within the agent's policy
+/// and budget.
+async fn transcribe_for(
+    state: &AppState,
+    agent_id: havn_core::AgentId,
+    how: &crate::transcribe::Transcription,
+    bytes: Vec<u8>,
+    format: &str,
+) -> Result<String, String> {
+    let agent = havn_db::repo::agents::find_by_id(&state.db, agent_id)
+        .await
+        .map_err(|e| format!("agent lookup failed: {e}"))?
+        .ok_or("the agent is gone")?;
+    let policy =
+        crate::policy_resolver::for_session(&state.db, &agent, state.trusted_proxies.is_some())
+            .await;
+    let models = state.models.load();
+    let call = crate::transcribe::ModelCall {
+        db: &state.db,
+        keyring: state.keyring.as_ref(),
+        llm: &state.llm,
+        models: &models,
+        billing: crate::llm_proxy::Billing {
+            user_id: agent.owner_id,
+            agent_id: Some(agent_id),
+            agent_team: agent.team_id,
+            budget: policy.budget.clone(),
+        },
+        allowed: &policy.allowed_models,
+    };
+    crate::transcribe::transcribe(how, &state.http, call, bytes, format).await
+}
+
+/// `attachment`, a file of agent `agent_id`'s inbox a web chat message
+/// names, with the transcript the gateway kept for it: none that the
+/// page sent is taken (issue #164).
+pub async fn with_transcript(
+    state: &AppState,
+    agent_id: havn_core::AgentId,
+    mut attachment: Attachment,
+) -> Attachment {
+    attachment.transcript = None;
+    if crate::transcribe::audio_format(&attachment.media_type, &attachment.name).is_none() {
+        return attachment;
+    }
+    // Where the gateway kept it, next to the file: not a path the page
+    // names.
+    let Some(name) = attachment
+        .path
+        .strip_prefix(INBOX_DIR)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .map(|file| format!("{file}.txt"))
+    else {
+        return attachment;
+    };
+    let workspace = crate::api::agents::workspace_for(state, agent_id);
+    let limit = (crate::transcribe::MAX_TRANSCRIPT_CHARS * 4) as u64;
+    let read =
+        tokio::task::spawn_blocking(move || inbox(&workspace)?.read_bytes(&name, limit)).await;
+    if let Ok(Ok(Some(bytes))) = read {
+        attachment.transcript = Some(
+            String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(crate::transcribe::MAX_TRANSCRIPT_CHARS)
+                .collect(),
+        );
+    }
+    attachment
 }
 
 /// Remove a received file no message carried, and its text, from the

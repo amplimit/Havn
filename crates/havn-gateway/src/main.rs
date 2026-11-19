@@ -30,6 +30,7 @@ mod schedule;
 mod secret_ref;
 mod supervisor;
 mod timezone;
+mod transcribe;
 mod web_fetch;
 mod web_search;
 mod webchat;
@@ -182,6 +183,8 @@ struct AppState {
     /// `[channel_texts]`, hot-reloaded: what channel bots tell senders
     /// who are not paired (issue #183).
     pub channel_texts: Arc<ArcSwap<config::ChannelTexts>>,
+    /// `[transcription]`, hot-reloaded (issue #164).
+    pub transcription: Arc<ArcSwap<Option<transcribe::Transcription>>>,
     pub config_path: PathBuf,
     pub models_write: Arc<tokio::sync::Mutex<()>>,
     pub search: Arc<web_search::WebSearch>,
@@ -486,6 +489,7 @@ async fn serve() -> anyhow::Result<()> {
     let models = reload_handles.models.clone();
     let workspace_browse = reload_handles.workspace_browse.clone();
     let channel_texts = reload_handles.channel_texts.clone();
+    let transcription = reload_handles.transcription.clone();
     info!(
         allowed_origins = ?allowed_origins.load(),
         "webchat origin allowlist"
@@ -562,6 +566,7 @@ async fn serve() -> anyhow::Result<()> {
         models: models.clone(),
         workspace_browse,
         channel_texts,
+        transcription,
         config_path: config_path.clone(),
         models_write: Arc::new(tokio::sync::Mutex::new(())),
         search: Arc::clone(&search),

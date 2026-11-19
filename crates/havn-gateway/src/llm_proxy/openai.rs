@@ -357,6 +357,32 @@ fn translate_message_to_openai(
                     "image_url": {"url": format!("data:{media};base64,{data}")},
                 }));
             }
+            // Audio (issue #164, a transcription), as an `input_audio` part.
+            "audio"
+                if m.role == "user"
+                    && block.pointer("/source/type").and_then(Value::as_str) == Some("base64") =>
+            {
+                let format = match block
+                    .pointer("/source/media_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("audio/ogg")
+                {
+                    "audio/mpeg" => "mp3",
+                    "audio/mp4" => "m4a",
+                    "audio/wav" => "wav",
+                    "audio/webm" => "webm",
+                    "audio/flac" => "flac",
+                    _ => "ogg",
+                };
+                let data = block
+                    .pointer("/source/data")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                images.push(json!({
+                    "type": "input_audio",
+                    "input_audio": {"data": data, "format": format},
+                }));
+            }
             // A model's reasoning goes back only where it asks for it.
             "thinking" => {
                 if reasoning_field.is_some()
@@ -740,6 +766,25 @@ mod tests {
             temperature: None,
             tools: None,
         }
+    }
+
+    #[test]
+    fn audio_becomes_an_input_audio_part() {
+        let r = req(
+            vec![AnthropicMessage {
+                role: "user".into(),
+                content: json!([
+                    {"type": "text", "text": "transcribe"},
+                    {"type": "audio", "source": {"type": "base64", "media_type": "audio/mpeg", "data": "AAAA"}},
+                ]),
+            }],
+            None,
+        );
+        let body = anthropic_to_openai(&r, "max_tokens", "openai").expect("translate");
+        let parts = body["messages"][0]["content"].as_array().expect("parts");
+        assert_eq!(parts[1]["type"], "input_audio");
+        assert_eq!(parts[1]["input_audio"]["format"], "mp3");
+        assert_eq!(parts[1]["input_audio"]["data"], "AAAA");
     }
 
     #[test]
