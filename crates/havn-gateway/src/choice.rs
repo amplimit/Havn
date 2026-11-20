@@ -178,13 +178,20 @@ pub fn read_answer(args: &str) -> Option<(&str, Vec<usize>)> {
 
 /// The person's choice of `numbers` (from 1) among `asked`'s options, as
 /// their message to the agent; why not, when the numbers do not answer it.
-pub fn chosen(asked: &Asked, numbers: &[usize]) -> Result<String, String> {
+pub fn chosen(
+    asked: &Asked,
+    numbers: &[usize],
+    language: havn_core::Language,
+) -> Result<String, String> {
     let mut picked: Vec<usize> = Vec::new();
     for &n in numbers {
         if n == 0 || n > asked.options.len() {
-            return Err(format!(
-                "(Choose by the options' numbers, 1 to {}.)",
-                asked.options.len()
+            return Err(language.pick(
+                format!(
+                    "(Choose by the options' numbers, 1 to {}.)",
+                    asked.options.len()
+                ),
+                format!("（请按选项编号选择，1 到 {}。）", asked.options.len()),
             ));
         }
         if !picked.contains(&n) {
@@ -216,7 +223,12 @@ pub fn chosen(asked: &Asked, numbers: &[usize]) -> Result<String, String> {
             serde_json::to_string(&asked.question).unwrap_or_default(),
             quote(*n)
         )),
-        _ => Err("(Choose one option, by its number.)".into()),
+        _ => Err(language
+            .pick(
+                "(Choose one option, by its number.)",
+                "（请按编号选一个选项。）",
+            )
+            .into()),
     }
 }
 
@@ -272,18 +284,18 @@ mod tests {
         assert_eq!(read_answer("abc 1 2"), None);
         assert_eq!(read_answer(""), None);
         assert_eq!(
-            chosen(&asked(false), &[2]),
+            chosen(&asked(false), &[2], havn_core::Language::English),
             Ok("[Chosen with a button, for \"Which report?\": \"Costs\"]".to_string())
         );
-        assert!(chosen(&asked(false), &[1, 2]).is_err());
-        assert!(chosen(&asked(false), &[]).is_err());
-        assert!(chosen(&asked(false), &[3]).is_err());
+        assert!(chosen(&asked(false), &[1, 2], havn_core::Language::English).is_err());
+        assert!(chosen(&asked(false), &[], havn_core::Language::English).is_err());
+        assert!(chosen(&asked(false), &[3], havn_core::Language::English).is_err());
         assert_eq!(
-            chosen(&asked(true), &[2, 1, 2]),
+            chosen(&asked(true), &[2, 1, 2], havn_core::Language::English),
             Ok("[Chosen in the poll \"Which report?\": \"Sales\", \"Costs\"]".to_string())
         );
         assert_eq!(
-            chosen(&asked(true), &[]),
+            chosen(&asked(true), &[], havn_core::Language::English),
             Ok("[Chosen in the poll \"Which report?\": none of the options]".to_string())
         );
     }

@@ -1203,7 +1203,8 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
         Some(
             refused @ (crate::commands::Parsed::Unknown(_) | crate::commands::Parsed::Misused(_)),
         ) => {
-            let text = refused.refusal().unwrap_or_default();
+            let language = crate::commands::language_of(state, agent_id).await;
+            let text = refused.refusal(language).unwrap_or_default();
             tell_sender(
                 state,
                 channel,
@@ -1234,6 +1235,7 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
             // reply.
             "retry" => branch = Some(havn_core::Branch::Regenerate { turn: None }),
             _ => {
+                let language = crate::commands::language_of(state, agent_id).await;
                 let asker = crate::commands::Asker {
                     agent_id,
                     scope: encoded_channel_id.clone(),
@@ -1241,9 +1243,14 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
                     who: format!("{} on {channel} account {}", inb.sender_id, inb.account_id),
                     admin: is_admin(state, channel, &inb.account_id, &inb.sender_id, agent_id)
                         .await,
-                    admin_hint: "the agent's owner (after connecting this account on the agent's \
-                                 settings page) and the senders listed under the account's \
-                                 `admins` in the gateway's config.toml",
+                    admin_hint: language.pick(
+                        "the agent's owner (after connecting this account on the agent's \
+                         settings page) and the senders listed under the account's `admins` in \
+                         the gateway's config.toml",
+                        "agent 的所有者（在 agent 设置页关联这个账号之后），以及网关 config.toml \
+                         里这个账号 `admins` 下列出的发送者",
+                    ),
+                    language,
                 };
                 match crate::commands::run(state, &asker, command, args).await {
                     crate::commands::Action::Reply(text) => {
@@ -1362,7 +1369,10 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
 
     // A command for the agent goes now that it runs.
     if let Some(frame) = command_frame {
-        let saved = crate::commands::saved_already(&frame);
+        let saved = crate::commands::saved_already(
+            &frame,
+            crate::commands::language_of(state, agent_id).await,
+        );
         if let Err(e) = state.registry.send(agent_id, frame).await {
             warn!(channel, %agent_id, error = ?e, "failed to forward a chat command");
             let text = match (saved, e) {

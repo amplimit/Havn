@@ -28,18 +28,28 @@ const ENDED: &str = "(The turn ended here.)";
 /// out of what later turns read, so the model does not take it for its own.
 #[must_use]
 pub fn fallback_note(model: &str) -> String {
-    format!("(Answered by {model}: the chat's model was unavailable.)")
+    let [start, end] = crate::lang().pick(FALLBACK_NOTE[0], FALLBACK_NOTE[1]);
+    format!("{start}{model}{end}")
 }
+
+/// How a [`fallback_note`] starts and ends, in English and in Chinese
+/// (issue #250): a reply kept in either is read back without it.
+const FALLBACK_NOTE: [[&str; 2]; 2] = [
+    ["(Answered by ", ": the chat's model was unavailable.)"],
+    ["（由 ", " 回答：这个对话的模型不可用。）"],
+];
 
 /// `reply` without its [`fallback_note`].
 #[must_use]
 pub fn without_note(reply: &str) -> &str {
-    match reply.rfind("(Answered by ") {
-        Some(at) if reply.ends_with(": the chat's model was unavailable.)") => {
-            reply[..at].trim_end()
+    for [start, end] in FALLBACK_NOTE {
+        if reply.ends_with(end)
+            && let Some(at) = reply.rfind(start)
+        {
+            return reply[..at].trim_end();
         }
-        _ => reply,
     }
+    reply
 }
 
 /// The steps of a turn, from its `messages` (those the tool loop added
@@ -294,6 +304,11 @@ mod tests {
         assert_eq!(without_note(&reply), "pong");
         assert_eq!(without_note("plain"), "plain");
         assert_eq!(without_note(&fallback_note("p:spare")), "");
+        let zh = format!(
+            "pong\n\n{}p:spare{}",
+            FALLBACK_NOTE[1][0], FALLBACK_NOTE[1][1]
+        );
+        assert_eq!(without_note(&zh), "pong", "a reply kept in Chinese too");
     }
 
     #[test]

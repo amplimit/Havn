@@ -74,6 +74,7 @@ export default function SettingsPage({
   const [model, setModel] = useState("");
   const [models, setModels] = useState<ModelsView | null>(null);
   const [heartbeatMin, setHeartbeatMin] = useState<string>("");
+  const [language, setLanguage] = useState<"en" | "zh">("en");
 
   useEffect(() => {
     let cancelled = false;
@@ -86,6 +87,7 @@ export default function SettingsPage({
         setName(a.name);
         const cfg = a.config as Record<string, unknown>;
         setModel(typeof cfg.model === "string" ? cfg.model : "");
+        setLanguage(cfg.language === "zh" ? "zh" : "en");
         // Without the list the picker only offers the current model.
         api.models
           .get()
@@ -128,6 +130,10 @@ export default function SettingsPage({
       const saved = (agent.config as Record<string, unknown>).model;
       if (model !== (typeof saved === "string" ? saved : "")) {
         config.model = model || null;
+      }
+      const savedLanguage = (agent.config as Record<string, unknown>).language === "zh" ? "zh" : "en";
+      if (language !== savedLanguage) {
+        config.language = language === "en" ? null : language;
       }
       const hbNum = Number(heartbeatMin);
       if (heartbeatMin.trim() && Number.isFinite(hbNum) && hbNum > 0) {
@@ -263,6 +269,21 @@ export default function SettingsPage({
               Manage the model list
             </Link>
           </p>
+        </Field>
+
+        <Field
+          label="Language"
+          hint="What Havn writes for this agent: the parts of the prompt it adds, and its own messages, such as replies to /model or /new and approval notices. The agent answers people in their own language either way; tool descriptions stay English."
+        >
+          <select
+            value={language}
+            onChange={(e) => setLanguage(e.target.value === "zh" ? "zh" : "en")}
+            className="input"
+            style={{ maxWidth: 200 }}
+          >
+            <option value="en">English</option>
+            <option value="zh">中文</option>
+          </select>
         </Field>
 
         <Field

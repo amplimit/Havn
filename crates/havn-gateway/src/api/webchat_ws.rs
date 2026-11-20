@@ -151,11 +151,17 @@ async fn web_asker(
     session_id: SessionId,
     sender_id: &str,
 ) -> crate::commands::Asker {
-    let owner = havn_db::repo::agents::find_by_id(&state.db, agent_id)
+    let agent = havn_db::repo::agents::find_by_id(&state.db, agent_id)
         .await
         .ok()
-        .flatten()
+        .flatten();
+    let owner = agent
+        .as_ref()
         .is_some_and(|a| a.owner_id.to_string() == sender_id);
+    let language = agent
+        .as_ref()
+        .map(|a| havn_core::Language::of_config(&a.config))
+        .unwrap_or_default();
     let name = match sender_id.parse() {
         Ok(id) => havn_db::repo::users::find_by_id(&state.db, id)
             .await
@@ -174,7 +180,8 @@ async fn web_asker(
             if owner { ", the agent's owner" } else { "" }
         ),
         admin: owner,
-        admin_hint: "the agent's owner",
+        admin_hint: language.pick("the agent's owner", "agent 的所有者"),
+        language,
     }
 }
 
@@ -195,11 +202,17 @@ async fn web_command(
     };
     let reply = match parsed {
         refused @ (crate::commands::Parsed::Unknown(_) | crate::commands::Parsed::Misused(_)) => {
-            refused.refusal().unwrap_or_default()
+            refused.refusal(asker.language).unwrap_or_default()
         }
         crate::commands::Parsed::Known(command, args) => match command.name {
             // The page has its own way of doing these.
-            "new" => "(Start a new chat with the New chat button.)".into(),
+            "new" => asker
+                .language
+                .pick(
+                    "(Start a new chat with the New chat button.)",
+                    "（用「New chat」按钮开始新对话。）",
+                )
+                .into(),
             "stop" => {
                 let stop = GatewayToAgent::StopTurn(havn_proto::StopTurn {
                     conversation: asker.conversation.clone(),
@@ -210,7 +223,13 @@ async fn web_command(
                 }
                 return None;
             }
-            "retry" => "(Answer again with the button under the reply.)".into(),
+            "retry" => asker
+                .language
+                .pick(
+                    "(Answer again with the button under the reply.)",
+                    "（用回复下面的按钮重新回答。）",
+                )
+                .into(),
             _ => match crate::commands::run(state, &asker, command, args).await {
                 crate::commands::Action::Reply(text) => text,
                 crate::commands::Action::Say { text, question } => {
@@ -218,12 +237,18 @@ async fn web_command(
                 }
                 crate::commands::Action::Agent(command) => {
                     let frame = GatewayToAgent::ChatCommand(command);
-                    let saved = crate::commands::saved_already(&frame);
+                    let saved = crate::commands::saved_already(&frame, asker.language);
                     if !state
                         .webchat_router
                         .expect_command_reply(asker.agent_id, session)
                     {
-                        "(Too many commands are waiting for an answer; try again in a moment.)"
+                        asker
+                            .language
+                            .pick(
+                                "(Too many commands are waiting for an answer; try again in a \
+                                 moment.)",
+                                "（等待回答的命令太多了，请稍后再试。）",
+                            )
                             .into()
                     } else {
                         match state.registry.send(asker.agent_id, frame).await {
@@ -234,10 +259,11 @@ async fn web_command(
                                     .take_command_reply(asker.agent_id, session);
                                 warn!(agent_id = %asker.agent_id, error = ?e, "failed to forward a chat command");
                                 saved
-                                    .unwrap_or(
+                                    .unwrap_or(asker.language.pick(
                                         "(The agent is not reachable right now; try again in a \
                                          moment.)",
-                                    )
+                                        "（现在连不上 agent，请稍后再试。）",
+                                    ))
                                     .into()
                             }
                         }

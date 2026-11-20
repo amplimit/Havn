@@ -21,6 +21,8 @@ pub struct Command {
     /// How its arguments are written, empty when it takes none.
     pub args: &'static str,
     pub about: &'static str,
+    /// `about` in Chinese (issue #250), for `/help` to an agent in Chinese.
+    pub about_zh: &'static str,
     /// Only for whoever administers the agent: it spends the owner's
     /// credentials or lets a step through.
     pub admin: bool,
@@ -33,6 +35,7 @@ pub const COMMANDS: &[Command] = &[
         aliases: &["reset", "clear"],
         args: "",
         about: "Start a new chat; the old one is kept",
+        about_zh: "开始一个新对话，旧的保留",
         admin: false,
     },
     Command {
@@ -40,6 +43,7 @@ pub const COMMANDS: &[Command] = &[
         aliases: &[],
         args: "",
         about: "Stop the reply being written",
+        about_zh: "停止正在写的回复",
         admin: false,
     },
     Command {
@@ -47,6 +51,7 @@ pub const COMMANDS: &[Command] = &[
         aliases: &[],
         args: "",
         about: "Answer your last message again",
+        about_zh: "重新回答你的上一条消息",
         admin: false,
     },
     Command {
@@ -54,6 +59,7 @@ pub const COMMANDS: &[Command] = &[
         aliases: &[],
         args: "",
         about: "Take back your last message and its reply",
+        about_zh: "撤回你的上一条消息和它的回复",
         admin: false,
     },
     Command {
@@ -61,6 +67,7 @@ pub const COMMANDS: &[Command] = &[
         aliases: &[],
         args: "",
         about: "Summarise the earlier part of this chat to make room",
+        about_zh: "把这个对话较早的部分压缩成摘要，腾出空间",
         admin: false,
     },
     Command {
@@ -68,6 +75,7 @@ pub const COMMANDS: &[Command] = &[
         aliases: &[],
         args: "",
         about: "This chat: the agent, its model, its messages",
+        about_zh: "这个对话：agent、模型和消息数",
         admin: false,
     },
     Command {
@@ -75,6 +83,7 @@ pub const COMMANDS: &[Command] = &[
         aliases: &[],
         args: "[name | number | default]",
         about: "Show the models, or switch this chat's",
+        about_zh: "列出模型，或切换这个对话的模型",
         admin: true,
     },
     Command {
@@ -82,6 +91,7 @@ pub const COMMANDS: &[Command] = &[
         aliases: &[],
         args: "[name | number | default]",
         about: "Show or switch the agent's model, for every chat",
+        about_zh: "列出或切换 agent 的模型，对所有对话生效",
         admin: true,
     },
     Command {
@@ -89,6 +99,7 @@ pub const COMMANDS: &[Command] = &[
         aliases: &[],
         args: "[off | on | level | tokens | default]",
         about: "Show or set how much this chat's model thinks",
+        about_zh: "查看或设置这个对话的模型思考多少",
         admin: true,
     },
     Command {
@@ -96,6 +107,7 @@ pub const COMMANDS: &[Command] = &[
         aliases: &[],
         args: "[days]",
         about: "Tokens the agent used",
+        about_zh: "agent 用掉的 token",
         admin: true,
     },
     Command {
@@ -103,6 +115,7 @@ pub const COMMANDS: &[Command] = &[
         aliases: &[],
         args: "[always] [id]",
         about: "Let the step waiting for approval run",
+        about_zh: "让等待批准的步骤执行",
         admin: true,
     },
     Command {
@@ -110,6 +123,7 @@ pub const COMMANDS: &[Command] = &[
         aliases: &[],
         args: "[id]",
         about: "Refuse the step waiting for approval",
+        about_zh: "拒绝等待批准的步骤",
         admin: true,
     },
     Command {
@@ -117,6 +131,7 @@ pub const COMMANDS: &[Command] = &[
         aliases: &[],
         args: "",
         about: "Disconnect this chat account from its Havn account",
+        about_zh: "断开这个聊天账号和 Havn 账号的关联",
         admin: false,
     },
     Command {
@@ -124,6 +139,7 @@ pub const COMMANDS: &[Command] = &[
         aliases: &[],
         args: "",
         about: "Who you are to this agent",
+        about_zh: "你对这个 agent 来说是谁",
         admin: false,
     },
     Command {
@@ -131,6 +147,7 @@ pub const COMMANDS: &[Command] = &[
         aliases: &["commands"],
         args: "",
         about: "List the commands",
+        about_zh: "列出所有命令",
         admin: false,
     },
 ];
@@ -157,15 +174,19 @@ pub enum Parsed<'a> {
 impl Parsed<'_> {
     /// What the gateway answers a command it does not carry out.
     #[must_use]
-    pub fn refusal(&self) -> Option<String> {
+    pub fn refusal(&self, language: havn_core::Language) -> Option<String> {
         match self {
             Self::Known(..) => None,
-            Self::Misused(c) => Some(format!(
-                "(/{0} takes nothing after it: send /{0} on its own.)",
-                c.name
+            Self::Misused(c) => Some(language.pick(
+                format!(
+                    "(/{0} takes nothing after it: send /{0} on its own.)",
+                    c.name
+                ),
+                format!("（/{0} 后面不带任何内容：单独发送 /{0}。）", c.name),
             )),
-            Self::Unknown(name) => Some(format!(
-                "(There is no /{name} command. Send /help for the list.)"
+            Self::Unknown(name) => Some(language.pick(
+                format!("(There is no /{name} command. Send /help for the list.)"),
+                format!("（没有 /{name} 这个命令。发 /help 查看命令列表。）"),
             )),
         }
     }
@@ -218,6 +239,7 @@ pub const CHOOSE: Command = Command {
     aliases: &[],
     args: "<question> <numbers>",
     about: "Answer a question the agent asked with buttons or a poll",
+    about_zh: "用按钮或投票回答 agent 提的问题",
     admin: false,
 };
 
@@ -270,8 +292,8 @@ pub async fn list(_user: crate::auth::AuthedUser) -> axum::Json<Vec<CommandView>
 
 /// `/help`: every command, the ones `admin` may not use marked.
 #[must_use]
-pub fn help(admin: bool) -> String {
-    let mut out = String::from("Commands:\n");
+pub fn help(admin: bool, language: havn_core::Language) -> String {
+    let mut out = String::from(language.pick("Commands:\n", "命令：\n"));
     for c in COMMANDS {
         out.push('/');
         out.push_str(c.name);
@@ -280,18 +302,21 @@ pub fn help(admin: bool) -> String {
             out.push_str(c.args);
         }
         out.push_str(" - ");
-        out.push_str(c.about);
+        out.push_str(language.pick(c.about, c.about_zh));
         if !c.aliases.is_empty() {
-            out.push_str(" (also /");
+            out.push_str(language.pick(" (also /", "（也可以用 /"));
             out.push_str(&c.aliases.join(", /"));
-            out.push(')');
+            out.push_str(language.pick(")", "）"));
         }
         if c.admin && !admin {
-            out.push_str(" [admins only]");
+            out.push_str(language.pick(" [admins only]", " [仅限管理员]"));
         }
         out.push('\n');
     }
-    out.push_str("Anything else you write goes to the agent.");
+    out.push_str(language.pick(
+        "Anything else you write goes to the agent.",
+        "其他任何内容都会发给 agent。",
+    ));
     out
 }
 
@@ -309,6 +334,19 @@ pub struct Asker {
     pub admin: bool,
     /// What the sender would need to be one, for a refusal.
     pub admin_hint: &'static str,
+    /// The agent's language, which its replies are in (issue #250).
+    pub language: havn_core::Language,
+}
+
+/// The language of agent `agent_id` (issue #250); English when it cannot
+/// be read.
+pub async fn language_of(state: &AppState, agent_id: AgentId) -> havn_core::Language {
+    agents_repo::find_by_id(&state.db, agent_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|a| havn_core::Language::of_config(&a.config))
+        .unwrap_or_default()
 }
 
 /// What the caller does with a command [`run`] took.
@@ -326,12 +364,18 @@ pub enum Action {
 /// What to tell the sender when `frame` cannot reach the agent but did
 /// its part already: `/agent_model` saved the agent's model.
 #[must_use]
-pub fn saved_already(frame: &havn_proto::GatewayToAgent) -> Option<&'static str> {
+pub fn saved_already(
+    frame: &havn_proto::GatewayToAgent,
+    language: havn_core::Language,
+) -> Option<&'static str> {
     match frame {
         havn_proto::GatewayToAgent::ChatCommand(ChatCommand {
             command: ChatCommandKind::AgentModel { .. },
             ..
-        }) => Some("(Saved. The agent uses that model from its next start.)"),
+        }) => Some(language.pick(
+            "(Saved. The agent uses that model from its next start.)",
+            "（已保存。agent 下次启动时开始使用这个模型。）",
+        )),
         _ => None,
     }
 }
@@ -340,10 +384,11 @@ pub fn saved_already(frame: &havn_proto::GatewayToAgent) -> Option<&'static str>
 /// `/retry` are not handled here: the channel and the web chat each have
 /// their own way of doing those.
 pub async fn run(state: &AppState, asker: &Asker, command: &Command, args: &str) -> Action {
+    let language = asker.language;
     if command.admin && !asker.admin {
-        return Action::Reply(format!(
-            "(Only {} can use /{}.)",
-            asker.admin_hint, command.name
+        return Action::Reply(language.pick(
+            format!("(Only {} can use /{}.)", asker.admin_hint, command.name),
+            format!("（只有 {} 可以使用 /{}。）", asker.admin_hint, command.name),
         ));
     }
     let to_agent = |kind: ChatCommandKind| {
@@ -354,21 +399,32 @@ pub async fn run(state: &AppState, asker: &Asker, command: &Command, args: &str)
         })
     };
     match command.name {
-        "help" => Action::Reply(help(asker.admin)),
-        "whoami" => Action::Reply(format!(
-            "You are {}. {}",
-            asker.who,
-            if asker.admin {
-                "You can use every command, the admin ones included."
-            } else {
-                "You can use the commands not marked [admins only] in /help."
-            }
-        )),
+        "help" => Action::Reply(help(asker.admin, language)),
+        "whoami" => Action::Reply(match language {
+            havn_core::Language::English => format!(
+                "You are {}. {}",
+                asker.who,
+                if asker.admin {
+                    "You can use every command, the admin ones included."
+                } else {
+                    "You can use the commands not marked [admins only] in /help."
+                }
+            ),
+            havn_core::Language::Chinese => format!(
+                "你是 {}。{}",
+                asker.who,
+                if asker.admin {
+                    "你可以使用所有命令，包括管理员命令。"
+                } else {
+                    "你可以使用 /help 里没有标「仅限管理员」的命令。"
+                }
+            ),
+        }),
         "undo" => to_agent(ChatCommandKind::Undo),
         "compact" => to_agent(ChatCommandKind::Compact),
         // The gateway does it before a chat-app message gets here.
         "disconnect" => Action::Reply(
-            "(Chat-app accounts are disconnected on an agent's settings page, under chat apps.)"
+            language.pick("(Chat-app accounts are disconnected on an agent's settings page, under chat apps.)", "（聊天应用账号在 agent 设置页的「chat apps」里断开。）")
                 .into(),
         ),
         "status" => {
@@ -383,7 +439,7 @@ pub async fn run(state: &AppState, asker: &Asker, command: &Command, args: &str)
             let choice = args.to_ascii_lowercase();
             if !choice.is_empty() && !is_thinking_choice(&choice) {
                 return Action::Reply(
-                    "(Send /think off, on, a level such as high, a number of tokens, or default.)"
+                    language.pick("(Send /think off, on, a level such as high, a number of tokens, or default.)", "（发 /think 加 off、on、一个级别（比如 high）、一个 token 数，或者 default。）")
                         .into(),
                 );
             }
@@ -391,12 +447,12 @@ pub async fn run(state: &AppState, asker: &Asker, command: &Command, args: &str)
                 choice: (!choice.is_empty()).then_some(choice),
             })
         }
-        "usage" => Action::Reply(usage(state, asker.agent_id, args).await),
+        "usage" => Action::Reply(usage(state, asker.agent_id, args, language).await),
         "choose" => match crate::choice::read_answer(args) {
             Some((id, numbers)) => {
                 match state
                     .webchat_router
-                    .answer_choice(asker.agent_id, &asker.scope, id, &numbers)
+                    .answer_choice(asker.agent_id, &asker.scope, id, &numbers, language)
                 {
                     Ok(text) => Action::Say {
                         text,
@@ -405,14 +461,14 @@ pub async fn run(state: &AppState, asker: &Asker, command: &Command, args: &str)
                     Err(why) => Action::Reply(why),
                 }
             }
-            None => Action::Reply("(Choose with the buttons or the poll.)".into()),
+            None => Action::Reply(language.pick("(Choose with the buttons or the poll.)", "（请用按钮或投票选择。）").into()),
         },
         "approve" | "deny" => {
             Action::Reply(decide(state, asker, command.name == "approve", args).await)
         }
         other => {
             warn!(command = other, "a chat command with no handler");
-            Action::Reply(format!("(/{other} does not work here.)"))
+            Action::Reply(language.pick(format!("(/{other} does not work here.)"), format!("（/{other} 在这里不能用。）")))
         }
     }
 }
@@ -485,9 +541,14 @@ fn listed(models: &[ModelEntry]) -> String {
 }
 
 async fn model(state: &AppState, asker: &Asker, agent_wide: bool, args: &str) -> Action {
+    let language = asker.language;
     let name = if agent_wide { "agent_model" } else { "model" };
     let Some(models) = usable_models(state, asker.agent_id).await else {
-        return Action::Reply("(The agent could not be found.)".into());
+        return Action::Reply(
+            language
+                .pick("(The agent could not be found.)", "（找不到这个 agent。）")
+                .into(),
+        );
     };
     if args.is_empty() {
         let current = if agent_wide {
@@ -503,28 +564,51 @@ async fn model(state: &AppState, asker: &Asker, agent_wide: bool, args: &str) ->
                 })
                 .unwrap_or_default();
             if model.is_empty() {
-                "The agent uses the gateway's default model.\n".to_string()
+                language
+                    .pick(
+                        "The agent uses the gateway's default model.\n",
+                        "agent 使用网关的默认模型。\n",
+                    )
+                    .to_string()
             } else {
-                format!("The agent uses {model}.\n")
+                language.pick(
+                    format!("The agent uses {model}.\n"),
+                    format!("agent 使用 {model}。\n"),
+                )
             }
         } else {
-            "/status shows the model this chat uses.\n".to_string()
+            language
+                .pick(
+                    "/status shows the model this chat uses.\n",
+                    "/status 显示这个对话使用的模型。\n",
+                )
+                .to_string()
         };
-        return Action::Reply(format!(
-            "{current}Models this agent may use:\n{}\nSend /{name} with a number or a name to \
-             switch{}, or /{name} default to go back to {}.",
-            listed(&models),
-            if agent_wide {
-                " every chat without a model of its own"
-            } else {
-                " this chat"
-            },
-            if agent_wide {
-                "the gateway's default"
-            } else {
-                "the agent's model"
-            },
-        ));
+        let list = listed(&models);
+        return Action::Reply(match (language, agent_wide) {
+            (havn_core::Language::English, wide) => format!(
+                "{current}Models this agent may use:\n{list}\nSend /{name} with a number or a \
+                 name to switch{}, or /{name} default to go back to {}.",
+                if wide {
+                    " every chat without a model of its own"
+                } else {
+                    " this chat"
+                },
+                if wide {
+                    "the gateway's default"
+                } else {
+                    "the agent's model"
+                },
+            ),
+            (havn_core::Language::Chinese, true) => format!(
+                "{current}这个 agent 可以使用的模型：\n{list}\n发 /{name} 加编号或名字，切换所有\
+                 没有单独设置模型的对话；发 /{name} default 恢复为网关的默认模型。"
+            ),
+            (havn_core::Language::Chinese, false) => format!(
+                "{current}这个 agent 可以使用的模型：\n{list}\n发 /{name} 加编号或名字，切换这个\
+                 对话的模型；发 /{name} default 恢复为 agent 的模型。"
+            ),
+        });
     }
     let chosen = if matches!(args.to_ascii_lowercase().as_str(), "default" | "reset") {
         None
@@ -532,9 +616,11 @@ async fn model(state: &AppState, asker: &Asker, agent_wide: bool, args: &str) ->
         match pick(&models, args) {
             Some(m) => Some(m.id.clone()),
             None => {
-                return Action::Reply(format!(
+                return Action::Reply(language.pick(format!(
                     "(No model this agent may use is called {args:?}. Send /{name} for the list.)"
-                ));
+                ), format!(
+                    "（这个 agent 能用的模型里没有叫 {args:?} 的。发 /{name} 查看列表。）"
+                )));
             }
         }
     };
@@ -576,7 +662,14 @@ async fn model(state: &AppState, asker: &Asker, agent_wide: bool, args: &str) ->
         Ok(Err(never)) => match never {},
         Err(e) => {
             warn!(agent_id = %asker.agent_id, error = %e, "could not save the agent's model");
-            return Action::Reply("(The model could not be saved; nothing changed.)".into());
+            return Action::Reply(
+                language
+                    .pick(
+                        "(The model could not be saved; nothing changed.)",
+                        "（模型没能保存，什么都没改。）",
+                    )
+                    .into(),
+            );
         }
     };
     crate::audit::record(
@@ -597,28 +690,43 @@ async fn model(state: &AppState, asker: &Asker, agent_wide: bool, args: &str) ->
     })
 }
 
-async fn usage(state: &AppState, agent_id: AgentId, args: &str) -> String {
+async fn usage(
+    state: &AppState,
+    agent_id: AgentId,
+    args: &str,
+    language: havn_core::Language,
+) -> String {
     let days = if args.is_empty() {
         USAGE_DAYS
     } else {
         match args.parse::<u32>() {
             Ok(d) if (1..=MAX_USAGE_DAYS).contains(&d) => d,
-            _ => return format!("(Give a number of days from 1 to {MAX_USAGE_DAYS}.)"),
+            _ => {
+                return language.pick(
+                    format!("(Give a number of days from 1 to {MAX_USAGE_DAYS}.)"),
+                    format!("（请给出 1 到 {MAX_USAGE_DAYS} 之间的天数。）"),
+                );
+            }
         }
     };
     let since = (chrono::Utc::now() - chrono::Duration::days(i64::from(days)))
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string();
     match havn_db::repo::credential_usage::agent_usage(&state.db, agent_id, &since).await {
-        Ok(rows) if rows.is_empty() => format!("The agent used no tokens in the last {days} days."),
+        Ok(rows) if rows.is_empty() => language.pick(
+            format!("The agent used no tokens in the last {days} days."),
+            format!("agent 最近 {days} 天没有用掉 token。"),
+        ),
         Ok(rows) => {
             let (calls, input, output) = rows.iter().fold((0, 0, 0), |(c, i, o), r| {
                 (c + r.calls, i + r.tokens_in, o + r.tokens_out)
             });
-            let mut out = format!(
+            let mut out = language.pick(format!(
                 "The agent's use in the last {days} days: {calls} model calls, {input} tokens in, \
                  {output} tokens out."
-            );
+            ), format!(
+                "agent 最近 {days} 天的用量：调用模型 {calls} 次，输入 {input} 个 token，输出 {output} 个 token。"
+            ));
             for r in &rows {
                 out.push_str(&format!(
                     "\n{}: {} calls, {} in, {} out",
@@ -629,7 +737,12 @@ async fn usage(state: &AppState, agent_id: AgentId, args: &str) -> String {
         }
         Err(e) => {
             warn!(%agent_id, error = %e, "could not read the agent's usage");
-            "(The usage could not be read right now.)".into()
+            language
+                .pick(
+                    "(The usage could not be read right now.)",
+                    "（现在读不到用量。）",
+                )
+                .into()
         }
     }
 }
@@ -653,13 +766,19 @@ fn decision_args(approve: bool, args: &str) -> Option<(bool, Option<&str>)> {
 }
 
 async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> String {
+    let language = asker.language;
     let Some((remember, id)) = decision_args(approve, args) else {
         return if approve {
-            "(Send /approve, or /approve always to allow the same step for the rest of the \
-             chat.)"
+            language.pick("(Send /approve, or /approve always to allow the same step for the rest of the \
+             chat.)", "（发 /approve，或者发 /approve always，在这个对话剩下的时间里都允许同样的步骤。）")
                 .into()
         } else {
-            "(Send /deny, or /deny with the id of the step.)".into()
+            language
+                .pick(
+                    "(Send /deny, or /deny with the id of the step.)",
+                    "（发 /deny，或者 /deny 加步骤的 id。）",
+                )
+                .into()
         };
     };
     let waiting = match id {
@@ -672,9 +791,19 @@ async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> S
     };
     let Some(request) = waiting else {
         return if id.is_some() {
-            "(That step was already decided, or it ended.)".into()
+            language
+                .pick(
+                    "(That step was already decided, or it ended.)",
+                    "（那个步骤已经有了决定，或者已经结束。）",
+                )
+                .into()
         } else {
-            "(Nothing here is waiting for approval.)".into()
+            language
+                .pick(
+                    "(Nothing here is waiting for approval.)",
+                    "（这里没有等待批准的步骤。）",
+                )
+                .into()
         };
     };
     let decided = crate::agent_socket::forward_decision(
@@ -689,21 +818,57 @@ async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> S
     )
     .await;
     if !decided {
-        return "(That step was decided or ended meanwhile; nothing changed.)".into();
+        return language
+            .pick(
+                "(That step was decided or ended meanwhile; nothing changed.)",
+                "（那个步骤在这期间已经有了决定或已经结束，什么都没改。）",
+            )
+            .into();
     }
     match (approve, remember) {
-        (true, true) => format!(
-            "(Approved {}, and the same step for the rest of the chat.)",
-            request.tool
+        (true, true) => language.pick(
+            format!(
+                "(Approved {}, and the same step for the rest of the chat.)",
+                request.tool
+            ),
+            format!(
+                "（已批准 {}，在这个对话剩下的时间里同样的步骤也会被允许。）",
+                request.tool
+            ),
         ),
-        (true, false) => format!("(Approved {}.)", request.tool),
-        (false, _) => format!("(Refused {}.)", request.tool),
+        (true, false) => language.pick(
+            format!("(Approved {}.)", request.tool),
+            format!("（已批准 {}。）", request.tool),
+        ),
+        (false, _) => language.pick(
+            format!("(Refused {}.)", request.tool),
+            format!("（已拒绝 {}。）", request.tool),
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_in_chinese_answers_commands_in_chinese() {
+        let zh = havn_core::Language::Chinese;
+        let help = help(false, zh);
+        assert!(help.starts_with("命令："), "{help}");
+        assert!(help.contains("/new - 开始一个新对话，旧的保留（也可以用 /reset, /clear）"));
+        assert!(help.contains("[仅限管理员]"));
+        assert!(!help.contains("Start a new chat"));
+        assert!(
+            COMMANDS.iter().all(|c| !c.about_zh.is_empty()),
+            "every command has one"
+        );
+        let unknown = parse("/nope")
+            .expect("a command")
+            .refusal(zh)
+            .expect("refused");
+        assert_eq!(unknown, "（没有 /nope 这个命令。发 /help 查看命令列表。）");
+    }
 
     #[test]
     fn approve_and_deny_take_an_id() {
@@ -782,10 +947,15 @@ mod tests {
         let misused = parse("/stop now please").expect("a command");
         assert!(matches!(misused, Parsed::Misused(c) if c.name == "stop"));
         assert_eq!(
-            misused.refusal().as_deref(),
+            misused.refusal(havn_core::Language::English).as_deref(),
             Some("(/stop takes nothing after it: send /stop on its own.)")
         );
-        assert!(parse("/model 2").expect("a command").refusal().is_none());
+        assert!(
+            parse("/model 2")
+                .expect("a command")
+                .refusal(havn_core::Language::English)
+                .is_none()
+        );
         // Telegram's first message reaches the agent.
         assert!(parse("/start").is_none());
         assert!(parse("/start ref-42").is_none());
@@ -852,8 +1022,8 @@ mod tests {
 
     #[test]
     fn help_marks_what_the_sender_may_not_use() {
-        assert!(help(false).contains("/model [name | number | default] - Show the models, or switch this chat's [admins only]"));
-        assert!(!help(true).contains("[admins only]"));
-        assert!(help(true).contains("(also /reset, /clear)"));
+        assert!(help(false, havn_core::Language::English).contains("/model [name | number | default] - Show the models, or switch this chat's [admins only]"));
+        assert!(!help(true, havn_core::Language::English).contains("[admins only]"));
+        assert!(help(true, havn_core::Language::English).contains("(also /reset, /clear)"));
     }
 }

@@ -647,13 +647,14 @@ async fn handle_connection(
     //    unavailable, ship `Policy::default()` rather than refuse the
     //    connection. Refusing here would just orphan the runtime; the
     //    spawner would retry into the same dead end.
-    let (policy, model, max_tokens, agent_name, gateway_tools, models): (
+    let (policy, model, max_tokens, agent_name, gateway_tools, models, language): (
         Policy,
         Option<String>,
         Option<u32>,
         Option<String>,
         Vec<GatewayToolSpec>,
         Vec<havn_proto::ModelChoice>,
+        havn_core::Language,
     ) = match agents_repo::find_by_id(&ctx.db, agent_id).await {
         Ok(Some(agent)) => {
             let model = agent
@@ -677,15 +678,40 @@ async fn handle_connection(
             policy.chat_titles.model = title_model(&policy, &ctx.models.load());
             let gateway_tools = gateway_tools_for(&ctx, &agent, &policy).await;
             let models = model_choices(&policy, &ctx.models.load());
-            (policy, model, max_tokens, name, gateway_tools, models)
+            let language = havn_core::Language::of_config(&agent.config);
+            (
+                policy,
+                model,
+                max_tokens,
+                name,
+                gateway_tools,
+                models,
+                language,
+            )
         }
         Ok(None) => {
             warn!(%agent_id, "agent not found at handshake; sending default policy");
-            (Policy::default(), None, None, None, Vec::new(), Vec::new())
+            (
+                Policy::default(),
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                havn_core::Language::English,
+            )
         }
         Err(e) => {
             warn!(%agent_id, error = %e, "policy lookup failed; sending default policy");
-            (Policy::default(), None, None, None, Vec::new(), Vec::new())
+            (
+                Policy::default(),
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                havn_core::Language::English,
+            )
         }
     };
 
@@ -721,6 +747,7 @@ async fn handle_connection(
         gateway_tools,
         timezone: Some(crate::timezone::for_agent(&ctx.db, agent_id).await),
         models,
+        language,
     };
     let write_welcome = write_frame(&mut write, &welcome);
     let sent = match tokio::time::timeout(AGENT_WRITE_TIMEOUT, write_welcome).await {
@@ -1275,9 +1302,12 @@ async fn ask_for_approval(
             .unwrap_or_default();
         // The agent's owner with a chat account of this channel connected
         // is an admin there too (issue #182).
-        let owner = match havn_db::repo::agents::find_by_id(&ctx.db, agent_id).await {
-            Ok(Some(agent)) => Some(agent.owner_id),
-            _ => None,
+        let (owner, language) = match havn_db::repo::agents::find_by_id(&ctx.db, agent_id).await {
+            Ok(Some(agent)) => (
+                Some(agent.owner_id),
+                havn_core::Language::of_config(&agent.config),
+            ),
+            _ => (None, havn_core::Language::English),
         };
         let owner_linked = match owner {
             Some(owner) => havn_db::repo::channel_access::list_links(&ctx.db, Some(owner))
@@ -1306,15 +1336,26 @@ async fn ask_for_approval(
             conversation: None,
             channel_id: request.channel_id,
             content: havn_core::MessageContent::Text {
-                text: format!(
-                    "(A step of this reply waits for approval: {}. {}the agent's owner can \
-                     decide in the web chat.)",
-                    request.tool,
-                    if admins {
-                        "An admin can send /approve or /deny here, or "
-                    } else {
-                        ""
-                    }
+                text: language.pick(
+                    format!(
+                        "(A step of this reply waits for approval: {}. {}the agent's owner can \
+                         decide in the web chat.)",
+                        request.tool,
+                        if admins {
+                            "An admin can send /approve or /deny here, or "
+                        } else {
+                            ""
+                        }
+                    ),
+                    format!(
+                        "（这条回复的一个步骤在等待批准：{}。{}agent 的所有者可以在网页聊天里决定。）",
+                        request.tool,
+                        if admins {
+                            "管理员可以在这里发 /approve 或 /deny，"
+                        } else {
+                            ""
+                        }
+                    ),
                 ),
             },
             reply_to: None,
