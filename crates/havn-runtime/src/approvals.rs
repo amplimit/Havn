@@ -4,6 +4,11 @@
 //! their [`ApprovalDecision`] lets the call run or refuses it. With no one
 //! to ask (a scheduled run, a heartbeat, another agent's query), an input
 //! too long to show, or no answer in time, the call is refused.
+//!
+//! In a conversation that is not the owner's (issue #255), a tool that
+//! runs or changes things waits for the owner before it runs, and one
+//! that reads waits after, with all of what the model would get: see
+//! [`Review`] and [`guarded`].
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -12,6 +17,8 @@ use std::time::Duration;
 use havn_proto::{AgentToGateway, ApprovalDecision, ApprovalRequest};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
+
+use crate::tools::ToolResult;
 
 /// How long a call waits for approval before it is refused.
 pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -27,19 +34,273 @@ struct Waiting {
     chat: String,
     tool: String,
     input: String,
+    /// Its "always" is kept by the one that asked, not for the chat.
+    kept: bool,
     reply: oneshot::Sender<ApprovalDecision>,
 }
 
-/// The owner's answer to what memory found for someone else (issue #249).
+/// The owner's answer about a call in someone else's conversation (issue
+/// #255).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemoryAnswer {
-    /// Always allow memory search in that conversation.
+pub struct Answer {
+    /// Always allow it in that conversation.
     pub always: bool,
     /// What the owner added, such as what not to say.
     pub note: Option<String>,
 }
 
-/// The agent's approvals, for a tool that asks itself (memory_search).
+/// When the owner looks at a call in a conversation that is not theirs
+/// (issue #255).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Review {
+    /// Before it runs, at its whole input: it runs or changes something.
+    Call,
+    /// After it ran, at all of what the model would get: it reads.
+    Result,
+}
+
+impl Review {
+    /// How the owner looks at `tool` in someone else's conversation;
+    /// `None` for a tool that needs no look (memory changes are the
+    /// owner's only already).
+    #[must_use]
+    pub fn of(tool: &str) -> Option<Self> {
+        match tool {
+            "memory_search" | "file_read" | "file_find" | "file_search" => Some(Self::Result),
+            "shell" | "process" | "file_write" | "file_edit" | "skill_manage" | "send_file" => {
+                Some(Self::Call)
+            }
+            _ if tool.starts_with("mcp__") => Some(Self::Call),
+            _ => None,
+        }
+    }
+
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Call => "call",
+            Self::Result => "result",
+        }
+    }
+}
+
+/// What the owner refused in one turn (issue #255), and its questions,
+/// one at a time (calls side by side, subagents).
+#[derive(Debug, Default)]
+pub struct Refused {
+    tools: Mutex<HashSet<String>>,
+    asking: tokio::sync::Mutex<()>,
+}
+
+impl Refused {
+    fn lock_tools(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// `run`, `tool` called with `input` in a turn that is not the owner's
+/// (issue #255): once the owner, shown who asked and what they wrote,
+/// allows it, before it runs for a [`Review::Call`] and after it ran, at
+/// all of what the model gets, for a [`Review::Result`]; or when they
+/// always allow it in that conversation, unless `must_ask` (a rule asks
+/// about every such call). The model gets the owner's note with it.
+pub async fn guarded(
+    approvals: Option<&Approvals>,
+    db: &sqlx::SqlitePool,
+    review: Review,
+    tool: &str,
+    input: &serde_json::Value,
+    must_ask: bool,
+    run: impl std::future::Future<Output = ToolResult>,
+) -> ToolResult {
+    let lang = crate::lang();
+    let Ok(scope) = crate::tools::gateway::CONVERSATION.try_with(Clone::clone) else {
+        return ToolResult::Error(lang.pick(
+            format!(
+                "{tool} was not run: in a conversation that is not your owner's it needs their \
+                 approval, and no one can be asked here (another agent's question, or a task \
+                 someone else scheduled)"
+            ),
+            format!(
+                "{tool} 没有运行：在不是所有者的对话里，它需要所有者批准，而这里没有人能问（另一个 \
+                 agent 的询问，或者别人建的定时任务）"
+            ),
+        ));
+    };
+    let chat = crate::tools::gateway::CHAT.try_with(Clone::clone).ok();
+    let whole = input.to_string();
+    // "Always" holds for a tool's results, but for one exact call of a
+    // tool that runs things: else anyone there could run anything.
+    let key = match review {
+        Review::Call => whole.as_str(),
+        Review::Result => "",
+    };
+    let refused = crate::tools::gateway::REFUSED
+        .try_with(std::sync::Arc::clone)
+        .ok();
+    let asking = match &refused {
+        Some(r) => Some(r.asking.lock().await),
+        None => None,
+    };
+    if refused
+        .as_ref()
+        .is_some_and(|r| r.lock_tools().contains(tool))
+    {
+        return refusal(
+            review,
+            tool,
+            lang.pick("they did not allow it", "所有者没有允许"),
+        );
+    }
+    let allowed = if must_ask {
+        None
+    } else {
+        match havn_db::agent::conversations::access_of(db, &scope, tool, key).await {
+            Ok(rule) => rule,
+            Err(e) => return ToolResult::Error(format!("{tool} was not run: {e}")),
+        }
+    };
+    if let Some(rule) = allowed {
+        drop(asking);
+        return with_rule(run.await, Some(&rule));
+    }
+    let Some(approvals) = approvals else {
+        return ToolResult::Error(format!("{tool} was not run: no one can be asked"));
+    };
+    let (from, said) = crate::tools::gateway::ASKED
+        .try_with(Clone::clone)
+        .unwrap_or_default();
+    let shown = |found: Option<&str>| {
+        let mut shown =
+            serde_json::json!({ "from": from, "said": said, "tool": tool, "input": input });
+        if let Some(found) = found {
+            shown["found"] = found.into();
+        }
+        shown.to_string()
+    };
+    let refuse = |why: &str| {
+        if let Some(refused) = &refused {
+            refused.lock_tools().insert(tool.to_string());
+        }
+        refusal(review, tool, why)
+    };
+    match review {
+        Review::Call => {
+            let answer = approvals
+                .ask_for(&scope, chat.as_deref(), review, tool, &shown(None))
+                .await;
+            drop(asking);
+            match answer {
+                Ok(answer) => {
+                    keep(db, &scope, tool, key, &answer).await;
+                    with_rule(run.await, answer.note.as_deref())
+                }
+                Err(why) => refuse(&why),
+            }
+        }
+        Review::Result => {
+            let found = match run.await {
+                ToolResult::Ok(found) => found,
+                failed @ ToolResult::Error(_) => return failed,
+            };
+            // What the owner sees is what the model gets: what does not
+            // fit is left out of both, and both are told.
+            let total = found.chars().count();
+            let left_out = lang.pick(
+                "\n(The rest was left out: too long to show.)",
+                "\n（其余部分太长，没有显示。）",
+            );
+            let room = MAX_SHOWN_INPUT.saturating_sub(shown(Some("")).chars().count());
+            let mut part: String = found.chars().take(room).collect();
+            let cut = |part: &str| {
+                if part.chars().count() < total {
+                    format!("{part}{left_out}")
+                } else {
+                    part.to_string()
+                }
+            };
+            while shown(Some(&cut(&part))).chars().count() > MAX_SHOWN_INPUT && !part.is_empty() {
+                part.pop();
+            }
+            let given = cut(&part);
+            match approvals
+                .ask_for(&scope, chat.as_deref(), review, tool, &shown(Some(&given)))
+                .await
+            {
+                Ok(answer) => {
+                    keep(db, &scope, tool, key, &answer).await;
+                    with_rule(ToolResult::Ok(given), answer.note.as_deref())
+                }
+                Err(why) => refuse(&why),
+            }
+        }
+    }
+}
+
+/// Keep what the owner always allows from now on.
+async fn keep(db: &sqlx::SqlitePool, scope: &str, tool: &str, key: &str, answer: &Answer) {
+    if answer.always
+        && let Err(e) = havn_db::agent::conversations::allow(
+            db,
+            scope,
+            tool,
+            key,
+            answer.note.as_deref().unwrap_or(""),
+        )
+        .await
+    {
+        tracing::warn!(tool, error = %e, "could not keep what the owner always allows");
+    }
+}
+
+/// What the model is told when the owner does not allow `tool`.
+fn refusal(review: Review, tool: &str, why: &str) -> ToolResult {
+    let lang = crate::lang();
+    ToolResult::Error(match review {
+        Review::Call => lang.pick(
+            format!(
+                "{tool} was not run: your owner was asked whether it may run here, and {why}. Do \
+                 not call {tool} again in this reply. This is for this reply only: for a later \
+                 message that needs it, call it again, and your owner is asked again"
+            ),
+            format!(
+                "{tool} 没有运行：你问了所有者它能不能在这里运行，结果是：{why}。这次回复里不要再调用 \
+                 {tool}。这只对这次回复有效：之后的消息如果需要，就再调用，会再问所有者"
+            ),
+        ),
+        Review::Result => lang.pick(
+            format!(
+                "your owner was asked whether you may use what {tool} gave here, and {why}: \
+                 answer this message without it, do not call {tool} again in this reply, and do \
+                 not say what it gave. This is for this reply only: for a later message that \
+                 needs it, call it again, and your owner is asked again"
+            ),
+            format!(
+                "你问了所有者能不能在这里使用 {tool} 给出的内容，结果是：{why}。这条消息不用它来回答，\
+                 这次回复里不要再调用 {tool}，也不要透露它给出了什么。这只对这次回复有效：之后的消息\
+                 如果需要，就再调用，会再问所有者"
+            ),
+        ),
+    })
+}
+
+/// `result`, with the owner's rule for what not to say, when there is one.
+fn with_rule(result: ToolResult, rule: Option<&str>) -> ToolResult {
+    let Some(rule) = rule.map(str::trim).filter(|r| !r.is_empty()) else {
+        return result;
+    };
+    let rule = crate::lang().pick(
+        format!("\nYour owner allowed this here, with this rule for what not to say: {rule}\n"),
+        format!("\n所有者允许了这一步，规定了不能说什么：{rule}\n"),
+    );
+    match result {
+        ToolResult::Ok(text) => ToolResult::Ok(format!("{text}{rule}")),
+        ToolResult::Error(text) => ToolResult::Error(format!("{text}{rule}")),
+    }
+}
+
+/// The agent's approvals, for a call asked about outside the registry.
 static GLOBAL: std::sync::OnceLock<std::sync::Arc<Approvals>> = std::sync::OnceLock::new();
 
 /// Make `approvals` the agent's, for [`global`].
@@ -109,19 +370,26 @@ impl Approvals {
         }
     }
 
-    /// Wait for the owner to let the model see what memory_search found
-    /// (`input`: who asked, what, and the results) in `conversation`
-    /// (issue #249). `Err` says why it may not.
-    pub async fn ask_memory(
+    /// Wait for the owner to allow `tool` in `conversation`, not theirs,
+    /// as `review` says (issue #255); `input` is what they are shown: who
+    /// asked, what, the call and, after it, what it gave. `Err` says why
+    /// it may not.
+    pub async fn ask_for(
         &self,
         conversation: &str,
         chat: Option<&str>,
+        review: Review,
+        tool: &str,
         input: &str,
-    ) -> Result<MemoryAnswer, String> {
+    ) -> Result<Answer, String> {
+        let lang = crate::lang();
         if input.chars().count() > MAX_SHOWN_INPUT {
-            return Err(format!(
-                "what it found is longer than the {MAX_SHOWN_INPUT} characters that can be \
-                 shown to the owner"
+            return Err(lang.pick(
+                format!(
+                    "it was not asked: it is longer than the {MAX_SHOWN_INPUT} characters that \
+                     can be shown to the owner"
+                ),
+                format!("没有问：内容超过了能给所有者看的 {MAX_SHOWN_INPUT} 个字符"),
             ));
         }
         let chat = chat.unwrap_or(conversation);
@@ -129,16 +397,16 @@ impl Approvals {
             .wait(
                 conversation,
                 chat,
-                "memory_search",
+                tool,
                 input,
-                "memory",
-                "memory",
+                review.kind(),
+                review.kind(),
             )
             .await?;
         if !decision.approve {
-            return Err("the owner did not allow it".into());
+            return Err(lang.pick("they did not allow it", "所有者没有允许").into());
         }
-        Ok(MemoryAnswer {
+        Ok(Answer {
             always: decision.remember,
             note: decision
                 .note
@@ -167,6 +435,7 @@ impl Approvals {
                 chat: chat.to_string(),
                 tool: tool.to_string(),
                 input: input.to_string(),
+                kept: !kind.is_empty(),
                 reply: tx,
             },
         ));
@@ -209,8 +478,8 @@ impl Approvals {
         let Some(waiting) = found else {
             return false;
         };
-        // Memory's "always" is kept by its tool, for the conversation.
-        if decision.approve && decision.remember && waiting.tool != "memory_search" {
+        // A call in someone else's conversation keeps its own "always".
+        if decision.approve && decision.remember && !waiting.kept {
             self.lock_remembered()
                 .insert((waiting.chat, waiting.tool, waiting.input));
         }
@@ -278,17 +547,26 @@ mod tests {
         let approvals = Arc::new(Approvals::new(tx));
         let ask = |a: &Arc<Approvals>| {
             let a = Arc::clone(a);
-            tokio::spawn(async move { a.ask_memory("tg:1", None, r#"{"found":"x"}"#).await })
+            tokio::spawn(async move {
+                a.ask_for(
+                    "tg:1",
+                    None,
+                    Review::Result,
+                    "memory_search",
+                    r#"{"found":"x"}"#,
+                )
+                .await
+            })
         };
         let call = ask(&approvals);
         let request = next_request(&mut rx).await;
-        assert_eq!(request.kind, "memory");
+        assert_eq!(request.kind, "result");
         let mut used = decision("tg:1", &request.request_id, true, true);
         used.note = Some("  not my address  ".into());
         assert!(approvals.decide(&used));
         assert_eq!(
             call.await.unwrap(),
-            Ok(MemoryAnswer {
+            Ok(Answer {
                 always: true,
                 note: Some("not my address".into())
             })
@@ -300,7 +578,13 @@ mod tests {
         assert!(call.await.unwrap().is_err());
         assert!(
             approvals
-                .ask_memory("tg:1", None, &"x".repeat(MAX_SHOWN_INPUT + 1))
+                .ask_for(
+                    "tg:1",
+                    None,
+                    Review::Call,
+                    "shell",
+                    &"x".repeat(MAX_SHOWN_INPUT + 1)
+                )
                 .await
                 .is_err()
         );
@@ -407,5 +691,154 @@ mod tests {
             matches!(rx.try_recv(), Ok(AgentToGateway::ApprovalClosed { .. })),
             "the gateway is told the request ended"
         );
+    }
+
+    /// `tool` called with `input` in conversation `tg:1`, not the owner's,
+    /// in a turn of `refused`; giving `output` when it runs, counted in
+    /// `ran`.
+    #[allow(clippy::too_many_arguments)]
+    async fn in_turn(
+        approvals: Arc<Approvals>,
+        db: sqlx::SqlitePool,
+        refused: Arc<Refused>,
+        review: Review,
+        tool: &'static str,
+        input: serde_json::Value,
+        output: String,
+        ran: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> ToolResult {
+        crate::tools::gateway::CONVERSATION
+            .scope(
+                "tg:1".into(),
+                crate::tools::gateway::REFUSED.scope(
+                    refused,
+                    guarded(
+                        Some(&approvals),
+                        &db,
+                        review,
+                        tool,
+                        &input,
+                        false,
+                        async move {
+                            ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            ToolResult::Ok(output)
+                        },
+                    ),
+                ),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn someone_else_s_call_waits_for_the_owner_before_it_runs() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let approvals = Arc::new(Approvals::new(tx));
+        let db = havn_db::agent::connect_in_memory().await.expect("db");
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = || ran.load(std::sync::atomic::Ordering::SeqCst);
+        let shell = |refused: &Arc<Refused>, command: &str| {
+            tokio::spawn(in_turn(
+                Arc::clone(&approvals),
+                db.clone(),
+                Arc::clone(refused),
+                Review::Call,
+                "shell",
+                serde_json::json!({ "command": command }),
+                "done".into(),
+                Arc::clone(&ran),
+            ))
+        };
+        let turn = Arc::new(Refused::default());
+        let call = shell(&turn, "ls");
+        let request = next_request(&mut rx).await;
+        assert_eq!(request.kind, "call");
+        assert_eq!(request.tool, "shell");
+        let shown: serde_json::Value = serde_json::from_str(&request.input).expect("json");
+        assert_eq!(shown["input"]["command"], "ls");
+        assert_eq!(count(), 0, "nothing runs before the owner answers");
+        assert!(approvals.decide(&decision("tg:1", &request.request_id, true, true)));
+        assert_eq!(call.await.expect("join").text(), "done");
+        assert_eq!(count(), 1);
+
+        // Always allowed: that exact call, and no other.
+        let again = shell(&turn, "ls").await.expect("join");
+        assert_eq!(again.text(), "done");
+        assert_eq!(count(), 2);
+        assert!(rx.try_recv().is_err(), "the owner is not asked again");
+        let other = shell(&turn, "rm -rf notes");
+        let request = next_request(&mut rx).await;
+        assert!(approvals.decide(&decision("tg:1", &request.request_id, false, false)));
+        assert!(other.await.expect("join").is_error());
+        assert_eq!(count(), 2);
+
+        // Refused once, the tool is refused for the rest of the turn.
+        let next = shell(&turn, "pwd").await.expect("join");
+        assert!(next.is_error());
+        assert!(rx.try_recv().is_err(), "without asking");
+        assert_eq!(count(), 2);
+
+        // With no one to ask, nothing runs.
+        let alone = guarded(
+            Some(&approvals),
+            &db,
+            Review::Call,
+            "shell",
+            &serde_json::json!({ "command": "ls" }),
+            false,
+            async { ToolResult::Ok("ran".into()) },
+        )
+        .await;
+        assert!(alone.is_error());
+    }
+
+    #[tokio::test]
+    async fn what_a_reading_tool_gave_someone_else_waits_for_the_owner() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let approvals = Arc::new(Approvals::new(tx));
+        let db = havn_db::agent::connect_in_memory().await.expect("db");
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let search = |output: String| {
+            tokio::spawn(in_turn(
+                Arc::clone(&approvals),
+                db.clone(),
+                Arc::new(Refused::default()),
+                Review::Result,
+                "memory_search",
+                serde_json::json!({ "query": "address" }),
+                output,
+                Arc::clone(&ran),
+            ))
+        };
+        let call = search("Mira, 12 Rose Street".into());
+        let request = next_request(&mut rx).await;
+        assert_eq!(request.kind, "result");
+        let shown: serde_json::Value = serde_json::from_str(&request.input).expect("json");
+        assert_eq!(shown["found"], "Mira, 12 Rose Street");
+        assert_eq!(shown["input"]["query"], "address");
+        assert!(approvals.decide(&ApprovalDecision {
+            note: Some("not the street".into()),
+            ..decision("tg:1", &request.request_id, true, false)
+        }));
+        let given = call.await.expect("join");
+        assert!(given.text().starts_with("Mira, 12 Rose Street"));
+        assert!(
+            given.text().contains("not the street"),
+            "with the owner's note"
+        );
+
+        // Too long to show: the owner and the model get the same part.
+        let call = search("x".repeat(10_000));
+        let request = next_request(&mut rx).await;
+        assert!(request.input.chars().count() <= MAX_SHOWN_INPUT);
+        let shown: serde_json::Value = serde_json::from_str(&request.input).expect("json");
+        let found = shown["found"].as_str().expect("found").to_string();
+        assert!(found.ends_with("(The rest was left out: too long to show.)"));
+        assert!(approvals.decide(&decision("tg:1", &request.request_id, true, true)));
+        assert_eq!(call.await.expect("join").text(), found);
+
+        // Always allowed there: given without asking.
+        let later = search("Mira".into()).await.expect("join");
+        assert_eq!(later.text(), "Mira");
+        assert!(rx.try_recv().is_err());
     }
 }

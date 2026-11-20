@@ -651,15 +651,22 @@ In the dashboard chat, a message can be edited and a reply regenerated. Either s
 
 A model names each new chat from its first message, while the agent answers it (in a channel too); until then, and if that fails, the chat is named after the start of its first message, and a chat renamed by hand keeps its name. The model that writes titles is `[llm] title_model` in config.toml, set on the dashboard's models page or with `havn model title <provider:model>` (a small, cheap model does well); without one, each agent's own model writes them. A role's policy can name another (`"chat_titles": {"model": "..."}`) or turn titles off (`"chat_titles": {"enabled": false}`; in multi-user mode an agent cannot turn them back on, and a user with several roles has them when any of the roles does), and an agent's settings page turns them off for that agent. A message of files alone keeps their names as its chat's title. Changes apply on the agent's next start; a title model removed meanwhile gives way to the agent's own model.
 
-### Memory in other people's conversations
+### Tools in other people's conversations
 
-The agent's memory is its owner's. In a conversation with someone else (a person the owner admitted to a chat-app account, anyone on an `open` account), recent events are not put in the prompt, and `memory_search` searches but does not give the model what it found until the owner decides. The person is told the agent checks with its owner. The owner sees who asked, what they wrote, the query and everything found (exactly what the model would get; past 4000 characters in all, the rest is left out of both) in the web chat and, when they linked an account of that chat app, in their own chat with the same bot, and answers there:
+The agent's memory, workspace and machine are its owner's. In a conversation with someone else (a person the owner admitted to a chat-app account, anyone on an `open` account), recent events are not put in the prompt, and the tools that reach them wait for the owner:
 
-- **use**: the model gets it for that reply; what was found is not kept in the reply's steps, so later turns there do not have it;
-- **always allow in this conversation**: it gets it, and later searches there do not ask;
-- **deny**, or no answer in 10 minutes: the model is told to answer without memory and not to say what it holds, and its further searches in that reply are refused without asking again.
+| Tools | The owner is asked |
+|---|---|
+| `shell`, `process`, `file_write`, `file_edit`, `skill_manage`, `send_file`, MCP tools | **before** the call runs, shown its whole input |
+| `memory_search`, `file_read`, `file_find`, `file_search` | **after** it ran, shown everything it gave (exactly what the model would get; past 4000 characters in all, the rest is left out of both, and both are told) |
 
-With use or always allow the owner can add what not to say (in the web chat's box, or `/approve <id> not my address` in their chat); with always allow it stays as the conversation's rule, given to the model in every later turn there. The agent's settings page ("memory in other people's conversations") lists the allowed conversations with their rules, to edit or revoke. Only the owner decides, never someone in the conversation the memory is for; one question waits per conversation at a time, and a reply's searches ask one after another. The audit log records that it was asked and decided, not what was found or the note. Scheduled tasks made in someone else's conversation, and other agents' questions, have no one to ask and get no memory; the owner's turns, heartbeats and the owner's tasks search it as before.
+The person is told the agent checks with its owner. The owner sees who asked, what they wrote and the call in the web chat and, when they linked an account of that chat app, in their own chat with the same bot, and answers there:
+
+- **allow once** / **use**: the call runs, or the model gets what it gave, this once; what a reading tool gave is not kept in the reply's steps, so later turns there do not have it;
+- **always allow there**: for a reading tool, it answers in that conversation from now on without asking; for one that runs or changes things, only that exact call does (always allowing `shell` in a group would let anyone there run anything);
+- **deny**, or no answer in 10 minutes: the model is told it was not allowed and not to say what it would have given, and further calls of that tool in that reply are refused without asking again.
+
+The owner can add what not to say (in the web chat's box, or `/approve <id> not my address` in their chat), which the model gets with the result; with always allow it stays as the rule, given to the model in every later turn there. The agent's settings page ("tools in other people's conversations") lists what is always allowed with its rules, to edit or revoke. Only the owner decides, never someone in the conversation it is for; one question waits per conversation at a time, and a reply's calls ask one after another. A rule's `ask` (see "Policy") still asks about every such call, always allowed or not. The audit log records that it was asked and decided, not the call, what it gave or the note. Scheduled tasks made in someone else's conversation, and other agents' questions, have no one to ask, and these tools are refused there; the owner's turns, heartbeats and the owner's tasks use them as before.
 
 ### Language
 
@@ -669,7 +676,7 @@ An agent's settings page sets the language of what Havn writes for it: English (
 
 An agent can hand a task to a subagent (`subagent_spawn`): it runs as the same agent, and subagents asked for in one reply run at once. For each, the agent picks a model among those its policy allows (`allowed_models`), how much it thinks (as `/think` takes it, within what that model takes; by default the chat's choice on the chat's model, else the model's own), and whether it sees the conversation so far (`context: fork`, its last 10 messages, the default) or starts with nothing but the task (`isolated`). A subagent shows in the steps of the reply that started it, with the model and thinking it ran with and its own steps, not as a chat of its own. Subagents get the agent's tools except `subagent_spawn`, `agent_query`, `set_timezone` and `schedule` (and those `context_toolsets.subagent.disabled` names), and up to `tool_rounds.subagent` rounds each; at most 8 run at once in an agent. A subagent whose model is unavailable falls back on its own, without the reply's model.
 
-An agent can also put a question to another agent of its owner's (`agent_query`), which answers with its own tools; its memory search answers no one else's question (see "Memory in other people's conversations").
+An agent can also put a question to another agent of its owner's (`agent_query`), which answers with its own tools, except those that wait for the owner in someone else's conversation (see "Tools in other people's conversations").
 
 Both are in the agent's settings page ("working with other agents"), as the policy's `permissions.can_spawn_subagents` and `permissions.can_query_other_agents`. On a single-user gateway, subagents are on unless an agent's policy turns them off, and asking other agents is off. In multi-user mode both follow the owner's role, and an agent cannot turn on one its owner's role has off. Turning either on applies on the agent's next start; asking other agents stops at once when turned off.
 

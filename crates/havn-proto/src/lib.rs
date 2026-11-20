@@ -242,9 +242,10 @@ pub struct ApprovalRequest {
     pub input: String,
     /// Which rule asked.
     pub reason: String,
-    /// `memory` for what memory_search found in a conversation that is
-    /// not the owner's (issue #249): the owner sees it before the model
-    /// does. Empty for a tool call.
+    /// For a call in a conversation that is not the owner's (issue #255):
+    /// `call` for one asked about before it runs, `result` for what one
+    /// gave, which the owner sees before the model does. Empty for a call
+    /// a rule asks about.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
 }
@@ -257,11 +258,11 @@ pub struct ApprovalDecision {
     pub request_id: String,
     pub approve: bool,
     /// Approve the same tool and input for the rest of the conversation;
-    /// for memory, always in that conversation.
+    /// for a `call` or `result`, always in that conversation.
     #[serde(default)]
     pub remember: bool,
-    /// What the owner adds to an approval of memory (issue #249), such as
-    /// what not to say.
+    /// What the owner adds to an approval of a `call` or `result` (issues
+    /// #249 and #255), such as what not to say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -625,14 +626,19 @@ pub enum DataQuery {
         #[serde(default)]
         after: Option<String>,
     },
-    /// The conversations where memory search is always allowed for
-    /// someone other than the owner (issue #249): `{"allowed": [{"scope",
-    /// "rule", "allowed_at"}]}`.
-    MemoryAccess,
-    /// Always allow memory search in conversation `scope`, with `rule`
-    /// for what not to say there; `None` takes the permission back:
-    /// `{"found": bool}`.
-    SetMemoryAccess { scope: String, rule: Option<String> },
+    /// What the owner always allows in conversations not theirs (issue
+    /// #255): `{"allowed": [{"scope", "tool", "input", "rule",
+    /// "allowed_at"}]}`.
+    Access,
+    /// Change the `rule` of what is always allowed for `tool` with `input`
+    /// in conversation `scope`; `None` takes it back: `{"found": bool}`.
+    SetAccess {
+        scope: String,
+        tool: String,
+        #[serde(default)]
+        input: String,
+        rule: Option<String>,
+    },
 }
 
 /// Longest memory key the dashboard can save.

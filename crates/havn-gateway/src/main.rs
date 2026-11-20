@@ -757,8 +757,8 @@ async fn serve() -> anyhow::Result<()> {
             get(api::agents::capabilities_get).put(api::agents::capabilities_put),
         )
         .route(
-            "/agents/{id}/memory-access",
-            get(api::agents::memory_access_get).put(api::agents::memory_access_put),
+            "/agents/{id}/access",
+            get(api::agents::access_get).put(api::agents::access_put),
         )
         .route(
             "/agents/{id}/files",

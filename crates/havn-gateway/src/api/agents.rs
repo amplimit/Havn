@@ -1053,11 +1053,15 @@ pub async fn capabilities_put(
     Ok(Json(capabilities_view(&state, &updated).await))
 }
 
-/// A conversation, not the owner's, where memory search is always allowed
-/// (issue #249), with the owner's rule for what not to say there.
+/// What the owner always allows in a conversation not theirs (issue
+/// #255): a tool's results (`input` empty) or one exact call, with their
+/// rule for what not to say there.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MemoryAccess {
+pub struct Access {
     pub scope: String,
+    pub tool: String,
+    #[serde(default)]
+    pub input: String,
     /// The channel, account and sender of `scope`, when it is a chat
     /// app's conversation.
     #[serde(default, skip_deserializing)]
@@ -1071,22 +1075,22 @@ pub struct MemoryAccess {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MemoryAccessView {
-    pub allowed: Vec<MemoryAccess>,
+pub struct AccessView {
+    pub allowed: Vec<Access>,
 }
 
-/// `GET /agents/{id}/memory-access`.
-pub async fn memory_access_get(
+/// `GET /agents/{id}/access`.
+pub async fn access_get(
     State(state): State<AppState>,
     user: AuthedUser,
     Path(id): Path<String>,
-) -> Result<Json<MemoryAccessView>, ApiError> {
+) -> Result<Json<AccessView>, ApiError> {
     let agent = resolve_agent(&id, &user, &state).await?;
-    let mut view: MemoryAccessView = agent_data(
+    let mut view: AccessView = agent_data(
         &state,
         user.id,
         agent.id,
-        havn_proto::DataQuery::MemoryAccess,
+        havn_proto::DataQuery::Access,
         false,
     )
     .await?;
@@ -1102,8 +1106,11 @@ pub async fn memory_access_get(
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct MemoryAccessPut {
+pub struct AccessPut {
     pub scope: String,
+    pub tool: String,
+    #[serde(default)]
+    pub input: String,
     /// The rule for what not to say there; `null` takes the permission
     /// back.
     pub rule: Option<String>,
@@ -1114,21 +1121,23 @@ struct Found {
     found: bool,
 }
 
-/// `PUT /agents/{id}/memory-access`: change a conversation's rule, or,
-/// with `rule: null`, take back its permission.
-pub async fn memory_access_put(
+/// `PUT /agents/{id}/access`: change the rule of what is always allowed,
+/// or, with `rule: null`, take it back.
+pub async fn access_put(
     State(state): State<AppState>,
     user: AuthedUser,
     Path(id): Path<String>,
-    Json(req): Json<MemoryAccessPut>,
-) -> Result<Json<MemoryAccessView>, ApiError> {
+    Json(req): Json<AccessPut>,
+) -> Result<Json<AccessView>, ApiError> {
     let agent = resolve_agent(&id, &user, &state).await?;
     let found: Found = agent_data(
         &state,
         user.id,
         agent.id,
-        havn_proto::DataQuery::SetMemoryAccess {
+        havn_proto::DataQuery::SetAccess {
             scope: req.scope.clone(),
+            tool: req.tool.clone(),
+            input: req.input.clone(),
             rule: req.rule.clone(),
         },
         true,
@@ -1142,14 +1151,14 @@ pub async fn memory_access_put(
         user.id,
         agent.id,
         if req.rule.is_some() {
-            "agent.memory_access.changed"
+            "agent.tool_access.changed"
         } else {
-            "agent.memory_access.revoked"
+            "agent.tool_access.revoked"
         },
-        serde_json::json!({ "scope": req.scope }),
+        serde_json::json!({ "scope": req.scope, "tool": req.tool }),
     )
     .await;
-    memory_access_get(State(state), user, Path(id)).await
+    access_get(State(state), user, Path(id)).await
 }
 
 #[cfg(test)]

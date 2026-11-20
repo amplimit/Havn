@@ -1270,8 +1270,8 @@ export default function ChatPage({
               ),
             )}
             {approvals.map((a) =>
-              a.kind === "memory" ? (
-                <MemoryApproval
+              a.kind === "call" || a.kind === "result" ? (
+                <OwnerApproval
                   key={a.id}
                   request={a}
                   disabled={wsState !== "open"}
@@ -2676,11 +2676,11 @@ function TraceList({ items, leftOut }: { items: TraceItem[]; leftOut: number }) 
 }
 
 /**
- * What memory search found for someone other than the owner (issue #249):
- * who asked and what, and all the agent gets if the owner lets it, with a
- * note for what not to say.
+ * A call in a conversation that is not the owner's (issue #255): who asked
+ * and what, the call, and, asked after it ran, all the agent gets if the
+ * owner lets it; with a note for what not to say.
  */
-function MemoryApproval({
+function OwnerApproval({
   request,
   disabled,
   onDecide,
@@ -2690,19 +2690,25 @@ function MemoryApproval({
   onDecide: (approve: boolean, remember: boolean, note?: string) => void;
 }) {
   const [note, setNote] = useState("");
-  let shown: { from?: string; said?: string; query?: string; found?: string } = {};
+  let shown: { from?: string; said?: string; input?: unknown; found?: string } = {};
   try {
     const parsed: unknown = JSON.parse(request.input);
     shown = parsed && typeof parsed === "object" ? (parsed as typeof shown) : { found: request.input };
   } catch {
     shown = { found: request.input };
   }
+  const before = request.kind === "call";
   const muted = { color: "var(--color-body)" };
   const given = note.trim() || undefined;
   return (
-    <div className="card px-4 py-3 text-sm" role="alertdialog" aria-label="use what memory found">
+    <div
+      className="card px-4 py-3 text-sm"
+      role="alertdialog"
+      aria-label={before ? `allow ${request.tool}` : `use what ${request.tool} gave`}
+    >
       <p className="mb-1">
-        <strong>Let the agent use what it found in memory?</strong>{" "}
+        <strong>{before ? "Let the agent run this?" : "Let the agent use what this gave?"}</strong>{" "}
+        <span className="font-mono">{request.tool}</span>{" "}
         <span style={muted}>Someone other than you asked{request.conversation ? ` (${request.conversation})` : ""}.</span>
       </p>
       <dl className="mb-2 grid gap-1 text-xs" style={{ gridTemplateColumns: "auto 1fr" }}>
@@ -2710,18 +2716,20 @@ function MemoryApproval({
         <dd className="font-mono wrap-anywhere">{shown.from || "?"}</dd>
         <dt style={muted}>they wrote</dt>
         <dd className="wrap-anywhere" style={{ whiteSpace: "pre-wrap" }}>{shown.said || "?"}</dd>
-        <dt style={muted}>searched for</dt>
-        <dd className="wrap-anywhere">{shown.query || "?"}</dd>
       </dl>
-      <p className="mb-1 text-xs" style={muted}>
-        Found, which is exactly what the agent gets:
-      </p>
-      <pre
-        className="mb-2 max-h-64 overflow-auto whitespace-pre-wrap text-xs font-mono"
-        style={muted}
-      >
-        {shown.found}
+      <pre className="mb-2 max-h-40 overflow-auto whitespace-pre-wrap text-xs font-mono" style={muted}>
+        {JSON.stringify(shown.input ?? {}, null, 2)}
       </pre>
+      {!before && (
+        <>
+          <p className="mb-1 text-xs" style={muted}>
+            It gave, which is exactly what the agent gets:
+          </p>
+          <pre className="mb-2 max-h-64 overflow-auto whitespace-pre-wrap text-xs font-mono" style={muted}>
+            {shown.found}
+          </pre>
+        </>
+      )}
       <label className="mb-2 block text-xs" style={muted}>
         What not to say (optional), such as &quot;not my address&quot;; with always allow it stays the
         conversation&apos;s rule
@@ -2735,16 +2743,20 @@ function MemoryApproval({
       </label>
       <div className="flex flex-wrap gap-2">
         <button type="button" className="btn-primary" disabled={disabled} onClick={() => onDecide(true, false, given)}>
-          use
+          {before ? "allow once" : "use"}
         </button>
         <button
           type="button"
           className="btn-ghost"
           disabled={disabled}
           onClick={() => onDecide(true, true, given)}
-          title="Let memory search answer in this conversation from now on, without asking"
+          title={
+            before
+              ? "Let this exact call run in this conversation from now on, without asking"
+              : `Let ${request.tool} answer in this conversation from now on, without asking`
+          }
         >
-          always allow in this conversation
+          {before ? "always allow this call there" : "always allow there"}
         </button>
         <button type="button" className="btn-ghost" disabled={disabled} onClick={() => onDecide(false, false)}>
           deny

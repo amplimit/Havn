@@ -39,15 +39,16 @@ const FALLBACK_NOTE: [[&str; 2]; 2] = [
     ["（由 ", " 回答：这个对话的模型不可用。）"],
 ];
 
-/// `messages` with the results of every call of `tool` replaced by
-/// `instead` (issue #249).
-pub fn without_results_of(messages: &mut [Value], tool: &str, instead: &str) {
+/// `messages` with the results of every call of a tool `of` names
+/// replaced by `instead` (issues #249 and #255).
+pub fn without_results_of(messages: &mut [Value], of: impl Fn(&str) -> bool, instead: &str) {
     let ids: Vec<String> = messages
         .iter()
         .filter_map(|m| m.get("content").and_then(Value::as_array))
         .flatten()
         .filter(|b| {
-            block_type(b) == Some("tool_use") && b.get("name").and_then(Value::as_str) == Some(tool)
+            block_type(b) == Some("tool_use")
+                && b.get("name").and_then(Value::as_str).is_some_and(&of)
         })
         .filter_map(|b| b.get("id").and_then(Value::as_str).map(str::to_string))
         .collect();
@@ -342,7 +343,7 @@ mod tests {
                 {"type": "tool_result", "tool_use_id": "b", "content": "ok"},
             ]}),
         ];
-        without_results_of(&mut done, "memory_search", "(gone)");
+        without_results_of(&mut done, |tool| tool == "memory_search", "(gone)");
         assert_eq!(done[1]["content"][0]["content"], "(gone)");
         assert_eq!(
             done[1]["content"][1]["content"], "ok",
