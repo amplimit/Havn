@@ -276,13 +276,20 @@ fn request_body(request: &AnthropicRequest) -> Result<serde_json::Value, Provide
     Ok(body)
 }
 
-/// Mark where Anthropic caches the prompt (issue #220): the end of the
-/// system part every turn shares (with the tools before it), and the end
-/// of the conversation, so a turn's next round and the next turn read
-/// what came before from the cache. Two of the four marks a request may
-/// carry.
+/// Mark where Anthropic caches the prompt (issue #220), with three of the
+/// four marks a request may carry:
+/// - the end of the system part every turn shares (the tools before it
+///   are cached with it);
+/// - the end of the conversation: the turn's next round and the next turn
+///   read what came before from the cache;
+/// - the end of the person's message or results before that, where the
+///   previous round wrote: a round of many calls can be further back than
+///   Anthropic looks for an earlier write.
 fn mark_cache(body: &mut serde_json::Value, request: &AnthropicRequest) {
-    if let Some(system) = request.system.as_deref().filter(|s| !s.is_empty()) {
+    if !super::marks_cache(request) {
+        return;
+    }
+    if let Some(system) = request.system.as_deref().filter(|s| !s.trim().is_empty()) {
         let (shared, rest) = super::system_parts(system, request.system_stable);
         let mut blocks = vec![serde_json::json!({
             "type": "text", "text": shared, "cache_control": super::cache_mark(),
@@ -292,32 +299,45 @@ fn mark_cache(body: &mut serde_json::Value, request: &AnthropicRequest) {
         }
         body["system"] = serde_json::Value::Array(blocks);
     }
-    let Some(last) = body
+    let Some(messages) = body
         .get_mut("messages")
         .and_then(serde_json::Value::as_array_mut)
-        .and_then(|m| m.last_mut())
     else {
         return;
     };
-    if let Some(text) = last.get("content").and_then(serde_json::Value::as_str) {
-        if text.is_empty() {
+    let users: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        .map(|(i, _)| i)
+        .rev()
+        .take(2)
+        .collect();
+    for at in users {
+        mark_message(&mut messages[at]);
+    }
+}
+
+/// Mark the last block of `message` that can carry it (not thinking).
+fn mark_message(message: &mut serde_json::Value) {
+    if let Some(text) = message.get("content").and_then(serde_json::Value::as_str) {
+        if text.trim().is_empty() {
             return;
         }
-        last["content"] = serde_json::json!([{"type": "text", "text": text}]);
+        message["content"] = serde_json::json!([{"type": "text", "text": text}]);
     }
-    // The last block that can carry it: thinking blocks cannot.
-    if let Some(block) = last
+    let Some(blocks) = message
         .get_mut("content")
         .and_then(serde_json::Value::as_array_mut)
-        .and_then(|blocks| {
-            blocks.iter_mut().rev().find(|b| {
-                !matches!(
-                    b.get("type").and_then(serde_json::Value::as_str),
-                    Some("thinking" | "redacted_thinking")
-                )
-            })
-        })
-        && let Some(block) = block.as_object_mut()
+    else {
+        return;
+    };
+    if let Some(block) = blocks.iter_mut().rev().find(|b| {
+        !matches!(
+            b.get("type").and_then(serde_json::Value::as_str),
+            Some("thinking" | "redacted_thinking")
+        )
+    }) && let Some(block) = block.as_object_mut()
     {
         block.insert("cache_control".into(), super::cache_mark());
     }
@@ -370,22 +390,30 @@ mod tests {
             messages[2]["content"][0]["cache_control"]["type"],
             "ephemeral"
         );
-        assert_eq!(messages[0]["content"], "hi", "only the last message");
+        assert_eq!(
+            messages[0]["content"][0]["cache_control"]["type"], "ephemeral",
+            "where the previous round wrote"
+        );
         let marks = body.to_string().matches("cache_control").count();
-        assert_eq!(marks, 2, "within Anthropic's four");
+        assert_eq!(marks, 3, "within Anthropic's four");
 
-        // A plain last message becomes a block that carries the mark; a
-        // system prompt with no known boundary is marked whole.
-        let mut r = hi();
-        r.system = Some("all of it".into());
-        let body = request_body(&r).expect("body");
-        assert_eq!(body["system"][0]["text"], "all of it");
-        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
-        let last = body["messages"]
-            .as_array()
-            .and_then(|m| m.last())
-            .expect("last");
-        assert_eq!(last["content"][0]["cache_control"]["type"], "ephemeral");
+        // A one-off call is not marked, nor one that marks its own.
+        let mut once = r.clone();
+        once.system_stable = 0;
+        assert!(
+            !request_body(&once)
+                .expect("body")
+                .to_string()
+                .contains("cache_control")
+        );
+        let mut own = r.clone();
+        own.messages[0].content = serde_json::json!([{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]);
+        let marks = request_body(&own)
+            .expect("body")
+            .to_string()
+            .matches("cache_control")
+            .count();
+        assert_eq!(marks, 1, "its own mark only");
     }
 
     #[tokio::test]

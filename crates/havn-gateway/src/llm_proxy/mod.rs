@@ -158,6 +158,23 @@ pub fn cache_mark() -> serde_json::Value {
     serde_json::json!({"type": "ephemeral"})
 }
 
+/// Whether `request` is marked for a prompt cache (issue #220): an agent's
+/// turn, which says where its shared prompt ends and is asked again with
+/// more after it. A one-off call (a title, a page's answer) would pay to
+/// write a cache nobody reads; one that marks its own is left as it is.
+#[must_use]
+pub fn marks_cache(request: &AnthropicRequest) -> bool {
+    request.system_stable > 0
+        && !request
+            .messages
+            .iter()
+            .any(|m| m.content.to_string().contains("\"cache_control\""))
+        && !request
+            .tools
+            .as_ref()
+            .is_some_and(|t| t.to_string().contains("\"cache_control\""))
+}
+
 /// What a request asks of a model's thinking, from the model's
 /// [`crate::model_catalog::ThinkingSpec`] and the chat's choice.
 #[derive(Debug, Clone, PartialEq, Eq)]
