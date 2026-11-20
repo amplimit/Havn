@@ -16,7 +16,9 @@ use uuid::Uuid;
 /// How long a call waits for approval before it is refused.
 pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Longest input that can be approved; the owner sees all of it.
-const MAX_SHOWN_INPUT: usize = 4000;
+pub const MAX_SHOWN_INPUT: usize = 4000;
+/// Characters of an owner's note kept.
+const MAX_NOTE_CHARS: usize = 1000;
 
 #[derive(Debug)]
 struct Waiting {
@@ -25,7 +27,29 @@ struct Waiting {
     chat: String,
     tool: String,
     input: String,
-    reply: oneshot::Sender<bool>,
+    reply: oneshot::Sender<ApprovalDecision>,
+}
+
+/// The owner's answer to what memory found for someone else (issue #249).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryAnswer {
+    /// Always allow memory search in that conversation.
+    pub always: bool,
+    /// What the owner added, such as what not to say.
+    pub note: Option<String>,
+}
+
+/// The agent's approvals, for a tool that asks itself (memory_search).
+static GLOBAL: std::sync::OnceLock<std::sync::Arc<Approvals>> = std::sync::OnceLock::new();
+
+/// Make `approvals` the agent's, for [`global`].
+pub fn install(approvals: std::sync::Arc<Approvals>) {
+    let _ = GLOBAL.set(approvals);
+}
+
+/// The agent's approvals, once [`install`]ed.
+pub fn global() -> Option<std::sync::Arc<Approvals>> {
+    GLOBAL.get().cloned()
 }
 
 #[derive(Debug)]
@@ -77,6 +101,63 @@ impl Approvals {
         if self.lock_remembered().contains(&key) {
             return Ok(());
         }
+        let decision = self.wait(channel_id, chat, tool, input, reason, "").await?;
+        if decision.approve {
+            Ok(())
+        } else {
+            Err("it was denied".into())
+        }
+    }
+
+    /// Wait for the owner to let the model see what memory_search found
+    /// (`input`: who asked, what, and the results) in `conversation`
+    /// (issue #249). `Err` says why it may not.
+    pub async fn ask_memory(
+        &self,
+        conversation: &str,
+        chat: Option<&str>,
+        input: &str,
+    ) -> Result<MemoryAnswer, String> {
+        if input.chars().count() > MAX_SHOWN_INPUT {
+            return Err(format!(
+                "what it found is longer than the {MAX_SHOWN_INPUT} characters that can be \
+                 shown to the owner"
+            ));
+        }
+        let chat = chat.unwrap_or(conversation);
+        let decision = self
+            .wait(
+                conversation,
+                chat,
+                "memory_search",
+                input,
+                "memory",
+                "memory",
+            )
+            .await?;
+        if !decision.approve {
+            return Err("the owner did not allow it".into());
+        }
+        Ok(MemoryAnswer {
+            always: decision.remember,
+            note: decision
+                .note
+                .map(|n| n.trim().chars().take(MAX_NOTE_CHARS).collect::<String>())
+                .filter(|n| !n.is_empty()),
+        })
+    }
+
+    /// Send the request and wait for its decision, for at most
+    /// [`APPROVAL_TIMEOUT`].
+    async fn wait(
+        &self,
+        channel_id: &str,
+        chat: &str,
+        tool: &str,
+        input: &str,
+        reason: &str,
+        kind: &str,
+    ) -> Result<ApprovalDecision, String> {
         let request_id = Uuid::now_v7().to_string();
         let (tx, rx) = oneshot::channel();
         self.lock_waiting().push((
@@ -100,13 +181,13 @@ impl Approvals {
             tool: tool.to_string(),
             input: input.to_string(),
             reason: reason.to_string(),
+            kind: kind.to_string(),
         });
         if self.writer_tx.send(request).await.is_err() {
             return Err("the gateway connection is closed".into());
         }
         match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
-            Ok(Ok(true)) => Ok(()),
-            Ok(Ok(false)) => Err("it was denied".into()),
+            Ok(Ok(decision)) => Ok(decision),
             Ok(Err(_)) => Err("the request was dropped".into()),
             Err(_) => Err(format!(
                 "it was not approved within {} minutes",
@@ -128,11 +209,12 @@ impl Approvals {
         let Some(waiting) = found else {
             return false;
         };
-        if decision.approve && decision.remember {
+        // Memory's "always" is kept by its tool, for the conversation.
+        if decision.approve && decision.remember && waiting.tool != "memory_search" {
             self.lock_remembered()
                 .insert((waiting.chat, waiting.tool, waiting.input));
         }
-        let _ = waiting.reply.send(decision.approve);
+        let _ = waiting.reply.send(decision.clone());
         true
     }
 
@@ -186,7 +268,42 @@ mod tests {
             request_id: id.into(),
             approve,
             remember,
+            note: None,
         }
+    }
+
+    #[tokio::test]
+    async fn what_memory_found_waits_for_the_owner_with_their_note() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let approvals = Arc::new(Approvals::new(tx));
+        let ask = |a: &Arc<Approvals>| {
+            let a = Arc::clone(a);
+            tokio::spawn(async move { a.ask_memory("tg:1", None, r#"{"found":"x"}"#).await })
+        };
+        let call = ask(&approvals);
+        let request = next_request(&mut rx).await;
+        assert_eq!(request.kind, "memory");
+        let mut used = decision("tg:1", &request.request_id, true, true);
+        used.note = Some("  not my address  ".into());
+        assert!(approvals.decide(&used));
+        assert_eq!(
+            call.await.unwrap(),
+            Ok(MemoryAnswer {
+                always: true,
+                note: Some("not my address".into())
+            })
+        );
+        // Its "always" is not the tools': the next search asks again here.
+        let call = ask(&approvals);
+        let request = next_request(&mut rx).await;
+        assert!(approvals.decide(&decision("tg:1", &request.request_id, false, false)));
+        assert!(call.await.unwrap().is_err());
+        assert!(
+            approvals
+                .ask_memory("tg:1", None, &"x".repeat(MAX_SHOWN_INPUT + 1))
+                .await
+                .is_err()
+        );
     }
 
     async fn next_request(rx: &mut mpsc::Receiver<AgentToGateway>) -> ApprovalRequest {

@@ -32,7 +32,7 @@ export type ChatHandle = {
   /** Stop the reply the agent is working on in a chat; queued messages still run. */
   stop: (conversation?: string) => void;
   /** Answer an approval request. */
-  decide: (id: string, approve: boolean, remember: boolean) => void;
+  decide: (id: string, approve: boolean, remember: boolean, note?: string) => void;
   close: () => void;
 };
 
@@ -92,8 +92,8 @@ export function openChat(
       const frame: ClientMessage = { type: "stop", conversation };
       ws.send(JSON.stringify(frame));
     },
-    decide: (id, approve, remember) => {
-      const frame: ClientMessage = { type: "decide", id, approve, remember };
+    decide: (id, approve, remember, note) => {
+      const frame: ClientMessage = { type: "decide", id, approve, remember, note };
       ws.send(JSON.stringify(frame));
     },
     close: () => ws.close(),

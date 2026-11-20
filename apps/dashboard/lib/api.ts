@@ -551,6 +551,17 @@ export type TitlesView = {
   model: string;
 };
 
+/** A conversation, not the owner's, where memory search is always allowed (issue #249). */
+export type MemoryAccess = {
+  scope: string;
+  channel?: string;
+  account?: string;
+  sender?: string;
+  /** What not to say there; empty for nothing. */
+  rule: string;
+  allowed_at: string;
+};
+
 /** One capability that costs model calls; locked when the owner's role has it off. */
 export type Capability = { enabled: boolean; locked: boolean };
 
@@ -662,6 +673,14 @@ export const api = {
       request<TitlesView>(`/agents/${agentId}/titles`, {
         method: "PUT",
         body: JSON.stringify({ enabled }),
+      }),
+  },
+  memoryAccess: {
+    get: (agentId: string) => request<{ allowed: MemoryAccess[] }>(`/agents/${agentId}/memory-access`),
+    put: (agentId: string, scope: string, rule: string | null) =>
+      request<{ allowed: MemoryAccess[] }>(`/agents/${agentId}/memory-access`, {
+        method: "PUT",
+        body: JSON.stringify({ scope, rule }),
       }),
   },
   capabilities: {

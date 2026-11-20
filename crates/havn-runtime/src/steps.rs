@@ -39,6 +39,34 @@ const FALLBACK_NOTE: [[&str; 2]; 2] = [
     ["（由 ", " 回答：这个对话的模型不可用。）"],
 ];
 
+/// `messages` with the results of every call of `tool` replaced by
+/// `instead` (issue #249).
+pub fn without_results_of(messages: &mut [Value], tool: &str, instead: &str) {
+    let ids: Vec<String> = messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|b| {
+            block_type(b) == Some("tool_use") && b.get("name").and_then(Value::as_str) == Some(tool)
+        })
+        .filter_map(|b| b.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    for block in messages
+        .iter_mut()
+        .filter_map(|m| m.get_mut("content").and_then(Value::as_array_mut))
+        .flatten()
+    {
+        if block_type(block) == Some("tool_result")
+            && block
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| ids.iter().any(|i| i == id))
+        {
+            block["content"] = Value::String(instead.to_string());
+        }
+    }
+}
+
 /// `reply` without its [`fallback_note`].
 #[must_use]
 pub fn without_note(reply: &str) -> &str {
@@ -304,6 +332,22 @@ mod tests {
         assert_eq!(without_note(&reply), "pong");
         assert_eq!(without_note("plain"), "plain");
         assert_eq!(without_note(&fallback_note("p:spare")), "");
+        let mut done = vec![
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "a", "name": "memory_search", "input": {}},
+                {"type": "tool_use", "id": "b", "name": "shell", "input": {}},
+            ]}),
+            serde_json::json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "Mira, 12 Rose Street"},
+                {"type": "tool_result", "tool_use_id": "b", "content": "ok"},
+            ]}),
+        ];
+        without_results_of(&mut done, "memory_search", "(gone)");
+        assert_eq!(done[1]["content"][0]["content"], "(gone)");
+        assert_eq!(
+            done[1]["content"][1]["content"], "ok",
+            "other tools' results stay"
+        );
         let zh = format!(
             "pong\n\n{}p:spare{}",
             FALLBACK_NOTE[1][0], FALLBACK_NOTE[1][1]

@@ -145,6 +145,9 @@ pub enum ClientMessage {
         approve: bool,
         #[serde(default)]
         remember: bool,
+        /// What the owner adds to an approval of memory (issue #249).
+        #[serde(default)]
+        note: Option<String>,
     },
 }
 
@@ -183,7 +186,10 @@ pub enum ServerMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         conversation: Option<String>,
         /// `network` for the egress proxy's questions about a domain:
-        /// "always" then adds it to the agent's allowed domains.
+        /// "always" then adds it to the agent's allowed domains. `memory`
+        /// for what memory_search found for someone else (issue #249):
+        /// "always" allows it in that conversation, and a note says what
+        /// not to say.
         #[serde(skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
     },
@@ -315,7 +321,18 @@ impl WebChatRouter {
             let mut pending = self.lock_approvals();
             pending.retain(|_, p| p.since.elapsed() < APPROVAL_KEPT);
             let waiting = pending.values().filter(|p| p.agent_id == agent_id).count();
-            if waiting >= MAX_PENDING_APPROVALS || pending.contains_key(&request.request_id) {
+            // One question about memory per conversation at a time (issue
+            // #249): someone else cannot fill the owner's slots.
+            let memory_waits = request.kind == "memory"
+                && pending.values().any(|p| {
+                    p.agent_id == agent_id
+                        && p.request.kind == "memory"
+                        && p.request.channel_id == request.channel_id
+                });
+            if waiting >= MAX_PENDING_APPROVALS
+                || memory_waits
+                || pending.contains_key(&request.request_id)
+            {
                 return false;
             }
             pending.insert(
@@ -737,6 +754,23 @@ impl WebChatRouter {
             .map(|p| p.request.clone())
     }
 
+    /// The approval of memory `id` of `agent_id`, in whichever conversation
+    /// it waits: the owner decides it from their own (issue #249).
+    pub fn memory_approval(
+        &self,
+        agent_id: AgentId,
+        id: &str,
+    ) -> Option<havn_proto::ApprovalRequest> {
+        let mut pending = self.lock_approvals();
+        pending.retain(|_, p| p.since.elapsed() < APPROVAL_KEPT);
+        pending
+            .values()
+            .find(|p| {
+                p.agent_id == agent_id && p.request.request_id == id && p.request.kind == "memory"
+            })
+            .map(|p| p.request.clone())
+    }
+
     /// The approval request of `agent_id` that has waited longest in
     /// conversation `channel_id`.
     pub fn oldest_approval(
@@ -928,10 +962,14 @@ fn approval_message(request: &havn_proto::ApprovalRequest) -> ServerMessage {
         conversation: (!request.channel_id.is_empty()
             && request.channel_id.parse::<SessionId>().is_err())
         .then(|| request.channel_id.clone()),
-        kind: request
+        kind: if request
             .request_id
             .starts_with(crate::egress_proxy::REQUEST_PREFIX)
-            .then(|| "network".to_string()),
+        {
+            Some("network".to_string())
+        } else {
+            (!request.kind.is_empty()).then(|| request.kind.clone())
+        },
     }
 }
 
@@ -948,6 +986,7 @@ mod tests {
             tool: "shell".into(),
             input: "{}".into(),
             reason: "rule".into(),
+            kind: String::new(),
         }
     }
 

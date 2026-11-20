@@ -31,6 +31,7 @@ import {
   type ApprovalsView,
   type TitlesView,
   type CapabilitiesView,
+  type MemoryAccess,
   type WorkspaceAccess,
   type PairingCode,
   type ChannelLinkView,
@@ -327,6 +328,7 @@ export default function SettingsPage({
       <ScheduledTasks agentId={id} />
       <TitlesEditor agentId={id} />
       <CapabilitiesEditor agentId={id} />
+      <MemoryAccessEditor agentId={id} />
       <WorkspaceAccessEditor agentId={id} />
       <ChannelPairing agentId={id} />
       <ApprovalsEditor agentId={id} />
@@ -802,6 +804,104 @@ function TitlesEditor({ agentId }: { agentId: string }) {
         <p className="mt-1 text-xs" style={{ color: "var(--color-body)" }}>
           Your role has chat titles off; a team admin can turn them on.
         </p>
+      )}
+    </section>
+  );
+}
+
+/**
+ * Conversations not the owner's where memory search is always allowed
+ * (issue #249), each with its rule for what not to say there.
+ */
+function MemoryAccessEditor({ agentId }: { agentId: string }) {
+  const [allowed, setAllowed] = useState<MemoryAccess[] | null>(null);
+  const [rules, setRules] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  function show(list: MemoryAccess[]) {
+    setAllowed(list);
+    setRules(Object.fromEntries(list.map((a) => [a.scope, a.rule])));
+  }
+  useEffect(() => {
+    let cancelled = false;
+    api.memoryAccess.get(agentId).then(
+      (v) => {
+        if (!cancelled) show(v.allowed);
+      },
+      (e: unknown) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId]);
+  async function save(scope: string, rule: string | null) {
+    setSaving(true);
+    setError(null);
+    try {
+      show((await api.memoryAccess.put(agentId, scope, rule)).allowed);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+  return (
+    <section className="mt-10 card px-4 py-4" aria-labelledby="memory-access-title">
+      <h2 id="memory-access-title" className="display-h3 mb-2">
+        memory in other people&apos;s conversations
+      </h2>
+      <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
+        When someone other than you asks and the agent searches its memory, you are shown what it found
+        and decide. These conversations are always allowed, with your rule for what not to say there.
+        Revoke one to be asked again.
+      </p>
+      {error && (
+        <p className="mb-2 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
+          {error}
+        </p>
+      )}
+      {allowed === null ? null : allowed.length === 0 ? (
+        <p className="text-sm" style={{ color: "var(--color-body)" }}>
+          None yet.
+        </p>
+      ) : (
+        <ul className="flex flex-col gap-3">
+          {allowed.map((a) => (
+            <li key={a.scope} className="text-sm">
+              <div className="font-mono wrap-anywhere">
+                {a.channel ? `${a.channel} · ${a.account} · ${a.sender}` : a.scope}
+              </div>
+              <textarea
+                className="input mt-1 w-full"
+                rows={2}
+                maxLength={1000}
+                placeholder="what not to say here (optional)"
+                value={rules[a.scope] ?? ""}
+                onChange={(e) => setRules({ ...rules, [a.scope]: e.target.value })}
+              />
+              <div className="mt-1 flex gap-2">
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  disabled={saving || (rules[a.scope] ?? "") === a.rule}
+                  onClick={() => void save(a.scope, rules[a.scope] ?? "")}
+                >
+                  save rule
+                </button>
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  disabled={saving}
+                  onClick={() => void save(a.scope, null)}
+                >
+                  revoke
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
       )}
     </section>
   );

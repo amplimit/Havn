@@ -334,6 +334,9 @@ pub struct Asker {
     pub who_shown: String,
     /// May use the commands marked admin.
     pub admin: bool,
+    /// Is the agent's owner, who decides what memory may give someone
+    /// else from their own conversation (issue #249).
+    pub owner: bool,
     /// What the sender would need to be one, for a refusal.
     pub admin_hint: &'static str,
     /// The agent's language, which its replies are in (issue #250).
@@ -756,26 +759,33 @@ async fn usage(
 }
 
 /// What `/approve` or `/deny` was given: whether to allow the step for
-/// the rest of the chat, and the request it names (issue #203, as a
-/// button sends it); `None` when the arguments are not those.
-fn decision_args(approve: bool, args: &str) -> Option<(bool, Option<&str>)> {
+/// the rest of the chat, the request it names (issue #203, as a button
+/// sends it), and, after the request, a note for an approval of memory
+/// (issue #249); `None` when the arguments are not those.
+fn decision_args(approve: bool, args: &str) -> Option<(bool, Option<&str>, Option<&str>)> {
     let mut remember = false;
-    let mut id = None;
-    for word in args.split_whitespace() {
-        if approve && !remember && id.is_none() && word.eq_ignore_ascii_case("always") {
-            remember = true;
-        } else if id.is_none() {
-            id = Some(word);
-        } else {
-            return None;
-        }
+    let mut rest = args.trim_start();
+    if approve
+        && let Some((word, after)) = rest.split_once(char::is_whitespace).or(Some((rest, "")))
+        && word.eq_ignore_ascii_case("always")
+    {
+        remember = true;
+        rest = after.trim_start();
     }
-    Some((remember, id))
+    if rest.is_empty() {
+        return Some((remember, None, None));
+    }
+    let (id, note) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let note = note.trim();
+    if !approve && !note.is_empty() {
+        return None;
+    }
+    Some((remember, Some(id), (!note.is_empty()).then_some(note)))
 }
 
 async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> String {
     let language = asker.language;
-    let Some((remember, id)) = decision_args(approve, args) else {
+    let Some((remember, id, note)) = decision_args(approve, args) else {
         return if approve {
             language.pick("(Send /approve, or /approve always to allow the same step for the rest of the \
              chat.)", "（发 /approve，或者发 /approve always，在这个对话剩下的时间里都允许同样的步骤。）")
@@ -792,11 +802,32 @@ async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> S
     let waiting = match id {
         Some(id) => state
             .webchat_router
-            .approval(asker.agent_id, &asker.scope, id),
+            .approval(asker.agent_id, &asker.scope, id)
+            // What memory found for someone else waits in their
+            // conversation; the owner decides it from their own.
+            .or_else(|| {
+                asker
+                    .owner
+                    .then(|| state.webchat_router.memory_approval(asker.agent_id, id))
+                    .flatten()
+            }),
         None => state
             .webchat_router
             .oldest_approval(asker.agent_id, &asker.scope),
     };
+    // Memory is decided by its owner only, never in the conversation it
+    // is for.
+    if let Some(request) = &waiting
+        && request.kind == "memory"
+        && !asker.owner
+    {
+        return language
+            .pick(
+                "(Only the agent's owner decides this, from their own chat.)",
+                "（这个只能由 agent 的所有者在自己的对话里决定。）",
+            )
+            .into();
+    }
     let Some(request) = waiting else {
         return if id.is_some() {
             language
@@ -823,6 +854,7 @@ async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> S
         &request.request_id,
         approve,
         remember,
+        note.map(str::to_string),
     )
     .await;
     if !decided {
@@ -834,6 +866,18 @@ async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> S
             .into();
     }
     match (approve, remember) {
+        (true, true) if request.kind == "memory" => language
+            .pick(
+                "(Allowed: memory search answers in that conversation from now on, without asking.)",
+                "（已允许：从现在起，那个对话里的记忆搜索不再询问，直接使用。）",
+            )
+            .to_string(),
+        (true, false) if request.kind == "memory" => language
+            .pick(
+                "(Allowed for that reply.)",
+                "（已允许用于那次回复。）",
+            )
+            .to_string(),
         (true, true) => language.pick(
             format!(
                 "(Approved {}, and the same step for the rest of the chat.)",
@@ -890,13 +934,31 @@ mod tests {
 
     #[test]
     fn a_decision_may_name_its_request() {
-        assert_eq!(decision_args(true, ""), Some((false, None)));
-        assert_eq!(decision_args(true, "always"), Some((true, None)));
-        assert_eq!(decision_args(true, "ALWAYS r-1"), Some((true, Some("r-1"))));
-        assert_eq!(decision_args(true, "r-1"), Some((false, Some("r-1"))));
-        assert_eq!(decision_args(false, "r-1"), Some((false, Some("r-1"))));
-        assert_eq!(decision_args(true, "r-1 r-2"), None);
-        assert_eq!(decision_args(true, "always always x"), None);
+        assert_eq!(decision_args(true, ""), Some((false, None, None)));
+        assert_eq!(decision_args(true, "always"), Some((true, None, None)));
+        assert_eq!(
+            decision_args(true, "ALWAYS r-1"),
+            Some((true, Some("r-1"), None))
+        );
+        assert_eq!(decision_args(true, "r-1"), Some((false, Some("r-1"), None)));
+        assert_eq!(
+            decision_args(false, "r-1"),
+            Some((false, Some("r-1"), None))
+        );
+        // After the request, a note for an approval of memory (issue #249).
+        assert_eq!(
+            decision_args(true, "r-1  not my address "),
+            Some((false, Some("r-1"), Some("not my address")))
+        );
+        assert_eq!(
+            decision_args(true, "always r-1 别提我的工资"),
+            Some((true, Some("r-1"), Some("别提我的工资")))
+        );
+        assert_eq!(
+            decision_args(false, "r-1 why"),
+            None,
+            "a refusal takes none"
+        );
     }
 
     fn known(text: &str) -> Option<(&'static str, &str)> {

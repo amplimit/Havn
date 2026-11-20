@@ -242,6 +242,11 @@ pub struct ApprovalRequest {
     pub input: String,
     /// Which rule asked.
     pub reason: String,
+    /// `memory` for what memory_search found in a conversation that is
+    /// not the owner's (issue #249): the owner sees it before the model
+    /// does. Empty for a tool call.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
 }
 
 /// See [`GatewayToAgent::ApprovalDecision`].
@@ -251,9 +256,14 @@ pub struct ApprovalDecision {
     /// The request answered.
     pub request_id: String,
     pub approve: bool,
-    /// Approve the same tool and input for the rest of the conversation.
+    /// Approve the same tool and input for the rest of the conversation;
+    /// for memory, always in that conversation.
     #[serde(default)]
     pub remember: bool,
+    /// What the owner adds to an approval of memory (issue #249), such as
+    /// what not to say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Frames sent from the gateway to the agent runtime.
@@ -615,6 +625,14 @@ pub enum DataQuery {
         #[serde(default)]
         after: Option<String>,
     },
+    /// The conversations where memory search is always allowed for
+    /// someone other than the owner (issue #249): `{"allowed": [{"scope",
+    /// "rule", "allowed_at"}]}`.
+    MemoryAccess,
+    /// Always allow memory search in conversation `scope`, with `rule`
+    /// for what not to say there; `None` takes the permission back:
+    /// `{"found": bool}`.
+    SetMemoryAccess { scope: String, rule: Option<String> },
 }
 
 /// Longest memory key the dashboard can save.

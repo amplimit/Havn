@@ -623,6 +623,7 @@ async fn main() -> anyhow::Result<()> {
     let (writer_tx, mut writer_rx) = mpsc::channel::<AgentToGateway>(OUTBOUND_QUEUE_CAPACITY);
     let gateway_pending: tools::gateway::PendingGatewayCalls = Arc::default();
     let approvals = Arc::new(approvals::Approvals::new(writer_tx.clone()));
+    approvals::install(Arc::clone(&approvals));
     let base_registry = ToolRegistry::standard(&policy)
         .with_hooks(Arc::clone(&hooks))
         .with_approvals(Arc::clone(&approvals))
@@ -1365,8 +1366,16 @@ async fn handle_heartbeat(ctx: Ctx) {
         })
         .collect();
 
-    let augmented =
-        augment_with_skills(&ctx, &ctx.system_prompt, &synthesised, None, false, None).await;
+    let augmented = augment_with_skills(
+        &ctx,
+        &ctx.system_prompt,
+        &synthesised,
+        None,
+        false,
+        true,
+        None,
+    )
+    .await;
     // The heartbeat works for the owner: it may change memory (issue #218).
     let final_text = match tool_loop::as_text(
         tools::gateway::FROM_OWNER
@@ -1458,19 +1467,28 @@ async fn handle_cron(tick: CronTick, ctx: Ctx) {
 
     let mut messages = vec![serde_json::json!({ "role": "user", "content": tick.prompt.clone() })];
 
-    let augmented =
-        augment_with_skills(&ctx, &ctx.cron_prompt, &tick.prompt, None, false, None).await;
-    let mut handle = ctx.parent_handle();
-    // A job nobody waits on gets the tighter limit (issue #219).
-    handle.max_iterations = ctx.tool_env.policy.tool_rounds.subagent.max(1);
     // The owner's task when scheduled in a chat of theirs, or outside any
-    // chat (the dashboard): only then may it change memory (issue #218).
+    // chat (the dashboard): only then may it change memory (issue #218),
+    // or be given recent events (issue #249).
     let owner = match &tick.chat {
         None => true,
         Some(chat) => conversations::chat_of_owner(&ctx.pool, chat)
             .await
             .unwrap_or(false),
     };
+    let augmented = augment_with_skills(
+        &ctx,
+        &ctx.cron_prompt,
+        &tick.prompt,
+        None,
+        false,
+        owner,
+        None,
+    )
+    .await;
+    let mut handle = ctx.parent_handle();
+    // A job nobody waits on gets the tighter limit (issue #219).
+    handle.max_iterations = ctx.tool_env.policy.tool_rounds.subagent.max(1);
     let run = tools::gateway::FROM_OWNER
         .scope(
             owner,
@@ -2513,7 +2531,8 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         // else's does not fill the agent's memory, nor get its saved facts
         // in front of it (memory_search still answers them).
         msg.from_owner,
-        Some(&talk_section(&msg)),
+        msg.from_owner,
+        Some(&with_memory_rule(&ctx.pool, &msg, talk_section(&msg)).await),
     )
     .await;
 
@@ -2537,21 +2556,33 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
             msg.channel_id.clone(),
             tools::gateway::FROM_OWNER.scope(
                 msg.from_owner,
-                tools::gateway::CHAT.scope(
-                    chat.clone(),
-                    tools::memory::MEMORY_CHANGES.scope(
-                        Arc::clone(&memory_changes),
-                        tool_loop::TRACE.scope(
-                            Arc::clone(&turn_trace),
-                            run_tool_loop(
-                                &ctx,
-                                crate::tools::context::WEBCHAT,
-                                &mut messages,
-                                &augmented,
-                                Some(stop),
-                                chat_model,
-                                chat_thinking,
-                                segments.clone(),
+                tools::gateway::ASKED.scope(
+                    (
+                        msg.sender_id.clone(),
+                        user_text.chars().take(ASKED_SHOWN_CHARS).collect(),
+                    ),
+                    tools::gateway::MEMORY_REFUSED.scope(
+                        Arc::new((
+                            std::sync::atomic::AtomicBool::new(false),
+                            tokio::sync::Mutex::new(()),
+                        )),
+                        tools::gateway::CHAT.scope(
+                            chat.clone(),
+                            tools::memory::MEMORY_CHANGES.scope(
+                                Arc::clone(&memory_changes),
+                                tool_loop::TRACE.scope(
+                                    Arc::clone(&turn_trace),
+                                    run_tool_loop(
+                                        &ctx,
+                                        crate::tools::context::WEBCHAT,
+                                        &mut messages,
+                                        &augmented,
+                                        Some(stop),
+                                        chat_model,
+                                        chat_thinking,
+                                        segments.clone(),
+                                    ),
+                                ),
                             ),
                         ),
                     ),
@@ -2632,7 +2663,20 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
             } else {
                 steps::without_note(&final_text)
             };
-            if let Some(kept) = steps::of_turn(messages.get(turn_start..).unwrap_or_default(), said)
+            // What memory gave someone else was for that reply only (issue
+            // #249): later turns do not get it back from the steps.
+            let mut done = messages.get(turn_start..).unwrap_or_default().to_vec();
+            if !msg.from_owner {
+                steps::without_results_of(
+                    &mut done,
+                    "memory_search",
+                    lang().pick(
+                        "(What memory search found was for that reply only.)",
+                        "（记忆搜索找到的内容只用于那次回复。）",
+                    ),
+                );
+            }
+            if let Some(kept) = steps::of_turn(&done, said)
                 && let Err(e) = conversations::set_steps(&ctx.pool, &turn, &kept).await
             {
                 warn!(error = %e, "could not keep the turn's steps");
@@ -2864,8 +2908,41 @@ fn talk_section(msg: &InboundMessage) -> String {
     )
 }
 
+/// Characters of a conversation's memory rule kept (issue #249).
+const MAX_MEMORY_RULE_CHARS: usize = 1000;
+
 /// Characters of a sender's id told to the model.
 const MAX_SENDER_SHOWN: usize = 128;
+
+/// Characters of the message a turn answers shown to the owner with what
+/// memory search found for it (issue #249).
+const ASKED_SHOWN_CHARS: usize = 500;
+
+/// `talk`, with the owner's rule for what not to say in `msg`'s
+/// conversation when memory search is always allowed there and they gave
+/// one (issue #249).
+async fn with_memory_rule(pool: &sqlx::SqlitePool, msg: &InboundMessage, talk: String) -> String {
+    if msg.from_owner {
+        return talk;
+    }
+    match havn_db::agent::memory::access_of(pool, &msg.channel_id).await {
+        Ok(Some(rule)) if !rule.trim().is_empty() => {
+            let rule = rule.split_whitespace().collect::<Vec<_>>().join(" ");
+            lang().pick(
+                format!(
+                    "{talk}\n\nYour owner lets you use what memory holds in this conversation, \
+                     with this rule for what not to say here: {rule}"
+                ),
+                format!("{talk}\n\n所有者允许你在这个对话里使用记忆中的内容，规定了在这里不能说什么：{rule}"),
+            )
+        }
+        Ok(_) => talk,
+        Err(e) => {
+            warn!(error = %e, "could not read the conversation's memory rule");
+            talk
+        }
+    }
+}
 
 /// `text`, a user turn sent `at`, with the time it was sent before it in
 /// `zone` (issues #221 and #220): the newest is the time now, and the
@@ -2955,6 +3032,7 @@ async fn augment_with_skills(
     user_text: &str,
     summary: Option<&str>,
     owner: bool,
+    memory_open: bool,
     talk: Option<&str>,
 ) -> SystemPrompt {
     let mut augmented = base.clone();
@@ -2978,12 +3056,17 @@ async fn augment_with_skills(
         }
     }
 
-    // Section 1: recent events.
+    // Section 1: recent events, in the owner's turns and the owner's runs
+    // only (`memory_open`, issue #249): someone else gets memory through
+    // memory_search, which asks the owner.
     let days = recent_events_days();
     let limit = recent_events_limit();
-    match havn_db::agent::memory::recent_events(&ctx.pool, chrono::Duration::days(days), limit)
-        .await
-    {
+    let events = if memory_open {
+        havn_db::agent::memory::recent_events(&ctx.pool, chrono::Duration::days(days), limit).await
+    } else {
+        Ok(Vec::new())
+    };
+    match events {
         Ok(events) if !events.is_empty() => {
             let mut section = lang().pick(format!(
                 "## Recent events (last {days} days)\n\n\
@@ -3802,6 +3885,36 @@ async fn answer_data_request(req: DataRequest, ctx: &Ctx) -> DataResponse {
                 if found {
                     ctx.turns.discard(&conversation);
                 }
+                Ok(serde_json::json!({ "found": found }))
+            }
+            DataQuery::MemoryAccess => {
+                let allowed = memory::accesses(&ctx.pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({
+                    "allowed": rows_within_budget(allowed, MAX_DATA_REPLY_BYTES, false)?,
+                }))
+            }
+            DataQuery::SetMemoryAccess { scope, rule } => {
+                let found = match rule {
+                    Some(rule) => {
+                        let rule: String =
+                            rule.trim().chars().take(MAX_MEMORY_RULE_CHARS).collect();
+                        let had = memory::access_of(&ctx.pool, &scope)
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .is_some();
+                        if had {
+                            memory::allow(&ctx.pool, &scope, &rule)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        }
+                        had
+                    }
+                    None => memory::revoke(&ctx.pool, &scope)
+                        .await
+                        .map_err(|e| e.to_string())?,
+                };
                 Ok(serde_json::json!({ "found": found }))
             }
             DataQuery::UndoMemory { key, before, after } => {
