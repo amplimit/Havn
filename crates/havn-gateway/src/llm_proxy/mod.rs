@@ -1764,7 +1764,13 @@ fn decoded(bytes: &[u8]) -> Result<Decoded, String> {
     let orientation = decoder
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
-    let icc = decoder.icc_profile().ok().flatten();
+    // The pixels come out RGB: a profile of another colour space (CMYK,
+    // grey) would not describe them.
+    let icc = decoder
+        .icc_profile()
+        .ok()
+        .flatten()
+        .filter(|icc| icc.get(16..20) == Some(b"RGB "));
     let image = image::DynamicImage::from_decoder(decoder).map_err(unreadable)?;
     Ok(Decoded {
         image,

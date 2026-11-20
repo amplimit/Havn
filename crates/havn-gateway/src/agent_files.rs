@@ -175,15 +175,11 @@ impl WorkspaceDir {
     /// name and linked into place whole, so `name` is never seen half
     /// written, not even after a crash.
     pub fn create_new(&self, name: &str, contents: &[u8]) -> io::Result<bool> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if std::fs::symlink_metadata(self.child(name)?).is_ok() {
+        if self.has(name)? {
             return Ok(false);
         }
-        let part = format!(
-            ".part-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
+        // Not a name anything else could have taken, or guess.
+        let part = format!(".part-{}", uuid::Uuid::now_v7().simple());
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -199,6 +195,15 @@ impl WorkspaceDir {
         match linked {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether an entry of any kind has the name `name`.
+    pub fn has(&self, name: &str) -> io::Result<bool> {
+        match std::fs::symlink_metadata(self.child(name)?) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e),
         }
     }

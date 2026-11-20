@@ -717,6 +717,7 @@ pub async fn inbox_file(
         // is one (issue #225): a HEIC photo a browser cannot show, a large
         // one quicker.
         if shown
+            && dir.has(&read)?
             && let Ok(Some(copy)) = dir.read_bytes(
                 &crate::llm_proxy::shown_copy(&read),
                 crate::llm_proxy::MAX_IMAGE_BYTES,
