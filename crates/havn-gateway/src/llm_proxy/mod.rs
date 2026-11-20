@@ -1519,10 +1519,20 @@ fn image_block(
         Err(e) => return Err(format!("the inbox cannot be read ({e})")),
     };
     let limit = MAX_IMAGE_BYTES.min(room);
-    // The copy the gateway made of one that cannot be shown as it is.
-    let read = match dir.read_bytes(&shown_copy(name), limit) {
-        Ok(None) => dir.read_bytes(name, limit),
-        copy => copy,
+    let original = dir.read_bytes(name, limit);
+    // One that is there but cannot be shown as it is goes as the copy the
+    // gateway made of it, if that reads; one that is gone, not at all.
+    let refused = match &original {
+        Ok(Some(bytes)) => {
+            image_type(bytes).is_none()
+                || image_size(bytes).is_some_and(|(w, h)| w.max(h) > MAX_IMAGE_SIDE)
+        }
+        Ok(None) => false,
+        Err(e) => e.kind() == std::io::ErrorKind::InvalidData,
+    };
+    let read = match refused.then(|| dir.read_bytes(&shown_copy(name), limit)) {
+        Some(Ok(Some(copy))) => Ok(Some(copy)),
+        _ => original,
     };
     let bytes = match read {
         Ok(Some(bytes)) => bytes,
@@ -1656,30 +1666,57 @@ fn is_heif(bytes: &[u8]) -> bool {
 
 /// A copy of image `bytes` that a model can be shown (issue #225): turned
 /// as its file says, at most [`SHOWN_SIDE`] on a side, and at most
-/// [`MAX_IMAGE_BYTES`], as a JPEG, or a PNG when it is transparent. The
-/// bytes are untrusted: this runs in the converter child.
+/// [`MAX_IMAGE_BYTES`], as a JPEG, or a PNG when it is transparent, with
+/// the colour profile it came with. The bytes are untrusted: this runs in
+/// the converter child.
 pub fn shown_image(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let mut image = decoded(bytes)?;
+    let fit = |image: image::DynamicImage, side: u32| {
+        if image.width().max(image.height()) > side {
+            image.resize(side, side, image::imageops::FilterType::CatmullRom)
+        } else {
+            image
+        }
+    };
+    let Decoded {
+        image,
+        orientation,
+        icc,
+    } = decoded(bytes)?;
+    // Turned once it is small, so the full size is held once.
+    let mut image = fit(image, SHOWN_SIDE);
+    image.apply_orientation(orientation);
     let mut side = SHOWN_SIDE;
     loop {
-        if image.width().max(image.height()) > side {
-            image = image.resize(side, side, image::imageops::FilterType::CatmullRom);
-        }
-        let out = encoded(&image)?;
+        image = fit(image, side);
+        let out = encoded(&image, icc.as_deref(), false)?;
         if out.len() as u64 <= MAX_IMAGE_BYTES {
             return Ok(out);
         }
-        side = image.width().max(image.height()) / 2;
-        if side < LEAST_SIDE {
+        let longest = image.width().max(image.height());
+        if longest <= LEAST_SIDE {
+            // Last, a transparent one goes as a JPEG, on white.
+            let out = encoded(&image, icc.as_deref(), true)?;
+            if out.len() as u64 <= MAX_IMAGE_BYTES {
+                return Ok(out);
+            }
             return Err(format!(
                 "it is over {MAX_IMAGE_BYTES} bytes even at {LEAST_SIDE} pixels on a side"
             ));
         }
+        side = (longest / 2).max(LEAST_SIDE);
     }
 }
 
-/// Image `bytes` as pixels, turned as its file says, a HEIC image in sRGB.
-fn decoded(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+/// A picture's pixels, how its file says to turn them, and the colour
+/// profile it came with.
+struct Decoded {
+    image: image::DynamicImage,
+    orientation: image::metadata::Orientation,
+    icc: Option<Vec<u8>>,
+}
+
+/// Image `bytes` as pixels; a HEIC image turned and in sRGB already.
+fn decoded(bytes: &[u8]) -> Result<Decoded, String> {
     use image::ImageDecoder as _;
     if is_heif(bytes) {
         let options = heifer::Options::new()
@@ -1691,9 +1728,13 @@ fn decoded(bytes: &[u8]) -> Result<image::DynamicImage, String> {
             decoded => decoded,
         }
         .map_err(|e| format!("it is not a readable HEIC image ({e})"))?;
-        return image::RgbaImage::from_raw(decoded.width, decoded.height, decoded.data)
-            .map(image::DynamicImage::ImageRgba8)
-            .ok_or_else(|| "it is not a readable HEIC image".to_string());
+        let image = image::RgbaImage::from_raw(decoded.width, decoded.height, decoded.data)
+            .ok_or("it is not a readable HEIC image")?;
+        return Ok(Decoded {
+            image: image::DynamicImage::ImageRgba8(image),
+            orientation: image::metadata::Orientation::NoTransforms,
+            icc: None,
+        });
     }
     let unreadable = |e: image::ImageError| format!("it is not a readable image ({e})");
     let cursor = std::io::Cursor::new(bytes);
@@ -1723,34 +1764,73 @@ fn decoded(bytes: &[u8]) -> Result<image::DynamicImage, String> {
     let orientation = decoder
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
-    let mut image = image::DynamicImage::from_decoder(decoder).map_err(unreadable)?;
-    image.apply_orientation(orientation);
-    Ok(image)
+    let icc = decoder.icc_profile().ok().flatten();
+    let image = image::DynamicImage::from_decoder(decoder).map_err(unreadable)?;
+    Ok(Decoded {
+        image,
+        orientation,
+        icc,
+    })
 }
 
-/// `image` as a PNG when any of it is transparent, else as a JPEG.
-fn encoded(image: &image::DynamicImage) -> Result<Vec<u8>, String> {
+/// `image` with colour profile `icc` as a PNG when any of it is
+/// transparent, unless `opaque`, else as a JPEG, on white where it is
+/// transparent.
+fn encoded(
+    image: &image::DynamicImage,
+    icc: Option<&[u8]>,
+    opaque: bool,
+) -> Result<Vec<u8>, String> {
     use image::ImageEncoder as _;
     let failed = |e: image::ImageError| format!("the copy could not be written ({e})");
     let mut out = Vec::new();
-    if image.color().has_alpha() {
-        let rgba = image.to_rgba8();
-        if rgba.pixels().any(|p| p[3] < u8::MAX) {
-            image::codecs::png::PngEncoder::new(&mut out)
-                .write_image(
-                    rgba.as_raw(),
-                    rgba.width(),
-                    rgba.height(),
-                    image::ExtendedColorType::Rgba8,
-                )
-                .map_err(failed)?;
-            return Ok(out);
+    let transparent = image
+        .color()
+        .has_alpha()
+        .then(|| image.to_rgba8())
+        .filter(|rgba| rgba.pixels().any(|p| p[3] < u8::MAX));
+    match transparent {
+        Some(rgba) if !opaque => {
+            let mut png = image::codecs::png::PngEncoder::new(&mut out);
+            if let Some(icc) = icc {
+                let _ = png.set_icc_profile(icc.to_vec());
+            }
+            png.write_image(
+                rgba.as_raw(),
+                rgba.width(),
+                rgba.height(),
+                image::ExtendedColorType::Rgba8,
+            )
+        }
+        transparent => {
+            let rgb = transparent.map_or_else(|| image.to_rgb8(), |rgba| on_white(&rgba));
+            let mut jpeg =
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY);
+            if let Some(icc) = icc {
+                let _ = jpeg.set_icc_profile(icc.to_vec());
+            }
+            jpeg.write_image(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
         }
     }
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY)
-        .encode_image(&image.to_rgb8())
-        .map_err(failed)?;
+    .map_err(failed)?;
     Ok(out)
+}
+
+/// `rgba` laid on white.
+fn on_white(rgba: &image::RgbaImage) -> image::RgbImage {
+    image::RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let [r, g, b, a] = rgba.get_pixel(x, y).0;
+        let a = u16::from(a);
+        let over = |c: u8| {
+            u8::try_from((u16::from(c) * a + 255 * (255 - a) + 127) / 255).unwrap_or(u8::MAX)
+        };
+        image::Rgb([over(r), over(g), over(b)])
+    })
 }
 
 /// Standard base64 with padding.
@@ -2532,16 +2612,19 @@ mod tests {
         out
     }
 
-    /// A grey JPEG of `width` by `height` whose EXIF says to turn it a
-    /// quarter clockwise, as a phone saves a photo taken upright.
+    /// A JPEG of `width` by `height`, black on its left half and white on
+    /// its right, whose EXIF says to turn it a quarter clockwise, as a
+    /// phone saves a photo taken upright.
     fn turned_jpeg(width: u32, height: u32) -> Vec<u8> {
         let mut plain = Vec::new();
         image::codecs::jpeg::JpegEncoder::new(&mut plain)
-            .encode_image(&image::RgbImage::from_pixel(
-                width,
-                height,
-                image::Rgb([90, 90, 90]),
-            ))
+            .encode_image(&image::RgbImage::from_fn(width, height, |x, _| {
+                if x < width / 2 {
+                    image::Rgb([0, 0, 0])
+                } else {
+                    image::Rgb([255, 255, 255])
+                }
+            }))
             .expect("jpeg");
         let mut exif =
             b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0".to_vec();
@@ -2579,13 +2662,25 @@ mod tests {
         assert_eq!(shown.get_pixel(0, 0)[3], 0);
         assert_eq!(shown.get_pixel(SHOWN_SIDE - 1, 0)[3], u8::MAX);
 
-        // A photo whose EXIF says to turn it is shown turned.
+        // A photo whose EXIF says to turn it is shown turned clockwise:
+        // its left half on top.
         let photo = turned_jpeg(8100, 40);
         assert_eq!(image_size(&photo), Some((8100, 40)));
         assert!(needs_copy(&photo));
-        let (width, height) = image_size(&shown_image(&photo).expect("copy")).expect("size");
-        assert_eq!(height, SHOWN_SIDE);
-        assert!(width <= 11, "{width}");
+        let shown = image::load_from_memory(&shown_image(&photo).expect("copy"))
+            .expect("decoded")
+            .to_luma8();
+        assert_eq!(shown.height(), SHOWN_SIDE);
+        assert!(shown.width() <= 11, "{}", shown.width());
+        let middle = shown.width() / 2;
+        assert!(shown.get_pixel(middle, 100)[0] < 40);
+        assert!(shown.get_pixel(middle, SHOWN_SIDE - 100)[0] > 215);
+
+        // One that does not fit as a PNG even small goes as a JPEG.
+        let noisy = png(&noise(600, 600, 128));
+        let copy =
+            encoded(&image::load_from_memory(&noisy).expect("png"), None, true).expect("jpeg");
+        assert_eq!(image_type(&copy), Some("image/jpeg"));
 
         // One within the limits is shown as it is.
         assert!(!needs_copy(&png(&noise(64, 64, u8::MAX))));
@@ -2626,13 +2721,27 @@ mod tests {
         std::fs::write(ws.path().join("inbox").join(shown_copy("a.heic")), &copy).expect("copy");
         std::fs::write(ws.path().join("inbox/b.heic"), heic).expect("b");
         let refer = |path: &str| serde_json::json!({"type": "image", "source": {"type": "workspace", "path": path}});
-        let mut request = chat(vec![vec![refer("inbox/a.heic"), refer("inbox/b.heic")]]);
+        // One shown as it is goes as it is, whatever is at its copy's name.
+        let small = png(&noise(4, 4, u8::MAX));
+        std::fs::write(ws.path().join("inbox/c.png"), &small).expect("c");
+        std::fs::write(ws.path().join("inbox").join(shown_copy("c.png")), &copy).expect("copy");
+        // One gone is not shown, though its copy is still there.
+        std::fs::write(ws.path().join("inbox").join(shown_copy("d.heic")), &copy).expect("copy");
+        let mut request = chat(vec![vec![
+            refer("inbox/a.heic"),
+            refer("inbox/b.heic"),
+            refer("inbox/c.png"),
+            refer("inbox/d.heic"),
+        ]]);
         resolve_workspace_images(&mut request, ws.path(), true, &Default::default());
         let blocks = &request.messages[0].content;
         assert_eq!(blocks[0]["source"]["media_type"], "image/png");
         assert_eq!(blocks[0]["source"]["data"], base64(&copy));
         let unshown = blocks[1]["text"].as_str().unwrap_or_default();
         assert!(unshown.contains("not a PNG"), "{unshown}");
+        assert_eq!(blocks[2]["source"]["data"], base64(&small));
+        let gone = blocks[3]["text"].as_str().unwrap_or_default();
+        assert!(gone.contains("not there any more"), "{gone}");
     }
 
     #[test]

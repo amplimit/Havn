@@ -190,9 +190,12 @@ pub async fn receive(
     let stamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
     let bytes = body.clone();
     let text_kind = crate::web_fetch::Kind::of_file(&media_type, &name);
+    // A picture a model cannot be shown as it is, too large or a HEIC
+    // photo, gets a copy it can, shown in its place (issue #225).
+    let copied = media_type.starts_with("image/") && crate::llm_proxy::needs_copy(&body);
     let reserve = if text_kind.is_some() {
         TEXT_BYTES
-    } else if media_type.starts_with("image/") {
+    } else if copied {
         crate::llm_proxy::MAX_IMAGE_BYTES
     } else {
         0
@@ -244,9 +247,7 @@ pub async fn receive(
             }
         }
     }
-    // A picture a model cannot be shown as it is, too large or a HEIC
-    // photo, gets a copy it can, shown in its place (issue #225).
-    if media_type.starts_with("image/") && crate::llm_proxy::needs_copy(&body) {
+    if copied {
         match crate::web_fetch::image_to_show(&body).await {
             Ok(image) => {
                 let copy = crate::llm_proxy::shown_copy(&stored.file);
@@ -667,11 +668,16 @@ fn file_response(
 pub struct InboxFileQuery {
     /// `inbox/<name>`, as an attachment names it.
     pub path: String,
+    /// A picture as the copy the model is shown, if it has one.
+    #[serde(default)]
+    pub shown: bool,
 }
 
 /// `GET /agents/:id/files?path=inbox/<name>` — a file in the agent's inbox
 /// (one sent in a chat, or its text), for the owner's chat to show: a
 /// PNG, JPEG, GIF or WebP image in place, anything else as a download.
+/// With `shown=true`, a picture with a copy the model is shown is that
+/// copy, for a thumbnail.
 /// Read without following links, as everything there may be the agent's.
 pub async fn inbox_file(
     State(state): State<AppState>,
@@ -704,13 +710,13 @@ pub async fn inbox_file(
     let name = q.path[INBOX_DIR.len() + 1..].to_string();
     let workspace = crate::api::agents::workspace_for(&state, agent.id);
     let read = name.clone();
+    let shown = q.shown;
     let bytes = tokio::task::spawn_blocking(move || {
         let dir = inbox(&workspace)?;
-        let bytes = dir.read_bytes(&read, MAX_UPLOAD_BYTES as u64 + TEXT_BYTES)?;
-        // A picture a browser cannot show, a HEIC photo, as the copy the
-        // model is shown (issue #225).
-        if let Some(original) = &bytes
-            && crate::llm_proxy::image_type(original).is_none()
+        // A picture as the copy the model is shown, when asked and there
+        // is one (issue #225): a HEIC photo a browser cannot show, a large
+        // one quicker.
+        if shown
             && let Ok(Some(copy)) = dir.read_bytes(
                 &crate::llm_proxy::shown_copy(&read),
                 crate::llm_proxy::MAX_IMAGE_BYTES,
@@ -718,7 +724,7 @@ pub async fn inbox_file(
         {
             return Ok(Some(copy));
         }
-        Ok::<_, std::io::Error>(bytes)
+        dir.read_bytes(&read, MAX_UPLOAD_BYTES as u64 + TEXT_BYTES)
     })
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?
