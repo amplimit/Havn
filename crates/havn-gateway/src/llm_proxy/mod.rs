@@ -1272,7 +1272,8 @@ pub fn too_long(e: &ProxyError) -> bool {
 /// through [`crate::agent_files`] so nothing the agent controls is
 /// followed. As many of them as `limits` allow, the newest messages' first
 /// (issue #211), each read once, are shown, and only to a model with
-/// `vision`; every other one (not a PNG, JPEG, GIF or WebP by its first
+/// `vision`; one the gateway made a copy of when it came ([`shown_copy`])
+/// as that copy. Every other one (not a PNG, JPEG, GIF or WebP by its first
 /// bytes, too large, missing, outside the inbox, one too many) becomes a
 /// line saying why. Blocking: it reads files. See [`send_seeing`] for a
 /// model that may not take them.
@@ -1518,7 +1519,12 @@ fn image_block(
         Err(e) => return Err(format!("the inbox cannot be read ({e})")),
     };
     let limit = MAX_IMAGE_BYTES.min(room);
-    let bytes = match dir.read_bytes(name, limit) {
+    // The copy the gateway made of one that cannot be shown as it is.
+    let read = match dir.read_bytes(&shown_copy(name), limit) {
+        Ok(None) => dir.read_bytes(name, limit),
+        copy => copy,
+    };
+    let bytes = match read {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return Err("it is not there any more".into()),
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData && limit < MAX_IMAGE_BYTES => {
@@ -1609,6 +1615,142 @@ pub(crate) fn image_type(bytes: &[u8]) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Longest side of the copy an image is shown as when it cannot be shown
+/// as it is (issue #225): as large as models look at.
+const SHOWN_SIDE: u32 = 2048;
+/// Shortest side the copy is made down to when a larger one is still over
+/// [`MAX_IMAGE_BYTES`].
+const LEAST_SIDE: u32 = 512;
+const JPEG_QUALITY: u8 = 85;
+/// Pixels an image may have to be read for its copy (a 48-megapixel phone
+/// photo has fewer), and memory its decoding may take.
+const MAX_DECODED_PIXELS: u64 = 1 << 26;
+const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The name, in the inbox, of the copy shown in place of file `name`
+/// (issue #225): hidden, and never the name of a file sent, as those start
+/// with the time they came.
+pub fn shown_copy(name: &str) -> String {
+    format!(".{name}.shown")
+}
+
+/// Whether image `bytes` is shown as a copy: a HEIC image, or a PNG, JPEG,
+/// GIF or WebP too large to be shown as it is.
+pub fn needs_copy(bytes: &[u8]) -> bool {
+    is_heif(bytes)
+        || image_type(bytes).is_some()
+            && (bytes.len() as u64 > MAX_IMAGE_BYTES
+                || image_size(bytes).is_some_and(|(w, h)| w.max(h) > MAX_IMAGE_SIDE))
+}
+
+/// Whether `bytes` start like a HEIF file that may hold an HEVC image.
+fn is_heif(bytes: &[u8]) -> bool {
+    bytes.get(4..8) == Some(b"ftyp")
+        && matches!(
+            heifer::check_file_type(bytes),
+            heifer::FileTypeResult::Supported | heifer::FileTypeResult::MayBe
+        )
+}
+
+/// A copy of image `bytes` that a model can be shown (issue #225): turned
+/// as its file says, at most [`SHOWN_SIDE`] on a side, and at most
+/// [`MAX_IMAGE_BYTES`], as a JPEG, or a PNG when it is transparent. The
+/// bytes are untrusted: this runs in the converter child.
+pub fn shown_image(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut image = decoded(bytes)?;
+    let mut side = SHOWN_SIDE;
+    loop {
+        if image.width().max(image.height()) > side {
+            image = image.resize(side, side, image::imageops::FilterType::CatmullRom);
+        }
+        let out = encoded(&image)?;
+        if out.len() as u64 <= MAX_IMAGE_BYTES {
+            return Ok(out);
+        }
+        side = image.width().max(image.height()) / 2;
+        if side < LEAST_SIDE {
+            return Err(format!(
+                "it is over {MAX_IMAGE_BYTES} bytes even at {LEAST_SIDE} pixels on a side"
+            ));
+        }
+    }
+}
+
+/// Image `bytes` as pixels, turned as its file says, a HEIC image in sRGB.
+fn decoded(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    use image::ImageDecoder as _;
+    if is_heif(bytes) {
+        let options = heifer::Options::new()
+            .with_max_threads(2)
+            .with_max_pixels(MAX_DECODED_PIXELS);
+        // A colour space heifer cannot convert is shown as it was coded.
+        let decoded = match heifer::decode_srgb_rgba8(bytes, &options) {
+            Err(heifer::Error::Unsupported(_)) => heifer::decode_rgba8(bytes, &options),
+            decoded => decoded,
+        }
+        .map_err(|e| format!("it is not a readable HEIC image ({e})"))?;
+        return image::RgbaImage::from_raw(decoded.width, decoded.height, decoded.data)
+            .map(image::DynamicImage::ImageRgba8)
+            .ok_or_else(|| "it is not a readable HEIC image".to_string());
+    }
+    let unreadable = |e: image::ImageError| format!("it is not a readable image ({e})");
+    let cursor = std::io::Cursor::new(bytes);
+    // By what the bytes are, and only these formats.
+    let mut decoder: Box<dyn image::ImageDecoder> = match image_type(bytes) {
+        Some("image/png") => {
+            Box::new(image::codecs::png::PngDecoder::new(cursor).map_err(unreadable)?)
+        }
+        Some("image/jpeg") => {
+            Box::new(image::codecs::jpeg::JpegDecoder::new(cursor).map_err(unreadable)?)
+        }
+        Some("image/gif") => {
+            Box::new(image::codecs::gif::GifDecoder::new(cursor).map_err(unreadable)?)
+        }
+        Some("image/webp") => {
+            Box::new(image::codecs::webp::WebPDecoder::new(cursor).map_err(unreadable)?)
+        }
+        _ => return Err("it is not a PNG, JPEG, GIF, WebP or HEIC image".into()),
+    };
+    let (width, height) = decoder.dimensions();
+    if u64::from(width) * u64::from(height) > MAX_DECODED_PIXELS {
+        return Err(format!("it is {width}x{height} pixels, too many to read"));
+    }
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_DECODED_BYTES);
+    decoder.set_limits(limits).map_err(unreadable)?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut image = image::DynamicImage::from_decoder(decoder).map_err(unreadable)?;
+    image.apply_orientation(orientation);
+    Ok(image)
+}
+
+/// `image` as a PNG when any of it is transparent, else as a JPEG.
+fn encoded(image: &image::DynamicImage) -> Result<Vec<u8>, String> {
+    use image::ImageEncoder as _;
+    let failed = |e: image::ImageError| format!("the copy could not be written ({e})");
+    let mut out = Vec::new();
+    if image.color().has_alpha() {
+        let rgba = image.to_rgba8();
+        if rgba.pixels().any(|p| p[3] < u8::MAX) {
+            image::codecs::png::PngEncoder::new(&mut out)
+                .write_image(
+                    rgba.as_raw(),
+                    rgba.width(),
+                    rgba.height(),
+                    image::ExtendedColorType::Rgba8,
+                )
+                .map_err(failed)?;
+            return Ok(out);
+        }
+    }
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY)
+        .encode_image(&image.to_rgb8())
+        .map_err(failed)?;
+    Ok(out)
 }
 
 /// Standard base64 with padding.
@@ -2365,6 +2507,132 @@ mod tests {
         webp.extend([0; 8]);
         webp.extend([0x1f, 0x03, 0x00, 0x57, 0x02, 0x00]);
         assert_eq!(image_size(&webp), Some((800, 600)));
+    }
+
+    /// `width` by `height` pixels of noise, which no format compresses, of
+    /// alpha `alpha`.
+    fn noise(width: u32, height: u32, alpha: u8) -> image::RgbaImage {
+        let mut state = 0x2545_f491_u32;
+        image::RgbaImage::from_fn(width, height, |_, _| {
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state.to_le_bytes()[0]
+            };
+            image::Rgba([next(), next(), next(), alpha])
+        })
+    }
+
+    fn png(image: &image::RgbaImage) -> Vec<u8> {
+        let mut out = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .expect("png");
+        out
+    }
+
+    /// A grey JPEG of `width` by `height` whose EXIF says to turn it a
+    /// quarter clockwise, as a phone saves a photo taken upright.
+    fn turned_jpeg(width: u32, height: u32) -> Vec<u8> {
+        let mut plain = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut plain)
+            .encode_image(&image::RgbImage::from_pixel(
+                width,
+                height,
+                image::Rgb([90, 90, 90]),
+            ))
+            .expect("jpeg");
+        let mut exif =
+            b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0".to_vec();
+        let mut out = vec![0xff, 0xd8, 0xff, 0xe1];
+        out.extend(u16::try_from(exif.len() + 2).expect("short").to_be_bytes());
+        out.append(&mut exif);
+        out.extend(&plain[2..]);
+        out
+    }
+
+    #[test]
+    fn an_image_too_large_to_show_is_shown_as_a_copy_within_the_limits() {
+        // Over the bytes a model takes, opaque: a JPEG of the same size.
+        let heavy = png(&noise(1100, 1000, u8::MAX));
+        assert!(heavy.len() as u64 > MAX_IMAGE_BYTES);
+        assert!(needs_copy(&heavy));
+        let copy = shown_image(&heavy).expect("copy");
+        assert_eq!(image_type(&copy), Some("image/jpeg"));
+        assert_eq!(image_size(&copy), Some((1100, 1000)));
+        assert!(copy.len() as u64 <= MAX_IMAGE_BYTES);
+
+        // Over the side a model takes, half transparent: a PNG within it.
+        let mut wide = image::RgbaImage::from_pixel(9000, 20, image::Rgba([10, 200, 30, 255]));
+        for x in 0..4500 {
+            for y in 0..20 {
+                wide.put_pixel(x, y, image::Rgba([0, 0, 0, 0]));
+            }
+        }
+        let wide = png(&wide);
+        assert!(needs_copy(&wide));
+        let copy = shown_image(&wide).expect("copy");
+        assert_eq!(image_type(&copy), Some("image/png"));
+        let shown = image::load_from_memory(&copy).expect("decoded").to_rgba8();
+        assert_eq!(shown.width(), SHOWN_SIDE);
+        assert_eq!(shown.get_pixel(0, 0)[3], 0);
+        assert_eq!(shown.get_pixel(SHOWN_SIDE - 1, 0)[3], u8::MAX);
+
+        // A photo whose EXIF says to turn it is shown turned.
+        let photo = turned_jpeg(8100, 40);
+        assert_eq!(image_size(&photo), Some((8100, 40)));
+        assert!(needs_copy(&photo));
+        let (width, height) = image_size(&shown_image(&photo).expect("copy")).expect("size");
+        assert_eq!(height, SHOWN_SIDE);
+        assert!(width <= 11, "{width}");
+
+        // One within the limits is shown as it is.
+        assert!(!needs_copy(&png(&noise(64, 64, u8::MAX))));
+        assert!(!needs_copy(b"not an image"));
+        assert!(shown_image(b"not an image").is_err());
+    }
+
+    #[test]
+    fn a_heic_photo_is_shown_as_a_jpeg() {
+        let (width, height) = (2600, 48);
+        let photo = heifer::Image {
+            width,
+            height,
+            bit_depth: 8,
+            has_alpha: false,
+            data: [200_u16, 40, 40, 255].repeat((width * height) as usize),
+        };
+        let heic = heifer::encode(&photo, &heifer::EncodeOptions::default()).expect("heic");
+        assert_eq!(image_type(&heic), None);
+        assert!(needs_copy(&heic));
+        let copy = shown_image(&heic).expect("copy");
+        assert_eq!(image_type(&copy), Some("image/jpeg"));
+        let shown = image::load_from_memory(&copy).expect("decoded").to_rgb8();
+        assert_eq!(shown.width(), SHOWN_SIDE);
+        let [r, g, b] = shown.get_pixel(SHOWN_SIDE / 2, shown.height() / 2).0;
+        assert!(r > 170 && g < 80 && b < 80, "{r} {g} {b}");
+        // Half a file is refused, not read.
+        assert!(shown_image(&heic[..heic.len() / 2]).is_err());
+    }
+
+    #[test]
+    fn an_image_is_shown_as_the_copy_made_of_it() {
+        let ws = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir(ws.path().join("inbox")).expect("inbox");
+        let heic = b"\0\0\0\x18ftypheic\0\0\0\0mif1heic";
+        let copy = png(&noise(8, 8, u8::MAX));
+        std::fs::write(ws.path().join("inbox/a.heic"), heic).expect("a");
+        std::fs::write(ws.path().join("inbox").join(shown_copy("a.heic")), &copy).expect("copy");
+        std::fs::write(ws.path().join("inbox/b.heic"), heic).expect("b");
+        let refer = |path: &str| serde_json::json!({"type": "image", "source": {"type": "workspace", "path": path}});
+        let mut request = chat(vec![vec![refer("inbox/a.heic"), refer("inbox/b.heic")]]);
+        resolve_workspace_images(&mut request, ws.path(), true, &Default::default());
+        let blocks = &request.messages[0].content;
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[0]["source"]["data"], base64(&copy));
+        let unshown = blocks[1]["text"].as_str().unwrap_or_default();
+        assert!(unshown.contains("not a PNG"), "{unshown}");
     }
 
     #[test]

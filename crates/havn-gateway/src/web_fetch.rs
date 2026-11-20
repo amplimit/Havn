@@ -12,10 +12,11 @@
 //! choosing. Domains on the policy's allowed domains need no such record.
 //!
 //! Untrusted documents are never parsed in the gateway: the HTML, PDF and
-//! Office parsers run in a child of the gateway binary (`--convert-page`) with no
-//! network, bounded memory and CPU time, killed on a deadline; under a root
-//! gateway it runs as `nobody`. A parser that panics or loops loses one
-//! fetch, not the gateway.
+//! Office parsers, and the image decoders that make a picture sent in a
+//! chat one a model can be shown, run in a child of the gateway binary
+//! (`--convert-page`) with no network, bounded memory and CPU time, killed
+//! on a deadline; under a root gateway it runs as `nobody`. A parser that
+//! panics or loops loses one fetch, not the gateway.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -1164,15 +1165,38 @@ fn error_chain(e: &dyn std::error::Error) -> String {
 /// chat), read in a converter child under the same limits as a fetched
 /// page, and whether it was cut.
 pub async fn document_text(kind: Kind, input: &[u8]) -> Result<(String, bool), String> {
-    // Converters of uploads, apart from the tool's: each may take
-    // [`CONVERT_MEMORY_BYTES`].
-    static UPLOAD_CONVERSIONS: Semaphore = Semaphore::const_new(2);
     let _slot = UPLOAD_CONVERSIONS
         .acquire()
         .await
         .map_err(|e| e.to_string())?;
-    let url = Url::parse("https://upload.invalid/").map_err(|e| e.to_string())?;
-    convert_in_child(kind, input, &url).await
+    convert_in_child(kind, input, &upload_url()?).await
+}
+
+/// The copy of image `input` (a file sent in a chat) that a model is shown
+/// in its place (issue #225), made in a converter child under the same
+/// limits as a document's text.
+pub async fn image_to_show(input: &[u8]) -> Result<Vec<u8>, String> {
+    let _slot = UPLOAD_CONVERSIONS
+        .acquire()
+        .await
+        .map_err(|e| e.to_string())?;
+    let image = run_converter(IMAGE, input, &upload_url()?).await?;
+    if image.len() as u64 > llm_proxy::MAX_IMAGE_BYTES || llm_proxy::image_type(&image).is_none() {
+        return Err("the converter wrote no image".into());
+    }
+    Ok(image)
+}
+
+/// The converter's argument for an image, made a copy a model can be shown.
+const IMAGE: &str = "image";
+
+/// Converters of uploads, apart from the tool's: each may take
+/// [`CONVERT_MEMORY_BYTES`].
+static UPLOAD_CONVERSIONS: Semaphore = Semaphore::const_new(2);
+
+/// The URL an upload is converted under: there is none.
+fn upload_url() -> Result<Url, String> {
+    Url::parse("https://upload.invalid/").map_err(|e| e.to_string())
 }
 
 /// The gateway binary, for the converter. `/proc/self/exe` still runs
@@ -1190,10 +1214,18 @@ fn converter_program() -> PathBuf {
 /// where other local users would see it. The child answers with a line
 /// saying whether it cut the text, then the text.
 async fn convert_in_child(kind: Kind, input: &[u8], url: &Url) -> Result<(String, bool), String> {
+    let out = run_converter(kind.name(), input, url).await?;
+    let out = String::from_utf8_lossy(&out);
+    let (flag, text) = out.split_once('\n').unwrap_or(("full", ""));
+    Ok((text.to_string(), flag == "cut"))
+}
+
+/// Run a converter child on `input` with argument `kind`: what it wrote.
+async fn run_converter(kind: &str, input: &[u8], url: &Url) -> Result<Vec<u8>, String> {
     let mut command = tokio::process::Command::new(converter_program());
     command
         .arg(CONVERT_ARG)
-        .arg(kind.name())
+        .arg(kind)
         .env_clear()
         .current_dir("/")
         .stdin(std::process::Stdio::piped())
@@ -1265,10 +1297,7 @@ async fn convert_in_child(kind: Kind, input: &[u8], url: &Url) -> Result<(String
             format!("could not read {url}: {message}")
         });
     }
-    let out = out.map_err(|e| format!("reading the page converter's output failed: {e}"))?;
-    let out = String::from_utf8_lossy(&out);
-    let (flag, text) = out.split_once('\n').unwrap_or(("full", ""));
-    Ok((text.to_string(), flag == "cut"))
+    out.map_err(|e| format!("reading the page converter's output failed: {e}"))
 }
 
 #[cfg(unix)]
@@ -1332,7 +1361,8 @@ fn confine_converter(command: &mut tokio::process::Command) {
 
 /// `havn-gateway --convert-page <kind>`: convert the document on stdin,
 /// after a first line holding its URL, to a line `full` or `cut` and the
-/// text on stdout. Run by the gateway only, before any async runtime
+/// text on stdout; with [`IMAGE`], the image to the copy a model is shown
+/// (issue #225). Run by the gateway only, before any async runtime
 /// starts. False when it failed, with the reason on stderr.
 pub fn convert_main(args: &[String]) -> bool {
     use std::io::{Read as _, Write as _};
@@ -1340,8 +1370,15 @@ pub fn convert_main(args: &[String]) -> bool {
         let _ = writeln!(std::io::stderr(), "{message}");
         false
     };
-    let Some(kind) = args.first().and_then(|k| Kind::named(k)) else {
-        return fail("usage: havn-gateway --convert-page <html|pdf|text|docx|sheet>");
+    // `None` for an image, made a copy a model can be shown.
+    let kind = match args.first().map(String::as_str) {
+        Some(IMAGE) => None,
+        named => match named.and_then(Kind::named) {
+            Some(kind) => Some(kind),
+            None => {
+                return fail("usage: havn-gateway --convert-page <html|pdf|text|docx|sheet|image>");
+            }
+        },
     };
     let mut input = Vec::new();
     if let Err(e) = std::io::stdin()
@@ -1376,6 +1413,15 @@ pub fn convert_main(args: &[String]) -> bool {
     };
     #[cfg(not(unix))]
     let mut out = std::io::stdout();
+    let Some(kind) = kind else {
+        return match crate::llm_proxy::shown_image(&input[newline + 1..]) {
+            Ok(image) => match out.write_all(&image).and_then(|()| out.flush()) {
+                Ok(()) => true,
+                Err(e) => fail(&format!("writing the image failed: {e}")),
+            },
+            Err(message) => fail(&message),
+        };
+    };
     match convert(kind, &input[newline + 1..], &url) {
         Ok(text) => {
             let (text, cut) = cap_text(text);
