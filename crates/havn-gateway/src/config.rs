@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct GatewayConfig {
     pub listen: String,
+    /// Where the gateway serves the dashboard, with the API under `/api`
+    /// (issue #259); empty to serve none.
+    pub dashboard_listen: String,
     /// Path to the gateway's `SQLite` database file. Per locked scope, no
     /// other datastore is supported. Created on first run with WAL + foreign
     /// keys.
@@ -623,6 +626,7 @@ impl Default for GatewayConfig {
             // Loopback by default; explicit opt-in for public exposure (spec §11
             // ClawJacked-class mitigation).
             listen: "127.0.0.1:8080".into(),
+            dashboard_listen: "127.0.0.1:3000".into(),
             db_path: default_data_dir().join("havn.db"),
             agent_socket_path: default_data_dir().join("agent.sock"),
             workspace_root: default_data_dir().join("agents"),
@@ -667,9 +671,10 @@ fn default_data_dir() -> PathBuf {
 }
 
 fn default_allowed_origins() -> Vec<String> {
-    // The dashboard (`apps/dashboard/server.mjs`, dev and production)
+    // The dashboard's development server (`apps/dashboard/server.mjs`)
     // listens on 3000 and presents WebSocket upgrades with
-    // `Origin: http://127.0.0.1:3000`.
+    // `Origin: http://127.0.0.1:3000`; the gateway's own dashboard
+    // accepts its origin anyway.
     vec![
         "http://127.0.0.1:3000".into(),
         "http://localhost:3000".into(),
@@ -761,6 +766,20 @@ impl GatewayConfig {
                 "[network] egress_proxy_port = {port} must be a port of its own, not 0 or the \
                  gateway's listen port"
             );
+        }
+        if !parsed.dashboard_listen.is_empty() {
+            let dashboard = parsed
+                .dashboard_listen
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .map(|addr| addr.port());
+            if dashboard.is_none() || dashboard == listen_port || dashboard == Some(port) {
+                anyhow::bail!(
+                    "dashboard_listen = {:?} must be an IP address and a port of its own, not \
+                     listen's or [network] egress_proxy_port; \"\" serves no dashboard",
+                    parsed.dashboard_listen
+                );
+            }
         }
         havn_core::policy::validate_domains(
             "[network] blocked_domains",

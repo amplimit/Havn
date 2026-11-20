@@ -1,7 +1,8 @@
 "use client";
 
-import { use, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import {
   ApiError,
   api,
@@ -42,7 +43,7 @@ const DEFAULT_DAYS: Record<MemoryKind, Record<MemoryEntry["source"], number | nu
 };
 
 /**
- * `/agents/[id]/memory` — view, edit, add and export what the agent
+ * `/agent/memory?id=` — view, edit, add and export what the agent
  * remembers.
  * Reads are answered by the running agent from its own agent.db (409
  * when it is stopped). Delete buttons route through the agent socket as
@@ -50,12 +51,12 @@ const DEFAULT_DAYS: Record<MemoryKind, Record<MemoryEntry["source"], number | nu
  * (spec §5.2). The "delete" button shows a 409-aware message when
  * the agent isn't running.
  */
-export default function MemoryPage({
-  params,
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const { id } = use(params);
+export default function MemoryPage() {
+  const id = useSearchParams().get("id") ?? "";
+  return <Memory key={id} id={id} />;
+}
+
+function Memory({ id }: { id: string }) {
 
   const [entries, setEntries] = useState<MemoryEntry[] | null>(null);
   const [uninitialised, setUninitialised] = useState(false);
@@ -164,7 +165,7 @@ export default function MemoryPage({
     <div className="mx-auto max-w-5xl px-4 py-8 sm:px-8 sm:py-12">
       <header className="mb-8">
         <Link
-          href={`/agents/${id}`}
+          href={`/agent?id=${id}`}
           className="mb-2 inline-block text-sm"
           style={{ color: "var(--color-body)" }}
         >

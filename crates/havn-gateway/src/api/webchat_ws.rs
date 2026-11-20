@@ -3,7 +3,8 @@
 //! Auth (Phase 1, single-user mode). The connect URL must include a
 //! `?token=<user_id>` query param matching the gateway's current user;
 //! Phase 2 replaces this with a signed short-lived token from real auth.
-//! The `Origin` header must be present and match the configured allowlist —
+//! The `Origin` header must be present and match the configured allowlist,
+//! or, on the dashboard's listener, be that page's own origin —
 //! direct mitigation of `OpenClaw`'s "`ClawJacked`" CVE class so that
 //! malicious websites cannot drive a local agent over a permissive
 //! `WebSocket`. The agent itself must already be running (registered and
@@ -16,6 +17,7 @@
 //! [`WebChatRouter::deliver`](crate::webchat::WebChatRouter::deliver) to push
 //! back onto the mpsc of every open tab of this session.
 
+use axum::Extension;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::HeaderMap;
@@ -46,6 +48,7 @@ pub async fn handler(
     user: AuthedUser,
     Path(agent_id): Path<String>,
     Query(query): Query<WsQuery>,
+    dashboard: Option<Extension<crate::dashboard::SameOrigin>>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
@@ -58,7 +61,8 @@ pub async fn handler(
             ApiError::BadRequest("missing Origin header".into())
         })?;
     let origins = state.allowed_origins.load();
-    if !origins.iter().any(|allowed| allowed == origin) {
+    let own = dashboard.is_some() && crate::dashboard::same_origin(origin, &headers);
+    if !own && !origins.iter().any(|allowed| allowed == origin) {
         warn!(origin, "rejecting webchat WS: origin not in allowlist");
         return Err(ApiError::BadRequest(format!("origin {origin} not allowed")));
     }

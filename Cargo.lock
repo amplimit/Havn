@@ -1886,6 +1886,7 @@ dependencies = [
  "quick-xml",
  "regex",
  "reqwest 0.13.1",
+ "rust-embed",
  "secrecy",
  "serde",
  "serde_json",
@@ -4259,6 +4260,7 @@ version = "8.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "915e33dccbe7deb2b8a342dc4c517503fe85e0230ddbae40a4fb0220493dad9b"
 dependencies = [
+ "mime_guess",
  "sha2 0.11.1",
  "walkdir",
 ]

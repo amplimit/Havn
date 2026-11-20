@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * `/teams/[id]/credentials` — team-shared LLM credentials with
+ * `/team/credentials?id=` — team-shared LLM credentials with
  * per-user caps (spec §7, §10.3 admin view).
  *
  * Members see the list (so they understand what fallback keys exist).
@@ -15,16 +15,17 @@
  * are the single most-asked-for use case for team credentials.
  */
 
-import { use, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { Lock } from "lucide-react";
 import { ApiError, api, type CredentialView, type TeamView } from "@/lib/api";
 
-export default function TeamCredentialsPage({
-  params,
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const { id } = use(params);
+export default function TeamCredentialsPage() {
+  const id = useSearchParams().get("id") ?? "";
+  return <TeamCredentials key={id} id={id} />;
+}
+
+function TeamCredentials({ id }: { id: string }) {
   const [team, setTeam] = useState<TeamView | null>(null);
   const [creds, setCreds] = useState<CredentialView[] | null>(null);
   const [error, setError] = useState<string | null>(null);

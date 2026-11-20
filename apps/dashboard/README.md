@@ -4,7 +4,7 @@ Next.js dashboard for the havn gateway (spec §10). Includes:
 
 - **agent list** (`/`) — start / stop / delete with live status pills
 - **agent creation** (`/agents/new`) — name + model picker
-- **chat view** (`/agents/[id]`) — WebSocket connection to `/ws/chat/:agent_id`
+- **chat view** (`/agent?id=`) — WebSocket connection to `/ws/chat/:agent_id`
 - **credentials** (`/credentials`) — provider keys with optional `max_tokens_per_day` cap
 
 ## Design
@@ -15,6 +15,15 @@ Inter's `ss01` stylistic set toggled on — the closest open match for
 "geometric, modern letterforms at light weights." All other tokens (colors,
 shadows, radii, spacing) are reproduced verbatim.
 
+## Release
+
+`npm run build` exports static pages to `out/`. Build it before the
+gateway: `havn-gateway` embeds `out/` and serves it on `dashboard_listen`
+with the API under `/api` and the web chat under `/ws` (see the
+[main README](../../README.md#dashboard)). The release workflow and
+install.sh do both. Pages that show one agent or team take its id from the
+address (`/agent/settings?id=<agent-id>`), since a static page cannot.
+
 ## Dev
 
 ```bash
@@ -23,16 +32,11 @@ npm install                       # one-time
 npm run dev                       # http://localhost:3000
 ```
 
-## Production
-
-```bash
-npm run build
-npm start                         # http://localhost:3000
-```
-
-Both commands run `server.mjs`, which serves the UI and proxies `/api/*`
-(REST) and `/ws/*` (WebChat WebSocket) to the gateway, so the browser only
-talks to the dashboard's origin. Settings, read at startup:
+`npm run dev` runs `server.mjs`: `next dev` with hot reload, proxying
+`/api/*` (REST) and `/ws/*` (WebChat WebSocket) to a running gateway, so the
+browser only talks to the dashboard's origin. Give the gateway
+`dashboard_listen = ""`, or another port, so the two do not both want 3000.
+Settings, read at startup:
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -47,15 +51,13 @@ The proxy presents WebSocket upgrades to the gateway with
 default `allowed_origins`; if you change `PORT`, add
 `http://127.0.0.1:<PORT>` to `allowed_origins` in the gateway config.
 
-## Access from another machine
+## The development server behind a proxy
 
-The dashboard has no login of its own: anyone who can reach it acts as
-the single-user operator, or as whatever identity header they are allowed
-to send. Keep it on `127.0.0.1` and reach it through one of:
+The development server has no login of its own either: anyone who can
+reach it acts as the single-user operator, or as whatever identity header
+they are allowed to send. Keep it on `127.0.0.1`. To try it multi-user:
 
-- **An SSH tunnel** (single user): `ssh -L 3000:127.0.0.1:3000 <server>`,
-  then open `http://localhost:3000`.
-- **An authenticating reverse proxy** on the same host (multi-user). The
+- **An authenticating reverse proxy** on the same host. The
   proxy logs the user in and sets the identity header (the gateway's
   `trust_header.header`, for example `X-Forwarded-User`) to the user's
   external id (`havn user add --external-id`) or havn user id on every

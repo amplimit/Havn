@@ -1,20 +1,20 @@
 "use client";
 
 /**
- * `/teams/[id]` overview tab — quick summary + admin-only delete
+ * `/team?id=` overview tab — quick summary + admin-only delete
  * (spec §10.3).
  */
 
-import { use, useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useEffect, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { api, type TeamView } from "@/lib/api";
 
-export default function TeamOverviewPage({
-  params,
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const { id } = use(params);
+export default function TeamOverviewPage() {
+  const id = useSearchParams().get("id") ?? "";
+  return <TeamOverview key={id} id={id} />;
+}
+
+function TeamOverview({ id }: { id: string }) {
   const router = useRouter();
   const [team, setTeam] = useState<TeamView | null>(null);
   const [error, setError] = useState<string | null>(null);

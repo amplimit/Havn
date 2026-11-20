@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * Team-scoped layout — shared sub-nav for `/teams/[id]/*` pages
+ * Team-scoped layout — shared sub-nav for `/team/*?id=` pages
  * (spec §10.3 admin views). Each tab is a Next route under this
  * folder; the layout provides the consistent header + nav strip.
  *
@@ -11,8 +11,8 @@
  */
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
-import { use, useEffect, useState } from "react";
+import { usePathname, useSearchParams } from "next/navigation";
+import { useEffect, useState } from "react";
 import { api, type TeamView } from "@/lib/api";
 
 const TABS: Array<{ slug: string; label: string; adminOnly: boolean }> = [
@@ -25,14 +25,16 @@ const TABS: Array<{ slug: string; label: string; adminOnly: boolean }> = [
   { slug: "audit", label: "audit log", adminOnly: true },
 ];
 
-export default function TeamLayout({
-  children,
-  params,
-}: {
-  children: React.ReactNode;
-  params: Promise<{ id: string }>;
-}) {
-  const { id } = use(params);
+export default function TeamLayout({ children }: { children: React.ReactNode }) {
+  const id = useSearchParams().get("id") ?? "";
+  return (
+    <TeamFrame key={id} id={id}>
+      {children}
+    </TeamFrame>
+  );
+}
+
+function TeamFrame({ id, children }: { id: string; children: React.ReactNode }) {
   const pathname = usePathname();
   const [team, setTeam] = useState<TeamView | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -92,8 +94,9 @@ export default function TeamLayout({
         style={{ borderColor: "var(--color-border-default)" }}
       >
         {TABS.filter((t) => !t.adminOnly || team?.is_admin).map((t) => {
-          const href = `/teams/${id}${t.slug ? `/${t.slug}` : ""}`;
-          const active = pathname === href;
+          const path = `/team${t.slug ? `/${t.slug}` : ""}`;
+          const href = `${path}?id=${id}`;
+          const active = pathname === path;
           return (
             <Link
               key={t.slug}

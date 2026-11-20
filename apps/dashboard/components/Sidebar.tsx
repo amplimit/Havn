@@ -9,7 +9,7 @@
  */
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useSearchParams } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import {
   Bot,
@@ -33,6 +33,9 @@ const NO_VERSION = "version not reported";
 
 export function Sidebar() {
   const pathname = usePathname();
+  const current = useSearchParams().get("id");
+  const onAgent = pathname === "/agent" || pathname?.startsWith("/agent/");
+  const onTeam = pathname === "/team" || pathname?.startsWith("/team/");
   const [agents, setAgents] = useState<AgentView[] | null>(null);
   const [teams, setTeams] = useState<TeamView[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -196,13 +199,13 @@ export function Sidebar() {
             </div>
           )}
           {agents?.map((a) => {
-            const href = `/agents/${a.id}`;
-            const active = pathname === href || pathname?.startsWith(`${href}/`);
+            const href = `/agent?id=${a.id}`;
+            const active = onAgent && current === a.id;
             return (
               <Link
                 key={a.id}
                 href={href}
-                aria-current={pathname === href ? "page" : active ? "true" : undefined}
+                aria-current={active && pathname === "/agent" ? "page" : active ? "true" : undefined}
                 className="flex items-center justify-between gap-2 rounded px-2 py-1.5 text-sm transition-colors hover:bg-[rgba(83,58,253,0.05)]"
                 style={{
                   backgroundColor: active ? ACTIVE_BG : undefined,
@@ -235,13 +238,13 @@ export function Sidebar() {
           <SectionTitle>Teams</SectionTitle>
           <nav aria-label="Teams" className="flex flex-col gap-0.5">
             {teams.map((t) => {
-              const href = `/teams/${t.id}`;
-              const active = pathname?.startsWith(href);
+              const href = `/team?id=${t.id}`;
+              const active = onTeam && current === t.id;
               return (
                 <Link
                   key={t.id}
                   href={href}
-                  aria-current={pathname === href ? "page" : active ? "true" : undefined}
+                  aria-current={active && pathname === "/team" ? "page" : active ? "true" : undefined}
                   className="flex items-center justify-between gap-2 rounded px-2 py-1.5 text-sm transition-colors hover:bg-[rgba(83,58,253,0.05)]"
                   style={{
                     backgroundColor: active ? ACTIVE_BG : undefined,
@@ -333,8 +336,8 @@ function SidebarLink({
   );
 }
 
-// The dashboard is built from a release tag next to the gateway; a pair
-// from different releases is the usual cause of odd API errors.
+// The gateway serves the dashboard of its own release, so a difference
+// means a page loaded before an upgrade (or a dashboard run from source).
 function VersionLine({ gateway }: { gateway: string | null }) {
   const mismatch = gateway !== null && gateway !== DASHBOARD_VERSION;
   return (
@@ -348,8 +351,7 @@ function VersionLine({ gateway }: { gateway: string | null }) {
           <p className="mt-1 flex items-start gap-1" style={{ color: "var(--color-warning-text)" }}>
             <TriangleAlert size={12} className="mt-px shrink-0" aria-hidden="true" />
             <span>
-              Different releases: build the dashboard from the tag that matches{" "}
-              <code className="font-mono">havn --version</code>.
+              Different releases: reload the page.
             </span>
           </p>
         )}

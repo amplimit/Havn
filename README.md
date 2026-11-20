@@ -115,7 +115,7 @@ A stopping gateway takes no new messages and gives the agents up to 30 seconds t
 
 Up to v0.2.0 havn has no `havn backup`: there, stop the gateway and copy its data instead (`systemctl stop havn && cp -a ~/.local/share/havn ~/havn-backup-$(date +%Y%m%d-%H%M%S)`, and a `db_path` or `workspace_root` elsewhere too), then install and start it.
 
-The new gateway and agents migrate their databases when they start, and there is no way back, so keep the backup until the new version works. Upgrade the dashboard separately: check out the new tag in its directory, then run `npm install` and `npm run build`, and restart it.
+The new gateway and agents migrate their databases when they start, and there is no way back, so keep the backup until the new version works. The dashboard comes with the gateway and is upgraded with it. Up to v0.2.7 it ran as a Node process of its own: when moving from one of those, stop and remove that process before restarting the gateway, which serves the dashboard on `dashboard_listen` (`127.0.0.1:3000` by default); set `dashboard_listen` to the address the old one used to keep your tunnels and proxy as they are. An open dashboard tab still runs the old page, and says so beside the version: reload it.
 
 ### Backup and restore
 
@@ -183,26 +183,24 @@ cargo build --release
 
 ### Dashboard
 
-The dashboard is not part of the release binaries. Run it on the gateway
-host with Node.js 22.13+, from your source checkout or a fresh clone:
+The gateway serves the dashboard of its own release, with nothing else to
+install or start: open `http://localhost:3000`, create an agent, and start
+chatting. It is served on `dashboard_listen` in config.toml
+(`"127.0.0.1:3000"` by default, `""` for none), with the management API under
+`/api` and the web chat under `/ws` on the same origin.
 
-```bash
-# Clone the tag matching the release you installed, e.g. v0.2.7
-# (`havn --version` shows it); skip if you built from source:
-git clone --branch v0.2.7 https://github.com/amplimit/havn
-cd havn/apps/dashboard
-npm install
-npm run build
-npm start                    # http://localhost:3000
-```
+It has no login of its own. Without `trust_header` it answers only requests
+addressed to `localhost`, `127.0.0.1` or `[::1]` (or to an origin listed in
+`allowed_origins`), so a web page whose host name leads to 127.0.0.1 cannot
+use it; the management API on `listen` checks the same. From another machine use an SSH tunnel
+(`ssh -L 3000:127.0.0.1:3000 <server>`) or an authenticating reverse proxy
+(see [Multi-user mode behind an SSO proxy](#multi-user-mode-behind-an-sso-proxy)).
 
-Then open `http://localhost:3000`, create an agent, and start chatting. The
-dashboard listens on 127.0.0.1 only and has no login of its own; from
-another machine use an SSH tunnel (`ssh -L 3000:127.0.0.1:3000 <server>`) or
-an authenticating reverse proxy. For development, `npm run dev` serves the
-same app with hot reload. See
-[apps/dashboard/README.md](apps/dashboard/README.md) for settings and
-multi-user setup.
+A gateway built from source embeds the dashboard when it is built first
+(`npm ci && npm run build` in `apps/dashboard`, with Node.js 22.13+;
+install.sh does this when it finds npm); without it, the port says how. See
+[apps/dashboard/README.md](apps/dashboard/README.md) for the development
+server (`npm run dev`).
 
 ## Project Structure
 
@@ -541,7 +539,7 @@ havn user set-external-id <existing-id> ops@example.com                 # e.g. t
 havn user set-external-id <existing-id> --clear
 ```
 
-The dashboard asks the gateway for the header name at startup (`GET /auth/info`) and forwards that header only from the addresses in `HAVN_DASHBOARD_TRUSTED_PROXIES`. It drops other common identity headers such as `X-User-ID`, `Remote-User` and `X-Forwarded-Email` from every peer, and refuses `/api` and `/ws` requests while it does not know the name. It marks each forwarded request with `X-Havn-Identity-Header` naming the header it filtered for, and the gateway refuses a request marked for another name, so renaming `trust_header.header` cannot open a window before the dashboard notices. `HAVN_DASHBOARD_IDENTITY_HEADER` is optional; when set, the dashboard refuses to start if the gateway reads another header. When the dashboard runs on the gateway host, the gateway sees the dashboard as a loopback peer, so `allowed_proxies = ["127.0.0.1/32"]` and `listen = "127.0.0.1:8080"` cover it. Route both the UI and `/api` and `/ws` through the SSO proxy, without unauthenticated paths: a path the proxy skips would pass through whatever header the client sent.
+Point the SSO proxy at `dashboard_listen`. Its `/api` is the same API as `listen`, under the same rule: the identity header is read only from an `allowed_proxies` peer, so with the proxy on the gateway host `allowed_proxies = ["127.0.0.1/32"]` covers it. Route the UI, `/api` and `/ws` through the SSO proxy, without unauthenticated paths: a path the proxy skips would pass through whatever header the client sent. The web chat's WebSocket is accepted from the page's own origin (its scheme and `Host`) or from one in `allowed_origins`, so have the proxy pass the `Host` header on (oauth2-proxy does by default, nginx with `proxy_set_header Host $host`), or list the dashboard's public origin there.
 
 #### oauth2-proxy
 
@@ -556,14 +554,11 @@ oauth2-proxy \
   --cookie-secret-file=/etc/oauth2-proxy/cookie-secret \
   --email-domain=example.com \
   --pass-user-headers=true
-
-HAVN_DASHBOARD_TRUSTED_PROXIES=127.0.0.1 \
-HAVN_DASHBOARD_IDENTITY_HEADER=X-Forwarded-Email \
-npm start   # in apps/dashboard
 ```
 
 ```toml
 listen = "127.0.0.1:8080"
+dashboard_listen = "127.0.0.1:3000"
 
 [trust_header]
 enabled = true
@@ -607,12 +602,9 @@ location / {
 }
 ```
 
-```sh
-HAVN_DASHBOARD_TRUSTED_PROXIES=127.0.0.1 HAVN_DASHBOARD_IDENTITY_HEADER=Remote-User npm start
-```
-
 ```toml
 listen = "127.0.0.1:8080"
+dashboard_listen = "127.0.0.1:3000"
 
 [trust_header]
 enabled = true

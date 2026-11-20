@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * `/teams/[id]/audit` — admin-only audit log viewer (spec §10.3).
+ * `/team/audit?id=` — admin-only audit log viewer (spec §10.3).
  *
  * Pagination is `before=<rfc3339>` cursor-style — older pages hang off
  * the oldest visible row. Filters (action prefix, agent, user) compose
@@ -9,7 +9,8 @@
  * we render JSON inline.
  */
 
-import { use, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { ApiError, type AuditEntryView } from "@/lib/api";
 import { SkeletonList } from "@/components/SkeletonList";
 
@@ -25,12 +26,12 @@ const ACTION_PREFIXES = [
   "team_credential.",
 ];
 
-export default function TeamAuditPage({
-  params,
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const { id } = use(params);
+export default function TeamAuditPage() {
+  const id = useSearchParams().get("id") ?? "";
+  return <TeamAudit key={id} id={id} />;
+}
+
+function TeamAudit({ id }: { id: string }) {
   const [entries, setEntries] = useState<AuditEntryView[]>([]);
   const [nextBefore, setNextBefore] = useState<string | null>(null);
   // True while the first page for the current filter loads.

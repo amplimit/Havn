@@ -1,10 +1,10 @@
-// scripts/dashboard-chat.mjs - open a chat through the dashboard's own
-// server in a headless browser and wait for the agent's reply.
+// scripts/dashboard-chat.mjs - open a chat through the dashboard the
+// gateway serves, in a headless browser, and wait for the agent's reply.
 //
 // For the length of the run it also serves a mock of the Anthropic
 // Messages API, which the gateway reaches through `[llm.base_url]`
 // (scripts/readme-deploy.sh sets that up). Checks that the reply shows up
-// in the page, that it came over the dashboard's `/ws` proxy, that `/api`
+// in the page, that it came over the dashboard's own `/ws`, that `/api`
 // answers through the dashboard, and that the gateway called the mock with
 // the credential that was added.
 //
@@ -123,8 +123,8 @@ try {
   await page.getByRole("button", { name: "create agent" }).click();
   const createdStatus = (await created).status();
   check(createdStatus === 200 || createdStatus === 201, `POST /api/agents returned ${createdStatus}`);
-  await page.waitForURL(/\/agents\/[0-9a-f-]{36}$/);
-  const agentPath = new URL(page.url()).pathname;
+  await page.waitForURL(/\/agent\?id=[0-9a-f-]{36}$/);
+  const agent = new URL(page.url()).searchParams.get("id");
 
   const composer = page.locator("textarea:not([disabled])");
   await composer.waitFor();
@@ -140,7 +140,7 @@ try {
   );
   check(
     chat.received.some((payload) => payload.includes(REPLY)),
-    "the reply did not arrive over the dashboard's /ws proxy",
+    "the reply did not arrive over the dashboard's own /ws",
   );
 
   const me = await page.evaluate(async () => {
@@ -162,8 +162,8 @@ try {
     ["models", "/models"],
     ["credentials", "/credentials"],
     ["teams", "/teams"],
-    ["chat", agentPath],
-    ["settings", `${agentPath}/settings`],
+    ["chat", `/agent?id=${agent}`],
+    ["settings", `/agent/settings?id=${agent}`],
   ]);
 } catch (e) {
   failure = e;

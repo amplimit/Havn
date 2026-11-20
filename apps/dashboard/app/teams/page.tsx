@@ -131,7 +131,7 @@ export default function TeamsPage() {
           {teams.map((t) => (
             <li key={t.id}>
               <Link
-                href={`/teams/${t.id}`}
+                href={`/team?id=${t.id}`}
                 className="card flex items-center justify-between px-4 py-3 transition-colors hover:bg-[rgba(83,58,253,0.04)]"
               >
                 <div>

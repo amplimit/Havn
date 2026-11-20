@@ -114,6 +114,19 @@ jobs:
           echo "/opt/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
           cargo install --locked cargo-zigbuild
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/dashboard/package-lock.json
+
+      - name: build the dashboard
+        # havn-gateway embeds apps/dashboard/out and serves it (issue #259).
+        working-directory: apps/dashboard
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
       - name: build static binaries
         run: cargo zigbuild --release --target ${{ matrix.target }} --bins
 
@@ -126,6 +139,9 @@ jobs:
           file "$bin" | grep -q "statically linked" \
             || { echo "::error::$bin is not statically linked"; exit 1; }
           echo "ok: static"
+          grep -qa '<title>havn dashboard</title>' "$bin" \
+            || { echo "::error::$bin does not carry the dashboard"; exit 1; }
+          echo "ok: dashboard embedded"
 
       - name: package
         id: pkg

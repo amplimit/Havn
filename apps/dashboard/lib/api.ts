@@ -2,8 +2,8 @@ import type { Attachment } from "./protocol";
 /**
  * Thin REST client for the gateway management API (spec §8.3, §10.3).
  *
- * Calls go to `/api/*` on the dashboard's own origin; `server.mjs`
- * proxies them to the gateway.
+ * Calls go to `/api/*` on the dashboard's own origin: the gateway serves
+ * both, and in development `server.mjs` proxies them to it.
  */
 
 const BASE = "/api";

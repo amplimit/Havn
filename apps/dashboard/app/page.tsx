@@ -104,7 +104,7 @@ export default function HomePage() {
               <div className="min-w-[12rem] flex-1">
                 <div className="flex items-center gap-3">
                   <Link
-                    href={`/agents/${a.id}`}
+                    href={`/agent?id=${a.id}`}
                     className="display-h3 truncate hover:underline"
                   >
                     {a.name}
@@ -119,7 +119,7 @@ export default function HomePage() {
                 </p>
               </div>
               <div className="flex shrink-0 gap-2">
-                <Link href={`/agents/${a.id}`} className="btn-primary">
+                <Link href={`/agent?id=${a.id}`} className="btn-primary">
                   chat
                 </Link>
                 <button

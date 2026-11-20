@@ -198,6 +198,16 @@ if $use_source; then
     # 5. Build the binaries. Profile defaults to release; HAVN_PROFILE=debug
     # is the fast path for CI smoke.
     cd "$SRC_DIR"
+    # The gateway embeds the dashboard built here (apps/dashboard/out).
+    if command -v npm >/dev/null 2>&1; then
+        log "building the dashboard (npm ci, npm run build)"
+        if ! (cd apps/dashboard && npm ci --no-audit --no-fund && npm run build); then
+            rm -rf apps/dashboard/out
+            warn "building the dashboard failed (it needs Node.js 22.13 or later): the gateway is built without it"
+        fi
+    else
+        warn "npm not found: the gateway is built without the dashboard; install Node.js 22.13 or later and run this again to include it"
+    fi
     log "cargo build --profile=$PROFILE --bins (this is the long step)"
     case "$PROFILE" in
         release) cargo build --release --bins ;;
@@ -313,6 +323,7 @@ next:
   havn model add anthropic:claude-sonnet-4-6    # a model agents may use (provider:model)
   havn agent create my-first-agent
   open http://127.0.0.1:8080/healthz            # confirm the gateway responds
+  open http://127.0.0.1:3000                    # the dashboard (dashboard_listen)
   havn doctor                                   # check isolation and network prerequisites
 EOF
 if $unit_installed; then

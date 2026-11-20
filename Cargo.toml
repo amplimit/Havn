@@ -47,6 +47,7 @@ tokio-tungstenite = "0.29"
 tokio-util = { version = "0.7", features = ["rt"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
+rust-embed = { version = "8.14", features = ["mime-guess", "debug-embed"] }
 
 # Errors / logging
 thiserror = "2"

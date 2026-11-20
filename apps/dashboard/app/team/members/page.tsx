@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * `/teams/[id]/members` — admin-only roster (spec §10.3).
+ * `/team/members?id=` — admin-only roster (spec §10.3).
  *
  * Add/remove members + change their role. Uses the team's roles API
  * to populate the role dropdown so admins always see the actual set
@@ -10,7 +10,8 @@
  * admin types a known X-User-ID (CLI: `havn user list`).
  */
 
-import { use, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import {
   ApiError,
   api,
@@ -18,12 +19,12 @@ import {
   type RoleView,
 } from "@/lib/api";
 
-export default function MembersPage({
-  params,
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const { id } = use(params);
+export default function MembersPage() {
+  const id = useSearchParams().get("id") ?? "";
+  return <Members key={id} id={id} />;
+}
+
+function Members({ id }: { id: string }) {
   const [members, setMembers] = useState<MemberView[] | null>(null);
   const [roles, setRoles] = useState<RoleView[]>([]);
   const [error, setError] = useState<string | null>(null);

@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * `/teams/[id]/roles` — admin-only role editor (spec §6.4, §10.3).
+ * `/team/roles?id=` — admin-only role editor (spec §6.4, §10.3).
  *
  * Two-pane: list of roles on top, JSON editor inline. Spec §10.3
  * calls for "form-based policy editor (not raw YAML)" — JSON in a
@@ -16,7 +16,8 @@
  * picker).
  */
 
-import { use, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { ApiError, api, type RoleView } from "@/lib/api";
 
 const POLICY_HINT = `Edit the JSON below. Required top-level keys (see havn-core::Policy):
@@ -25,12 +26,12 @@ const POLICY_HINT = `Edit the JSON below. Required top-level keys (see havn-core
 Optional: mcp_servers, hooks ({"pre_tool_use": [{"tool": "shell", "deny": ["^rm -rf"]}]}).
 Save validates by deserialising — broken JSON yields a 400 with the parse error.`;
 
-export default function RolesPage({
-  params,
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const { id } = use(params);
+export default function RolesPage() {
+  const id = useSearchParams().get("id") ?? "";
+  return <Roles key={id} id={id} />;
+}
+
+function Roles({ id }: { id: string }) {
   const [roles, setRoles] = useState<RoleView[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);

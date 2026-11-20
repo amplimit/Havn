@@ -37,6 +37,8 @@ impl Plan {
 # Spec §12.1.
 
 listen = {listen:?}
+# The dashboard, served by the gateway; "" serves none.
+dashboard_listen = "127.0.0.1:3000"
 db_path = {db:?}
 agent_socket_path = {socket:?}
 workspace_root = {agents_root:?}
@@ -228,6 +230,7 @@ mod tests {
         let rendered = plan.render_config();
         for key in &[
             "listen",
+            "dashboard_listen",
             "db_path",
             "agent_socket_path",
             "workspace_root",

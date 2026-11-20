@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { Suspense } from "react";
 import "./globals.css";
 import { Sidebar } from "@/components/Sidebar";
 
@@ -19,12 +20,16 @@ export default function RootLayout({
         <a href="#main" className="skip-link">
           Skip to content
         </a>
-        <div className="flex min-h-screen flex-col md:flex-row">
-          <Sidebar />
-          <main id="main" tabIndex={-1} className="min-w-0 flex-1 overflow-x-hidden focus:outline-none">
-            {children}
-          </main>
-        </div>
+        {/* Pages read their agent or team from the address (`?id=`), which
+            a static page only knows in the browser. */}
+        <Suspense>
+          <div className="flex min-h-screen flex-col md:flex-row">
+            <Sidebar />
+            <main id="main" tabIndex={-1} className="min-w-0 flex-1 overflow-x-hidden focus:outline-none">
+              {children}
+            </main>
+          </div>
+        </Suspense>
       </body>
     </html>
   );

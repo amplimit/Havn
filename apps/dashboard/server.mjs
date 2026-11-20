@@ -1,8 +1,9 @@
 /**
- * Custom Next.js server for both `npm run dev` (`--dev`) and
- * `npm start`. It proxies `/api/*` (HTTP) and `/ws/*` (WebSocket) to
- * the gateway at runtime, so `HAVN_GATEWAY_URL` takes effect without
- * a rebuild and dev and production share one code path.
+ * Development server (`npm run dev`). A release has no Node process: the
+ * gateway serves the exported dashboard itself, with `/api` and `/ws`.
+ * This runs `next dev` and proxies `/api/*` (HTTP) and `/ws/*`
+ * (WebSocket) to the gateway at `HAVN_GATEWAY_URL`, filtering identity
+ * headers as below.
  *
  * The dashboard has no login of its own, so it listens on 127.0.0.1 by
  * default. In multi-user mode an authenticating proxy in front of it
@@ -28,7 +29,6 @@ import { connect as netConnect } from "node:net";
 import { pipeline } from "node:stream";
 import next from "next";
 
-const DEV = process.argv.includes("--dev");
 const PORT = Number(process.env.PORT ?? 3000);
 // Not HOSTNAME: shells and containers often export it as the machine
 // name, which would bind the dashboard to a network interface.
@@ -92,7 +92,7 @@ const gatewayUrl = parseGatewayUrl(GATEWAY);
 const GATEWAY_HOST = gatewayUrl.hostname.replace(/^\[|\]$/g, "");
 const GATEWAY_PORT = Number(gatewayUrl.port || 80);
 
-const app = next({ dev: DEV, hostname: HOST, port: PORT });
+const app = next({ dev: true, hostname: HOST, port: PORT });
 await app.prepare();
 const handle = app.getRequestHandler();
 
@@ -301,7 +301,7 @@ server.on("upgrade", (req, clientSocket, head) => {
     // over WebSocket.
     // If the dev server restarts while a tab is open, reload the tab: Next
     // only attaches that listener after its first page request.
-    if (DEV && req.url?.startsWith("/_next/")) return;
+    if (req.url?.startsWith("/_next/")) return;
     clientSocket.destroy();
     return;
   }
@@ -380,7 +380,7 @@ server.listen(PORT, HOST, () => {
   console.log(
     `  identity header accepted from: ${TRUSTED_PROXIES.length ? TRUSTED_PROXIES.join(", ") : "nobody"}`,
   );
-  console.log(`  /api and /ws proxy → ${GATEWAY_HOST}:${GATEWAY_PORT}${DEV ? " (dev)" : ""}`);
+  console.log(`  /api and /ws proxy → ${GATEWAY_HOST}:${GATEWAY_PORT}`);
 });
 
 process.on("unhandledRejection", (reason) => {

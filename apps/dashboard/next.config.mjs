@@ -1,7 +1,7 @@
 /**
- * Next.js config. `/api/*` and `/ws/*` are proxied to the gateway by
- * `server.mjs` at runtime, not here, so the gateway address is not baked
- * into the build.
+ * Next.js config. `next build` exports static files to `out/`, which the
+ * gateway embeds and serves with `/api/*` and `/ws/*` on the same origin.
+ * In development `server.mjs` proxies those to the gateway instead.
  */
 import { readFileSync } from "node:fs";
 
@@ -12,6 +12,7 @@ const { version } = JSON.parse(
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  output: "export",
   env: { NEXT_PUBLIC_DASHBOARD_VERSION: version },
   // Pin the file-tracing root so Next doesn't pick a parent lockfile and
   // emit the multi-lockfile warning.
