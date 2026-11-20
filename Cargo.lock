@@ -1937,6 +1937,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "fastembed",
+ "futures-util",
  "havn-core",
  "havn-db",
  "havn-proto",
