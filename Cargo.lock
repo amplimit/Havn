@@ -1879,7 +1879,9 @@ dependencies = [
  "havn-db",
  "havn-proto",
  "havn-spawner",
+ "heifer",
  "htmd",
+ "image",
  "libc",
  "notify",
  "pdf-extract",
@@ -1982,6 +1984,46 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "heifer"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42a5b50fde4e3cbde838ba1f5b450034658033cb6e9a94466edf9278a30a380d"
+dependencies = [
+ "heifer-hevc-dec",
+ "heifer-hevc-enc",
+ "heifer-isobmff",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "heifer-hevc-dec"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39e44e38f72a6e1ebfdbefb766f6c781dc7364a3181c50c00f89e8991e25844f"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "heifer-hevc-enc"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4bdfff8dd00dac3f773cc033ab909afbd9090fef39168f6f100e89dff5200c76"
+dependencies = [
+ "heifer-hevc-dec",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "heifer-isobmff"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdec6b5afdb5b6dbfbcceea2855c38abe818a704d61a134861895d75a04f5d9a"
+dependencies = [
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "hex"

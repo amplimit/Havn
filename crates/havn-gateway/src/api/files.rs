@@ -2,7 +2,8 @@
 //! chat (issue #106). It is saved in the agent's workspace under
 //! `inbox/`, through [`crate::agent_files`] so that nothing the agent put
 //! there is followed, and the text of a PDF, Word document or spreadsheet
-//! is saved next to it. The answer is
+//! is saved next to it, as is the copy of a picture a model cannot be
+//! shown as it is (issue #225). The answer is
 //! the [`Attachment`] the chat message then carries.
 
 use axum::Json;
@@ -189,7 +190,16 @@ pub async fn receive(
     let stamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
     let bytes = body.clone();
     let text_kind = crate::web_fetch::Kind::of_file(&media_type, &name);
-    let reserve = if text_kind.is_some() { TEXT_BYTES } else { 0 };
+    // A picture a model cannot be shown as it is, too large or a HEIC
+    // photo, gets a copy it can, shown in its place (issue #225).
+    let copied = media_type.starts_with("image/") && crate::llm_proxy::needs_copy(&body);
+    let reserve = if text_kind.is_some() {
+        TEXT_BYTES
+    } else if copied {
+        crate::llm_proxy::MAX_IMAGE_BYTES
+    } else {
+        0
+    };
     let file = name.clone();
     let stored =
         tokio::task::spawn_blocking(move || save(&workspace, &stamp, &file, &bytes, reserve))
@@ -204,7 +214,7 @@ pub async fn receive(
     if let Some(kind) = text_kind {
         match crate::web_fetch::document_text(kind, &body).await {
             Ok((text, _)) if !text.trim().is_empty() => {
-                text_path = save_text(state, agent_id, &stored.file, text).await;
+                text_path = keep(state, agent_id, text_name(&stored.file), text.into_bytes()).await;
             }
             Ok(_) => {}
             Err(e) => {
@@ -223,11 +233,28 @@ pub async fn receive(
     {
         match transcribe_for(state, agent_id, &how, body.to_vec(), format).await {
             Ok(text) => {
-                text_path = save_text(state, agent_id, &stored.file, text.clone()).await;
+                text_path = keep(
+                    state,
+                    agent_id,
+                    text_name(&stored.file),
+                    text.clone().into_bytes(),
+                )
+                .await;
                 transcript = Some(text);
             }
             Err(why) => {
                 tracing::info!(agent_id = %agent_id, why, "an audio file was not transcribed");
+            }
+        }
+    }
+    if copied {
+        match crate::web_fetch::image_to_show(&body).await {
+            Ok(image) => {
+                let copy = crate::llm_proxy::shown_copy(&stored.file);
+                keep(state, agent_id, copy, image).await;
+            }
+            Err(why) => {
+                tracing::info!(agent_id = %agent_id, why, "no copy made of an image sent");
             }
         }
     }
@@ -243,32 +270,37 @@ pub async fn receive(
     Ok(attachment)
 }
 
-/// Keep `text`, the text of inbox file `file`, next to it as `<file>.txt`:
-/// its path, or `None` when it could not be saved.
-async fn save_text(
+/// Where the text of inbox file `file` is kept, next to it.
+fn text_name(file: &str) -> String {
+    format!("{file}.txt")
+}
+
+/// Keep `bytes`, made of an inbox file (its text, the copy of an image
+/// shown), in the inbox as `name`: its path, or `None` when it could not
+/// be saved.
+async fn keep(
     state: &AppState,
     agent_id: havn_core::AgentId,
-    file: &str,
-    text: String,
+    name: String,
+    bytes: Vec<u8>,
 ) -> Option<String> {
     let workspace = crate::api::agents::workspace_for(state, agent_id);
-    let text_name = format!("{file}.txt");
-    let written = text_name.clone();
+    let path = format!("{INBOX_DIR}/{name}");
     let saved = tokio::task::spawn_blocking(move || {
         let inbox = inbox(&workspace)?;
-        inbox.require_free(text.len() as u64 + MIN_FREE_BYTES)?;
-        inbox.create_new(&written, text.as_bytes())
+        inbox.require_free(bytes.len() as u64 + MIN_FREE_BYTES)?;
+        inbox.create_new(&name, &bytes)
     })
     .await;
     match saved {
-        Ok(Ok(true)) => Some(format!("{INBOX_DIR}/{text_name}")),
+        Ok(Ok(true)) => Some(path),
         Ok(Ok(false)) => None,
         Ok(Err(e)) => {
-            tracing::warn!(agent_id = %agent_id, error = %e, "could not save a file's text");
+            tracing::warn!(agent_id = %agent_id, error = %e, path, "could not save a file made of one sent");
             None
         }
         Err(e) => {
-            tracing::warn!(agent_id = %agent_id, error = %e, "could not save a file's text");
+            tracing::warn!(agent_id = %agent_id, error = %e, path, "could not save a file made of one sent");
             None
         }
     }
@@ -326,7 +358,7 @@ pub async fn with_transcript(
         .path
         .strip_prefix(INBOX_DIR)
         .and_then(|rest| rest.strip_prefix('/'))
-        .map(|file| format!("{file}.txt"))
+        .map(text_name)
     else {
         return attachment;
     };
@@ -345,19 +377,24 @@ pub async fn with_transcript(
     attachment
 }
 
-/// Remove a received file no message carried, and its text, from the
-/// inbox of `workspace`.
+/// Remove a received file no message carried, its text and the copy shown
+/// of it, from the inbox of `workspace`.
 pub fn discard(workspace: &std::path::Path, attachment: &Attachment) {
     let Ok(inbox) = inbox(workspace) else {
         return;
     };
-    for path in std::iter::once(&attachment.path).chain(attachment.text_path.as_ref()) {
-        if let Some(name) = path
-            .strip_prefix(INBOX_DIR)
+    let name = |path: &String| {
+        path.strip_prefix(INBOX_DIR)
             .and_then(|rest| rest.strip_prefix('/'))
-        {
-            let _ = inbox.remove(name);
-        }
+            .map(str::to_string)
+    };
+    let copy = name(&attachment.path).map(|file| crate::llm_proxy::shown_copy(&file));
+    let names = std::iter::once(&attachment.path)
+        .chain(attachment.text_path.as_ref())
+        .filter_map(name)
+        .chain(copy);
+    for name in names {
+        let _ = inbox.remove(&name);
     }
 }
 
@@ -487,6 +524,8 @@ pub fn type_of_name(name: &str) -> &'static str {
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
         "txt" | "log" => "text/plain",
         "md" => "text/markdown",
         "csv" => "text/csv",
@@ -629,11 +668,16 @@ fn file_response(
 pub struct InboxFileQuery {
     /// `inbox/<name>`, as an attachment names it.
     pub path: String,
+    /// A picture as the copy the model is shown, if it has one.
+    #[serde(default)]
+    pub shown: bool,
 }
 
 /// `GET /agents/:id/files?path=inbox/<name>` — a file in the agent's inbox
 /// (one sent in a chat, or its text), for the owner's chat to show: a
 /// PNG, JPEG, GIF or WebP image in place, anything else as a download.
+/// With `shown=true`, a picture with a copy the model is shown is that
+/// copy, for a thumbnail.
 /// Read without following links, as everything there may be the agent's.
 pub async fn inbox_file(
     State(state): State<AppState>,
@@ -666,9 +710,22 @@ pub async fn inbox_file(
     let name = q.path[INBOX_DIR.len() + 1..].to_string();
     let workspace = crate::api::agents::workspace_for(&state, agent.id);
     let read = name.clone();
+    let shown = q.shown;
     let bytes = tokio::task::spawn_blocking(move || {
-        inbox(&workspace)
-            .and_then(|dir| dir.read_bytes(&read, MAX_UPLOAD_BYTES as u64 + TEXT_BYTES))
+        let dir = inbox(&workspace)?;
+        // A picture as the copy the model is shown, when asked and there
+        // is one (issue #225): a HEIC photo a browser cannot show, a large
+        // one quicker.
+        if shown
+            && dir.has(&read)?
+            && let Ok(Some(copy)) = dir.read_bytes(
+                &crate::llm_proxy::shown_copy(&read),
+                crate::llm_proxy::MAX_IMAGE_BYTES,
+            )
+        {
+            return Ok(Some(copy));
+        }
+        dir.read_bytes(&read, MAX_UPLOAD_BYTES as u64 + TEXT_BYTES)
     })
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?

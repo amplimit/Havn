@@ -1955,9 +1955,11 @@ function AttachmentCard({
   onRemove?: () => void;
 }) {
   // The gateway shows an inbox image in place and gives anything else as a
-  // download.
+  // download; the thumbnail is the copy it made of a HEIC or large photo.
   const url = `/api/agents/${agentId}/files?path=${encodeURIComponent(file.path)}`;
-  const image = /^image\/(png|jpeg|gif|webp)$/.test(file.media_type);
+  const thumbnail = `${url}&shown=true`;
+  const [unshown, setUnshown] = useState(false);
+  const image = !unshown && /^image\/(png|jpeg|gif|webp|heic|heif)$/.test(file.media_type);
   const dot = file.name.lastIndexOf(".");
   const kind = (dot > 0 ? file.name.slice(dot + 1) : file.media_type.split("/").pop() || "file")
     .toUpperCase()
@@ -1979,7 +1981,13 @@ function AttachmentCard({
           }}
         >
           {/* eslint-disable-next-line @next/next/no-img-element -- an inbox file, served by the gateway */}
-          <img src={url} alt={file.name} loading="lazy" className="h-full w-full object-cover" />
+          <img
+            src={thumbnail}
+            alt={file.name}
+            loading="lazy"
+            className="h-full w-full object-cover"
+            onError={() => setUnshown(true)}
+          />
         </a>
       ) : (
         <a

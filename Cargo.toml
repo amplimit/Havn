@@ -84,6 +84,12 @@ tar = { version = "0.4", default-features = false }
 flate2 = "1"
 encoding_rs = "0.8"
 url = "2"
+# Pictures sent in a chat that a model cannot be shown as they are (issue
+# #225) are read and scaled down in the gateway's converter child: PNG,
+# JPEG, GIF and WebP by `image`, HEIC by `heifer`. Both pure Rust; heifer
+# is young, so it is pinned.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+heifer = { version = "=0.5.1", default-features = false }
 
 # Filesystem watch + atomic Arc swap for hot config reload (spec §8.4).
 notify = "8"

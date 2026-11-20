@@ -49,9 +49,13 @@ quick-xml.workspace = true
 encoding_rs.workspace = true
 regex.workspace = true
 url.workspace = true
+image.workspace = true
+heifer.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# HEIC files for the tests.
+heifer = { workspace = true, features = ["encoder"] }
 tokio-tungstenite.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 

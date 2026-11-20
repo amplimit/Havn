@@ -170,22 +170,40 @@ impl WorkspaceDir {
         }
     }
 
-    /// Create the regular file `name` with `contents`; false, writing
-    /// nothing, when an entry of any kind already has that name.
+    /// Create the regular file `name` with `contents`; false when an entry
+    /// of any kind already has that name. It is written under a passing
+    /// name and linked into place whole, so `name` is never seen half
+    /// written, not even after a crash.
     pub fn create_new(&self, name: &str, contents: &[u8]) -> io::Result<bool> {
-        match OpenOptions::new()
+        if self.has(name)? {
+            return Ok(false);
+        }
+        // Not a name anything else could have taken, or guess.
+        let part = format!(".part-{}", uuid::Uuid::now_v7().simple());
+        let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o644)
             .custom_flags(NOFOLLOW_FLAGS)
-            .open(self.child(name)?)
-        {
-            Ok(mut file) => {
-                self.give_to_owner(&file)?;
-                file.write_all(contents)?;
-                Ok(true)
-            }
+            .open(self.child(&part)?)?;
+        let linked = self
+            .give_to_owner(&file)
+            .and_then(|()| file.write_all(contents))
+            .and_then(|()| file.sync_data())
+            .and_then(|()| std::fs::hard_link(self.child(&part)?, self.child(name)?));
+        let _ = self.remove(&part);
+        match linked {
+            Ok(()) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether an entry of any kind has the name `name`.
+    pub fn has(&self, name: &str) -> io::Result<bool> {
+        match std::fs::symlink_metadata(self.child(name)?) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -371,6 +389,30 @@ mod tests {
         );
         ws.remove("SOUL.md").expect("remove");
         ws.remove("SOUL.md").expect("remove missing");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_new_file_is_created_whole_and_never_over_another() {
+        let root = scratch();
+        let ws = WorkspaceDir::open(&root).expect("open");
+        assert!(ws.create_new("a.jpg", b"first").expect("create"));
+        assert!(!ws.create_new("a.jpg", b"second").expect("taken"));
+        assert_eq!(std::fs::read(root.join("a.jpg")).expect("a"), b"first");
+        let outside = scratch().join("secret");
+        std::fs::write(&outside, "host secret").expect("outside file");
+        symlink(&outside, root.join("b.jpg")).expect("symlink");
+        assert!(!ws.create_new("b.jpg", b"owned").expect("taken"));
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("outside"),
+            "host secret"
+        );
+        // Nothing is left under the passing name.
+        let names: Vec<String> = std::fs::read_dir(&root)
+            .expect("list")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|n| !n.starts_with(".part-")), "{names:?}");
         std::fs::remove_dir_all(&root).ok();
     }
 
