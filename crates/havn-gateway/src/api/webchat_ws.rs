@@ -176,8 +176,20 @@ async fn web_asker(
         conversation: None,
         who: format!(
             "{} in the web chat{}",
-            name.unwrap_or_else(|| sender_id.to_string()),
+            name.clone().unwrap_or_else(|| sender_id.to_string()),
             if owner { ", the agent's owner" } else { "" }
+        ),
+        who_shown: language.pick(
+            format!(
+                "{} in the web chat{}",
+                name.clone().unwrap_or_else(|| sender_id.to_string()),
+                if owner { ", the agent's owner" } else { "" }
+            ),
+            format!(
+                "网页聊天里的 {}{}",
+                name.unwrap_or_else(|| sender_id.to_string()),
+                if owner { "，agent 的所有者" } else { "" }
+            ),
         ),
         admin: owner,
         admin_hint: language.pick("the agent's owner", "agent 的所有者"),

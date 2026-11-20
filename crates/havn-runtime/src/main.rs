@@ -1504,7 +1504,10 @@ async fn handle_cron(tick: CronTick, ctx: Ctx) {
         CronOutcome::Error { message } if output.is_empty() => {
             lang().pick(format!("({message})"), format!("（{message}）"))
         }
-        CronOutcome::Error { message } => format!("{output}\n\n({message})"),
+        CronOutcome::Error { message } => lang().pick(
+            format!("{output}\n\n({message})"),
+            format!("{output}\n\n（{message}）"),
+        ),
     };
     if let Err(e) = conversations::record(&ctx.pool, &channel_id, Role::Assistant, &turn).await {
         warn!(%job_id, error = %e, "could not persist cron assistant turn");
@@ -2062,29 +2065,47 @@ async fn chat_command(ctx: &Ctx, command: &havn_proto::ChatCommand) -> (Option<S
             };
             let agent_model = ctx.model();
             let model = match info.as_ref().and_then(|i| i.model.as_deref()) {
-                Some(own) => format!(
-                    "{own} (this chat's own; the agent's is {})",
-                    model_name(&agent_model)
+                Some(own) => lang().pick(
+                    format!(
+                        "{own} (this chat's own; the agent's is {})",
+                        model_name(&agent_model)
+                    ),
+                    format!(
+                        "{own}（这个对话自己的；agent 的是 {}）",
+                        model_name(&agent_model)
+                    ),
                 ),
                 None => model_name(&agent_model),
             };
             let chat_line = match &info {
-                Some(info) if !info.title.is_empty() => {
-                    format!("{} ({} messages)", info.title, info.turns)
-                }
-                Some(info) => format!("untitled ({} messages)", info.turns),
-                None => "none yet".into(),
+                Some(info) if !info.title.is_empty() => lang().pick(
+                    format!("{} ({} messages)", info.title, info.turns),
+                    format!("{}（{} 条消息）", info.title, info.turns),
+                ),
+                Some(info) => lang().pick(
+                    format!("untitled ({} messages)", info.turns),
+                    format!("未命名（{} 条消息）", info.turns),
+                ),
+                None => lang().pick("none yet", "还没有").into(),
             };
             let waiting = chat.as_deref().map_or(0, |c| ctx.turns.waiting(c));
+            let thinking = info
+                .as_ref()
+                .and_then(|i| i.thinking.as_deref())
+                .unwrap_or(lang().pick("as the model is set", "按模型自己的设置"));
+            let rounds = ctx.tool_env.policy.tool_rounds.max.max(1);
             (
                 chat,
-                format!(
-                    "Agent: {agent}\nModel: {model}\nThinking: {}\nTool rounds a message may take: \
-                     {}\nThis chat: {chat_line}\nReplies being written or waiting: {waiting}",
-                    info.as_ref()
-                        .and_then(|i| i.thinking.as_deref())
-                        .unwrap_or("as the model is set"),
-                    ctx.tool_env.policy.tool_rounds.max.max(1)
+                lang().pick(
+                    format!(
+                        "Agent: {agent}\nModel: {model}\nThinking: {thinking}\nTool rounds a \
+                         message may take: {rounds}\nThis chat: {chat_line}\nReplies being \
+                         written or waiting: {waiting}"
+                    ),
+                    format!(
+                        "Agent：{agent}\n模型：{model}\n思考：{thinking}\n一条消息最多可用的工具\
+                         轮数：{rounds}\n这个对话：{chat_line}\n正在写或等待中的回复：{waiting}"
+                    ),
                 ),
             )
         }
@@ -2565,9 +2586,12 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         warn!(%chat, error = %detail, "the turn failed");
         let (mut text, again) = failure_text(&detail);
         if msg.channel == "webchat" {
-            text.push_str(&format!("\n\nWhat failed, shown only here: {detail}"));
+            text.push_str(&lang().pick(
+                format!("\n\nWhat failed, shown only here: {detail}"),
+                format!("\n\n出错的详情，只在这里显示：{detail}"),
+            ));
         } else if again {
-            text.push_str(" Send /retry to try again.");
+            text.push_str(lang().pick(" Send /retry to try again.", "发 /retry 可以重试。"));
         }
         final_text_failed.replace(text);
         true
@@ -2875,6 +2899,20 @@ fn zone_section(now: chrono::DateTime<chrono::Utc>, zone: chrono_tz::Tz) -> Stri
 /// The prompt section that tells the model the current time in `zone`.
 fn time_section(now: chrono::DateTime<chrono::Utc>, zone: chrono_tz::Tz) -> String {
     let local = now.with_timezone(&zone);
+    if lang() == havn_core::Language::Chinese {
+        use chrono::Datelike as _;
+        const DAYS: [&str; 7] = ["一", "二", "三", "四", "五", "六", "日"];
+        let day = DAYS[local.weekday().num_days_from_monday() as usize];
+        return format!(
+            "## 当前时间\n\n现在是星期{day} {}，用户时区为 {}（UTC{}）；UTC 时间 {}。用户说的\
+             「今天」「明天」「9 点」等时间，除非另有说明，都按这个时区理解。如果用户说自己在\
+             别处，用 set_timezone 设置其时区。",
+            local.format("%Y-%m-%d %H:%M"),
+            zone.name(),
+            local.format("%:z"),
+            now.format("%Y-%m-%d %H:%M"),
+        );
+    }
     lang().pick(format!(
         "## Current time\n\nIt is {} in the user's time zone, {} (UTC{}); {} UTC. Read \
          \"today\", \"tomorrow\", \"at 9\" and other times the user gives in this zone unless \

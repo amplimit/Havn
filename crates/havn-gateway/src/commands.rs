@@ -328,8 +328,10 @@ pub struct Asker {
     pub scope: String,
     /// The chat it was sent in, when the sender named one (the web chat).
     pub conversation: Option<String>,
-    /// How the audit log and `/whoami` name the sender.
+    /// How the audit log names the sender.
     pub who: String,
+    /// How `/whoami` names the sender, in the agent's language.
+    pub who_shown: String,
     /// May use the commands marked admin.
     pub admin: bool,
     /// What the sender would need to be one, for a refusal.
@@ -403,7 +405,7 @@ pub async fn run(state: &AppState, asker: &Asker, command: &Command, args: &str)
         "whoami" => Action::Reply(match language {
             havn_core::Language::English => format!(
                 "You are {}. {}",
-                asker.who,
+                asker.who_shown,
                 if asker.admin {
                     "You can use every command, the admin ones included."
                 } else {
@@ -412,7 +414,7 @@ pub async fn run(state: &AppState, asker: &Asker, command: &Command, args: &str)
             ),
             havn_core::Language::Chinese => format!(
                 "你是 {}。{}",
-                asker.who,
+                asker.who_shown,
                 if asker.admin {
                     "你可以使用所有命令，包括管理员命令。"
                 } else {
@@ -728,9 +730,15 @@ async fn usage(
                 "agent 最近 {days} 天的用量：调用模型 {calls} 次，输入 {input} 个 token，输出 {output} 个 token。"
             ));
             for r in &rows {
-                out.push_str(&format!(
-                    "\n{}: {} calls, {} in, {} out",
-                    r.model, r.calls, r.tokens_in, r.tokens_out
+                out.push_str(&language.pick(
+                    format!(
+                        "\n{}: {} calls, {} in, {} out",
+                        r.model, r.calls, r.tokens_in, r.tokens_out
+                    ),
+                    format!(
+                        "\n{}：{} 次调用，输入 {}，输出 {}",
+                        r.model, r.calls, r.tokens_in, r.tokens_out
+                    ),
                 ));
             }
             out

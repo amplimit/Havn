@@ -533,13 +533,25 @@ impl CronScheduler {
                     .chars()
                     .take(200)
                     .collect();
+                let language = havn_db::repo::agents::find_by_id(&self.db, agent_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|a| havn_core::Language::of_config(&a.config))
+                    .unwrap_or_default();
                 let notice = OutboundMessage {
                     conversation: job.chat.clone(),
                     channel_id: target.unwrap_or("broadcast").to_string(),
-                    content: text(format!(
-                        "(The scheduled task \"{}\" failed: {reason}. I will not report it \
-                         again today.)",
-                        job.name
+                    content: text(language.pick(
+                        format!(
+                            "(The scheduled task \"{}\" failed: {reason}. I will not report it \
+                             again today.)",
+                            job.name
+                        ),
+                        format!(
+                            "（定时任务「{}」失败了：{reason}。今天不会再报告这个任务。）",
+                            job.name
+                        ),
                     )),
                     reply_to: None,
                     buttons: Vec::new(),

@@ -374,7 +374,9 @@ pub fn render_for_prompt(skills: &[RetrievedSkill]) -> Option<String> {
     if skills.is_empty() {
         return None;
     }
-    let mut out = String::from("## Skills available right now\n\n");
+    let mut out = String::from(
+        crate::lang().pick("## Skills available right now\n\n", "## 现在可用的技能\n\n"),
+    );
     for skill in skills {
         writeln!(
             out,

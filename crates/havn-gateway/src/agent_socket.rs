@@ -1348,12 +1348,12 @@ async fn ask_for_approval(
                         }
                     ),
                     format!(
-                        "（这条回复的一个步骤在等待批准：{}。{}agent 的所有者可以在网页聊天里决定。）",
+                        "（这条回复的一个步骤在等待批准：{}。{}agent 的所有者在网页聊天里决定。）",
                         request.tool,
                         if admins {
-                            "管理员可以在这里发 /approve 或 /deny，"
+                            "管理员可以在这里发 /approve 或 /deny，或者由"
                         } else {
-                            ""
+                            "由"
                         }
                     ),
                 ),
