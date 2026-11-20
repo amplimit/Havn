@@ -639,10 +639,13 @@ function ChannelPairing({ agentId }: { agentId: string }) {
                   <a href={c.link} target="_blank" rel="noreferrer" className="underline">
                     {c.link}
                   </a>{" "}
-                  and press Start, or send the bot this code:
+                  and press Start, or send the bot <span className="font-mono">/start</span> and this
+                  code:
                 </p>
               ) : (
-                <p>Send the bot this code:</p>
+                <p>
+                  Send the bot <span className="font-mono">/start</span> and this code:
+                </p>
               )}
               <p className="font-mono text-base tracking-wider" aria-label="pairing code">
                 {c.code}
