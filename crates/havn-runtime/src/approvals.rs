@@ -228,8 +228,13 @@ pub async fn guarded(
                 }
             };
             let fits = |n: usize| shown(Some(&given_of(n))).chars().count() <= MAX_SHOWN_INPUT;
-            // The longest part that fits, as shown with its escapes.
-            let (mut low, mut high) = (0, total.min(MAX_SHOWN_INPUT));
+            // All of it when it fits, else the longest part that fits with
+            // the note, as shown with its escapes.
+            let (mut low, mut high) = (0, total.saturating_sub(1).min(MAX_SHOWN_INPUT));
+            if fits(total) {
+                low = total;
+                high = total;
+            }
             while low < high {
                 let mid = (low + high).div_ceil(2);
                 if fits(mid) {
