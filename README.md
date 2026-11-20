@@ -257,6 +257,33 @@ havn is **infrastructure, not SaaS**. The test: does it require kernel primitive
 - WebChat WebSocket connections are checked against an Origin allowlist (`allowed_origins`) and must present the caller's `ws_token` from `GET /me`; the token identifies the user rather than being a secret, so the Origin check is what blocks cross-site connections
 - No marketplace — skills are local files; sharing via git
 
+## Policy
+
+What an agent may do is one JSON policy (`havn_core::Policy`). Its top-level keys, with the defaults a key left out takes:
+
+- `max_agents`: how many agents a user may create (1; a user in no team gets 50, or `HAVN_MAX_AGENTS_PER_USER`).
+- `allowed_models`: `provider:model` ids the agent may use, or `*` for any of `[[llm.models]]` (`["*"]`); see [Configuration](#configuration).
+- `resource_limits`: the agent's cgroup limits, `memory_mb` (512), `cpu_cores` (1.0) and `pids_max` (64).
+- `budget`: `max_tokens_per_day` (0, no cap) and `on_exhaust` (`warn_only`, `warn_and_pause` or `fail`; `warn_and_pause`); see [Security Model](#security-model).
+- `permissions`: switches for tools and capabilities: `can_use_shell`, `can_access_network`, `can_install_skills`, `can_schedule_cron`, `can_search_web` and `can_fetch_web` (on), `can_use_mcp`, `can_spawn_subagents` and `can_query_other_agents` (off). `can_view_own_logs`, `can_export_memory` and `can_bind_channels` are part of the schema, but nothing in Havn checks them.
+- `network_policy`: `egress_allowed`, `egress_proxy`, `allowed_domains` and `blocked_domains`; see [Security Model](#security-model) and [Reading web pages](#reading-web-pages).
+- `context_toolsets`: tool names turned off in one context, as `{"cron": {"disabled": ["shell"]}}`. The contexts are `webchat` (messages, from the dashboard or a chat app), `heartbeat`, `cron`, `subagent` and `agent_query`.
+- `admin_visibility`: `can_view_audit_log` lets a team admin holding the role read the team's audit log; `can_view_agent_status`, `can_view_agent_config` and `can_view_conversations` are part of the schema, but nothing in Havn checks them.
+- `mcp_servers`: see [MCP servers](#mcp-servers).
+- `hooks`: see [Tool Hooks](#tool-hooks).
+- `chat_titles`: see [Chat titles](#chat-titles).
+- `tool_rounds`: `max` (100), the tool rounds one message may take, and `subagent` (30), the rounds of a subagent's task, another agent's question, a heartbeat or a cron job. At the limit the model is asked to sum up what it did and what is left.
+- `shell`: `timeout_seconds` (300), how long a command runs when it does not say; `max_timeout_seconds` (1800), the most it may ask for; `background` (8), commands running in the background at once.
+
+Policies are set in two places:
+
+- **Team roles.** Each team member holds a role whose policy governs their agents. The operator sets it with `havn role add <team-id> <name> --policy <file>` and `havn role set-policy <role-id> <file>`, which replaces the whole policy with the file's (keys left out take the defaults above; `havn role show <role-id>` prints the current one). Team admins edit it as JSON on the dashboard's team roles page (`PATCH /teams/{id}/roles/{role_id}`). A policy is validated when it is saved. An agent created in a team gets the owner's role in that team; for their other agents, a user in several roles gets the widest of them (every role's hook rules and blocked domains still apply). A user in no team gets the defaults.
+- **The agent's override**, `config.policy`. It is laid over the owner's policy key by key, so it changes only the keys it sets; `mcp_servers` and `context_toolsets` it replaces as a whole. The agent settings page writes parts of it (network and web access, MCP servers, tools that need approval, chat titles); `PATCH /agents/{id}` with `config.policy` replaces the stored override as a whole.
+
+On a single-user gateway the override applies as it is, except that it cannot remove the owner's hook rules or domain lists, and subagents are on unless the override turns them off. In multi-user mode (`trust_header`) it is clamped to the owner's policy: a switch is on only where both have it on, a limit is the lower of the two (a 0, no limit, gives way to the other), `on_exhaust` is the stricter, `allowed_models` keeps only what both allow, domain lists and hook rules add up, egress stays on the proxy when the owner's policy has it there, `admin_visibility` is the owner's, and only MCP servers the owner's policy lists are kept, with the owner's settings.
+
+The policy an agent's tools and sandbox get is resolved when the agent starts, so changes apply on its next start. The gateway's own checks (model calls, budgets, `web_fetch`, queries to other agents) resolve it on every request and see a change at once.
+
 ## Tool Hooks
 
 PreToolUse hooks refuse a tool call before it runs when one of its regex patterns matches the call's main input (the shell command, the file path, the URL). The agent sees the refusal as the tool result and can adjust its plan.
@@ -290,6 +317,67 @@ pre_tool_use:
 Agents find files with `file_find` (by name, with a glob) and `file_search` (by content), which need no `shell`. They leave out the files that rules about `file_read` (or `file_*`) deny or ask about, matched against each file's path in the workspace, so a search cannot read what `file_read` may not; they never follow links, and skip `.git`, `.havn` and the agent's database.
 
 The agent settings page keeps a list of tools whose every call needs approval (`GET` and `PUT /agents/{id}/approvals`). Requests and decisions are audited as `tool.approval.requested` and `tool.approval.decided`, with who decided. Like `deny`, `ask` guards against model mistakes on matching inputs; the sandbox and permissions stay the enforcement.
+
+## MCP servers
+
+Agents can use the tools of MCP (Model Context Protocol) servers the operator installed. A server is a binary in `/usr/share/havn/mcp-servers/` on the host, which agents see read-only through their `/usr`; neither agents nor users can add one. An agent runs servers only with `policy.permissions.can_use_mcp` on (off by default), and only those listed in `policy.mcp_servers`, by a name of the operator's choosing:
+
+```json
+"permissions": { "can_use_mcp": true },
+"mcp_servers": {
+  "github": {
+    "binary": "github-mcp",
+    "args": [],
+    "env": { "API_TOKEN": "..." },
+    "extra_paths_rw": [],
+    "extra_paths_ro": [],
+    "timeout_seconds": 60,
+    "enabled": true
+  }
+}
+```
+
+- `binary` is a file name in that directory, never a path (no `/` or `..`).
+- `args` go to the binary as they are, without a shell; `env` is added to its environment. Give secrets in `env`, not `args` (see [Security Model](#security-model)).
+- `extra_paths_rw` and `extra_paths_ro` are added to the Landlock allowlist of every process of the agent, its own tools too, while the server is enabled; a path that does not exist is skipped.
+- `timeout_seconds` (default 60) limits each tool call; a call that runs longer returns an error to the agent.
+- `enabled: false` keeps the entry without running the server.
+
+The runtime starts each enabled server when the agent starts, after its Landlock and seccomp rules are in place, as a child process speaking MCP over stdin and stdout, with `HOME=/nonexistent` unless `env` sets one and, when the agent's network goes through the egress proxy, the proxy variables. It lists the server's tools and registers each as `mcp__<server>__<tool>`, with the server's description and input schema; subagents get them too. Only tools are used, not resources or prompts, and only the text of a result: images, audio and resources in it become a placeholder line. A server that fails to start or to list its tools is left out, with a warning in the agent's log, and the agent starts without it; what servers write to stderr goes to that log too. Hook rules can name a server's tools with a prefix, such as `mcp__github__*` (see [Tool Hooks](#tool-hooks)).
+
+The agent's settings page has an **MCP servers** section: `can_use_mcp`, the servers with an on/off switch and remove, and a form to add one (name, a binary from the ones installed, arguments separated by spaces, read-write and read-only paths). `env` and `timeout_seconds` are set through the API: `GET /agents/{id}/mcp` returns `can_use_mcp`, `servers` and the `available_binaries`, and `PATCH /agents/{id}/mcp` takes `can_use_mcp` and `servers`, which replaces the agent's list as a whole. Both write the agent's policy override, and each change is audited as `agent.mcp.updated`. Changes apply on the agent's next start. In multi-user mode an agent runs only servers its owner's role lists under the same name, with the role's settings, so team admins grant servers in the role's `mcp_servers` (see [Policy](#policy)).
+
+## Skills
+
+A skill is a directory in the agent's workspace, `skills/<name>/SKILL.md`: YAML front matter with a `name` and a `description` (both required, and optionally `version` and `triggers`), then a Markdown body of at most 100 KB.
+
+```markdown
+---
+name: code-review
+description: Reviews a diff against the team's checklist.
+triggers: [review, PR, diff]
+---
+
+Look at the diff first. Check that every change has a test.
+```
+
+When the agent starts, the runtime reads every `skills/*/SKILL.md` and indexes it in the agent's database; a file that does not parse is skipped with a warning. For each message, heartbeat and cron job, the three skills that best match its text (keyword search over name, description and body, joined by vector search when `[embedding]` is configured) are added to the system prompt for that turn only, under "Skills available right now". The matches are counted as uses.
+
+- **`skill_manage`** lets the agent create, update, delete, list, pin and unpin its skills. It writes `skills/<name>/SKILL.md` (names of lowercase letters, digits, `-` and `_`, up to 64) and indexes it at once, so a new skill can match from the next message on; delete removes the directory and its index entry. The agent gets the tool with `permissions.can_install_skills` (on by default); without it, skills in the workspace are still read.
+- **Installing a skill by hand**: copy its directory into the workspace's `skills/` (by default `~/.local/share/havn/agents/<agent-id>/workspace/skills/` of the gateway's user, under `workspace_root`), give it the workspace's owner (`chown -R --reference=<workspace> <workspace>/skills/<name>`), and restart the agent (`havn agent stop <agent-id> && havn agent start <agent-id>`). A skill directory removed by hand stays in the index: have the agent remove it with `skill_manage` instead.
+- **Curator.** Every 7 days, when the agent has had no message for 2 hours, a curator pass archives skills unused for 90 days and used fewer than 5 times, moving them to `.archive/<name>/` in the workspace, then asks the model for a plan to merge overlapping skills, writes each merged skill and archives the ones it absorbed. Pinned skills are left out of both. Each pass writes a report to `.curator/` in the workspace.
+- The agent's **skills** page in the dashboard lists its active and archived skills with their uses and last use, pins and unpins them (`POST /agents/{id}/skills/{name}/pin` and `/unpin`, while the agent runs), and shows the curator's reports.
+
+## Heartbeat
+
+The gateway sends each running agent a heartbeat every `config.heartbeat.interval_seconds` of the agent's config (default 1800, 30 minutes; at least 60), the first one an interval after the agent connects. The agent's settings page sets it in minutes, as does `PATCH /agents/{id}` with `{"config": {"heartbeat": {"interval_seconds": 3600}}}`; the gateway reads it on every check, so a change needs no restart.
+
+On a heartbeat the agent reads `HEARTBEAT.md` in its workspace (the settings page edits it), fresh each time, so an edit applies on the next heartbeat. Without the file, or with an empty one, the heartbeat does nothing and costs no model call. Otherwise the model is asked to save stable new facts about the owner it learned (`memory_remember`), then to follow `HEARTBEAT.md`, and to answer `HEARTBEAT_OK` when neither produced anything to tell.
+
+- It runs with the agent's system prompt, the recent events and the skills that match, and the heartbeat's own earlier runs (its last 40 messages, a thread of its own, not any chat).
+- It has the agent's tools except `conversation_search` and those in `context_toolsets.heartbeat.disabled`, up to `tool_rounds.subagent` rounds, and may change memory as the owner. Calls that a hook would ask about are refused, and it cannot change scheduled tasks.
+- A reply that ends with `HEARTBEAT_OK` is not delivered. Any other reply goes to the agent's dashboard chat tabs open at the time, and not to chat apps.
+
 ## Configuration
 
 Gateway config lives at `~/.config/havn/config.toml`:
@@ -545,12 +633,15 @@ Havn ships a stable HTTP + WebSocket protocol at `/api/v1/channel` for external 
 | Adapter | Repository | Status |
 |---------|-----------|--------|
 | Telegram | [havn-channel-telegram](https://github.com/amplimit/havn-channel-telegram) | Available |
+| Lark / Feishu | [havn-channel-lark](https://github.com/amplimit/havn-channel-lark) | Available |
 | Slack | — | Planned |
 | Discord | — | Planned |
 
+The Lark / Feishu adapter takes Lark's events on an HTTP webhook (`im.message.receive_v1`) and answers 1:1 chats only; see its README for setup and the message kinds it carries.
+
 An agent can only send through the channel accounts that `[[bindings]]` binds to it. With an account's `dm_policy = "allowlist"` (the default) it can only message senders in `allow_from` or admitted with an invite code (below); with `dm_policy = "open"` it can message anyone the bot can reach on that platform, so use `open` only for bots meant to be public.
 
-An agent answers one message at a time per conversation. A message sent while it is still replying waits and is answered after that reply, in order (up to 20 waiting; channel users are told it was queued). The dashboard chat has a stop button while a reply runs, and in a channel conversation `/stop` (or `/stop@botname`) stops it: the agent ends the model call or tool call in progress, kills the processes a running shell command started, and keeps what it had said so far, marked `(stopped)`. Waiting messages are answered after it.
+An agent answers one message at a time per conversation. A message sent while it is still replying waits and is answered after that reply, in order (up to 20 waiting; channel users are told it was queued). The dashboard chat has a stop button while a reply runs, and in a channel conversation `/stop` (or `/stop@botname`) stops it: the agent ends the model call or tool call in progress and kills the processes a running shell command started. The reply it keeps is the text of the model calls that had finished, followed by a blank line and `(stopped)`, or only `(stopped)` when they wrote none; the text of the model call in progress is dropped. Waiting messages are answered after it.
 
 Each user has several chats with an agent. The dashboard chat lists them next to the conversation, most recent first: "new chat" starts another, and a chat can be renamed or deleted (with its messages). In a channel conversation, `/new` (or `/new@botname`) starts a new chat; the earlier one is kept. Chats keep their own history, queue, stop button and "approve for this conversation" approvals, and a task the agent schedules in a chat reports there and keeps its results in that chat's history; `/stop` in a channel stops the reply running in any of the sender's chats. Deleting a chat stops its reply and drops its waiting messages; the agent's memory is shared by all of them. `conversation_search` finds past messages: for the agent's owner, in every chat they wrote from (the dashboard, and chat-app accounts linked to them); for anyone else, in their own chats only. The facts the agent saved about its owner (who they are, what they like, what they work on) are in every chat of the owner's, on any channel; the owner's messages on a linked chat-app account are remembered as the dashboard's are. History from before chats existed became each conversation's first chat.
 
