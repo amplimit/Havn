@@ -272,7 +272,75 @@ fn request_body(request: &AnthropicRequest) -> Result<serde_json::Value, Provide
             obj.remove("temperature");
         }
     }
+    mark_cache(&mut body, request);
     Ok(body)
+}
+
+/// Mark where Anthropic caches the prompt (issue #220), with three of the
+/// four marks a request may carry:
+/// - the end of the system part every turn shares (the tools before it
+///   are cached with it);
+/// - the end of the conversation: the turn's next round and the next turn
+///   read what came before from the cache;
+/// - the end of the person's message or results before that, where the
+///   previous round wrote: a round of many calls can be further back than
+///   Anthropic looks for an earlier write.
+fn mark_cache(body: &mut serde_json::Value, request: &AnthropicRequest) {
+    if !super::marks_cache(request) {
+        return;
+    }
+    if let Some(system) = request.system.as_deref().filter(|s| !s.trim().is_empty()) {
+        let (shared, rest) = super::system_parts(system, request.system_stable);
+        let mut blocks = vec![serde_json::json!({
+            "type": "text", "text": shared, "cache_control": super::cache_mark(),
+        })];
+        if let Some(rest) = rest {
+            blocks.push(serde_json::json!({"type": "text", "text": rest}));
+        }
+        body["system"] = serde_json::Value::Array(blocks);
+    }
+    let Some(messages) = body
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    let users: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        .map(|(i, _)| i)
+        .rev()
+        .take(2)
+        .collect();
+    for at in users {
+        mark_message(&mut messages[at]);
+    }
+}
+
+/// Mark the last block of `message` that can carry it (not thinking).
+fn mark_message(message: &mut serde_json::Value) {
+    if let Some(text) = message.get("content").and_then(serde_json::Value::as_str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        message["content"] = serde_json::json!([{"type": "text", "text": text}]);
+    }
+    let Some(blocks) = message
+        .get_mut("content")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    if let Some(block) = blocks.iter_mut().rev().find(|b| {
+        !matches!(
+            b.get("type").and_then(serde_json::Value::as_str),
+            Some("thinking" | "redacted_thinking")
+        )
+    }) && let Some(block) = block.as_object_mut()
+    {
+        block.insert("cache_control".into(), super::cache_mark());
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +352,69 @@ mod tests {
     use axum::http::{HeaderMap, StatusCode, header};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn the_shared_system_part_and_the_conversation_s_end_are_marked_for_the_cache() {
+        let mut r = hi();
+        r.system = Some("base prompt\n\n---\n\nthe time now".into());
+        r.system_stable = "base prompt".len();
+        r.messages = vec![
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!("hi"),
+            },
+            AnthropicMessage {
+                role: "assistant".into(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "t1", "name": "x", "input": {}},
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                ]),
+            },
+        ];
+        let body = request_body(&r).expect("body");
+        let system = body["system"].as_array().expect("blocks");
+        assert_eq!(system.len(), 2);
+        assert_eq!(system[0]["text"], "base prompt");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+        assert!(
+            system[1].get("cache_control").is_none(),
+            "the turn's own part is not"
+        );
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(
+            messages[2]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(
+            messages[0]["content"][0]["cache_control"]["type"], "ephemeral",
+            "where the previous round wrote"
+        );
+        let marks = body.to_string().matches("cache_control").count();
+        assert_eq!(marks, 3, "within Anthropic's four");
+
+        // A one-off call is not marked, nor one that marks its own.
+        let mut once = r.clone();
+        once.system_stable = 0;
+        assert!(
+            !request_body(&once)
+                .expect("body")
+                .to_string()
+                .contains("cache_control")
+        );
+        let mut own = r.clone();
+        own.messages[0].content = serde_json::json!([{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]);
+        let marks = request_body(&own)
+            .expect("body")
+            .to_string()
+            .matches("cache_control")
+            .count();
+        assert_eq!(marks, 1, "its own mark only");
+    }
 
     #[tokio::test]
     async fn calls_the_messages_endpoint_under_the_given_base_url() {
@@ -452,6 +583,7 @@ mod tests {
             system: None,
             temperature: None,
             tools: None,
+            system_stable: 0,
         }
     }
 
@@ -466,6 +598,7 @@ mod tests {
             system: None,
             temperature: Some(0.2),
             tools: None,
+            system_stable: 0,
         };
         let body = request_body(&r).expect("body");
         assert_eq!(

@@ -626,6 +626,7 @@ mod tests {
             system: system.map(String::from),
             temperature: None,
             tools: None,
+            system_stable: 0,
         }
     }
 

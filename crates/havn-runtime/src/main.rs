@@ -2318,11 +2318,10 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         .timezone
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let now = chrono::Utc::now();
     for t in &history {
         match t.role {
             Role::User => {
-                let said = with_sent_time(&t.content, t.created_at, now, zone);
+                let said = with_sent_time(&t.content, t.created_at, zone);
                 messages.push(serde_json::json!({ "role": "user", "content": said }));
             }
             Role::Assistant => {
@@ -2727,24 +2726,28 @@ fn talk_section(msg: &InboundMessage) -> String {
 /// Characters of a sender's id told to the model.
 const MAX_SENDER_SHOWN: usize = 128;
 
-/// User turns older than this get the time they were sent in history
-/// (issue #221).
-const TIMED_AFTER: chrono::Duration = chrono::Duration::minutes(5);
-
 /// `text`, a user turn sent `at`, with the time it was sent before it in
-/// `zone` when it is older than [`TIMED_AFTER`].
-fn with_sent_time(
-    text: &str,
-    at: chrono::DateTime<chrono::Utc>,
-    now: chrono::DateTime<chrono::Utc>,
-    zone: chrono_tz::Tz,
-) -> String {
-    if now - at < TIMED_AFTER {
-        return text.to_string();
-    }
+/// `zone` (issues #221 and #220): the newest is the time now, and the
+/// older ones read the same from turn to turn, so the conversation keeps
+/// its prompt cache.
+fn with_sent_time(text: &str, at: chrono::DateTime<chrono::Utc>, zone: chrono_tz::Tz) -> String {
     format!(
         "[Sent {}]\n{text}",
         at.with_timezone(&zone).format("%a %Y-%m-%d %H:%M")
+    )
+}
+
+/// The prompt section of a conversation's time: the zone its messages'
+/// times are in, which changes only with the zone or its offset.
+fn zone_section(now: chrono::DateTime<chrono::Utc>, zone: chrono_tz::Tz) -> String {
+    let local = now.with_timezone(&zone);
+    format!(
+        "## Time\n\nEach of the person's messages starts with when it was sent, as [Sent \
+         ...], in their time zone, {} (UTC{}); the newest is the time now. Read \"today\", \
+         \"tomorrow\", \"at 9\" and other times they give in this zone unless they say \
+         otherwise. If they say they are elsewhere, set their zone with set_timezone.",
+        zone.name(),
+        local.format("%:z"),
     )
 }
 
@@ -2774,7 +2777,10 @@ fn time_section(now: chrono::DateTime<chrono::Utc>, zone: chrono_tz::Tz) -> Stri
 ///
 /// 3. **Current time** in the owner's time zone, always, and last.
 ///
-/// The first two are omitted when empty.
+/// The first two are omitted when empty. In a conversation the time is
+/// not given here but on each of the person's messages, the newest being
+/// now: the prompt then stays the same from turn to turn, and so keeps its
+/// cache with the conversation after it (issue #220).
 /// `summary`: of the turns before the ones given (issue #105); `owner`:
 /// the turn answers the owner in the dashboard, who may be told to save
 /// what they say about themselves.
@@ -2865,14 +2871,18 @@ async fn augment_with_skills(
         ));
     }
 
-    // Section 3: the current time, last, as it changes every minute: what
-    // comes before it, the frozen base above all, keeps its prompt cache.
+    // Section 3, last: the time. A conversation's messages carry when they
+    // were sent, so its prompt names the zone only; a scheduled run or a
+    // heartbeat, which has no message from anyone, is told the time.
     let zone = *ctx
         .timezone
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    augmented = augmented.augmented(&time_section(chrono::Utc::now(), zone));
-    augmented
+    if talk.is_some() {
+        augmented.augmented(&zone_section(chrono::Utc::now(), zone))
+    } else {
+        augmented.augmented(&time_section(chrono::Utc::now(), zone))
+    }
 }
 
 /// How far back the auto-injected recent-events window reaches. Override
@@ -4093,15 +4103,21 @@ mod tests {
     }
 
     #[test]
-    fn older_messages_say_when_they_were_sent() {
-        let now = chrono::Utc::now();
+    fn messages_say_when_they_were_sent_the_same_in_every_turn() {
         let zone: chrono_tz::Tz = "Europe/Berlin".parse().expect("zone");
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-20T08:30:00Z")
+            .expect("time")
+            .with_timezone(&chrono::Utc);
         assert_eq!(
-            with_sent_time("hi", now - chrono::Duration::minutes(1), now, zone),
-            "hi"
+            with_sent_time("hi", at, zone),
+            "[Sent Fri 2026-11-20 09:30]\nhi"
         );
-        let old = with_sent_time("hi", now - chrono::Duration::days(1), now, zone);
-        assert!(old.starts_with("[Sent ") && old.ends_with("]\nhi"), "{old}");
+        let section = zone_section(at, zone);
+        assert!(section.contains("Europe/Berlin (UTC+01:00)"), "{section}");
+        assert!(
+            !section.contains("09:30"),
+            "no clock time: it is the same all day"
+        );
     }
 
     #[tokio::test]

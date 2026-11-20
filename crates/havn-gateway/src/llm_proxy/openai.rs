@@ -216,12 +216,31 @@ fn anthropic_to_openai(
         _ => None,
     };
 
+    // OpenRouter caches an Anthropic model's prompt where it is marked
+    // (issue #220); other models cache on their own, or not at all.
+    let marks = provider == OpenAiProvider::OPENROUTER_NAME
+        && req.model.starts_with("anthropic/")
+        && super::marks_cache(req);
     if let Some(sys) = req.system.as_ref().filter(|s| !s.is_empty()) {
-        messages.push(json!({"role": "system", "content": sys}));
+        if marks {
+            let (shared, rest) = super::system_parts(sys, req.system_stable);
+            let mut parts = vec![json!({
+                "type": "text", "text": shared, "cache_control": super::cache_mark(),
+            })];
+            if let Some(rest) = rest {
+                parts.push(json!({"type": "text", "text": rest}));
+            }
+            messages.push(json!({"role": "system", "content": parts}));
+        } else {
+            messages.push(json!({"role": "system", "content": sys}));
+        }
     }
 
     for m in &req.messages {
         translate_message_to_openai(m, &mut messages, reasoning_field)?;
+    }
+    if marks {
+        mark_last(&mut messages);
     }
 
     let mut body = json!({
@@ -261,6 +280,70 @@ fn anthropic_to_openai(
         body["tools"] = translate_tools_to_openai(tools)?;
     }
     Ok(body)
+}
+
+/// An OpenAI-shaped `usage`, as Anthropic counts it: `completion_tokens`
+/// includes reasoning tokens, and `prompt_tokens` includes the prompt read
+/// from the cache (`prompt_tokens_details.cached_tokens`) and, on
+/// OpenRouter, written to it (`cache_write_tokens`), which are counted
+/// apart (issue #220).
+fn usage_of(u: &Value) -> Option<AnthropicUsage> {
+    let prompt = u.get("prompt_tokens")?.as_u64()?;
+    let details = u.get("prompt_tokens_details");
+    let detail = |key: &str| {
+        details
+            .and_then(|d| d.get(key))
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+    };
+    // DeepSeek reports its cache hits on their own.
+    let read = detail("cached_tokens").or_else(|| {
+        u.get("prompt_cache_hit_tokens")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+    });
+    let written = detail("cache_write_tokens");
+    Some(AnthropicUsage {
+        input_tokens: prompt
+            .saturating_sub(read.unwrap_or(0))
+            .saturating_sub(written.unwrap_or(0)),
+        output_tokens: u.get("completion_tokens")?.as_u64()?,
+        cache_read_input_tokens: read,
+        cache_creation_input_tokens: written,
+        unreported: false,
+    })
+}
+
+/// Mark the end of the conversation for the cache: the last tool result or
+/// user message, whose content becomes parts to carry it. The conversation
+/// up to it is read from the cache by the turn's later rounds and the next
+/// turn.
+fn mark_last(messages: &mut [Value]) {
+    let Some(last) = messages.last_mut() else {
+        return;
+    };
+    if !matches!(
+        last.get("role").and_then(Value::as_str),
+        Some("user" | "tool")
+    ) {
+        return;
+    }
+    if let Some(text) = last.get("content").and_then(Value::as_str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        last["content"] =
+            json!([{"type": "text", "text": text, "cache_control": super::cache_mark()}]);
+        return;
+    }
+    if let Some(part) = last
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .and_then(|parts| parts.last_mut())
+        && let Some(part) = part.as_object_mut()
+    {
+        part.insert("cache_control".into(), super::cache_mark());
+    }
 }
 
 fn translate_message_to_openai(
@@ -665,17 +748,9 @@ fn openai_to_anthropic(raw: &Value) -> Result<AnthropicResponse, String> {
         None => None,
     };
 
-    // `completion_tokens` includes reasoning tokens and `prompt_tokens`
-    // includes cached ones.
     let usage = raw
         .get("usage")
-        .and_then(|u| {
-            Some(AnthropicUsage {
-                input_tokens: u.get("prompt_tokens")?.as_u64()?,
-                output_tokens: u.get("completion_tokens")?.as_u64()?,
-                ..AnthropicUsage::default()
-            })
-        })
+        .and_then(usage_of)
         .unwrap_or_else(AnthropicUsage::unreported);
 
     Ok(AnthropicResponse {
@@ -767,6 +842,7 @@ mod tests {
             system: system.map(String::from),
             temperature: None,
             tools: None,
+            system_stable: 0,
         }
     }
 
@@ -956,6 +1032,110 @@ mod tests {
         assert_eq!(canon.usage.input_tokens, 12);
         assert_eq!(canon.usage.output_tokens, 4);
         assert!(!canon.usage.unreported);
+    }
+
+    #[test]
+    fn openrouter_s_anthropic_models_get_cache_marks_and_others_do_not() {
+        let mut r = req(
+            vec![
+                AnthropicMessage {
+                    role: "user".into(),
+                    content: json!("first"),
+                },
+                AnthropicMessage {
+                    role: "assistant".into(),
+                    content: json!("reply"),
+                },
+                AnthropicMessage {
+                    role: "user".into(),
+                    content: json!([{"type": "text", "text": "second"}]),
+                },
+            ],
+            Some("base\n\nturn"),
+        );
+        r.system_stable = "base".len();
+        r.model = "anthropic/claude-sonnet-4.5".into();
+        let body =
+            anthropic_to_openai(&r, "max_tokens", OpenAiProvider::OPENROUTER_NAME).expect("body");
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages[0]["content"][0]["text"], "base");
+        assert_eq!(
+            messages[0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(messages[0]["content"][1].get("cache_control").is_none());
+        let marked = messages.last().expect("last");
+        assert_eq!(marked["content"][0]["text"], "second");
+        assert_eq!(marked["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            messages[1]["content"], "first",
+            "only the end of the conversation"
+        );
+
+        // A tool result ends a round: it carries the mark.
+        let mut round = r.clone();
+        round.messages.push(AnthropicMessage {
+            role: "assistant".into(),
+            content: json!([{"type": "tool_use", "id": "t1", "name": "x", "input": {}}]),
+        });
+        round.messages.push(AnthropicMessage {
+            role: "user".into(),
+            content: json!([{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]),
+        });
+        let body = anthropic_to_openai(&round, "max_tokens", OpenAiProvider::OPENROUTER_NAME)
+            .expect("body");
+        let last = body["messages"]
+            .as_array()
+            .and_then(|m| m.last())
+            .expect("last");
+        assert_eq!(last["role"], "tool");
+        assert_eq!(last["content"][0]["cache_control"]["type"], "ephemeral");
+
+        // A one-off call is not marked.
+        let mut once = r.clone();
+        once.system_stable = 0;
+        let body = anthropic_to_openai(&once, "max_tokens", OpenAiProvider::OPENROUTER_NAME)
+            .expect("body");
+        assert!(!body.to_string().contains("cache_control"));
+
+        r.model = "deepseek/deepseek-v4".into();
+        let other =
+            anthropic_to_openai(&r, "max_tokens", OpenAiProvider::OPENROUTER_NAME).expect("body");
+        assert!(!other.to_string().contains("cache_control"));
+        r.model = "anthropic/claude-sonnet-4.5".into();
+        let openai = anthropic_to_openai(&r, "max_tokens", "openai").expect("body");
+        assert!(
+            !openai.to_string().contains("cache_control"),
+            "only behind OpenRouter"
+        );
+    }
+
+    #[test]
+    fn cached_prompt_tokens_are_counted_apart() {
+        let usage = usage_of(&json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 20,
+            "prompt_tokens_details": {"cached_tokens": 700, "cache_write_tokens": 200},
+        }))
+        .expect("usage");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.cache_read_input_tokens, Some(700));
+        assert_eq!(usage.cache_creation_input_tokens, Some(200));
+        assert_eq!(usage.total_input_tokens(), 1000);
+        let deepseek = usage_of(&json!({
+            "prompt_tokens": 500, "completion_tokens": 3,
+            "prompt_cache_hit_tokens": 400, "prompt_cache_miss_tokens": 100,
+        }))
+        .expect("usage");
+        assert_eq!(
+            (deepseek.input_tokens, deepseek.cache_read_input_tokens),
+            (100, Some(400))
+        );
+        let plain = usage_of(&json!({"prompt_tokens": 12, "completion_tokens": 4})).expect("usage");
+        assert_eq!(
+            (plain.input_tokens, plain.cache_read_input_tokens),
+            (12, None)
+        );
     }
 
     #[test]

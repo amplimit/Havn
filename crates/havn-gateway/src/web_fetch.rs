@@ -855,6 +855,7 @@ async fn answer(
         system: Some(ANSWER_SYSTEM.into()),
         temperature: None,
         tools: None,
+        system_stable: 0,
     };
     if call.models.is_empty() {
         return Err("no model is configured to answer from the page".into());
