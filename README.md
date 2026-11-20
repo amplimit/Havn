@@ -192,7 +192,7 @@ chatting. It is served on `dashboard_listen` in config.toml
 It has no login of its own. Without `trust_header` it answers only requests
 addressed to `localhost`, `127.0.0.1` or `[::1]` (or to an origin listed in
 `allowed_origins`), so a web page whose host name leads to 127.0.0.1 cannot
-use it. From another machine use an SSH tunnel
+use it; the management API on `listen` checks the same. From another machine use an SSH tunnel
 (`ssh -L 3000:127.0.0.1:3000 <server>`) or an authenticating reverse proxy
 (see [Multi-user mode behind an SSO proxy](#multi-user-mode-behind-an-sso-proxy)).
 
