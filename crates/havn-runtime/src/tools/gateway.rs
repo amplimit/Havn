@@ -35,6 +35,13 @@ tokio::task_local! {
     /// The turn answers the agent's owner (issue #218): their search
     /// covers the chats of every scope they write from.
     pub static FROM_OWNER: bool;
+    /// Who wrote the message the turn answers, and what they wrote (cut
+    /// short), for the owner to see what memory search found it (issue
+    /// #249).
+    pub static ASKED: (String, String);
+    /// The owner refused memory to this turn already (issue #249): a
+    /// later search in it is refused without asking them again.
+    pub static MEMORY_REFUSED: std::sync::Arc<std::sync::atomic::AtomicBool>;
 }
 
 pub struct GatewayTool {

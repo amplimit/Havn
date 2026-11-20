@@ -389,6 +389,7 @@ impl EgressProxy {
             tool: "network".into(),
             input,
             reason: format!("{host} is not on the agent's allowed domains"),
+            kind: String::new(),
         };
         let posted = self.router.ask_gateway_approval(agent.id, request).await;
         let asked = posted.is_some();

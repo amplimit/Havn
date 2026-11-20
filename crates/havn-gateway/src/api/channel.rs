@@ -1253,6 +1253,7 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
                     ),
                     admin: is_admin(state, channel, &inb.account_id, &inb.sender_id, agent_id)
                         .await,
+                    owner: owner_linked(state, channel, agent_id, &inb.sender_id).await,
                     admin_hint: language.pick(
                         "the agent's owner (after connecting this account on the agent's \
                          settings page) and the senders listed under the account's `admins` in \

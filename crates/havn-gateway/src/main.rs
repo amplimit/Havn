@@ -757,6 +757,10 @@ async fn serve() -> anyhow::Result<()> {
             get(api::agents::capabilities_get).put(api::agents::capabilities_put),
         )
         .route(
+            "/agents/{id}/memory-access",
+            get(api::agents::memory_access_get).put(api::agents::memory_access_put),
+        )
+        .route(
             "/agents/{id}/files",
             // The handler reads the body itself, up to its limit, once it
             // knows who is sending.

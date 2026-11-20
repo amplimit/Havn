@@ -364,6 +364,9 @@ impl Tool for MemorySearchTool {
             return ToolResult::Ok("(no matches)".into());
         }
 
+        let owner = super::gateway::FROM_OWNER
+            .try_with(|owner| *owner)
+            .unwrap_or(false);
         let mut out = String::new();
         if !memory_hits.is_empty() {
             out.push_str("# Memory entries\n\n");
@@ -379,7 +382,113 @@ impl Tool for MemorySearchTool {
             }
             out.push('\n');
         }
-        ToolResult::Ok(out)
+        if owner {
+            return ToolResult::Ok(out);
+        }
+        for_someone_else(ctx, raw_query, out).await
+    }
+}
+
+/// What memory search `found` for `query` in a turn that is not the
+/// owner's (issue #249): given when the conversation is always allowed,
+/// else only once the owner, shown who asked and all of what is given,
+/// lets it; with what they said not to say.
+async fn for_someone_else(ctx: &ToolCtx, query: &str, found: String) -> ToolResult {
+    let lang = crate::lang();
+    let Ok(scope) = super::gateway::CONVERSATION.try_with(Clone::clone) else {
+        return ToolResult::Error(
+            lang.pick(
+                "memory is your owner's, and no one can be asked here whether you may use it \
+                 (a task scheduled by someone else, or another agent's question): answer without it",
+                "记忆是所有者的，而这里没有人能确认你能不能用（别人建的定时任务，或者另一个 agent \
+                 的询问）：不用记忆来回答",
+            )
+            .into(),
+        );
+    };
+    match havn_db::agent::memory::access_of(&ctx.agent_db, &scope).await {
+        Ok(Some(rule)) => return ToolResult::Ok(with_rule(found, Some(&rule))),
+        Ok(None) => {}
+        Err(e) => return ToolResult::Error(format!("memory search failed: {e}")),
+    }
+    let refused = super::gateway::MEMORY_REFUSED
+        .try_with(std::sync::Arc::clone)
+        .ok();
+    let refusal = |why: &str| {
+        ToolResult::Error(lang.pick(
+            format!(
+                "your owner was asked whether you may use what memory holds here, and {why}: \
+                 answer this message without it, do not search memory again in this reply, and \
+                 do not say what memory holds. This is for this reply only: for a later message \
+                 that needs memory, search again, and your owner is asked again"
+            ),
+            format!(
+                "你问了所有者能不能在这里使用记忆中的内容，结果是：{why}。这条消息不用记忆来回答，这次\
+                 回复里不要再搜记忆，也不要透露记忆里有什么。这只对这次回复有效：之后的消息如果需要\
+                 记忆，就再搜一次，会再问所有者"
+            ),
+        ))
+    };
+    if refused
+        .as_ref()
+        .is_some_and(|r| r.load(std::sync::atomic::Ordering::Relaxed))
+    {
+        return refusal(lang.pick("they did not allow it", "所有者没有允许"));
+    }
+    let Some(approvals) = crate::approvals::global() else {
+        return ToolResult::Error("memory search failed: no one can be asked".into());
+    };
+    let (from, said) = super::gateway::ASKED
+        .try_with(Clone::clone)
+        .unwrap_or_default();
+    // What the owner sees is what the model gets: what does not fit is
+    // left out of both.
+    let shown_input = |found: &str| {
+        serde_json::json!({ "from": from, "said": said, "query": query, "found": found })
+            .to_string()
+    };
+    let room = crate::approvals::MAX_SHOWN_INPUT.saturating_sub(shown_input("").chars().count());
+    let mut shown: String = found.chars().take(room).collect();
+    while shown_input(&shown).chars().count() > crate::approvals::MAX_SHOWN_INPUT
+        && !shown.is_empty()
+    {
+        shown.pop();
+    }
+    let chat = super::gateway::CHAT.try_with(Clone::clone).ok();
+    match approvals
+        .ask_memory(&scope, chat.as_deref(), &shown_input(&shown))
+        .await
+    {
+        Ok(answer) => {
+            if answer.always
+                && let Err(e) = havn_db::agent::memory::allow(
+                    &ctx.agent_db,
+                    &scope,
+                    answer.note.as_deref().unwrap_or(""),
+                )
+                .await
+            {
+                tracing::warn!(error = %e, "could not keep the conversation's memory permission");
+            }
+            ToolResult::Ok(with_rule(shown, answer.note.as_deref()))
+        }
+        Err(why) => {
+            if let Some(refused) = &refused {
+                refused.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            refusal(&why)
+        }
+    }
+}
+
+/// `found`, with the owner's rule for what not to say, when there is one.
+fn with_rule(found: String, rule: Option<&str>) -> String {
+    match rule.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(rule) => crate::lang().pick(
+            format!("{found}\nYour owner lets you use this here, with this rule for what not to say: {rule}\n"),
+            format!("{found}\n所有者允许你在这里使用这些内容，规定了不能说什么：{rule}\n"),
+        ),
+        None => found,
     }
 }
 

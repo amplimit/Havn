@@ -10,7 +10,7 @@ export type ClientMessage =
   /** Another reply in place of reply `turn`, or of the last one. */
   | { type: "regenerate"; conversation?: string; turn?: string }
   | { type: "stop"; conversation?: string }
-  | { type: "decide"; id: string; approve: boolean; remember: boolean };
+  | { type: "decide"; id: string; approve: boolean; remember: boolean; note?: string };
 
 /** A button under a message: pressed, its `data` is sent as the next message. */
 export type ChoiceButton = { label: string; data: string };
@@ -38,7 +38,9 @@ export type ServerMessage =
       input: string;
       reason: string;
       conversation?: string;
-      /** `network`: a question of the egress proxy about a domain. */
+      /** `network`: a question of the egress proxy about a domain.
+       * `memory`: what memory search found for someone else, as JSON
+       * `{from, said, query, found}` in `input`. */
       kind?: string;
     }
   /** The approval request was decided elsewhere or ended. */

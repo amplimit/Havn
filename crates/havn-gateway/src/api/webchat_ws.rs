@@ -192,6 +192,7 @@ async fn web_asker(
             ),
         ),
         admin: owner,
+        owner,
         admin_hint: language.pick("the agent's owner", "agent 的所有者"),
         language,
     }
@@ -488,9 +489,10 @@ async fn serve_session<Si, St, E>(
                 id,
                 approve,
                 remember,
+                note,
             } => {
                 crate::agent_socket::forward_decision(
-                    registry, db, router, agent_id, sender_id, &id, approve, remember,
+                    registry, db, router, agent_id, sender_id, &id, approve, remember, note,
                 )
                 .await;
                 continue;

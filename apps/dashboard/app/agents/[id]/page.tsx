@@ -1051,10 +1051,10 @@ export default function ChatPage({
     void refreshChats();
   }
 
-  function decide(id: string, approve: boolean, remember: boolean) {
+  function decide(id: string, approve: boolean, remember: boolean, note?: string) {
     // The gateway closes the card in every tab once it took the answer.
     if (!chatRef.current || wsState !== "open") return;
-    chatRef.current.decide(id, approve, remember);
+    chatRef.current.decide(id, approve, remember, note);
   }
 
   function onSubmit(e?: React.FormEvent) {
@@ -1269,7 +1269,15 @@ export default function ChatPage({
               />
               ),
             )}
-            {approvals.map((a) => (
+            {approvals.map((a) =>
+              a.kind === "memory" ? (
+                <MemoryApproval
+                  key={a.id}
+                  request={a}
+                  disabled={wsState !== "open"}
+                  onDecide={(approve, remember, note) => decide(a.id, approve, remember, note)}
+                />
+              ) : (
               <div
                 key={a.id}
                 className="card px-4 py-3 text-sm"
@@ -1326,7 +1334,8 @@ export default function ChatPage({
                   </button>
                 </div>
               </div>
-            ))}
+              ),
+            )}
             {pending && live.some((p) => p.thinking.trim() !== "") && (
               <LiveThinking text={live.map((p) => p.thinking.trim()).filter(Boolean).join("\n\n")} />
             )}
@@ -2663,6 +2672,84 @@ function TraceList({ items, leftOut }: { items: TraceItem[]; leftOut: number }) 
       )}
       {leftOut > 0 && <li>…and {leftOut} more, not kept.</li>}
     </ol>
+  );
+}
+
+/**
+ * What memory search found for someone other than the owner (issue #249):
+ * who asked and what, and all the agent gets if the owner lets it, with a
+ * note for what not to say.
+ */
+function MemoryApproval({
+  request,
+  disabled,
+  onDecide,
+}: {
+  request: ApprovalRequest;
+  disabled: boolean;
+  onDecide: (approve: boolean, remember: boolean, note?: string) => void;
+}) {
+  const [note, setNote] = useState("");
+  let shown: { from?: string; said?: string; query?: string; found?: string } = {};
+  try {
+    shown = JSON.parse(request.input) as typeof shown;
+  } catch {
+    shown = { found: request.input };
+  }
+  const muted = { color: "var(--color-body)" };
+  const given = note.trim() || undefined;
+  return (
+    <div className="card px-4 py-3 text-sm" role="alertdialog" aria-label="use what memory found">
+      <p className="mb-1">
+        <strong>Let the agent use what it found in memory?</strong>{" "}
+        <span style={muted}>Someone other than you asked{request.conversation ? ` (${request.conversation})` : ""}.</span>
+      </p>
+      <dl className="mb-2 grid gap-1 text-xs" style={{ gridTemplateColumns: "auto 1fr" }}>
+        <dt style={muted}>from</dt>
+        <dd className="font-mono wrap-anywhere">{shown.from || "?"}</dd>
+        <dt style={muted}>they wrote</dt>
+        <dd className="wrap-anywhere" style={{ whiteSpace: "pre-wrap" }}>{shown.said || "?"}</dd>
+        <dt style={muted}>searched for</dt>
+        <dd className="wrap-anywhere">{shown.query || "?"}</dd>
+      </dl>
+      <p className="mb-1 text-xs" style={muted}>
+        Found, which is exactly what the agent gets:
+      </p>
+      <pre
+        className="mb-2 max-h-64 overflow-auto whitespace-pre-wrap text-xs font-mono"
+        style={muted}
+      >
+        {shown.found}
+      </pre>
+      <label className="mb-2 block text-xs" style={muted}>
+        What not to say (optional), such as &quot;not my address&quot;; with always allow it stays the
+        conversation&apos;s rule
+        <textarea
+          className="input mt-1 w-full"
+          rows={2}
+          maxLength={1000}
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+        />
+      </label>
+      <div className="flex flex-wrap gap-2">
+        <button type="button" className="btn-primary" disabled={disabled} onClick={() => onDecide(true, false, given)}>
+          use
+        </button>
+        <button
+          type="button"
+          className="btn-ghost"
+          disabled={disabled}
+          onClick={() => onDecide(true, true, given)}
+          title="Let memory search answer in this conversation from now on, without asking"
+        >
+          always allow in this conversation
+        </button>
+        <button type="button" className="btn-ghost" disabled={disabled} onClick={() => onDecide(false, false)}>
+          deny
+        </button>
+      </div>
+    </div>
   );
 }
 
