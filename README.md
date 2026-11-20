@@ -657,12 +657,12 @@ The agent's memory, workspace and machine are its owner's. In a conversation wit
 
 | Tools | The owner is asked |
 |---|---|
-| `shell`, `process`, `file_write`, `file_edit`, `skill_manage`, `send_file`, MCP tools | **before** the call runs, shown its whole input |
+| `shell`, `process`, `file_write`, `file_edit`, `skill_manage`, `send_file`, `set_timezone`, MCP tools | **before** the call runs, shown its whole input |
 | `memory_search`, `file_read`, `file_find`, `file_search` | **after** it ran, shown everything it gave (exactly what the model would get; past 4000 characters in all, the rest is left out of both, and both are told) |
 
 The person is told the agent checks with its owner. The owner sees who asked, what they wrote and the call in the web chat and, when they linked an account of that chat app, in their own chat with the same bot, and answers there:
 
-- **allow once** / **use**: the call runs, or the model gets what it gave, this once; what a reading tool gave is not kept in the reply's steps, so later turns there do not have it;
+- **allow once** / **use**: the call runs, or the model gets what it gave, this once; what a reading tool or a subagent gave is not kept in the reply's steps, so later turns there do not have it;
 - **always allow there**: for a reading tool, it answers in that conversation from now on without asking; for one that runs or changes things, only that exact call does (always allowing `shell` in a group would let anyone there run anything);
 - **deny**, or no answer in 10 minutes: the model is told it was not allowed and not to say what it would have given, and further calls of that tool in that reply are refused without asking again.
 

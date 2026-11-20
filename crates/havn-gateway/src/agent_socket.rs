@@ -1269,6 +1269,10 @@ async fn ask_for_approval(
     request.tool = request.tool.chars().take(200).collect();
     // A kind the gateway knows, or none: a runtime's must not dress a card
     // as another.
+    // A runtime of before issue #255 asks about memory as `memory`.
+    if request.kind == "memory" {
+        request.kind = "result".into();
+    }
     if !matches!(request.kind.as_str(), "call" | "result") {
         request.kind.clear();
     }

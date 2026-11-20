@@ -67,9 +67,8 @@ impl Review {
     pub fn of(tool: &str) -> Option<Self> {
         match tool {
             "memory_search" | "file_read" | "file_find" | "file_search" => Some(Self::Result),
-            "shell" | "process" | "file_write" | "file_edit" | "skill_manage" | "send_file" => {
-                Some(Self::Call)
-            }
+            "shell" | "process" | "file_write" | "file_edit" | "skill_manage" | "send_file"
+            | "set_timezone" => Some(Self::Call),
             _ if tool.starts_with("mcp__") => Some(Self::Call),
             _ => None,
         }
@@ -136,6 +135,12 @@ pub async fn guarded(
         Review::Call => whole.as_str(),
         Review::Result => "",
     };
+    // What is always allowed does not wait behind a question.
+    match allowed(db, &scope, tool, key, must_ask).await {
+        Ok(Some(rule)) => return with_rule(run.await, Some(&rule)),
+        Ok(None) => {}
+        Err(failed) => return failed,
+    }
     let refused = crate::tools::gateway::REFUSED
         .try_with(std::sync::Arc::clone)
         .ok();
@@ -150,20 +155,20 @@ pub async fn guarded(
         return refusal(
             review,
             tool,
-            lang.pick("they did not allow it", "所有者没有允许"),
+            lang.pick(
+                "your owner did not allow it earlier in this reply",
+                "所有者在这次回复里已经没有允许",
+            ),
         );
     }
-    let allowed = if must_ask {
-        None
-    } else {
-        match havn_db::agent::conversations::access_of(db, &scope, tool, key).await {
-            Ok(rule) => rule,
-            Err(e) => return ToolResult::Error(format!("{tool} was not run: {e}")),
+    // Allowed while this call waited for the lock.
+    match allowed(db, &scope, tool, key, must_ask).await {
+        Ok(Some(rule)) => {
+            drop(asking);
+            return with_rule(run.await, Some(&rule));
         }
-    };
-    if let Some(rule) = allowed {
-        drop(asking);
-        return with_rule(run.await, Some(&rule));
+        Ok(None) => {}
+        Err(failed) => return failed,
     }
     let Some(approvals) = approvals else {
         return ToolResult::Error(format!("{tool} was not run: no one can be asked"));
@@ -193,7 +198,9 @@ pub async fn guarded(
             drop(asking);
             match answer {
                 Ok(answer) => {
-                    keep(db, &scope, tool, key, &answer).await;
+                    if !must_ask {
+                        keep(db, &scope, tool, key, &answer).await;
+                    }
                     with_rule(run.await, answer.note.as_deref())
                 }
                 Err(why) => refuse(&why),
@@ -211,31 +218,58 @@ pub async fn guarded(
                 "\n(The rest was left out: too long to show.)",
                 "\n（其余部分太长，没有显示。）",
             );
-            let room = MAX_SHOWN_INPUT.saturating_sub(shown(Some("")).chars().count());
-            let mut part: String = found.chars().take(room).collect();
-            let cut = |part: &str| {
-                if part.chars().count() < total {
+            let chars: Vec<char> = found.chars().collect();
+            let given_of = |n: usize| {
+                let part: String = chars[..n].iter().collect();
+                if n < total {
                     format!("{part}{left_out}")
                 } else {
-                    part.to_string()
+                    part
                 }
             };
-            while shown(Some(&cut(&part))).chars().count() > MAX_SHOWN_INPUT && !part.is_empty() {
-                part.pop();
+            let fits = |n: usize| shown(Some(&given_of(n))).chars().count() <= MAX_SHOWN_INPUT;
+            // The longest part that fits, as shown with its escapes.
+            let (mut low, mut high) = (0, total.min(MAX_SHOWN_INPUT));
+            while low < high {
+                let mid = (low + high).div_ceil(2);
+                if fits(mid) {
+                    low = mid;
+                } else {
+                    high = mid - 1;
+                }
             }
-            let given = cut(&part);
+            let given = given_of(low);
             match approvals
                 .ask_for(&scope, chat.as_deref(), review, tool, &shown(Some(&given)))
                 .await
             {
                 Ok(answer) => {
-                    keep(db, &scope, tool, key, &answer).await;
+                    if !must_ask {
+                        keep(db, &scope, tool, key, &answer).await;
+                    }
                     with_rule(ToolResult::Ok(given), answer.note.as_deref())
                 }
                 Err(why) => refuse(&why),
             }
         }
     }
+}
+
+/// The rule of what is always allowed for `tool` with `key` in `scope`;
+/// none under a rule that asks every time.
+async fn allowed(
+    db: &sqlx::SqlitePool,
+    scope: &str,
+    tool: &str,
+    key: &str,
+    must_ask: bool,
+) -> Result<Option<String>, ToolResult> {
+    if must_ask {
+        return Ok(None);
+    }
+    havn_db::agent::conversations::access_of(db, scope, tool, key)
+        .await
+        .map_err(|e| ToolResult::Error(format!("{tool} was not run: {e}")))
 }
 
 /// Keep what the owner always allows from now on.
@@ -260,26 +294,26 @@ fn refusal(review: Review, tool: &str, why: &str) -> ToolResult {
     ToolResult::Error(match review {
         Review::Call => lang.pick(
             format!(
-                "{tool} was not run: your owner was asked whether it may run here, and {why}. Do \
-                 not call {tool} again in this reply. This is for this reply only: for a later \
-                 message that needs it, call it again, and your owner is asked again"
+                "{tool} was not run: here it needs your owner's approval, and {why}. Do not call \
+                 {tool} again in this reply. This is for this reply only: for a later message \
+                 that needs it, call it again, and your owner is asked again"
             ),
             format!(
-                "{tool} 没有运行：你问了所有者它能不能在这里运行，结果是：{why}。这次回复里不要再调用 \
-                 {tool}。这只对这次回复有效：之后的消息如果需要，就再调用，会再问所有者"
+                "{tool} 没有运行：在这里它需要所有者批准，而{why}。这次回复里不要再调用 {tool}。这只对\
+                 这次回复有效：之后的消息如果需要，就再调用，会再问所有者"
             ),
         ),
         Review::Result => lang.pick(
             format!(
-                "your owner was asked whether you may use what {tool} gave here, and {why}: \
-                 answer this message without it, do not call {tool} again in this reply, and do \
-                 not say what it gave. This is for this reply only: for a later message that \
-                 needs it, call it again, and your owner is asked again"
+                "what {tool} gave needs your owner's approval here, and {why}: answer this \
+                 message without it, do not call {tool} again in this reply, and do not say what \
+                 it gave. This is for this reply only: for a later message that needs it, call it \
+                 again, and your owner is asked again"
             ),
             format!(
-                "你问了所有者能不能在这里使用 {tool} 给出的内容，结果是：{why}。这条消息不用它来回答，\
-                 这次回复里不要再调用 {tool}，也不要透露它给出了什么。这只对这次回复有效：之后的消息\
-                 如果需要，就再调用，会再问所有者"
+                "{tool} 给出的内容在这里需要所有者批准，而{why}。这条消息不用它来回答，这次回复里不要\
+                 再调用 {tool}，也不要透露它给出了什么。这只对这次回复有效：之后的消息如果需要，就再\
+                 调用，会再问所有者"
             ),
         ),
     })
@@ -386,10 +420,10 @@ impl Approvals {
         if input.chars().count() > MAX_SHOWN_INPUT {
             return Err(lang.pick(
                 format!(
-                    "it was not asked: it is longer than the {MAX_SHOWN_INPUT} characters that \
-                     can be shown to the owner"
+                    "it could not be put to them: it is longer than the {MAX_SHOWN_INPUT} \
+                     characters that can be shown"
                 ),
-                format!("没有问：内容超过了能给所有者看的 {MAX_SHOWN_INPUT} 个字符"),
+                format!("没法问所有者：内容超过了能显示的 {MAX_SHOWN_INPUT} 个字符"),
             ));
         }
         let chat = chat.unwrap_or(conversation);
@@ -404,7 +438,9 @@ impl Approvals {
             )
             .await?;
         if !decision.approve {
-            return Err(lang.pick("they did not allow it", "所有者没有允许").into());
+            return Err(lang
+                .pick("your owner did not allow it", "所有者没有允许")
+                .into());
         }
         Ok(Answer {
             always: decision.remember,

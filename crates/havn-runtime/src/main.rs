@@ -2662,12 +2662,15 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
             };
             // What a reading tool gave someone else was for that reply only
             // (issues #249 and #255): later turns do not get it back from
-            // the steps.
+            // the steps, nor from a subagent's answer, which may hold it.
             let mut done = messages.get(turn_start..).unwrap_or_default().to_vec();
             if !msg.from_owner {
                 steps::without_results_of(
                     &mut done,
-                    |tool| approvals::Review::of(tool) == Some(approvals::Review::Result),
+                    |tool| {
+                        tool == "subagent_spawn"
+                            || approvals::Review::of(tool) == Some(approvals::Review::Result)
+                    },
                     lang().pick(
                         "(What this gave was for that reply only.)",
                         "（这一步给出的内容只用于那次回复。）",
