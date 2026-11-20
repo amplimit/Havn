@@ -1352,11 +1352,158 @@ impl TryFrom<TurnRow> for Turn {
     }
 }
 
+/// What the owner always allows in conversation `scope`, not theirs
+/// (issue #255): `tool`'s results when `input` is empty, else that one
+/// exact call.
+#[derive(Debug, Clone, Serialize)]
+pub struct Access {
+    pub scope: String,
+    pub tool: String,
+    pub input: String,
+    /// What not to say there, as the owner wrote it; empty for nothing.
+    pub rule: String,
+    pub allowed_at: String,
+}
+
+/// The rule of what is always allowed for `tool` with `input` in `scope`
+/// (its results, or that exact call); `None` when nothing is.
+pub async fn access_of(
+    pool: &SqlitePool,
+    scope: &str,
+    tool: &str,
+    input: &str,
+) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT rule FROM tool_access WHERE scope = ?1 AND tool = ?2 AND input = ?3",
+    )
+    .bind(scope)
+    .bind(tool)
+    .bind(input)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(rule,)| rule))
+}
+
+/// Always allow `tool` with `input` in `scope`, with `rule`.
+pub async fn allow(
+    pool: &SqlitePool,
+    scope: &str,
+    tool: &str,
+    input: &str,
+    rule: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO tool_access (scope, tool, input, rule, allowed_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT (scope, tool, input) DO UPDATE SET rule = excluded.rule",
+    )
+    .bind(scope)
+    .bind(tool)
+    .bind(input)
+    .bind(rule)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Take back what was always allowed for `tool` with `input` in `scope`:
+/// whether it was.
+pub async fn revoke(pool: &SqlitePool, scope: &str, tool: &str, input: &str) -> Result<bool> {
+    let done = sqlx::query("DELETE FROM tool_access WHERE scope = ?1 AND tool = ?2 AND input = ?3")
+        .bind(scope)
+        .bind(tool)
+        .bind(input)
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// What is always allowed, in `scope` or everywhere, newest first.
+pub async fn accesses(pool: &SqlitePool, scope: Option<&str>) -> Result<Vec<Access>> {
+    let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT scope, tool, input, rule, allowed_at FROM tool_access \
+         WHERE ?1 IS NULL OR scope = ?1 ORDER BY allowed_at DESC",
+    )
+    .bind(scope)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(scope, tool, input, rule, allowed_at)| Access {
+            scope,
+            tool,
+            input,
+            rule,
+            allowed_at,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[tokio::test]
+    async fn what_the_owner_allows_is_kept_per_conversation_tool_and_call() {
+        let pool = crate::agent::connect_in_memory().await.expect("db");
+        assert_eq!(
+            access_of(&pool, "tg:1", "memory_search", "")
+                .await
+                .expect("db"),
+            None
+        );
+        allow(&pool, "tg:1", "memory_search", "", "")
+            .await
+            .expect("allow");
+        allow(&pool, "tg:1", "shell", r#"{"command":"ls"}"#, "")
+            .await
+            .expect("allow");
+        assert_eq!(
+            access_of(&pool, "tg:1", "memory_search", "")
+                .await
+                .expect("db"),
+            Some(String::new())
+        );
+        assert_eq!(
+            access_of(&pool, "tg:1", "shell", r#"{"command":"rm -rf x"}"#)
+                .await
+                .expect("db"),
+            None,
+            "one call allowed is not every call"
+        );
+        assert_eq!(
+            access_of(&pool, "tg:2", "memory_search", "")
+                .await
+                .expect("db"),
+            None
+        );
+        allow(&pool, "tg:1", "memory_search", "", "not my address")
+            .await
+            .expect("again");
+        assert_eq!(
+            access_of(&pool, "tg:1", "memory_search", "")
+                .await
+                .expect("db")
+                .as_deref(),
+            Some("not my address")
+        );
+        assert_eq!(accesses(&pool, None).await.expect("list").len(), 2);
+        assert_eq!(accesses(&pool, Some("tg:2")).await.expect("list").len(), 0);
+        assert!(
+            revoke(&pool, "tg:1", "memory_search", "")
+                .await
+                .expect("revoke")
+        );
+        assert!(
+            !revoke(&pool, "tg:1", "memory_search", "")
+                .await
+                .expect("again")
+        );
+        assert_eq!(accesses(&pool, Some("tg:1")).await.expect("list").len(), 1);
+    }
 
     #[tokio::test]
     async fn a_reply_s_steps_come_back_with_the_history() {

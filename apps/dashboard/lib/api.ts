@@ -551,9 +551,14 @@ export type TitlesView = {
   model: string;
 };
 
-/** A conversation, not the owner's, where memory search is always allowed (issue #249). */
-export type MemoryAccess = {
+/**
+ * What the owner always allows in a conversation not theirs (issue #255): a
+ * tool's results (`input` empty) or one exact call.
+ */
+export type Access = {
   scope: string;
+  tool: string;
+  input: string;
   channel?: string;
   account?: string;
   sender?: string;
@@ -675,12 +680,12 @@ export const api = {
         body: JSON.stringify({ enabled }),
       }),
   },
-  memoryAccess: {
-    get: (agentId: string) => request<{ allowed: MemoryAccess[] }>(`/agents/${agentId}/memory-access`),
-    put: (agentId: string, scope: string, rule: string | null) =>
-      request<{ allowed: MemoryAccess[] }>(`/agents/${agentId}/memory-access`, {
+  access: {
+    get: (agentId: string) => request<{ allowed: Access[] }>(`/agents/${agentId}/access`),
+    put: (agentId: string, allowed: Pick<Access, "scope" | "tool" | "input">, rule: string | null) =>
+      request<{ allowed: Access[] }>(`/agents/${agentId}/access`, {
         method: "PUT",
-        body: JSON.stringify({ scope, rule }),
+        body: JSON.stringify({ scope: allowed.scope, tool: allowed.tool, input: allowed.input, rule }),
       }),
   },
   capabilities: {

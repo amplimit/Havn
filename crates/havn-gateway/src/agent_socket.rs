@@ -1269,7 +1269,11 @@ async fn ask_for_approval(
     request.tool = request.tool.chars().take(200).collect();
     // A kind the gateway knows, or none: a runtime's must not dress a card
     // as another.
-    if request.kind != "memory" {
+    // A runtime of before issue #255 asks about memory as `memory`.
+    if request.kind == "memory" {
+        request.kind = "result".into();
+    }
+    if !matches!(request.kind.as_str(), "call" | "result") {
         request.kind.clear();
     }
     request.reason = request.reason.chars().take(300).collect();
@@ -1290,29 +1294,29 @@ async fn ask_for_approval(
             agent.team_id,
             Some(agent_id),
             "tool.approval.requested",
-            // What memory found and what someone else wrote are not for
-            // the audit log, which team admins read (issue #249).
-            if request.kind == "memory" {
-                serde_json::json!({
-                    "request_id": request.request_id,
-                    "tool": request.tool,
-                    "kind": "memory",
-                    "input_chars": request.input.chars().count(),
-                    "conversation": request.channel_id,
-                })
-            } else {
+            // What a call gave and what someone else wrote are not for the
+            // audit log, which team admins read (issues #249 and #255).
+            if request.kind.is_empty() {
                 serde_json::json!({
                     "request_id": request.request_id,
                     "tool": request.tool,
                     "input": request.input,
                     "conversation": request.channel_id,
                 })
+            } else {
+                serde_json::json!({
+                    "request_id": request.request_id,
+                    "tool": request.tool,
+                    "kind": request.kind,
+                    "input_chars": request.input.chars().count(),
+                    "conversation": request.channel_id,
+                })
             },
         )
         .await;
     }
-    if request.kind == "memory" {
-        ask_owner_about_memory(agent_id, &request, ctx).await;
+    if !request.kind.is_empty() {
+        ask_owner_for_someone_else(agent_id, &request, ctx).await;
         return;
     }
     if let Some((channel, account, sender)) = crate::channel_id_codec::decode(&request.channel_id) {
@@ -1389,11 +1393,11 @@ async fn ask_for_approval(
     }
 }
 
-/// What memory search found for someone other than the owner (issue
-/// #249): the conversation it is for is told the agent checks with its
-/// owner, and the owner is asked, with all of it, in the web chat (as any
-/// approval) and in their own chat with the same bot when they linked one.
-async fn ask_owner_about_memory(
+/// A call in a conversation that is not the owner's (issue #255): the
+/// conversation is told the agent checks with its owner, and the owner is
+/// asked, shown all of it, in the web chat (as any approval) and in their
+/// own chat with the same bot when they linked one.
+async fn ask_owner_for_someone_else(
     agent_id: AgentId,
     request: &havn_proto::ApprovalRequest,
     ctx: &AgentSocketCtx,
@@ -1424,9 +1428,8 @@ async fn ask_owner_about_memory(
             request.channel_id.clone(),
             language
                 .pick(
-                    "(Checking with the agent's owner whether it may use what it knows here; \
-                     a moment, please.)",
-                    "（正在和 agent 的所有者确认能不能在这里使用它知道的内容，请稍等。）",
+                    "(Checking with the agent's owner first; a moment, please.)",
+                    "（正在先和 agent 的所有者确认，请稍等。）",
                 )
                 .to_string(),
             Vec::new(),
@@ -1438,7 +1441,7 @@ async fn ask_owner_about_memory(
     let Ok(links) = havn_db::repo::channel_access::list_links(&ctx.db, Some(owner)).await else {
         return;
     };
-    let shown = memory_question(&request.input, &request.request_id, language);
+    let shown = question(request, language);
     for link in links.iter().filter(|l| l.channel == channel) {
         let dm = crate::channel_id_codec::encode(channel, account, &link.sender_id);
         if dm == request.channel_id {
@@ -1446,66 +1449,95 @@ async fn ask_owner_about_memory(
         }
         route_outbound(
             agent_id,
-            tell(
-                dm,
-                shown.clone(),
-                memory_buttons(&request.request_id, language),
-            ),
+            tell(dm, shown.clone(), owner_buttons(request, language)),
             ctx,
         )
         .await;
     }
 }
 
-/// The owner's question about what memory found: who asked and what, the
-/// query, all that was found, and how to answer.
-fn memory_question(input: &str, id: &str, language: havn_core::Language) -> String {
+/// The owner's question about a call in someone else's conversation:
+/// who asked and what, the call, what it gave when asked after, and how
+/// to answer.
+fn question(request: &havn_proto::ApprovalRequest, language: havn_core::Language) -> String {
+    let shown = serde_json::from_str::<serde_json::Value>(&request.input).unwrap_or_default();
     let field = |name: &str| -> String {
-        serde_json::from_str::<serde_json::Value>(input)
-            .ok()
-            .and_then(|v| {
-                v.get(name)
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            })
+        shown
+            .get(name)
+            .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
+            .to_string()
     };
-    // What someone else wrote, and the model's query, on one line each and
-    // quoted, so they cannot pass for the parts around them; what was
-    // found in a block of its own.
-    let line = |text: String| {
+    // What someone else wrote on one line and quoted, so it cannot pass
+    // for the parts around it; the call and what it gave in blocks of
+    // their own.
+    let line = |text: &str| {
         let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
         format!("\"{}\"", flat.replace('`', "'"))
     };
-    let (from, said, query) = (
-        line(field("from")),
-        line(field("said")),
-        line(field("query")),
+    let block = |text: &str| format!("```\n{}\n```", text.trim().replace("```", "'''"));
+    let (from, said, tool) = (
+        line(&field("from")),
+        line(&field("said")),
+        line(&request.tool),
     );
-    let found = format!("```\n{}\n```", field("found").trim().replace("```", "'''"));
+    let input = block(
+        &shown
+            .get("input")
+            .and_then(|input| serde_json::to_string_pretty(input).ok())
+            .unwrap_or_default(),
+    );
+    let id = &request.request_id;
+    if request.kind == "call" {
+        return language.pick(
+            format!(
+                "Someone other than you asked, and the agent wants to run {tool}.\n\nFrom: \
+                 {from}\nThey wrote: {said}\n\nIt would run with:\n{input}\nAllow it once, \
+                 always allow this exact call in that conversation, or deny with the buttons. To \
+                 add what not to say, send /approve {id} followed by it (or /approve always {id} \
+                 ...)."
+            ),
+            format!(
+                "有不是你的人提问，agent 想运行 {tool}。\n\n来自：{from}\n对方写的：{said}\n\n要运行\
+                 的内容：\n{input}\n用按钮选择：允许这一次、在那个对话里永久允许这一条，或拒绝。要附一\
+                 句不能说什么，发 /approve {id} 后面跟上说明（或者 /approve always {id} ……）。"
+            ),
+        );
+    }
+    let found = block(&field("found"));
     language.pick(
         format!(
-            "Someone other than you asked, and the agent searched its memory.\n\nFrom: {from}\n\
-             They wrote: {said}\nSearched for: {query}\n\nFound (the agent gets exactly this):\n\
-             {found}\nUse, always allow in that conversation, or deny with the buttons. To add \
+            "Someone other than you asked, and the agent used {tool}.\n\nFrom: {from}\nThey \
+             wrote: {said}\nWith:\n{input}\n\nIt gave (the agent gets exactly this):\n{found}\n\
+             Use it, always allow {tool} in that conversation, or deny with the buttons. To add \
              what not to say, send /approve {id} followed by it (or /approve always {id} ...)."
         ),
         format!(
-            "有不是你的人提问，agent 搜了它的记忆。\n\n来自：{from}\n对方写的：{said}\n搜索：\
-             {query}\n\n搜到的内容（agent 会原样拿到这些）：\n{found}\n用按钮选择：使用、在那个对话里\
-             永久允许，或拒绝。要附一句不能说什么，发 /approve {id} 后面跟上说明（或者 /approve \
-             always {id} ……）。"
+            "有不是你的人提问，agent 用了 {tool}。\n\n来自：{from}\n对方写的：{said}\n输入：\n\
+             {input}\n\n得到的内容（agent 会原样拿到这些）：\n{found}\n用按钮选择：使用、在那个对话\
+             里永久允许 {tool}，或拒绝。要附一句不能说什么，发 /approve {id} 后面跟上说明（或者 \
+             /approve always {id} ……）。"
         ),
     )
 }
 
-/// Use, always allow and deny, for the approval of memory `id`.
-fn memory_buttons(id: &str, language: havn_core::Language) -> Vec<Vec<havn_core::Button>> {
-    let mut rows = approval_buttons(id);
-    let labels = language.pick(
-        ["Use", "Always allow there", "Deny"],
-        ["使用", "在那里永久允许", "拒绝"],
-    );
+/// Allow (or use), always allow and deny, for the owner's question.
+fn owner_buttons(
+    request: &havn_proto::ApprovalRequest,
+    language: havn_core::Language,
+) -> Vec<Vec<havn_core::Button>> {
+    let mut rows = approval_buttons(&request.request_id);
+    let labels = if request.kind == "call" {
+        language.pick(
+            ["Allow once", "Always allow this call there", "Deny"],
+            ["允许这一次", "在那里永久允许这一条", "拒绝"],
+        )
+    } else {
+        language.pick(
+            ["Use", "Always allow there", "Deny"],
+            ["使用", "在那里永久允许", "拒绝"],
+        )
+    };
     for (button, label) in rows.iter_mut().flatten().zip(labels) {
         button.label = label.to_string();
     }
@@ -1654,7 +1686,7 @@ pub async fn forward_decision(
         request_id: request.request_id,
         approve,
         remember,
-        note: note.filter(|_| approve && request.kind == "memory"),
+        note: note.filter(|_| approve && !request.kind.is_empty()),
     };
     if let Err(e) = registry
         .send(agent_id, GatewayToAgent::ApprovalDecision(decision))

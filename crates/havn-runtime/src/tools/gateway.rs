@@ -36,14 +36,12 @@ tokio::task_local! {
     /// covers the chats of every scope they write from.
     pub static FROM_OWNER: bool;
     /// Who wrote the message the turn answers, and what they wrote (cut
-    /// short), for the owner to see what memory search found it (issue
-    /// #249).
+    /// short), for the owner to see when a call in it waits for them
+    /// (issue #255).
     pub static ASKED: (String, String);
-    /// The owner refused memory to this turn already (issue #249): a
-    /// later search in it is refused without asking them again. Its lock
-    /// keeps the turn's questions (calls side by side, subagents) to one
-    /// at a time.
-    pub static MEMORY_REFUSED: std::sync::Arc<(std::sync::atomic::AtomicBool, tokio::sync::Mutex<()>)>;
+    /// What the owner refused in this turn, asked no more in it, and its
+    /// questions, one at a time (issue #255).
+    pub static REFUSED: std::sync::Arc<crate::approvals::Refused>;
 }
 
 pub struct GatewayTool {

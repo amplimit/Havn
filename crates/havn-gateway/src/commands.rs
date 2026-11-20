@@ -334,8 +334,8 @@ pub struct Asker {
     pub who_shown: String,
     /// May use the commands marked admin.
     pub admin: bool,
-    /// Is the agent's owner, who decides what memory may give someone
-    /// else from their own conversation (issue #249).
+    /// Is the agent's owner, who decides from their own conversation what
+    /// may run and be read in someone else's (issue #255).
     pub owner: bool,
     /// What the sender would need to be one, for a refusal.
     pub admin_hint: &'static str,
@@ -760,8 +760,9 @@ async fn usage(
 
 /// What `/approve` or `/deny` was given: whether to allow the step for
 /// the rest of the chat, the request it names (issue #203, as a button
-/// sends it), and, after the request, a note for an approval of memory
-/// (issue #249); `None` when the arguments are not those.
+/// sends it), and, after the request, a note for an approval of a call in
+/// someone else's conversation (issue #255); `None` when the arguments are
+/// not those.
 fn decision_args(approve: bool, args: &str) -> Option<(bool, Option<&str>, Option<&str>)> {
     let mut remember = false;
     let mut rest = args.trim_start();
@@ -803,22 +804,21 @@ async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> S
         Some(id) => state
             .webchat_router
             .approval(asker.agent_id, &asker.scope, id)
-            // What memory found for someone else waits in their
-            // conversation; the owner decides it from their own.
+            // A call in someone else's conversation waits there; the
+            // owner decides it from their own.
             .or_else(|| {
                 asker
                     .owner
-                    .then(|| state.webchat_router.memory_approval(asker.agent_id, id))
+                    .then(|| state.webchat_router.owner_approval(asker.agent_id, id))
                     .flatten()
             }),
         None => state
             .webchat_router
             .oldest_approval(asker.agent_id, &asker.scope),
     };
-    // Memory is decided by its owner only, never in the conversation it
-    // is for.
+    // Decided by the owner only, never in the conversation it is for.
     if let Some(request) = &waiting
-        && request.kind == "memory"
+        && !request.kind.is_empty()
         && !asker.owner
     {
         return language
@@ -866,17 +866,29 @@ async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> S
             .into();
     }
     match (approve, remember) {
-        (true, true) if request.kind == "memory" => language
-            .pick(
-                "(Allowed: memory search answers in that conversation from now on, without asking.)",
-                "（已允许：从现在起，那个对话里的记忆搜索不再询问，直接使用。）",
-            )
-            .to_string(),
-        (true, false) if request.kind == "memory" => language
-            .pick(
-                "(Allowed for that reply.)",
-                "（已允许用于那次回复。）",
-            )
+        (true, true) if request.kind == "result" => language.pick(
+            format!(
+                "(Allowed: {} answers in that conversation from now on, without asking.)",
+                request.tool
+            ),
+            format!(
+                "（已允许：从现在起，那个对话里的 {} 不再询问，直接使用。）",
+                request.tool
+            ),
+        ),
+        (true, true) if request.kind == "call" => language.pick(
+            format!(
+                "(Allowed: this exact {} call runs in that conversation from now on, without \
+                 asking.)",
+                request.tool
+            ),
+            format!(
+                "（已允许：从现在起，那个对话里完全相同的这一条 {} 不再询问，直接运行。）",
+                request.tool
+            ),
+        ),
+        (true, false) if !request.kind.is_empty() => language
+            .pick("(Allowed this once.)", "（已允许这一次。）")
             .to_string(),
         (true, true) => language.pick(
             format!(
@@ -945,7 +957,8 @@ mod tests {
             decision_args(false, "r-1"),
             Some((false, Some("r-1"), None))
         );
-        // After the request, a note for an approval of memory (issue #249).
+        // After the request, a note for an approval of a call in someone
+        // else's conversation (issue #255).
         assert_eq!(
             decision_args(true, "r-1  not my address "),
             Some((false, Some("r-1"), Some("not my address")))

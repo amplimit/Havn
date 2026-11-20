@@ -855,91 +855,12 @@ pub async fn bump_recall_for(pool: &SqlitePool, ids: &[String]) -> Result<()> {
     bump_recall(pool, ids).await
 }
 
-/// A conversation where memory search is always allowed for someone other
-/// than the owner (issue #249).
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct Access {
-    pub scope: String,
-    /// What not to say there, as the owner wrote it; empty for nothing.
-    pub rule: String,
-    pub allowed_at: String,
-}
-
-/// The rule of conversation `scope` when memory search is always allowed
-/// there; `None` when it is not.
-pub async fn access_of(pool: &SqlitePool, scope: &str) -> Result<Option<String>> {
-    let row: Option<(String,)> = sqlx::query_as("SELECT rule FROM memory_access WHERE scope = ?1")
-        .bind(scope)
-        .fetch_optional(pool)
-        .await?;
-    Ok(row.map(|(rule,)| rule))
-}
-
-/// Always allow memory search in `scope`, with `rule`.
-pub async fn allow(pool: &SqlitePool, scope: &str, rule: &str) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO memory_access (scope, rule, allowed_at) VALUES (?1, ?2, ?3) \
-         ON CONFLICT (scope) DO UPDATE SET rule = excluded.rule",
-    )
-    .bind(scope)
-    .bind(rule)
-    .bind(chrono::Utc::now().to_rfc3339())
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Take back the permission of `scope`: whether it had one.
-pub async fn revoke(pool: &SqlitePool, scope: &str) -> Result<bool> {
-    let done = sqlx::query("DELETE FROM memory_access WHERE scope = ?1")
-        .bind(scope)
-        .execute(pool)
-        .await?;
-    Ok(done.rows_affected() > 0)
-}
-
-/// Every conversation where memory search is always allowed, newest first.
-pub async fn accesses(pool: &SqlitePool) -> Result<Vec<Access>> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT scope, rule, allowed_at FROM memory_access ORDER BY allowed_at DESC",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|(scope, rule, allowed_at)| Access {
-            scope,
-            rule,
-            allowed_at,
-        })
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used, deprecated)]
 
     use super::*;
 
-    #[tokio::test]
-    async fn memory_access_is_kept_per_conversation_with_its_rule() {
-        let pool = crate::agent::connect_in_memory().await.expect("db");
-        assert_eq!(access_of(&pool, "tg:1").await.expect("db"), None);
-        allow(&pool, "tg:1", "").await.expect("allow");
-        assert_eq!(
-            access_of(&pool, "tg:1").await.expect("db"),
-            Some(String::new())
-        );
-        allow(&pool, "tg:1", "not my address").await.expect("again");
-        assert_eq!(
-            access_of(&pool, "tg:1").await.expect("db").as_deref(),
-            Some("not my address")
-        );
-        assert_eq!(accesses(&pool).await.expect("list").len(), 1);
-        assert!(revoke(&pool, "tg:1").await.expect("revoke"));
-        assert!(!revoke(&pool, "tg:1").await.expect("again"));
-        assert_eq!(access_of(&pool, "tg:1").await.expect("db"), None);
-    }
     use crate::agent::connect_in_memory;
     use crate::agent::conversations::escape_fts_query;
 

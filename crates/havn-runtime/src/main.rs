@@ -2532,7 +2532,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         // in front of it (memory_search still answers them).
         msg.from_owner,
         msg.from_owner,
-        Some(&with_memory_rule(&ctx.pool, &msg, talk_section(&msg)).await),
+        Some(&with_rules(&ctx.pool, &msg, talk_section(&msg)).await),
     )
     .await;
 
@@ -2561,11 +2561,8 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
                         msg.sender_id.clone(),
                         user_text.chars().take(ASKED_SHOWN_CHARS).collect(),
                     ),
-                    tools::gateway::MEMORY_REFUSED.scope(
-                        Arc::new((
-                            std::sync::atomic::AtomicBool::new(false),
-                            tokio::sync::Mutex::new(()),
-                        )),
+                    tools::gateway::REFUSED.scope(
+                        Arc::new(approvals::Refused::default()),
                         tools::gateway::CHAT.scope(
                             chat.clone(),
                             tools::memory::MEMORY_CHANGES.scope(
@@ -2663,16 +2660,20 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
             } else {
                 steps::without_note(&final_text)
             };
-            // What memory gave someone else was for that reply only (issue
-            // #249): later turns do not get it back from the steps.
+            // What a reading tool gave someone else was for that reply only
+            // (issues #249 and #255): later turns do not get it back from
+            // the steps, nor from a subagent's answer, which may hold it.
             let mut done = messages.get(turn_start..).unwrap_or_default().to_vec();
             if !msg.from_owner {
                 steps::without_results_of(
                     &mut done,
-                    "memory_search",
+                    |tool| {
+                        tool == "subagent_spawn"
+                            || approvals::Review::of(tool) == Some(approvals::Review::Result)
+                    },
                     lang().pick(
-                        "(What memory search found was for that reply only.)",
-                        "（记忆搜索找到的内容只用于那次回复。）",
+                        "(What this gave was for that reply only.)",
+                        "（这一步给出的内容只用于那次回复。）",
                     ),
                 );
             }
@@ -2908,40 +2909,54 @@ fn talk_section(msg: &InboundMessage) -> String {
     )
 }
 
-/// Characters of a conversation's memory rule kept (issue #249).
-const MAX_MEMORY_RULE_CHARS: usize = 1000;
+/// Characters of a rule for what not to say kept (issues #249 and #255).
+const MAX_RULE_CHARS: usize = 1000;
 
 /// Characters of a sender's id told to the model.
 const MAX_SENDER_SHOWN: usize = 128;
 
-/// Characters of the message a turn answers shown to the owner with what
-/// memory search found for it (issue #249).
+/// Characters of the message a turn answers shown to the owner with a
+/// call that waits for them (issue #255).
 const ASKED_SHOWN_CHARS: usize = 500;
 
-/// `talk`, with the owner's rule for what not to say in `msg`'s
-/// conversation when memory search is always allowed there and they gave
-/// one (issue #249).
-async fn with_memory_rule(pool: &sqlx::SqlitePool, msg: &InboundMessage, talk: String) -> String {
+/// `talk`, with the owner's rules for what not to say in `msg`'s
+/// conversation, given with what they always allow there (issues #249
+/// and #255).
+async fn with_rules(pool: &sqlx::SqlitePool, msg: &InboundMessage, talk: String) -> String {
     if msg.from_owner {
         return talk;
     }
-    match havn_db::agent::memory::access_of(pool, &msg.channel_id).await {
-        Ok(Some(rule)) if !rule.trim().is_empty() => {
-            let rule = rule.split_whitespace().collect::<Vec<_>>().join(" ");
-            lang().pick(
-                format!(
-                    "{talk}\n\nYour owner lets you use what memory holds in this conversation, \
-                     with this rule for what not to say here: {rule}"
-                ),
-                format!("{talk}\n\n所有者允许你在这个对话里使用记忆中的内容，规定了在这里不能说什么：{rule}"),
-            )
-        }
-        Ok(_) => talk,
+    let allowed = match conversations::accesses(pool, Some(&msg.channel_id)).await {
+        Ok(allowed) => allowed,
         Err(e) => {
-            warn!(error = %e, "could not read the conversation's memory rule");
-            talk
+            warn!(error = %e, "could not read the conversation's rules");
+            return talk;
         }
+    };
+    let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let rules: Vec<String> = allowed
+        .iter()
+        .filter(|a| !a.rule.trim().is_empty())
+        .map(|a| {
+            let call = if a.input.is_empty() {
+                a.tool.clone()
+            } else {
+                format!("{} {}", a.tool, flat(&a.input))
+            };
+            format!("- {call}: {}", flat(&a.rule))
+        })
+        .collect();
+    if rules.is_empty() {
+        return talk;
     }
+    let rules = rules.join("\n");
+    lang().pick(
+        format!(
+            "{talk}\n\nYour owner always allows these here, with these rules for what not to \
+             say here:\n{rules}"
+        ),
+        format!("{talk}\n\n所有者在这里永久允许了这些，并规定了在这里不能说什么：\n{rules}"),
+    )
 }
 
 /// `text`, a user turn sent `at`, with the time it was sent before it in
@@ -3887,31 +3902,35 @@ async fn answer_data_request(req: DataRequest, ctx: &Ctx) -> DataResponse {
                 }
                 Ok(serde_json::json!({ "found": found }))
             }
-            DataQuery::MemoryAccess => {
-                let allowed = memory::accesses(&ctx.pool)
+            DataQuery::Access => {
+                let allowed = conversations::accesses(&ctx.pool, None)
                     .await
                     .map_err(|e| e.to_string())?;
                 Ok(serde_json::json!({
                     "allowed": rows_within_budget(allowed, MAX_DATA_REPLY_BYTES, false)?,
                 }))
             }
-            DataQuery::SetMemoryAccess { scope, rule } => {
+            DataQuery::SetAccess {
+                scope,
+                tool,
+                input,
+                rule,
+            } => {
                 let found = match rule {
                     Some(rule) => {
-                        let rule: String =
-                            rule.trim().chars().take(MAX_MEMORY_RULE_CHARS).collect();
-                        let had = memory::access_of(&ctx.pool, &scope)
+                        let rule: String = rule.trim().chars().take(MAX_RULE_CHARS).collect();
+                        let had = conversations::access_of(&ctx.pool, &scope, &tool, &input)
                             .await
                             .map_err(|e| e.to_string())?
                             .is_some();
                         if had {
-                            memory::allow(&ctx.pool, &scope, &rule)
+                            conversations::allow(&ctx.pool, &scope, &tool, &input, &rule)
                                 .await
                                 .map_err(|e| e.to_string())?;
                         }
                         had
                     }
-                    None => memory::revoke(&ctx.pool, &scope)
+                    None => conversations::revoke(&ctx.pool, &scope, &tool, &input)
                         .await
                         .map_err(|e| e.to_string())?,
                 };

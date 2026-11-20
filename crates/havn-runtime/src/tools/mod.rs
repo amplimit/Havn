@@ -405,6 +405,17 @@ impl ToolRegistry {
             warn!(name, "tool dispatch failed: unknown tool");
             return ToolResult::Error(format!("unknown tool: {name}"));
         };
+        // In a conversation that is not the owner's, what runs, changes or
+        // reads things waits for the owner (issue #255).
+        let review = if gateway::FROM_OWNER
+            .try_with(|owner| *owner)
+            .unwrap_or(false)
+        {
+            None
+        } else {
+            crate::approvals::Review::of(name)
+        };
+        let mut must_ask = false;
         if let Some(hooks) = &self.hooks {
             // The snapshot guard is not held across the approval wait.
             let verdict = {
@@ -421,6 +432,8 @@ impl ToolRegistry {
                             "tool {name:?} dispatch denied by hook: {reason}"
                         ));
                     }
+                    // The owner is asked about it anyway, every time.
+                    crate::hooks::Veto::Ask { .. } if review.is_some() => must_ask = true,
                     crate::hooks::Veto::Ask { reason } => {
                         let conversation = crate::tools::gateway::CONVERSATION
                             .try_with(Clone::clone)
@@ -455,6 +468,7 @@ impl ToolRegistry {
         // Finding and searching files leave out the files a rule about
         // file_read guards; the registry says which, whatever the model
         // sent in that field.
+        let shown = review.map(|_| input.clone());
         let mut input = input;
         if matches!(name, "file_find" | "file_search")
             && let Some(obj) = input.as_object_mut()
@@ -467,7 +481,22 @@ impl ToolRegistry {
             obj.insert(files::GUARDED_READS.into(), serde_json::json!(guarded));
         }
 
-        tool.execute(ctx, input).await
+        match (review, shown) {
+            (Some(review), Some(shown)) => {
+                let approvals = self.approvals.clone().or_else(crate::approvals::global);
+                crate::approvals::guarded(
+                    approvals.as_deref(),
+                    &ctx.agent_db,
+                    review,
+                    name,
+                    &shown,
+                    must_ask,
+                    tool.execute(ctx, input),
+                )
+                .await
+            }
+            _ => tool.execute(ctx, input).await,
+        }
     }
 }
 
@@ -662,57 +691,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finding_files_follows_file_read_and_its_rules() {
-        let mut policy = Policy::default();
-        policy.hooks.pre_tool_use.push(havn_core::ToolHookRule {
-            tool: "file_read".into(),
-            deny: vec!["^secrets/".into()],
-            ask: Vec::new(),
-        });
+    async fn someone_else_s_turn_reads_files_only_through_the_owner() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join("secrets")).expect("dir");
-        std::fs::write(dir.path().join("secrets/key.md"), "k").expect("write");
-        std::fs::write(dir.path().join("notes.md"), "n").expect("write");
-        let set = crate::hooks::load(&policy.hooks, dir.path())
-            .await
-            .expect("hooks");
-        let reg = registry(policy.clone()).with_hooks(crate::hooks::handle(set));
+        std::fs::write(dir.path().join("notes.md"), "the owner's note").expect("write");
+        let reg = registry(Policy::default());
         let env = ToolCtx {
             workspace_dir: dir.path().to_path_buf(),
             agent_db: dummy_pool().await,
             policy: Arc::clone(&reg.policy),
             embedder: None,
         };
-        // The model cannot clear the rules by sending the field itself.
-        let res = reg
-            .execute_for(
+        let read = || {
+            reg.execute_for(
                 context::WEBCHAT,
-                "file_find",
-                serde_json::json!({"pattern": "*.md", files::GUARDED_READS: []}),
+                "file_read",
+                serde_json::json!({"path": "notes.md"}),
                 &env,
             )
-            .await;
-        assert!(!res.text().contains("secrets/key.md"), "{}", res.text());
-        assert!(res.text().contains("notes.md"), "{}", res.text());
-        // Nor hide files from a registry that has no rules.
-        let res = registry(Policy::default())
-            .execute_for(
-                context::WEBCHAT,
-                "file_find",
-                serde_json::json!({"pattern": "*.md", files::GUARDED_READS: ["."]}),
-                &env,
-            )
-            .await;
-        assert!(res.text().contains("secrets/key.md"), "{}", res.text());
+        };
+        // Issue #255: with no one to ask, someone else's turn gets nothing.
+        for res in [gateway::FROM_OWNER.scope(false, read()).await, read().await] {
+            assert!(res.is_error(), "{}", res.text());
+            assert!(!res.text().contains("the owner's note"), "{}", res.text());
+        }
+        let res = gateway::FROM_OWNER.scope(true, read()).await;
+        assert!(res.text().contains("the owner's note"), "{}", res.text());
+    }
 
-        policy.context_toolsets.0.insert(
-            context::CRON.into(),
-            ContextToolsetEntry {
-                disabled: vec!["file_read".into()],
-            },
-        );
-        let names = names_in(&registry(policy).schemas_for(context::CRON));
-        assert!(!names.contains(&"file_find".into()) && !names.contains(&"file_search".into()));
+    #[tokio::test]
+    async fn finding_files_follows_file_read_and_its_rules() {
+        // The owner's turn: someone else's waits for the owner (issue #255).
+        gateway::FROM_OWNER
+            .scope(true, async {
+                let mut policy = Policy::default();
+                policy.hooks.pre_tool_use.push(havn_core::ToolHookRule {
+                    tool: "file_read".into(),
+                    deny: vec!["^secrets/".into()],
+                    ask: Vec::new(),
+                });
+                let dir = tempfile::tempdir().expect("tempdir");
+                std::fs::create_dir_all(dir.path().join("secrets")).expect("dir");
+                std::fs::write(dir.path().join("secrets/key.md"), "k").expect("write");
+                std::fs::write(dir.path().join("notes.md"), "n").expect("write");
+                let set = crate::hooks::load(&policy.hooks, dir.path())
+                    .await
+                    .expect("hooks");
+                let reg = registry(policy.clone()).with_hooks(crate::hooks::handle(set));
+                let env = ToolCtx {
+                    workspace_dir: dir.path().to_path_buf(),
+                    agent_db: dummy_pool().await,
+                    policy: Arc::clone(&reg.policy),
+                    embedder: None,
+                };
+                // The model cannot clear the rules by sending the field itself.
+                let res = reg
+                    .execute_for(
+                        context::WEBCHAT,
+                        "file_find",
+                        serde_json::json!({"pattern": "*.md", files::GUARDED_READS: []}),
+                        &env,
+                    )
+                    .await;
+                assert!(!res.text().contains("secrets/key.md"), "{}", res.text());
+                assert!(res.text().contains("notes.md"), "{}", res.text());
+                // Nor hide files from a registry that has no rules.
+                let res = registry(Policy::default())
+                    .execute_for(
+                        context::WEBCHAT,
+                        "file_find",
+                        serde_json::json!({"pattern": "*.md", files::GUARDED_READS: ["."]}),
+                        &env,
+                    )
+                    .await;
+                assert!(res.text().contains("secrets/key.md"), "{}", res.text());
+
+                policy.context_toolsets.0.insert(
+                    context::CRON.into(),
+                    ContextToolsetEntry {
+                        disabled: vec!["file_read".into()],
+                    },
+                );
+                let names = names_in(&registry(policy).schemas_for(context::CRON));
+                assert!(
+                    !names.contains(&"file_find".into()) && !names.contains(&"file_search".into())
+                );
+            })
+            .await;
     }
 
     #[tokio::test]

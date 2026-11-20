@@ -145,7 +145,8 @@ pub enum ClientMessage {
         approve: bool,
         #[serde(default)]
         remember: bool,
-        /// What the owner adds to an approval of memory (issue #249).
+        /// What the owner adds to an approval of a call in someone else's
+        /// conversation (issue #255).
         #[serde(default)]
         note: Option<String>,
     },
@@ -186,10 +187,10 @@ pub enum ServerMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         conversation: Option<String>,
         /// `network` for the egress proxy's questions about a domain:
-        /// "always" then adds it to the agent's allowed domains. `memory`
-        /// for what memory_search found for someone else (issue #249):
-        /// "always" allows it in that conversation, and a note says what
-        /// not to say.
+        /// "always" then adds it to the agent's allowed domains. `call` and
+        /// `result` for a call in someone else's conversation, before it
+        /// runs and after, at what it gave (issue #255): "always" allows it
+        /// in that conversation, and a note says what not to say.
         #[serde(skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
     },
@@ -321,16 +322,17 @@ impl WebChatRouter {
             let mut pending = self.lock_approvals();
             pending.retain(|_, p| p.since.elapsed() < APPROVAL_KEPT);
             let waiting = pending.values().filter(|p| p.agent_id == agent_id).count();
-            // One question about memory per conversation at a time (issue
-            // #249): someone else cannot fill the owner's slots.
-            let memory_waits = request.kind == "memory"
+            // One question about someone else's conversation per
+            // conversation at a time (issue #255): they cannot fill the
+            // owner's slots.
+            let someone_waits = !request.kind.is_empty()
                 && pending.values().any(|p| {
                     p.agent_id == agent_id
-                        && p.request.kind == "memory"
+                        && !p.request.kind.is_empty()
                         && p.request.channel_id == request.channel_id
                 });
             if waiting >= MAX_PENDING_APPROVALS
-                || memory_waits
+                || someone_waits
                 || pending.contains_key(&request.request_id)
             {
                 return false;
@@ -754,9 +756,10 @@ impl WebChatRouter {
             .map(|p| p.request.clone())
     }
 
-    /// The approval of memory `id` of `agent_id`, in whichever conversation
-    /// it waits: the owner decides it from their own (issue #249).
-    pub fn memory_approval(
+    /// The approval `id` of `agent_id` about someone else's conversation,
+    /// in whichever conversation it waits: the owner decides it from their
+    /// own (issue #255).
+    pub fn owner_approval(
         &self,
         agent_id: AgentId,
         id: &str,
@@ -766,7 +769,7 @@ impl WebChatRouter {
         pending
             .values()
             .find(|p| {
-                p.agent_id == agent_id && p.request.request_id == id && p.request.kind == "memory"
+                p.agent_id == agent_id && p.request.request_id == id && !p.request.kind.is_empty()
             })
             .map(|p| p.request.clone())
     }
