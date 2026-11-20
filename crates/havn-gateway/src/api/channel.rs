@@ -84,12 +84,16 @@ const PAIR_HELP: &str = "This bot answers only people who have paired with it. T
                          the pairing link you got. Codes come from whoever runs this bot.";
 
 /// Sent back when an inbound message could not be handed to the agent.
-const AGENT_UNREACHABLE_MESSAGE: &str =
-    "The agent could not receive your message right now. Please try again later.";
+const AGENT_UNREACHABLE_MESSAGE: [&str; 2] = [
+    "The agent could not receive your message right now. Please try again later.",
+    "agent 现在收不到你的消息，请稍后再试。",
+];
 
 /// Sent back when the gateway is restarting and takes no new messages.
-const GATEWAY_RESTARTING_MESSAGE: &str =
-    "The service is restarting and did not take your message. Please send it again in a minute.";
+const GATEWAY_RESTARTING_MESSAGE: [&str; 2] = [
+    "The service is restarting and did not take your message. Please send it again in a minute.",
+    "服务正在重启，没有收下你的消息，请过一分钟再发一次。",
+];
 
 const INVITE_WELCOME_MESSAGE: &str = "Paired. You can now message this bot.";
 /// What a sender is told when a pairing code made on the web links them
@@ -367,8 +371,10 @@ const MAX_MESSAGE_FILES: usize = 10;
 const MAX_SENDER_FILES: usize = 60;
 /// Bytes of a sender id, at most.
 const MAX_SENDER_BYTES: usize = 128;
-const FILE_LOST_MESSAGE: &str =
-    "The file did not reach the agent (it may have restarted meanwhile). Please send it again.";
+const FILE_LOST_MESSAGE: [&str; 2] = [
+    "The file did not reach the agent (it may have restarted meanwhile). Please send it again.",
+    "文件没有送到 agent（它可能在这期间重启了），请再发一次。",
+];
 
 /// The files channel senders sent, by agent and inbox path.
 fn received() -> &'static std::sync::Mutex<HashMap<(havn_core::AgentId, String), Received>> {
@@ -1203,7 +1209,8 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
         Some(
             refused @ (crate::commands::Parsed::Unknown(_) | crate::commands::Parsed::Misused(_)),
         ) => {
-            let text = refused.refusal().unwrap_or_default();
+            let language = crate::commands::language_of(state, agent_id).await;
+            let text = refused.refusal(language).unwrap_or_default();
             tell_sender(
                 state,
                 channel,
@@ -1234,16 +1241,26 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
             // reply.
             "retry" => branch = Some(havn_core::Branch::Regenerate { turn: None }),
             _ => {
+                let language = crate::commands::language_of(state, agent_id).await;
                 let asker = crate::commands::Asker {
                     agent_id,
                     scope: encoded_channel_id.clone(),
                     conversation: None,
                     who: format!("{} on {channel} account {}", inb.sender_id, inb.account_id),
+                    who_shown: language.pick(
+                        format!("{} on {channel} account {}", inb.sender_id, inb.account_id),
+                        format!("{channel} 账号 {} 上的 {}", inb.account_id, inb.sender_id),
+                    ),
                     admin: is_admin(state, channel, &inb.account_id, &inb.sender_id, agent_id)
                         .await,
-                    admin_hint: "the agent's owner (after connecting this account on the agent's \
-                                 settings page) and the senders listed under the account's \
-                                 `admins` in the gateway's config.toml",
+                    admin_hint: language.pick(
+                        "the agent's owner (after connecting this account on the agent's \
+                         settings page) and the senders listed under the account's `admins` in \
+                         the gateway's config.toml",
+                        "agent 的所有者（在 agent 设置页关联这个账号之后），以及网关 config.toml \
+                         里这个账号 `admins` 下列出的发送者",
+                    ),
+                    language,
                 };
                 match crate::commands::run(state, &asker, command, args).await {
                     crate::commands::Action::Reply(text) => {
@@ -1317,7 +1334,9 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
             &inb.account_id,
             &inb.sender_id,
             &inb.channel_message_id,
-            GATEWAY_RESTARTING_MESSAGE,
+            crate::commands::language_of(state, agent_id)
+                .await
+                .of(GATEWAY_RESTARTING_MESSAGE),
         )
         .await;
         return;
@@ -1362,13 +1381,20 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
 
     // A command for the agent goes now that it runs.
     if let Some(frame) = command_frame {
-        let saved = crate::commands::saved_already(&frame);
+        // Its language only when it is not sent, which is rare.
+        let agent_model = crate::commands::saved_already(&frame, havn_core::Language::English)
+            .is_some()
+            .then(|| frame.clone());
         if let Err(e) = state.registry.send(agent_id, frame).await {
             warn!(channel, %agent_id, error = ?e, "failed to forward a chat command");
+            let language = crate::commands::language_of(state, agent_id).await;
+            let saved = agent_model
+                .as_ref()
+                .and_then(|frame| crate::commands::saved_already(frame, language));
             let text = match (saved, e) {
                 (Some(saved), _) => saved,
-                (None, SendError::Draining) => GATEWAY_RESTARTING_MESSAGE,
-                (None, _) => AGENT_UNREACHABLE_MESSAGE,
+                (None, SendError::Draining) => language.of(GATEWAY_RESTARTING_MESSAGE),
+                (None, _) => language.of(AGENT_UNREACHABLE_MESSAGE),
             };
             tell_sender(
                 state,
@@ -1396,7 +1422,9 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
                 &inb.account_id,
                 &inb.sender_id,
                 &inb.channel_message_id,
-                FILE_LOST_MESSAGE,
+                crate::commands::language_of(state, agent_id)
+                    .await
+                    .of(FILE_LOST_MESSAGE),
             )
             .await;
             return;
@@ -1426,9 +1454,10 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
             error = ?e,
             "channel inbound: failed to forward to agent (offline?)"
         );
+        let language = crate::commands::language_of(state, agent_id).await;
         let text = match e {
-            SendError::Draining => GATEWAY_RESTARTING_MESSAGE,
-            _ => AGENT_UNREACHABLE_MESSAGE,
+            SendError::Draining => language.of(GATEWAY_RESTARTING_MESSAGE),
+            _ => language.of(AGENT_UNREACHABLE_MESSAGE),
         };
         tell_sender(
             state,
@@ -2327,7 +2356,10 @@ mod tests {
             assert!(f.forwarded().is_empty());
             assert_eq!(
                 f.replies(),
-                vec![("tg:1".to_string(), GATEWAY_RESTARTING_MESSAGE.to_string())]
+                vec![(
+                    "tg:1".to_string(),
+                    GATEWAY_RESTARTING_MESSAGE[0].to_string()
+                )]
             );
         }
 

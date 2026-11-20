@@ -109,8 +109,11 @@ fn may_change_memory() -> bool {
         .unwrap_or(false)
 }
 
-const NOT_THE_OWNER: &str = "only your owner's conversations change your memory, and this one \
-                             is with someone else: nothing was saved or forgotten";
+const NOT_THE_OWNER: [&str; 2] = [
+    "only your owner's conversations change your memory, and this one is with someone else: \
+     nothing was saved or forgotten",
+    "只有和所有者的对话才能改动你的记忆，而这个对话是和别人的：什么都没有保存或删除",
+];
 
 #[async_trait]
 impl Tool for MemoryRememberTool {
@@ -163,7 +166,7 @@ impl Tool for MemoryRememberTool {
 
     async fn execute(&self, ctx: &ToolCtx, input: Value) -> ToolResult {
         if !may_change_memory() {
-            return ToolResult::Error(NOT_THE_OWNER.into());
+            return ToolResult::Error(crate::lang().of(NOT_THE_OWNER).into());
         }
         let Some(key) = input.get("key").and_then(Value::as_str) else {
             return ToolResult::Error("missing required field: key".into());
@@ -601,7 +604,7 @@ impl Tool for MemoryForgetTool {
 
     async fn execute(&self, ctx: &ToolCtx, input: Value) -> ToolResult {
         if !may_change_memory() {
-            return ToolResult::Error(NOT_THE_OWNER.into());
+            return ToolResult::Error(crate::lang().of(NOT_THE_OWNER).into());
         }
         let Some(key) = input.get("key").and_then(Value::as_str) else {
             return ToolResult::Error("missing required field: key".into());

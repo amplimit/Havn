@@ -345,6 +345,10 @@ pub enum GatewayToAgent {
         /// gateways: subagents use the turn's model.
         #[serde(default)]
         models: Vec<ModelChoice>,
+        /// The language of what Havn writes for the agent (issue #250).
+        /// Absent from older gateways: English.
+        #[serde(default)]
+        language: havn_core::Language,
     },
     /// Inbound message from a channel adapter.
     InboundMessage(InboundMessage),
@@ -1043,6 +1047,7 @@ mod tests {
             timezone: None,
             egress_proxy: None,
             models: Vec::new(),
+            language: havn_core::Language::English,
         };
         let line = serde_json::to_string(&frame).expect("serialize");
         assert!(line.contains("\"type\":\"welcome\""));
@@ -1082,6 +1087,7 @@ mod tests {
             timezone: None,
             egress_proxy: None,
             models: Vec::new(),
+            language: havn_core::Language::English,
         };
         let line = serde_json::to_string(&frame).expect("serialize");
         let parsed: GatewayToAgent = serde_json::from_str(&line).expect("parse");

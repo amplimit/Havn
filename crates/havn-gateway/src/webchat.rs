@@ -696,6 +696,7 @@ impl WebChatRouter {
         channel_id: &str,
         id: &str,
         numbers: &[usize],
+        language: havn_core::Language,
     ) -> Result<String, String> {
         let mut choices = self
             .choices
@@ -706,9 +707,14 @@ impl WebChatRouter {
             .get(id)
             .filter(|c| c.agent_id == agent_id && c.channel_id == channel_id)
         else {
-            return Err("(That question was already answered, or it expired.)".into());
+            return Err(language
+                .pick(
+                    "(That question was already answered, or it expired.)",
+                    "（那个问题已经回答过了，或者已经过期。）",
+                )
+                .into());
         };
-        crate::choice::chosen(&pending.asked, numbers)
+        crate::choice::chosen(&pending.asked, numbers, language)
     }
 
     /// Approval request `id` of `agent_id`, when it waits in conversation
@@ -957,27 +963,47 @@ mod tests {
         let id = router.ask_choice(agent, chat.into(), asked.clone());
         assert!(
             router
-                .answer_choice(agent, "ch|telegram|bot|tg:2", &id, &[1])
+                .answer_choice(
+                    agent,
+                    "ch|telegram|bot|tg:2",
+                    &id,
+                    &[1],
+                    havn_core::Language::English
+                )
                 .is_err()
         );
         assert!(
             router
-                .answer_choice(AgentId::new(), chat, &id, &[1])
+                .answer_choice(
+                    AgentId::new(),
+                    chat,
+                    &id,
+                    &[1],
+                    havn_core::Language::English
+                )
                 .is_err()
         );
         assert!(
-            router.answer_choice(agent, chat, &id, &[5]).is_err(),
+            router
+                .answer_choice(agent, chat, &id, &[5], havn_core::Language::English)
+                .is_err(),
             "not an option"
         );
         let text = router
-            .answer_choice(agent, chat, &id, &[2])
+            .answer_choice(agent, chat, &id, &[2], havn_core::Language::English)
             .expect("answered");
         assert!(text.contains("\"b\""), "{text}");
         // Until the answer reached the agent, the question waits.
-        assert!(router.answer_choice(agent, chat, &id, &[2]).is_ok());
+        assert!(
+            router
+                .answer_choice(agent, chat, &id, &[2], havn_core::Language::English)
+                .is_ok()
+        );
         router.forget_choice(&id);
         assert!(
-            router.answer_choice(agent, chat, &id, &[2]).is_err(),
+            router
+                .answer_choice(agent, chat, &id, &[2], havn_core::Language::English)
+                .is_err(),
             "once"
         );
         // Too many in a conversation: the oldest goes.
@@ -986,13 +1012,21 @@ mod tests {
             router.ask_choice(agent, chat.into(), asked.clone());
         }
         assert!(
-            router.answer_choice(agent, chat, &first, &[1]).is_err(),
+            router
+                .answer_choice(agent, chat, &first, &[1], havn_core::Language::English)
+                .is_err(),
             "the oldest went"
         );
         let other = router.ask_choice(agent, "ch|telegram|bot|tg:9".into(), asked);
         assert!(
             router
-                .answer_choice(agent, "ch|telegram|bot|tg:9", &other, &[1])
+                .answer_choice(
+                    agent,
+                    "ch|telegram|bot|tg:9",
+                    &other,
+                    &[1],
+                    havn_core::Language::English
+                )
                 .is_ok()
         );
     }

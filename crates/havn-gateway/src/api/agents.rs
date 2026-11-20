@@ -253,6 +253,7 @@ pub async fn patch(
         check_policy_override(raw)?;
     }
     check_model(&state, req.config.as_ref().and_then(|c| c.get("model")))?;
+    check_language(req.config.as_ref().and_then(|c| c.get("language")))?;
 
     let name = req.name.as_deref().map(str::trim);
     let updated = match &req.config {
@@ -301,6 +302,17 @@ fn check_model(state: &AppState, raw: Option<&serde_json::Value>) -> Result<(), 
         ))),
         Some(_) => Err(ApiError::BadRequest(
             "config.model must be a provider:model string".into(),
+        )),
+    }
+}
+
+/// Rejects a `config.language` Havn does not write in (issue #250).
+fn check_language(raw: Option<&serde_json::Value>) -> Result<(), ApiError> {
+    match raw {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(v) if serde_json::from_value::<havn_core::Language>(v.clone()).is_ok() => Ok(()),
+        Some(_) => Err(ApiError::BadRequest(
+            "config.language must be \"en\" or \"zh\"".into(),
         )),
     }
 }
@@ -1043,7 +1055,17 @@ pub async fn capabilities_put(
 
 #[cfg(test)]
 mod tests {
-    use super::{check_model, check_policy_override, embedding_env_passthrough};
+    use super::{check_language, check_model, check_policy_override, embedding_env_passthrough};
+
+    #[test]
+    fn only_a_language_havn_writes_in_is_taken() {
+        assert!(check_language(None).is_ok());
+        assert!(check_language(Some(&json!(null))).is_ok());
+        assert!(check_language(Some(&json!("zh"))).is_ok());
+        assert!(check_language(Some(&json!("en"))).is_ok());
+        assert!(check_language(Some(&json!("fr"))).is_err());
+        assert!(check_language(Some(&json!(1))).is_err());
+    }
     use serde_json::json;
 
     #[tokio::test]
