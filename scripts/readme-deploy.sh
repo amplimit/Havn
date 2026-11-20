@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # scripts/readme-deploy.sh - deploy havn the way README.md's Quick Start
 # says, from this checkout, then chat with an agent through the
-# dashboard's own server in a headless browser.
+# dashboard the gateway serves, in a headless browser.
 #
-# Steps, as in the README: install.sh, `havn setup`, `havn start` as root,
-# `havn credential add anthropic ...`, `havn model add anthropic:...`, and
-# the dashboard's install, build and start. CI has no LLM key, so the credential is a dummy and
+# Steps, as in the README: install.sh (which builds the dashboard into the
+# gateway), `havn setup`, `havn start` as root,
+# `havn credential add anthropic ...` and `havn model add anthropic:...`;
+# nothing else starts the dashboard. CI has no LLM key, so the credential is a dummy and
 # `[llm.base_url]` points anthropic calls at a mock provider that
 # scripts/dashboard-chat.mjs runs for the chat.
 #
@@ -45,7 +46,6 @@ command -v jq >/dev/null 2>&1 || die "jq is required"
 
 LOG_DIR="${RUNNER_TEMP:-/tmp}"
 GATEWAY_LOG="$LOG_DIR/readme-gateway.log"
-DASHBOARD_LOG="$LOG_DIR/readme-dashboard.log"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
@@ -59,11 +59,7 @@ for line in \
     "export HAVN_AGE_KEY=" \
     "havn start" \
     "havn credential add anthropic " \
-    "havn model add anthropic:" \
-    "cd havn/apps/dashboard" \
-    "npm install" \
-    "npm run build" \
-    "npm start"; do
+    "havn model add anthropic:"; do
     awk -v p="$line" 'index($0, p) == 1 { found = 1 } END { exit !found }' README.md \
         || die "README.md no longer has a line starting with '$line'; update $0 to match it"
 done
@@ -110,11 +106,7 @@ log "havn start"
 "${AS_ROOT[@]}" env HAVN_AGE_KEY="$AGE_KEY" HAVN_SPAWNER="${HAVN_SPAWNER:-}" \
     havn start >"$GATEWAY_LOG" 2>&1 &
 GW_PID=$!
-DASH_PID=""
 cleanup() {
-    if [ -n "$DASH_PID" ]; then
-        kill -- "-$DASH_PID" 2>/dev/null || true
-    fi
     for id in $(curl -fs --max-time 5 "$GATEWAY_URL/agents" 2>/dev/null | jq -r '.[].id' || true); do
         curl -fs --max-time 15 -X POST "$GATEWAY_URL/agents/$id/stop" -o /dev/null || true
     done
@@ -140,22 +132,12 @@ if ! "${AS_ROOT[@]}" havn model list | awk -v m="$MODEL" '$1 == m { f = 1 } END 
         || { tail -50 "$GATEWAY_LOG" >&2; die "model add failed"; }
 fi
 
-# README: `cd havn/apps/dashboard && npm install && npm run build && npm start`;
-# `npm ci` installs the same lockfile without rewriting it.
-log "dashboard: npm ci && npm run build && npm start"
-(
-    cd apps/dashboard
-    npm ci --no-audit --no-fund
-    npm run build
-) >"$DASHBOARD_LOG" 2>&1 || { tail -50 "$DASHBOARD_LOG" >&2; die "dashboard build failed"; }
-# Its own process group, so cleanup also stops the node process npm starts.
-setsid bash -c 'cd apps/dashboard && exec npm start' >>"$DASHBOARD_LOG" 2>&1 &
-DASH_PID=$!
+# README: the gateway serves the dashboard on dashboard_listen.
 wait_for dashboard "$DASHBOARD_URL/" 60 \
-    || { tail -50 "$DASHBOARD_LOG" >&2; die "dashboard never came up"; }
+    || { tail -50 "$GATEWAY_LOG" >&2; die "the gateway does not serve the dashboard"; }
 
 log "chatting through the dashboard in a headless browser"
 HAVN_DASHBOARD_URL="$DASHBOARD_URL" HAVN_MOCK_LLM_PORT="$MOCK_PORT" HAVN_MOCK_LLM_KEY="$MOCK_KEY" \
     node scripts/dashboard-chat.mjs \
-    || { tail -80 "$GATEWAY_LOG" >&2; tail -30 "$DASHBOARD_LOG" >&2; die "dashboard chat failed"; }
+    || { tail -80 "$GATEWAY_LOG" >&2; die "dashboard chat failed"; }
 ok "README deployment answers a chat through the dashboard"

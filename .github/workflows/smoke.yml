@@ -208,6 +208,5 @@ jobs:
           name: readme-deploy-logs
           path: |
             ${{ runner.temp }}/readme-gateway.log
-            ${{ runner.temp }}/readme-dashboard.log
             ${{ runner.temp }}/dashboard-chat.png
           if-no-files-found: ignore
