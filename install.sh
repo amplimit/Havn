@@ -201,8 +201,10 @@ if $use_source; then
     # The gateway embeds the dashboard built here (apps/dashboard/out).
     if command -v npm >/dev/null 2>&1; then
         log "building the dashboard (npm ci, npm run build)"
-        (cd apps/dashboard && npm ci --no-audit --no-fund && npm run build) \
-            || die "building the dashboard failed (it needs Node.js 22.13 or later)"
+        if ! (cd apps/dashboard && npm ci --no-audit --no-fund && npm run build); then
+            rm -rf apps/dashboard/out
+            warn "building the dashboard failed (it needs Node.js 22.13 or later): the gateway is built without it"
+        fi
     else
         warn "npm not found: the gateway is built without the dashboard; install Node.js 22.13 or later and run this again to include it"
     fi

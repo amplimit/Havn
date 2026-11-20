@@ -770,11 +770,12 @@ impl GatewayConfig {
         if !parsed.dashboard_listen.is_empty() {
             let dashboard = parsed
                 .dashboard_listen
-                .rsplit_once(':')
-                .and_then(|(_, p)| p.parse::<u16>().ok());
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .map(|addr| addr.port());
             if dashboard.is_none() || dashboard == listen_port || dashboard == Some(port) {
                 anyhow::bail!(
-                    "dashboard_listen = {:?} must be host:port with a port of its own, not \
+                    "dashboard_listen = {:?} must be an IP address and a port of its own, not \
                      listen's or [network] egress_proxy_port; \"\" serves no dashboard",
                     parsed.dashboard_listen
                 );

@@ -848,6 +848,10 @@ async fn serve() -> anyhow::Result<()> {
     let dashboard = (!cfg.dashboard_listen.is_empty())
         .then(|| dashboard::router(management.clone(), state.clone()));
     let app = management
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            dashboard::named_host,
+        ))
         .route("/ws/chat/{agent_id}", get(api::webchat_ws::handler))
         .route("/api/v1/channel", get(api::channel::handler))
         .route("/api/v1/channel/files", post(api::channel::upload))
@@ -861,6 +865,7 @@ async fn serve() -> anyhow::Result<()> {
 
     let addr: SocketAddr = cfg.listen.parse().context("parsing listen address")?;
     let listener = TcpListener::bind(addr).await.context("binding listener")?;
+    let signals = count_stop_signals();
     let dashboard_task = match dashboard {
         Some(dashboard) => {
             let addr: SocketAddr = cfg
@@ -871,8 +876,12 @@ async fn serve() -> anyhow::Result<()> {
                 Ok(listener) => {
                     info!(%addr, "serving the dashboard");
                     let service = dashboard.into_make_service_with_connect_info::<SocketAddr>();
+                    let stop = stop_signals(signals.clone(), 1);
                     Some(tokio::spawn(async move {
-                        if let Err(e) = axum::serve(listener, service).await {
+                        if let Err(e) = axum::serve(listener, service)
+                            .with_graceful_shutdown(stop)
+                            .await
+                        {
                             warn!(error = %e, "the dashboard stopped serving");
                         }
                     }))
@@ -892,7 +901,6 @@ async fn serve() -> anyhow::Result<()> {
         }
         None => None,
     };
-    let signals = count_stop_signals();
     let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -906,8 +914,11 @@ async fn serve() -> anyhow::Result<()> {
         }
     }
 
-    if let Some(task) = dashboard_task {
-        task.abort();
+    if let Some(mut task) = dashboard_task {
+        tokio::select! {
+            _ = &mut task => {}
+            () = stop_signals(signals.clone(), 2) => task.abort(),
+        }
     }
     // No new ticks, and no liveness verdicts on agents that are leaving.
     for task in [liveness_task, heartbeat_task, cron_task] {

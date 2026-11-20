@@ -6,9 +6,10 @@
 //! development the dashboard runs from source instead (`npm run dev`).
 //!
 //! Without `trust_header` only a loopback name, or an origin in
-//! `allowed_origins`, may be the request's `Host`: a page of another site
-//! whose name resolves to 127.0.0.1 (DNS rebinding) is refused rather
-//! than served the bootstrap user's API.
+//! `allowed_origins`, may be the request's `Host`, here and for the
+//! management API on `listen`: a page of another site whose name resolves
+//! to 127.0.0.1 (DNS rebinding) is refused rather than served the
+//! bootstrap user's API.
 
 use axum::Router;
 use axum::body::Body;
@@ -39,7 +40,7 @@ const NOT_BUILT: &str = "This gateway was built without the dashboard. Build it 
 
 pub fn router(api: Router<AppState>, state: AppState) -> Router {
     Router::new()
-        .nest("/api", api)
+        .nest("/api", api.fallback(|| async { StatusCode::NOT_FOUND }))
         .route("/ws/chat/{agent_id}", get(crate::api::webchat_ws::handler))
         .fallback(serve)
         .layer(middleware::from_fn_with_state(state.clone(), named_host))
@@ -59,7 +60,7 @@ pub fn same_origin(origin: &str, headers: &HeaderMap) -> bool {
         .any(|scheme| origin.strip_prefix(scheme) == Some(host))
 }
 
-async fn named_host(State(state): State<AppState>, request: Request, next: Next) -> Response {
+pub async fn named_host(State(state): State<AppState>, request: Request, next: Next) -> Response {
     if state.trusted_proxies.is_some() {
         return next.run(request).await;
     }
@@ -76,12 +77,12 @@ async fn named_host(State(state): State<AppState>, request: Request, next: Next)
     if loopback_host(host) || listed {
         return next.run(request).await;
     }
-    tracing::warn!(host, "refusing a dashboard request for another host name");
+    tracing::warn!(host, "refusing a request for another host name");
     (
         StatusCode::MISDIRECTED_REQUEST,
         Json(serde_json::json!({
-            "error": "open the dashboard as localhost or 127.0.0.1 (an SSH tunnel), \
-                      or add this address to allowed_origins"
+            "error": "address the gateway as localhost or 127.0.0.1 (an SSH tunnel), \
+                      or add this origin to allowed_origins"
         })),
     )
         .into_response()
@@ -232,6 +233,36 @@ mod tests {
         ] {
             assert!(!loopback_host(host), "{host}");
         }
+    }
+
+    #[tokio::test]
+    async fn other_host_names_are_refused_without_trust_header() {
+        use tower::ServiceExt as _;
+
+        let call = |app: Router, host: &'static str| async move {
+            let request = Request::builder()
+                .uri("/api/healthz")
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .expect("request");
+            app.oneshot(request).await.expect("response").status()
+        };
+        let api = Router::new().route("/healthz", get(|| async { "ok" }));
+        let (single, _) = crate::auth::tests::state_with(false).await;
+        single
+            .allowed_origins
+            .store(std::sync::Arc::new(vec!["https://havn.example.com".into()]));
+        let app = router(api.clone(), single);
+        assert_eq!(call(app.clone(), "127.0.0.1:3000").await, StatusCode::OK);
+        assert_eq!(call(app.clone(), "localhost:3000").await, StatusCode::OK);
+        assert_eq!(call(app.clone(), "havn.example.com").await, StatusCode::OK);
+        assert_eq!(
+            call(app.clone(), "rebound.example.com:3000").await,
+            StatusCode::MISDIRECTED_REQUEST
+        );
+        let (multi, _) = crate::auth::tests::state_with(true).await;
+        let app = router(api, multi);
+        assert_eq!(call(app, "sso.example.com").await, StatusCode::OK);
     }
 
     #[test]
