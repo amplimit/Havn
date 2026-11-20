@@ -15,6 +15,7 @@ mod commands;
 mod config;
 mod credential_resolver;
 mod cron;
+mod dashboard;
 mod egress_proxy;
 mod heartbeat;
 mod keyring;
@@ -249,6 +250,10 @@ async fn serve() -> anyhow::Result<()> {
 
     enforce_listen_safety(&cfg.listen, cfg.trust_header.enabled)
         .context("listen-address safety check (spec §1.7)")?;
+    if !cfg.dashboard_listen.is_empty() {
+        enforce_listen_safety(&cfg.dashboard_listen, cfg.trust_header.enabled)
+            .context("dashboard_listen safety check (spec §1.7)")?;
+    }
     let identity = auth::IdentityHeader::from_config(&cfg.trust_header)
         .map_err(anyhow::Error::msg)
         .context("parsing gateway.trust_header.header")?;
@@ -666,7 +671,8 @@ async fn serve() -> anyhow::Result<()> {
     // Background task: config watcher (spec §8.4).
     let reload_task = reload::spawn_watcher(config_path, cfg.clone(), reload_handles);
 
-    let app = Router::new()
+    // The management API, served on `listen` and under the dashboard's `/api`.
+    let management = Router::new()
         .route("/healthz", get(healthz))
         .route("/auth/info", get(auth::info))
         .route("/me", get(api::me::get))
@@ -838,7 +844,10 @@ async fn serve() -> anyhow::Result<()> {
         .route(
             "/teams/{id}/credentials/{cred_id}",
             patch(api::team_credentials::update).delete(api::team_credentials::delete),
-        )
+        );
+    let dashboard = (!cfg.dashboard_listen.is_empty())
+        .then(|| dashboard::router(management.clone(), state.clone()));
+    let app = management
         .route("/ws/chat/{agent_id}", get(api::webchat_ws::handler))
         .route("/api/v1/channel", get(api::channel::handler))
         .route("/api/v1/channel/files", post(api::channel::upload))
@@ -852,6 +861,37 @@ async fn serve() -> anyhow::Result<()> {
 
     let addr: SocketAddr = cfg.listen.parse().context("parsing listen address")?;
     let listener = TcpListener::bind(addr).await.context("binding listener")?;
+    let dashboard_task = match dashboard {
+        Some(dashboard) => {
+            let addr: SocketAddr = cfg
+                .dashboard_listen
+                .parse()
+                .context("parsing dashboard_listen")?;
+            match TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    info!(%addr, "serving the dashboard");
+                    let service = dashboard.into_make_service_with_connect_info::<SocketAddr>();
+                    Some(tokio::spawn(async move {
+                        if let Err(e) = axum::serve(listener, service).await {
+                            warn!(error = %e, "the dashboard stopped serving");
+                        }
+                    }))
+                }
+                // The API matters more; a dashboard from an older release may
+                // still hold the port until its process is stopped.
+                Err(e) => {
+                    warn!(
+                        %addr,
+                        error = %e,
+                        "cannot serve the dashboard on dashboard_listen (is an older dashboard \
+                         process still running there?); serving the API without it"
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
     let signals = count_stop_signals();
     let serve = axum::serve(
         listener,
@@ -866,6 +906,9 @@ async fn serve() -> anyhow::Result<()> {
         }
     }
 
+    if let Some(task) = dashboard_task {
+        task.abort();
+    }
     // No new ticks, and no liveness verdicts on agents that are leaving.
     for task in [liveness_task, heartbeat_task, cron_task] {
         task.abort();

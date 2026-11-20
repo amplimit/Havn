@@ -1,7 +1,8 @@
 "use client";
 
-import { use, useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { Pin } from "lucide-react";
 import {
   ApiError,
@@ -11,7 +12,7 @@ import {
 } from "@/lib/api";
 
 /**
- * `/agents/[id]/skills` — read-only audit view of:
+ * `/agent/skills?id=` — read-only audit view of:
  *   - what skills the agent has installed (bundled + workspace);
  *   - what the curator has consolidated / archived (its `.curator/`
  *     report log).
@@ -21,12 +22,12 @@ import {
  * Pin/unpin and skill_manage CRUD live on the agent socket — surfaced
  * here once the dashboard-write proto frames land.
  */
-export default function SkillsPage({
-  params,
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const { id } = use(params);
+export default function SkillsPage() {
+  const id = useSearchParams().get("id") ?? "";
+  return <Skills key={id} id={id} />;
+}
+
+function Skills({ id }: { id: string }) {
 
   const [active, setActive] = useState<SkillView[] | null>(null);
   const [archived, setArchived] = useState<SkillView[]>([]);
@@ -93,7 +94,7 @@ export default function SkillsPage({
     <div className="mx-auto max-w-5xl px-4 py-8 sm:px-8 sm:py-12">
       <header className="mb-8">
         <Link
-          href={`/agents/${id}`}
+          href={`/agent?id=${id}`}
           className="mb-2 inline-block text-sm"
           style={{ color: "var(--color-body)" }}
         >

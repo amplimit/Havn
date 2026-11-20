@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * `/teams/[id]/usage` — token totals per member of the team's agents
+ * `/team/usage?id=` — token totals per member of the team's agents
  * and credentials (spec §10.3 "Resource Dashboard"; team admins only).
  * Spec §7.3 / v0.6: token counts only, no USD. Operators compute $ in
  * their own analytics from this data.
@@ -9,7 +9,8 @@
  * Default window 30 days; the picker also offers 7 / 90 / 365.
  */
 
-import { use, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { api, type TeamUsageEntry } from "@/lib/api";
 
 const WINDOWS: Array<{ days: number; label: string }> = [
@@ -19,12 +20,12 @@ const WINDOWS: Array<{ days: number; label: string }> = [
   { days: 365, label: "1y" },
 ];
 
-export default function TeamUsagePage({
-  params,
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const { id } = use(params);
+export default function TeamUsagePage() {
+  const id = useSearchParams().get("id") ?? "";
+  return <TeamUsage key={id} id={id} />;
+}
+
+function TeamUsage({ id }: { id: string }) {
   const [days, setDays] = useState(30);
   const [entries, setEntries] = useState<TeamUsageEntry[] | null>(null);
   const [since, setSince] = useState<string | null>(null);

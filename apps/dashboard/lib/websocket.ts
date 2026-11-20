@@ -1,12 +1,10 @@
 /**
  * WebSocket client for the WebChat endpoint (spec §3.2 + §11).
  *
- * The dashboard's `server.mjs` custom Next server proxies WebSocket
- * upgrades for `/ws/*` to the loopback-only gateway, so the browser
- * always opens WS to the dashboard's own origin. This keeps the
- * gateway out of the public network surface and means the same code
- * works whether the user accesses the dashboard via SSH tunnel,
- * direct public IP, or behind a real reverse proxy.
+ * The browser opens WS to the dashboard's own origin: the gateway serves
+ * `/ws/*` beside the dashboard (and in development `server.mjs` proxies
+ * it), so the same code works through an SSH tunnel or behind a reverse
+ * proxy.
  *
  * `NEXT_PUBLIC_HAVN_GATEWAY_WS` overrides for the rare case where you
  * want the browser to bypass the dashboard and hit the gateway

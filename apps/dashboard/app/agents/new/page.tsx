@@ -71,7 +71,7 @@ export default function NewAgentPage() {
         model ? { model } : {},
         teamId || null,
       );
-      router.push(`/agents/${agent.id}`);
+      router.push(`/agent?id=${agent.id}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setSubmitting(false);

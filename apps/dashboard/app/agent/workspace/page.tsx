@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, use, useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Download, File, Folder, Link2 } from "lucide-react";
@@ -33,23 +33,16 @@ type Preview =
   | { path: string; kind: "none"; why: string };
 
 /**
- * `/agents/[id]/workspace` — the files of the agent's workspace, read-only:
+ * `/agent/workspace?id=` — the files of the agent's workspace, read-only:
  * folders, text and images shown, any file downloaded. Links are shown and
  * never followed.
  */
-export default function WorkspacePage({ params }: { params: Promise<{ id: string }> }) {
-  const { id } = use(params);
-  return (
-    <Suspense>
-      <AddressedFolder id={id} />
-    </Suspense>
-  );
-}
-
 /** The folder the address names; a new folder starts afresh. */
-function AddressedFolder({ id }: { id: string }) {
-  const path = useSearchParams().get("path") ?? "";
-  return <Workspace key={path} id={id} path={path} />;
+export default function WorkspacePage() {
+  const search = useSearchParams();
+  const id = search.get("id") ?? "";
+  const path = search.get("path") ?? "";
+  return <Workspace key={`${id}/${path}`} id={id} path={path} />;
 }
 
 function Workspace({ id, path }: { id: string; path: string }) {
@@ -82,7 +75,7 @@ function Workspace({ id, path }: { id: string; path: string }) {
 
   const go = useCallback(
     (to: string) =>
-      router.push(`/agents/${id}/workspace${to ? `?path=${encodeURIComponent(to)}` : ""}`),
+      router.push(`/agent/workspace?id=${id}${to ? `&path=${encodeURIComponent(to)}` : ""}`),
     [id, router],
   );
 
@@ -124,7 +117,7 @@ function Workspace({ id, path }: { id: string; path: string }) {
   return (
     <div className="mx-auto max-w-5xl px-6 py-8">
       <p className="mb-2 text-sm">
-        <Link href={`/agents/${id}`} className="underline">
+        <Link href={`/agent?id=${id}`} className="underline">
           back to the chat
         </Link>
       </p>

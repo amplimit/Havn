@@ -8,9 +8,8 @@
     "node": ">=22.13"
   },
   "scripts": {
-    "dev": "node server.mjs --dev",
+    "dev": "node server.mjs",
     "build": "next build",
-    "start": "node server.mjs",
     "lint": "eslint",
     "type-check": "tsc --noEmit"
   },

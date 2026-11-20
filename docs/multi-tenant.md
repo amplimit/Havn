@@ -144,9 +144,9 @@ workspaces.
   only, for example
   `lxc config device add acme dash proxy listen=tcp:127.0.0.1:3101 connect=tcp:127.0.0.1:3000`,
   and point an authenticating reverse proxy on the host at that port (see the
-  [dashboard README](../apps/dashboard/README.md) for what the proxy must
-  send). The proxy device connects to the dashboard from 127.0.0.1 inside the
-  container, so that is the address to set in `HAVN_DASHBOARD_TRUSTED_PROXIES`
-  there, not the address of the reverse proxy on the host. For the same
+  [README](../README.md#multi-user-mode-behind-an-sso-proxy) for what the
+  proxy must send). The proxy device connects to the gateway's dashboard from
+  127.0.0.1 inside the container, so `trust_header.allowed_proxies` there is
+  `["127.0.0.1/32"]`, not the address of the reverse proxy on the host. For the same
   reason, never listen on `0.0.0.0` or the `lxdbr0` address: anyone who can
   reach that port is treated as the trusted proxy.

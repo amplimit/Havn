@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * `/agents/[id]/settings` — per-agent configuration.
+ * `/agent/settings?id=` — per-agent configuration.
  *
  * Editable today: name, model, heartbeat interval. The PATCH endpoint
  * shallow-merges config keys, so saving "model" doesn't disturb
@@ -13,9 +13,9 @@
  * is currently running so the user knows to expect that.
  */
 
-import { use, useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import {
   ApiError,
   api,
@@ -56,12 +56,12 @@ function useFlash(ms = 4000): [boolean, () => void] {
   return [on, flash];
 }
 
-export default function SettingsPage({
-  params,
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const { id } = use(params);
+export default function SettingsPage() {
+  const id = useSearchParams().get("id") ?? "";
+  return <Settings key={id} id={id} />;
+}
+
+function Settings({ id }: { id: string }) {
   const router = useRouter();
 
   const [agent, setAgent] = useState<AgentView | null>(null);
@@ -199,7 +199,7 @@ export default function SettingsPage({
     <div className="mx-auto max-w-3xl px-4 py-8 sm:px-8 sm:py-10">
       <header className="mb-6">
         <Link
-          href={`/agents/${id}`}
+          href={`/agent?id=${id}`}
           className="mb-2 inline-block text-sm"
           style={{ color: "var(--color-body)" }}
         >

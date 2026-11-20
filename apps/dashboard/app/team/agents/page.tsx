@@ -1,15 +1,16 @@
 "use client";
 
 /**
- * `/teams/[id]/agents` — every agent created in this team
+ * `/team/agents?id=` — every agent created in this team
  * (spec §10.3 admin view "Team Agents"). Members can view; admins
  * who want to bulk-stop click into individual agents (the lifecycle
  * endpoints already gate on owner_id, so cross-user start/stop from
  * here is intentionally NOT exposed — admins ask the owner).
  */
 
-import { use, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { api, type TeamAgentView } from "@/lib/api";
 
 const STATUS_COLOUR: Record<TeamAgentView["status"], string> = {
@@ -20,12 +21,12 @@ const STATUS_COLOUR: Record<TeamAgentView["status"], string> = {
   error: "var(--color-ruby)",
 };
 
-export default function TeamAgentsPage({
-  params,
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const { id } = use(params);
+export default function TeamAgentsPage() {
+  const id = useSearchParams().get("id") ?? "";
+  return <TeamAgents key={id} id={id} />;
+}
+
+function TeamAgents({ id }: { id: string }) {
   const [agents, setAgents] = useState<TeamAgentView[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -87,7 +88,7 @@ export default function TeamAgentsPage({
       {agents.map((a) => (
         <li key={a.id}>
           <Link
-            href={`/agents/${a.id}`}
+            href={`/agent?id=${a.id}`}
             className="card flex items-center justify-between px-4 py-3 transition-colors hover:bg-[rgba(83,58,253,0.04)]"
           >
             <div className="min-w-0 flex-1">

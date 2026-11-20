@@ -1,7 +1,8 @@
 "use client";
 
-import { use, useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import {
   api,
   type AgentView,
@@ -223,12 +224,12 @@ function underAnchor(b: Bubble, stored: Bubble[]): Bubble {
   return reply ? { ...b, ts: reply.ts + 0.5 } : b;
 }
 
-export default function ChatPage({
-  params,
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const { id } = use(params);
+export default function ChatPage() {
+  const id = useSearchParams().get("id") ?? "";
+  return <Chat key={id} id={id} />;
+}
+
+function Chat({ id }: { id: string }) {
 
   const [agent, setAgent] = useState<AgentView | null>(null);
   const [me, setMe] = useState<MeView | null>(null);
@@ -1141,7 +1142,7 @@ export default function ChatPage({
               new chat
             </button>
             <Link
-              href={`/agents/${agent.id}/memory`}
+              href={`/agent/memory?id=${agent.id}`}
               className="btn-ghost inline-flex items-center gap-1.5"
               title="See what the agent remembers about you"
             >
@@ -1149,7 +1150,7 @@ export default function ChatPage({
               memory
             </Link>
             <Link
-              href={`/agents/${agent.id}/skills`}
+              href={`/agent/skills?id=${agent.id}`}
               className="btn-ghost inline-flex items-center gap-1.5"
               title="Installed skills + curator log"
             >
@@ -1158,7 +1159,7 @@ export default function ChatPage({
             </Link>
             {workspaceOpen && (
               <Link
-                href={`/agents/${agent.id}/workspace`}
+                href={`/agent/workspace?id=${agent.id}`}
                 className="btn-ghost inline-flex items-center gap-1.5"
                 title="Browse the files in the agent's workspace"
               >
@@ -1167,7 +1168,7 @@ export default function ChatPage({
               </Link>
             )}
             <Link
-              href={`/agents/${agent.id}/settings`}
+              href={`/agent/settings?id=${agent.id}`}
               className="btn-ghost inline-flex items-center gap-1.5"
               title="Rename, change model, edit policy"
             >
