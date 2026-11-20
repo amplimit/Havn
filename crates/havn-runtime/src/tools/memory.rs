@@ -429,9 +429,14 @@ async fn for_someone_else(ctx: &ToolCtx, query: &str, found: String) -> ToolResu
             ),
         ))
     };
+    // One question at a time in a turn; one refused answers the rest.
+    let _asking = match &refused {
+        Some(r) => Some(r.1.lock().await),
+        None => None,
+    };
     if refused
         .as_ref()
-        .is_some_and(|r| r.load(std::sync::atomic::Ordering::Relaxed))
+        .is_some_and(|r| r.0.load(std::sync::atomic::Ordering::Relaxed))
     {
         return refusal(lang.pick("they did not allow it", "所有者没有允许"));
     }
@@ -474,7 +479,7 @@ async fn for_someone_else(ctx: &ToolCtx, query: &str, found: String) -> ToolResu
         }
         Err(why) => {
             if let Some(refused) = &refused {
-                refused.store(true, std::sync::atomic::Ordering::Relaxed);
+                refused.0.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             refusal(&why)
         }

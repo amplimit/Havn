@@ -2692,7 +2692,8 @@ function MemoryApproval({
   const [note, setNote] = useState("");
   let shown: { from?: string; said?: string; query?: string; found?: string } = {};
   try {
-    shown = JSON.parse(request.input) as typeof shown;
+    const parsed: unknown = JSON.parse(request.input);
+    shown = parsed && typeof parsed === "object" ? (parsed as typeof shown) : { found: request.input };
   } catch {
     shown = { found: request.input };
   }

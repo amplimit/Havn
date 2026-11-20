@@ -321,7 +321,18 @@ impl WebChatRouter {
             let mut pending = self.lock_approvals();
             pending.retain(|_, p| p.since.elapsed() < APPROVAL_KEPT);
             let waiting = pending.values().filter(|p| p.agent_id == agent_id).count();
-            if waiting >= MAX_PENDING_APPROVALS || pending.contains_key(&request.request_id) {
+            // One question about memory per conversation at a time (issue
+            // #249): someone else cannot fill the owner's slots.
+            let memory_waits = request.kind == "memory"
+                && pending.values().any(|p| {
+                    p.agent_id == agent_id
+                        && p.request.kind == "memory"
+                        && p.request.channel_id == request.channel_id
+                });
+            if waiting >= MAX_PENDING_APPROVALS
+                || memory_waits
+                || pending.contains_key(&request.request_id)
+            {
                 return false;
             }
             pending.insert(

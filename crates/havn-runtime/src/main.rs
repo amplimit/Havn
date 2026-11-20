@@ -2562,7 +2562,10 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
                         user_text.chars().take(ASKED_SHOWN_CHARS).collect(),
                     ),
                     tools::gateway::MEMORY_REFUSED.scope(
-                        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        Arc::new((
+                            std::sync::atomic::AtomicBool::new(false),
+                            tokio::sync::Mutex::new(()),
+                        )),
                         tools::gateway::CHAT.scope(
                             chat.clone(),
                             tools::memory::MEMORY_CHANGES.scope(
@@ -2660,7 +2663,20 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
             } else {
                 steps::without_note(&final_text)
             };
-            if let Some(kept) = steps::of_turn(messages.get(turn_start..).unwrap_or_default(), said)
+            // What memory gave someone else was for that reply only (issue
+            // #249): later turns do not get it back from the steps.
+            let mut done = messages.get(turn_start..).unwrap_or_default().to_vec();
+            if !msg.from_owner {
+                steps::without_results_of(
+                    &mut done,
+                    "memory_search",
+                    lang().pick(
+                        "(What memory search found was for that reply only.)",
+                        "（记忆搜索找到的内容只用于那次回复。）",
+                    ),
+                );
+            }
+            if let Some(kept) = steps::of_turn(&done, said)
                 && let Err(e) = conversations::set_steps(&ctx.pool, &turn, &kept).await
             {
                 warn!(error = %e, "could not keep the turn's steps");

@@ -40,8 +40,10 @@ tokio::task_local! {
     /// #249).
     pub static ASKED: (String, String);
     /// The owner refused memory to this turn already (issue #249): a
-    /// later search in it is refused without asking them again.
-    pub static MEMORY_REFUSED: std::sync::Arc<std::sync::atomic::AtomicBool>;
+    /// later search in it is refused without asking them again. Its lock
+    /// keeps the turn's questions (calls side by side, subagents) to one
+    /// at a time.
+    pub static MEMORY_REFUSED: std::sync::Arc<(std::sync::atomic::AtomicBool, tokio::sync::Mutex<()>)>;
 }
 
 pub struct GatewayTool {

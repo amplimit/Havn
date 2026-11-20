@@ -1267,6 +1267,11 @@ async fn ask_for_approval(
         })
     };
     request.tool = request.tool.chars().take(200).collect();
+    // A kind the gateway knows, or none: a runtime's must not dress a card
+    // as another.
+    if request.kind != "memory" {
+        request.kind.clear();
+    }
     request.reason = request.reason.chars().take(300).collect();
     if request.input.chars().count() > MAX_APPROVAL_INPUT
         || !ctx
@@ -1285,12 +1290,24 @@ async fn ask_for_approval(
             agent.team_id,
             Some(agent_id),
             "tool.approval.requested",
-            serde_json::json!({
-                "request_id": request.request_id,
-                "tool": request.tool,
-                "input": request.input,
-                "conversation": request.channel_id,
-            }),
+            // What memory found and what someone else wrote are not for
+            // the audit log, which team admins read (issue #249).
+            if request.kind == "memory" {
+                serde_json::json!({
+                    "request_id": request.request_id,
+                    "tool": request.tool,
+                    "kind": "memory",
+                    "input_chars": request.input.chars().count(),
+                    "conversation": request.channel_id,
+                })
+            } else {
+                serde_json::json!({
+                    "request_id": request.request_id,
+                    "tool": request.tool,
+                    "input": request.input,
+                    "conversation": request.channel_id,
+                })
+            },
         )
         .await;
     }
@@ -1453,7 +1470,19 @@ fn memory_question(input: &str, id: &str, language: havn_core::Language) -> Stri
             })
             .unwrap_or_default()
     };
-    let (from, said, query, found) = (field("from"), field("said"), field("query"), field("found"));
+    // What someone else wrote, and the model's query, on one line each and
+    // quoted, so they cannot pass for the parts around them; what was
+    // found in a block of its own.
+    let line = |text: String| {
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        format!("\"{}\"", flat.replace('`', "'"))
+    };
+    let (from, said, query) = (
+        line(field("from")),
+        line(field("said")),
+        line(field("query")),
+    );
+    let found = format!("```\n{}\n```", field("found").trim().replace("```", "'''"));
     language.pick(
         format!(
             "Someone other than you asked, and the agent searched its memory.\n\nFrom: {from}\n\
@@ -1613,7 +1642,7 @@ pub async fn forward_decision(
                 "tool": request.tool,
                 "approve": approve,
                 "remember": remember,
-                "note": note,
+                "note_chars": note.as_deref().map_or(0, |n| n.chars().count()),
                 "decided_by": decided_by,
                 "conversation": request.channel_id,
             }),

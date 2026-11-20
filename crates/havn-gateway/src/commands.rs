@@ -866,6 +866,18 @@ async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> S
             .into();
     }
     match (approve, remember) {
+        (true, true) if request.kind == "memory" => language
+            .pick(
+                "(Allowed: memory search answers in that conversation from now on, without asking.)",
+                "（已允许：从现在起，那个对话里的记忆搜索不再询问，直接使用。）",
+            )
+            .to_string(),
+        (true, false) if request.kind == "memory" => language
+            .pick(
+                "(Allowed for that reply.)",
+                "（已允许用于那次回复。）",
+            )
+            .to_string(),
         (true, true) => language.pick(
             format!(
                 "(Approved {}, and the same step for the rest of the chat.)",

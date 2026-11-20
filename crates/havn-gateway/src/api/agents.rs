@@ -1087,7 +1087,7 @@ pub async fn memory_access_get(
         user.id,
         agent.id,
         havn_proto::DataQuery::MemoryAccess,
-        true,
+        false,
     )
     .await?;
     for access in &mut view.allowed {
