@@ -250,6 +250,7 @@ pub async fn check(
         system: None,
         temperature: None,
         tools: None,
+        system_stable: 0,
     };
     let answer = crate::llm_proxy::complete_with_provider(
         &state.db,

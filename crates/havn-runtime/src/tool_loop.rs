@@ -786,6 +786,11 @@ async fn call_llm(
     }
     if let Some(prompt) = system_prompt.as_text() {
         options["system"] = Value::String(prompt.to_string());
+        // Where the part every turn shares ends: a provider that caches
+        // prompts caches it (issue #220).
+        if system_prompt.stable_len() > 0 {
+            options["system_stable"] = Value::from(system_prompt.stable_len());
+        }
     }
     if !handle.registry.is_empty_for(context) {
         options["tools"] = handle.registry.schemas_for(context);

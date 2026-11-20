@@ -221,6 +221,10 @@ impl BootstrapFiles {
 #[derive(Debug, Clone, Default)]
 pub struct SystemPrompt {
     text: Option<String>,
+    /// Bytes of `text` that are the same in every turn (issue #220): the
+    /// frozen base, before the sections a turn adds. A provider caches
+    /// the prompt up to there.
+    stable: usize,
 }
 
 impl SystemPrompt {
@@ -246,7 +250,13 @@ impl SystemPrompt {
         } else {
             Some(chunks.join("\n\n---\n\n"))
         };
-        Self { text }
+        let stable = text.as_ref().map_or(0, String::len);
+        Self { text, stable }
+    }
+
+    /// Bytes of the prompt that are the same in every turn.
+    pub fn stable_len(&self) -> usize {
+        self.stable
     }
 
     pub fn as_text(&self) -> Option<&str> {
@@ -262,7 +272,10 @@ impl SystemPrompt {
             Some(base) => format!("{base}\n\n---\n\n{extra}"),
             None => extra.to_string(),
         };
-        Self { text: Some(text) }
+        Self {
+            text: Some(text),
+            stable: self.stable,
+        }
     }
 }
 

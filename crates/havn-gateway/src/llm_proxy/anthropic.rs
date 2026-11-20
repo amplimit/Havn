@@ -272,7 +272,55 @@ fn request_body(request: &AnthropicRequest) -> Result<serde_json::Value, Provide
             obj.remove("temperature");
         }
     }
+    mark_cache(&mut body, request);
     Ok(body)
+}
+
+/// Mark where Anthropic caches the prompt (issue #220): the end of the
+/// system part every turn shares (with the tools before it), and the end
+/// of the conversation, so a turn's next round and the next turn read
+/// what came before from the cache. Two of the four marks a request may
+/// carry.
+fn mark_cache(body: &mut serde_json::Value, request: &AnthropicRequest) {
+    if let Some(system) = request.system.as_deref().filter(|s| !s.is_empty()) {
+        let (shared, rest) = super::system_parts(system, request.system_stable);
+        let mut blocks = vec![serde_json::json!({
+            "type": "text", "text": shared, "cache_control": super::cache_mark(),
+        })];
+        if let Some(rest) = rest {
+            blocks.push(serde_json::json!({"type": "text", "text": rest}));
+        }
+        body["system"] = serde_json::Value::Array(blocks);
+    }
+    let Some(last) = body
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|m| m.last_mut())
+    else {
+        return;
+    };
+    if let Some(text) = last.get("content").and_then(serde_json::Value::as_str) {
+        if text.is_empty() {
+            return;
+        }
+        last["content"] = serde_json::json!([{"type": "text", "text": text}]);
+    }
+    // The last block that can carry it: thinking blocks cannot.
+    if let Some(block) = last
+        .get_mut("content")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|blocks| {
+            blocks.iter_mut().rev().find(|b| {
+                !matches!(
+                    b.get("type").and_then(serde_json::Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+            })
+        })
+        && let Some(block) = block.as_object_mut()
+    {
+        block.insert("cache_control".into(), super::cache_mark());
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +332,61 @@ mod tests {
     use axum::http::{HeaderMap, StatusCode, header};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn the_shared_system_part_and_the_conversation_s_end_are_marked_for_the_cache() {
+        let mut r = hi();
+        r.system = Some("base prompt\n\n---\n\nthe time now".into());
+        r.system_stable = "base prompt".len();
+        r.messages = vec![
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!("hi"),
+            },
+            AnthropicMessage {
+                role: "assistant".into(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "t1", "name": "x", "input": {}},
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".into(),
+                content: serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                ]),
+            },
+        ];
+        let body = request_body(&r).expect("body");
+        let system = body["system"].as_array().expect("blocks");
+        assert_eq!(system.len(), 2);
+        assert_eq!(system[0]["text"], "base prompt");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+        assert!(
+            system[1].get("cache_control").is_none(),
+            "the turn's own part is not"
+        );
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(
+            messages[2]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(messages[0]["content"], "hi", "only the last message");
+        let marks = body.to_string().matches("cache_control").count();
+        assert_eq!(marks, 2, "within Anthropic's four");
+
+        // A plain last message becomes a block that carries the mark; a
+        // system prompt with no known boundary is marked whole.
+        let mut r = hi();
+        r.system = Some("all of it".into());
+        let body = request_body(&r).expect("body");
+        assert_eq!(body["system"][0]["text"], "all of it");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        let last = body["messages"]
+            .as_array()
+            .and_then(|m| m.last())
+            .expect("last");
+        assert_eq!(last["content"][0]["cache_control"]["type"], "ephemeral");
+    }
 
     #[tokio::test]
     async fn calls_the_messages_endpoint_under_the_given_base_url() {
@@ -452,6 +555,7 @@ mod tests {
             system: None,
             temperature: None,
             tools: None,
+            system_stable: 0,
         }
     }
 
@@ -466,6 +570,7 @@ mod tests {
             system: None,
             temperature: Some(0.2),
             tools: None,
+            system_stable: 0,
         };
         let body = request_body(&r).expect("body");
         assert_eq!(

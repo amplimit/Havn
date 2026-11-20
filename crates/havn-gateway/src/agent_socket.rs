@@ -2823,6 +2823,12 @@ fn build_anthropic_request(req: &LlmRequest) -> anyhow::Result<AnthropicRequest>
         max_tokens,
         reasoning: None,
         messages,
+        system_stable: req
+            .options
+            .get("system_stable")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(0),
         system,
         temperature,
         tools,

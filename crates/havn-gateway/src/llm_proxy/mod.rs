@@ -127,6 +127,10 @@ pub struct AnthropicRequest {
     pub messages: Vec<AnthropicMessage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
+    /// Bytes of `system` that every turn of the agent shares (issue
+    /// #220); 0 when unknown. Providers that cache prompts mark it.
+    #[serde(skip)]
+    pub system_stable: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     /// Tool definitions in Anthropic's `tools` shape: an array of
@@ -134,6 +138,24 @@ pub struct AnthropicRequest {
     /// (or translated to OpenAI/Gemini shape inside the relevant provider).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<serde_json::Value>,
+}
+
+/// `system` cut where the part every turn shares ends (issue #220): that
+/// part, and the rest when there is any. The whole of it as one part when
+/// the boundary is unknown or not on a character's edge.
+#[must_use]
+pub fn system_parts(system: &str, stable: usize) -> (&str, Option<&str>) {
+    if stable == 0 || stable >= system.len() || !system.is_char_boundary(stable) {
+        return (system, None);
+    }
+    let (shared, rest) = system.split_at(stable);
+    (shared, Some(rest).filter(|r| !r.trim().is_empty()))
+}
+
+/// Anthropic's mark of a prompt-cache breakpoint.
+#[must_use]
+pub fn cache_mark() -> serde_json::Value {
+    serde_json::json!({"type": "ephemeral"})
 }
 
 /// What a request asks of a model's thinking, from the model's
@@ -636,6 +658,14 @@ impl ReservationGuard {
     }
 
     async fn settle(self, resp: &AnthropicResponse) {
+        tracing::debug!(
+            model = %resp.model,
+            input = resp.usage.input_tokens,
+            cache_read = resp.usage.cache_read_input_tokens.unwrap_or(0),
+            cache_write = resp.usage.cache_creation_input_tokens.unwrap_or(0),
+            output = resp.usage.output_tokens,
+            "llm usage"
+        );
         let tokens_in = i64::try_from(resp.usage.total_input_tokens()).unwrap_or(i64::MAX);
         let tokens_out = i64::try_from(resp.usage.output_tokens).unwrap_or(i64::MAX);
         self.settle_tokens(&resp.model, tokens_in, tokens_out).await;
@@ -1889,6 +1919,7 @@ mod tests {
             system: None,
             temperature: None,
             tools: None,
+            system_stable: 0,
         };
         resolve_workspace_images(
             &mut request,
@@ -1926,6 +1957,7 @@ mod tests {
             system: None,
             temperature: None,
             tools: None,
+            system_stable: 0,
         }
     }
 
@@ -1963,6 +1995,7 @@ mod tests {
             system: Some("system".into()),
             temperature: None,
             tools: None,
+            system_stable: 0,
         }
     }
 
@@ -2359,6 +2392,7 @@ mod tests {
             system: None,
             temperature: None,
             tools: None,
+            system_stable: 0,
         }
     }
 
@@ -2577,6 +2611,7 @@ mod tests {
             system: None,
             temperature: None,
             tools: None,
+            system_stable: 0,
         };
 
         let mut seen = request();
@@ -2629,6 +2664,7 @@ mod tests {
             system: None,
             temperature: None,
             tools,
+            system_stable: 0,
         }
     }
 
@@ -2671,6 +2707,24 @@ mod tests {
             req.model = model.into();
             assert!(provider_side_fetch(&req).is_some(), "{model}");
         }
+    }
+
+    #[test]
+    fn a_system_prompt_is_cut_where_the_shared_part_ends() {
+        assert_eq!(system_parts("base\nturn", 4), ("base", Some("\nturn")));
+        assert_eq!(system_parts("base", 0), ("base", None), "unknown");
+        assert_eq!(system_parts("base", 4), ("base", None), "nothing after it");
+        assert_eq!(
+            system_parts("base  ", 4),
+            ("base", None),
+            "only spaces after it"
+        );
+        assert_eq!(
+            system_parts("é", 1),
+            ("é", None),
+            "not on a character's edge"
+        );
+        assert_eq!(system_parts("ab", 9), ("ab", None), "past the end");
     }
 
     #[test]
@@ -2860,6 +2914,7 @@ mod tests {
                 system: None,
                 temperature: None,
                 tools: None,
+                system_stable: 0,
             }
         }
 
