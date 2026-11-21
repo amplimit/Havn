@@ -1610,29 +1610,47 @@ fn without_codes(said: &str) -> String {
             Some(_) => true,
         }
     };
+    // Where a code that starts at `pos` ends.
+    let code_at = |pos: usize| {
+        let rest = &said[pos..];
+        form.find(rest)
+            .filter(|found| {
+                ends_there(&rest[found.end()..])
+                    && shaped(found.as_str())
+                    && channel_access::normalize_code(found.as_str()).is_some()
+            })
+            .map(|found| pos + found.end())
+    };
+    let word_start = |pos: usize| {
+        said[pos..].starts_with(|c: char| c.is_ascii_alphanumeric())
+            && !said[..pos].ends_with(|c: char| c.is_ascii_alphanumeric())
+    };
     let mut out = String::with_capacity(said.len());
     let mut at = 0;
-    let mut in_word = false;
     while let Some(c) = said[at..].chars().next() {
-        if !in_word && c.is_ascii_alphanumeric() {
-            let rest = &said[at..];
-            if let Some(found) = form.find(rest)
-                && ends_there(&rest[found.end()..])
-                && shaped(found.as_str())
-                && channel_access::normalize_code(found.as_str()).is_some()
-            {
-                out.push_str("(a code)");
-                at += found.end();
-                in_word = false;
-                continue;
-            }
+        if word_start(at)
+            && let Some(end) = code_at(at)
+            // A word before a code reads as its first group: the code is
+            // the one that starts further on and goes further.
+            && !said[at..end]
+                .char_indices()
+                .skip(1)
+                .any(|(k, _)| word_start(at + k) && code_at(at + k).is_some_and(|e| e > end))
+        {
+            out.push_str(CODE_LEFT_OUT);
+            at = end;
+            continue;
         }
         out.push(c);
-        in_word = c.is_ascii_alphanumeric();
         at += c.len_utf8();
     }
     out
 }
+
+/// What stands for a pairing code left out of what a sender said; like
+/// the others there, with nothing Markdown reads, so a chat app that does
+/// not render it shows no escapes.
+const CODE_LEFT_OUT: &str = "«a code»";
 
 /// `text` on one line, with what Markdown reads as a link or a format
 /// escaped, so a chat app that renders it shows the text as written.
@@ -1667,16 +1685,16 @@ async fn refused(
     }
     let said = match (why, &inb.content) {
         (Refusal::InvalidCode | Refusal::TooManyTries | Refusal::LinkedElsewhere, _) => {
-            "(a pairing code that did not work)".to_string()
+            "«a pairing code that did not work»".to_string()
         }
         (Refusal::Welcome, _) => "/start".to_string(),
         (Refusal::Help, _) => "/help".to_string(),
         (_, ChannelMessageContent::Text { text }) => text.clone(),
         (_, ChannelMessageContent::Image { caption, .. }) => {
-            format!("(a picture) {}", caption.as_deref().unwrap_or_default())
+            format!("«a picture» {}", caption.as_deref().unwrap_or_default())
         }
-        (_, ChannelMessageContent::File { filename, .. }) => format!("(a file: {filename})"),
-        (_, ChannelMessageContent::Audio { .. }) => "(a voice message)".to_string(),
+        (_, ChannelMessageContent::File { filename, .. }) => format!("«a file: {filename}»"),
+        (_, ChannelMessageContent::Audio { .. }) => "«a voice message»".to_string(),
         (_, _) => String::new(),
     };
     let said = without_codes(&said);
@@ -3360,12 +3378,20 @@ mod tests {
                 "ABCDEFGH JKMNPQ12",
                 "abcd\u{ad}efgh\u{200b}jkmn-pqrs",
                 "code: 0123456789ABCDEF.",
+                "code 7K3M QX9P 2HWD RT4B",
+                "password 7K3MQX9P 2HWDRT4B",
             ] {
                 let kept = without_codes(said);
-                assert!(kept.contains("(a code)"), "{said:?} gives {kept:?}");
+                assert!(kept.contains(CODE_LEFT_OUT), "{said:?} gives {kept:?}");
                 assert!(
-                    !kept.contains("PQRS") && !kept.contains("PQ12") && !kept.contains("pqrs"),
+                    !["PQRS", "PQ12", "pqrs", "RT4B", "2HWDRT4B"]
+                        .iter()
+                        .any(|g| kept.contains(g)),
                     "{said:?} gives {kept:?}"
+                );
+                assert!(
+                    !said.starts_with("code ") || kept.starts_with("code "),
+                    "the word before it is kept: {kept:?}"
                 );
             }
             for said in [
@@ -3400,14 +3426,14 @@ mod tests {
                 "{notice}"
             );
             assert!(
-                !notice.contains("PQRS") && notice.contains(r"\(a code\)"),
+                !notice.contains("PQRS") && notice.contains(CODE_LEFT_OUT),
                 "{notice}"
             );
             let refused = channel_access::list_refusals(&f.state.db, "telegram", "bot")
                 .await
                 .expect("refused");
             assert!(
-                !refused[0].said.contains("PQRS") && refused[0].said.contains("(a code)"),
+                !refused[0].said.contains("PQRS") && refused[0].said.contains(CODE_LEFT_OUT),
                 "{}",
                 refused[0].said
             );

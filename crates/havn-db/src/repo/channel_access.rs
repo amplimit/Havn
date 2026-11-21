@@ -677,13 +677,16 @@ pub async fn record_refusal(
         "INSERT INTO channel_refusals (channel, account_id, sender_id, first_at, last_at, said) \
          VALUES (?1, ?2, ?3, ?4, ?4, ?5) \
          ON CONFLICT (channel, account_id, sender_id) DO UPDATE SET \
-             last_at = excluded.last_at, count = count + 1, said = excluded.said",
+             first_at = CASE WHEN last_at < ?6 THEN excluded.first_at ELSE first_at END, \
+             count = CASE WHEN last_at < ?6 THEN 1 ELSE count + 1 END, \
+             last_at = excluded.last_at, said = excluded.said",
     )
     .bind(channel)
     .bind(account_id)
     .bind(sender_id)
     .bind(&at)
     .bind(&said)
+    .bind(timestamp(now - Duration::days(REFUSAL_KEPT_DAYS)))
     .execute(&mut *tx)
     .await?;
     if before.is_none() {
@@ -997,6 +1000,36 @@ mod tests {
                 .await
                 .expect("gone")
         );
+
+        // Someone back after the days kept starts over.
+        for _ in 0..2 {
+            record_refusal(&pool, "telegram", "back", "tg:3", "", Utc::now())
+                .await
+                .expect("record");
+        }
+        sqlx::query(
+            "UPDATE channel_refusals SET last_at = ?1, first_at = ?1 WHERE sender_id = 'tg:3'",
+        )
+        .bind(timestamp(
+            Utc::now() - Duration::days(REFUSAL_KEPT_DAYS + 5),
+        ))
+        .execute(&pool)
+        .await
+        .expect("age");
+        assert!(
+            list_refusals(&pool, "telegram", "back")
+                .await
+                .expect("list")
+                .is_empty()
+        );
+        record_refusal(&pool, "telegram", "back", "tg:3", "hi", Utc::now())
+            .await
+            .expect("back");
+        let refused = list_refusals(&pool, "telegram", "back")
+            .await
+            .expect("list");
+        assert_eq!(refused[0].count, 1);
+        assert!(refused[0].first_at > Utc::now() - Duration::hours(1));
     }
 
     #[tokio::test]
