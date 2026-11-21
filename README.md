@@ -727,6 +727,7 @@ A message that is only a command is answered by the gateway or the agent and nev
 | `/agent_model [name\|number\|default]` | sets the agent's model, as its settings page does, for every chat without one of its own |
 | `/usage [days]` | the agent's model calls and tokens, per model (30 days by default) |
 | `/approve [always] [id]`, `/deny [id]` | answer the step of this conversation waiting for approval: the one named by its request id, else the one that waited longest |
+| `/allow <sender>` | the agent's owner, in their connected chat with the bot, lets in someone the bot turned away (see [Who can reach a bot](#who-can-reach-a-bot)) |
 | `/disconnect` | in a chat app, ends this account's link to a Havn account (see [Connecting a chat account](#connecting-a-chat-account)) |
 | `/whoami` | who the gateway takes you for, and whether you may use the admin commands |
 | `/help` (`/commands`) | lists them |
@@ -774,7 +775,7 @@ too_many_tries = "尝试次数太多，请几分钟后再发送配对码。"
 
 A text is cut to 2000 characters, and the gateway warns about texts for an account it does not declare.
 
-Manage invites and admitted senders with the same direct-database commands as `havn user` (no gateway restart needed):
+The agent's owner can do the same from its settings page (see [Who can reach a bot](#who-can-reach-a-bot)). The operator manages invites and admitted senders with the same direct-database commands as `havn user` (no gateway restart needed):
 
 ```sh
 havn invite list [--channel telegram] [--account acme-bot]   # status of each invite; codes are never shown again
@@ -787,6 +788,21 @@ havn access revoke --all --account acme-bot [--channel telegram]   # every invit
 `access revoke` applies to the sender's next message, and the agent can no longer message them either. Entries in `allow_from` can only be removed from the config file; `access revoke` warns when a sender it removed is still listed there.
 
 Invited senders are stored per account and outlive config edits. If an account is removed or switched to `open`, its grants stop applying but are kept, and apply again if the account comes back as `allowlist`. The gateway warns about such grants at start-up and `access list` marks them; clear them with `havn access revoke --all`.
+
+### Who can reach a bot
+
+An agent's settings page manages its `allowlist` bots without the CLI (**who can reach the bot**, owner only; `GET /agents/{id}/channel-access`). For each account bound to the agent, it lists:
+
+- the senders in `allow_from` (changed in config.toml only);
+- the senders let in by an invite or connect code, or by the owner, and whether each is connected to a Havn account (the owner's own is marked). **remove** takes their access back from their next message (`DELETE .../channel-access/senders`); the owner's own connected account stays let in while it is connected.
+- the invite codes made for it. **make an invite code** (1 hour to 30 days) shows a code once, with a `t.me` link when the bot's username is known; an unused one can be revoked. Connect codes are their users' own and are not listed.
+- the senders it turned away recently: who, about how many times (counted as often as they are answered, at most 3 a minute), when last, and the start of what they last said, with anything that reads as a pairing code left out. **let in** admits them (`POST .../channel-access/senders`), and **dismiss** forgets them. Each account keeps the 100 who wrote last, for 30 days. Someone let in otherwise (`allow_from`, a code, the owner's connected account) who sends a code that does not work is not listed.
+
+A sender can also be let in by id.
+
+When someone the bot turns away writes, and the agent's owner connected their own account on that channel, the owner is told in their chat with the same bot (Telegram delivers it only if they have started that bot): who wrote and what, as plain text, with an **Allow** button that sends `/allow <sender>`. They are told once a day per sender, and about at most 5 senders an hour per account. The setting on the same page turns this off (`config.notify_unpaired = false`). Only the agent's owner can use `/allow`; it lets the sender in to the bot the owner sends it to.
+
+A sender let in is told they can talk now. Letting in, removing and making or revoking a code are audited as `channel_access.granted` (with `"by": "owner"`), `channel_access.revoked`, `channel_invite.created` and `channel_invite.revoked`.
 
 ### Connecting a chat account
 

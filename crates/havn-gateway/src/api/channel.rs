@@ -1102,6 +1102,9 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
         );
         let limiter_key = format!("{channel}|{}|{}", inb.account_id, inb.sender_id);
         if state.dm_reject_limiter.should_send(&limiter_key) {
+            // As often as the sender is answered: a flood does not write
+            // on every message.
+            refused(state, channel, agent_id, &inb, why).await;
             let rejection = ChannelMessageContent::Text {
                 text: pairing_text(state, channel, &inb.account_id, why),
             };
@@ -1540,6 +1543,306 @@ enum Refusal {
     Paired,
 }
 
+/// Whether `inb`'s sender is let in to its `allowlist` account all the
+/// same: a refused code from someone admitted is not a stranger writing.
+async fn admitted_anyway(
+    state: &AppState,
+    channel: &str,
+    agent_id: havn_core::AgentId,
+    inb: &ChannelInbound,
+) -> bool {
+    let Some(account) = state
+        .channels
+        .get(channel)
+        .and_then(|entry| entry.accounts.iter().find(|a| a.id == inb.account_id))
+    else {
+        return true;
+    };
+    account.dm_policy != DmPolicy::Allowlist
+        || account.allow_from.iter().any(|s| s == &inb.sender_id)
+        || channel_access::is_allowed(&state.db, channel, &inb.account_id, &inb.sender_id)
+            .await
+            .unwrap_or(true)
+        || owner_linked(state, channel, agent_id, &inb.sender_id).await
+}
+
+/// `said` with what reads as a pairing code in it left out: only codes'
+/// hashes are kept. A code is tried at the start of every ASCII word, so
+/// one next to Chinese text, or after words that look like one, is found:
+/// four groups of four, two of eight or one of sixteen, with the
+/// separators [`channel_access::normalize_code`] drops between them.
+fn without_codes(said: &str) -> String {
+    static FORM: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    let Some(form) = FORM.get_or_init(|| {
+        let sep = r"[\s\-\u{2010}-\u{2015}\u{2212}\u{ff0d}\u{fe63}\u{ad}\u{200b}-\u{200d}\u{2060}\u{feff}]{1,3}";
+        let group = |n: usize| format!("[0-9A-Za-z]{{{n}}}");
+        regex::Regex::new(&format!(
+            "^(?:{g4}{sep}{g4}{sep}{g4}{sep}{g4}|{g8}{sep}{g8}|{g16})",
+            g4 = group(4),
+            g8 = group(8),
+            g16 = group(16),
+        ))
+        .ok()
+    }) else {
+        return said.to_string();
+    };
+    // Words of a sentence run together read as a code now and then; a
+    // code has a digit or a dash nearly always.
+    let shaped = |written: &str| {
+        written
+            .chars()
+            .any(|c| c.is_ascii_digit() || !(c.is_ascii_alphanumeric() || c.is_whitespace()))
+    };
+    // A code ends where no letter follows, nor a dash and a letter: one
+    // found inside a longer run is part of it, and is looked for further on.
+    // What a code's groups are joined with besides spaces: what
+    // `normalize_code` drops from one.
+    let joins = |c: char| {
+        !c.is_whitespace()
+            && channel_access::normalize_code(&format!("{c}0123456789ABCDEF")).is_some()
+    };
+    let ends_there = |after: &str| {
+        let mut next = after.chars();
+        match next.next() {
+            None => true,
+            Some(c) if c.is_ascii_alphanumeric() => false,
+            Some(c) if joins(c) => !next.next().is_some_and(|n| n.is_ascii_alphanumeric()),
+            Some(_) => true,
+        }
+    };
+    // Where a code that starts at `pos` ends.
+    let code_at = |pos: usize| {
+        let rest = &said[pos..];
+        form.find(rest)
+            .filter(|found| {
+                ends_there(&rest[found.end()..])
+                    && shaped(found.as_str())
+                    && channel_access::normalize_code(found.as_str()).is_some()
+            })
+            .map(|found| pos + found.end())
+    };
+    let word_start = |pos: usize| {
+        said[pos..].starts_with(|c: char| c.is_ascii_alphanumeric())
+            && !said[..pos].ends_with(|c: char| c.is_ascii_alphanumeric())
+    };
+    let mut out = String::with_capacity(said.len());
+    let mut at = 0;
+    while let Some(c) = said[at..].chars().next() {
+        if word_start(at)
+            && let Some(end) = code_at(at)
+            // A word before a code reads as its first group: the code is
+            // the one that starts further on and goes further.
+            && !said[at..end]
+                .char_indices()
+                .skip(1)
+                .any(|(k, _)| word_start(at + k) && code_at(at + k).is_some_and(|e| e > end))
+        {
+            out.push_str(CODE_LEFT_OUT);
+            at = end;
+            continue;
+        }
+        out.push(c);
+        at += c.len_utf8();
+    }
+    out
+}
+
+/// What stands for a pairing code left out of what a sender said; like
+/// the others there, with nothing Markdown reads, so a chat app that does
+/// not render it shows no escapes.
+const CODE_LEFT_OUT: &str = "«a code»";
+
+/// `text` on one line, with what Markdown reads as a link or a format
+/// escaped, so a chat app that renders it shows the text as written.
+fn as_plain(text: &str) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::with_capacity(line.len());
+    for c in line.chars() {
+        if matches!(
+            c,
+            '\\' | '`' | '*' | '_' | '[' | ']' | '(' | ')' | '#' | '!' | '<' | '>' | '~' | '|'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Keep that `inb`'s sender was turned away for `why` (issue #231), and
+/// tell the agent's owner the first time in a day, in their own chat with
+/// the bot, with a button that lets the sender in. A code sent is not
+/// kept.
+async fn refused(
+    state: &AppState,
+    channel: &str,
+    agent_id: havn_core::AgentId,
+    inb: &ChannelInbound,
+    why: Refusal,
+) {
+    if admitted_anyway(state, channel, agent_id, inb).await {
+        return;
+    }
+    let said = match (why, &inb.content) {
+        (Refusal::InvalidCode | Refusal::TooManyTries | Refusal::LinkedElsewhere, _) => {
+            "«a pairing code that did not work»".to_string()
+        }
+        (Refusal::Welcome, _) => "/start".to_string(),
+        (Refusal::Help, _) => "/help".to_string(),
+        (_, ChannelMessageContent::Text { text }) => text.clone(),
+        (_, ChannelMessageContent::Image { caption, .. }) => {
+            format!("«a picture» {}", caption.as_deref().unwrap_or_default())
+        }
+        (_, ChannelMessageContent::File { filename, .. }) => format!("«a file: {filename}»"),
+        (_, ChannelMessageContent::Audio { .. }) => "«a voice message»".to_string(),
+        (_, _) => String::new(),
+    };
+    let said = without_codes(&said);
+    let now = chrono::Utc::now();
+    let notify = match channel_access::record_refusal(
+        &state.db,
+        channel,
+        &inb.account_id,
+        &inb.sender_id,
+        &said,
+        now,
+    )
+    .await
+    {
+        Ok(notify) => notify,
+        Err(e) => {
+            warn!(channel, account = %inb.account_id, error = %e, "could not keep a refused sender");
+            return;
+        }
+    };
+    if !notify {
+        return;
+    }
+    let Ok(Some(agent)) = agent_repo::find_by_id(&state.db, agent_id).await else {
+        return;
+    };
+    if agent
+        .config
+        .get("notify_unpaired")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+    {
+        return;
+    }
+    let Ok(links) = channel_access::list_links(&state.db, Some(agent.owner_id)).await else {
+        return;
+    };
+    let Some(owner) = links.iter().find(|l| l.channel == channel) else {
+        return;
+    };
+    if owner.sender_id == inb.sender_id {
+        return;
+    }
+    let language = havn_core::Language::of_config(&agent.config);
+    let said = as_plain(
+        &said
+            .chars()
+            .take(channel_access::REFUSAL_SAID_CHARS)
+            .collect::<String>(),
+    );
+    let data = format!("/allow {}", inb.sender_id);
+    let fits = data.len() <= havn_core::MAX_BUTTON_DATA;
+    let text = language.pick(
+        format!(
+            "{} wrote to this bot and is not paired, so {} did not get it: \"{said}\". {}",
+            inb.sender_id,
+            agent.name,
+            if fits {
+                "Let them talk to it?"
+            } else {
+                "Let them in from the agent's settings page, under who can reach the bot."
+            }
+        ),
+        format!(
+            "{} 给这个机器人发了消息，但还没配对，所以 {} 没有收到：「{said}」。{}",
+            inb.sender_id,
+            agent.name,
+            if fits {
+                "要让对方和它对话吗？"
+            } else {
+                "可以在 agent 设置页的“谁能联系机器人”里放行。"
+            }
+        ),
+    );
+    let buttons = if fits {
+        vec![vec![havn_core::Button {
+            label: language.pick("Allow", "放行").into(),
+            data,
+        }]]
+    } else {
+        Vec::new()
+    };
+    if let Err(e) = state
+        .channel_router
+        .deliver_with(
+            channel,
+            &inb.account_id,
+            &owner.sender_id,
+            None,
+            ChannelMessageContent::Text { text },
+            buttons,
+            None,
+            false,
+        )
+        .await
+    {
+        warn!(channel, account = %inb.account_id, error = %e, "could not tell the owner about a refused sender");
+        return;
+    }
+    if let Err(e) =
+        channel_access::refusal_told(&state.db, channel, &inb.account_id, &inb.sender_id, now).await
+    {
+        warn!(channel, error = %e, "could not note that the owner was told");
+    }
+}
+
+/// Admit `sender_id` to `(channel, account_id)`, bound to `agent`, as its
+/// owner asked (issue #231): audited, and the sender is told they can
+/// talk now. Whether they were not admitted yet.
+pub(crate) async fn admit_sender(
+    state: &AppState,
+    agent: &agent_repo::Agent,
+    channel: &str,
+    account_id: &str,
+    sender_id: &str,
+    from: &str,
+) -> Result<bool, havn_db::DbError> {
+    let new = channel_access::admit(&state.db, channel, account_id, sender_id).await?;
+    if new {
+        crate::audit::record(
+            &state.db,
+            agent.owner_id,
+            agent.team_id,
+            Some(agent.id),
+            "channel_access.granted",
+            serde_json::json!({
+                "channel": channel,
+                "account_id": account_id,
+                "sender_id": sender_id,
+                "by": "owner",
+                "from": from,
+            }),
+        )
+        .await;
+        let welcome = ChannelMessageContent::Text {
+            text: pairing_text(state, channel, account_id, Refusal::Paired),
+        };
+        if let Err(e) = state
+            .channel_router
+            .deliver(channel, account_id, sender_id, None, welcome)
+            .await
+        {
+            warn!(error = %e, "could not tell an admitted sender");
+        }
+    }
+    Ok(new)
+}
+
 /// The text `why` gets on account `account_id` of `channel`: the one in
 /// `[channel_texts]`, or the default.
 fn pairing_text(state: &AppState, channel: &str, account_id: &str, why: Refusal) -> String {
@@ -1866,6 +2169,9 @@ async fn disconnect(state: &AppState, channel: &str, inb: &ChannelInbound) {
 
 #[derive(Debug, serde::Serialize)]
 pub struct PairingCode {
+    /// The invite's id, for an invite code made on the access page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub channel: String,
     pub account_id: String,
     /// Shown once: what the person sends to the bot.
@@ -1911,6 +2217,7 @@ pub async fn pairing_create(
             .filter(|u| binding.channel == "telegram" && !u.is_empty())
             .map(|u| format!("https://t.me/{u}?start={}", made.code));
         codes.push(PairingCode {
+            id: None,
             channel: binding.channel.clone(),
             account_id: acct.id.clone(),
             code: made.code,
@@ -1932,6 +2239,376 @@ pub async fn pairing_create(
     )
     .await;
     Ok(axum::Json(codes))
+}
+
+/// Who can reach one channel account an agent is bound to (issue #231).
+#[derive(Debug, serde::Serialize)]
+pub struct AccountAccess {
+    pub channel: String,
+    pub account_id: String,
+    /// `allowlist` or `open`: on `open` everyone is let in.
+    pub dm_policy: &'static str,
+    /// Listed in config.toml, removed only there.
+    pub allow_from: Vec<String>,
+    /// Let in by an invite code, a connect code or the owner.
+    pub allowed: Vec<AllowedView>,
+    /// Invite codes made for the account, newest first.
+    pub invites: Vec<InviteView>,
+    /// Senders turned away, who wrote last first.
+    pub refused: Vec<RefusedView>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct AllowedView {
+    pub sender_id: String,
+    pub since: chrono::DateTime<chrono::Utc>,
+    /// Let in by a code rather than by the owner.
+    pub by_code: bool,
+    /// Connected to a Havn account.
+    pub connected: bool,
+    /// Connected to the owner's: removing it does not shut them out.
+    pub yours: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct InviteView {
+    pub id: String,
+    pub status: &'static str,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_by: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct RefusedView {
+    pub sender_id: String,
+    pub first_at: chrono::DateTime<chrono::Utc>,
+    pub last_at: chrono::DateTime<chrono::Utc>,
+    pub count: i64,
+    pub said: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ChannelAccessView {
+    pub accounts: Vec<AccountAccess>,
+    /// Whether the owner is told in their chat when someone not paired
+    /// writes (`config.notify_unpaired`, on unless false).
+    pub notify_unpaired: bool,
+}
+
+/// The channel accounts whose messages reach `agent`: those it is bound
+/// to first.
+fn reaching<'a>(
+    state: &'a AppState,
+    agent: &havn_core::AgentId,
+) -> Vec<(&'a str, &'a crate::config::ChannelAccount)> {
+    let agent_id = agent.to_string();
+    state
+        .bindings
+        .iter()
+        .filter(|b| {
+            b.agent_id == agent_id
+                && channel_router::agent_for_account(&state.bindings, &b.channel, &b.account_id)
+                    == Some(agent_id.as_str())
+        })
+        .filter_map(|b| {
+            let account = state
+                .channels
+                .get(&b.channel)?
+                .accounts
+                .iter()
+                .find(|a| a.id == b.account_id)?;
+            Some((b.channel.as_str(), account))
+        })
+        .collect()
+}
+
+/// The account `account_id` of `channel` when its messages reach the
+/// agent: else `NotFound`, so no one manages another agent's bot.
+fn reaching_account<'a>(
+    state: &'a AppState,
+    agent: &havn_core::AgentId,
+    channel: &str,
+    account_id: &str,
+) -> Result<&'a crate::config::ChannelAccount, crate::api::ApiError> {
+    reaching(state, agent)
+        .into_iter()
+        .find(|(c, a)| *c == channel && a.id == account_id)
+        .map(|(_, a)| a)
+        .ok_or(crate::api::ApiError::NotFound)
+}
+
+async fn channel_access_view(
+    state: &AppState,
+    agent: &agent_repo::Agent,
+) -> Result<ChannelAccessView, crate::api::ApiError> {
+    let internal = |e: havn_db::DbError| crate::api::ApiError::Internal(e.to_string());
+    let now = chrono::Utc::now();
+    let mut accounts = Vec::new();
+    for (channel, account) in reaching(state, &agent.id) {
+        let invites = channel_access::list_invites(&state.db, Some(channel), Some(&account.id))
+            .await
+            .map_err(internal)?
+            .into_iter()
+            // Connect codes are their users' own.
+            .filter(|i| i.user_id.is_none())
+            .map(|i| InviteView {
+                id: i.id.to_string(),
+                status: i.status(now).as_str(),
+                created_at: i.created_at,
+                expires_at: i.expires_at,
+                used_by: i.used_by_sender,
+            })
+            .collect();
+        let refused = channel_access::list_refusals(&state.db, channel, &account.id)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(|r| RefusedView {
+                sender_id: r.sender_id,
+                first_at: r.first_at,
+                last_at: r.last_at,
+                count: r.count,
+                said: r.said,
+            })
+            .collect();
+        let mut allowed = Vec::new();
+        for a in channel_access::list_allowed_on(&state.db, channel, &account.id)
+            .await
+            .map_err(internal)?
+        {
+            let link = channel_access::linked_user(&state.db, channel, &a.sender_id)
+                .await
+                .map_err(internal)?;
+            allowed.push(AllowedView {
+                yours: link.as_ref().is_some_and(|l| l.user_id == agent.owner_id),
+                connected: link.is_some(),
+                sender_id: a.sender_id,
+                since: a.registered_at,
+                by_code: a.invite_id.is_some(),
+            });
+        }
+        accounts.push(AccountAccess {
+            channel: channel.to_string(),
+            account_id: account.id.clone(),
+            dm_policy: match account.dm_policy {
+                DmPolicy::Allowlist => "allowlist",
+                DmPolicy::Open => "open",
+            },
+            allow_from: account.allow_from.clone(),
+            allowed,
+            invites,
+            refused,
+        });
+    }
+    Ok(ChannelAccessView {
+        accounts,
+        notify_unpaired: agent
+            .config
+            .get("notify_unpaired")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false),
+    })
+}
+
+/// `GET /agents/{id}/channel-access`: who can reach the agent's bots
+/// (issue #231). Owner only.
+pub async fn channel_access_get(
+    State(state): State<AppState>,
+    user: crate::auth::AuthedUser,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<axum::Json<ChannelAccessView>, crate::api::ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    Ok(axum::Json(channel_access_view(&state, &agent).await?))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InviteCreate {
+    pub channel: String,
+    pub account_id: String,
+    /// Hours it lasts: 24 by default, at most 30 days.
+    #[serde(default)]
+    pub hours: Option<i64>,
+}
+
+/// The longest an invite made on the dashboard lasts, in hours.
+const MAX_INVITE_HOURS: i64 = 30 * 24;
+
+/// `POST /agents/{id}/channel-access/invites`: an invite code for one of
+/// the agent's bots, shown once.
+pub async fn channel_invite_create(
+    State(state): State<AppState>,
+    user: crate::auth::AuthedUser,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(req): axum::Json<InviteCreate>,
+) -> Result<axum::Json<PairingCode>, crate::api::ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let account = reaching_account(&state, &agent.id, &req.channel, &req.account_id)?;
+    let hours = req.hours.unwrap_or(24);
+    if !(1..=MAX_INVITE_HOURS).contains(&hours) {
+        return Err(crate::api::ApiError::BadRequest(format!(
+            "hours must be 1 to {MAX_INVITE_HOURS}"
+        )));
+    }
+    let made = channel_access::create_invite(
+        &state.db,
+        &req.channel,
+        &account.id,
+        chrono::Duration::hours(hours),
+    )
+    .await
+    .map_err(|e| crate::api::ApiError::Internal(e.to_string()))?;
+    let link = account
+        .bot_username
+        .as_deref()
+        .map(|u| u.trim_start_matches('@'))
+        .filter(|u| req.channel == "telegram" && !u.is_empty())
+        .map(|u| format!("https://t.me/{u}?start={}", made.code));
+    crate::audit::record_agent_action(
+        &state.db,
+        user.id,
+        agent.id,
+        "channel_invite.created",
+        serde_json::json!({
+            "channel": req.channel,
+            "account_id": account.id,
+            "invite": made.invite.id.to_string(),
+            "expires_at": made.invite.expires_at,
+        }),
+    )
+    .await;
+    Ok(axum::Json(PairingCode {
+        id: Some(made.invite.id.to_string()),
+        channel: req.channel,
+        account_id: account.id.clone(),
+        code: made.code,
+        link,
+        expires_at: made.invite.expires_at,
+    }))
+}
+
+/// `DELETE /agents/{id}/channel-access/invites/{invite}`: revoke an
+/// unused invite of one of the agent's bots.
+pub async fn channel_invite_revoke(
+    State(state): State<AppState>,
+    user: crate::auth::AuthedUser,
+    axum::extract::Path((id, invite)): axum::extract::Path<(String, String)>,
+) -> Result<axum::Json<ChannelAccessView>, crate::api::ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let invite_id = uuid::Uuid::parse_str(&invite).map_err(|_| crate::api::ApiError::NotFound)?;
+    let found = channel_access::find_invite(&state.db, invite_id)
+        .await
+        .map_err(|e| crate::api::ApiError::Internal(e.to_string()))?
+        .filter(|i| i.user_id.is_none())
+        .ok_or(crate::api::ApiError::NotFound)?;
+    reaching_account(&state, &agent.id, &found.channel, &found.account_id)?;
+    match channel_access::revoke_invite(&state.db, invite_id).await {
+        Ok(()) => {}
+        Err(havn_db::DbError::Conflict(_)) => {
+            return Err(crate::api::ApiError::BadRequest(
+                "the invite was used: remove the sender it let in instead".into(),
+            ));
+        }
+        Err(e) => return Err(crate::api::ApiError::Internal(e.to_string())),
+    }
+    crate::audit::record_agent_action(
+        &state.db,
+        user.id,
+        agent.id,
+        "channel_invite.revoked",
+        serde_json::json!({ "invite": invite_id.to_string() }),
+    )
+    .await;
+    Ok(axum::Json(channel_access_view(&state, &agent).await?))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SenderChange {
+    pub channel: String,
+    pub account_id: String,
+    pub sender_id: String,
+}
+
+/// `POST /agents/{id}/channel-access/senders`: let a sender talk to one of
+/// the agent's bots (issue #231).
+pub async fn channel_sender_allow(
+    State(state): State<AppState>,
+    user: crate::auth::AuthedUser,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(req): axum::Json<SenderChange>,
+) -> Result<axum::Json<ChannelAccessView>, crate::api::ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    reaching_account(&state, &agent.id, &req.channel, &req.account_id)?;
+    let sender = req.sender_id.trim();
+    if sender.is_empty()
+        || sender.len() > 256
+        || sender.chars().any(char::is_whitespace)
+        || channel_id_codec::validate_channel_id_part("sender_id", sender).is_err()
+    {
+        return Err(crate::api::ApiError::BadRequest("not a sender id".into()));
+    }
+    admit_sender(
+        &state,
+        &agent,
+        &req.channel,
+        &req.account_id,
+        sender,
+        "dashboard",
+    )
+    .await
+    .map_err(|e| crate::api::ApiError::Internal(e.to_string()))?;
+    Ok(axum::Json(channel_access_view(&state, &agent).await?))
+}
+
+/// `DELETE /agents/{id}/channel-access/senders`: take back a sender's
+/// access to one of the agent's bots; their next message is turned away.
+pub async fn channel_sender_remove(
+    State(state): State<AppState>,
+    user: crate::auth::AuthedUser,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(req): axum::Json<SenderChange>,
+) -> Result<axum::Json<ChannelAccessView>, crate::api::ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    reaching_account(&state, &agent.id, &req.channel, &req.account_id)?;
+    match channel_access::revoke_sender(&state.db, &req.channel, &req.account_id, &req.sender_id)
+        .await
+    {
+        Ok(()) => {}
+        Err(havn_db::DbError::NotFound) => return Err(crate::api::ApiError::NotFound),
+        Err(e) => return Err(crate::api::ApiError::Internal(e.to_string())),
+    }
+    crate::audit::record_agent_action(
+        &state.db,
+        user.id,
+        agent.id,
+        "channel_access.revoked",
+        serde_json::json!({
+            "channel": req.channel,
+            "account_id": req.account_id,
+            "sender_id": req.sender_id,
+        }),
+    )
+    .await;
+    Ok(axum::Json(channel_access_view(&state, &agent).await?))
+}
+
+/// `DELETE /agents/{id}/channel-access/refused`: forget a sender the bot
+/// turned away.
+pub async fn channel_refusal_forget(
+    State(state): State<AppState>,
+    user: crate::auth::AuthedUser,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(req): axum::Json<SenderChange>,
+) -> Result<axum::Json<ChannelAccessView>, crate::api::ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    reaching_account(&state, &agent.id, &req.channel, &req.account_id)?;
+    channel_access::forget_refusal(&state.db, &req.channel, &req.account_id, &req.sender_id)
+        .await
+        .map_err(|e| crate::api::ApiError::Internal(e.to_string()))?;
+    Ok(axum::Json(channel_access_view(&state, &agent).await?))
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -2619,6 +3296,334 @@ mod tests {
                 .await
                 .expect("code")
                 .code
+        }
+
+        #[tokio::test]
+        async fn the_owner_is_told_of_a_stranger_once_and_lets_them_in_with_the_button() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let code = link_code(&f, "bot").await;
+            f.send("tg:owner", &format!("/start {code}")).await;
+            f.replies();
+
+            f.send("tg:stranger", "hi, it is Bob from the shop").await;
+            let mut notices = Vec::new();
+            let mut to_stranger = 0;
+            while let Ok(frame) = f.adapter.try_recv() {
+                if let ChannelFrame::Outbound(o) = frame {
+                    if o.to == "tg:owner" {
+                        notices.push(o);
+                    } else if o.to == "tg:stranger" {
+                        to_stranger += 1;
+                    }
+                }
+            }
+            assert_eq!(to_stranger, 1, "the stranger is told they are not paired");
+            assert_eq!(notices.len(), 1, "{notices:?}");
+            let ChannelMessageContent::Text { text } = &notices[0].content else {
+                panic!("{:?}", notices[0].content);
+            };
+            assert!(
+                text.contains("tg:stranger") && text.contains("Bob from the shop"),
+                "{text}"
+            );
+            assert_eq!(notices[0].buttons[0][0].data, "/allow tg:stranger");
+            assert!(f.forwarded().is_empty());
+
+            f.send("tg:stranger", "hello?").await;
+            assert!(
+                !f.replies().iter().any(|(to, _)| to == "tg:owner"),
+                "told once a day"
+            );
+            let refused = channel_access::list_refusals(&f.state.db, "telegram", "bot")
+                .await
+                .expect("refused");
+            assert_eq!(refused.len(), 1);
+            assert_eq!(refused[0].count, 2);
+
+            // Someone else's /allow is not the owner's.
+            f.send("tg:stranger", "/allow tg:stranger").await;
+            assert!(!f.allowed("tg:stranger").await);
+
+            f.send("tg:owner", "/allow tg:stranger").await;
+            assert!(f.allowed("tg:stranger").await);
+            let replies = f.replies();
+            assert!(
+                replies
+                    .iter()
+                    .any(|(to, t)| to == "tg:owner" && t.contains("can talk to this bot now")),
+                "{replies:?}"
+            );
+            assert!(
+                replies.iter().any(|(to, _)| to == "tg:stranger"),
+                "they are told: {replies:?}"
+            );
+            assert!(
+                channel_access::list_refusals(&f.state.db, "telegram", "bot")
+                    .await
+                    .expect("refused")
+                    .is_empty()
+            );
+            f.forwarded();
+            f.send("tg:stranger", "thanks").await;
+            assert_eq!(f.forwarded(), vec!["tg:stranger".to_string()]);
+        }
+
+        #[test]
+        fn codes_are_left_out_wherever_they_are_written() {
+            for said in [
+                "my code ABCD-EFGH-JKMN-PQRS thanks",
+                "我的码是ABCD-EFGH-JKMN-PQRS谢谢",
+                "what time does ABCD-EFGH-JKMN-PQ12",
+                "make sure ABCD EFGH JKMN PQ12 ok",
+                "ABCDEFGH JKMNPQ12",
+                "abcd\u{ad}efgh\u{200b}jkmn-pqrs",
+                "code: 0123456789ABCDEF.",
+                "code 7K3M QX9P 2HWD RT4B",
+                "password 7K3MQX9P 2HWDRT4B",
+            ] {
+                let kept = without_codes(said);
+                assert!(kept.contains(CODE_LEFT_OUT), "{said:?} gives {kept:?}");
+                assert!(
+                    !["PQRS", "PQ12", "pqrs", "RT4B", "2HWDRT4B"]
+                        .iter()
+                        .any(|g| kept.contains(g)),
+                    "{said:?} gives {kept:?}"
+                );
+                assert!(
+                    !said.starts_with("code ") || kept.starts_with("code "),
+                    "the word before it is kept: {kept:?}"
+                );
+            }
+            for said in [
+                "hi, it is Bob from the shop",
+                "what time does work start",
+                "responsibilities",
+                "see you at 10:30",
+            ] {
+                assert_eq!(without_codes(said), said);
+            }
+        }
+
+        #[tokio::test]
+        async fn the_notice_is_plain_text_and_keeps_no_code() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let code = link_code(&f, "bot").await;
+            f.send("tg:owner", &format!("/start {code}")).await;
+            f.replies();
+            f.send(
+                "tg:stranger",
+                "[Sign in again](https://evil.example)\n# urgent my code ABCD-EFGH-JKMN-PQRS",
+            )
+            .await;
+            let notice = f
+                .replies()
+                .into_iter()
+                .find(|(to, _)| to == "tg:owner")
+                .map(|(_, text)| text)
+                .expect("notice");
+            assert!(
+                notice.contains(r"\[Sign in again\]\(https://evil.example\) \# urgent"),
+                "{notice}"
+            );
+            assert!(
+                !notice.contains("PQRS") && notice.contains(CODE_LEFT_OUT),
+                "{notice}"
+            );
+            let refused = channel_access::list_refusals(&f.state.db, "telegram", "bot")
+                .await
+                .expect("refused");
+            assert!(
+                !refused[0].said.contains("PQRS") && refused[0].said.contains(CODE_LEFT_OUT),
+                "{}",
+                refused[0].said
+            );
+        }
+
+        #[tokio::test]
+        async fn someone_let_in_is_never_listed_as_turned_away_nor_lets_others_in() {
+            let mut f = fixture(DmPolicy::Allowlist, &["tg:friend"]).await;
+            let code = link_code(&f, "bot").await;
+            f.send("tg:owner", &format!("/start {code}")).await;
+            f.replies();
+            // A code that reads as one but is no one's.
+            f.send("tg:friend", "/start ABCD-EFGH-JKMN-PQRS").await;
+            f.send("tg:friend", "/allow tg:stranger").await;
+            assert!(
+                !f.allowed("tg:stranger").await,
+                "only the owner lets people in"
+            );
+            let replies = f.replies();
+            assert!(
+                !replies.iter().any(|(to, _)| to == "tg:owner"),
+                "{replies:?}"
+            );
+            assert!(
+                replies
+                    .iter()
+                    .any(|(to, t)| to == "tg:friend" && t.contains("Only the agent's owner")),
+                "{replies:?}"
+            );
+            assert!(
+                channel_access::list_refusals(&f.state.db, "telegram", "bot")
+                    .await
+                    .expect("refused")
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn the_access_page_manages_only_this_agent_s_bots() {
+            use crate::api::ApiError;
+            use axum::extract::{Json, Path};
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let agent = agent_repo::list_for_owner(&f.state.db, f.owner)
+                .await
+                .expect("agents")
+                .remove(0);
+            let (owner, state) = (f.owner, f.state.clone());
+            let user = || crate::auth::AuthedUser {
+                id: owner,
+                display_name: "owner".into(),
+            };
+            let id = || Path(agent.id.to_string());
+            let who = |account: &str, sender: &str| SenderChange {
+                channel: "telegram".into(),
+                account_id: account.into(),
+                sender_id: sender.into(),
+            };
+            let st = || State(state.clone());
+
+            let view = channel_access_get(st(), user(), id())
+                .await
+                .expect("view")
+                .0;
+            assert_eq!(view.accounts.len(), 1, "other-bot is bound to no agent");
+            assert!(view.notify_unpaired);
+
+            for (account, sender, bad) in
+                [("other-bot", "tg:1", "not found"), ("bot", "tg 1", "bad")]
+            {
+                let err = channel_sender_allow(st(), user(), id(), Json(who(account, sender)))
+                    .await
+                    .expect_err(bad);
+                assert!(
+                    matches!(
+                        (&err, bad),
+                        (ApiError::NotFound, "not found") | (ApiError::BadRequest(_), "bad")
+                    ),
+                    "{err:?}"
+                );
+            }
+            let view = channel_sender_allow(st(), user(), id(), Json(who("bot", "tg:9")))
+                .await
+                .expect("allow")
+                .0;
+            assert!(
+                view.accounts[0]
+                    .allowed
+                    .iter()
+                    .any(|a| a.sender_id == "tg:9" && !a.by_code)
+            );
+            assert!(matches!(
+                channel_sender_remove(st(), user(), id(), Json(who("bot", "tg:nobody"))).await,
+                Err(ApiError::NotFound)
+            ));
+            assert!(
+                channel_sender_remove(st(), user(), id(), Json(who("bot", "tg:9")))
+                    .await
+                    .is_ok()
+            );
+
+            // A connect code is its user's: not listed, not revoked here.
+            let connect = channel_access::create_link_code(&f.state.db, "telegram", "bot", f.owner)
+                .await
+                .expect("code");
+            assert!(matches!(
+                channel_invite_revoke(
+                    st(),
+                    user(),
+                    Path((agent.id.to_string(), connect.invite.id.to_string()))
+                )
+                .await,
+                Err(ApiError::NotFound)
+            ));
+            let made = channel_invite_create(
+                st(),
+                user(),
+                id(),
+                Json(InviteCreate {
+                    channel: "telegram".into(),
+                    account_id: "bot".into(),
+                    hours: Some(1),
+                }),
+            )
+            .await
+            .expect("invite")
+            .0;
+            f.send("tg:invited", &format!("/start {}", made.code)).await;
+            let used = channel_access_get(st(), user(), id())
+                .await
+                .expect("view")
+                .0
+                .accounts[0]
+                .invites
+                .iter()
+                .find(|i| i.status == "used")
+                .map(|i| i.id.clone())
+                .expect("used");
+            assert!(matches!(
+                channel_invite_revoke(st(), user(), Path((agent.id.to_string(), used))).await,
+                Err(ApiError::BadRequest(_))
+            ));
+            assert!(
+                channel_invite_create(
+                    st(),
+                    user(),
+                    id(),
+                    Json(InviteCreate {
+                        channel: "telegram".into(),
+                        account_id: "other-bot".into(),
+                        hours: None,
+                    }),
+                )
+                .await
+                .is_err()
+            );
+
+            f.send("tg:stranger", "hi").await;
+            let view = channel_refusal_forget(st(), user(), id(), Json(who("bot", "tg:stranger")))
+                .await
+                .expect("forget")
+                .0;
+            assert!(view.accounts[0].refused.is_empty());
+        }
+
+        #[tokio::test]
+        async fn no_notice_when_the_owner_turned_them_off() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let code = link_code(&f, "bot").await;
+            f.send("tg:owner", &format!("/start {code}")).await;
+            f.replies();
+            let agent = agent_repo::list_for_owner(&f.state.db, f.owner)
+                .await
+                .expect("agents")
+                .remove(0);
+            agent_repo::update_config(&f.state.db, agent.id, None, |_| {
+                Ok::<_, ()>(serde_json::json!({"notify_unpaired": false}))
+            })
+            .await
+            .expect("config")
+            .expect("changed");
+            f.send("tg:stranger", "hi").await;
+            assert!(!f.replies().iter().any(|(to, _)| to == "tg:owner"));
+            assert_eq!(
+                channel_access::list_refusals(&f.state.db, "telegram", "bot")
+                    .await
+                    .expect("refused")
+                    .len(),
+                1,
+                "still kept for the dashboard"
+            );
         }
 
         #[tokio::test]

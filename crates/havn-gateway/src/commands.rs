@@ -127,6 +127,14 @@ pub const COMMANDS: &[Command] = &[
         admin: true,
     },
     Command {
+        name: "allow",
+        aliases: &[],
+        args: "<sender>",
+        about: "Let someone the bot turned away talk to it",
+        about_zh: "让被机器人拒绝的人可以和它对话",
+        admin: true,
+    },
+    Command {
         name: "disconnect",
         aliases: &[],
         args: "",
@@ -471,6 +479,7 @@ pub async fn run(state: &AppState, asker: &Asker, command: &Command, args: &str)
         "approve" | "deny" => {
             Action::Reply(decide(state, asker, command.name == "approve", args).await)
         }
+        "allow" => Action::Reply(allow(state, asker, args).await),
         other => {
             warn!(command = other, "a chat command with no handler");
             Action::Reply(language.pick(format!("(/{other} does not work here.)"), format!("（/{other} 在这里不能用。）")))
@@ -782,6 +791,62 @@ fn decision_args(approve: bool, args: &str) -> Option<(bool, Option<&str>, Optio
         return None;
     }
     Some((remember, Some(id), (!note.is_empty()).then_some(note)))
+}
+
+/// `/allow <sender>` (issue #231): the agent's owner lets a sender the
+/// bot turned away talk to it, from their own chat with the bot, where
+/// the notice's button sends it.
+async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
+    let language = asker.language;
+    if !asker.owner {
+        return language
+            .pick(
+                "(Only the agent's owner can let someone in.)",
+                "（只有 agent 的所有者能放行别人。）",
+            )
+            .into();
+    }
+    let Some((channel, account_id, _)) = crate::channel_id_codec::decode(&asker.scope) else {
+        return language
+            .pick(
+                "(Send it in your chat with the bot they wrote to, or use the agent's settings page.)",
+                "（请在对方联系的那个机器人的对话里发送，或者用 agent 的设置页。）",
+            )
+            .into();
+    };
+    let sender = args.trim();
+    if sender.is_empty()
+        || sender.chars().any(char::is_whitespace)
+        || crate::channel_id_codec::validate_channel_id_part("sender_id", sender).is_err()
+    {
+        return language
+            .pick(
+                "(Send /allow and who, such as /allow tg:123.)",
+                "（发 /allow 加对方，比如 /allow tg:123。）",
+            )
+            .into();
+    }
+    let Ok(Some(agent)) = agents_repo::find_by_id(&state.db, asker.agent_id).await else {
+        return language
+            .pick("(The agent is gone.)", "（这个 agent 不在了。）")
+            .into();
+    };
+    match crate::api::channel::admit_sender(state, &agent, channel, account_id, sender, &asker.who)
+        .await
+    {
+        Ok(true) => language.pick(
+            format!("({sender} can talk to this bot now.)"),
+            format!("（{sender} 现在可以和这个机器人对话了。）"),
+        ),
+        Ok(false) => language.pick(
+            format!("({sender} could already talk to this bot.)"),
+            format!("（{sender} 本来就可以和这个机器人对话。）"),
+        ),
+        Err(e) => language.pick(
+            format!("(Could not let {sender} in: {e}.)"),
+            format!("（没能放行 {sender}：{e}。）"),
+        ),
+    }
 }
 
 async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> String {
