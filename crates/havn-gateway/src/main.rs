@@ -735,6 +735,14 @@ async fn serve() -> anyhow::Result<()> {
         )
         .route("/agents/{id}/cron/{job_id}/runs", get(api::cron::list_runs))
         .route("/agents/{id}/cron/{job_id}/run", post(api::cron::run_now))
+        .route(
+            "/agents/{id}/webhooks",
+            get(api::webhooks::list).post(api::webhooks::create),
+        )
+        .route(
+            "/agents/{id}/webhooks/{hook}",
+            patch(api::webhooks::update).delete(api::webhooks::delete),
+        )
         .route("/agents/{id}/conversation", get(api::conversation::list))
         .route("/agents/{id}/chats", get(api::conversation::chats))
         .route("/agents/{id}/search", get(api::conversation::search))
@@ -898,6 +906,14 @@ async fn serve() -> anyhow::Result<()> {
             get(api::channel::file),
         )
         .route("/v1/llm/anthropic", post(api::llm::anthropic))
+        // Called from outside, often through a proxy under another name:
+        // not limited to this host's names (issue #236).
+        .route(
+            "/hooks/{id}",
+            post(api::webhooks::call).layer(axum::extract::DefaultBodyLimit::max(
+                api::webhooks::MAX_BODY_BYTES,
+            )),
+        )
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 

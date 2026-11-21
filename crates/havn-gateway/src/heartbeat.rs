@@ -67,13 +67,28 @@ pub async fn tick_for(
     channels: &Channels,
     agent: &Agent,
 ) -> HeartbeatTick {
-    let web = crate::webchat::session_for(&agent.owner_id.to_string(), agent.id).to_string();
     let deliver = agent
         .config
         .get("heartbeat")
         .and_then(|h| h.get("deliver"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or(DELIVER_LAST);
+    targets_for(db, bindings, channels, agent, deliver).await
+}
+
+/// Where a result of `agent`'s that `deliver` sends goes: the owner's web
+/// chat, and their conversations with it that `deliver` lets it go to
+/// (`last`: any; a channel's name: that channel's; `web`: none), those of
+/// their chats in the chat apps they linked, as the dashboard lists them,
+/// that the agent may send to. Heartbeats and webhooks (issue #236) use it.
+pub async fn targets_for(
+    db: &SqlitePool,
+    bindings: &[ChannelBindingConfig],
+    channels: &Channels,
+    agent: &Agent,
+    deliver: &str,
+) -> HeartbeatTick {
+    let web = crate::webchat::session_for(&agent.owner_id.to_string(), agent.id).to_string();
     if deliver == DELIVER_WEB {
         return HeartbeatTick {
             web,

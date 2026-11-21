@@ -425,6 +425,7 @@ impl AgentRegistry {
                 GatewayToAgent::InboundMessage(_)
                     | GatewayToAgent::HeartbeatTick(_)
                     | GatewayToAgent::CronTick(_)
+                    | GatewayToAgent::WebhookCall(_)
             )
     }
 

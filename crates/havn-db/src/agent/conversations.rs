@@ -128,6 +128,58 @@ pub async fn heartbeat_chat(pool: &SqlitePool, scope: &str, title: &str) -> Resu
     Ok(id)
 }
 
+/// The chat of `scope` that keeps webhook `webhook_id`'s calls and what
+/// the agent made of them (issue #236): made, titled `title`, when it has
+/// none, or when the one it had was deleted or is another scope's. It is
+/// not made the active chat.
+pub async fn webhook_chat(
+    pool: &SqlitePool,
+    scope: &str,
+    webhook_id: &str,
+    title: &str,
+) -> Result<String> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let found: Option<(String,)> = sqlx::query_as(
+        "SELECT w.chat_id FROM webhook_chats w JOIN chats c ON c.id = w.chat_id          AND c.scope = w.scope WHERE w.webhook_id = ?1 AND w.scope = ?2",
+    )
+    .bind(webhook_id)
+    .bind(scope)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((id,)) = found {
+        tx.commit().await?;
+        return Ok(id);
+    }
+    let id = Uuid::now_v7().to_string();
+    sqlx::query("INSERT INTO chats (id, scope, title) VALUES (?1, ?2, ?3)")
+        .bind(&id)
+        .bind(scope)
+        .bind(title.chars().take(MAX_TITLE_CHARS).collect::<String>())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO webhook_chats (webhook_id, scope, chat_id) VALUES (?1, ?2, ?3)          ON CONFLICT (webhook_id, scope) DO UPDATE SET chat_id = excluded.chat_id",
+    )
+    .bind(webhook_id)
+    .bind(scope)
+    .bind(&id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Whether `chat` keeps a webhook's calls (issue #236): what is in it came
+/// from outside, so it is never the owner's.
+pub async fn is_webhook_chat(pool: &SqlitePool, chat: &str) -> Result<bool> {
+    let (found,): (bool,) =
+        sqlx::query_as("SELECT EXISTS (SELECT 1 FROM webhook_chats WHERE chat_id = ?1)")
+            .bind(chat)
+            .fetch_one(pool)
+            .await?;
+    Ok(found)
+}
+
 /// Record `reply` to turn `parent` of chat `chat`. The chat continues from
 /// it when its head is still `parent`, or a turn that followed it without
 /// the user saying anything (a scheduled task's result), after which it is
@@ -700,7 +752,7 @@ const TRIGRAM_CHARS: usize = 3;
 pub async fn chat_of_owner(pool: &SqlitePool, chat: &str) -> Result<bool> {
     let (found,): (bool,) = sqlx::query_as(
         "SELECT EXISTS (SELECT 1 FROM chats c JOIN owner_scopes o ON o.scope = c.scope \
-         WHERE c.id = ?1)",
+         WHERE c.id = ?1 AND c.id NOT IN (SELECT chat_id FROM webhook_chats))",
     )
     .bind(chat)
     .fetch_one(pool)
@@ -771,6 +823,8 @@ pub async fn search_chats(
         );
     }
     sql.push_str(" AND c.role IN ('user', 'assistant')");
+    // What webhooks brought is no one's to search (issue #236).
+    sql.push_str(" AND h.id NOT IN (SELECT chat_id FROM webhook_chats)");
     for _ in &short {
         sql.push_str(" AND c.content LIKE ? ESCAPE '\\'");
     }
@@ -814,7 +868,8 @@ pub async fn around(
                           c.created_at FROM conversations c JOIN chats h ON h.id = c.channel_id";
     let found: Option<ChatTurnRow> = sqlx::query_as(&format!(
         "{SELECT} WHERE c.id = ?1 AND (h.scope = ?2 OR (?3 AND h.scope IN \
-             (SELECT scope FROM owner_scopes)))"
+             (SELECT scope FROM owner_scopes))) \
+             AND h.id NOT IN (SELECT chat_id FROM webhook_chats)"
     ))
     .bind(turn)
     .bind(scope)
@@ -901,7 +956,8 @@ pub async fn chats_titled(
                    AND t.parent_id IS NULL AND t.role = 'user' \
                  ORDER BY t.created_at, t.rowid LIMIT 1) AS first_turn \
          FROM chats c \
-         WHERE (c.scope = ? OR (? AND c.scope IN (SELECT scope FROM owner_scopes)))",
+         WHERE (c.scope = ? OR (? AND c.scope IN (SELECT scope FROM owner_scopes))) \
+         AND c.id NOT IN (SELECT chat_id FROM webhook_chats)",
     );
     for _ in &terms {
         sql.push_str(" AND c.title LIKE ? ESCAPE '\\'");
@@ -1554,6 +1610,68 @@ mod tests {
             .await
             .expect("chat");
         assert_ne!(again, kept, "a deleted chat is not made again under its id");
+    }
+
+    #[tokio::test]
+    async fn each_webhook_keeps_a_chat_of_its_own_in_the_scope_it_names() {
+        let pool = crate::agent::connect_in_memory().await.expect("db");
+        let talk = chat_for(&pool, "web", None, "hi").await.expect("chat");
+        let alerts = webhook_chat(&pool, "web", "w1", "Webhook: alerts")
+            .await
+            .expect("chat");
+        assert_ne!(alerts, talk);
+        assert_eq!(
+            webhook_chat(&pool, "web", "w1", "Webhook: alerts")
+                .await
+                .expect("chat"),
+            alerts
+        );
+        assert_ne!(
+            webhook_chat(&pool, "web", "w2", "Webhook: ci")
+                .await
+                .expect("chat"),
+            alerts,
+            "a chat per webhook"
+        );
+        assert_eq!(
+            existing_chat(&pool, "web", None)
+                .await
+                .expect("db")
+                .as_deref(),
+            Some(talk.as_str()),
+            "the active chat stays"
+        );
+        // Another scope (another owner) gets one of its own.
+        let moved = webhook_chat(&pool, "other", "w1", "Webhook: alerts")
+            .await
+            .expect("chat");
+        assert_ne!(moved, alerts);
+        assert!(delete_chat(&pool, "other", &moved).await.expect("delete"));
+        assert_ne!(
+            webhook_chat(&pool, "other", "w1", "Webhook: alerts")
+                .await
+                .expect("chat"),
+            moved,
+            "made again when deleted"
+        );
+
+        // Never the owner's, though in the owner's scope, and not searched.
+        note_owner_scope(&pool, "web").await.expect("owner");
+        assert!(chat_of_owner(&pool, &talk).await.expect("db"));
+        assert!(!chat_of_owner(&pool, &alerts).await.expect("db"));
+        assert!(is_webhook_chat(&pool, &alerts).await.expect("db"));
+        assert!(!is_webhook_chat(&pool, &talk).await.expect("db"));
+        record_in_chat(&pool, &alerts, Role::Assistant, "zebracorn outage")
+            .await
+            .expect("turn");
+        record_in_chat(&pool, &talk, Role::User, "zebracorn party")
+            .await
+            .expect("turn");
+        let found = search_chats(&pool, "web", true, "zebracorn", 10)
+            .await
+            .expect("search");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].chat, talk);
     }
 
     #[tokio::test]

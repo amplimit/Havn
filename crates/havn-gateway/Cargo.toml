@@ -15,6 +15,7 @@ path = "src/main.rs"
 havn-core.workspace = true
 havn-proto.workspace = true
 havn-spawner.workspace = true
+sha2.workspace = true
 havn-db.workspace = true
 sqlx.workspace = true
 reqwest.workspace = true

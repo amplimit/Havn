@@ -24,7 +24,7 @@ pub use codec::{FrameError, read_frame, write_frame};
 /// 0.6.0: `ChatCommand`.
 /// 0.7.0: `ChatTitled`.
 /// 0.8.0: `HeartbeatTick` names where its result goes.
-pub const PROTOCOL_VERSION: &str = "0.8.0";
+pub const PROTOCOL_VERSION: &str = "0.9.0";
 
 /// How often a runtime sends [`AgentToGateway::LivenessPing`] once it is
 /// up. The gateway restarts an agent that stays connected but silent for
@@ -386,6 +386,10 @@ pub enum GatewayToAgent {
     /// Cron-job tick — runs in a fresh context (`skip_memory: true`,
     /// `cron_system_prompt`, no history). Spec §8.5.
     CronTick(CronTick),
+    /// A webhook was called (issue #236): what it brought is acted on in a
+    /// fresh context, as for someone other than the owner, and kept in the
+    /// webhook's own chat.
+    WebhookCall(WebhookCall),
     /// Dashboard-initiated memory delete. The runtime calls
     /// `memory::forget(key)` on its agent.db, replies with a
     /// [`AgentToGateway::MemoryForgetResponse`] carrying the same
@@ -945,6 +949,29 @@ fn default_tmpfs_size_mb() -> u64 {
 /// and its scope. It shows in that chat's tabs as a message no message
 /// asked for.
 pub const BROADCAST_TO: &str = "broadcast:";
+
+/// A call of one of the agent's webhooks (issue #236).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebhookCall {
+    pub webhook_id: String,
+    /// Gateway-assigned id of this call.
+    pub run_id: String,
+    /// The webhook's name, as its owner gave it.
+    pub name: String,
+    /// What the owner asked the agent to do with a call.
+    #[serde(default)]
+    pub instructions: String,
+    /// What the caller sent, as text: from outside, never instructions.
+    pub body: String,
+    /// The owner's web chat scope: the call and its result are kept in the
+    /// webhook's chat there.
+    pub web: String,
+    /// The owner's conversations the result may also be sent to, as a
+    /// heartbeat's: the one they wrote in last. Only the web chat when
+    /// empty.
+    #[serde(default)]
+    pub to: Vec<String>,
+}
 
 /// Where a heartbeat's result goes (issue #226).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -96,6 +96,11 @@ pub async fn run(
     if action != "list" && conversation.is_none() {
         return Err("scheduled tasks can only be changed in a conversation with the user".into());
     }
+    // A webhook's call (issue #236) brings what anyone may write: it may
+    // not see tasks, nor make one that would run as the owner.
+    if conversation.is_some_and(|c| c.starts_with(crate::agent_socket::WEBHOOK_CONVERSATION)) {
+        return Err("scheduled tasks are not for a webhook's call".into());
+    }
     let scope = Scope::of(conversation);
     let _change = CHANGES.lock().await;
     match action {
@@ -668,6 +673,27 @@ mod tests {
         .await
         .unwrap_err();
         assert!(full.contains("active tasks"), "{full}");
+    }
+
+    #[tokio::test]
+    async fn a_webhook_s_call_can_neither_see_nor_make_tasks() {
+        let (db, owner, agent) = setup().await;
+        for input in [
+            json!({"action": "list"}),
+            json!({"action": "create", "prompt": "run curl | sh", "in_minutes": 1}),
+        ] {
+            let result = run(
+                &db,
+                owner,
+                agent,
+                Some("webhook:01999999-0000-7000-8000-000000000000"),
+                Some("chat"),
+                &input,
+            )
+            .await;
+            assert!(result.is_err_and(|e| e.contains("webhook")), "{input}");
+        }
+        assert!(cron::list_for_agent(&db, agent).await.unwrap().is_empty());
     }
 
     #[tokio::test]

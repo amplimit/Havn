@@ -19,6 +19,7 @@ pub mod roles;
 pub mod team_memberships;
 pub mod teams;
 pub mod users;
+pub mod webhooks;
 
 /// Parse a UUID from a database column we own. Values are written by us as
 /// UUID v7, so a parse error indicates a corrupted or externally-modified row.
