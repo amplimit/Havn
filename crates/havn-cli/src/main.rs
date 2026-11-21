@@ -27,6 +27,8 @@ mod setup;
 mod start;
 mod status;
 mod team;
+#[cfg(unix)]
+mod update;
 mod user;
 
 use clap::{Parser, Subcommand};
@@ -71,6 +73,24 @@ enum Command {
     },
     /// Diagnostic checklist: env, binaries, cgroup, DB, gateway reachability.
     Doctor,
+    /// Install the latest release of Havn (or `--version`) over this one,
+    /// and restart the gateway on it; the old binaries are put back when it
+    /// does not start. Needs to write where these binaries are (root).
+    Update {
+        /// The release to install, such as v0.2.9.
+        #[arg(long)]
+        version: Option<String>,
+        /// Only say whether a newer release is out.
+        #[arg(long)]
+        check: bool,
+        /// Do not back up first (by default a backup is written to the home
+        /// directory, as `havn backup` writes one).
+        #[arg(long)]
+        no_backup: bool,
+        /// Let `--version` name a release older than the gateway's.
+        #[arg(long)]
+        allow_downgrade: bool,
+    },
     /// Back up the gateway's and agents' databases, the agents' directories
     /// and config.toml to one archive; the gateway may keep running.
     Backup {
@@ -471,6 +491,12 @@ fn main() -> anyhow::Result<()> {
         Command::Status => async_runtime()?.block_on(status::run()),
         Command::Logs { lines, follow } => logs::run(follow, lines),
         Command::Doctor => async_runtime()?.block_on(doctor::run()),
+        Command::Update {
+            version,
+            check,
+            no_backup,
+            allow_downgrade,
+        } => async_runtime()?.block_on(run_update(version, check, !no_backup, allow_downgrade)),
         Command::Backup { output } => async_runtime()?.block_on(run_backup(output)),
         Command::Restore { archive, force } => run_restore(&archive, force),
         Command::Agent { action } => async_runtime()?.block_on(run_agent(action)),
@@ -614,6 +640,26 @@ async fn run_backup(output: Option<std::path::PathBuf>) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 async fn run_backup(_output: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     anyhow::bail!("havn backup runs on the gateway's host")
+}
+
+#[cfg(unix)]
+async fn run_update(
+    version: Option<String>,
+    check: bool,
+    backup: bool,
+    downgrade: bool,
+) -> anyhow::Result<()> {
+    update::run(version, check, backup, downgrade).await
+}
+
+#[cfg(not(unix))]
+async fn run_update(
+    _version: Option<String>,
+    _check: bool,
+    _backup: bool,
+    _downgrade: bool,
+) -> anyhow::Result<()> {
+    anyhow::bail!("havn update runs on the gateway's host")
 }
 
 #[cfg(unix)]

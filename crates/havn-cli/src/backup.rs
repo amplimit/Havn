@@ -82,9 +82,9 @@ pub struct Install {
     pub config: PathBuf,
 }
 
-/// The gateway's data directory by default.
-fn default_data_dir() -> PathBuf {
-    std::env::var_os("HOME").map_or_else(
+/// The gateway's data directory by default, under `home`.
+fn default_data_dir(home: Option<&std::ffi::OsStr>) -> PathBuf {
+    home.map_or_else(
         || PathBuf::from("./havn-data"),
         |h| PathBuf::from(h).join(".local/share/havn"),
     )
@@ -94,9 +94,21 @@ impl Install {
     /// The installation as the gateway finds it: `config.toml` at
     /// `$HAVN_CONFIG` or `~/.config/havn/config.toml`, and the paths it sets.
     pub fn from_config() -> anyhow::Result<Self> {
-        let config = std::env::var_os("HAVN_CONFIG").map_or_else(
+        Self::in_env(
+            std::env::var_os("HAVN_CONFIG").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        )
+    }
+
+    /// The installation a gateway with `HAVN_CONFIG` = `config` and `HOME`
+    /// = `home` finds (`havn update` reads them from the running gateway).
+    pub fn in_env(
+        config: Option<&std::ffi::OsStr>,
+        home: Option<&std::ffi::OsStr>,
+    ) -> anyhow::Result<Self> {
+        let config = config.map_or_else(
             || {
-                std::env::var_os("HOME").map_or_else(
+                home.map_or_else(
                     || PathBuf::from("./havn.toml"),
                     |h| PathBuf::from(h).join(".config/havn/config.toml"),
                 )
@@ -110,19 +122,19 @@ impl Install {
         } else {
             CliConfig::default()
         };
-        Ok(Self::of(&cfg, config))
+        Ok(Self::of(&cfg, config, home))
     }
 
-    fn of(cfg: &CliConfig, config: PathBuf) -> Self {
+    fn of(cfg: &CliConfig, config: PathBuf, home: Option<&std::ffi::OsStr>) -> Self {
         Self {
             db: cfg
                 .db_path
                 .clone()
-                .unwrap_or_else(|| default_data_dir().join(GATEWAY_DB)),
+                .unwrap_or_else(|| default_data_dir(home).join(GATEWAY_DB)),
             workspaces: cfg
                 .workspace_root
                 .clone()
-                .unwrap_or_else(|| default_data_dir().join(AGENTS)),
+                .unwrap_or_else(|| default_data_dir(home).join(AGENTS)),
             config,
         }
     }

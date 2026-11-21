@@ -18,6 +18,9 @@ pub struct GatewayConfig {
     /// Where the gateway serves Prometheus metrics at `/metrics` (issue
     /// #236); empty, the default, to serve none.
     pub metrics_listen: String,
+    /// Whether the gateway looks once a day for a newer release, to show in
+    /// the dashboard (issue #236). On by default.
+    pub update_check: bool,
     /// Path to the gateway's `SQLite` database file. Per locked scope, no
     /// other datastore is supported. Created on first run with WAL + foreign
     /// keys.
@@ -789,6 +792,7 @@ impl Default for GatewayConfig {
             listen: "127.0.0.1:8080".into(),
             dashboard_listen: "127.0.0.1:3000".into(),
             metrics_listen: String::new(),
+            update_check: true,
             db_path: default_data_dir().join("havn.db"),
             agent_socket_path: default_data_dir().join("agent.sock"),
             workspace_root: default_data_dir().join("agents"),

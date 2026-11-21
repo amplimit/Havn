@@ -101,6 +101,8 @@ pub async fn info(State(app): State<AppState>) -> Json<serde_json::Value> {
         "identity_header": app.identity.name.as_str(),
         "trust_header": app.trusted_proxies.is_some(),
         "version": env!("CARGO_PKG_VERSION"),
+        // A newer release, when the gateway looked and found one (#236).
+        "newer_release": crate::update_check::newer(),
     }))
 }
 

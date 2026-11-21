@@ -37,7 +37,7 @@ pub fn start(detach: bool) -> anyhow::Result<()> {
 // The gateway locks `<db_path>.lock` while it runs. Checking it catches a
 // gateway the pid file does not know, such as the systemd unit's; otherwise
 // a detached start would report success for a gateway that exits at once.
-fn running_gateway(cfg: &paths::CliConfig) -> Option<String> {
+pub(crate) fn running_gateway(cfg: &paths::CliConfig) -> Option<String> {
     let db = cfg
         .db_path
         .clone()
