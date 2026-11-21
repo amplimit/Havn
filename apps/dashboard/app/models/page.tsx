@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ApiError,
   LLM_PROVIDERS as PROVIDERS,
@@ -12,6 +12,26 @@ import {
   type ThinkingSpec,
 } from "@/lib/api";
 import { SkeletonList } from "@/components/SkeletonList";
+
+type Price = NonNullable<ModelEntry["price"]>;
+
+// As the usage page shows dollars: with a point and no grouping, whatever
+// the locale, so what it shows can be typed back.
+function perMillion(n: number): string {
+  return `$${n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 6, useGrouping: false })}`;
+}
+
+// A price as typed: decimal digits, with a point or a comma; nothing a
+// `Number` would read otherwise (0x10, 0b11). "1,500" could be either a
+// thousand and a half or one and a half, so it is refused.
+function parsePrice(typed: string): number | null {
+  const trimmed = typed.trim();
+  if (/^[1-9]\d{0,2},\d{3}$/.test(trimmed)) return null;
+  const t = trimmed.replace(/^(\d*),(\d+)$/, "$1.$2");
+  if (!/^(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(t)) return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : null;
+}
 
 export default function ModelsPage() {
   const [view, setView] = useState<ModelsView | null>(null);
@@ -118,6 +138,8 @@ export default function ModelsPage() {
           of their own use the default: the one marked below, or the first.
           The list lives in <code className="font-mono">[[llm.models]]</code>{" "}
           of the gateway&apos;s config.toml; changes here are written there.
+          A model&apos;s price, in dollars per million tokens, gives what its
+          calls cost on the usage page.
         </p>
         {view && editable && view.default_model && (
           <p className="mt-3 text-sm" style={{ color: "var(--color-body)" }}>
@@ -302,6 +324,14 @@ export default function ModelsPage() {
                     thinks: {thinkingChoices(m.thinking).join(" / ")}
                   </span>
                 )}
+                {m.price && (
+                  <span
+                    className="pill pill-stopped tabular"
+                    title={`dollars per million tokens; cache reads ${perMillion(m.price.cache_read ?? m.price.input)}, cache writes ${perMillion(m.price.cache_write ?? m.price.input)}`}
+                  >
+                    {perMillion(m.price.input)} in / {perMillion(m.price.output)} out
+                  </span>
+                )}
               </div>
               {m.label && (
                 <p className="mt-1 font-mono text-xs wrap-anywhere" style={{ color: "var(--color-body)" }}>
@@ -315,6 +345,17 @@ export default function ModelsPage() {
                   save(
                     view.default_model,
                     view.models.map((x) => (x.id === m.id ? { ...x, thinking } : x)),
+                  )
+                }
+              />
+              <PriceEditor
+                entry={m}
+                editable={editable}
+                busy={busy}
+                onSave={(price) =>
+                  save(
+                    view.default_model,
+                    view.models.map((x) => (x.id === m.id ? { ...x, price } : x)),
                   )
                 }
               />
@@ -418,7 +459,7 @@ function ThinkingEditor({
   const muted = { color: "var(--color-body)" };
   if (!open) {
     return (
-      <button type="button" className="mt-2 text-xs underline" style={muted} onClick={() => setOpen(true)}>
+      <button type="button" className="mt-2 mr-3 text-xs underline" style={muted} onClick={() => setOpen(true)}>
         {spec ? "thinking settings" : "set up thinking"}
       </button>
     );
@@ -506,5 +547,170 @@ function ThinkingEditor({
         </p>
       )}
     </div>
+  );
+}
+
+/**
+ * What a model's tokens cost, in US dollars per million (issue #282): input
+ * and output, and its prompt cache's reads and writes, which cost what
+ * input does when left blank. All blank, it has no price.
+ */
+function PriceEditor({
+  entry,
+  editable,
+  busy,
+  onSave,
+}: {
+  entry: ModelEntry;
+  /** Whether the list may be changed here (not with trust_header). */
+  editable: boolean;
+  busy: boolean;
+  onSave: (price: Price | undefined) => Promise<boolean>;
+}) {
+  const price = entry.price;
+  const shown = (n: number | undefined) => (n === undefined ? "" : String(n));
+  const [open, setOpen] = useState(false);
+  const [input, setInput] = useState("");
+  const [output, setOutput] = useState("");
+  const [cacheRead, setCacheRead] = useState("");
+  const [cacheWrite, setCacheWrite] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const toggle = useRef<HTMLButtonElement>(null);
+  const firstField = useRef<HTMLInputElement>(null);
+  // Where focus goes once React has rendered: back to the link on close,
+  // back to the first field after a save that failed.
+  const focusToggle = useRef(false);
+  const focusFirst = useRef(false);
+
+  useEffect(() => {
+    if (!open && focusToggle.current) {
+      focusToggle.current = false;
+      toggle.current?.focus();
+    }
+  }, [open]);
+
+  useEffect(() => {
+    if (open && !busy && focusFirst.current) {
+      focusFirst.current = false;
+      firstField.current?.focus();
+    }
+  }, [open, busy]);
+
+  function draft(): Price | undefined | string {
+    const fields = [input, output, cacheRead, cacheWrite].map((f) => f.trim());
+    if (fields.every((f) => f === "")) return undefined;
+    if (fields[0] === "" || fields[1] === "") return "give both the input and the output price, or clear all four";
+    const numbers = fields.map((f) => (f === "" ? undefined : parsePrice(f)));
+    if (numbers.some((n) => n === null)) {
+      return "a price is a number of dollars, 0 or more, such as 0.15 (no thousands separators)";
+    }
+    const [i, o, r, w] = numbers as Array<number | undefined>;
+    const out: Price = { input: i as number, output: o as number };
+    if (r !== undefined) out.cache_read = r;
+    if (w !== undefined) out.cache_write = w;
+    return out;
+  }
+
+  function reset() {
+    setInput(shown(price?.input));
+    setOutput(shown(price?.output));
+    setCacheRead(shown(price?.cache_read));
+    setCacheWrite(shown(price?.cache_write));
+    setError(null);
+  }
+
+  function close() {
+    focusToggle.current = true;
+    setOpen(false);
+  }
+
+  async function submit(next: Price | undefined | string) {
+    if (typeof next === "string") {
+      setError(next);
+      return;
+    }
+    setError(null);
+    if (await onSave(next)) {
+      close();
+    } else {
+      setError("Not saved (see the message at the top of the page). Reset shows the price saved now.");
+      focusFirst.current = true;
+    }
+  }
+
+  const muted = { color: "var(--color-body)" };
+  // Where only config.toml may change it, a model without one has nothing to show.
+  if (!editable && !price) return null;
+  if (!open) {
+    return (
+      <button
+        ref={toggle}
+        type="button"
+        className="mt-2 text-xs underline"
+        style={muted}
+        aria-label={`${price ? "price" : "set a price"} of ${entry.id}`}
+        onClick={() => {
+          reset();
+          setOpen(true);
+        }}
+      >
+        {price ? "price" : "set a price"}
+      </button>
+    );
+  }
+  const field = (label: string, value: string, set: (v: string) => void, placeholder: string, first = false) => (
+    <label className="flex flex-wrap items-center gap-2">
+      <span className="w-28">{label}</span>
+      <input
+        ref={first ? firstField : undefined}
+        className="input tabular"
+        style={{ maxWidth: 140 }}
+        inputMode="decimal"
+        value={value}
+        placeholder={placeholder}
+        disabled={!editable || busy}
+        autoFocus={first && editable}
+        onChange={(e) => set(e.target.value)}
+        aria-label={`${label} price of ${entry.id}`}
+      />
+    </label>
+  );
+  return (
+    <form
+      className="mt-3 grid gap-2 text-sm"
+      style={muted}
+      aria-label={`price of ${entry.id}`}
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (editable && !busy) void submit(draft());
+      }}
+    >
+      <p className="text-xs">US dollars per million tokens, as the provider lists them.</p>
+      {field("input", input, setInput, "3", true)}
+      {field("output", output, setOutput, "15")}
+      {field("cache read", cacheRead, setCacheRead, "as input")}
+      {field("cache write", cacheWrite, setCacheWrite, "as input")}
+      <div className="flex flex-wrap items-center gap-2">
+        {editable && (
+          <button type="submit" className="btn-ghost" disabled={busy}>
+            save
+          </button>
+        )}
+        {editable && price && (
+          <button type="button" className="btn-ghost" disabled={busy} onClick={() => void submit(undefined)}>
+            clear
+          </button>
+        )}
+        {editable && (
+          <button type="button" className="text-xs underline" onClick={reset}>
+            reset
+          </button>
+        )}
+        <button type="button" className="text-xs underline" autoFocus={!editable} onClick={close}>
+          close
+        </button>
+      </div>
+      {error && <p role="alert" style={{ color: "var(--color-ruby)" }}>{error}</p>}
+    </form>
   );
 }
