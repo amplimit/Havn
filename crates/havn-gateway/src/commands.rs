@@ -129,9 +129,9 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "allow",
         aliases: &[],
-        args: "<sender>",
-        about: "Let someone the bot turned away talk to it",
-        about_zh: "让被机器人拒绝的人可以和它对话",
+        args: "[group] <id>",
+        about: "Let someone, or a group, the bot turned away use it",
+        about_zh: "让被机器人拒绝的人或群可以使用它",
         admin: true,
     },
     Command {
@@ -349,6 +349,9 @@ pub struct Asker {
     pub admin_hint: &'static str,
     /// The agent's language, which its replies are in (issue #250).
     pub language: havn_core::Language,
+    /// Written in a group (issue #263), where a step waiting may be
+    /// another member's: it is named to be decided.
+    pub group: bool,
 }
 
 /// The language of agent `agent_id` (issue #250); English when it cannot
@@ -814,7 +817,11 @@ async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
             )
             .into();
     };
-    let sender = args.trim();
+    // A group (issue #263): `/allow group <id>`.
+    let (group, sender) = match args.trim().strip_prefix("group") {
+        Some(id) if id.is_empty() || id.starts_with(char::is_whitespace) => (true, id.trim()),
+        _ => (false, args.trim()),
+    };
     if sender.is_empty()
         || sender.chars().any(char::is_whitespace)
         || crate::channel_id_codec::validate_channel_id_part("sender_id", sender).is_err()
@@ -831,6 +838,39 @@ async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
             .pick("(The agent is gone.)", "（这个 agent 不在了。）")
             .into();
     };
+    if group {
+        let off = state
+            .channels
+            .get(channel)
+            .and_then(|entry| entry.accounts.iter().find(|a| a.id == account_id))
+            .is_none_or(|a| a.group_policy == crate::config::GroupPolicy::Off);
+        if off {
+            return language
+                .pick(
+                    "(Groups are off for this bot: set group_policy for its account in the gateway's config.toml first.)",
+                    "（这个机器人没有开启群聊：请先在网关的 config.toml 里给它的账号设置 group_policy。）",
+                )
+                .into();
+        }
+        return match crate::api::channel::admit_group_of(
+            state, &agent, channel, account_id, sender, &asker.who,
+        )
+        .await
+        {
+            Ok(true) => language.pick(
+                format!("(The group {sender} can use this bot now.)"),
+                format!("（群 {sender} 现在可以使用这个机器人了。）"),
+            ),
+            Ok(false) => language.pick(
+                format!("(The group {sender} could already use this bot.)"),
+                format!("（群 {sender} 本来就可以使用这个机器人。）"),
+            ),
+            Err(e) => language.pick(
+                format!("(Could not let the group {sender} in: {e}.)"),
+                format!("（没能放行群 {sender}：{e}。）"),
+            ),
+        };
+    }
     match crate::api::channel::admit_sender(state, &agent, channel, account_id, sender, &asker.who)
         .await
     {
@@ -877,6 +917,16 @@ async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> S
                     .then(|| state.webchat_router.owner_approval(asker.agent_id, id))
                     .flatten()
             }),
+        // In a group the step waiting may be a member's the owner did not
+        // see there (issue #263): it is named.
+        None if asker.group => {
+            return language
+                .pick(
+                    "(In a group, name the step: /approve <id> or /deny <id>, as your own chat with the bot shows it.)",
+                    "（在群里请写明步骤：/approve <id> 或 /deny <id>，id 见你和机器人的私聊。）",
+                )
+                .into();
+        }
         None => state
             .webchat_router
             .oldest_approval(asker.agent_id, &asker.scope),

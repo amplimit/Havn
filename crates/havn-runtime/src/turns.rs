@@ -203,6 +203,8 @@ mod tests {
             attachments: Vec::new(),
             raw: serde_json::Value::Null,
             from_owner: false,
+            group: false,
+            answers: None,
         }
     }
 

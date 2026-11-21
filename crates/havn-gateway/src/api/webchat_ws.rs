@@ -199,6 +199,7 @@ async fn web_asker(
         owner,
         admin_hint: language.pick("the agent's owner", "agent 的所有者"),
         language,
+        group: false,
     }
 }
 
@@ -525,6 +526,8 @@ async fn serve_session<Si, St, E>(
             raw: serde_json::Value::Null,
             // The dashboard's chats are its owner's.
             from_owner: true,
+            group: false,
+            answers: None,
         };
 
         let sent = registry
