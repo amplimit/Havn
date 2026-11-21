@@ -397,13 +397,22 @@ pub(crate) mod tests {
         // Stub out the rest of AppState's plumbing — these tests never
         // touch them, but Rust's struct-init makes us produce values.
         let dummy_path = PathBuf::from("/tmp/havn-test-stub");
+        let registry = AgentRegistry::new();
+        let webchat_router = WebChatRouter::new();
+        let cron_scheduler = crate::cron::CronScheduler::new(
+            pool.clone(),
+            registry.clone(),
+            webchat_router.clone(),
+            dummy_path.clone(),
+        );
         let app = AppState {
             db: pool,
             bootstrap_user_id: bootstrap,
             trusted_proxies: trust.then(|| Arc::new(trusted_proxies(&[]).expect("loopback"))),
             identity: IdentityHeader::from_config(&TrustHeaderConfig::default()).expect("default"),
             http: reqwest::Client::new(),
-            registry: AgentRegistry::new(),
+            registry,
+            cron_scheduler,
             spawner: Arc::new(havn_spawner::subprocess::SubprocessSpawner::new()),
             workspace_root: dummy_path.clone(),
             runtime_binary: dummy_path.clone(),
@@ -418,7 +427,7 @@ pub(crate) mod tests {
             channel_router: crate::channel_router::ChannelRouter::new(),
             dm_reject_limiter: crate::api::channel::DmRejectLimiter::new(),
             invite_attempt_limiter: crate::api::channel::InviteAttemptLimiter::new(),
-            webchat_router: WebChatRouter::new(),
+            webchat_router,
             allowed_origins: Arc::new(ArcSwap::from_pointee(Vec::new())),
             admin_rpc: crate::admin_rpc::AdminRpc::new(),
             start_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),

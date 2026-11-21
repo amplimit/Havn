@@ -183,6 +183,29 @@ impl CronScheduler {
         }
     }
 
+    /// Run `job` now, as its owner asked (issue #236): without its wake
+    /// check, and without moving its schedule. Its result goes where a
+    /// scheduled run's does. The run's id.
+    pub async fn run_now(&self, job: &CronJob) -> Result<String, CronError> {
+        if !self.registry.is_connected(job.agent_id).await {
+            return Err(CronError::NotRunning);
+        }
+        let run_id = self.track_dispatch(job.agent_id, job.id);
+        let frame = GatewayToAgent::CronTick(CronTick {
+            job_id: job.id.to_string(),
+            run_id: run_id.clone(),
+            prompt: job.prompt.clone(),
+            enabled_toolsets: job.enabled_toolsets.clone(),
+            chat: job.chat.clone(),
+        });
+        if let Err(e) = self.registry.send(job.agent_id, frame).await {
+            warn!(job_id = %job.id, error = %e, "could not deliver a CronTick run now");
+            self.pending_runs().remove(&run_id);
+            return Err(CronError::NotRunning);
+        }
+        Ok(run_id)
+    }
+
     pub async fn run(self) {
         info!(
             tick_interval_s = TICK_INTERVAL.as_secs(),
@@ -596,6 +619,8 @@ pub enum CronError {
     NotPending(String),
     #[error("result for an expired run {0:?}")]
     ExpiredRun(String),
+    #[error("the agent is not running")]
+    NotRunning,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("db: {0}")]
@@ -925,6 +950,43 @@ mod tests {
             output,
             silent: true,
         }
+    }
+
+    #[tokio::test]
+    async fn a_task_run_now_goes_to_its_agent_and_keeps_its_schedule() {
+        let pool = havn_db::connect_in_memory().await.expect("db");
+        let s = make_scheduler(pool.clone());
+        let (agent_id, job_id) = job_fixture(&pool).await;
+        let job = cron::find_by_id(&pool, job_id)
+            .await
+            .expect("find")
+            .expect("job");
+        assert!(matches!(s.run_now(&job).await, Err(CronError::NotRunning)));
+
+        s.registry
+            .register(havn_spawner::AgentHandle::new(agent_id, 1))
+            .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        s.registry.attach(agent_id, tx).await.expect("attach");
+        let run_id = s.run_now(&job).await.expect("run");
+        let Some(GatewayToAgent::CronTick(tick)) = rx.recv().await else {
+            panic!("a cron tick");
+        };
+        assert_eq!(
+            (tick.job_id, tick.run_id.clone(), tick.prompt),
+            (job_id.to_string(), run_id.clone(), "p".to_string())
+        );
+        let after = cron::find_by_id(&pool, job_id)
+            .await
+            .expect("find")
+            .expect("job");
+        assert_eq!(
+            after.next_run_at, job.next_run_at,
+            "the schedule does not move"
+        );
+        s.record_result(agent_id, result_for(job_id, &run_id, "done".into()))
+            .await
+            .expect("its result is taken as a run's");
     }
 
     #[tokio::test]

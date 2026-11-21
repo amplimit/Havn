@@ -370,6 +370,47 @@ pub async fn list_runs(
     Ok(Json(runs.into_iter().map(CronRunView::from).collect()))
 }
 
+/// `POST /agents/{id}/cron/{job_id}/run`: run a task now (issue #236),
+/// paused or not, without its wake check and without moving its schedule.
+/// Its result goes where a scheduled run's does.
+pub async fn run_now(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path((agent_id, job_id)): Path<(String, String)>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let agent = crate::api::agents::resolve_agent(&agent_id, &user, &state).await?;
+    let job_id = parse_job(&job_id)?;
+    let job = cron::find_by_id(&state.db, job_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if job.agent_id != agent.id {
+        return Err(ApiError::NotFound);
+    }
+    let run_id = state
+        .cron_scheduler
+        .run_now(&job)
+        .await
+        .map_err(|e| match e {
+            crate::cron::CronError::NotRunning => {
+                ApiError::Conflict("the agent is not running; start it first".into())
+            }
+            other => ApiError::Internal(other.to_string()),
+        })?;
+    crate::audit::record(
+        &state.db,
+        user.id,
+        agent.team_id,
+        Some(agent.id),
+        "cron.run_now",
+        serde_json::json!({ "job_id": job_id.to_string(), "run_id": run_id }),
+    )
+    .await;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "run_id": run_id })),
+    ))
+}
+
 fn parse_job(s: &str) -> Result<CronJobId, ApiError> {
     CronJobId::from_str(s).map_err(|_| ApiError::BadRequest("invalid cron job id".into()))
 }

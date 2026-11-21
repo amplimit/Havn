@@ -1698,6 +1698,15 @@ function ScheduledTasks({ agentId }: { agentId: string }) {
                   type="button"
                   className="btn-ghost"
                   disabled={busy}
+                  title="run it now, without moving its schedule"
+                  onClick={() => act(() => api.cron.runNow(agentId, job.id))}
+                >
+                  run now
+                </button>
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  disabled={busy}
                   onClick={() => act(() => api.cron.setEnabled(agentId, job.id, !job.enabled))}
                 >
                   {job.enabled ? "pause" : "resume"}

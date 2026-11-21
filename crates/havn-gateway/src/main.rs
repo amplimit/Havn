@@ -84,6 +84,8 @@ struct AppState {
     pub identity: auth::IdentityHeader,
     pub http: reqwest::Client,
     pub registry: AgentRegistry,
+    /// Fires scheduled tasks; the API runs one now (issue #236).
+    pub cron_scheduler: cron::CronScheduler,
     pub spawner: Arc<dyn AgentSpawner>,
     pub workspace_root: PathBuf,
     pub runtime_binary: PathBuf,
@@ -544,6 +546,7 @@ async fn serve() -> anyhow::Result<()> {
         identity,
         http: http.clone(),
         registry: registry.clone(),
+        cron_scheduler: cron_scheduler.clone(),
         spawner,
         workspace_root: cfg.workspace_root.clone(),
         runtime_binary,
@@ -728,6 +731,7 @@ async fn serve() -> anyhow::Result<()> {
             patch(api::cron::update).delete(api::cron::delete),
         )
         .route("/agents/{id}/cron/{job_id}/runs", get(api::cron::list_runs))
+        .route("/agents/{id}/cron/{job_id}/run", post(api::cron::run_now))
         .route("/agents/{id}/conversation", get(api::conversation::list))
         .route("/agents/{id}/chats", get(api::conversation::chats))
         .route("/agents/{id}/search", get(api::conversation::search))
