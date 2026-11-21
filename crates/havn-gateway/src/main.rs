@@ -114,10 +114,12 @@ struct AppState {
     /// Channel-adapter accounts keyed by channel id (spec §3.4). Source
     /// of truth for "which (channel, account) pairs are allowed to open
     /// a `/api/v1/channel` WS"; the WS handler rejects connections for
-    /// pairs not declared here. A snapshot taken at startup — edits are
-    /// restart-class (spec §8.4 / §3.5): the config watcher logs that a
-    /// `[[channels]]` change needs `havn gateway restart`.
-    pub channels: Arc<std::collections::BTreeMap<String, config::ChannelEntry>>,
+    /// pairs not declared here. Who may reach each account is reloaded
+    /// live (issue #273); adding, dropping an account or changing its
+    /// `adapter_token_ref` waits for `havn gateway restart`.
+    pub channels: std::sync::Arc<
+        arc_swap::ArcSwap<std::collections::BTreeMap<String, crate::config::ChannelEntry>>,
+    >,
     /// Cross-channel agent bindings (spec §3.5). The router consults
     /// this to translate inbound `(channel, account)` → `agent_id`. Startup
     /// snapshot; `[[bindings]]` edits are restart-class (spec §8.4 / §3.5).
@@ -551,7 +553,7 @@ async fn serve() -> anyhow::Result<()> {
         tmpfs_mounts: cfg.tmpfs_mounts.clone(),
         seccomp_allow_extra: cfg.seccomp.allow_extra.clone(),
         agent_dns: cfg.network.agent_dns.clone(),
-        channels: Arc::new(cfg.channels.clone()),
+        channels: reload_handles.channels.clone(),
         bindings: Arc::new(cfg.bindings.clone()),
         channel_router: channel_router_state.clone(),
         dm_reject_limiter: crate::api::channel::DmRejectLimiter::new(),
@@ -620,7 +622,7 @@ async fn serve() -> anyhow::Result<()> {
         webchat_router,
         channel_router: channel_router_state.clone(),
         bindings: Arc::new(cfg.bindings.clone()),
-        channels: Arc::new(cfg.channels.clone()),
+        channels: reload_handles.channels.clone(),
         cron_scheduler: cron_scheduler.clone(),
         admin_rpc,
         query_broker,
@@ -795,6 +797,10 @@ async fn serve() -> anyhow::Result<()> {
         .route(
             "/agents/{id}/channel-access/senders",
             post(api::channel::channel_sender_allow).delete(api::channel::channel_sender_remove),
+        )
+        .route(
+            "/agents/{id}/channel-access/policy",
+            axum::routing::put(api::channel::channel_policy_set),
         )
         .route(
             "/agents/{id}/channel-access/refused",

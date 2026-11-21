@@ -68,11 +68,15 @@ pub const RULES: &[ReloadRule] = &[
         prefix: "allowed_origins",
         kind: ReloadKind::Hot,
     },
-    // Per spec §8.4, new config fields default to "restart required" and the
-    // rule table is deliberately not grown. `[[bindings]]` / `[[channels]]`
-    // therefore fall through to the default Restart class: an edit is surfaced
-    // to the operator to apply on `havn gateway restart` (spec §3.5), not
-    // hot-swapped live.
+    // New config fields default to "restart required". `[[bindings]]` stays
+    // restart-class (spec §3.5): an agent's routing is fixed while it runs.
+    // `[channels]` is hot (issue #273): who may reach a bot is set from the
+    // dashboard too, and an account's adapter uses a new token ref when it
+    // next connects.
+    ReloadRule {
+        prefix: "channels",
+        kind: ReloadKind::Hot,
+    },
     ReloadRule {
         prefix: "llm.models",
         kind: ReloadKind::Hot,
@@ -214,6 +218,8 @@ pub struct ReloadHandles {
     pub transcription: Arc<ArcSwap<Option<crate::transcribe::Transcription>>>,
     /// `[attachments]`.
     pub attachments: Arc<ArcSwap<crate::config::AttachmentLimits>>,
+    /// `[channels]`: the accounts and who may reach them.
+    pub channels: Arc<ArcSwap<std::collections::BTreeMap<String, crate::config::ChannelEntry>>>,
 }
 
 impl ReloadHandles {
@@ -225,6 +231,7 @@ impl ReloadHandles {
             channel_texts: Arc::new(ArcSwap::from_pointee(cfg.channel_texts.clone())),
             transcription: Arc::new(ArcSwap::from_pointee(cfg.transcription.clone())),
             attachments: Arc::new(ArcSwap::from_pointee(cfg.attachments.clone())),
+            channels: Arc::new(ArcSwap::from_pointee(cfg.channels.clone())),
         }
     }
 
@@ -257,6 +264,21 @@ impl ReloadHandles {
                     on = new.transcription.is_some(),
                     "hot-reloaded the transcription of audio"
                 );
+            } else if path.starts_with("channels") {
+                let mut waiting = Vec::new();
+                self.channels.rcu(|running| {
+                    let (merged, left) = crate::config::with_policies_of(running, &new.channels);
+                    waiting = left;
+                    Arc::new(merged)
+                });
+                info!("hot-reloaded who may reach the channel accounts");
+                if !waiting.is_empty() {
+                    warn!(
+                        accounts = ?waiting,
+                        "channel accounts were added, dropped or given another adapter_token_ref; \
+                         run `havn gateway restart` to apply that"
+                    );
+                }
             } else if path.starts_with("attachments") {
                 self.attachments.store(Arc::new(new.attachments.clone()));
                 info!(limits = ?new.attachments, "hot-reloaded the limits of attachments");
@@ -444,20 +466,18 @@ mod tests {
             "channels.telegram.accounts".to_string(),
             "totally_unknown".to_string(),
         ]);
-        // Only allowed_origins is Hot; channels/bindings are restart-class
-        // (spec §8.4 — the rule table is not grown for them).
-        assert_eq!(plan.hot_paths, vec!["allowed_origins"]);
         assert_eq!(
-            plan.restart_paths,
-            vec!["listen", "channels.telegram.accounts", "totally_unknown"]
+            plan.hot_paths,
+            vec!["allowed_origins", "channels.telegram.accounts"]
         );
+        assert_eq!(plan.restart_paths, vec!["listen", "totally_unknown"]);
     }
 
     #[test]
     fn plan_separates_hot_from_deploy_time_paths() {
         // The watcher applies hot_paths in place and only reports
-        // restart_paths to the operator — no self-restart. bindings/channels
-        // edits are restart-class (spec §8.4 / §3.5).
+        // restart_paths to the operator — no self-restart. bindings edits
+        // are restart-class (spec §3.5).
         let plan = ReloadPlan::build(&[
             "allowed_origins".into(),
             "bindings".into(),
@@ -466,6 +486,42 @@ mod tests {
         ]);
         assert_eq!(plan.hot_paths, vec!["allowed_origins"]);
         assert_eq!(plan.restart_paths, vec!["bindings", "listen", "db_path"]);
+    }
+
+    #[test]
+    fn handles_apply_hot_swaps_the_channel_accounts() {
+        let mut cfg = GatewayConfig::default();
+        cfg.channels.insert(
+            "telegram".into(),
+            crate::config::ChannelEntry {
+                accounts: vec![crate::config::ChannelAccount {
+                    id: "bot".into(),
+                    adapter_token_ref: "secret:channel:telegram:bot".into(),
+                    dm_policy: crate::config::DmPolicy::Allowlist,
+                    allow_from: Vec::new(),
+                    admins: Vec::new(),
+                    bot_username: None,
+                    group_policy: crate::config::GroupPolicy::Off,
+                    allow_groups: Vec::new(),
+                }],
+            },
+        );
+        let handles = ReloadHandles::from_config(&cfg);
+        let mut new_cfg = cfg.clone();
+        let account = &mut new_cfg
+            .channels
+            .get_mut("telegram")
+            .expect("telegram")
+            .accounts[0];
+        account.group_policy = crate::config::GroupPolicy::Allowlist;
+        account.dm_policy = crate::config::DmPolicy::Open;
+        let plan = ReloadPlan::build(&["channels.telegram.accounts".to_string()]);
+        assert!(plan.restart_paths.is_empty());
+        handles.apply_hot(&new_cfg, &plan.hot_paths);
+        let now = handles.channels.load_full();
+        let account = &now["telegram"].accounts[0];
+        assert_eq!(account.group_policy, crate::config::GroupPolicy::Allowlist);
+        assert_eq!(account.dm_policy, crate::config::DmPolicy::Open);
     }
 
     #[test]

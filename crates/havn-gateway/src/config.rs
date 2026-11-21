@@ -233,6 +233,18 @@ pub enum GroupPolicy {
     Open,
 }
 
+impl GroupPolicy {
+    /// As config.toml writes it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Allowlist => "allowlist",
+            Self::Open => "open",
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DmPolicy {
@@ -245,6 +257,17 @@ pub enum DmPolicy {
     /// personal bots where the operator controls visibility at the
     /// platform level (e.g. Telegram bot handle is private).
     Open,
+}
+
+impl DmPolicy {
+    /// As config.toml writes it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Allowlist => "allowlist",
+            Self::Open => "open",
+        }
+    }
 }
 
 /// Why senders admitted by invite to `(channel, account_id)` are not in
@@ -445,6 +468,118 @@ impl Default for AttachmentLimits {
             file_chars: 30_000,
         }
     }
+}
+
+/// `running`'s accounts with who may reach each taken from `new` (issue
+/// #273): `dm_policy`, `allow_from`, `group_policy`, `allow_groups`,
+/// `admins` and `bot_username`, which apply to the next message. The
+/// accounts themselves stay as they run, each with the `adapter_token_ref`
+/// its adapter's session was let in by: those `new` adds or drops, or
+/// gives another token, are named in the second part, as they wait for a
+/// restart.
+#[must_use]
+pub fn with_policies_of(
+    running: &std::collections::BTreeMap<String, ChannelEntry>,
+    new: &std::collections::BTreeMap<String, ChannelEntry>,
+) -> (
+    std::collections::BTreeMap<String, ChannelEntry>,
+    Vec<String>,
+) {
+    let mut merged = running.clone();
+    let mut waiting = Vec::new();
+    for (channel, entry) in &mut merged {
+        for account in &mut entry.accounts {
+            let found = new
+                .get(channel)
+                .and_then(|e| e.accounts.iter().find(|a| a.id == account.id));
+            let Some(next) = found else {
+                waiting.push(format!("{channel}/{}", account.id));
+                continue;
+            };
+            account.dm_policy = next.dm_policy;
+            account.allow_from.clone_from(&next.allow_from);
+            account.group_policy = next.group_policy;
+            account.allow_groups.clone_from(&next.allow_groups);
+            account.admins.clone_from(&next.admins);
+            account.bot_username.clone_from(&next.bot_username);
+            if next.adapter_token_ref != account.adapter_token_ref {
+                waiting.push(format!("{channel}/{}", account.id));
+            }
+        }
+    }
+    for (channel, entry) in new {
+        for account in &entry.accounts {
+            let running_it = running
+                .get(channel)
+                .is_some_and(|e| e.accounts.iter().any(|a| a.id == account.id));
+            if !running_it {
+                waiting.push(format!("{channel}/{}", account.id));
+            }
+        }
+    }
+    (merged, waiting)
+}
+
+/// Set `key` of `table` to `text`, keeping what was written around the
+/// old value (a comment after it).
+fn set_kept(table: &mut toml_edit::Table, key: &str, text: &str) {
+    let mut value = toml_edit::Value::from(text);
+    if let Some(old) = table.get(key).and_then(toml_edit::Item::as_value) {
+        *value.decor_mut() = old.decor().clone();
+    }
+    table[key] = toml_edit::Item::Value(value);
+}
+
+/// Set the policies given of the account `account_id` of `channel` in the
+/// config file at `path` (issue #273), keeping the rest of the file as it
+/// is: `dm_policy` for private chats, `group_policy` for groups. What is
+/// written must load, else the file is left as it is: what loaded.
+pub fn write_account_policy(
+    path: &std::path::Path,
+    channel: &str,
+    account_id: &str,
+    dm_policy: Option<DmPolicy>,
+    group_policy: Option<GroupPolicy>,
+) -> anyhow::Result<GatewayConfig> {
+    use anyhow::Context as _;
+    let target =
+        std::fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?;
+    let raw = std::fs::read_to_string(&target)
+        .with_context(|| format!("reading {}", target.display()))?;
+    let mut doc: toml_edit::DocumentMut = raw
+        .parse()
+        .with_context(|| format!("parsing {}", target.display()))?;
+    let accounts = doc
+        .get_mut("channels")
+        .and_then(|channels| channels.get_mut(channel))
+        .and_then(|entry| entry.get_mut("accounts"))
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has no [[channels.{channel}.accounts]] tables to change; edit it by hand",
+                target.display()
+            )
+        })?;
+    let account = accounts
+        .iter_mut()
+        .find(|a| a.get("id").and_then(toml_edit::Item::as_str) == Some(account_id))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has no account {account_id} under [[channels.{channel}.accounts]]",
+                target.display()
+            )
+        })?;
+    if let Some(policy) = dm_policy {
+        set_kept(account, "dm_policy", policy.name());
+    }
+    if let Some(policy) = group_policy {
+        set_kept(account, "group_policy", policy.name());
+    }
+    let written = doc.to_string();
+    let loaded = GatewayConfig::from_toml(&written)
+        .context("config.toml has changes the gateway could not load; fix the file, then retry")?;
+    crate::model_catalog::replace_file(&target, written.as_bytes())?;
+    Ok(loaded)
 }
 
 /// Set `[workspace] browse` in the config file at `path`, keeping the rest
@@ -764,8 +899,12 @@ impl GatewayConfig {
     /// watcher (spec §8.4). Errors propagate so the watcher can roll back to
     /// the last known good snapshot.
     pub fn load_from(path: &std::path::Path) -> anyhow::Result<Self> {
-        let raw = std::fs::read_to_string(path)?;
-        let mut parsed: Self = toml::from_str(&raw)?;
+        Self::from_toml(&std::fs::read_to_string(path)?)
+    }
+
+    /// The config `raw` holds, checked as [`Self::load_from`] checks a file.
+    pub fn from_toml(raw: &str) -> anyhow::Result<Self> {
+        let mut parsed: Self = toml::from_str(raw)?;
         parsed.validate_channel_ids()?;
         parsed.warn_channel_texts();
         parsed.validate_llm()?;
@@ -1423,5 +1562,105 @@ mod tests {
         ] {
             assert!(!is_plaintext_to_another_host(local), "{local}");
         }
+    }
+
+    #[test]
+    fn a_bot_s_policies_are_written_to_config_toml_keeping_the_rest() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# mine\n[channels.telegram]\n[[channels.telegram.accounts]]\nid = \"other\"\nadapter_token_ref = \"secret:channel:telegram:other\"\n\n[[channels.telegram.accounts]]\nid = \"bot\" # the team's\nadapter_token_ref = \"secret:channel:telegram:bot\"\ndm_policy = \"allowlist\"\n",
+        )
+        .expect("write");
+        write_account_policy(&path, "telegram", "bot", None, Some(GroupPolicy::Allowlist))
+            .expect("groups");
+        write_account_policy(&path, "telegram", "bot", Some(DmPolicy::Open), None).expect("dm");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            text.contains("# mine") && text.contains("# the team's"),
+            "{text}"
+        );
+        let parsed: GatewayConfig = toml::from_str(&text).expect("parse");
+        let accounts = &parsed.channels["telegram"].accounts;
+        assert_eq!(
+            accounts[0].group_policy,
+            GroupPolicy::Off,
+            "the other account is as it was"
+        );
+        assert_eq!(accounts[1].group_policy, GroupPolicy::Allowlist);
+        assert_eq!(accounts[1].dm_policy, DmPolicy::Open);
+        assert!(
+            write_account_policy(&path, "telegram", "gone", Some(DmPolicy::Open), None).is_err()
+        );
+        assert!(write_account_policy(&path, "slack", "bot", Some(DmPolicy::Open), None).is_err());
+
+        // A comment after a value stays with it.
+        std::fs::write(
+            &path,
+            "[[channels.telegram.accounts]]\nid = \"bot\"\nadapter_token_ref = \"secret:channel:telegram:bot\"\ndm_policy = \"allowlist\" # only us\n",
+        )
+        .expect("write");
+        write_account_policy(&path, "telegram", "bot", Some(DmPolicy::Open), None).expect("dm");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("dm_policy = \"open\" # only us"), "{text}");
+
+        // A file the gateway could not load is left as it is.
+        let broken = "[llm]\nmax_tokens_ceiling = 0\n[[channels.telegram.accounts]]\nid = \"bot\"\nadapter_token_ref = \"secret:channel:telegram:bot\"\n";
+        std::fs::write(&path, broken).expect("write");
+        assert!(GatewayConfig::load_from(&path).is_err());
+        assert!(
+            write_account_policy(&path, "telegram", "bot", Some(DmPolicy::Open), None).is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), broken);
+    }
+
+    #[test]
+    fn a_reload_takes_who_may_reach_an_account_and_leaves_the_accounts_as_they_run() {
+        let account = |id: &str, token: &str| ChannelAccount {
+            id: id.into(),
+            adapter_token_ref: token.into(),
+            dm_policy: DmPolicy::Allowlist,
+            allow_from: Vec::new(),
+            admins: Vec::new(),
+            bot_username: None,
+            group_policy: GroupPolicy::Off,
+            allow_groups: Vec::new(),
+        };
+        let mut running = std::collections::BTreeMap::new();
+        running.insert(
+            "telegram".to_string(),
+            ChannelEntry {
+                accounts: vec![
+                    account("a", "secret:a"),
+                    account("b", "secret:b"),
+                    account("c", "secret:c"),
+                ],
+            },
+        );
+        let mut new = running.clone();
+        let accounts = &mut new.get_mut("telegram").expect("telegram").accounts;
+        accounts[0].group_policy = GroupPolicy::Open;
+        accounts[0].allow_from = vec!["tg:1".into()];
+        accounts[1].adapter_token_ref = "secret:b2".into();
+        accounts[1].dm_policy = DmPolicy::Open;
+        accounts.remove(2);
+        accounts.push(account("d", "secret:d"));
+        let (merged, waiting) = with_policies_of(&running, &new);
+        let merged = &merged["telegram"].accounts;
+        assert_eq!(merged.len(), 3, "none added or dropped");
+        assert_eq!(merged[0].group_policy, GroupPolicy::Open);
+        assert_eq!(merged[0].allow_from, vec!["tg:1".to_string()]);
+        assert_eq!(
+            merged[1].adapter_token_ref, "secret:b",
+            "the session's token stays"
+        );
+        assert_eq!(
+            merged[1].dm_policy,
+            DmPolicy::Open,
+            "who may reach it does not wait"
+        );
+        assert_eq!(merged[2].id, "c");
+        assert_eq!(waiting, vec!["telegram/b", "telegram/c", "telegram/d"]);
     }
 }

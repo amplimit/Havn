@@ -108,7 +108,9 @@ pub struct AgentSocketCtx {
     /// accounts bound to the sending agent, to recipients its account's
     /// `dm_policy` allows (TOML `allow_from` or the invite allowlist in `db`).
     pub bindings: Arc<Vec<crate::config::ChannelBindingConfig>>,
-    pub channels: Arc<std::collections::BTreeMap<String, crate::config::ChannelEntry>>,
+    pub channels: std::sync::Arc<
+        arc_swap::ArcSwap<std::collections::BTreeMap<String, crate::config::ChannelEntry>>,
+    >,
     pub cron_scheduler: CronScheduler,
     /// Pending admin RPC senders (`MemoryForget`, `SkillPin`, `Data`). The
     /// reader matches `*Response` variants and resolves the matching
@@ -1322,6 +1324,7 @@ async fn ask_for_approval(
     if let Some((channel, account, sender)) = crate::channel_id_codec::decode(&request.channel_id) {
         let admins_of_account = ctx
             .channels
+            .load_full()
             .get(channel)
             .and_then(|entry| entry.accounts.iter().find(|a| a.id == account))
             .map(|acct| acct.admins.clone())
@@ -1715,7 +1718,7 @@ async fn channel_send_permitted(
     crate::channel_router::send_permitted(
         &ctx.db,
         &ctx.bindings,
-        &ctx.channels,
+        &ctx.channels.load_full(),
         agent_id,
         channel,
         account_id,
@@ -3610,7 +3613,7 @@ mod tests {
             webchat_router,
             channel_router: crate::channel_router::ChannelRouter::new(),
             bindings: Arc::new(Vec::new()),
-            channels: Arc::new(std::collections::BTreeMap::new()),
+            channels: Default::default(),
             admin_rpc: crate::admin_rpc::AdminRpc::new(),
             query_broker: crate::query_broker::QueryBroker::new(),
             embedding_config: Arc::new(arc_swap::ArcSwap::from_pointee(
@@ -4700,7 +4703,7 @@ mod tests {
                 }],
             },
         );
-        ctx.channels = Arc::new(channels);
+        ctx.channels.store(Arc::new(channels));
         let (adapter_tx, mut adapter) = mpsc::channel(8);
         ctx.channel_router
             .register(
@@ -4848,7 +4851,7 @@ mod tests {
                 }],
             },
         );
-        ctx.channels = Arc::new(channels);
+        ctx.channels.store(Arc::new(channels));
         sqlx::query("INSERT INTO channel_links (channel, sender_id, user_id) VALUES ('telegram', 'tg:owner', ?1)")
             .bind(owner.to_string())
             .execute(&ctx.db)
