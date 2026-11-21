@@ -148,6 +148,8 @@ pub async fn create(
         check_policy_override(raw)?;
     }
     check_model(&state, req.config.as_ref().and_then(|c| c.get("model")))?;
+    check_language(req.config.as_ref().and_then(|c| c.get("language")))?;
+    check_heartbeat(req.config.as_ref().and_then(|c| c.get("heartbeat")))?;
 
     // Spec §6.3 enforcement: max_agents is checked here, before INSERT.
     // policy_resolver::for_user is the single source of truth for "what
@@ -326,9 +328,9 @@ fn check_heartbeat(raw: Option<&serde_json::Value>) -> Result<(), ApiError> {
         Some(serde_json::Value::String(to))
             if !to.is_empty()
                 && to.len() <= 64
-                && to
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') =>
+                && to.chars().all(|c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'
+                }) =>
         {
             Ok(())
         }
@@ -1208,7 +1210,12 @@ mod tests {
                 "{to}"
             );
         }
-        for to in [json!(""), json!("ch|telegram|bot|42"), json!(1)] {
+        for to in [
+            json!(""),
+            json!("Telegram"),
+            json!("ch|telegram|bot|42"),
+            json!(1),
+        ] {
             assert!(
                 check_heartbeat(Some(&json!({"deliver": to}))).is_err(),
                 "{to}"

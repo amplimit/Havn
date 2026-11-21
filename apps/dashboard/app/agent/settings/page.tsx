@@ -147,8 +147,13 @@ function Settings({ id }: { id: string }) {
       }
       const hbNum = Number(heartbeatMin);
       const heartbeat: Record<string, unknown> = {};
+      const savedHeartbeat =
+        ((agent.config as Record<string, unknown>).heartbeat as Record<string, unknown> | undefined) ?? {};
       if (heartbeatMin.trim() && Number.isFinite(hbNum) && hbNum > 0) {
         heartbeat.interval_seconds = Math.round(hbNum * 60);
+      } else if (heartbeatMin.trim() && typeof savedHeartbeat.interval_seconds === "number") {
+        // An interval that is not a number of minutes leaves the saved one.
+        heartbeat.interval_seconds = savedHeartbeat.interval_seconds;
       }
       if (heartbeatTo !== "last") heartbeat.deliver = heartbeatTo;
       if (Object.keys(heartbeat).length > 0) {

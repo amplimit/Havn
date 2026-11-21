@@ -26,7 +26,10 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::agent_registry::AgentRegistry;
-use crate::config::ChannelBindingConfig;
+use crate::config::{ChannelBindingConfig, ChannelEntry};
+
+/// The `[channels]` of the gateway's config.
+pub type Channels = std::collections::BTreeMap<String, ChannelEntry>;
 
 /// Default per-agent heartbeat interval if the agent's config doesn't override.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -44,6 +47,7 @@ pub struct HeartbeatScheduler {
     registry: AgentRegistry,
     db: SqlitePool,
     bindings: Arc<Vec<ChannelBindingConfig>>,
+    channels: Arc<Channels>,
     state: Arc<Mutex<HashMap<AgentId, Instant>>>,
 }
 
@@ -55,10 +59,12 @@ pub const DELIVER_WEB: &str = "web";
 
 /// The tick for `agent`: the owner's web chat, and the owner's
 /// conversations with it that `heartbeat.deliver` lets the result go to:
-/// their chats in the chat apps they linked, as the dashboard lists them.
+/// their chats in the chat apps they linked, as the dashboard lists them,
+/// that the agent may send to.
 pub async fn tick_for(
     db: &SqlitePool,
     bindings: &[ChannelBindingConfig],
+    channels: &Channels,
     agent: &Agent,
 ) -> HeartbeatTick {
     let web = crate::webchat::session_for(&agent.owner_id.to_string(), agent.id).to_string();
@@ -92,12 +98,30 @@ pub async fn tick_for(
     if deliver == DELIVER_LAST {
         to.push(web.clone());
     }
-    to.extend(
-        linked
-            .into_iter()
-            .filter(|l| deliver == DELIVER_LAST || l.channel == deliver)
-            .map(|l| l.scope),
-    );
+    for l in linked
+        .into_iter()
+        .filter(|l| deliver == DELIVER_LAST || l.channel == deliver)
+    {
+        let permitted = crate::channel_router::send_permitted(
+            db,
+            bindings,
+            channels,
+            agent.id,
+            &l.channel,
+            &l.account_id,
+            &l.sender_id,
+        )
+        .await;
+        match permitted {
+            Ok(()) => to.push(l.scope),
+            Err(refusal) => debug!(
+                agent_id = %agent.id,
+                channel = l.channel,
+                reason = refusal.as_str(),
+                "the owner's chat-app account cannot be sent to"
+            ),
+        }
+    }
     HeartbeatTick { web, to }
 }
 
@@ -106,11 +130,13 @@ impl HeartbeatScheduler {
         registry: AgentRegistry,
         db: SqlitePool,
         bindings: Arc<Vec<ChannelBindingConfig>>,
+        channels: Arc<Channels>,
     ) -> Self {
         Self {
             registry,
             db,
             bindings,
+            channels,
             state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -144,42 +170,55 @@ impl HeartbeatScheduler {
 
         let mut intervals = Vec::with_capacity(connected.len());
         for agent_id in &connected {
-            let agent = agents::find_by_id(&self.db, *agent_id).await.ok().flatten();
-            let tick = match &agent {
-                Some(agent) => tick_for(&self.db, &self.bindings, agent).await,
-                None => HeartbeatTick::default(),
-            };
-            intervals.push((*agent_id, interval_of(agent.as_ref()), tick));
+            // An agent that cannot be read now is tried on the next pass.
+            match agents::find_by_id(&self.db, *agent_id).await {
+                Ok(Some(agent)) => intervals.push((interval_of(Some(&agent)), agent)),
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(%agent_id, error = %e, "could not read the agent for its heartbeat")
+                }
+            }
         }
+
+        // First observation: record `now` and skip — the first heartbeat
+        // fires `interval` after the agent first connects, not immediately.
+        let due: Vec<Agent> = {
+            let mut state = self.state.lock().await;
+            intervals
+                .into_iter()
+                .filter(|(interval, agent)| {
+                    let last = *state.entry(agent.id).or_insert(now);
+                    now.saturating_duration_since(last) >= *interval
+                })
+                .map(|(_, agent)| agent)
+                .collect()
+        };
 
         // One pass serves every agent, so it never waits on one agent's
         // queue: an agent whose queue is full misses this tick and is
         // retried on the next pass.
-        let mut state = self.state.lock().await;
-        for (agent_id, interval, tick) in intervals {
-            // First observation: record `now` and skip — the first heartbeat
-            // fires `interval` after the agent first connects, not immediately.
-            let last = *state.entry(agent_id).or_insert(now);
-            if now.saturating_duration_since(last) < interval {
-                continue;
-            }
+        for agent in due {
+            let tick = tick_for(&self.db, &self.bindings, &self.channels, &agent).await;
             match self
                 .registry
-                .try_send(agent_id, GatewayToAgent::HeartbeatTick(tick))
+                .try_send(agent.id, GatewayToAgent::HeartbeatTick(tick))
                 .await
             {
                 Ok(()) => {
-                    debug!(%agent_id, "heartbeat tick sent");
-                    state.insert(agent_id, now);
+                    debug!(agent_id = %agent.id, "heartbeat tick sent");
+                    self.state.lock().await.insert(agent.id, now);
                 }
                 Err(e) => {
-                    warn!(%agent_id, error = %e, "could not deliver HeartbeatTick");
+                    warn!(agent_id = %agent.id, error = %e, "could not deliver HeartbeatTick");
                 }
             }
         }
 
         // Forget state for agents that disconnected.
-        state.retain(|id, _| connected.contains(id));
+        self.state
+            .lock()
+            .await
+            .retain(|id, _| connected.contains(id));
     }
 }
 
@@ -209,7 +248,12 @@ mod tests {
             .await
             .expect("user");
         let registry = AgentRegistry::new();
-        let scheduler = HeartbeatScheduler::new(registry.clone(), db.clone(), Arc::new(Vec::new()));
+        let scheduler = HeartbeatScheduler::new(
+            registry.clone(),
+            db.clone(),
+            Arc::new(Vec::new()),
+            Arc::new(Channels::new()),
+        );
         (scheduler, registry, db, user.id)
     }
 
@@ -439,12 +483,35 @@ mod tests {
         // An account bound first to another agent is that agent's.
         bindings.insert(0, bound(&web_only.id.to_string(), "telegram", "shared"));
         bindings.push(bound(&last.id.to_string(), "telegram", "shared"));
+        // An account that may not send to the owner is left out.
+        bindings.push(bound(&last.id.to_string(), "telegram", "closed"));
+        let account =
+            |id: &str, dm_policy: crate::config::DmPolicy| crate::config::ChannelAccount {
+                id: id.into(),
+                adapter_token_ref: "secret:channel:telegram:bot".into(),
+                dm_policy,
+                allow_from: Vec::new(),
+                admins: Vec::new(),
+                bot_username: None,
+            };
+        let mut channels = Channels::new();
+        for channel in ["telegram", "lark"] {
+            let mut accounts: Vec<_> = bindings
+                .iter()
+                .filter(|b| b.channel == channel && b.account_id != "closed")
+                .map(|b| account(&b.account_id, crate::config::DmPolicy::Open))
+                .collect();
+            if channel == "telegram" {
+                accounts.push(account("closed", crate::config::DmPolicy::Allowlist));
+            }
+            channels.insert(channel.to_string(), ChannelEntry { accounts });
+        }
 
         let web =
             |agent: &Agent| crate::webchat::session_for(&owner.to_string(), agent.id).to_string();
         let dm = |agent: &Agent| format!("ch|telegram|bot-{}|42", agent.id);
 
-        let tick = tick_for(&db, &bindings, &last).await;
+        let tick = tick_for(&db, &bindings, &channels, &last).await;
         assert_eq!(tick.web, web(&last));
         assert_eq!(
             tick.to,
@@ -452,7 +519,7 @@ mod tests {
             "the web chat and the linked account"
         );
 
-        let tick = tick_for(&db, &bindings, &web_only).await;
+        let tick = tick_for(&db, &bindings, &channels, &web_only).await;
         assert_eq!(
             tick,
             HeartbeatTick {
@@ -461,10 +528,10 @@ mod tests {
             }
         );
 
-        let tick = tick_for(&db, &bindings, &telegram).await;
+        let tick = tick_for(&db, &bindings, &channels, &telegram).await;
         assert_eq!(tick.to, vec![dm(&telegram)]);
 
-        let tick = tick_for(&db, &bindings, &lark).await;
+        let tick = tick_for(&db, &bindings, &channels, &lark).await;
         assert!(
             tick.to.is_empty(),
             "no account linked on that channel: the web chat"

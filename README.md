@@ -379,6 +379,8 @@ On a heartbeat the agent reads `HEARTBEAT.md` in its workspace (the settings pag
   - `"web"`: the web chat only.
   - A channel, such as `"telegram"`: the owner's connected account there, through the agent's bot. The web chat when there is none.
 
+  A chat-app account the agent's bot may not send to (an `allowlist` account that has not admitted it) is left out.
+
   In the web chat it shows in the owner's open tabs, in the Heartbeat chat. In a chat app it is also kept in the chat there, so a reply there follows it. Other people's chats with the agent never get it.
 
 ## Configuration

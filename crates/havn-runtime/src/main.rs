@@ -1417,57 +1417,66 @@ async fn handle_heartbeat(tick: HeartbeatTick, ctx: Ctx) {
     deliver_heartbeat(&ctx, &tick, final_text).await;
 }
 
-/// The owner's chat in web chat `scope` that keeps heartbeat results
-/// (issue #226), made when missing.
-async fn heartbeat_chat(pool: &SqlitePool, scope: &str) -> Option<String> {
-    let id = uuid::Uuid::new_v5(
-        &uuid::Uuid::NAMESPACE_OID,
-        format!("havn-heartbeat:{scope}").as_bytes(),
-    )
-    .to_string();
-    let chat = match conversations::own_chat(pool, scope, &id).await {
-        Ok(chat) => chat?,
-        Err(e) => {
-            warn!(error = %e, "could not make the heartbeat chat");
-            return None;
-        }
+/// Keep heartbeat result `text` in the owner's heartbeat chat, and send it
+/// where [`heartbeat_outbound`] says.
+async fn deliver_heartbeat(ctx: &Ctx, tick: &HeartbeatTick, text: String) {
+    let Some(outbound) = heartbeat_outbound(&ctx.pool, tick, text).await else {
+        return;
     };
-    if let Err(e) = conversations::retitle(pool, &chat, "", lang().pick("Heartbeat", "心跳")).await
+    if let Err(e) = ctx
+        .writer_tx
+        .send(AgentToGateway::OutboundMessage(outbound))
+        .await
     {
-        warn!(error = %e, "could not title the heartbeat chat");
+        error!(error = ?e, "failed to enqueue heartbeat OutboundMessage");
     }
-    Some(chat)
 }
 
-/// Keep heartbeat result `text` in the owner's heartbeat chat, and send it
-/// to the conversation of `tick.to` they wrote in last, the first when they
-/// wrote in none (issue #226). Sent to a chat app, it is also kept in the
-/// chat there, so a reply there follows it.
-async fn deliver_heartbeat(ctx: &Ctx, tick: &HeartbeatTick, text: String) {
-    let kept = match tick.web.as_str() {
-        "" => None,
-        web => heartbeat_chat(&ctx.pool, web).await,
+/// Keep heartbeat result `text` in the chat of the owner's web chat that
+/// keeps them, and the message sending it to the conversation of
+/// `tick.to` they wrote in last, the first when they wrote in none, the
+/// web chat when there is none (issue #226). Sent to a chat app, it is also
+/// kept in the chat there, so a reply there follows it. `None` when the
+/// gateway named no web chat: the owner's is the only one it may show in.
+async fn heartbeat_outbound(
+    pool: &SqlitePool,
+    tick: &HeartbeatTick,
+    text: String,
+) -> Option<OutboundMessage> {
+    if tick.web.is_empty() {
+        warn!("heartbeat tick without the owner's web chat; result not sent");
+        return None;
+    }
+    let kept = match conversations::heartbeat_chat(
+        pool,
+        &tick.web,
+        lang().pick("Heartbeat", "心跳"),
+    )
+    .await
+    {
+        Ok(chat) => Some(chat),
+        Err(e) => {
+            warn!(error = %e, "could not find the heartbeat chat");
+            None
+        }
     };
     if let Some(chat) = &kept
-        && let Err(e) = conversations::record_in_chat(&ctx.pool, chat, Role::Assistant, &text).await
+        && let Err(e) = conversations::record_in_chat(pool, chat, Role::Assistant, &text).await
     {
         warn!(error = %e, "could not keep the heartbeat result");
     }
-    let last = match conversations::last_written(&ctx.pool, &tick.to).await {
+    let last = match conversations::last_written(pool, &tick.to).await {
         Ok(last) => last,
         Err(e) => {
             warn!(error = %e, "could not find where the owner wrote last");
             None
         }
     };
-    let target = last.or_else(|| tick.to.first().cloned());
-    let (channel_id, conversation) = match target {
+    let (channel_id, conversation) = match last.or_else(|| tick.to.first().cloned()) {
         Some(scope) if scope != tick.web => {
-            let chat = match conversations::existing_chat(&ctx.pool, &scope, None).await {
+            let chat = match conversations::existing_chat(pool, &scope, None).await {
                 Ok(Some(chat)) => Some(chat),
-                Ok(None) => conversations::chat_for(&ctx.pool, &scope, None, "")
-                    .await
-                    .ok(),
+                Ok(None) => conversations::chat_for(pool, &scope, None, "").await.ok(),
                 Err(e) => {
                     warn!(error = %e, "could not find the chat to keep the heartbeat result in");
                     None
@@ -1475,7 +1484,7 @@ async fn deliver_heartbeat(ctx: &Ctx, tick: &HeartbeatTick, text: String) {
             };
             if let Some(chat) = &chat
                 && let Err(e) = conversations::record_in_chat(
-                    &ctx.pool,
+                    pool,
                     chat,
                     Role::Assistant,
                     &lang().pick(
@@ -1497,11 +1506,9 @@ async fn deliver_heartbeat(ctx: &Ctx, tick: &HeartbeatTick, text: String) {
             }
             (scope, chat)
         }
-        _ if !tick.web.is_empty() => (format!("{BROADCAST_TO}{}", tick.web), kept),
-        // Every open tab, when the gateway named no web chat.
-        _ => ("broadcast".to_string(), None),
+        _ => (format!("{BROADCAST_TO}{}", tick.web), kept),
     };
-    let outbound = OutboundMessage {
+    Some(OutboundMessage {
         conversation,
         channel_id,
         content: MessageContent::Text { text },
@@ -1509,14 +1516,7 @@ async fn deliver_heartbeat(ctx: &Ctx, tick: &HeartbeatTick, text: String) {
         buttons: Vec::new(),
         poll: None,
         partial: false,
-    };
-    if let Err(e) = ctx
-        .writer_tx
-        .send(AgentToGateway::OutboundMessage(outbound))
-        .await
-    {
-        error!(error = ?e, "failed to enqueue heartbeat OutboundMessage");
-    }
+    })
 }
 
 /// Stable channel-id prefix for cron-job conversations. Lets the runtime
@@ -4670,6 +4670,109 @@ mod tests {
             "{first:?}"
         );
         let _ = gateway.await.expect("join");
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_is_kept_and_sent_where_the_owner_wrote_last() {
+        let pool = havn_db::agent::connect_in_memory().await.expect("db");
+        let web = "11111111-1111-1111-1111-111111111111".to_string();
+        let dm = "ch|telegram|bot|42".to_string();
+        let kept = |pool: SqlitePool| async move {
+            let chat = conversations::heartbeat_chat(
+                &pool,
+                "11111111-1111-1111-1111-111111111111",
+                "Heartbeat",
+            )
+            .await
+            .expect("chat");
+            conversations::branch(&pool, &chat, 50)
+                .await
+                .expect("turns")
+                .into_iter()
+                .map(|t| t.content)
+                .collect::<Vec<_>>()
+        };
+        let text = |m: &OutboundMessage| match &m.content {
+            MessageContent::Text { text } => text.clone(),
+            other => panic!("{other:?}"),
+        };
+
+        // No web chat named: nothing goes anywhere.
+        assert!(
+            heartbeat_outbound(&pool, &HeartbeatTick::default(), "x".into())
+                .await
+                .is_none()
+        );
+
+        // Nobody wrote anywhere: the first, the web chat.
+        let tick = HeartbeatTick {
+            web: web.clone(),
+            to: vec![web.clone(), dm.clone()],
+        };
+        let out = heartbeat_outbound(&pool, &tick, "one".into())
+            .await
+            .expect("sent");
+        assert_eq!(out.channel_id, format!("{BROADCAST_TO}{web}"));
+        let chat = conversations::heartbeat_chat(&pool, &web, "Heartbeat")
+            .await
+            .expect("chat");
+        assert_eq!(out.conversation.as_deref(), Some(chat.as_str()));
+        assert_eq!(text(&out), "one");
+
+        // The owner wrote on Telegram last: it goes there, and is kept in
+        // both chats.
+        let telegram = conversations::chat_for(&pool, &dm, None, "hi")
+            .await
+            .expect("chat");
+        conversations::record_in_chat(&pool, &telegram, Role::User, "hi")
+            .await
+            .expect("turn");
+        let out = heartbeat_outbound(&pool, &tick, "two".into())
+            .await
+            .expect("sent");
+        assert_eq!(out.channel_id, dm);
+        assert_eq!(out.conversation.as_deref(), Some(telegram.as_str()));
+        assert_eq!(text(&out), "two");
+        let there: Vec<String> = conversations::branch(&pool, &telegram, 50)
+            .await
+            .expect("turns")
+            .into_iter()
+            .map(|t| t.content)
+            .collect();
+        assert_eq!(
+            there.last().map(String::as_str),
+            Some(
+                "(A heartbeat's message.)
+
+two"
+            )
+        );
+        assert_eq!(
+            kept(pool.clone()).await,
+            vec!["one".to_string(), "two".to_string()]
+        );
+
+        // Told the web chat only, it stays there.
+        let tick = HeartbeatTick {
+            web: web.clone(),
+            to: Vec::new(),
+        };
+        let out = heartbeat_outbound(&pool, &tick, "three".into())
+            .await
+            .expect("sent");
+        assert_eq!(out.channel_id, format!("{BROADCAST_TO}{web}"));
+        assert_eq!(kept(pool.clone()).await.len(), 3);
+
+        // Told a channel the owner never wrote on, it goes there.
+        let tick = HeartbeatTick {
+            web: web.clone(),
+            to: vec!["ch|lark|app|7".into()],
+        };
+        let out = heartbeat_outbound(&pool, &tick, "four".into())
+            .await
+            .expect("sent");
+        assert_eq!(out.channel_id, "ch|lark|app|7");
+        assert!(out.conversation.is_some(), "a chat is made there");
     }
 
     #[test]
