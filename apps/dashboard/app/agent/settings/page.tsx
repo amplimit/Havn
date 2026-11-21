@@ -948,7 +948,7 @@ function AccessEditor({ agentId }: { agentId: string }) {
           <button
             type="button"
             className="btn-ghost"
-            disabled={saving || allowedEverywhere}
+            disabled={saving || allowed === null || allowedEverywhere}
             onClick={() =>
               void save({ scope: EVERY_CONVERSATION, tool: everyTool, input: "" }, everyRule).then((saved) => {
                 if (saved) setEveryRule("");

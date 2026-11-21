@@ -3004,9 +3004,6 @@ const MAX_SENDER_SHOWN: usize = 128;
 /// call that waits for them (issue #255).
 const ASKED_SHOWN_CHARS: usize = 500;
 
-/// `talk`, with the owner's rules for what not to say in `msg`'s
-/// conversation, given with what they always allow there (issues #249
-/// and #255).
 /// What is always allowed in conversation `scope`: its own entries, and
 /// those allowed in every conversation (issue #268), whose rule also
 /// stands where the conversation's own entry for the tool says nothing.
@@ -3061,6 +3058,9 @@ async fn set_access(
     }
 }
 
+/// `talk`, with the owner's rules for what not to say in `msg`'s
+/// conversation, given with what they always allow there (issues #249
+/// and #255).
 async fn with_rules(pool: &sqlx::SqlitePool, msg: &InboundMessage, talk: String) -> String {
     if msg.from_owner {
         return talk;
