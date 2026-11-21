@@ -858,6 +858,12 @@ function accessKey(a: Pick<Access, "scope" | "tool" | "input">): string {
   return JSON.stringify([a.scope, a.tool, a.input]);
 }
 
+/** The scope of what is allowed in every conversation with the agent (issue #268). */
+const EVERY_CONVERSATION = "*";
+
+/** Tools that read, which can be allowed in every conversation. */
+const READING_TOOLS = ["memory_search", "file_read", "file_find", "file_search"];
+
 /**
  * What is always allowed in conversations not the owner's (issue #255): a
  * tool's results, or one exact call, each with its rule for what not to say.
@@ -865,6 +871,8 @@ function accessKey(a: Pick<Access, "scope" | "tool" | "input">): string {
 function AccessEditor({ agentId }: { agentId: string }) {
   const [allowed, setAllowed] = useState<Access[] | null>(null);
   const [rules, setRules] = useState<Record<string, string>>({});
+  const [everyTool, setEveryTool] = useState(READING_TOOLS[0]);
+  const [everyRule, setEveryRule] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   function show(list: Access[]) {
@@ -885,7 +893,7 @@ function AccessEditor({ agentId }: { agentId: string }) {
       cancelled = true;
     };
   }, [agentId]);
-  async function save(a: Access, rule: string | null) {
+  async function save(a: Pick<Access, "scope" | "tool" | "input">, rule: string | null) {
     setSaving(true);
     setError(null);
     try {
@@ -907,6 +915,44 @@ function AccessEditor({ agentId }: { agentId: string }) {
         anything, and before it uses what it read (memory, files). These are always allowed, with your
         rule for what not to say there. Revoke one to be asked again.
       </p>
+      <div className="mb-4 text-sm">
+        <div className="mb-1">Allow a reading tool in every conversation with this agent:</div>
+        <div className="flex flex-wrap items-start gap-2">
+          <select
+            className="input"
+            style={{ maxWidth: 200 }}
+            value={everyTool}
+            onChange={(e) => setEveryTool(e.target.value)}
+            aria-label="tool to allow everywhere"
+          >
+            {READING_TOOLS.map((t) => (
+              <option key={t} value={t}>
+                {t}
+              </option>
+            ))}
+          </select>
+          <input
+            className="input"
+            style={{ flex: "1 1 220px" }}
+            maxLength={1000}
+            placeholder="what not to say (optional)"
+            value={everyRule}
+            onChange={(e) => setEveryRule(e.target.value)}
+          />
+          <button
+            type="button"
+            className="btn-ghost"
+            disabled={saving}
+            onClick={() =>
+              void save({ scope: EVERY_CONVERSATION, tool: everyTool, input: "" }, everyRule).then(() =>
+                setEveryRule(""),
+              )
+            }
+          >
+            allow everywhere
+          </button>
+        </div>
+      </div>
       {error && (
         <p className="mb-2 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
           {error}
@@ -923,7 +969,11 @@ function AccessEditor({ agentId }: { agentId: string }) {
             return (
               <li key={key} className="text-sm">
                 <div className="font-mono wrap-anywhere">
-                  {a.channel ? `${a.channel} · ${a.account} · ${a.sender}` : a.scope}
+                  {a.scope === EVERY_CONVERSATION
+                    ? "every conversation"
+                    : a.channel
+                      ? `${a.channel} · ${a.account} · ${a.sender}`
+                      : a.scope}
                 </div>
                 <div className="text-xs wrap-anywhere" style={muted}>
                   <span className="font-mono">{a.tool}</span>

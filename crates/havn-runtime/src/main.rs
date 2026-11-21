@@ -3011,13 +3011,29 @@ async fn with_rules(pool: &sqlx::SqlitePool, msg: &InboundMessage, talk: String)
     if msg.from_owner {
         return talk;
     }
-    let allowed = match conversations::accesses(pool, Some(&msg.channel_id)).await {
+    let mut allowed = match conversations::accesses(pool, Some(&msg.channel_id)).await {
         Ok(allowed) => allowed,
         Err(e) => {
             warn!(error = %e, "could not read the conversation's rules");
             return talk;
         }
     };
+    // What is allowed in every conversation (issue #268), where the
+    // conversation has no rule of its own for it.
+    match conversations::accesses(pool, Some(conversations::EVERY_CONVERSATION)).await {
+        Ok(every) => {
+            let own: Vec<(String, String)> = allowed
+                .iter()
+                .map(|a| (a.tool.clone(), a.input.clone()))
+                .collect();
+            allowed.extend(
+                every
+                    .into_iter()
+                    .filter(|a| !own.contains(&(a.tool.clone(), a.input.clone()))),
+            );
+        }
+        Err(e) => warn!(error = %e, "could not read the rules of every conversation"),
+    }
     let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let rules: Vec<String> = allowed
         .iter()
@@ -4001,6 +4017,15 @@ async fn answer_data_request(req: DataRequest, ctx: &Ctx) -> DataResponse {
                 input,
                 rule,
             } => {
+                // A reading tool may be allowed in every conversation from
+                // the settings page (issue #268); the rest only changes what
+                // the owner allowed when asked.
+                let every = scope == conversations::EVERY_CONVERSATION
+                    && input.is_empty()
+                    && matches!(
+                        approvals::Review::of(&tool),
+                        Some(approvals::Review::Result)
+                    );
                 let found = match rule {
                     Some(rule) => {
                         let rule: String = rule.trim().chars().take(MAX_RULE_CHARS).collect();
@@ -4008,12 +4033,12 @@ async fn answer_data_request(req: DataRequest, ctx: &Ctx) -> DataResponse {
                             .await
                             .map_err(|e| e.to_string())?
                             .is_some();
-                        if had {
+                        if had || every {
                             conversations::allow(&ctx.pool, &scope, &tool, &input, &rule)
                                 .await
                                 .map_err(|e| e.to_string())?;
                         }
-                        had
+                        had || every
                     }
                     None => conversations::revoke(&ctx.pool, &scope, &tool, &input)
                         .await
