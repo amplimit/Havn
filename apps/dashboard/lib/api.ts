@@ -583,6 +583,23 @@ export type PairingCode = {
   expires_at: string;
 };
 
+/** Who can reach one of an agent's bots (issue #231). */
+export type AccountAccess = {
+  channel: string;
+  account_id: string;
+  dm_policy: "allowlist" | "open";
+  /** Listed in config.toml, removed only there. */
+  allow_from: string[];
+  allowed: { sender_id: string; since: string; by_code: boolean; linked?: string }[];
+  invites: { id: string; status: "active" | "used" | "expired" | "revoked"; created_at: string; expires_at: string; used_by?: string }[];
+  refused: { sender_id: string; first_at: string; last_at: string; count: number; said: string }[];
+};
+
+export type ChannelAccessView = { accounts: AccountAccess[]; notify_unpaired: boolean };
+
+/** One sender of one of an agent's bots. */
+export type SenderRef = { channel: string; account_id: string; sender_id: string };
+
 /** One of the caller's chats with an agent in a chat app they linked (issue #184). */
 export type ChannelChat = ChatSummary & {
   channel: string;
@@ -658,6 +675,32 @@ export const api = {
         `/me/channel-links?channel=${encodeURIComponent(channel)}&sender=${encodeURIComponent(sender)}`,
         { method: "DELETE" },
       ),
+    /** Who can reach the agent's bots (issue #231). */
+    access: (agentId: string) => request<ChannelAccessView>(`/agents/${agentId}/channel-access`),
+    invite: (agentId: string, channel: string, account_id: string, hours: number) =>
+      request<PairingCode>(`/agents/${agentId}/channel-access/invites`, {
+        method: "POST",
+        body: JSON.stringify({ channel, account_id, hours }),
+      }),
+    revokeInvite: (agentId: string, invite: string) =>
+      request<ChannelAccessView>(`/agents/${agentId}/channel-access/invites/${encodeURIComponent(invite)}`, {
+        method: "DELETE",
+      }),
+    allow: (agentId: string, who: SenderRef) =>
+      request<ChannelAccessView>(`/agents/${agentId}/channel-access/senders`, {
+        method: "POST",
+        body: JSON.stringify(who),
+      }),
+    remove: (agentId: string, who: SenderRef) =>
+      request<ChannelAccessView>(`/agents/${agentId}/channel-access/senders`, {
+        method: "DELETE",
+        body: JSON.stringify(who),
+      }),
+    forget: (agentId: string, who: SenderRef) =>
+      request<ChannelAccessView>(`/agents/${agentId}/channel-access/refused`, {
+        method: "DELETE",
+        body: JSON.stringify(who),
+      }),
   },
   workspace: {
     access: (agentId: string) => request<WorkspaceAccess>(`/agents/${agentId}/workspace/access`),

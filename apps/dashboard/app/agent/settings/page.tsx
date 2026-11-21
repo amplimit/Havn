@@ -35,6 +35,9 @@ import {
   type WorkspaceAccess,
   type PairingCode,
   type ChannelLinkView,
+  type ChannelAccessView,
+  type AccountAccess,
+  type SenderRef,
   type MyDomainsView,
   type TimezoneView,
 } from "@/lib/api";
@@ -372,6 +375,7 @@ function Settings({ id }: { id: string }) {
       <AccessEditor agentId={id} />
       <WorkspaceAccessEditor agentId={id} />
       <ChannelPairing agentId={id} />
+      <BotAccess agentId={id} />
       <ApprovalsEditor agentId={id} />
 
       <McpEditor agentId={id} />
@@ -599,6 +603,286 @@ function BootstrapFileEditor({
         )}
       </div>
     </div>
+  );
+}
+
+/** How long an invite made here lasts, in hours, and how it is shown. */
+const INVITE_HOURS: [number, string][] = [
+  [1, "1 hour"],
+  [24, "1 day"],
+  [24 * 7, "7 days"],
+  [24 * 30, "30 days"],
+];
+
+/**
+ * Who can reach this agent's bots (issue #231): invite codes, the senders
+ * let in, those turned away, and whether the owner is told about them.
+ */
+function BotAccess({ agentId }: { agentId: string }) {
+  const [view, setView] = useState<ChannelAccessView | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [made, setMade] = useState<PairingCode | null>(null);
+  const [hours, setHours] = useState(24);
+  const [typed, setTyped] = useState<Record<string, string>>({});
+  useEffect(() => {
+    let cancelled = false;
+    api.channels.access(agentId).then(
+      (v) => {
+        if (!cancelled) setView(v);
+      },
+      (e: unknown) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId]);
+  async function run(change: () => Promise<ChannelAccessView | void>) {
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await change();
+      if (next) setView(next);
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function invite(account: AccountAccess) {
+    await run(async () => {
+      setMade(await api.channels.invite(agentId, account.channel, account.account_id, hours));
+      return api.channels.access(agentId);
+    });
+  }
+  async function setNotify(on: boolean) {
+    await run(async () => {
+      await api.agents.patch(agentId, { config: { notify_unpaired: on ? null : false } });
+      return api.channels.access(agentId);
+    });
+  }
+  const muted = { color: "var(--color-body)" };
+  const when = (at: string) => new Date(at).toLocaleString();
+  if (view && view.accounts.length === 0) return null;
+  return (
+    <section className="mt-10 card px-4 py-4" aria-labelledby="bot-access-title">
+      <h2 id="bot-access-title" className="display-h3 mb-2">
+        who can reach the bot
+      </h2>
+      <p className="mb-3 text-sm" style={muted}>
+        On an allowlist bot, only the people let in reach the agent: those in config.toml, those who
+        sent an invite code, and those you let in here. Someone who writes without being let in is
+        turned away and listed below.
+      </p>
+      {error && (
+        <p className="mb-2 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
+          {error}
+        </p>
+      )}
+      {view && (
+        <label className="mb-4 flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={view.notify_unpaired}
+            disabled={busy}
+            onChange={(e) => void setNotify(e.target.checked)}
+          />
+          Tell me in my connected chat when someone not let in writes, with a button to let them in
+          (once a day per person)
+        </label>
+      )}
+      {made && (
+        <div className="mb-4 rounded border px-3 py-2 text-sm" role="status">
+          <div>
+            Invite code for {made.channel} · {made.account_id}, shown once:{" "}
+            <span className="font-mono text-base tracking-wider">{made.code}</span>
+          </div>
+          {made.link && (
+            <div className="wrap-anywhere">
+              or the link{" "}
+              <a className="underline" href={made.link} target="_blank" rel="noreferrer">
+                {made.link}
+              </a>
+            </div>
+          )}
+          <div className="text-xs" style={muted}>
+            Works once, until {when(made.expires_at)}. Send it to the person over a channel you trust.
+          </div>
+        </div>
+      )}
+      {(view?.accounts ?? []).map((account) => {
+        const key = `${account.channel}|${account.account_id}`;
+        const who = (sender_id: string): SenderRef => ({
+          channel: account.channel,
+          account_id: account.account_id,
+          sender_id,
+        });
+        return (
+          <div key={key} className="mb-6">
+            <h3 className="mb-1 font-mono text-sm">
+              {account.channel} · {account.account_id}
+            </h3>
+            {account.dm_policy === "open" ? (
+              <p className="text-sm" style={muted}>
+                Open: anyone can write to this bot.
+              </p>
+            ) : (
+              <>
+                <div className="mb-2 flex flex-wrap items-center gap-2 text-sm">
+                  <select
+                    className="input"
+                    style={{ maxWidth: 140 }}
+                    value={hours}
+                    onChange={(e) => setHours(Number(e.target.value))}
+                    aria-label="how long the invite lasts"
+                  >
+                    {INVITE_HOURS.map(([h, label]) => (
+                      <option key={h} value={h}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                  <button type="button" className="btn-ghost" disabled={busy} onClick={() => void invite(account)}>
+                    make an invite code
+                  </button>
+                </div>
+                <div className="mb-2 flex flex-wrap items-center gap-2 text-sm">
+                  <input
+                    className="input font-mono"
+                    style={{ maxWidth: 220 }}
+                    placeholder="sender id, such as tg:123"
+                    value={typed[key] ?? ""}
+                    onChange={(e) => setTyped({ ...typed, [key]: e.target.value })}
+                  />
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    disabled={busy || !(typed[key] ?? "").trim()}
+                    onClick={() =>
+                      void run(() => api.channels.allow(agentId, who((typed[key] ?? "").trim()))).then((ok) => {
+                        if (ok) setTyped({ ...typed, [key]: "" });
+                      })
+                    }
+                  >
+                    let in
+                  </button>
+                </div>
+
+                <h4 className="mt-3 text-xs uppercase" style={muted}>
+                  turned away recently
+                </h4>
+                {account.refused.length === 0 ? (
+                  <p className="text-sm" style={muted}>
+                    No one.
+                  </p>
+                ) : (
+                  <ul className="flex flex-col gap-2 text-sm">
+                    {account.refused.map((r) => (
+                      <li key={r.sender_id}>
+                        <span className="font-mono">{r.sender_id}</span>{" "}
+                        <span className="text-xs" style={muted}>
+                          {r.count} {r.count === 1 ? "message" : "messages"}, last {when(r.last_at)}
+                        </span>
+                        {r.said && <div className="text-xs wrap-anywhere">&ldquo;{r.said}&rdquo;</div>}
+                        <div className="mt-1 flex gap-2">
+                          <button
+                            type="button"
+                            className="btn-ghost"
+                            disabled={busy}
+                            onClick={() => void run(() => api.channels.allow(agentId, who(r.sender_id)))}
+                          >
+                            let in
+                          </button>
+                          <button
+                            type="button"
+                            className="btn-ghost"
+                            disabled={busy}
+                            onClick={() => void run(() => api.channels.forget(agentId, who(r.sender_id)))}
+                          >
+                            dismiss
+                          </button>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+
+                <h4 className="mt-3 text-xs uppercase" style={muted}>
+                  let in
+                </h4>
+                {account.allow_from.length === 0 && account.allowed.length === 0 ? (
+                  <p className="text-sm" style={muted}>
+                    No one yet.
+                  </p>
+                ) : (
+                  <ul className="flex flex-col gap-1 text-sm">
+                    {account.allow_from.map((s) => (
+                      <li key={`toml-${s}`}>
+                        <span className="font-mono">{s}</span>{" "}
+                        <span className="text-xs" style={muted}>
+                          in config.toml (allow_from)
+                        </span>
+                      </li>
+                    ))}
+                    {account.allowed.map((a) => (
+                      <li key={a.sender_id} className="flex flex-wrap items-center gap-2">
+                        <span className="font-mono">{a.sender_id}</span>
+                        <span className="text-xs" style={muted}>
+                          {a.linked ? `connected to ${a.linked}, ` : ""}
+                          {a.by_code ? "by a code" : "by you"} since {when(a.since)}
+                        </span>
+                        <button
+                          type="button"
+                          className="btn-ghost"
+                          disabled={busy}
+                          onClick={() => void run(() => api.channels.remove(agentId, who(a.sender_id)))}
+                        >
+                          remove
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+
+                {account.invites.length > 0 && (
+                  <>
+                    <h4 className="mt-3 text-xs uppercase" style={muted}>
+                      invite codes
+                    </h4>
+                    <ul className="flex flex-col gap-1 text-sm">
+                      {account.invites.map((i) => (
+                        <li key={i.id} className="flex flex-wrap items-center gap-2">
+                          <span>{i.status}</span>
+                          <span className="text-xs" style={muted}>
+                            made {when(i.created_at)}
+                            {i.status === "active" && `, until ${when(i.expires_at)}`}
+                            {i.used_by && `, used by ${i.used_by}`}
+                          </span>
+                          {i.status === "active" && (
+                            <button
+                              type="button"
+                              className="btn-ghost"
+                              disabled={busy}
+                              onClick={() => void run(() => api.channels.revokeInvite(agentId, i.id))}
+                            >
+                              revoke
+                            </button>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+              </>
+            )}
+          </div>
+        );
+      })}
+    </section>
   );
 }
 

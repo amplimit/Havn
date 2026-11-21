@@ -780,6 +780,26 @@ async fn serve() -> anyhow::Result<()> {
         .route("/agents/{id}/outbox", get(api::files::sent))
         .route("/agents/{id}/workspace", get(api::files::workspace_list))
         .route("/agents/{id}/pairing", post(api::channel::pairing_create))
+        .route(
+            "/agents/{id}/channel-access",
+            get(api::channel::channel_access_get),
+        )
+        .route(
+            "/agents/{id}/channel-access/invites",
+            post(api::channel::channel_invite_create),
+        )
+        .route(
+            "/agents/{id}/channel-access/invites/{invite}",
+            axum::routing::delete(api::channel::channel_invite_revoke),
+        )
+        .route(
+            "/agents/{id}/channel-access/senders",
+            post(api::channel::channel_sender_allow).delete(api::channel::channel_sender_remove),
+        )
+        .route(
+            "/agents/{id}/channel-access/refused",
+            axum::routing::delete(api::channel::channel_refusal_forget),
+        )
         .route("/agents/{id}/channel-chats", get(api::conversation::channel_chats))
         .route(
             "/agents/{id}/chats/{chat}/move",
