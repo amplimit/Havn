@@ -43,10 +43,10 @@ use clap::Parser;
 use havn_core::{Branch, InboundMessage, MessageContent, OutboundMessage, Policy};
 use havn_db::agent::conversations::{self as conversations, Role};
 use havn_proto::{
-    AdminOutcome, AgentQueryOutcome, AgentQueryResponse, AgentToGateway, ChatCommandKind,
-    CronOutcome, CronResult, CronTick, DataQuery, DataRequest, DataResponse, GatewayToAgent,
-    IncomingQuery, MemoryForgetRequest, MemoryForgetResponse, PROTOCOL_VERSION, SkillPinRequest,
-    SkillPinResponse, read_frame, write_frame,
+    AdminOutcome, AgentQueryOutcome, AgentQueryResponse, AgentToGateway, BROADCAST_TO,
+    ChatCommandKind, CronOutcome, CronResult, CronTick, DataQuery, DataRequest, DataResponse,
+    GatewayToAgent, HeartbeatTick, IncomingQuery, MemoryForgetRequest, MemoryForgetResponse,
+    PROTOCOL_VERSION, SkillPinRequest, SkillPinResponse, read_frame, write_frame,
 };
 use sqlx::SqlitePool;
 use tokio::io::BufReader;
@@ -1156,10 +1156,10 @@ where
                     warn!(req = %resp.request_id, "LlmResponse with no pending request");
                 }
             }
-            GatewayToAgent::HeartbeatTick => {
+            GatewayToAgent::HeartbeatTick(tick) => {
                 let ctx = ctx.clone();
                 work.spawn(async move {
-                    handle_heartbeat(ctx).await;
+                    handle_heartbeat(tick, ctx).await;
                 });
             }
             GatewayToAgent::CronTick(tick) => {
@@ -1259,7 +1259,7 @@ fn takes_new_work(frame: &GatewayToAgent) -> bool {
     matches!(
         frame,
         GatewayToAgent::InboundMessage(_)
-            | GatewayToAgent::HeartbeatTick
+            | GatewayToAgent::HeartbeatTick(_)
             | GatewayToAgent::CronTick(_)
     )
 }
@@ -1284,7 +1284,7 @@ const HEARTBEAT_CHANNEL: &str = "agent:heartbeat";
 /// picks up the change without restarting the agent. On read failure we
 /// fall back to the snapshot taken at session start so a transient I/O
 /// hiccup doesn't silently disable heartbeats.
-async fn handle_heartbeat(ctx: Ctx) {
+async fn handle_heartbeat(tick: HeartbeatTick, ctx: Ctx) {
     let hb_path = ctx.workspace_dir.join("HEARTBEAT.md");
     let hb_text = match tokio::fs::read_to_string(&hb_path).await {
         Ok(content) => {
@@ -1414,12 +1414,97 @@ async fn handle_heartbeat(ctx: Ctx) {
         return;
     }
 
+    deliver_heartbeat(&ctx, &tick, final_text).await;
+}
+
+/// The owner's chat in web chat `scope` that keeps heartbeat results
+/// (issue #226), made when missing.
+async fn heartbeat_chat(pool: &SqlitePool, scope: &str) -> Option<String> {
+    let id = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("havn-heartbeat:{scope}").as_bytes(),
+    )
+    .to_string();
+    let chat = match conversations::own_chat(pool, scope, &id).await {
+        Ok(chat) => chat?,
+        Err(e) => {
+            warn!(error = %e, "could not make the heartbeat chat");
+            return None;
+        }
+    };
+    if let Err(e) = conversations::retitle(pool, &chat, "", lang().pick("Heartbeat", "心跳")).await
+    {
+        warn!(error = %e, "could not title the heartbeat chat");
+    }
+    Some(chat)
+}
+
+/// Keep heartbeat result `text` in the owner's heartbeat chat, and send it
+/// to the conversation of `tick.to` they wrote in last, the first when they
+/// wrote in none (issue #226). Sent to a chat app, it is also kept in the
+/// chat there, so a reply there follows it.
+async fn deliver_heartbeat(ctx: &Ctx, tick: &HeartbeatTick, text: String) {
+    let kept = match tick.web.as_str() {
+        "" => None,
+        web => heartbeat_chat(&ctx.pool, web).await,
+    };
+    if let Some(chat) = &kept
+        && let Err(e) = conversations::record_in_chat(&ctx.pool, chat, Role::Assistant, &text).await
+    {
+        warn!(error = %e, "could not keep the heartbeat result");
+    }
+    let last = match conversations::last_written(&ctx.pool, &tick.to).await {
+        Ok(last) => last,
+        Err(e) => {
+            warn!(error = %e, "could not find where the owner wrote last");
+            None
+        }
+    };
+    let target = last.or_else(|| tick.to.first().cloned());
+    let (channel_id, conversation) = match target {
+        Some(scope) if scope != tick.web => {
+            let chat = match conversations::existing_chat(&ctx.pool, &scope, None).await {
+                Ok(Some(chat)) => Some(chat),
+                Ok(None) => conversations::chat_for(&ctx.pool, &scope, None, "")
+                    .await
+                    .ok(),
+                Err(e) => {
+                    warn!(error = %e, "could not find the chat to keep the heartbeat result in");
+                    None
+                }
+            };
+            if let Some(chat) = &chat
+                && let Err(e) = conversations::record_in_chat(
+                    &ctx.pool,
+                    chat,
+                    Role::Assistant,
+                    &lang().pick(
+                        format!(
+                            "(A heartbeat's message.)
+
+{text}"
+                        ),
+                        format!(
+                            "（心跳消息。）
+
+{text}"
+                        ),
+                    ),
+                )
+                .await
+            {
+                warn!(error = %e, "could not keep the heartbeat result in its chat");
+            }
+            (scope, chat)
+        }
+        _ if !tick.web.is_empty() => (format!("{BROADCAST_TO}{}", tick.web), kept),
+        // Every open tab, when the gateway named no web chat.
+        _ => ("broadcast".to_string(), None),
+    };
     let outbound = OutboundMessage {
-        conversation: None,
-        // Sentinel — gateway's agent_socket fans this out to every WebChat
-        // session bound to this agent.
-        channel_id: "broadcast".into(),
-        content: MessageContent::Text { text: final_text },
+        conversation,
+        channel_id,
+        content: MessageContent::Text { text },
         reply_to: None,
         buttons: Vec::new(),
         poll: None,
@@ -4569,16 +4654,19 @@ mod tests {
                 .await
                 .expect("read");
             assert!(matches!(hello, Some(AgentToGateway::Hello { .. })));
-            write_frame(&mut write, &GatewayToAgent::HeartbeatTick)
-                .await
-                .expect("write");
+            write_frame(
+                &mut write,
+                &GatewayToAgent::HeartbeatTick(HeartbeatTick::default()),
+            )
+            .await
+            .expect("write");
             (reader, write)
         });
 
         let (_reader, _write, first) = handshake(&path, "agent").await.expect("handshake");
 
         assert!(
-            matches!(first, Some(GatewayToAgent::HeartbeatTick)),
+            matches!(first, Some(GatewayToAgent::HeartbeatTick(_))),
             "{first:?}"
         );
         let _ = gateway.await.expect("join");

@@ -614,8 +614,9 @@ function Chat({ id }: { id: string }) {
             if (deletedChats.current.has(msg.conversation)) return;
             void refreshChats();
             const current = chatIdRef.current;
-            // A reply in another chat shows there.
-            if (current && msg.conversation !== current) {
+            // A reply in another chat shows there, as does a message nobody
+            // asked for while no chat is open.
+            if (msg.conversation !== current && (current || msg.broadcast)) {
               const due = waitingElsewhere.current.get(msg.conversation) ?? 0;
               if (!msg.broadcast && due > 0) waitingElsewhere.current.set(msg.conversation, due - 1);
               return;

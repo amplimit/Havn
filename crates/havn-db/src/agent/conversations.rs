@@ -669,6 +669,25 @@ pub async fn chat_of_owner(pool: &SqlitePool, chat: &str) -> Result<bool> {
     Ok(found)
 }
 
+/// Of `scopes`, the one whose chats have the latest message from the
+/// person; `None` when none has any.
+pub async fn last_written(pool: &SqlitePool, scopes: &[String]) -> Result<Option<String>> {
+    if scopes.is_empty() {
+        return Ok(None);
+    }
+    let scopes = serde_json::to_string(scopes).map_err(|e| DbError::InvalidValue {
+        column: "chats.scope",
+        message: e.to_string(),
+    })?;
+    let found: Option<(String,)> = sqlx::query_as(
+        "SELECT c.scope FROM chats c JOIN conversations t ON t.channel_id = c.id          WHERE c.scope IN (SELECT value FROM json_each(?1)) AND t.role = 'user'          ORDER BY t.created_at DESC, t.rowid DESC LIMIT 1",
+    )
+    .bind(scopes)
+    .fetch_optional(pool)
+    .await?;
+    Ok(found.map(|(scope,)| scope))
+}
+
 /// Note that the owner writes from `scope` (issue #218): their search
 /// covers its chats from then on.
 pub async fn note_owner_scope(pool: &SqlitePool, scope: &str) -> Result<()> {
@@ -1445,6 +1464,52 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[tokio::test]
+    async fn the_conversation_written_in_last_is_the_one_with_the_latest_message() {
+        let pool = crate::agent::connect_in_memory().await.expect("db");
+        let scopes = vec!["web".to_string(), "ch|telegram|bot|42".to_string()];
+        assert_eq!(last_written(&pool, &scopes).await.expect("db"), None);
+        let web = chat_for(&pool, "web", None, "hi").await.expect("chat");
+        record_in_chat(&pool, &web, Role::User, "hi")
+            .await
+            .expect("turn");
+        let telegram = chat_for(&pool, "ch|telegram|bot|42", None, "")
+            .await
+            .expect("chat");
+        record_in_chat(&pool, &telegram, Role::User, "there")
+            .await
+            .expect("turn");
+        assert_eq!(
+            last_written(&pool, &scopes).await.expect("db").as_deref(),
+            Some("ch|telegram|bot|42")
+        );
+        record_in_chat(&pool, &telegram, Role::Assistant, "answer")
+            .await
+            .expect("turn");
+        record_in_chat(&pool, &web, Role::User, "back")
+            .await
+            .expect("turn");
+        record_in_chat(&pool, &telegram, Role::Assistant, "a heartbeat")
+            .await
+            .expect("turn");
+        assert_eq!(
+            last_written(&pool, &scopes).await.expect("db").as_deref(),
+            Some("web"),
+            "what the agent sent does not count"
+        );
+        let other = chat_for(&pool, "ch|telegram|bot|7", None, "")
+            .await
+            .expect("chat");
+        record_in_chat(&pool, &other, Role::User, "someone else")
+            .await
+            .expect("turn");
+        assert_eq!(
+            last_written(&pool, &scopes).await.expect("db").as_deref(),
+            Some("web"),
+            "only the scopes asked about"
+        );
+    }
 
     #[tokio::test]
     async fn what_the_owner_allows_is_kept_per_conversation_tool_and_call() {

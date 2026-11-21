@@ -254,6 +254,7 @@ pub async fn patch(
     }
     check_model(&state, req.config.as_ref().and_then(|c| c.get("model")))?;
     check_language(req.config.as_ref().and_then(|c| c.get("language")))?;
+    check_heartbeat(req.config.as_ref().and_then(|c| c.get("heartbeat")))?;
 
     let name = req.name.as_deref().map(str::trim);
     let updated = match &req.config {
@@ -313,6 +314,26 @@ fn check_language(raw: Option<&serde_json::Value>) -> Result<(), ApiError> {
         Some(v) if serde_json::from_value::<havn_core::Language>(v.clone()).is_ok() => Ok(()),
         Some(_) => Err(ApiError::BadRequest(
             "config.language must be \"en\" or \"zh\"".into(),
+        )),
+    }
+}
+
+/// Rejects a `config.heartbeat.deliver` that names no place a heartbeat's
+/// result can go (issue #226): `"last"`, `"web"` or a channel.
+fn check_heartbeat(raw: Option<&serde_json::Value>) -> Result<(), ApiError> {
+    match raw.and_then(|h| h.get("deliver")) {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(serde_json::Value::String(to))
+            if !to.is_empty()
+                && to.len() <= 64
+                && to
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(ApiError::BadRequest(
+            "config.heartbeat.deliver must be \"last\", \"web\" or a channel name".into(),
         )),
     }
 }
@@ -1163,7 +1184,10 @@ pub async fn access_put(
 
 #[cfg(test)]
 mod tests {
-    use super::{check_language, check_model, check_policy_override, embedding_env_passthrough};
+    use super::{
+        check_heartbeat, check_language, check_model, check_policy_override,
+        embedding_env_passthrough,
+    };
 
     #[test]
     fn only_a_language_havn_writes_in_is_taken() {
@@ -1174,6 +1198,24 @@ mod tests {
         assert!(check_language(Some(&json!("fr"))).is_err());
         assert!(check_language(Some(&json!(1))).is_err());
     }
+    #[test]
+    fn a_heartbeat_goes_only_somewhere_it_can() {
+        assert!(check_heartbeat(None).is_ok());
+        assert!(check_heartbeat(Some(&json!({"interval_seconds": 60}))).is_ok());
+        for to in ["last", "web", "telegram"] {
+            assert!(
+                check_heartbeat(Some(&json!({"deliver": to}))).is_ok(),
+                "{to}"
+            );
+        }
+        for to in [json!(""), json!("ch|telegram|bot|42"), json!(1)] {
+            assert!(
+                check_heartbeat(Some(&json!({"deliver": to}))).is_err(),
+                "{to}"
+            );
+        }
+    }
+
     use serde_json::json;
 
     #[tokio::test]

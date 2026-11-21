@@ -423,7 +423,7 @@ impl AgentRegistry {
             && matches!(
                 frame,
                 GatewayToAgent::InboundMessage(_)
-                    | GatewayToAgent::HeartbeatTick
+                    | GatewayToAgent::HeartbeatTick(_)
                     | GatewayToAgent::CronTick(_)
             )
     }
@@ -579,11 +579,11 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<GatewayToAgent>(8);
         reg.attach(id, tx).await.expect("attach");
 
-        reg.send(id, GatewayToAgent::HeartbeatTick)
+        reg.send(id, GatewayToAgent::HeartbeatTick(Default::default()))
             .await
             .expect("send");
         let frame = rx.recv().await.expect("frame");
-        assert!(matches!(frame, GatewayToAgent::HeartbeatTick));
+        assert!(matches!(frame, GatewayToAgent::HeartbeatTick(_)));
 
         let listed = reg.list().await;
         assert_eq!(listed.len(), 1);
@@ -606,11 +606,14 @@ mod tests {
             .expect_err("second connection must be refused");
         assert!(matches!(err, AttachError::AlreadyConnected(_)), "{err:?}");
 
-        reg.send(id, GatewayToAgent::HeartbeatTick)
+        reg.send(id, GatewayToAgent::HeartbeatTick(Default::default()))
             .await
             .expect("send");
         assert!(
-            matches!(first_rx.recv().await, Some(GatewayToAgent::HeartbeatTick)),
+            matches!(
+                first_rx.recv().await,
+                Some(GatewayToAgent::HeartbeatTick(_))
+            ),
             "frames keep going to the original connection"
         );
     }
@@ -627,12 +630,12 @@ mod tests {
         drop(first_rx);
         let (second, mut second_rx) = mpsc::channel::<GatewayToAgent>(8);
         reg.attach(id, second).await.expect("reconnect");
-        reg.send(id, GatewayToAgent::HeartbeatTick)
+        reg.send(id, GatewayToAgent::HeartbeatTick(Default::default()))
             .await
             .expect("send");
         assert!(matches!(
             second_rx.recv().await,
-            Some(GatewayToAgent::HeartbeatTick)
+            Some(GatewayToAgent::HeartbeatTick(_))
         ));
     }
 
@@ -655,7 +658,7 @@ mod tests {
         reg.register(handle).await;
 
         let err = reg
-            .send(id, GatewayToAgent::HeartbeatTick)
+            .send(id, GatewayToAgent::HeartbeatTick(Default::default()))
             .await
             .expect_err("not connected");
         assert!(matches!(err, SendError::NotConnected(_)));
@@ -669,7 +672,7 @@ mod tests {
         reg.register(handle).await;
         let (tx, _rx) = mpsc::channel::<GatewayToAgent>(1);
         reg.attach(id, tx.clone()).await.expect("attach");
-        reg.send(id, GatewayToAgent::HeartbeatTick)
+        reg.send(id, GatewayToAgent::HeartbeatTick(Default::default()))
             .await
             .expect("first frame fits");
         let signal = reg.disconnect_signal(id, &tx).await.expect("connected");
@@ -677,14 +680,14 @@ mod tests {
 
         let started = tokio::time::Instant::now();
         let err = reg
-            .send(id, GatewayToAgent::HeartbeatTick)
+            .send(id, GatewayToAgent::HeartbeatTick(Default::default()))
             .await
             .expect_err("a full queue must not block forever");
         assert!(matches!(err, SendError::Stalled(_)), "{err:?}");
         assert!(started.elapsed() >= SEND_TIMEOUT);
 
         let err = reg
-            .try_send(id, GatewayToAgent::HeartbeatTick)
+            .try_send(id, GatewayToAgent::HeartbeatTick(Default::default()))
             .await
             .expect_err("try_send fails at once");
         assert!(matches!(err, SendError::Stalled(_)), "{err:?}");
@@ -957,12 +960,12 @@ mod tests {
             reg.is_connected(id).await,
             "the new connection must survive"
         );
-        reg.send(id, GatewayToAgent::HeartbeatTick)
+        reg.send(id, GatewayToAgent::HeartbeatTick(Default::default()))
             .await
             .expect("send");
         assert!(matches!(
             new_rx.recv().await,
-            Some(GatewayToAgent::HeartbeatTick)
+            Some(GatewayToAgent::HeartbeatTick(_))
         ));
     }
 }

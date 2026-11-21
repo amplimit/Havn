@@ -657,7 +657,8 @@ async fn serve() -> anyhow::Result<()> {
     let shutdown_state = state.clone();
 
     // Background task: heartbeat scheduler (spec §9.6).
-    let heartbeat = heartbeat::HeartbeatScheduler::new(registry.clone(), db.clone());
+    let heartbeat =
+        heartbeat::HeartbeatScheduler::new(registry.clone(), db.clone(), state.bindings.clone());
     let heartbeat_task = tokio::spawn(async move {
         heartbeat.run().await;
     });

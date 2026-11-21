@@ -1762,9 +1762,21 @@ async fn deliver_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSo
     //     deliver via channel_router to the right WS.
     //  3. Anything else — assumed to be a WebChat session
     //     UUID; route via webchat_router.
+    //  4. `broadcast:<session>` — the same as 1, for one session's tabs.
     if msg.channel_id == "broadcast" {
         let n = ctx.webchat_router.broadcast(agent_id, msg).await;
         debug!(%agent_id, sessions = n, "broadcast outbound delivered");
+        n > 0
+    } else if let Some(session) = msg.channel_id.strip_prefix(havn_proto::BROADCAST_TO) {
+        let Ok(session) = session.parse::<crate::webchat::SessionId>() else {
+            warn!(%agent_id, "dropping an outbound for a malformed web chat");
+            return false;
+        };
+        let n = ctx
+            .webchat_router
+            .broadcast_to(agent_id, session, msg)
+            .await;
+        debug!(%agent_id, tabs = n, "outbound for one web chat delivered");
         n > 0
     } else if let Some((channel, account_id, sender_id)) =
         crate::channel_id_codec::decode(&msg.channel_id)
@@ -4612,12 +4624,12 @@ mod tests {
         assert!(verdict.is_err(), "the second connection must be rejected");
         assert!(reply.is_none(), "no Welcome may be sent: {reply:?}");
         ctx.registry
-            .send(agent, GatewayToAgent::HeartbeatTick)
+            .send(agent, GatewayToAgent::HeartbeatTick(Default::default()))
             .await
             .expect("send");
         assert!(matches!(
             live_rx.recv().await,
-            Some(GatewayToAgent::HeartbeatTick)
+            Some(GatewayToAgent::HeartbeatTick(_))
         ));
     }
 

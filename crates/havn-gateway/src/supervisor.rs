@@ -1459,7 +1459,10 @@ mod tests {
         .await;
         assert!(
             matches!(
-                state.registry.send(id, GatewayToAgent::HeartbeatTick).await,
+                state
+                    .registry
+                    .send(id, GatewayToAgent::HeartbeatTick(Default::default()))
+                    .await,
                 Err(crate::agent_registry::SendError::Draining)
             ),
             "no new work while draining"

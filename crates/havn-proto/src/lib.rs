@@ -23,7 +23,8 @@ pub use codec::{FrameError, read_frame, write_frame};
 /// the version check refuses the mix instead.
 /// 0.6.0: `ChatCommand`.
 /// 0.7.0: `ChatTitled`.
-pub const PROTOCOL_VERSION: &str = "0.7.0";
+/// 0.8.0: `HeartbeatTick` names where its result goes.
+pub const PROTOCOL_VERSION: &str = "0.8.0";
 
 /// How often a runtime sends [`AgentToGateway::LivenessPing`] once it is
 /// up. The gateway restarts an agent that stays connected but silent for
@@ -381,7 +382,7 @@ pub enum GatewayToAgent {
     LlmResponse(LlmResponse),
     /// Heartbeat-tick injection — fired per agent's HEARTBEAT.md schedule (§9.6).
     /// Runs in the live session context.
-    HeartbeatTick,
+    HeartbeatTick(HeartbeatTick),
     /// Cron-job tick — runs in a fresh context (`skip_memory: true`,
     /// `cron_system_prompt`, no history). Spec §8.5.
     CronTick(CronTick),
@@ -938,6 +939,25 @@ pub struct TmpfsMountWire {
 
 fn default_tmpfs_size_mb() -> u64 {
     64
+}
+
+/// The `channel_id` of an `OutboundMessage` for one web chat: `broadcast:`
+/// and its scope. It shows in that chat's tabs as a message no message
+/// asked for.
+pub const BROADCAST_TO: &str = "broadcast:";
+
+/// Where a heartbeat's result goes (issue #226).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeartbeatTick {
+    /// The owner's web chat scope: every result is kept in its heartbeat
+    /// chat.
+    #[serde(default)]
+    pub web: String,
+    /// The owner's conversations the result may be sent to: the one they
+    /// wrote in last, the first when they wrote in none. The web chat when
+    /// empty.
+    #[serde(default)]
+    pub to: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

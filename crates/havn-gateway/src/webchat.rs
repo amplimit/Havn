@@ -346,7 +346,8 @@ impl WebChatRouter {
                 },
             );
         }
-        self.fan_out(agent_id, approval_message(&request)).await;
+        self.fan_out(agent_id, None, approval_message(&request))
+            .await;
         true
     }
 
@@ -401,6 +402,7 @@ impl WebChatRouter {
         if taken.is_some() {
             self.fan_out(
                 agent_id,
+                None,
                 ServerMessage::ApprovalClosed { id: id.to_string() },
             )
             .await;
@@ -906,24 +908,18 @@ impl WebChatRouter {
     /// silently — the per-tab writer task already handles that path — and
     /// tabs whose queue is full are dropped (see [`Self::offer`]).
     pub async fn broadcast(&self, agent_id: AgentId, msg: OutboundMessage) -> usize {
-        let conversation = msg.conversation;
-        let server_msg = match msg.content {
-            MessageContent::Text { text } => ServerMessage::AgentMessage {
-                content: text,
-                broadcast: true,
-                conversation,
-                buttons: Vec::new(),
-                poll: None,
-            },
-            other => ServerMessage::AgentMessage {
-                content: format!("(unsupported content variant: {other:?})"),
-                broadcast: true,
-                conversation,
-                buttons: Vec::new(),
-                poll: None,
-            },
-        };
-        self.fan_out(agent_id, server_msg).await
+        self.fan_out(agent_id, None, unprompted(msg)).await
+    }
+
+    /// [`Self::broadcast`] to the tabs of session `session_id` only.
+    pub async fn broadcast_to(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        msg: OutboundMessage,
+    ) -> usize {
+        self.fan_out(agent_id, Some(session_id), unprompted(msg))
+            .await
     }
 
     /// Show `message` as an error in every open tab of `agent_id`.
@@ -931,14 +927,20 @@ impl WebChatRouter {
         let server_msg = ServerMessage::Error {
             message: message.to_owned(),
         };
-        self.fan_out(agent_id, server_msg).await
+        self.fan_out(agent_id, None, server_msg).await
     }
 
-    async fn fan_out(&self, agent_id: AgentId, server_msg: ServerMessage) -> usize {
+    async fn fan_out(
+        &self,
+        agent_id: AgentId,
+        session_id: Option<SessionId>,
+        server_msg: ServerMessage,
+    ) -> usize {
         let targets: Vec<_> = {
             let map = self.inner.lock().await;
             map.iter()
                 .filter(|(_, t)| t.agent_id == agent_id)
+                .filter(|(_, t)| session_id.is_none_or(|s| s == t.session_id))
                 .map(|(id, t)| (t.session_id, *id, t.tx.clone()))
                 .collect()
         };
@@ -953,6 +955,22 @@ impl WebChatRouter {
             }
         }
         delivered
+    }
+}
+
+/// `msg` as a message nobody's message asked for.
+fn unprompted(msg: OutboundMessage) -> ServerMessage {
+    let conversation = msg.conversation;
+    let content = match msg.content {
+        MessageContent::Text { text } => text,
+        other => format!("(unsupported content variant: {other:?})"),
+    };
+    ServerMessage::AgentMessage {
+        content,
+        broadcast: true,
+        conversation,
+        buttons: Vec::new(),
+        poll: None,
     }
 }
 
@@ -1376,6 +1394,34 @@ mod tests {
         }
         // The unrelated agent's session must NOT have received it.
         assert!(rx_other.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_message_for_one_session_reaches_its_tabs_only_and_is_no_reply() {
+        let router = WebChatRouter::new();
+        let agent_id = AgentId::new();
+        let owner = Uuid::now_v7();
+        let (tx_a, mut rx_a) = mpsc::channel::<ServerMessage>(8);
+        let (tx_b, mut rx_b) = mpsc::channel::<ServerMessage>(8);
+        let (tx_other, mut rx_other) = mpsc::channel::<ServerMessage>(8);
+        let (tx_elsewhere, mut rx_elsewhere) = mpsc::channel::<ServerMessage>(8);
+        router.register(owner, agent_id, tx_a).await;
+        router.register(owner, agent_id, tx_b).await;
+        router.register(Uuid::now_v7(), agent_id, tx_other).await;
+        router.register(owner, AgentId::new(), tx_elsewhere).await;
+
+        assert_eq!(router.broadcast_to(agent_id, owner, text("hello")).await, 2);
+        for rx in [&mut rx_a, &mut rx_b] {
+            assert!(matches!(
+                rx.recv().await,
+                Some(ServerMessage::AgentMessage {
+                    broadcast: true,
+                    ..
+                })
+            ));
+        }
+        assert!(rx_other.try_recv().is_err(), "another user's session");
+        assert!(rx_elsewhere.try_recv().is_err(), "another agent's");
     }
 
     fn text(t: &str) -> OutboundMessage {

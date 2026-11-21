@@ -561,7 +561,7 @@ async fn own_scopes(
         "broadcast".to_string(),
     ];
     scopes.extend(
-        crate::api::conversation::linked_scopes(state, user, agent)
+        crate::api::conversation::linked_scopes(&state.db, &state.bindings, user.id, agent)
             .await?
             .into_iter()
             .map(|l| l.scope),
