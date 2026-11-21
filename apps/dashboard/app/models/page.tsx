@@ -11,6 +11,12 @@ import {
   type ModelsView,
   type ThinkingSpec,
 } from "@/lib/api";
+
+type Price = NonNullable<ModelEntry["price"]>;
+
+function perMillion(n: number): string {
+  return `$${n.toLocaleString(undefined, { maximumFractionDigits: 6 })}`;
+}
 import { SkeletonList } from "@/components/SkeletonList";
 
 export default function ModelsPage() {
@@ -118,6 +124,8 @@ export default function ModelsPage() {
           of their own use the default: the one marked below, or the first.
           The list lives in <code className="font-mono">[[llm.models]]</code>{" "}
           of the gateway&apos;s config.toml; changes here are written there.
+          A model&apos;s price, in dollars per million tokens, gives what its
+          calls cost on the usage page.
         </p>
         {view && editable && view.default_model && (
           <p className="mt-3 text-sm" style={{ color: "var(--color-body)" }}>
@@ -302,6 +310,11 @@ export default function ModelsPage() {
                     thinks: {thinkingChoices(m.thinking).join(" / ")}
                   </span>
                 )}
+                {m.price && (
+                  <span className="pill pill-stopped tabular" title="dollars per million tokens">
+                    {perMillion(m.price.input)} in / {perMillion(m.price.output)} out
+                  </span>
+                )}
               </div>
               {m.label && (
                 <p className="mt-1 font-mono text-xs wrap-anywhere" style={{ color: "var(--color-body)" }}>
@@ -315,6 +328,16 @@ export default function ModelsPage() {
                   save(
                     view.default_model,
                     view.models.map((x) => (x.id === m.id ? { ...x, thinking } : x)),
+                  )
+                }
+              />
+              <PriceEditor
+                entry={m}
+                editable={editable && !busy}
+                onSave={(price) =>
+                  save(
+                    view.default_model,
+                    view.models.map((x) => (x.id === m.id ? { ...x, price } : x)),
                   )
                 }
               />
@@ -505,6 +528,117 @@ function ThinkingEditor({
           {check.outcome === "error" && `The provider refused: ${check.error}`}
         </p>
       )}
+    </div>
+  );
+}
+
+/**
+ * What a model's tokens cost, in US dollars per million (issue #282): input
+ * and output, and its prompt cache's reads and writes, which cost what
+ * input does when left blank. All blank, it has no price.
+ */
+function PriceEditor({
+  entry,
+  editable,
+  onSave,
+}: {
+  entry: ModelEntry;
+  editable: boolean;
+  onSave: (price: Price | undefined) => Promise<boolean>;
+}) {
+  const price = entry.price;
+  const shown = (n: number | undefined) => (n === undefined ? "" : String(n));
+  const [open, setOpen] = useState(false);
+  const [input, setInput] = useState(shown(price?.input));
+  const [output, setOutput] = useState(shown(price?.output));
+  const [cacheRead, setCacheRead] = useState(shown(price?.cache_read));
+  const [cacheWrite, setCacheWrite] = useState(shown(price?.cache_write));
+  const [error, setError] = useState<string | null>(null);
+
+  function draft(): Price | undefined | string {
+    const fields = [input, output, cacheRead, cacheWrite].map((f) => f.trim());
+    if (fields.every((f) => f === "")) return undefined;
+    if (fields[0] === "" || fields[1] === "") return "give both the input and the output price, or clear all four";
+    const numbers = fields.map((f) => (f === "" ? undefined : Number(f)));
+    if (numbers.some((n) => n !== undefined && (!Number.isFinite(n) || n < 0 || Object.is(n, -0)))) {
+      return "a price is a number of dollars, 0 or more";
+    }
+    const [i, o, r, w] = numbers;
+    const out: Price = { input: i as number, output: o as number };
+    if (r !== undefined) out.cache_read = r;
+    if (w !== undefined) out.cache_write = w;
+    return out;
+  }
+
+  function reset() {
+    setInput(shown(price?.input));
+    setOutput(shown(price?.output));
+    setCacheRead(shown(price?.cache_read));
+    setCacheWrite(shown(price?.cache_write));
+    setError(null);
+  }
+
+  async function submit(next: Price | undefined | string) {
+    if (typeof next === "string") {
+      setError(next);
+      return;
+    }
+    setError(null);
+    if (await onSave(next)) setOpen(false);
+  }
+
+  const muted = { color: "var(--color-body)" };
+  if (!open) {
+    return (
+      <button
+        type="button"
+        className="mt-2 ml-3 text-xs underline"
+        style={muted}
+        onClick={() => {
+          reset();
+          setOpen(true);
+        }}
+      >
+        {price ? "price" : "set a price"}
+      </button>
+    );
+  }
+  const field = (label: string, value: string, set: (v: string) => void, placeholder: string) => (
+    <label className="flex flex-wrap items-center gap-2">
+      <span className="w-28">{label}</span>
+      <input
+        className="input tabular"
+        style={{ maxWidth: 140 }}
+        inputMode="decimal"
+        value={value}
+        placeholder={placeholder}
+        disabled={!editable}
+        onChange={(e) => set(e.target.value)}
+        aria-label={`${label} price of ${entry.id}`}
+      />
+    </label>
+  );
+  return (
+    <div className="mt-3 grid gap-2 text-sm" style={muted}>
+      <p className="text-xs">US dollars per million tokens, as the provider lists them.</p>
+      {field("input", input, setInput, "3")}
+      {field("output", output, setOutput, "15")}
+      {field("cache read", cacheRead, setCacheRead, "as input")}
+      {field("cache write", cacheWrite, setCacheWrite, "as input")}
+      <div className="flex flex-wrap items-center gap-2">
+        <button type="button" className="btn-ghost" disabled={!editable} onClick={() => void submit(draft())}>
+          save
+        </button>
+        {price && (
+          <button type="button" className="btn-ghost" disabled={!editable} onClick={() => void submit(undefined)}>
+            clear
+          </button>
+        )}
+        <button type="button" className="text-xs underline" onClick={() => setOpen(false)}>
+          close
+        </button>
+      </div>
+      {error && <p role="alert" style={{ color: "var(--color-ruby)" }}>{error}</p>}
     </div>
   );
 }
