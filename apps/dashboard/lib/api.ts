@@ -598,6 +598,7 @@ export type AccountAccess = {
   /** `group`: a group turned away (issue #263). */
   refused: { sender_id: string; group: boolean; first_at: string; last_at: string; count: number; said: string }[];
   group_policy: "off" | "allowlist" | "open";
+  sees_all: boolean | null;
   /** Groups in config.toml, removed only there. */
   allow_groups: string[];
   /** Groups let in by the owner (`owner`), or used while the account was open (`open`). */

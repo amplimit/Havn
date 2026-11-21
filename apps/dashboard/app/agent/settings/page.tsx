@@ -770,6 +770,13 @@ function BotAccess({ agentId }: { agentId: string }) {
             <h4 className="mt-3 text-xs uppercase" style={muted}>
               groups ({account.group_policy === "open" ? "open: every group it is added to" : "those let in"})
             </h4>
+            {account.sees_all === false && (
+              <p className="text-sm" style={muted}>
+                The bot does not see every message in groups, so a mention that is not a reply does not reach it:
+                members reply to its messages or send it commands. On Telegram, turn its privacy mode off with
+                BotFather (/setprivacy), then remove the bot from each group and add it again.
+              </p>
+            )}
             {account.allow_groups.length === 0 && account.groups.length === 0 ? (
               <p className="text-sm" style={muted}>
                 None yet.

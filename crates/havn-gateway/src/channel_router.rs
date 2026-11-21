@@ -97,6 +97,9 @@ struct AccountState {
     /// catches up, so a long replay cannot fill the queue and look like a
     /// stall. A replay by a superseded connection never matches.
     replaying: Option<mpsc::Sender<ChannelFrame>>,
+    /// Whether the bot sees every message in its groups, as its adapter
+    /// last said with a group message; `None` before it said.
+    sees_all: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +126,7 @@ impl AccountState {
             next_seq: first_seq(),
             replay: VecDeque::new(),
             replaying: None,
+            sees_all: None,
         }
     }
 }
@@ -152,6 +156,21 @@ impl ChannelRouter {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Note whether `key`'s bot sees every message in its groups, as its
+    /// adapter says with a group message.
+    pub async fn note_sees_all(&self, key: AccountKey, sees_all: bool) {
+        let mut map = self.inner.lock().await;
+        map.entry(key)
+            .or_insert_with(|| AccountState::new(None))
+            .sees_all = Some(sees_all);
+    }
+
+    /// Whether `key`'s bot sees every message in its groups, as its
+    /// adapter last said; `None` before it said.
+    pub async fn sees_all(&self, key: &AccountKey) -> Option<bool> {
+        self.inner.lock().await.get(key).and_then(|s| s.sees_all)
     }
 
     /// Register a connected adapter's outbound mpsc. If an

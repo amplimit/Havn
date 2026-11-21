@@ -121,6 +121,11 @@ pub struct ChannelGroup {
     /// and not answered.
     #[serde(default)]
     pub addressed: bool,
+    /// Whether the bot sees every message in the group. A Telegram bot in
+    /// privacy mode (the default) does not, and then a mention that is not
+    /// a reply never reaches it. `None` when the adapter does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sees_all: Option<bool>,
 }
 
 /// Gateway → adapter: one assistant-turn reply to deliver.
