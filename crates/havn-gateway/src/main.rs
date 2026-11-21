@@ -33,6 +33,7 @@ mod secret_ref;
 mod supervisor;
 mod timezone;
 mod transcribe;
+mod update_check;
 mod web_fetch;
 mod web_search;
 mod webchat;
@@ -680,6 +681,11 @@ async fn serve() -> anyhow::Result<()> {
     });
     drop(db);
 
+    // Background task: a look for a newer release, once a day (issue #236).
+    let update_task = cfg
+        .update_check
+        .then(|| update_check::spawn(state.http.clone()));
+
     // Background task: config watcher (spec §8.4).
     let reload_task = reload::spawn_watcher(config_path, cfg.clone(), reload_handles);
 
@@ -1007,6 +1013,9 @@ async fn serve() -> anyhow::Result<()> {
     }
 
     if let Some(task) = metrics_task {
+        task.abort();
+    }
+    if let Some(task) = update_task {
         task.abort();
     }
     if let Some(mut task) = dashboard_task {

@@ -9,6 +9,7 @@ pub mod error;
 pub mod ids;
 pub mod message;
 pub mod policy;
+pub mod release;
 
 pub use error::{Error, Result};
 pub use ids::{

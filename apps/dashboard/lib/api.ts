@@ -477,6 +477,8 @@ export type AuthInfo = {
   trust_header: boolean;
   /** Absent on gateways that do not report their version. */
   version?: string;
+  /** A newer release the gateway found, as its tag; null when none. */
+  newer_release?: string | null;
 };
 
 async function request<T>(

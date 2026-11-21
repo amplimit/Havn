@@ -40,6 +40,7 @@ export function Sidebar() {
   const [teams, setTeams] = useState<TeamView[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [gatewayVersion, setGatewayVersion] = useState<string | null>(null);
+  const [newerRelease, setNewerRelease] = useState<string | null>(null);
   // Below the md breakpoint the sidebar is a drawer behind a menu button.
   const [open, setOpen] = useState(false);
   const menuButton = useRef<HTMLButtonElement>(null);
@@ -95,7 +96,10 @@ export function Sidebar() {
       // shows up without a reload.
       try {
         const info = await api.authInfo();
-        if (!cancelled) setGatewayVersion(info.version ?? NO_VERSION);
+        if (!cancelled) {
+          setGatewayVersion(info.version ?? NO_VERSION);
+          setNewerRelease(info.newer_release ?? null);
+        }
       } catch (e) {
         // Gateways before /auth/info answer 404.
         if (!cancelled && e instanceof ApiError && e.status === 404) {
@@ -281,7 +285,7 @@ export function Sidebar() {
           <SidebarLink href="/teams" pathname={pathname} icon={Users} label="teams" />
           <SidebarLink href="/settings" pathname={pathname} icon={SlidersHorizontal} label="settings" />
         </nav>
-        <VersionLine gateway={gatewayVersion} />
+        <VersionLine gateway={gatewayVersion} newer={newerRelease} />
       </div>
       </aside>
     </>
@@ -338,7 +342,7 @@ function SidebarLink({
 
 // The gateway serves the dashboard of its own release, so a difference
 // means a page loaded before an upgrade (or a dashboard run from source).
-function VersionLine({ gateway }: { gateway: string | null }) {
+function VersionLine({ gateway, newer }: { gateway: string | null; newer: string | null }) {
   const mismatch = gateway !== null && gateway !== DASHBOARD_VERSION;
   return (
     <div className="mt-3 px-2 text-[11px] tabular" style={{ color: "var(--color-body)" }}>
@@ -353,6 +357,11 @@ function VersionLine({ gateway }: { gateway: string | null }) {
             <span>
               Different releases: reload the page.
             </span>
+          </p>
+        )}
+        {newer && (
+          <p className="mt-1">
+            {newer} is out: <span className="font-mono">havn update</span> on the server installs it.
           </p>
         )}
       </div>

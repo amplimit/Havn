@@ -987,7 +987,8 @@ fn refuse_private_literal(url: &Url) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "{ip} is a private, reserved or this gateway host's own address, which web_fetch              does not read"
+            "{ip} is a private, reserved or this gateway host's own address, which web_fetch \
+             does not read"
         ))
     }
 }

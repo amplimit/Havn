@@ -101,6 +101,10 @@ Agent cgroups are `/sys/fs/cgroup/havn/agent-<id>`. The gateway creates that top
 
 ### Upgrading
 
+From v0.2.9, `sudo havn update` does it all: it backs up the installation (to `~/havn-backup-before-<version>-<time>.tar.gz`; `--no-backup` skips it), downloads the latest release (or `--version v0.2.10`) for this machine and checks its sha256, puts each binary in place of the one beside this `havn` (the previous ones kept as `<name>.old`), restarts the gateway (through systemd when the `havn` unit runs, else as `havn gateway restart` does) and waits up to 90 seconds for it to answer as the new release. One that does not is given back its previous binaries and restarted again; if it had migrated its databases by then, restore the backup with `havn restore`. `havn update --check` only says whether a newer release is out. Channel adapters (Telegram, Lark) are updated on their own. The gateway also looks for a newer release once a day (from GitHub's API, a minute after it starts) and the dashboard shows one beside its version; `update_check = false` in config.toml turns that off.
+
+By hand, or up to v0.2.8:
+
 ```bash
 sudo -i
 # First a backup, by the havn that made the data (see Backup and restore);
