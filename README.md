@@ -640,7 +640,7 @@ Havn ships a stable HTTP + WebSocket protocol at `/api/v1/channel` for external 
 
 The Lark / Feishu adapter takes Lark's events on an HTTP webhook (`im.message.receive_v1`) and answers 1:1 chats only; see its README for setup and the message kinds it carries.
 
-An agent can only send through the channel accounts that `[[bindings]]` binds to it. With an account's `dm_policy = "allowlist"` (the default) it can only message senders in `allow_from` or admitted with an invite code (below); with `dm_policy = "open"` it can message anyone the bot can reach on that platform, so use `open` only for bots meant to be public.
+An agent can only send through the channel accounts that `[[bindings]]` binds to it. With an account's `dm_policy = "allowlist"` (the default) it can only message senders in `allow_from` or admitted with an invite code (below); with `dm_policy = "open"` it can message anyone the bot can reach on that platform, so use `open` only for bots meant to be public. It can message a group only while the group may use the bot (see "Group chats").
 
 **Admitted or connected.** These are two different things, and the owner needs the second for their own account:
 
@@ -727,7 +727,7 @@ A message that is only a command is answered by the gateway or the agent and nev
 | `/agent_model [name\|number\|default]` | sets the agent's model, as its settings page does, for every chat without one of its own |
 | `/usage [days]` | the agent's model calls and tokens, per model (30 days by default) |
 | `/approve [always] [id]`, `/deny [id]` | answer the step of this conversation waiting for approval: the one named by its request id, else the one that waited longest |
-| `/allow <sender>` | the agent's owner, in their connected chat with the bot, lets in someone the bot turned away (see [Who can reach a bot](#who-can-reach-a-bot)) |
+| `/allow <sender>`, `/allow group <id>` | the agent's owner, in their connected chat with the bot, lets in someone, or a group, the bot turned away (see [Who can reach a bot](#who-can-reach-a-bot)) |
 | `/disconnect` | in a chat app, ends this account's link to a Havn account (see [Connecting a chat account](#connecting-a-chat-account)) |
 | `/whoami` | who the gateway takes you for, and whether you may use the admin commands |
 | `/help` (`/commands`) | lists them |
@@ -789,6 +789,29 @@ havn access revoke --all --account acme-bot [--channel telegram]   # every invit
 
 Invited senders are stored per account and outlive config edits. If an account is removed or switched to `open`, its grants stop applying but are kept, and apply again if the account comes back as `allowlist`. The gateway warns about such grants at start-up and `access list` marks them; clear them with `havn access revoke --all`.
 
+### Group chats
+
+A bot can be used in the groups of its platform (Telegram groups and supergroups; not broadcast channels), set per account:
+
+```toml
+[[channels.telegram.accounts]]
+id = "acme-bot"
+group_policy = "allowlist"           # "off" (the default), "allowlist" or "open"
+allow_groups = ["tg:-1001234567890"] # with "allowlist"
+```
+
+- `off`: group messages are dropped.
+- `allowlist`: the groups in `allow_groups`, and those the agent's owner lets in (see "Who can reach a bot"), may use it. A group not let in that addresses the bot is told it is not let in yet, is listed for the owner as turned away, and the owner is told in their connected chat with an **Allow the group** button (`/allow group <id>`).
+- `open`: every group the bot is added to. The agent can send to a group it was used in while the account is `open`.
+
+A group let in lets its members use the bot there, and only there: it does not admit them to private chats.
+
+**One conversation per group.** Everyone in a group shares one conversation with its own chats (`/new` starts another for all of them). Each message the agent gets says who wrote it: the name the platform shows (in quotes) and their sender id, and "your owner" when it is the agent's owner's connected account. Lines that members write that read like one of these labels are quoted.
+
+**When it answers.** The agent answers a message that addresses the bot: one that names it (`@acme_bot`), replies to one of its messages, or is a command. Other messages are not answered. The gateway keeps the last 30 of them per group (500 characters each, in memory only) and gives them to the agent with the next message that addresses it, as what was said since it was last addressed. With Telegram's privacy mode on (the default), the bot sees only the messages that address it, so there is no such context; turn it off with BotFather (`/setprivacy`) for the bot to see the rest.
+
+**Who is who.** Whether a message is the owner's is decided per message. The owner's connected account in a group is treated as in a private chat: their calls run without waiting, and memory is used and kept as usual, so what the agent says from it the whole group reads. Everyone else is someone other than the owner (see "Tools in other people's conversations"): their calls wait for the owner, who is asked in their own chat with the same bot and in the web chat, never in the group; the group is told the agent is checking with its owner. "Always allow there" applies to the group. A group's chats are not the owner's own: they are not searched with the owner's chats, and a task scheduled there is not the owner's.
+
 ### Who can reach a bot
 
 An agent's settings page manages its `allowlist` bots without the CLI (**who can reach the bot**, owner only; `GET /agents/{id}/channel-access`). For each account bound to the agent, it lists:
@@ -796,7 +819,8 @@ An agent's settings page manages its `allowlist` bots without the CLI (**who can
 - the senders in `allow_from` (changed in config.toml only);
 - the senders let in by an invite or connect code, or by the owner, and whether each is connected to a Havn account (the owner's own is marked). **remove** takes their access back from their next message (`DELETE .../channel-access/senders`); the owner's own connected account stays let in while it is connected.
 - the invite codes made for it. **make an invite code** (1 hour to 30 days) shows a code once, with a `t.me` link when the bot's username is known; an unused one can be revoked. Connect codes are their users' own and are not listed.
-- the senders it turned away recently: who, about how many times (counted as often as they are answered, at most 3 a minute), when last, and the start of what they last said, with anything that reads as a pairing code left out. **let in** admits them (`POST .../channel-access/senders`), and **dismiss** forgets them. Each account keeps the 100 who wrote last, for 30 days. Someone let in otherwise (`allow_from`, a code, the owner's connected account) who sends a code that does not work is not listed.
+- the groups it may be used in, when `group_policy` is not `off`: those in `allow_groups`, those let in by the owner (**remove**), and with `open` those it was used in;
+- the senders and groups it turned away recently: who, about how many times (counted as often as they are answered, at most 3 a minute), when last, and the start of what they last said, with anything that reads as a pairing code left out. **let in** admits them (`POST .../channel-access/senders`), and **dismiss** forgets them. Each account keeps the 100 who wrote last, for 30 days. Someone let in otherwise (`allow_from`, a code, the owner's connected account) who sends a code that does not work is not listed.
 
 A sender can also be let in by id.
 

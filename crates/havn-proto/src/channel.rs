@@ -93,6 +93,29 @@ pub struct ChannelInbound {
     /// caption, or empty) with its file here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<havn_core::Attachment>,
+    /// The group the message was sent in (issue #263); none in a private
+    /// chat. Replies go to the group, which is one conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<ChannelGroup>,
+}
+
+/// The group a message was sent in (issue #263).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelGroup {
+    /// Platform-prefixed group id, as a sender's (`tg:-1001234`): what
+    /// replies are sent to.
+    pub id: String,
+    /// The group's name, as the platform shows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The sender's name, as the platform shows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_name: Option<String>,
+    /// Whether the message is to the bot: it names the bot, replies to
+    /// one of its messages, or is a command. Others are kept for context
+    /// and not answered.
+    #[serde(default)]
+    pub addressed: bool,
 }
 
 /// Gateway → adapter: one assistant-turn reply to deliver.
@@ -241,6 +264,7 @@ mod tests {
             timestamp: Utc::now(),
             raw: None,
             attachments: Vec::new(),
+            group: None,
         });
         let s = serde_json::to_string(&frame).expect("serialize");
         // Sanity-check the discriminator and absence of raw.

@@ -525,6 +525,7 @@ async fn serve_session<Si, St, E>(
             raw: serde_json::Value::Null,
             // The dashboard's chats are its owner's.
             from_owner: true,
+            group: false,
         };
 
         let sent = registry

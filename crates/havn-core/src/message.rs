@@ -35,6 +35,11 @@ pub struct InboundMessage {
     /// sender linked to the owner (issue #221). Told to the model.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub from_owner: bool,
+    /// Sent in a group a chat app shares with several people (issue
+    /// #263): its conversation is not one of the owner's own, whoever
+    /// writes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub group: bool,
 }
 
 /// A file sent with a message (issue #106), saved in the agent's

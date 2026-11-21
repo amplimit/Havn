@@ -595,13 +595,19 @@ export type AccountAccess = {
   /** `yours`: connected to the owner's Havn account, which removing does not shut out. */
   allowed: { sender_id: string; since: string; by_code: boolean; connected: boolean; yours: boolean }[];
   invites: { id: string; status: "active" | "used" | "expired" | "revoked"; created_at: string; expires_at: string; used_by?: string }[];
-  refused: { sender_id: string; first_at: string; last_at: string; count: number; said: string }[];
+  /** `group`: a group turned away (issue #263). */
+  refused: { sender_id: string; group: boolean; first_at: string; last_at: string; count: number; said: string }[];
+  group_policy: "off" | "allowlist" | "open";
+  /** Groups in config.toml, removed only there. */
+  allow_groups: string[];
+  /** Groups let in by the owner (`owner`), or used while the account was open (`open`). */
+  groups: { group_id: string; title: string; source: "owner" | "open"; since: string }[];
 };
 
 export type ChannelAccessView = { accounts: AccountAccess[]; notify_unpaired: boolean };
 
 /** One sender of one of an agent's bots. */
-export type SenderRef = { channel: string; account_id: string; sender_id: string };
+export type SenderRef = { channel: string; account_id: string; sender_id: string; group?: boolean };
 
 /** One of the caller's chats with an agent in a chat app they linked (issue #184). */
 export type ChannelChat = ChatSummary & {

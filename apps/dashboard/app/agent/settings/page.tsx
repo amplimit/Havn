@@ -683,7 +683,7 @@ function BotAccess({ agentId }: { agentId: string }) {
           {error}
         </p>
       )}
-      {view && view.accounts.some((a) => a.dm_policy === "allowlist") && (
+      {view && view.accounts.some((a) => a.dm_policy === "allowlist" || a.group_policy === "allowlist") && (
         <label className="mb-4 flex items-center gap-2 text-sm">
           <input
             type="checkbox"
@@ -716,20 +716,64 @@ function BotAccess({ agentId }: { agentId: string }) {
       )}
       {(view?.accounts ?? []).map((account) => {
         const key = `${account.channel}|${account.account_id}`;
-        const who = (sender_id: string): SenderRef => ({
+        const who = (sender_id: string, group = false): SenderRef => ({
           channel: account.channel,
           account_id: account.account_id,
           sender_id,
+          group,
         });
+        const groups = account.group_policy === "off" ? null : (
+          <>
+            <h4 className="mt-3 text-xs uppercase" style={muted}>
+              groups ({account.group_policy === "open" ? "open: every group it is added to" : "those let in"})
+            </h4>
+            {account.allow_groups.length === 0 && account.groups.length === 0 ? (
+              <p className="text-sm" style={muted}>
+                None yet.
+              </p>
+            ) : (
+              <ul className="flex flex-col gap-1 text-sm">
+                {account.allow_groups.map((g) => (
+                  <li key={`toml-group-${g}`}>
+                    <span className="font-mono">{g}</span>{" "}
+                    <span className="text-xs" style={muted}>
+                      in config.toml (allow_groups)
+                    </span>
+                  </li>
+                ))}
+                {account.groups.map((g) => (
+                  <li key={`group-${g.group_id}`} className="flex flex-wrap items-center gap-2">
+                    <span className="font-mono">{g.group_id}</span>
+                    {g.title && <span>{g.title}</span>}
+                    <span className="text-xs" style={muted}>
+                      {g.source === "owner" ? "let in by you" : "used while open"} since {when(g.since)}
+                    </span>
+                    <button
+                      type="button"
+                      className="btn-ghost"
+                      disabled={busy}
+                      onClick={() => void run(() => api.channels.remove(agentId, who(g.group_id, true)))}
+                    >
+                      remove
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </>
+        );
         return (
           <div key={key} className="mb-6">
             <h3 className="mb-1 font-mono text-sm">
               {account.channel} · {account.account_id}
             </h3>
             {account.dm_policy === "open" ? (
-              <p className="text-sm" style={muted}>
-                Open: anyone can write to this bot.
-              </p>
+              <>
+                <p className="text-sm" style={muted}>
+                  Open: anyone can write to this bot.
+                </p>
+                {groups}
+              </>
             ) : (
               <>
                 <div className="mb-2 flex flex-wrap items-center gap-2 text-sm">
@@ -794,6 +838,7 @@ function BotAccess({ agentId }: { agentId: string }) {
                   <ul className="flex flex-col gap-2 text-sm">
                     {account.refused.map((r) => (
                       <li key={r.sender_id}>
+                        {r.group && <span className="text-xs uppercase">group </span>}
                         <span className="font-mono">{r.sender_id}</span>{" "}
                         <span className="text-xs" style={muted}>
                           {r.count} {r.count === 1 ? "message" : "messages"}, last {when(r.last_at)}
@@ -804,7 +849,7 @@ function BotAccess({ agentId }: { agentId: string }) {
                             type="button"
                             className="btn-ghost"
                             disabled={busy}
-                            onClick={() => void run(() => api.channels.allow(agentId, who(r.sender_id)))}
+                            onClick={() => void run(() => api.channels.allow(agentId, who(r.sender_id, r.group)))}
                           >
                             let in
                           </button>
@@ -812,7 +857,7 @@ function BotAccess({ agentId }: { agentId: string }) {
                             type="button"
                             className="btn-ghost"
                             disabled={busy}
-                            onClick={() => void run(() => api.channels.forget(agentId, who(r.sender_id)))}
+                            onClick={() => void run(() => api.channels.forget(agentId, who(r.sender_id, r.group)))}
                           >
                             dismiss
                           </button>
@@ -860,6 +905,8 @@ function BotAccess({ agentId }: { agentId: string }) {
                     ))}
                   </ul>
                 )}
+
+                {groups}
 
                 {account.invites.length > 0 && (
                   <>

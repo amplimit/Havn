@@ -2631,7 +2631,10 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     // Where this turn's own messages start.
     let turn_start = messages.len();
     let mut final_text_failed: Option<String> = None;
+    // A group is shared (issue #263): its chats are not the owner's own,
+    // though they write there too.
     if msg.from_owner
+        && !msg.group
         && let Err(e) = conversations::note_owner_scope(&ctx.pool, &msg.channel_id).await
     {
         warn!(error = %e, "could not note the owner's conversation");
@@ -2988,9 +2991,22 @@ fn talk_section(msg: &InboundMessage) -> String {
             serde_json::Value::String(sender)
         ))
     };
+    // A group (issue #263): several people, each message naming who
+    // wrote it; everyone there reads the reply.
+    let group = if msg.group {
+        lang().pick(
+            " This is a group chat: several people write in it, each message says who wrote it, \
+             and everyone in the group reads what you reply. You get a message when it is to you; \
+             what was said before it in the group comes with it. The person writing now:",
+            "这是一个群聊：好几个人在里面说话，每条消息都写明了是谁发的，你的回复群里所有人都能看到。\
+             有人在对你说话时你才会收到消息，之前群里说过的话会随它一起给你。现在说话的人：",
+        )
+    } else {
+        ""
+    };
     lang().pick(
-        format!("## This conversation\n\nYou are talking on {place}. {shows} {who}"),
-        format!("## 这个对话\n\n你正在{place}上对话。{shows}{who}"),
+        format!("## This conversation\n\nYou are talking on {place}. {shows}{group} {who}"),
+        format!("## 这个对话\n\n你正在{place}上对话。{shows}{group}{who}"),
     )
 }
 
@@ -4632,6 +4648,7 @@ mod tests {
             attachments: Vec::new(),
             raw: serde_json::Value::Null,
             from_owner: owner,
+            group: false,
         };
         let web = talk_section(&msg("webchat", true));
         assert!(

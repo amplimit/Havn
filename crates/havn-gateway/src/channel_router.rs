@@ -482,7 +482,7 @@ pub async fn send_permitted(
                 .await
             {
                 Ok(true) => Ok(()),
-                Ok(false) => Err(OutboundRefusal::RecipientNotAllowed),
+                Ok(false) => group_permitted(db, channels, channel, account_id, recipient).await,
                 Err(e) => {
                     warn!(%agent_id, error = %e, "channel allowlist lookup failed");
                     Err(OutboundRefusal::RecipientNotAllowed)
@@ -490,6 +490,43 @@ pub async fn send_permitted(
             }
         }
         other => other,
+    }
+}
+
+/// Whether `recipient` is a group the account may be used in (issue
+/// #263): in `allow_groups`, let in by the owner, or, while the account
+/// is `open` to groups, one it was used in. An account whose groups are
+/// `off` sends to none.
+async fn group_permitted(
+    db: &sqlx::SqlitePool,
+    channels: &std::collections::BTreeMap<String, ChannelEntry>,
+    channel: &str,
+    account_id: &str,
+    recipient: &str,
+) -> Result<(), OutboundRefusal> {
+    let Some(account) = channels
+        .get(channel)
+        .and_then(|entry| entry.accounts.iter().find(|a| a.id == account_id))
+    else {
+        return Err(OutboundRefusal::UnknownAccount);
+    };
+    let open = match account.group_policy {
+        crate::config::GroupPolicy::Off => return Err(OutboundRefusal::RecipientNotAllowed),
+        crate::config::GroupPolicy::Allowlist => false,
+        crate::config::GroupPolicy::Open => true,
+    };
+    if account.allow_groups.iter().any(|g| g == recipient) {
+        return Ok(());
+    }
+    match havn_db::repo::channel_access::group_allowed(db, channel, account_id, recipient, open)
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(OutboundRefusal::RecipientNotAllowed),
+        Err(e) => {
+            warn!(error = %e, "group allowlist lookup failed");
+            Err(OutboundRefusal::RecipientNotAllowed)
+        }
     }
 }
 
@@ -946,6 +983,8 @@ mod tests {
                     allow_from: allow_from.iter().map(|s| (*s).to_string()).collect(),
                     admins: Vec::new(),
                     bot_username: None,
+                    group_policy: crate::config::GroupPolicy::Off,
+                    allow_groups: Vec::new(),
                 }],
             },
         );

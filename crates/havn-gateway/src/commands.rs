@@ -129,9 +129,9 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "allow",
         aliases: &[],
-        args: "<sender>",
-        about: "Let someone the bot turned away talk to it",
-        about_zh: "让被机器人拒绝的人可以和它对话",
+        args: "[group] <id>",
+        about: "Let someone, or a group, the bot turned away use it",
+        about_zh: "让被机器人拒绝的人或群可以使用它",
         admin: true,
     },
     Command {
@@ -814,7 +814,11 @@ async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
             )
             .into();
     };
-    let sender = args.trim();
+    // A group (issue #263): `/allow group <id>`.
+    let (group, sender) = match args.trim().strip_prefix("group ") {
+        Some(id) => (true, id.trim()),
+        None => (false, args.trim()),
+    };
     if sender.is_empty()
         || sender.chars().any(char::is_whitespace)
         || crate::channel_id_codec::validate_channel_id_part("sender_id", sender).is_err()
@@ -831,6 +835,26 @@ async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
             .pick("(The agent is gone.)", "（这个 agent 不在了。）")
             .into();
     };
+    if group {
+        return match crate::api::channel::admit_group_of(
+            state, &agent, channel, account_id, sender, &asker.who,
+        )
+        .await
+        {
+            Ok(true) => language.pick(
+                format!("(The group {sender} can use this bot now.)"),
+                format!("（群 {sender} 现在可以使用这个机器人了。）"),
+            ),
+            Ok(false) => language.pick(
+                format!("(The group {sender} could already use this bot.)"),
+                format!("（群 {sender} 本来就可以使用这个机器人。）"),
+            ),
+            Err(e) => language.pick(
+                format!("(Could not let the group {sender} in: {e}.)"),
+                format!("（没能放行群 {sender}：{e}。）"),
+            ),
+        };
+    }
     match crate::api::channel::admit_sender(state, &agent, channel, account_id, sender, &asker.who)
         .await
     {

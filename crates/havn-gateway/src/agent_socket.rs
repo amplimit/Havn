@@ -4695,6 +4695,8 @@ mod tests {
                     allow_from: Vec::new(),
                     admins: Vec::new(),
                     bot_username: None,
+                    group_policy: crate::config::GroupPolicy::Off,
+                    allow_groups: Vec::new(),
                 }],
             },
         );

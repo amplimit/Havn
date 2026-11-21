@@ -617,10 +617,13 @@ pub const REFUSAL_SAID_CHARS: usize = 200;
 /// again.
 pub const REFUSAL_NOTICE_EVERY: Duration = Duration::hours(24);
 
-/// A sender an `allowlist` account turned away (issue #231).
+/// A sender an `allowlist` account turned away (issue #231), or a group
+/// (issue #263).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
     pub sender_id: String,
+    /// `sender_id` is a group's.
+    pub group: bool,
     pub first_at: DateTime<Utc>,
     pub last_at: DateTime<Utc>,
     pub count: i64,
@@ -631,6 +634,7 @@ pub struct Refusal {
 #[derive(Debug, sqlx::FromRow)]
 struct RefusalRow {
     sender_id: String,
+    is_group: bool,
     first_at: DateTime<Utc>,
     last_at: DateTime<Utc>,
     count: i64,
@@ -659,6 +663,31 @@ pub async fn record_refusal(
     said: &str,
     now: DateTime<Utc>,
 ) -> Result<bool> {
+    record(pool, channel, account_id, sender_id, false, said, now).await
+}
+
+/// [`record_refusal`] for group `group_id` (issue #263), where `said`
+/// says who wrote.
+pub async fn record_group_refusal(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    group_id: &str,
+    said: &str,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    record(pool, channel, account_id, group_id, true, said, now).await
+}
+
+async fn record(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    sender_id: &str,
+    is_group: bool,
+    said: &str,
+    now: DateTime<Utc>,
+) -> Result<bool> {
     let said: String = said.trim().chars().take(REFUSAL_SAID_CHARS).collect();
     let at = timestamp(now);
     let day_ago = timestamp(now - REFUSAL_NOTICE_EVERY);
@@ -674,8 +703,9 @@ pub async fn record_refusal(
     .fetch_optional(&mut *tx)
     .await?;
     sqlx::query(
-        "INSERT INTO channel_refusals (channel, account_id, sender_id, first_at, last_at, said) \
-         VALUES (?1, ?2, ?3, ?4, ?4, ?5) \
+        "INSERT INTO channel_refusals \
+             (channel, account_id, sender_id, first_at, last_at, said, is_group) \
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?7) \
          ON CONFLICT (channel, account_id, sender_id) DO UPDATE SET \
              first_at = CASE WHEN last_at < ?6 THEN excluded.first_at ELSE first_at END, \
              count = CASE WHEN last_at < ?6 THEN 1 ELSE count + 1 END, \
@@ -687,6 +717,7 @@ pub async fn record_refusal(
     .bind(&at)
     .bind(&said)
     .bind(timestamp(now - Duration::days(REFUSAL_KEPT_DAYS)))
+    .bind(is_group)
     .execute(&mut *tx)
     .await?;
     if before.is_none() {
@@ -768,7 +799,7 @@ pub async fn list_refusals(
     account_id: &str,
 ) -> Result<Vec<Refusal>> {
     let rows: Vec<RefusalRow> = sqlx::query_as(
-        "SELECT sender_id, first_at, last_at, count, said FROM channel_refusals \
+        "SELECT sender_id, is_group, first_at, last_at, count, said FROM channel_refusals \
          WHERE channel = ?1 AND account_id = ?2 AND last_at >= ?3 ORDER BY last_at DESC",
     )
     .bind(channel)
@@ -780,12 +811,155 @@ pub async fn list_refusals(
         .into_iter()
         .map(|r| Refusal {
             sender_id: r.sender_id,
+            group: r.is_group,
             first_at: r.first_at,
             last_at: r.last_at,
             count: r.count,
             said: r.said,
         })
         .collect())
+}
+
+/// Where a group's admission came from (issue #263).
+pub const GROUP_BY_OWNER: &str = "owner";
+/// A group used while its account was `open`: it counts only while the
+/// account still is.
+pub const GROUP_WHILE_OPEN: &str = "open";
+
+/// A group a channel account may be used in, besides the config's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowedGroup {
+    pub group_id: String,
+    /// [`GROUP_BY_OWNER`] or [`GROUP_WHILE_OPEN`].
+    pub source: String,
+    pub title: String,
+    pub registered_at: DateTime<Utc>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct GroupRow {
+    group_id: String,
+    source: String,
+    title: String,
+    registered_at: DateTime<Utc>,
+}
+
+/// Let group `group_id` use `(channel, account_id)`, from `source`, and
+/// forget that it was turned away. One let in by the owner stays so; one
+/// used while open becomes the owner's when they let it in. Whether it
+/// was not let in from `source` before.
+pub async fn admit_group(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    group_id: &str,
+    title: &str,
+    source: &str,
+) -> Result<bool> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let before: Option<(String,)> = sqlx::query_as(
+        "SELECT source FROM channel_groups WHERE channel = ?1 AND account_id = ?2 AND group_id = ?3",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(group_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let title: String = title.trim().chars().take(REFUSAL_SAID_CHARS).collect();
+    sqlx::query(
+        "INSERT INTO channel_groups (channel, account_id, group_id, source, title, registered_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT (channel, account_id, group_id) DO UPDATE SET \
+             source = CASE WHEN excluded.source = 'owner' THEN 'owner' ELSE source END, \
+             title = CASE WHEN excluded.title != '' THEN excluded.title ELSE title END",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(group_id)
+    .bind(source)
+    .bind(&title)
+    .bind(timestamp(Utc::now()))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM channel_refusals WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(group_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(match before {
+        None => true,
+        Some((was,)) => was != source && source == GROUP_BY_OWNER,
+    })
+}
+
+/// Whether group `group_id` may use `(channel, account_id)`: let in by
+/// the owner, or, while the account is `open`, used while it was.
+pub async fn group_allowed(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    group_id: &str,
+    open: bool,
+) -> Result<bool> {
+    let (found,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM channel_groups WHERE channel = ?1 AND account_id = ?2 \
+         AND group_id = ?3 AND (source = 'owner' OR ?4))",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(group_id)
+    .bind(open)
+    .fetch_one(pool)
+    .await?;
+    Ok(found)
+}
+
+/// The groups of `(channel, account_id)`, by when they came.
+pub async fn list_groups_on(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+) -> Result<Vec<AllowedGroup>> {
+    let rows: Vec<GroupRow> = sqlx::query_as(
+        "SELECT group_id, source, title, registered_at FROM channel_groups \
+         WHERE channel = ?1 AND account_id = ?2 ORDER BY registered_at",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| AllowedGroup {
+            group_id: r.group_id,
+            source: r.source,
+            title: r.title,
+            registered_at: r.registered_at,
+        })
+        .collect())
+}
+
+/// Take back group `group_id`'s use of `(channel, account_id)`; whether
+/// it had one.
+pub async fn revoke_group(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    group_id: &str,
+) -> Result<bool> {
+    let res = sqlx::query(
+        "DELETE FROM channel_groups WHERE channel = ?1 AND account_id = ?2 AND group_id = ?3",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(group_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 /// Forget that `sender_id` was turned away; whether they were.
@@ -1030,6 +1204,87 @@ mod tests {
             .expect("list");
         assert_eq!(refused[0].count, 1);
         assert!(refused[0].first_at > Utc::now() - Duration::hours(1));
+    }
+
+    #[tokio::test]
+    async fn groups_are_let_in_by_the_owner_or_while_open() {
+        let pool = crate::connect_in_memory().await.expect("db");
+        let allowed = |open: bool| {
+            let pool = pool.clone();
+            async move {
+                group_allowed(&pool, "telegram", "bot", "tg:-100", open)
+                    .await
+                    .expect("allowed")
+            }
+        };
+        assert!(!allowed(true).await);
+        assert!(
+            record_group_refusal(&pool, "telegram", "bot", "tg:-100", "Ann: hi", Utc::now())
+                .await
+                .expect("refused")
+        );
+        assert!(list_refusals(&pool, "telegram", "bot").await.expect("list")[0].group);
+
+        assert!(
+            admit_group(
+                &pool,
+                "telegram",
+                "bot",
+                "tg:-100",
+                "Team",
+                GROUP_WHILE_OPEN
+            )
+            .await
+            .expect("open")
+        );
+        assert!(allowed(true).await, "used while open");
+        assert!(
+            !allowed(false).await,
+            "not once the account is an allowlist"
+        );
+        assert!(
+            list_refusals(&pool, "telegram", "bot")
+                .await
+                .expect("list")
+                .is_empty()
+        );
+
+        assert!(
+            admit_group(&pool, "telegram", "bot", "tg:-100", "", GROUP_BY_OWNER)
+                .await
+                .expect("owner")
+        );
+        assert!(allowed(false).await, "let in by the owner");
+        assert!(
+            !admit_group(&pool, "telegram", "bot", "tg:-100", "", GROUP_WHILE_OPEN)
+                .await
+                .expect("again"),
+            "the owner's stays the owner's"
+        );
+        let groups = list_groups_on(&pool, "telegram", "bot")
+            .await
+            .expect("list");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].source, GROUP_BY_OWNER);
+        assert_eq!(groups[0].title, "Team", "a title is kept");
+        assert!(
+            !is_allowed(&pool, "telegram", "bot", "tg:-100")
+                .await
+                .expect("sender"),
+            "not a sender"
+        );
+
+        assert!(
+            revoke_group(&pool, "telegram", "bot", "tg:-100")
+                .await
+                .expect("revoke")
+        );
+        assert!(!allowed(true).await);
+        assert!(
+            !revoke_group(&pool, "telegram", "bot", "tg:-100")
+                .await
+                .expect("gone")
+        );
     }
 
     #[tokio::test]

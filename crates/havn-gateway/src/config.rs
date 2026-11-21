@@ -208,6 +208,29 @@ pub struct ChannelAccount {
     /// pairing links the dashboard shows (`https://t.me/acme_bot?start=`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bot_username: Option<String>,
+    /// Groups the bot may be used in (issue #263): `off` (the default),
+    /// `allowlist` (those in `allow_groups` and those the agent's owner
+    /// let in) or `open`.
+    #[serde(default)]
+    pub group_policy: GroupPolicy,
+    /// Platform-prefixed group ids let in when `group_policy =
+    /// "allowlist"`. A group let in admits its members there only, not
+    /// in private chats.
+    #[serde(default)]
+    pub allow_groups: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupPolicy {
+    /// Group messages are dropped.
+    #[default]
+    Off,
+    /// Groups in `allow_groups` or let in by the owner; others are
+    /// turned away and listed for the owner.
+    Allowlist,
+    /// Every group the bot is added to.
+    Open,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -1141,6 +1164,8 @@ mod tests {
                     allow_from: Vec::new(),
                     admins: Vec::new(),
                     bot_username: None,
+                    group_policy: crate::config::GroupPolicy::Off,
+                    allow_groups: Vec::new(),
                 }],
             },
         );
@@ -1167,6 +1192,8 @@ mod tests {
                     allow_from: Vec::new(),
                     admins: Vec::new(),
                     bot_username: None,
+                    group_policy: crate::config::GroupPolicy::Off,
+                    allow_groups: Vec::new(),
                 }],
             },
         );
