@@ -237,6 +237,19 @@ pub async fn advance_after_run(pool: &SqlitePool, job: &CronJob, now: DateTime<U
     Ok(())
 }
 
+/// Mark one-shot `id` as run at `at`: its time becomes `at` and it is
+/// disabled, so it is done (issue #236), as one that ran at its time is.
+pub async fn finish_one_shot(pool: &SqlitePool, id: CronJobId, at: DateTime<Utc>) -> Result<()> {
+    let schedule = Schedule::At { instant: at };
+    sqlx::query("UPDATE cron_jobs SET schedule = ?1, next_run_at = ?2, enabled = 0 WHERE id = ?3")
+        .bind(schedule.encode())
+        .bind(at.to_rfc3339())
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn set_enabled(pool: &SqlitePool, id: CronJobId, enabled: bool) -> Result<()> {
     let res = sqlx::query("UPDATE cron_jobs SET enabled = ?1 WHERE id = ?2")
         .bind(i32::from(enabled))

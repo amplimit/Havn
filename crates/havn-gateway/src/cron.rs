@@ -148,6 +148,30 @@ impl CronScheduler {
         self.pending.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Record a run of `job_id` about to be sent now, unless one of it is
+    /// still going (younger than [`RUN_NOW_BUSY`]): checked and recorded
+    /// under one lock, so two at once do not both pass. Its id.
+    fn track_run_now(&self, agent_id: AgentId, job_id: CronJobId) -> Option<String> {
+        let mut pending = self.pending_runs();
+        if pending
+            .values()
+            .any(|run| run.job_id == job_id && run.dispatched.elapsed() < RUN_NOW_BUSY)
+        {
+            return None;
+        }
+        let run_id = uuid::Uuid::now_v7().to_string();
+        pending.insert(
+            run_id.clone(),
+            PendingRun {
+                agent_id,
+                job_id,
+                dispatched_at: Utc::now(),
+                dispatched: Instant::now(),
+            },
+        );
+        Some(run_id)
+    }
+
     /// Record a run about to be sent to `agent_id` and return its id.
     fn track_dispatch(&self, agent_id: AgentId, job_id: CronJobId) -> String {
         let run_id = uuid::Uuid::now_v7().to_string();
@@ -195,14 +219,9 @@ impl CronScheduler {
         if !self.registry.is_connected(job.agent_id).await {
             return Err(CronError::NotRunning);
         }
-        let going = self
-            .pending_runs()
-            .values()
-            .any(|run| run.job_id == job.id && run.dispatched.elapsed() < RUN_NOW_BUSY);
-        if going {
-            return Err(CronError::Busy);
-        }
-        let run_id = self.track_dispatch(job.agent_id, job.id);
+        let run_id = self
+            .track_run_now(job.agent_id, job.id)
+            .ok_or(CronError::Busy)?;
         let frame = GatewayToAgent::CronTick(CronTick {
             job_id: job.id.to_string(),
             run_id: run_id.clone(),
@@ -218,10 +237,11 @@ impl CronScheduler {
                 _ => CronError::NotRunning,
             });
         }
-        // A reminder run now is not run again at its time.
+        // A reminder run now is done: not run again at its time, nor
+        // resumed to be.
         if job.enabled
             && matches!(job.schedule, Schedule::At { .. })
-            && let Err(e) = advance_after_run(&self.db, job, Utc::now()).await
+            && let Err(e) = cron::finish_one_shot(&self.db, job.id, Utc::now()).await
         {
             warn!(job_id = %job.id, error = %e, "could not mark a one-shot run now as done");
         }
@@ -1069,7 +1089,12 @@ mod tests {
             .await
             .expect("find")
             .expect("job");
-        assert!(!done.enabled, "a one-shot run now is done");
+        assert!(!done.enabled, "a one-shot run now is not run again");
+        assert!(
+            matches!(done.schedule, Schedule::At { instant } if instant <= Utc::now()),
+            "and is done, not paused: {:?}",
+            done.schedule
+        );
     }
 
     #[tokio::test]
