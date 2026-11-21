@@ -204,16 +204,16 @@ server (`npm run dev`).
 
 ### Metrics
 
-Set `metrics_listen` in config.toml (for example `"127.0.0.1:9464"`; empty, the default, serves none) for the gateway to serve Prometheus metrics at `/metrics` there, in the text format, with no login: keep it on loopback or a network only your Prometheus reaches (the gateway warns when it is not loopback). It must be a port of its own, and applies on `havn gateway restart`. The counters start at zero when the gateway starts:
+Set `metrics_listen` in config.toml (for example `"127.0.0.1:9464"`; empty, the default, serves none) for the gateway to serve Prometheus metrics at `/metrics` there, in the text format, with no login: keep it on loopback or a network only your Prometheus reaches (the gateway warns when it is not loopback, but serves it, unlike `listen`). It must be a port of its own, and applies on `havn gateway restart`; if the port is taken, the gateway says so and runs without metrics. The counters start at zero when the gateway starts:
 
 - `havn_build_info{version}`, `havn_uptime_seconds`;
 - `havn_agents_connected` and `havn_channel_adapters_connected`, now;
-- `havn_llm_calls_total{provider, model, outcome}`, the LLM calls made for agents, where `outcome` is `ok`, `no_credential`, `unavailable`, `upstream_error`, `transport_error`, `budget_exhausted` or `other_error`;
+- `havn_llm_calls_total{provider, model, outcome}`, the LLM calls made for agents (each request an agent makes counts once, whatever credentials it tried; the gateway's own calls, such as checking a model, are not counted), where `outcome` is `ok`, `no_credential`, `unavailable`, `upstream_error`, `transport_error`, `budget_exhausted` or `other_error`;
 - `havn_llm_tokens_total{provider, model, direction}`, the input (cache reads and writes included) and output tokens of the calls that answered;
-- `havn_channel_messages_total{channel, direction}`, the messages adapters passed in and the gateway sent out;
-- `havn_cron_runs_total{outcome}`, the runs of scheduled tasks: `success`, `failure`, or `skipped` by their wake check.
+- `havn_channel_messages_total{channel, direction}`, the messages adapters passed in (all of them, those turned away too) and the replies written to adapters (each part of a reply sent in parts counts; one written again after an adapter reconnects counts once);
+- `havn_cron_runs_total{outcome}`, the runs of scheduled tasks: `success`, `failure` (also one that could not be sent to its agent, or whose output could not be kept), or `skipped` by their wake check.
 
-A counter keeps at most 1000 label sets; past that, a new model or channel is counted as `other`.
+A counter keeps at most 1000 models per provider, and 1000 channels; past that, a new one is counted as `__other__`.
 
 ## Project Structure
 

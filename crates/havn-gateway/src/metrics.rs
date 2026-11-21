@@ -13,10 +13,14 @@ use axum::response::IntoResponse;
 use crate::AppState;
 use crate::llm_proxy::{AnthropicResponse, ProxyError};
 
-/// Label sets a counter keeps at most, so names from outside (a model an
-/// agent asks for) cannot grow it without end. Past it, new sets are
-/// counted under `other`.
-const SERIES_MAX: usize = 1000;
+/// Models (per provider) or channels a counter keeps at most, so names
+/// from outside (a model an agent asks for) cannot grow it without end.
+/// Past it, a new one is counted under [`OTHER`].
+const NAMES_MAX: usize = 1000;
+
+/// What a name past [`NAMES_MAX`] is counted as: no model or channel is
+/// called this.
+const OTHER: &str = "__other__";
 
 #[derive(Default)]
 struct Counts {
@@ -28,6 +32,10 @@ struct Counts {
     channel_messages: BTreeMap<(String, &'static str), u64>,
     /// By outcome.
     cron_runs: BTreeMap<&'static str, u64>,
+    /// Per `channel|account`, the last reply counted as sent: a reply
+    /// written again (replayed to an adapter that came back) is not
+    /// counted again.
+    sent_up_to: std::collections::HashMap<String, u64>,
 }
 
 static COUNTS: LazyLock<Mutex<Counts>> = LazyLock::new(Default::default);
@@ -37,12 +45,13 @@ fn counts() -> std::sync::MutexGuard<'static, Counts> {
     COUNTS.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// `name` when a counter of `len` sets may take another, else `other`.
-fn kept(name: &str, has: bool, len: usize) -> String {
-    if has || len < SERIES_MAX {
+/// `name` when it is one of `known` names or there is room for another,
+/// else [`OTHER`].
+fn kept<'a>(name: &str, mut known: impl Iterator<Item = &'a String>, len: usize) -> String {
+    if len < NAMES_MAX || known.any(|k| k == name) {
         name.to_string()
     } else {
-        "other".to_string()
+        OTHER.to_string()
     }
 }
 
@@ -63,12 +72,14 @@ pub fn llm_call(provider: &str, model: &str, result: &Result<AnthropicResponse, 
         Err(_) => "other_error",
     };
     let mut counts = counts();
-    let has = counts
+    let models: std::collections::BTreeSet<&String> = counts
         .llm_calls
         .keys()
-        .any(|(p, m, _)| p == provider && m == model);
-    let len = counts.llm_calls.len();
-    let model = kept(model, has, len);
+        .filter(|(p, _, _)| p == provider)
+        .map(|(_, m, _)| m)
+        .collect();
+    let len = models.len();
+    let model = kept(model, models.into_iter(), len);
     *counts
         .llm_calls
         .entry((provider.to_string(), model.clone(), outcome))
@@ -86,13 +97,31 @@ pub fn llm_call(provider: &str, model: &str, result: &Result<AnthropicResponse, 
 /// A message of `channel` came in (`in`) or went out (`out`).
 pub fn channel_message(channel: &str, direction: &'static str) {
     let mut counts = counts();
-    let has = counts.channel_messages.keys().any(|(c, _)| c == channel);
-    let len = counts.channel_messages.len();
-    let channel = kept(channel, has, len);
+    let channels: std::collections::BTreeSet<&String> =
+        counts.channel_messages.keys().map(|(c, _)| c).collect();
+    let len = channels.len();
+    let channel = kept(channel, channels.into_iter(), len);
     *counts
         .channel_messages
         .entry((channel, direction))
         .or_default() += 1;
+}
+
+/// Reply `seq` of `channel`'s account `account_id` was written to its
+/// adapter: counted as `out` unless it was counted already.
+pub fn channel_sent(channel: &str, account_id: &str, seq: u64) {
+    {
+        let mut counts = counts();
+        let last = counts
+            .sent_up_to
+            .entry(format!("{channel}|{account_id}"))
+            .or_default();
+        if seq <= *last {
+            return;
+        }
+        *last = seq;
+    }
+    channel_message(channel, "out");
 }
 
 /// A scheduled task ran: `success`, `failure` or `skipped` (its wake check
@@ -307,9 +336,73 @@ mod tests {
     }
 
     #[test]
-    fn a_counter_takes_so_many_label_sets_and_counts_the_rest_as_other() {
-        assert_eq!(kept("m", false, SERIES_MAX - 1), "m");
-        assert_eq!(kept("m", true, SERIES_MAX), "m");
-        assert_eq!(kept("m", false, SERIES_MAX), "other");
+    fn a_counter_takes_so_many_names_and_counts_the_rest_as_other() {
+        let known = ["a".to_string()];
+        assert_eq!(kept("m", known.iter(), NAMES_MAX - 1), "m");
+        assert_eq!(kept("a", known.iter(), NAMES_MAX), "a");
+        assert_eq!(kept("m", known.iter(), NAMES_MAX), OTHER);
+    }
+
+    #[test]
+    fn an_llm_call_is_counted_with_its_outcome_and_tokens_and_a_model_past_the_cap_as_other() {
+        let provider = "metrics-test";
+        let answered: Result<AnthropicResponse, ProxyError> =
+            Ok(serde_json::from_value(serde_json::json!({
+                "id": "m", "type": "message", "role": "assistant", "model": "x",
+                "content": [], "stop_reason": "end_turn",
+                "usage": {"input_tokens": 3, "output_tokens": 4}
+            }))
+            .expect("response"));
+        llm_call(provider, "model-0", &answered);
+        llm_call(
+            provider,
+            "model-0",
+            &Err(ProxyError::NoCredential(provider.into())),
+        );
+        for n in 1..NAMES_MAX {
+            llm_call(
+                provider,
+                &format!("model-{n}"),
+                &Err(ProxyError::NoCredential(provider.into())),
+            );
+        }
+        // A known model takes a new outcome; a new one goes to other.
+        llm_call(provider, "model-1", &answered);
+        llm_call(provider, "one-too-many", &answered);
+        let text = render(0, 0);
+        assert!(
+            text.contains(&format!(
+                "havn_llm_calls_total{{provider=\"{provider}\",model=\"model-0\",outcome=\"ok\"}} 1"
+            )),
+            "{text}"
+        );
+        assert!(text.contains(&format!("havn_llm_calls_total{{provider=\"{provider}\",model=\"model-0\",outcome=\"no_credential\"}} 1")));
+        assert!(text.contains(&format!("havn_llm_tokens_total{{provider=\"{provider}\",model=\"model-0\",direction=\"input\"}} 3")));
+        assert!(text.contains(&format!("havn_llm_tokens_total{{provider=\"{provider}\",model=\"model-0\",direction=\"output\"}} 4")));
+        assert!(text.contains(&format!(
+            "havn_llm_calls_total{{provider=\"{provider}\",model=\"model-1\",outcome=\"ok\"}} 1"
+        )));
+        assert!(text.contains(&format!(
+            "havn_llm_calls_total{{provider=\"{provider}\",model=\"{OTHER}\",outcome=\"ok\"}} 1"
+        )));
+        assert!(!text.contains("one-too-many"));
+    }
+
+    #[test]
+    fn a_reply_written_again_is_counted_once() {
+        let out = |text: &str| {
+            text.lines()
+                .find(|l| {
+                    l.starts_with(
+                        "havn_channel_messages_total{channel=\"metrics-sent\",direction=\"out\"}",
+                    )
+                })
+                .map(|l| l.rsplit(' ').next().unwrap().parse::<u64>().unwrap())
+        };
+        channel_sent("metrics-sent", "bot", 5);
+        channel_sent("metrics-sent", "bot", 6);
+        channel_sent("metrics-sent", "bot", 5);
+        channel_sent("metrics-sent", "bot", 6);
+        assert_eq!(out(&render(0, 0)), Some(2));
     }
 }

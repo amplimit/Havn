@@ -334,7 +334,9 @@ pub async fn complete_with_provider(
         None,
     )
     .await;
-    crate::metrics::llm_call(provider_name, &request.model, &result);
+    if billing.agent_id.is_some() {
+        crate::metrics::llm_call(provider_name, &request.model, &result);
+    }
     result
 }
 
@@ -368,7 +370,9 @@ pub async fn stream_with_provider(
         Some(text),
     )
     .await;
-    crate::metrics::llm_call(provider_name, &request.model, &result);
+    if billing.agent_id.is_some() {
+        crate::metrics::llm_call(provider_name, &request.model, &result);
+    }
     result
 }
 

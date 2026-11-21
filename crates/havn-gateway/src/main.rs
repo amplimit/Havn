@@ -946,28 +946,36 @@ async fn serve() -> anyhow::Result<()> {
             .metrics_listen
             .parse()
             .context("parsing metrics_listen")?;
-        let listener = TcpListener::bind(addr)
-            .await
-            .context("binding metrics_listen")?;
-        if !addr.ip().is_loopback() {
-            warn!(
-                %addr,
-                "serving metrics beyond this host: anyone who can reach metrics_listen reads them"
-            );
-        }
-        info!(%addr, "serving metrics at /metrics");
-        let service = Router::new()
-            .route("/metrics", get(metrics::handler))
-            .with_state(metrics_state);
-        let stop = stop_signals(signals.clone(), 1);
-        Some(tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, service)
-                .with_graceful_shutdown(stop)
-                .await
-            {
-                warn!(error = %e, "metrics stopped being served");
+        // Metrics are not worth stopping the gateway for: a port taken
+        // (by another exporter, say) is said, and the rest runs.
+        match TcpListener::bind(addr).await {
+            Ok(listener) => {
+                if !addr.ip().is_loopback() {
+                    warn!(
+                        %addr,
+                        "serving metrics beyond this host: anyone who can reach metrics_listen \
+                         reads them"
+                    );
+                }
+                info!(%addr, "serving metrics at /metrics");
+                let service = Router::new()
+                    .route("/metrics", get(metrics::handler))
+                    .with_state(metrics_state);
+                let stop = stop_signals(signals.clone(), 1);
+                Some(tokio::spawn(async move {
+                    if let Err(e) = axum::serve(listener, service)
+                        .with_graceful_shutdown(stop)
+                        .await
+                    {
+                        warn!(error = %e, "metrics stopped being served");
+                    }
+                }))
             }
-        }))
+            Err(e) => {
+                warn!(%addr, error = %e, "cannot serve metrics on metrics_listen; running without them");
+                None
+            }
+        }
     };
     let serve = axum::serve(
         listener,

@@ -335,10 +335,7 @@ impl ChannelRouter {
         // Never wait on the adapter: it serves every agent bound to its
         // account, and the caller is an agent's reader loop.
         match tx.try_send(frame) {
-            Ok(()) => {
-                crate::metrics::channel_message(&key.channel, "out");
-                Ok(seq)
-            }
+            Ok(()) => Ok(seq),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(DeliverError::WriterClosed),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 warn!(
@@ -1106,5 +1103,30 @@ mod tests {
             outbound_permitted(&bs, &chs, a1, "telegram", "bot", "111"),
             Err(OutboundRefusal::UnknownAccount)
         );
+    }
+
+    #[tokio::test]
+    async fn only_adapters_still_there_count_as_connected() {
+        let router = ChannelRouter::new();
+        let (live, _live_rx) = mpsc::channel(1);
+        let (gone, gone_rx) = mpsc::channel(1);
+        router
+            .register(AccountKey::new("telegram", "a"), live)
+            .await;
+        router
+            .register(AccountKey::new("telegram", "b"), gone)
+            .await;
+        drop(gone_rx);
+        router
+            .deliver(
+                "telegram",
+                "c",
+                "tg:1",
+                None,
+                ChannelMessageContent::Text { text: "x".into() },
+            )
+            .await
+            .ok();
+        assert_eq!(router.connected().await, 1);
     }
 }

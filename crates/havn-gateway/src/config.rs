@@ -1691,4 +1691,26 @@ mod tests {
         assert_eq!(merged[2].id, "c");
         assert_eq!(waiting, vec!["telegram/b", "telegram/c", "telegram/d"]);
     }
+
+    #[test]
+    fn metrics_listen_is_off_by_default_and_needs_a_port_of_its_own() {
+        assert!(
+            GatewayConfig::from_toml("")
+                .expect("empty")
+                .metrics_listen
+                .is_empty()
+        );
+        let with = |value: &str| {
+            GatewayConfig::from_toml(&format!(
+                "listen = \"127.0.0.1:8080\"
+dashboard_listen = \"127.0.0.1:3000\"
+metrics_listen = \"{value}\"
+"
+            ))
+        };
+        assert!(with("127.0.0.1:9464").is_ok());
+        assert!(with("127.0.0.1:8080").is_err(), "listen's port");
+        assert!(with("127.0.0.1:3000").is_err(), "dashboard_listen's port");
+        assert!(with("not an address").is_err());
+    }
 }
