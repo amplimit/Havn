@@ -1405,8 +1405,21 @@ async fn ask_owner_for_someone_else(
     request: &havn_proto::ApprovalRequest,
     ctx: &AgentSocketCtx,
 ) {
-    let Some((channel, account, _)) = crate::channel_id_codec::decode(&request.channel_id) else {
-        return;
+    // A chat app's conversation is told the owner is asked, there; a
+    // webhook's call (issue #236) has no one to tell, and the owner is asked
+    // on each of the agent's bots.
+    let decoded = crate::channel_id_codec::decode(&request.channel_id);
+    let bots: Vec<(String, String)> = match decoded {
+        Some((channel, account, _)) => vec![(channel.to_string(), account.to_string())],
+        None if request.channel_id.starts_with(WEBHOOK_CONVERSATION) => {
+            let agent = agent_id.to_string();
+            ctx.bindings
+                .iter()
+                .filter(|b| b.agent_id == agent)
+                .map(|b| (b.channel.clone(), b.account_id.clone()))
+                .collect()
+        }
+        None => return,
     };
     let (owner, language) = match havn_db::repo::agents::find_by_id(&ctx.db, agent_id).await {
         Ok(Some(agent)) => (
@@ -1425,39 +1438,47 @@ async fn ask_owner_for_someone_else(
             poll: None,
             partial: false,
         };
-    route_outbound(
-        agent_id,
-        tell(
-            request.channel_id.clone(),
-            language
-                .pick(
-                    "(Checking with the agent's owner first; a moment, please.)",
-                    "（正在先和 agent 的所有者确认，请稍等。）",
-                )
-                .to_string(),
-            Vec::new(),
-        ),
-        ctx,
-    )
-    .await;
+    if decoded.is_some() {
+        route_outbound(
+            agent_id,
+            tell(
+                request.channel_id.clone(),
+                language
+                    .pick(
+                        "(Checking with the agent's owner first; a moment, please.)",
+                        "（正在先和 agent 的所有者确认，请稍等。）",
+                    )
+                    .to_string(),
+                Vec::new(),
+            ),
+            ctx,
+        )
+        .await;
+    }
     let Some(owner) = owner else { return };
     let Ok(links) = havn_db::repo::channel_access::list_links(&ctx.db, Some(owner)).await else {
         return;
     };
     let shown = question(request, language);
-    for link in links.iter().filter(|l| l.channel == channel) {
-        let dm = crate::channel_id_codec::encode(channel, account, &link.sender_id);
-        if dm == request.channel_id {
-            continue;
+    for (channel, account) in &bots {
+        for link in links.iter().filter(|l| &l.channel == channel) {
+            let dm = crate::channel_id_codec::encode(channel, account, &link.sender_id);
+            if dm == request.channel_id {
+                continue;
+            }
+            route_outbound(
+                agent_id,
+                tell(dm, shown.clone(), owner_buttons(request, language)),
+                ctx,
+            )
+            .await;
         }
-        route_outbound(
-            agent_id,
-            tell(dm, shown.clone(), owner_buttons(request, language)),
-            ctx,
-        )
-        .await;
     }
 }
+
+/// The conversation of a webhook's calls in the runtime (issue #236): this
+/// prefix and the webhook's id.
+pub const WEBHOOK_CONVERSATION: &str = "webhook:";
 
 /// The owner's question about a call in someone else's conversation:
 /// who asked and what, the call, what it gave when asked after, and how

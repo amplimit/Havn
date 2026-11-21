@@ -398,6 +398,17 @@ On a heartbeat the agent reads `HEARTBEAT.md` in its workspace (the settings pag
 
   In the web chat it shows in the owner's open tabs, in the Heartbeat chat. In a chat app it is also kept in the chat there, so a reply there follows it. Other people's chats with the agent never get it.
 
+## Webhooks
+
+A webhook is an address other systems (an alert, a CI build, a form, GitHub) call to have an agent act on what they send. The agent's owner makes them on its settings page (**webhooks**; `POST /agents/{id}/webhooks` with `name`, `instructions` and `deliver`), up to 20 an agent: each gets an id and a secret, shown once. It is called at `POST /hooks/<id>` on the gateway's `listen` address, so put that path behind your reverse proxy for callers outside the host; it is not limited to the host's names as the API is. A call holds the secret in one of these ways, else it is answered 401, as is a webhook that is not there:
+
+- `Authorization: Bearer <secret>`, or `X-Havn-Token: <secret>`;
+- `X-Hub-Signature-256: sha256=<hex>` (as GitHub sends it, with the secret as the webhook's secret there), or `X-Havn-Signature-256`: the HMAC-SHA256 of the body under the secret.
+
+The body is text (UTF-8, at most 256 KB; the agent gets the first 32,000 characters), whatever its type: JSON, a form, a plain line. A webhook takes 30 calls a minute; more are answered 429. A call is answered 202 with its `run_id` once it is checked; the agent, started when it is not running, then acts on it in a fresh context, with the subagent tool-round limit and the `cron` context's tools, told what its owner asked it to do with a call (`instructions`) and given what the call brought as a JSON string marked as from outside. What a call brings is treated as from someone other than the owner (see "Tools in other people's conversations"): what reading tools give and calls that run things wait for the owner, who is asked in their own chat with each of the agent's bots and in the web chat, and the owner's memory is neither searched for it nor changed by it.
+
+Each webhook has a chat of its own in the owner's web chat ("Webhook: <name>"), which keeps each call (its first 4,000 characters) and what the agent made of it. `deliver` also sends the result, as a heartbeat's (see "Heartbeat"): `web` (the default) keeps it to that chat, `last` sends it to the conversation the owner wrote in last, and a channel's name to the owner on that channel. An answer with `[SILENT]` in it is not kept or sent. Making, calling and deleting a webhook are audited as `webhook.created`, `webhook.called` and `webhook.deleted`. The secret is kept in the gateway's database as given, since a signed call is checked with it; delete the webhook and make another to change it.
+
 ## Configuration
 
 Gateway config lives at `~/.config/havn/config.toml`:

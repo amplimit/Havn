@@ -527,6 +527,22 @@ export type TimezoneView = {
   host: string;
 };
 
+/** A webhook of an agent: an address outside systems call (issue #236). */
+export type WebhookView = {
+  id: string;
+  name: string;
+  /** Where it is called, under the gateway's `listen` address. */
+  path: string;
+  instructions: string;
+  /** `web`, `last`, or a channel's name. */
+  deliver: string;
+  created_at: string;
+  last_called_at: string | null;
+  calls: number;
+  /** Only when it was just made: not shown again. */
+  secret?: string;
+};
+
 /** A scheduled task (cron job) of an agent. */
 export type CronJobView = {
   id: string;
@@ -790,6 +806,21 @@ export const api = {
       request<void>(`/agents/${agentId}/cron/${jobId}`, { method: "DELETE" }),
     runNow: (agentId: string, jobId: string) =>
       request<{ run_id: string }>(`/agents/${agentId}/cron/${jobId}/run`, { method: "POST" }),
+  },
+  webhooks: {
+    list: (agentId: string) => request<WebhookView[]>(`/agents/${agentId}/webhooks`),
+    create: (agentId: string, made: { name: string; instructions: string; deliver: string }) =>
+      request<WebhookView>(`/agents/${agentId}/webhooks`, {
+        method: "POST",
+        body: JSON.stringify(made),
+      }),
+    update: (agentId: string, id: string, change: { instructions: string; deliver: string }) =>
+      request<WebhookView>(`/agents/${agentId}/webhooks/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify(change),
+      }),
+    remove: (agentId: string, id: string) =>
+      request<void>(`/agents/${agentId}/webhooks/${id}`, { method: "DELETE" }),
   },
   setTimezone: (timezone: string | null) =>
     request<TimezoneView>("/me/timezone", {

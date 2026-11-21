@@ -40,6 +40,7 @@ import {
   type SenderRef,
   type MyDomainsView,
   type TimezoneView,
+  type WebhookView,
 } from "@/lib/api";
 
 function useFlash(ms = 4000): [boolean, () => void] {
@@ -370,6 +371,7 @@ function Settings({ id }: { id: string }) {
       <WebAccessEditor agentId={id} />
       <TimezoneEditor />
       <ScheduledTasks agentId={id} />
+      <Webhooks agentId={id} />
       <TitlesEditor agentId={id} />
       <CapabilitiesEditor agentId={id} />
       <AccessEditor agentId={id} />
@@ -1723,6 +1725,197 @@ function ScheduledTasks({ agentId }: { agentId: string }) {
             </li>
           ))}
         </ul>
+      )}
+    </section>
+  );
+}
+
+/** Where a webhook's results go, as its select names them. */
+const WEBHOOK_DELIVER: [string, string][] = [
+  ["web", "its chat in the web chat"],
+  ["last", "also where you wrote last"],
+];
+
+/** An agent's webhooks (issue #236): addresses outside systems call. */
+function Webhooks({ agentId }: { agentId: string }) {
+  const [hooks, setHooks] = useState<WebhookView[] | null>(null);
+  const [channels, setChannels] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [made, setMade] = useState<WebhookView | null>(null);
+  const [name, setName] = useState("");
+  const [instructions, setInstructions] = useState("");
+  const [deliver, setDeliver] = useState("web");
+  const load = useCallback(() => {
+    api.webhooks.list(agentId).then(setHooks, (e: unknown) =>
+      setError(e instanceof Error ? e.message : String(e)),
+    );
+    api.channels.access(agentId).then(
+      (view) => setChannels([...new Set(view.accounts.map((a) => a.channel))]),
+      () => setChannels([]),
+    );
+  }, [agentId]);
+  useEffect(load, [load]);
+  async function act(work: () => Promise<unknown>) {
+    setBusy(true);
+    setError(null);
+    try {
+      await work();
+      load();
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+  const muted = { color: "var(--color-body)" };
+  const options = [...WEBHOOK_DELIVER, ...channels.map((c): [string, string] => [c, `also to you on ${c}`])];
+  const origin = typeof window === "undefined" ? "" : window.location.origin;
+  if (!hooks) return error ? <p className="mt-10 text-sm" role="alert">{error}</p> : null;
+  return (
+    <section className="mt-10 card px-4 py-4" aria-labelledby="webhooks-title">
+      <h2 id="webhooks-title" className="display-h3 mb-2">
+        webhooks
+      </h2>
+      <p className="mb-3 text-sm" style={muted}>
+        An address that other systems (an alert, a CI build, a form) call to have the agent act on what they send.
+        What a call brings is treated as from someone other than you: calls that need you wait for your approval,
+        and your memory is not used. Each webhook has its own chat in the web chat. It is served under the
+        gateway&apos;s <span className="font-mono">listen</span> address (put it behind your proxy for outside
+        callers); a caller sends the secret as <span className="font-mono">Authorization: Bearer</span> or signs
+        the body with it (<span className="font-mono">X-Hub-Signature-256</span>, as GitHub does).
+      </p>
+      {error && (
+        <p className="mb-2 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
+          {error}
+        </p>
+      )}
+      {made && (
+        <div className="mb-4 rounded border px-3 py-2 text-sm" role="status">
+          <div>
+            Webhook <span className="font-mono">{made.name}</span>: call{" "}
+            <span className="font-mono wrap-anywhere">POST {made.path}</span>
+          </div>
+          <div>
+            Secret, shown once: <span className="font-mono wrap-anywhere">{made.secret}</span>
+          </div>
+          <div className="text-xs" style={muted}>
+            For example:{" "}
+            <span className="font-mono wrap-anywhere">
+              curl -X POST -H &quot;Authorization: Bearer {made.secret}&quot; --data &quot;hello&quot; http://
+              {"<listen>"}
+              {made.path}
+            </span>
+          </div>
+        </div>
+      )}
+      <div className="mb-4 flex flex-col gap-2 text-sm">
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            className="input"
+            style={{ maxWidth: 200 }}
+            placeholder="name, such as alerts"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+          <select className="input" style={{ maxWidth: 240 }} value={deliver} onChange={(e) => setDeliver(e.target.value)}>
+            {options.map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <textarea
+          className="input"
+          rows={2}
+          placeholder="what to do with a call, such as: tell me which service is down and why"
+          value={instructions}
+          onChange={(e) => setInstructions(e.target.value)}
+        />
+        <div>
+          <button
+            type="button"
+            className="btn-ghost"
+            disabled={busy || !name.trim()}
+            onClick={() =>
+              void act(async () => {
+                setMade(await api.webhooks.create(agentId, { name: name.trim(), instructions, deliver }));
+              }).then((ok) => {
+                if (ok) {
+                  setName("");
+                  setInstructions("");
+                }
+              })
+            }
+          >
+            make a webhook
+          </button>
+        </div>
+      </div>
+      {hooks.length === 0 ? (
+        <p className="text-sm" style={muted}>
+          None yet.
+        </p>
+      ) : (
+        <ul className="flex flex-col gap-3 text-sm">
+          {hooks.map((hook) => (
+            <li key={hook.id}>
+              <div>
+                <span className="font-mono">{hook.name}</span>{" "}
+                <span className="text-xs" style={muted}>
+                  POST {hook.path} ·{" "}
+                  {hook.last_called_at
+                    ? `called ${hook.calls} ${hook.calls === 1 ? "time" : "times"}, last ${new Date(hook.last_called_at).toLocaleString()}`
+                    : "not called yet"}
+                </span>
+              </div>
+              {hook.instructions && <div className="text-xs wrap-anywhere">{hook.instructions}</div>}
+              <div className="mt-1 flex flex-wrap items-center gap-2">
+                <select
+                  className="input"
+                  style={{ maxWidth: 240 }}
+                  value={hook.deliver}
+                  disabled={busy}
+                  onChange={(e) =>
+                    void act(() =>
+                      api.webhooks.update(agentId, hook.id, { instructions: hook.instructions, deliver: e.target.value }),
+                    )
+                  }
+                  aria-label="where its results go"
+                >
+                  {(options.some(([v]) => v === hook.deliver)
+                    ? options
+                    : [...options, [hook.deliver, hook.deliver] as [string, string]]
+                  ).map(([value, label]) => (
+                    <option key={value} value={value}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  disabled={busy}
+                  onClick={() => {
+                    if (window.confirm(`Delete the webhook ${hook.name}? Calls to it are refused from now on.`)) {
+                      void act(() => api.webhooks.remove(agentId, hook.id));
+                    }
+                  }}
+                >
+                  delete
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+      {origin && (
+        <p className="mt-3 text-xs" style={muted}>
+          The path is on the gateway&apos;s API address, not this page&apos;s ({origin}).
+        </p>
       )}
     </section>
   );

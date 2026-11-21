@@ -128,6 +128,47 @@ pub async fn heartbeat_chat(pool: &SqlitePool, scope: &str, title: &str) -> Resu
     Ok(id)
 }
 
+/// The chat of `scope` that keeps webhook `webhook_id`'s calls and what
+/// the agent made of them (issue #236): made, titled `title`, when it has
+/// none, or when the one it had was deleted or is another scope's. It is
+/// not made the active chat.
+pub async fn webhook_chat(
+    pool: &SqlitePool,
+    scope: &str,
+    webhook_id: &str,
+    title: &str,
+) -> Result<String> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let found: Option<(String,)> = sqlx::query_as(
+        "SELECT w.chat_id FROM webhook_chats w JOIN chats c ON c.id = w.chat_id          AND c.scope = w.scope WHERE w.webhook_id = ?1 AND w.scope = ?2",
+    )
+    .bind(webhook_id)
+    .bind(scope)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((id,)) = found {
+        tx.commit().await?;
+        return Ok(id);
+    }
+    let id = Uuid::now_v7().to_string();
+    sqlx::query("INSERT INTO chats (id, scope, title) VALUES (?1, ?2, ?3)")
+        .bind(&id)
+        .bind(scope)
+        .bind(title.chars().take(MAX_TITLE_CHARS).collect::<String>())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO webhook_chats (webhook_id, scope, chat_id) VALUES (?1, ?2, ?3)          ON CONFLICT (webhook_id) DO UPDATE SET scope = excluded.scope, chat_id = excluded.chat_id",
+    )
+    .bind(webhook_id)
+    .bind(scope)
+    .bind(&id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
 /// Record `reply` to turn `parent` of chat `chat`. The chat continues from
 /// it when its head is still `parent`, or a turn that followed it without
 /// the user saying anything (a scheduled task's result), after which it is
@@ -1554,6 +1595,50 @@ mod tests {
             .await
             .expect("chat");
         assert_ne!(again, kept, "a deleted chat is not made again under its id");
+    }
+
+    #[tokio::test]
+    async fn each_webhook_keeps_a_chat_of_its_own_in_the_scope_it_names() {
+        let pool = crate::agent::connect_in_memory().await.expect("db");
+        let talk = chat_for(&pool, "web", None, "hi").await.expect("chat");
+        let alerts = webhook_chat(&pool, "web", "w1", "Webhook: alerts")
+            .await
+            .expect("chat");
+        assert_ne!(alerts, talk);
+        assert_eq!(
+            webhook_chat(&pool, "web", "w1", "Webhook: alerts")
+                .await
+                .expect("chat"),
+            alerts
+        );
+        assert_ne!(
+            webhook_chat(&pool, "web", "w2", "Webhook: ci")
+                .await
+                .expect("chat"),
+            alerts,
+            "a chat per webhook"
+        );
+        assert_eq!(
+            existing_chat(&pool, "web", None)
+                .await
+                .expect("db")
+                .as_deref(),
+            Some(talk.as_str()),
+            "the active chat stays"
+        );
+        // Another scope (another owner) gets one of its own.
+        let moved = webhook_chat(&pool, "other", "w1", "Webhook: alerts")
+            .await
+            .expect("chat");
+        assert_ne!(moved, alerts);
+        assert!(delete_chat(&pool, "other", &moved).await.expect("delete"));
+        assert_ne!(
+            webhook_chat(&pool, "other", "w1", "Webhook: alerts")
+                .await
+                .expect("chat"),
+            moved,
+            "made again when deleted"
+        );
     }
 
     #[tokio::test]
