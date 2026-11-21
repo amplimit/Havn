@@ -1100,9 +1100,11 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
             ?why,
             "dm_policy: not forwarding a message from a sender who is not paired"
         );
-        refused(state, channel, agent_id, &inb, why).await;
         let limiter_key = format!("{channel}|{}|{}", inb.account_id, inb.sender_id);
         if state.dm_reject_limiter.should_send(&limiter_key) {
+            // As often as the sender is answered: a flood does not write
+            // on every message.
+            refused(state, channel, agent_id, &inb, why).await;
             let rejection = ChannelMessageContent::Text {
                 text: pairing_text(state, channel, &inb.account_id, why),
             };
@@ -1541,6 +1543,71 @@ enum Refusal {
     Paired,
 }
 
+/// Whether `inb`'s sender is let in to its `allowlist` account all the
+/// same: a refused code from someone admitted is not a stranger writing.
+async fn admitted_anyway(
+    state: &AppState,
+    channel: &str,
+    agent_id: havn_core::AgentId,
+    inb: &ChannelInbound,
+) -> bool {
+    let Some(account) = state
+        .channels
+        .get(channel)
+        .and_then(|entry| entry.accounts.iter().find(|a| a.id == inb.account_id))
+    else {
+        return true;
+    };
+    account.dm_policy != DmPolicy::Allowlist
+        || account.allow_from.iter().any(|s| s == &inb.sender_id)
+        || channel_access::is_allowed(&state.db, channel, &inb.account_id, &inb.sender_id)
+            .await
+            .unwrap_or(true)
+        || owner_linked(state, channel, agent_id, &inb.sender_id).await
+}
+
+/// `said` with what reads as a pairing code in it left out: only codes'
+/// hashes are kept.
+fn without_codes(said: &str) -> String {
+    static CODE: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    let Some(code) = CODE.get_or_init(|| {
+        // As codes are shown (four groups of four, with dashes), or written
+        // in one: no words of a sentence run together into one.
+        regex::Regex::new(
+            r"\b(?:[0-9A-Za-z]{4}[\-\u{2010}-\u{2015}\u{2212}\u{ff0d}]){3}[0-9A-Za-z]{4}\b|\b[0-9A-Za-z]{16}\b",
+        )
+        .ok()
+    }) else {
+        return said.to_string();
+    };
+    code.replace_all(said, |m: &regex::Captures<'_>| {
+        let written = &m[0];
+        // A word of sixteen letters is a word; a code has a digit or dashes
+        // nearly always.
+        let shaped = written.len() > 16 || written.chars().any(|c| c.is_ascii_digit());
+        if shaped && channel_access::normalize_code(written).is_some() {
+            "(a code)".to_string()
+        } else {
+            m[0].to_string()
+        }
+    })
+    .into_owned()
+}
+
+/// `text` on one line, with every ASCII punctuation mark escaped, so the
+/// Markdown a chat app reads in it makes no link or format of it.
+fn as_plain(text: &str) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::with_capacity(line.len());
+    for c in line.chars() {
+        if c.is_ascii_punctuation() {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Keep that `inb`'s sender was turned away for `why` (issue #231), and
 /// tell the agent's owner the first time in a day, in their own chat with
 /// the bot, with a button that lets the sender in. A code sent is not
@@ -1552,6 +1619,9 @@ async fn refused(
     inb: &ChannelInbound,
     why: Refusal,
 ) {
+    if admitted_anyway(state, channel, agent_id, inb).await {
+        return;
+    }
     let said = match (why, &inb.content) {
         (Refusal::InvalidCode | Refusal::TooManyTries | Refusal::LinkedElsewhere, _) => {
             "(a pairing code that did not work)".to_string()
@@ -1566,13 +1636,15 @@ async fn refused(
         (_, ChannelMessageContent::Audio { .. }) => "(a voice message)".to_string(),
         (_, _) => String::new(),
     };
+    let said = without_codes(&said);
+    let now = chrono::Utc::now();
     let notify = match channel_access::record_refusal(
         &state.db,
         channel,
         &inb.account_id,
         &inb.sender_id,
         &said,
-        chrono::Utc::now(),
+        now,
     )
     .await
     {
@@ -1606,10 +1678,12 @@ async fn refused(
         return;
     }
     let language = havn_core::Language::of_config(&agent.config);
-    let said: String = said
-        .chars()
-        .take(channel_access::REFUSAL_SAID_CHARS)
-        .collect();
+    let said = as_plain(
+        &said
+            .chars()
+            .take(channel_access::REFUSAL_SAID_CHARS)
+            .collect::<String>(),
+    );
     let data = format!("/allow {}", inb.sender_id);
     let fits = data.len() <= havn_core::MAX_BUTTON_DATA;
     let text = language.pick(
@@ -1657,6 +1731,12 @@ async fn refused(
         .await
     {
         warn!(channel, account = %inb.account_id, error = %e, "could not tell the owner about a refused sender");
+        return;
+    }
+    if let Err(e) =
+        channel_access::refusal_told(&state.db, channel, &inb.account_id, &inb.sender_id, now).await
+    {
+        warn!(channel, error = %e, "could not note that the owner was told");
     }
 }
 
@@ -2119,9 +2199,10 @@ pub struct AllowedView {
     pub since: chrono::DateTime<chrono::Utc>,
     /// Let in by a code rather than by the owner.
     pub by_code: bool,
-    /// The Havn user the sender is connected to.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub linked: Option<String>,
+    /// Connected to a Havn account.
+    pub connected: bool,
+    /// Connected to the owner's: removing it does not shut them out.
+    pub yours: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -2198,12 +2279,6 @@ async fn channel_access_view(
     agent: &agent_repo::Agent,
 ) -> Result<ChannelAccessView, crate::api::ApiError> {
     let internal = |e: havn_db::DbError| crate::api::ApiError::Internal(e.to_string());
-    let allowed = channel_access::list_allowed(&state.db)
-        .await
-        .map_err(internal)?;
-    let links = channel_access::list_links(&state.db, None)
-        .await
-        .map_err(internal)?;
     let now = chrono::Utc::now();
     let mut accounts = Vec::new();
     for (channel, account) in reaching(state, &agent.id) {
@@ -2233,6 +2308,22 @@ async fn channel_access_view(
                 said: r.said,
             })
             .collect();
+        let mut allowed = Vec::new();
+        for a in channel_access::list_allowed_on(&state.db, channel, &account.id)
+            .await
+            .map_err(internal)?
+        {
+            let link = channel_access::linked_user(&state.db, channel, &a.sender_id)
+                .await
+                .map_err(internal)?;
+            allowed.push(AllowedView {
+                yours: link.as_ref().is_some_and(|l| l.user_id == agent.owner_id),
+                connected: link.is_some(),
+                sender_id: a.sender_id,
+                since: a.registered_at,
+                by_code: a.invite_id.is_some(),
+            });
+        }
         accounts.push(AccountAccess {
             channel: channel.to_string(),
             account_id: account.id.clone(),
@@ -2241,19 +2332,7 @@ async fn channel_access_view(
                 DmPolicy::Open => "open",
             },
             allow_from: account.allow_from.clone(),
-            allowed: allowed
-                .iter()
-                .filter(|a| a.channel == channel && a.account_id == account.id)
-                .map(|a| AllowedView {
-                    sender_id: a.sender_id.clone(),
-                    since: a.registered_at,
-                    by_code: a.invite_id.is_some(),
-                    linked: links
-                        .iter()
-                        .find(|l| l.channel == channel && l.sender_id == a.sender_id)
-                        .map(|l| l.user_name.clone()),
-                })
-                .collect(),
+            allowed,
             invites,
             refused,
         });
@@ -3221,6 +3300,200 @@ mod tests {
             f.forwarded();
             f.send("tg:stranger", "thanks").await;
             assert_eq!(f.forwarded(), vec!["tg:stranger".to_string()]);
+        }
+
+        #[tokio::test]
+        async fn the_notice_is_plain_text_and_keeps_no_code() {
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let code = link_code(&f, "bot").await;
+            f.send("tg:owner", &format!("/start {code}")).await;
+            f.replies();
+            f.send(
+                "tg:stranger",
+                "[Sign in again](https://evil.example)\n# urgent my code ABCD-EFGH-JKMN-PQRS",
+            )
+            .await;
+            let notice = f
+                .replies()
+                .into_iter()
+                .find(|(to, _)| to == "tg:owner")
+                .map(|(_, text)| text)
+                .expect("notice");
+            assert!(
+                notice.contains(r"\[Sign in again\]\(https\:\/\/evil\.example\) \# urgent"),
+                "{notice}"
+            );
+            assert!(
+                !notice.contains("PQRS") && notice.contains(r"\(a code\)"),
+                "{notice}"
+            );
+            let refused = channel_access::list_refusals(&f.state.db, "telegram", "bot")
+                .await
+                .expect("refused");
+            assert!(
+                !refused[0].said.contains("PQRS") && refused[0].said.contains("(a code)"),
+                "{}",
+                refused[0].said
+            );
+        }
+
+        #[tokio::test]
+        async fn someone_let_in_is_never_listed_as_turned_away_nor_lets_others_in() {
+            let mut f = fixture(DmPolicy::Allowlist, &["tg:friend"]).await;
+            let code = link_code(&f, "bot").await;
+            f.send("tg:owner", &format!("/start {code}")).await;
+            f.replies();
+            // A code that reads as one but is no one's.
+            f.send("tg:friend", "/start ABCD-EFGH-JKMN-PQRS").await;
+            f.send("tg:friend", "/allow tg:stranger").await;
+            assert!(
+                !f.allowed("tg:stranger").await,
+                "only the owner lets people in"
+            );
+            let replies = f.replies();
+            assert!(
+                !replies.iter().any(|(to, _)| to == "tg:owner"),
+                "{replies:?}"
+            );
+            assert!(
+                replies
+                    .iter()
+                    .any(|(to, t)| to == "tg:friend" && t.contains("Only the agent's owner")),
+                "{replies:?}"
+            );
+            assert!(
+                channel_access::list_refusals(&f.state.db, "telegram", "bot")
+                    .await
+                    .expect("refused")
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn the_access_page_manages_only_this_agent_s_bots() {
+            use crate::api::ApiError;
+            use axum::extract::{Json, Path};
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let agent = agent_repo::list_for_owner(&f.state.db, f.owner)
+                .await
+                .expect("agents")
+                .remove(0);
+            let (owner, state) = (f.owner, f.state.clone());
+            let user = || crate::auth::AuthedUser {
+                id: owner,
+                display_name: "owner".into(),
+            };
+            let id = || Path(agent.id.to_string());
+            let who = |account: &str, sender: &str| SenderChange {
+                channel: "telegram".into(),
+                account_id: account.into(),
+                sender_id: sender.into(),
+            };
+            let st = || State(state.clone());
+
+            let view = channel_access_get(st(), user(), id())
+                .await
+                .expect("view")
+                .0;
+            assert_eq!(view.accounts.len(), 1, "other-bot is bound to no agent");
+            assert!(view.notify_unpaired);
+
+            for (account, sender, bad) in
+                [("other-bot", "tg:1", "not found"), ("bot", "tg 1", "bad")]
+            {
+                let err = channel_sender_allow(st(), user(), id(), Json(who(account, sender)))
+                    .await
+                    .expect_err(bad);
+                assert!(
+                    matches!(
+                        (&err, bad),
+                        (ApiError::NotFound, "not found") | (ApiError::BadRequest(_), "bad")
+                    ),
+                    "{err:?}"
+                );
+            }
+            let view = channel_sender_allow(st(), user(), id(), Json(who("bot", "tg:9")))
+                .await
+                .expect("allow")
+                .0;
+            assert!(
+                view.accounts[0]
+                    .allowed
+                    .iter()
+                    .any(|a| a.sender_id == "tg:9" && !a.by_code)
+            );
+            assert!(matches!(
+                channel_sender_remove(st(), user(), id(), Json(who("bot", "tg:nobody"))).await,
+                Err(ApiError::NotFound)
+            ));
+            assert!(
+                channel_sender_remove(st(), user(), id(), Json(who("bot", "tg:9")))
+                    .await
+                    .is_ok()
+            );
+
+            // A connect code is its user's: not listed, not revoked here.
+            let connect = channel_access::create_link_code(&f.state.db, "telegram", "bot", f.owner)
+                .await
+                .expect("code");
+            assert!(matches!(
+                channel_invite_revoke(
+                    st(),
+                    user(),
+                    Path((agent.id.to_string(), connect.invite.id.to_string()))
+                )
+                .await,
+                Err(ApiError::NotFound)
+            ));
+            let made = channel_invite_create(
+                st(),
+                user(),
+                id(),
+                Json(InviteCreate {
+                    channel: "telegram".into(),
+                    account_id: "bot".into(),
+                    hours: Some(1),
+                }),
+            )
+            .await
+            .expect("invite")
+            .0;
+            f.send("tg:invited", &format!("/start {}", made.code)).await;
+            let used = channel_access_get(st(), user(), id())
+                .await
+                .expect("view")
+                .0
+                .accounts[0]
+                .invites
+                .iter()
+                .find(|i| i.status == "used")
+                .map(|i| i.id.clone())
+                .expect("used");
+            assert!(matches!(
+                channel_invite_revoke(st(), user(), Path((agent.id.to_string(), used))).await,
+                Err(ApiError::BadRequest(_))
+            ));
+            assert!(
+                channel_invite_create(
+                    st(),
+                    user(),
+                    id(),
+                    Json(InviteCreate {
+                        channel: "telegram".into(),
+                        account_id: "other-bot".into(),
+                        hours: None,
+                    }),
+                )
+                .await
+                .is_err()
+            );
+
+            f.send("tg:stranger", "hi").await;
+            let view = channel_refusal_forget(st(), user(), id(), Json(who("bot", "tg:stranger")))
+                .await
+                .expect("forget")
+                .0;
+            assert!(view.accounts[0].refused.is_empty());
         }
 
         #[tokio::test]

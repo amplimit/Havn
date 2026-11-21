@@ -637,10 +637,20 @@ struct RefusalRow {
     said: String,
 }
 
+/// Notices about senders turned away one account sends its owner in an
+/// hour, at most: rotating ids cannot flood them.
+pub const REFUSAL_NOTICES_PER_HOUR: i64 = 5;
+
+/// Days a sender turned away is kept after they last wrote.
+pub const REFUSAL_KEPT_DAYS: i64 = 30;
+
 /// Note that `sender_id` was turned away by `(channel, account_id)` at
 /// `now`, having said `said`. Whether the owner should be told: the first
-/// time, and once a [`REFUSAL_NOTICE_EVERY`] after; telling is noted
-/// with it. The account keeps the [`REFUSALS_KEPT`] who wrote last.
+/// time, and once a [`REFUSAL_NOTICE_EVERY`] after, while the account sent
+/// fewer than [`REFUSAL_NOTICES_PER_HOUR`] in the last hour; a notice sent
+/// is noted with [`refusal_told`]. The account keeps the
+/// [`REFUSALS_KEPT`] who wrote last, and every one told about in the last
+/// day, for [`REFUSAL_KEPT_DAYS`].
 pub async fn record_refusal(
     pool: &SqlitePool,
     channel: &str,
@@ -651,38 +661,100 @@ pub async fn record_refusal(
 ) -> Result<bool> {
     let said: String = said.trim().chars().take(REFUSAL_SAID_CHARS).collect();
     let at = timestamp(now);
-    let due = timestamp(now - REFUSAL_NOTICE_EVERY);
+    let day_ago = timestamp(now - REFUSAL_NOTICE_EVERY);
+    let hour_ago = timestamp(now - Duration::hours(1));
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let (notify,): (bool,) = sqlx::query_as(
-        "INSERT INTO channel_refusals \
-             (channel, account_id, sender_id, first_at, last_at, said, notified_at) \
-         VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?4) \
+    let before: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT notified_at FROM channel_refusals \
+         WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(sender_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO channel_refusals (channel, account_id, sender_id, first_at, last_at, said) \
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5) \
          ON CONFLICT (channel, account_id, sender_id) DO UPDATE SET \
-             last_at = excluded.last_at, count = count + 1, said = excluded.said, \
-             notified_at = CASE WHEN notified_at IS NULL OR notified_at <= ?6 \
-                 THEN excluded.last_at ELSE notified_at END \
-         RETURNING notified_at = ?4",
+             last_at = excluded.last_at, count = count + 1, said = excluded.said",
     )
     .bind(channel)
     .bind(account_id)
     .bind(sender_id)
     .bind(&at)
     .bind(&said)
-    .bind(&due)
-    .fetch_one(&mut *tx)
+    .execute(&mut *tx)
     .await?;
-    sqlx::query(
-        "DELETE FROM channel_refusals WHERE channel = ?1 AND account_id = ?2 AND sender_id NOT IN \
-         (SELECT sender_id FROM channel_refusals WHERE channel = ?1 AND account_id = ?2 \
-          ORDER BY last_at DESC LIMIT ?3)",
+    if before.is_none() {
+        sqlx::query(
+            "DELETE FROM channel_refusals WHERE channel = ?1 AND account_id = ?2 \
+             AND (last_at < ?5 OR ((notified_at IS NULL OR notified_at <= ?4) AND sender_id NOT IN \
+                 (SELECT sender_id FROM channel_refusals WHERE channel = ?1 AND account_id = ?2 \
+                  ORDER BY last_at DESC LIMIT ?3)))",
+        )
+        .bind(channel)
+        .bind(account_id)
+        .bind(REFUSALS_KEPT)
+        .bind(&day_ago)
+        .bind(timestamp(now - Duration::days(REFUSAL_KEPT_DAYS)))
+        .execute(&mut *tx)
+        .await?;
+    }
+    let due = match &before {
+        None | Some((None,)) => true,
+        Some((Some(told),)) => told.as_str() <= day_ago.as_str(),
+    };
+    let (recent,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM channel_refusals \
+         WHERE channel = ?1 AND account_id = ?2 AND notified_at > ?3",
     )
     .bind(channel)
     .bind(account_id)
-    .bind(REFUSALS_KEPT)
-    .execute(&mut *tx)
+    .bind(&hour_ago)
+    .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(notify)
+    Ok(due && recent < REFUSAL_NOTICES_PER_HOUR)
+}
+
+/// Note that the owner was told about `sender_id` at `now`.
+pub async fn refusal_told(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    sender_id: &str,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE channel_refusals SET notified_at = ?4 \
+         WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(sender_id)
+    .bind(timestamp(now))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The senders admitted by invite or by the owner to `(channel,
+/// account_id)`, by registration.
+pub async fn list_allowed_on(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+) -> Result<Vec<AllowedSender>> {
+    let rows: Vec<AllowedRow> = sqlx::query_as(
+        "SELECT channel, account_id, sender_id, registered_at, invite_id FROM channel_allowlist \
+         WHERE channel = ?1 AND account_id = ?2 ORDER BY registered_at",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(AllowedSender::try_from).collect()
 }
 
 /// The senders `(channel, account_id)` turned away, who wrote last first.
@@ -831,46 +903,36 @@ mod tests {
     async fn senders_turned_away_are_kept_admitted_and_told_of_once_a_day() {
         let pool = crate::connect_in_memory().await.expect("db");
         let t0 = Utc::now();
-        assert!(
-            record_refusal(&pool, "telegram", "bot", "tg:1", "hi, it is Bob", t0)
-                .await
-                .expect("one")
-        );
-        assert!(
-            !record_refusal(
-                &pool,
-                "telegram",
-                "bot",
-                "tg:1",
-                "hello?",
-                t0 + Duration::hours(1)
-            )
+        let record = |sender: &'static str, said: &'static str, at: DateTime<Utc>| {
+            let pool = pool.clone();
+            async move {
+                record_refusal(&pool, "telegram", "bot", sender, said, at)
+                    .await
+                    .expect("record")
+            }
+        };
+        assert!(record("tg:1", "hi, it is Bob", t0).await);
+        assert!(record("tg:1", "hello?", t0).await, "due until told");
+        refusal_told(&pool, "telegram", "bot", "tg:1", t0)
             .await
-            .expect("two"),
+            .expect("told");
+        assert!(
+            !record("tg:1", "hello?", t0 + Duration::hours(1)).await,
             "told once"
         );
         assert!(
-            record_refusal(
-                &pool,
-                "telegram",
-                "bot",
-                "tg:1",
-                "anyone?",
-                t0 + Duration::hours(25)
-            )
-            .await
-            .expect("three"),
+            record("tg:1", "anyone?", t0 + Duration::hours(25)).await,
             "and again a day later"
         );
+
         let long = "x".repeat(REFUSAL_SAID_CHARS * 2);
         record_refusal(&pool, "telegram", "other", "tg:2", &long, t0)
             .await
             .expect("other");
-
         let refused = list_refusals(&pool, "telegram", "bot").await.expect("list");
         assert_eq!(refused.len(), 1);
         assert_eq!(refused[0].sender_id, "tg:1");
-        assert_eq!(refused[0].count, 3);
+        assert_eq!(refused[0].count, 4);
         assert_eq!(refused[0].said, "anyone?");
         assert_eq!(
             list_refusals(&pool, "telegram", "other")
@@ -909,6 +971,19 @@ mod tests {
                 .expect("list")
                 .is_empty()
         );
+        assert_eq!(
+            list_allowed_on(&pool, "telegram", "bot")
+                .await
+                .expect("on")
+                .len(),
+            1
+        );
+        assert!(
+            list_allowed_on(&pool, "telegram", "other")
+                .await
+                .expect("on")
+                .is_empty()
+        );
 
         assert!(
             forget_refusal(&pool, "telegram", "other", "tg:2")
@@ -920,27 +995,70 @@ mod tests {
                 .await
                 .expect("gone")
         );
+    }
 
-        for n in 0..(REFUSALS_KEPT + 5) {
-            record_refusal(
-                &pool,
-                "telegram",
-                "busy",
-                &format!("tg:{n}"),
-                "",
-                t0 + Duration::seconds(n),
-            )
-            .await
-            .expect("many");
+    #[tokio::test]
+    async fn rotating_senders_cannot_flood_the_owner() {
+        let pool = crate::connect_in_memory().await.expect("db");
+        let t0 = Utc::now();
+        let mut told = 0;
+        for n in 0..(REFUSALS_KEPT + 30) {
+            let sender = format!("tg:{n}");
+            let at = t0 + Duration::seconds(n);
+            if record_refusal(&pool, "telegram", "busy", &sender, "", at)
+                .await
+                .expect("record")
+            {
+                refusal_told(&pool, "telegram", "busy", &sender, at)
+                    .await
+                    .expect("told");
+                told += 1;
+            }
         }
+        assert_eq!(told, REFUSAL_NOTICES_PER_HOUR, "a few an hour");
         let kept = list_refusals(&pool, "telegram", "busy")
             .await
             .expect("list");
-        assert_eq!(kept.len() as i64, REFUSALS_KEPT);
+        assert_eq!(
+            kept.len() as i64,
+            REFUSALS_KEPT + REFUSAL_NOTICES_PER_HOUR,
+            "{}",
+            kept.len()
+        );
         assert_eq!(
             kept[0].sender_id,
-            format!("tg:{}", REFUSALS_KEPT + 4),
+            format!("tg:{}", REFUSALS_KEPT + 29),
             "the latest kept"
+        );
+        assert!(
+            kept.iter().any(|r| r.sender_id == "tg:0"),
+            "one told about is kept for the day, so it is not told again"
+        );
+        let later = t0 + Duration::hours(2);
+        assert!(
+            !record_refusal(&pool, "telegram", "busy", "tg:0", "", later)
+                .await
+                .expect("again")
+        );
+        assert!(
+            record_refusal(&pool, "telegram", "busy", "tg:new", "", later)
+                .await
+                .expect("new"),
+            "the hour's budget is back"
+        );
+        let month = t0 + Duration::days(REFUSAL_KEPT_DAYS + 1);
+        record_refusal(&pool, "telegram", "busy", "tg:late", "", month)
+            .await
+            .expect("late");
+        let kept = list_refusals(&pool, "telegram", "busy")
+            .await
+            .expect("list");
+        assert_eq!(
+            kept.iter()
+                .map(|r| r.sender_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tg:late"],
+            "the old ones are forgotten"
         );
     }
     use crate::connect_in_memory;

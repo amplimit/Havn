@@ -623,7 +623,7 @@ function BotAccess({ agentId }: { agentId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [made, setMade] = useState<PairingCode | null>(null);
-  const [hours, setHours] = useState(24);
+  const [hours, setHours] = useState<Record<string, number>>({});
   const [typed, setTyped] = useState<Record<string, string>>({});
   useEffect(() => {
     let cancelled = false;
@@ -653,9 +653,9 @@ function BotAccess({ agentId }: { agentId: string }) {
       setBusy(false);
     }
   }
-  async function invite(account: AccountAccess) {
+  async function invite(account: AccountAccess, lasts: number) {
     await run(async () => {
-      setMade(await api.channels.invite(agentId, account.channel, account.account_id, hours));
+      setMade(await api.channels.invite(agentId, account.channel, account.account_id, lasts));
       return api.channels.access(agentId);
     });
   }
@@ -683,7 +683,7 @@ function BotAccess({ agentId }: { agentId: string }) {
           {error}
         </p>
       )}
-      {view && (
+      {view && view.accounts.some((a) => a.dm_policy === "allowlist") && (
         <label className="mb-4 flex items-center gap-2 text-sm">
           <input
             type="checkbox"
@@ -691,8 +691,8 @@ function BotAccess({ agentId }: { agentId: string }) {
             disabled={busy}
             onChange={(e) => void setNotify(e.target.checked)}
           />
-          Tell me in my connected chat when someone not let in writes, with a button to let them in
-          (once a day per person)
+          Tell me in my connected chat with the bot when someone not let in writes, with a button to let
+          them in (once a day per person, a few an hour at most; you must have started that bot)
         </label>
       )}
       {made && (
@@ -736,8 +736,11 @@ function BotAccess({ agentId }: { agentId: string }) {
                   <select
                     className="input"
                     style={{ maxWidth: 140 }}
-                    value={hours}
-                    onChange={(e) => setHours(Number(e.target.value))}
+                    value={hours[key] ?? 24}
+                    onChange={(e) => {
+                      const lasts = Number(e.target.value);
+                      setHours((h) => ({ ...h, [key]: lasts }));
+                    }}
                     aria-label="how long the invite lasts"
                   >
                     {INVITE_HOURS.map(([h, label]) => (
@@ -746,7 +749,12 @@ function BotAccess({ agentId }: { agentId: string }) {
                       </option>
                     ))}
                   </select>
-                  <button type="button" className="btn-ghost" disabled={busy} onClick={() => void invite(account)}>
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    disabled={busy}
+                    onClick={() => void invite(account, hours[key] ?? 24)}
+                  >
                     make an invite code
                   </button>
                 </div>
@@ -756,7 +764,10 @@ function BotAccess({ agentId }: { agentId: string }) {
                     style={{ maxWidth: 220 }}
                     placeholder="sender id, such as tg:123"
                     value={typed[key] ?? ""}
-                    onChange={(e) => setTyped({ ...typed, [key]: e.target.value })}
+                    onChange={(e) => {
+                      const value = e.target.value;
+                      setTyped((t) => ({ ...t, [key]: value }));
+                    }}
                   />
                   <button
                     type="button"
@@ -764,7 +775,7 @@ function BotAccess({ agentId }: { agentId: string }) {
                     disabled={busy || !(typed[key] ?? "").trim()}
                     onClick={() =>
                       void run(() => api.channels.allow(agentId, who((typed[key] ?? "").trim()))).then((ok) => {
-                        if (ok) setTyped({ ...typed, [key]: "" });
+                        if (ok) setTyped((t) => ({ ...t, [key]: "" }));
                       })
                     }
                   >
@@ -832,17 +843,19 @@ function BotAccess({ agentId }: { agentId: string }) {
                       <li key={a.sender_id} className="flex flex-wrap items-center gap-2">
                         <span className="font-mono">{a.sender_id}</span>
                         <span className="text-xs" style={muted}>
-                          {a.linked ? `connected to ${a.linked}, ` : ""}
+                          {a.yours ? "you, connected; " : a.connected ? "connected to a Havn account, " : ""}
                           {a.by_code ? "by a code" : "by you"} since {when(a.since)}
                         </span>
-                        <button
-                          type="button"
-                          className="btn-ghost"
-                          disabled={busy}
-                          onClick={() => void run(() => api.channels.remove(agentId, who(a.sender_id)))}
-                        >
-                          remove
-                        </button>
+                        {!a.yours && (
+                          <button
+                            type="button"
+                            className="btn-ghost"
+                            disabled={busy}
+                            onClick={() => void run(() => api.channels.remove(agentId, who(a.sender_id)))}
+                          >
+                            remove
+                          </button>
+                        )}
                       </li>
                     ))}
                   </ul>
@@ -867,7 +880,11 @@ function BotAccess({ agentId }: { agentId: string }) {
                               type="button"
                               className="btn-ghost"
                               disabled={busy}
-                              onClick={() => void run(() => api.channels.revokeInvite(agentId, i.id))}
+                              onClick={() =>
+                                void run(() => api.channels.revokeInvite(agentId, i.id)).then((ok) => {
+                                  if (ok) setMade(null);
+                                })
+                              }
                             >
                               revoke
                             </button>

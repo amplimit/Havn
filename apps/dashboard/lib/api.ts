@@ -590,7 +590,8 @@ export type AccountAccess = {
   dm_policy: "allowlist" | "open";
   /** Listed in config.toml, removed only there. */
   allow_from: string[];
-  allowed: { sender_id: string; since: string; by_code: boolean; linked?: string }[];
+  /** `yours`: connected to the owner's Havn account, which removing does not shut out. */
+  allowed: { sender_id: string; since: string; by_code: boolean; connected: boolean; yours: boolean }[];
   invites: { id: string; status: "active" | "used" | "expired" | "revoked"; created_at: string; expires_at: string; used_by?: string }[];
   refused: { sender_id: string; first_at: string; last_at: string; count: number; said: string }[];
 };
