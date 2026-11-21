@@ -354,6 +354,25 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
+    fn an_image_a_tool_showed_stays_in_its_result() {
+        let mut r = hi();
+        let shown = serde_json::json!([
+            {"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "text", "text": "The image chart.png:"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+            ]},
+        ]);
+        r.messages = vec![AnthropicMessage {
+            role: "user".into(),
+            content: shown.clone(),
+        }];
+        let body = request_body(&r).expect("body");
+        let image = &body["messages"][0]["content"][0]["content"][1];
+        assert_eq!(image["type"], "image");
+        assert_eq!(image["source"]["data"], "AAAA");
+    }
+
+    #[test]
     fn the_shared_system_part_and_the_conversation_s_end_are_marked_for_the_cache() {
         let mut r = hi();
         r.system = Some("base prompt\n\n---\n\nthe time now".into());

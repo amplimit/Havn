@@ -314,6 +314,8 @@ pre_tool_use:
 
 Agents find files with `file_find` (by name, with a glob) and `file_search` (by content), which need no `shell`. They leave out the files that rules about `file_read` (or `file_*`) deny or ask about, matched against each file's path in the workspace, so a search cannot read what `file_read` may not; they never follow links, and skip `.git`, `.havn` and the agent's database.
 
+`view_image` shows the agent an image of its workspace (PNG, JPEG, GIF or WebP): a screenshot it took, a chart it drew, a picture it downloaded. The gateway reads the file, without following links, and puts it in the tool's result for Anthropic. For OpenAI-compatible providers it goes in a message right after the results, because their tool results carry no images; for Gemini it goes after the function's response. It is subject to the same limits as attached images: a model without `vision` gets a line saying so, and an image over the size or count limits is not shown. Later turns keep a line naming the image instead of the image itself, so the agent views it again when it needs it. Rules about `file_read` apply to it, and disabling `file_read` in a context disables it too.
+
 The agent settings page keeps a list of tools whose every call needs approval (`GET` and `PUT /agents/{id}/approvals`). Requests and decisions are audited as `tool.approval.requested` and `tool.approval.decided`, with who decided. Like `deny`, `ask` guards against model mistakes on matching inputs; the sandbox and permissions stay the enforcement.
 
 ## MCP servers
@@ -663,7 +665,7 @@ The agent's memory, workspace and machine are its owner's. In a conversation wit
 
 | Tools | The owner is asked |
 |---|---|
-| `shell`, `process`, `file_write`, `file_edit`, `skill_manage`, `send_file`, `set_timezone`, MCP tools | **before** the call runs, shown its whole input |
+| `shell`, `process`, `file_write`, `file_edit`, `view_image`, `skill_manage`, `send_file`, `set_timezone`, MCP tools | **before** the call runs, shown its whole input |
 | `memory_search`, `file_read`, `file_find`, `file_search` | **after** it ran, shown everything it gave (exactly what the model would get; past 4000 characters in all, the rest is left out of both, and both are told) |
 
 The person is told the agent checks with its owner. The owner sees who asked, what they wrote and the call in the web chat and, when they linked an account of that chat app, in their own chat with the same bot, and answers there:

@@ -77,7 +77,11 @@ impl ToolHook {
     fn covers(&self, tool: &str) -> bool {
         match self.tool.strip_suffix('*') {
             Some(prefix) => tool.starts_with(prefix),
-            None => self.tool == tool || (self.tool == "file_write" && tool == "file_edit"),
+            None => {
+                self.tool == tool
+                    || (self.tool == "file_write" && tool == "file_edit")
+                    || (self.tool == "file_read" && tool == "view_image")
+            }
         }
     }
 }

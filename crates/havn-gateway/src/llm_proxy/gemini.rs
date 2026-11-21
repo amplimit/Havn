@@ -283,9 +283,16 @@ fn translate_message_to_gemini(m: &AnthropicMessage) -> Result<Value, String> {
                 // sets name on tool_use, so this fallback only fires for
                 // odd direct callers.
                 let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                // An image a tool showed (issue #227) follows its response.
+                let mut shown = Vec::new();
                 let content = match block.get("content") {
                     Some(Value::String(s)) => json!({"result": s}),
                     Some(Value::Array(a)) => {
+                        shown.extend(
+                            a.iter()
+                                .filter(|p| super::openai::is_base64_image(p))
+                                .map(inline_data),
+                        );
                         let combined: String = a
                             .iter()
                             .filter_map(|p| p.get("text").and_then(Value::as_str))
@@ -299,16 +306,12 @@ fn translate_message_to_gemini(m: &AnthropicMessage) -> Result<Value, String> {
                 parts.push(json!({
                     "functionResponse": {"name": name, "response": content}
                 }));
+                parts.append(&mut shown);
             }
             "image" | "audio"
                 if block.pointer("/source/type").and_then(Value::as_str) == Some("base64") =>
             {
-                parts.push(json!({
-                    "inline_data": {
-                        "mime_type": block.pointer("/source/media_type").and_then(Value::as_str).unwrap_or("image/png"),
-                        "data": block.pointer("/source/data").and_then(Value::as_str).unwrap_or_default(),
-                    }
-                }));
+                parts.push(inline_data(block));
             }
             // A model's reasoning is not sent back to it.
             "thinking" | "redacted_thinking" => {}
@@ -323,6 +326,16 @@ fn translate_message_to_gemini(m: &AnthropicMessage) -> Result<Value, String> {
     }
 
     Ok(json!({"role": role, "parts": parts}))
+}
+
+/// Base64 block `block` (an image, audio) as an `inline_data` part.
+fn inline_data(block: &Value) -> Value {
+    json!({
+        "inline_data": {
+            "mime_type": block.pointer("/source/media_type").and_then(Value::as_str).unwrap_or("image/png"),
+            "data": block.pointer("/source/data").and_then(Value::as_str).unwrap_or_default(),
+        }
+    })
 }
 
 fn translate_tools_to_gemini(tools: &Value) -> Result<Value, String> {
@@ -645,6 +658,35 @@ mod tests {
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0]["role"], "user");
         assert_eq!(contents[0]["parts"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn an_image_a_tool_showed_follows_its_response() {
+        let r = req(
+            vec![AnthropicMessage {
+                role: "user".into(),
+                content: json!([
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_1",
+                        "content": [
+                            {"type": "text", "text": "The image chart.png:"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+                        ]
+                    }
+                ]),
+            }],
+            None,
+        );
+        let body = anthropic_to_gemini(&r).expect("translate");
+        let parts = body["contents"][0]["parts"].as_array().expect("parts");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0]["functionResponse"]["response"]["result"],
+            "The image chart.png:"
+        );
+        assert_eq!(parts[1]["inline_data"]["mime_type"], "image/png");
+        assert_eq!(parts[1]["inline_data"]["data"], "AAAA");
     }
 
     #[test]

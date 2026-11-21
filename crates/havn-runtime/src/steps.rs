@@ -255,7 +255,8 @@ fn without_reasoning(message: &Value) -> Value {
     message
 }
 
-/// Cut each tool result of `message` to `max` characters, saying so.
+/// Cut each tool result of `message` to `max` characters, saying so. An
+/// image a result showed (issue #227) becomes a line naming it.
 fn cut_results(message: &mut Value, max: usize) {
     let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
         return;
@@ -263,6 +264,19 @@ fn cut_results(message: &mut Value, max: usize) {
     for block in blocks {
         if block_type(block) != Some("tool_result") {
             continue;
+        }
+        if let Some(Value::Array(parts)) = block.get_mut("content") {
+            for part in parts.iter_mut().filter(|p| block_type(p) == Some("image")) {
+                let path = part
+                    .pointer("/source/path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                *part = json!({
+                    "type": "text",
+                    "text": format!("(The image {path} was shown here; view it again if it is needed.)"),
+                });
+            }
         }
         if let Some(Value::String(text)) = block.get_mut("content") {
             let total = text.chars().count();
@@ -325,6 +339,33 @@ mod tests {
             ]}),
             json!({"role": "assistant", "content": [{"type": "text", "text": "It says x."}]}),
         ]
+    }
+
+    #[test]
+    fn an_image_a_turn_looked_at_is_kept_as_its_name() {
+        let messages = vec![
+            json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "view_image", "input": {"path": "chart.png"}},
+            ]}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "is_error": false, "content": [
+                    {"type": "text", "text": "The image chart.png:"},
+                    {"type": "image", "source": {"type": "workspace", "path": "chart.png"}},
+                ]},
+            ]}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "A rising line."}]}),
+        ];
+        let kept: Vec<Value> =
+            serde_json::from_str(&of_turn(&messages, "A rising line.").expect("steps"))
+                .expect("json");
+        let parts = &kept[1]["content"][0]["content"];
+        assert_eq!(parts[0]["text"], "The image chart.png:");
+        assert_eq!(parts[1]["type"], "text");
+        assert!(
+            parts[1]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("chart.png"))
+        );
     }
 
     #[test]

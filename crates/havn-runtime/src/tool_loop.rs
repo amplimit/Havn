@@ -695,9 +695,10 @@ async fn execute_tool_use(
     } else {
         (call.await, None)
     };
-    let (text, is_error) = match result {
-        ToolResult::Ok(s) => (s, false),
-        ToolResult::Error(s) => (s, true),
+    let (text, is_error, image) = match result {
+        ToolResult::Ok(s) => (s, false, None),
+        ToolResult::Error(s) => (s, true, None),
+        ToolResult::Image { text, path } => (text, false, Some(path)),
     };
     let step = traced(context).then(|| {
         let input = block.get("input").cloned().unwrap_or(Value::Null);
@@ -720,10 +721,19 @@ async fn execute_tool_use(
         }
         (item, chars)
     });
+    // An image goes with the text as the gateway's reference to its file,
+    // which it reads and shows in its place (issue #227).
+    let content = match image {
+        Some(path) => serde_json::json!([
+            {"type": "text", "text": text},
+            {"type": "image", "source": {"type": "workspace", "path": path}},
+        ]),
+        None => Value::String(text),
+    };
     let result = serde_json::json!({
         "type": "tool_result",
         "tool_use_id": id,
-        "content": text,
+        "content": content,
         "is_error": is_error,
     });
     (result, step)
