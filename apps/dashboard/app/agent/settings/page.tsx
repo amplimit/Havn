@@ -861,7 +861,7 @@ function accessKey(a: Pick<Access, "scope" | "tool" | "input">): string {
 /** The scope of what is allowed in every conversation with the agent (issue #268). */
 const EVERY_CONVERSATION = "*";
 
-/** Tools that read, which can be allowed in every conversation. */
+/** Tools that read, which can be allowed in every conversation: those `Review::of` in the runtime's approvals.rs reviews after they run. */
 const READING_TOOLS = ["memory_search", "file_read", "file_find", "file_search"];
 
 /**
@@ -893,17 +893,23 @@ function AccessEditor({ agentId }: { agentId: string }) {
       cancelled = true;
     };
   }, [agentId]);
-  async function save(a: Pick<Access, "scope" | "tool" | "input">, rule: string | null) {
+  /** Whether it was saved. */
+  async function save(a: Pick<Access, "scope" | "tool" | "input">, rule: string | null): Promise<boolean> {
     setSaving(true);
     setError(null);
     try {
       show((await api.access.put(agentId, a, rule)).allowed);
+      return true;
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      return false;
     } finally {
       setSaving(false);
     }
   }
+  const allowedEverywhere = (allowed ?? []).some(
+    (a) => a.scope === EVERY_CONVERSATION && a.tool === everyTool && a.input === "",
+  );
   const muted = { color: "var(--color-body)" };
   return (
     <section className="mt-10 card px-4 py-4" aria-labelledby="access-title">
@@ -942,16 +948,21 @@ function AccessEditor({ agentId }: { agentId: string }) {
           <button
             type="button"
             className="btn-ghost"
-            disabled={saving}
+            disabled={saving || allowedEverywhere}
             onClick={() =>
-              void save({ scope: EVERY_CONVERSATION, tool: everyTool, input: "" }, everyRule).then(() =>
-                setEveryRule(""),
-              )
+              void save({ scope: EVERY_CONVERSATION, tool: everyTool, input: "" }, everyRule).then((saved) => {
+                if (saved) setEveryRule("");
+              })
             }
           >
             allow everywhere
           </button>
         </div>
+        {allowedEverywhere && (
+          <div className="mt-1 text-xs" style={muted}>
+            Already allowed everywhere: change its rule below.
+          </div>
+        )}
       </div>
       {error && (
         <p className="mb-2 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>

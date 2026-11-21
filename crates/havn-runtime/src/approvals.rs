@@ -283,15 +283,18 @@ async fn allowed(
         return Ok(None);
     }
     let failed = |e: havn_db::DbError| ToolResult::Error(format!("{tool} was not run: {e}"));
-    if let Some(rule) = access_of(db, scope, tool, key).await.map_err(failed)? {
-        return Ok(Some(rule));
+    let own = access_of(db, scope, tool, key).await.map_err(failed)?;
+    // The conversation's own rule stands; where it says nothing, the rule
+    // of every conversation does.
+    if own.as_deref().is_some_and(|rule| !rule.trim().is_empty())
+        || !(matches!(review, Review::Result) && key.is_empty())
+    {
+        return Ok(own);
     }
-    if matches!(review, Review::Result) && key.is_empty() {
-        return access_of(db, EVERY_CONVERSATION, tool, "")
-            .await
-            .map_err(failed);
-    }
-    Ok(None)
+    let every = access_of(db, EVERY_CONVERSATION, tool, "")
+        .await
+        .map_err(failed)?;
+    Ok(every.or(own))
 }
 
 /// Keep what the owner always allows from now on.
@@ -646,6 +649,16 @@ mod tests {
                 .as_deref(),
             Some("nothing about work"),
             "the conversation's own rule wins"
+        );
+        allow(&pool, "ch|telegram|bot|3", "memory_search", "", "")
+            .await
+            .expect("allow");
+        assert_eq!(
+            found("ch|telegram|bot|3", Review::Result, "memory_search", "")
+                .await
+                .as_deref(),
+            Some("no addresses"),
+            "where its own says nothing, the rule of every conversation stands"
         );
         assert_eq!(
             allowed(

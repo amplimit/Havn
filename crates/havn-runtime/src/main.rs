@@ -3007,33 +3007,71 @@ const ASKED_SHOWN_CHARS: usize = 500;
 /// `talk`, with the owner's rules for what not to say in `msg`'s
 /// conversation, given with what they always allow there (issues #249
 /// and #255).
+/// What is always allowed in conversation `scope`: its own entries, and
+/// those allowed in every conversation (issue #268), whose rule also
+/// stands where the conversation's own entry for the tool says nothing.
+async fn allowed_in(
+    pool: &sqlx::SqlitePool,
+    scope: &str,
+) -> havn_db::Result<Vec<conversations::Access>> {
+    let mut allowed = conversations::accesses(pool, Some(scope)).await?;
+    for every in conversations::accesses(pool, Some(conversations::EVERY_CONVERSATION)).await? {
+        match allowed
+            .iter_mut()
+            .find(|a| a.tool == every.tool && a.input == every.input)
+        {
+            Some(own) if own.rule.trim().is_empty() => own.rule = every.rule,
+            Some(_) => {}
+            None => allowed.push(every),
+        }
+    }
+    Ok(allowed)
+}
+
+/// Change what is always allowed in `scope` for `tool` with `input`: its
+/// rule, or with `None` take it back. Only what the owner allowed when
+/// asked can be changed, except that a reading tool may be allowed in
+/// every conversation (issue #268). Whether it was found or made, and
+/// whether it was made.
+async fn set_access(
+    pool: &sqlx::SqlitePool,
+    scope: &str,
+    tool: &str,
+    input: &str,
+    rule: Option<String>,
+) -> havn_db::Result<(bool, bool)> {
+    let every = scope == conversations::EVERY_CONVERSATION
+        && input.is_empty()
+        && matches!(approvals::Review::of(tool), Some(approvals::Review::Result));
+    match rule {
+        Some(rule) => {
+            let rule: String = rule.trim().chars().take(MAX_RULE_CHARS).collect();
+            let had = conversations::access_of(pool, scope, tool, input)
+                .await?
+                .is_some();
+            if had || every {
+                conversations::allow(pool, scope, tool, input, &rule).await?;
+            }
+            Ok((had || every, !had && every))
+        }
+        None => Ok((
+            conversations::revoke(pool, scope, tool, input).await?,
+            false,
+        )),
+    }
+}
+
 async fn with_rules(pool: &sqlx::SqlitePool, msg: &InboundMessage, talk: String) -> String {
     if msg.from_owner {
         return talk;
     }
-    let mut allowed = match conversations::accesses(pool, Some(&msg.channel_id)).await {
+    let allowed = match allowed_in(pool, &msg.channel_id).await {
         Ok(allowed) => allowed,
         Err(e) => {
             warn!(error = %e, "could not read the conversation's rules");
             return talk;
         }
     };
-    // What is allowed in every conversation (issue #268), where the
-    // conversation has no rule of its own for it.
-    match conversations::accesses(pool, Some(conversations::EVERY_CONVERSATION)).await {
-        Ok(every) => {
-            let own: Vec<(String, String)> = allowed
-                .iter()
-                .map(|a| (a.tool.clone(), a.input.clone()))
-                .collect();
-            allowed.extend(
-                every
-                    .into_iter()
-                    .filter(|a| !own.contains(&(a.tool.clone(), a.input.clone()))),
-            );
-        }
-        Err(e) => warn!(error = %e, "could not read the rules of every conversation"),
-    }
     let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let rules: Vec<String> = allowed
         .iter()
@@ -4004,9 +4042,11 @@ async fn answer_data_request(req: DataRequest, ctx: &Ctx) -> DataResponse {
                 Ok(serde_json::json!({ "found": found }))
             }
             DataQuery::Access => {
-                let allowed = conversations::accesses(&ctx.pool, None)
+                let mut allowed = conversations::accesses(&ctx.pool, None)
                     .await
                     .map_err(|e| e.to_string())?;
+                // What is allowed everywhere first: the list is cut to fit.
+                allowed.sort_by_key(|a| a.scope != conversations::EVERY_CONVERSATION);
                 Ok(serde_json::json!({
                     "allowed": rows_within_budget(allowed, MAX_DATA_REPLY_BYTES, false)?,
                 }))
@@ -4017,34 +4057,10 @@ async fn answer_data_request(req: DataRequest, ctx: &Ctx) -> DataResponse {
                 input,
                 rule,
             } => {
-                // A reading tool may be allowed in every conversation from
-                // the settings page (issue #268); the rest only changes what
-                // the owner allowed when asked.
-                let every = scope == conversations::EVERY_CONVERSATION
-                    && input.is_empty()
-                    && matches!(
-                        approvals::Review::of(&tool),
-                        Some(approvals::Review::Result)
-                    );
-                let found = match rule {
-                    Some(rule) => {
-                        let rule: String = rule.trim().chars().take(MAX_RULE_CHARS).collect();
-                        let had = conversations::access_of(&ctx.pool, &scope, &tool, &input)
-                            .await
-                            .map_err(|e| e.to_string())?
-                            .is_some();
-                        if had || every {
-                            conversations::allow(&ctx.pool, &scope, &tool, &input, &rule)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                        }
-                        had || every
-                    }
-                    None => conversations::revoke(&ctx.pool, &scope, &tool, &input)
-                        .await
-                        .map_err(|e| e.to_string())?,
-                };
-                Ok(serde_json::json!({ "found": found }))
+                let (found, created) = set_access(&ctx.pool, &scope, &tool, &input, rule)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({ "found": found, "created": created }))
             }
             DataQuery::UndoMemory { key, before, after } => {
                 let undone = memory::undo(&ctx.pool, &key, after.as_deref(), before.as_deref())
@@ -4308,6 +4324,82 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn only_a_reading_tool_can_be_allowed_in_every_conversation() {
+        let pool = havn_db::agent::connect_in_memory().await.expect("db");
+        let every = conversations::EVERY_CONVERSATION;
+        let set =
+            |scope: &'static str, tool: &'static str, input: &'static str, rule: Option<&str>| {
+                let pool = pool.clone();
+                let rule = rule.map(str::to_string);
+                async move {
+                    set_access(&pool, scope, tool, input, rule)
+                        .await
+                        .expect("set")
+                }
+            };
+        assert_eq!(
+            set(every, "memory_search", "", Some("no addresses")).await,
+            (true, true)
+        );
+        assert_eq!(
+            set(every, "memory_search", "", Some("no work")).await,
+            (true, false),
+            "changing its rule makes nothing new"
+        );
+        for (tool, input) in [
+            ("shell", ""),
+            ("file_write", ""),
+            ("mcp__fs__write_file", ""),
+            ("no_such_tool", ""),
+            ("memory_search", "{\"query\":\"x\"}"),
+        ] {
+            assert_eq!(
+                set(every, tool, input, Some("")).await,
+                (false, false),
+                "{tool} {input}"
+            );
+        }
+        assert_eq!(
+            set("ch|telegram|bot|1", "memory_search", "", Some("")).await,
+            (false, false),
+            "a conversation's entry is made by the owner's answer only"
+        );
+
+        // What a conversation is given: its own entry, and every
+        // conversation's where it has none or its own says nothing.
+        conversations::allow(&pool, "ch|telegram|bot|2", "memory_search", "", "")
+            .await
+            .expect("allow");
+        conversations::allow(
+            &pool,
+            "ch|telegram|bot|3",
+            "memory_search",
+            "",
+            "only first names",
+        )
+        .await
+        .expect("allow");
+        let rules = |scope: &'static str| {
+            let pool = pool.clone();
+            async move {
+                allowed_in(&pool, scope)
+                    .await
+                    .expect("allowed")
+                    .into_iter()
+                    .map(|a| (a.tool, a.rule))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let tool = |rule: &str| vec![("memory_search".to_string(), rule.to_string())];
+        assert_eq!(rules("ch|telegram|bot|1").await, tool("no work"));
+        assert_eq!(rules("ch|telegram|bot|2").await, tool("no work"));
+        assert_eq!(rules("ch|telegram|bot|3").await, tool("only first names"));
+
+        assert_eq!(set(every, "memory_search", "", None).await, (true, false));
+        assert!(rules("ch|telegram|bot|1").await.is_empty());
+    }
 
     #[test]
     fn a_models_answer_becomes_a_clean_title() {
