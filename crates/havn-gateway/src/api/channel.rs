@@ -1085,6 +1085,7 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
                 .channel_router
                 .note_sees_all(
                     crate::channel_router::AccountKey::new(channel, &inb.account_id),
+                    &g.id,
                     sees_all,
                 )
                 .await;
@@ -1936,15 +1937,15 @@ fn in_group(
     out
 }
 
-/// Groups kept as used while their account was open, so each is written
-/// once, not on every message.
-/// Told to the owner who lets a group in while the bot does not see every
-/// message in groups.
+/// Told to the owner who lets a group in where the bot does not see every
+/// message.
 pub(crate) const UNSEEN_MENTIONS: [&str; 2] = [
-    "The bot does not see every message in groups, so a mention that is not a reply does not reach it. On Telegram, turn its privacy mode off with BotFather (/setprivacy), then remove the bot from the group and add it again.",
-    "这个机器人在群里看不到所有消息，所以单纯 @ 它的消息它收不到。在 Telegram 上，用 BotFather 的 /setprivacy 关掉它的隐私模式，然后把它移出群再重新拉进来。",
+    "The bot does not see every message in that group, so a mention that is not a reply does not reach it. On Telegram, turn its privacy mode off with BotFather (/setprivacy), then remove the bot from the group and add it again.",
+    "这个机器人在那个群里看不到所有消息，所以单纯 @ 它的消息它收不到。在 Telegram 上，用 BotFather 的 /setprivacy 关掉它的隐私模式，然后把它移出群再重新拉进来。",
 ];
 
+/// Groups kept as used while their account was open, so each is written
+/// once, not on every message.
 static OPEN_GROUPS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
@@ -2342,21 +2343,33 @@ pub(crate) async fn admit_group_of(
         let language = havn_core::Language::of_config(&agent.config);
         let sees_all = state
             .channel_router
-            .sees_all(&crate::channel_router::AccountKey::new(channel, account_id))
+            .sees_all(
+                &crate::channel_router::AccountKey::new(channel, account_id),
+                group_id,
+            )
             .await;
+        // A mention is named only where it is known to reach the bot; a
+        // reply and a command reach it in any case.
+        let command = state
+            .channels
+            .get(channel)
+            .and_then(|entry| entry.accounts.iter().find(|a| a.id == account_id))
+            .and_then(|a| a.bot_username.as_deref())
+            .map_or_else(|| "/help".to_string(), |bot| format!("/help@{bot}"));
         let welcome = ChannelMessageContent::Text {
-            text: if sees_all == Some(false) {
-                language.pick(
-                    "This group can use the bot now: reply to one of its messages, or send it a command.",
-                    "这个群现在可以使用这个机器人了：回复它的消息，或者给它发命令。",
-                )
+            text: if sees_all == Some(true) {
+                language
+                    .pick(
+                        "This group can use the bot now: mention it, or reply to it.",
+                        "这个群现在可以使用这个机器人了：@ 它，或者回复它的消息。",
+                    )
+                    .to_string()
             } else {
                 language.pick(
-                    "This group can use the bot now: mention it, or reply to it.",
-                    "这个群现在可以使用这个机器人了：@ 它，或者回复它的消息。",
+                    format!("This group can use the bot now: reply to one of its messages, or send it a command such as {command}."),
+                    format!("这个群现在可以使用这个机器人了：回复它的消息，或者给它发命令，比如 {command}。"),
                 )
-            }
-            .into(),
+            },
         };
         if on
             && let Err(e) = state
@@ -2831,9 +2844,6 @@ pub struct AccountAccess {
     pub allow_groups: Vec<String>,
     /// Groups let in by the owner, or used while the account was open.
     pub groups: Vec<GroupView>,
-    /// Whether the bot sees every message in its groups, as its adapter
-    /// last said; `None` before it said.
-    pub sees_all: Option<bool>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -2843,6 +2853,9 @@ pub struct GroupView {
     /// `owner`, or `open`: used while the account was open.
     pub source: String,
     pub since: chrono::DateTime<chrono::Utc>,
+    /// Whether the bot sees every message there, as its adapter last said;
+    /// `None` when it has not said since the gateway started.
+    pub sees_all: Option<bool>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -2979,6 +2992,13 @@ async fn channel_access_view(
                 by_code: a.invite_id.is_some(),
             });
         }
+        let seeing = state
+            .channel_router
+            .groups_seeing(&crate::channel_router::AccountKey::new(
+                channel,
+                &account.id,
+            ))
+            .await;
         accounts.push(AccountAccess {
             channel: channel.to_string(),
             account_id: account.id.clone(),
@@ -2996,18 +3016,12 @@ async fn channel_access_view(
                 crate::config::GroupPolicy::Open => "open",
             },
             allow_groups: account.allow_groups.clone(),
-            sees_all: state
-                .channel_router
-                .sees_all(&crate::channel_router::AccountKey::new(
-                    channel,
-                    &account.id,
-                ))
-                .await,
             groups: channel_access::list_groups_on(&state.db, channel, &account.id)
                 .await
                 .map_err(internal)?
                 .into_iter()
                 .map(|g| GroupView {
+                    sees_all: seeing.get(&g.group_id).copied(),
                     group_id: g.group_id,
                     title: g.title,
                     source: g.source,
@@ -4372,36 +4386,70 @@ mod tests {
             f.replies();
             f.groups(GroupPolicy::Allowlist, &[]);
             let key = crate::channel_router::AccountKey::new("telegram", "bot");
-            assert_eq!(f.state.channel_router.sees_all(&key).await, None);
+            let say = |group: &str, text: &str, addressed: bool, sees_all: Option<bool>| {
+                let mut inb = text_from("tg:ann", text);
+                inb.group = Some(havn_proto::channel::ChannelGroup {
+                    id: group.into(),
+                    title: Some("Team".into()),
+                    sender_name: Some("Ann".into()),
+                    addressed,
+                    sees_all,
+                });
+                inb
+            };
+            // Allow `group` as the owner: what the owner and the group are told.
+            async fn allow(f: &mut Fixture, group: &str) -> (String, String) {
+                f.send("tg:owner", &format!("/allow group {group}")).await;
+                let replies = f.replies();
+                let told = |to: &str| {
+                    replies
+                        .iter()
+                        .find(|(t, _)| t == to)
+                        .map(|(_, text)| text.clone())
+                        .unwrap_or_else(|| panic!("{to} is told: {replies:?}"))
+                };
+                (told("tg:owner"), told(group))
+            }
 
-            let mut inb = text_from("tg:ann", "/help@bot");
-            inb.group = Some(havn_proto::channel::ChannelGroup {
-                id: "tg:-100".into(),
-                title: Some("Team".into()),
-                sender_name: Some("Ann".into()),
-                addressed: true,
-                sees_all: Some(false),
-            });
-            handle_inbound(&f.state, "telegram", inb).await;
-            assert_eq!(f.state.channel_router.sees_all(&key).await, Some(false));
+            // In privacy mode: told how to reach it, and how to turn it off.
+            handle_inbound(
+                &f.state,
+                "telegram",
+                say("tg:-100", "/help@bot", true, Some(false)),
+            )
+            .await;
             f.replies();
-
-            f.send("tg:owner", "/allow group tg:-100").await;
-            let replies = f.replies();
-            let to_owner = replies
-                .iter()
-                .find(|(to, _)| to == "tg:owner")
-                .map(|(_, t)| t.clone())
-                .expect("the owner is answered");
+            let (owner, welcome) = allow(&mut f, "tg:-100").await;
             assert!(
-                to_owner.contains("can use this bot now") && to_owner.contains("/setprivacy"),
-                "{to_owner}"
+                owner.contains("can use this bot now") && owner.contains("/setprivacy"),
+                "{owner}"
             );
-            let welcome = replies
-                .iter()
-                .find(|(to, _)| to == "tg:-100")
-                .map(|(_, t)| t.clone())
-                .expect("the group is told");
+            assert!(
+                welcome.contains("reply to one of its messages")
+                    && welcome.contains("/help")
+                    && !welcome.contains("mention"),
+                "{welcome}"
+            );
+
+            // Another group, where the bot sees every message: a mention is named.
+            handle_inbound(
+                &f.state,
+                "telegram",
+                say("tg:-200", "talk among ourselves", false, Some(true)),
+            )
+            .await;
+            let (owner, welcome) = allow(&mut f, "tg:-200").await;
+            assert!(!owner.contains("/setprivacy"), "{owner}");
+            assert!(welcome.contains("mention it"), "{welcome}");
+            assert_eq!(
+                f.state.channel_router.sees_all(&key, "tg:-100").await,
+                Some(false),
+                "kept per group"
+            );
+
+            // Not known (the gateway restarted, say): what works in any mode, and no advice.
+            let (owner, welcome) = allow(&mut f, "tg:-300").await;
+            assert!(!owner.contains("/setprivacy"), "{owner}");
             assert!(
                 welcome.contains("reply to one of its messages") && !welcome.contains("mention"),
                 "{welcome}"
@@ -4414,30 +4462,17 @@ mod tests {
                 .expect("agent")
                 .expect("agent");
             let view = channel_access_view(&f.state, &agent).await.expect("view");
-            assert_eq!(view.accounts[0].sees_all, Some(false));
-
-            // Once the bot sees every message, a mention is named again.
-            let mut inb = text_from("tg:ann", "talk among ourselves");
-            inb.group = Some(havn_proto::channel::ChannelGroup {
-                id: "tg:-200".into(),
-                title: Some("Other".into()),
-                sender_name: Some("Ann".into()),
-                addressed: false,
-                sees_all: Some(true),
-            });
-            handle_inbound(&f.state, "telegram", inb).await;
-            assert_eq!(f.state.channel_router.sees_all(&key).await, Some(true));
-            f.send("tg:owner", "/allow group tg:-200").await;
-            let replies = f.replies();
-            assert!(
-                replies
+            let seen = |id: &str| {
+                view.accounts[0]
+                    .groups
                     .iter()
-                    .any(|(to, t)| to == "tg:-200" && t.contains("mention it")),
-                "{replies:?}"
-            );
-            assert!(
-                replies.iter().all(|(_, t)| !t.contains("/setprivacy")),
-                "{replies:?}"
+                    .find(|g| g.group_id == id)
+                    .map(|g| g.sees_all)
+                    .expect("listed")
+            };
+            assert_eq!(
+                (seen("tg:-100"), seen("tg:-200"), seen("tg:-300")),
+                (Some(false), Some(true), None)
             );
         }
 

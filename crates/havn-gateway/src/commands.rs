@@ -860,7 +860,10 @@ async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
             Ok(true) => {
                 let sees_all = state
                     .channel_router
-                    .sees_all(&crate::channel_router::AccountKey::new(channel, account_id))
+                    .sees_all(
+                        &crate::channel_router::AccountKey::new(channel, account_id),
+                        sender,
+                    )
                     .await;
                 let hint = if sees_all == Some(false) {
                     format!(" {}", language.of(crate::api::channel::UNSEEN_MENTIONS))
