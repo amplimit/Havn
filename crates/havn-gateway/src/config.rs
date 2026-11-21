@@ -233,6 +233,18 @@ pub enum GroupPolicy {
     Open,
 }
 
+impl GroupPolicy {
+    /// As config.toml writes it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Allowlist => "allowlist",
+            Self::Open => "open",
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DmPolicy {
@@ -245,6 +257,17 @@ pub enum DmPolicy {
     /// personal bots where the operator controls visibility at the
     /// platform level (e.g. Telegram bot handle is private).
     Open,
+}
+
+impl DmPolicy {
+    /// As config.toml writes it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Allowlist => "allowlist",
+            Self::Open => "open",
+        }
+    }
 }
 
 /// Why senders admitted by invite to `(channel, account_id)` are not in
@@ -445,6 +468,53 @@ impl Default for AttachmentLimits {
             file_chars: 30_000,
         }
     }
+}
+
+/// Set the policies given of the account `account_id` of `channel` in the
+/// config file at `path` (issue #273), keeping the rest of the file as it
+/// is: `dm_policy` for private chats, `group_policy` for groups.
+pub fn write_account_policy(
+    path: &std::path::Path,
+    channel: &str,
+    account_id: &str,
+    dm_policy: Option<DmPolicy>,
+    group_policy: Option<GroupPolicy>,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let target =
+        std::fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?;
+    let raw = std::fs::read_to_string(&target)
+        .with_context(|| format!("reading {}", target.display()))?;
+    let mut doc: toml_edit::DocumentMut = raw
+        .parse()
+        .with_context(|| format!("parsing {}", target.display()))?;
+    let accounts = doc
+        .get_mut("channels")
+        .and_then(|channels| channels.get_mut(channel))
+        .and_then(|entry| entry.get_mut("accounts"))
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has no [[channels.{channel}.accounts]] tables to change; edit it by hand",
+                target.display()
+            )
+        })?;
+    let account = accounts
+        .iter_mut()
+        .find(|a| a.get("id").and_then(toml_edit::Item::as_str) == Some(account_id))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has no account {account_id} under [[channels.{channel}.accounts]]",
+                target.display()
+            )
+        })?;
+    if let Some(policy) = dm_policy {
+        account["dm_policy"] = toml_edit::value(policy.name());
+    }
+    if let Some(policy) = group_policy {
+        account["group_policy"] = toml_edit::value(policy.name());
+    }
+    crate::model_catalog::replace_file(&target, doc.to_string().as_bytes())
 }
 
 /// Set `[workspace] browse` in the config file at `path`, keeping the rest
@@ -1423,5 +1493,37 @@ mod tests {
         ] {
             assert!(!is_plaintext_to_another_host(local), "{local}");
         }
+    }
+
+    #[test]
+    fn a_bot_s_policies_are_written_to_config_toml_keeping_the_rest() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# mine\n[channels.telegram]\n[[channels.telegram.accounts]]\nid = \"other\"\nadapter_token_ref = \"secret:channel:telegram:other\"\n\n[[channels.telegram.accounts]]\nid = \"bot\" # the team's\nadapter_token_ref = \"secret:channel:telegram:bot\"\ndm_policy = \"allowlist\"\n",
+        )
+        .expect("write");
+        write_account_policy(&path, "telegram", "bot", None, Some(GroupPolicy::Allowlist))
+            .expect("groups");
+        write_account_policy(&path, "telegram", "bot", Some(DmPolicy::Open), None).expect("dm");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            text.contains("# mine") && text.contains("# the team's"),
+            "{text}"
+        );
+        let parsed: GatewayConfig = toml::from_str(&text).expect("parse");
+        let accounts = &parsed.channels["telegram"].accounts;
+        assert_eq!(
+            accounts[0].group_policy,
+            GroupPolicy::Off,
+            "the other account is as it was"
+        );
+        assert_eq!(accounts[1].group_policy, GroupPolicy::Allowlist);
+        assert_eq!(accounts[1].dm_policy, DmPolicy::Open);
+        assert!(
+            write_account_policy(&path, "telegram", "gone", Some(DmPolicy::Open), None).is_err()
+        );
+        assert!(write_account_policy(&path, "slack", "bot", Some(DmPolicy::Open), None).is_err());
     }
 }

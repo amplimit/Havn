@@ -645,8 +645,8 @@ async fn authenticate(
     // credential row (defence against an operator who manually
     // inserted a `channel:*` row without binding it to a config-
     // declared account).
-    let account = state
-        .channels
+    let channels = state.channels.load_full();
+    let account = channels
         .get(&q.channel)
         .and_then(|entry| entry.accounts.iter().find(|a| a.id == q.account))
         .ok_or_else(|| {
@@ -1602,6 +1602,7 @@ async fn is_admin(
 ) -> bool {
     let listed = state
         .channels
+        .load_full()
         .get(channel)
         .and_then(|entry| entry.accounts.iter().find(|a| a.id == account_id))
         .is_some_and(|acct| acct.admins.iter().any(|id| id == sender_id));
@@ -1666,8 +1667,8 @@ async fn admitted_anyway(
     agent_id: havn_core::AgentId,
     inb: &ChannelInbound,
 ) -> bool {
-    let Some(account) = state
-        .channels
+    let channels = state.channels.load_full();
+    let Some(account) = channels
         .get(channel)
         .and_then(|entry| entry.accounts.iter().find(|a| a.id == inb.account_id))
     else {
@@ -1950,8 +1951,8 @@ static OPEN_GROUPS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashS
 /// Whether group `group` may use `(channel, account_id)`, without
 /// keeping anything: for a file one of its members sends.
 async fn group_may(state: &AppState, channel: &str, account_id: &str, group: &str) -> bool {
-    let Some(account) = state
-        .channels
+    let channels = state.channels.load_full();
+    let Some(account) = channels
         .get(channel)
         .and_then(|entry| entry.accounts.iter().find(|a| a.id == account_id))
     else {
@@ -1979,8 +1980,8 @@ async fn group_admitted(
     inb: &ChannelInbound,
     g: &havn_proto::channel::ChannelGroup,
 ) -> bool {
-    let Some(account) = state
-        .channels
+    let channels = state.channels.load_full();
+    let Some(account) = channels
         .get(channel)
         .and_then(|entry| entry.accounts.iter().find(|a| a.id == inb.account_id))
     else {
@@ -1990,6 +1991,11 @@ async fn group_admitted(
     match account.group_policy {
         crate::config::GroupPolicy::Off => {
             tracing::debug!(channel, account = %inb.account_id, group = %g.id, "group_policy is off: dropping a group message");
+            // One that asks for the bot is told, and so is the owner, who
+            // can turn groups on (issue #273).
+            if g.addressed {
+                group_refused(state, channel, agent_id, inb, g, true).await;
+            }
             false
         }
         crate::config::GroupPolicy::Open => {
@@ -2032,7 +2038,7 @@ async fn group_admitted(
                 Ok(false) => {
                     // Talk not to the bot is no one asking for it.
                     if g.addressed {
-                        group_refused(state, channel, agent_id, inb, g).await;
+                        group_refused(state, channel, agent_id, inb, g, false).await;
                     }
                     false
                 }
@@ -2046,13 +2052,15 @@ async fn group_admitted(
 }
 
 /// Turn away group `g`: answer one that addresses the bot, keep it for
-/// the owner, and tell them, with a button that lets the group in.
+/// the owner, and tell them, with a button that lets the group in; or,
+/// while groups are `off` for the account, how to turn them on.
 async fn group_refused(
     state: &AppState,
     channel: &str,
     agent_id: havn_core::AgentId,
     inb: &ChannelInbound,
     g: &havn_proto::channel::ChannelGroup,
+    off: bool,
 ) {
     let key = format!("{channel}|{}|{}", inb.account_id, g.id);
     if !state.dm_reject_limiter.should_send(&key) {
@@ -2067,10 +2075,17 @@ async fn group_refused(
             &inb.account_id,
             &g.id,
             &inb.channel_message_id,
-            language.pick(
-                "This group is not let in to use this bot yet; its owner can let it in.",
-                "这个群还没被放行使用这个机器人，需要机器人的所有者放行。",
-            ),
+            if off {
+                language.pick(
+                    "This bot is not used in groups yet; its owner can turn groups on.",
+                    "这个机器人还没开启群聊，需要机器人的所有者开启。",
+                )
+            } else {
+                language.pick(
+                    "This group is not let in to use this bot yet; its owner can let it in.",
+                    "这个群还没被放行使用这个机器人，需要机器人的所有者放行。",
+                )
+            },
         )
         .await;
     }
@@ -2099,6 +2114,7 @@ async fn group_refused(
                 agent_id,
                 &g.id,
                 Some(title),
+                off,
                 &said,
                 now,
             )
@@ -2165,6 +2181,7 @@ async fn refused(
         agent_id,
         &inb.sender_id,
         None,
+        false,
         &said,
         now,
     )
@@ -2184,6 +2201,7 @@ async fn tell_owner(
     agent_id: havn_core::AgentId,
     about: &str,
     group: Option<&str>,
+    groups_off: bool,
     said: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) {
@@ -2218,7 +2236,8 @@ async fn tell_owner(
         Some(_) => format!("/allow group {about}"),
         None => format!("/allow {about}"),
     };
-    let fits = data.len() <= havn_core::MAX_BUTTON_DATA;
+    // While groups are off, letting one in does nothing yet.
+    let fits = data.len() <= havn_core::MAX_BUTTON_DATA && !groups_off;
     let text = match group {
         None => language.pick(
             format!(
@@ -2240,6 +2259,19 @@ async fn tell_owner(
                 }
             ),
         ),
+        Some(title) if groups_off => {
+            let title = as_plain(title);
+            language.pick(
+                format!(
+                    "The group \"{title}\" ({about}) wrote to this bot, but groups are off for it, so {} did not get this: {said}. Turn groups on for the bot on the agent's settings page, under who can reach the bot, then let the group in.",
+                    agent.name
+                ),
+                format!(
+                    "群「{title}」（{about}）给这个机器人发了消息，但它没有开启群聊，所以 {} 没有收到：{said}。可以在 agent 设置页的“谁能联系机器人”里开启群聊，再放行这个群。",
+                    agent.name
+                ),
+            )
+        }
         Some(title) => {
             let title = as_plain(title);
             language.pick(
@@ -2320,6 +2352,7 @@ pub(crate) async fn admit_group_of(
     .await?;
     let on = state
         .channels
+        .load_full()
         .get(channel)
         .and_then(|entry| entry.accounts.iter().find(|a| a.id == account_id))
         .is_some_and(|a| a.group_policy != crate::config::GroupPolicy::Off);
@@ -2350,6 +2383,7 @@ pub(crate) async fn admit_group_of(
         // reply and a command reach it in any case.
         let command = state
             .channels
+            .load_full()
             .get(channel)
             .and_then(|entry| entry.accounts.iter().find(|a| a.id == account_id))
             .and_then(|a| a.bot_username.as_deref())
@@ -2517,8 +2551,8 @@ async fn sender_access(
     agent_id: havn_core::AgentId,
     inb: &ChannelInbound,
 ) -> SenderAccess {
-    let Some(acct) = state
-        .channels
+    let channels = state.channels.load_full();
+    let Some(acct) = channels
         .get(channel)
         .and_then(|entry| entry.accounts.iter().find(|a| a.id == inb.account_id))
     else {
@@ -2780,8 +2814,8 @@ pub async fn pairing_create(
             && channel_router::agent_for_account(&state.bindings, &b.channel, &b.account_id)
                 == Some(agent_id.as_str())
     }) {
-        let Some(acct) = state
-            .channels
+        let channels = state.channels.load_full();
+        let Some(acct) = channels
             .get(&binding.channel)
             .and_then(|entry| entry.accounts.iter().find(|a| a.id == binding.account_id))
         else {
@@ -2895,6 +2929,9 @@ pub struct ChannelAccessView {
     /// Whether the owner is told in their chat when someone not paired
     /// writes (`config.notify_unpaired`, on unless false).
     pub notify_unpaired: bool,
+    /// Whether the accounts' policies can be set here (issue #273): not
+    /// with `trust_header`, where only config.toml sets them.
+    pub editable: bool,
 }
 
 /// The channel accounts whose messages reach `agent`: those it is bound
@@ -2902,8 +2939,9 @@ pub struct ChannelAccessView {
 fn reaching<'a>(
     state: &'a AppState,
     agent: &havn_core::AgentId,
-) -> Vec<(&'a str, &'a crate::config::ChannelAccount)> {
+) -> Vec<(&'a str, crate::config::ChannelAccount)> {
     let agent_id = agent.to_string();
+    let channels = state.channels.load_full();
     state
         .bindings
         .iter()
@@ -2913,25 +2951,24 @@ fn reaching<'a>(
                     == Some(agent_id.as_str())
         })
         .filter_map(|b| {
-            let account = state
-                .channels
+            let account = channels
                 .get(&b.channel)?
                 .accounts
                 .iter()
                 .find(|a| a.id == b.account_id)?;
-            Some((b.channel.as_str(), account))
+            Some((b.channel.as_str(), account.clone()))
         })
         .collect()
 }
 
 /// The account `account_id` of `channel` when its messages reach the
 /// agent: else `NotFound`, so no one manages another agent's bot.
-fn reaching_account<'a>(
-    state: &'a AppState,
+fn reaching_account(
+    state: &AppState,
     agent: &havn_core::AgentId,
     channel: &str,
     account_id: &str,
-) -> Result<&'a crate::config::ChannelAccount, crate::api::ApiError> {
+) -> Result<crate::config::ChannelAccount, crate::api::ApiError> {
     reaching(state, agent)
         .into_iter()
         .find(|(c, a)| *c == channel && a.id == account_id)
@@ -3030,6 +3067,7 @@ async fn channel_access_view(
     }
     Ok(ChannelAccessView {
         accounts,
+        editable: state.trusted_proxies.is_none(),
         notify_unpaired: agent
             .config
             .get("notify_unpaired")
@@ -3202,6 +3240,87 @@ pub async fn channel_sender_allow(
     }
     .map_err(|e| crate::api::ApiError::Internal(e.to_string()))?;
     Ok(axum::Json(channel_access_view(&state, &agent).await?))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyChange {
+    pub channel: String,
+    pub account_id: String,
+    #[serde(default)]
+    pub dm_policy: Option<crate::config::DmPolicy>,
+    #[serde(default)]
+    pub group_policy: Option<crate::config::GroupPolicy>,
+}
+
+/// `PUT /agents/{id}/channel-access/policy`: who may reach one of the
+/// agent's bots in private chats and in groups (issue #273), written to
+/// config.toml and applied at once.
+pub async fn channel_policy_set(
+    State(state): State<AppState>,
+    user: crate::auth::AuthedUser,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(req): axum::Json<PolicyChange>,
+) -> Result<axum::Json<ChannelAccessView>, crate::api::ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    reaching_account(&state, &agent.id, &req.channel, &req.account_id)?;
+    if state.trusted_proxies.is_some() {
+        return Err(crate::api::ApiError::Forbidden(
+            "with trust_header enabled, a bot's policies are set in config.toml".into(),
+        ));
+    }
+    if req.dm_policy.is_none() && req.group_policy.is_none() {
+        return Err(crate::api::ApiError::BadRequest(
+            "give dm_policy, group_policy or both".into(),
+        ));
+    }
+    set_policy(&state, &req).await?;
+    crate::audit::record(
+        &state.db,
+        user.id,
+        agent.team_id,
+        Some(agent.id),
+        "channel_account.policy.changed",
+        serde_json::json!({
+            "channel": req.channel,
+            "account_id": req.account_id,
+            "dm_policy": req.dm_policy.map(crate::config::DmPolicy::name),
+            "group_policy": req.group_policy.map(crate::config::GroupPolicy::name),
+        }),
+    )
+    .await;
+    Ok(axum::Json(channel_access_view(&state, &agent).await?))
+}
+
+/// Write `change` to config.toml and apply it, without waiting for the
+/// file to be read again.
+async fn set_policy(state: &AppState, change: &PolicyChange) -> Result<(), crate::api::ApiError> {
+    let _writing = state.models_write.lock().await;
+    let path = state.config_path.clone();
+    let (channel, account_id) = (change.channel.clone(), change.account_id.clone());
+    let (dm_policy, group_policy) = (change.dm_policy, change.group_policy);
+    tokio::task::spawn_blocking(move || {
+        crate::config::write_account_policy(&path, &channel, &account_id, dm_policy, group_policy)
+    })
+    .await
+    .map_err(|e| crate::api::ApiError::Internal(e.to_string()))?
+    .map_err(|e| crate::api::ApiError::Internal(format!("{e:#}")))?;
+    let mut channels = (*state.channels.load_full()).clone();
+    if let Some(account) = channels.get_mut(&change.channel).and_then(|entry| {
+        entry
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == change.account_id)
+    }) {
+        if let Some(policy) = dm_policy {
+            account.dm_policy = policy;
+        }
+        if let Some(policy) = group_policy {
+            account.group_policy = policy;
+        }
+    }
+    state.channels.store(std::sync::Arc::new(channels));
+    Ok(())
 }
 
 /// `DELETE /agents/{id}/channel-access/senders`: take back a sender's
@@ -3521,7 +3640,7 @@ mod tests {
                         .collect(),
                 },
             );
-            state.channels = Arc::new(channels);
+            state.channels.store(Arc::new(channels));
             state
                 .registry
                 .register(havn_spawner::AgentHandle::new(agent_id, 1))
@@ -3666,7 +3785,7 @@ mod tests {
             /// The bot's account takes groups by `policy`, `allow_groups`
             /// listing `listed`.
             fn groups(&mut self, policy: crate::config::GroupPolicy, listed: &[&str]) {
-                let mut channels = (*self.state.channels).clone();
+                let mut channels = (*self.state.channels.load_full()).clone();
                 for account in channels
                     .get_mut("telegram")
                     .expect("telegram")
@@ -3676,7 +3795,7 @@ mod tests {
                     account.group_policy = policy;
                     account.allow_groups = listed.iter().map(|s| (*s).to_string()).collect();
                 }
-                self.state.channels = Arc::new(channels);
+                self.state.channels.store(Arc::new(channels));
             }
 
             fn messages(&mut self) -> Vec<InboundMessage> {
@@ -4312,10 +4431,33 @@ mod tests {
             f.send("tg:owner", &format!("/start {code}")).await;
             f.replies();
 
+            // Off: talk among members is not kept; asking for the bot is
+            // answered, and the owner is told how to turn groups on.
             f.groups(GroupPolicy::Off, &[]);
-            f.say_in("tg:-100", "tg:ann", "@bot hi", true).await;
-            assert!(f.replies().is_empty(), "off: nothing is said");
+            f.say_in("tg:-150", "tg:ann", "lunch?", false).await;
+            assert!(f.replies().is_empty(), "off: talk is not answered");
+            f.say_in("tg:-150", "tg:ann", "@bot hi", true).await;
             assert!(f.messages().is_empty());
+            let mut told = Vec::new();
+            while let Ok(frame) = f.adapter.try_recv() {
+                if let ChannelFrame::Outbound(o) = frame
+                    && let ChannelMessageContent::Text { text } = o.content
+                {
+                    told.push((o.to, text, o.buttons.len()));
+                }
+            }
+            assert!(
+                told.iter()
+                    .any(|(to, t, _)| to == "tg:-150" && t.contains("not used in groups yet")),
+                "{told:?}"
+            );
+            assert!(
+                told.iter().any(|(to, t, buttons)| to == "tg:owner"
+                    && t.contains("groups are off")
+                    && t.contains("settings page")
+                    && *buttons == 0),
+                "{told:?}"
+            );
 
             f.groups(GroupPolicy::Allowlist, &[]);
             f.say_in("tg:-100", "tg:ann", "@bot what is the plan?", true)
@@ -4373,6 +4515,63 @@ mod tests {
             // The group does not let its members write privately.
             f.send("tg:ann", "hi in private").await;
             assert!(f.messages().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_bot_s_policies_set_from_the_dashboard_are_written_and_apply_at_once() {
+            use crate::config::{DmPolicy, GroupPolicy};
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let code = link_code(&f, "bot").await;
+            f.send("tg:owner", &format!("/start {code}")).await;
+            f.replies();
+            let dir = tempfile::tempdir().expect("dir");
+            let path = dir.path().join("config.toml");
+            std::fs::write(
+                &path,
+                "# kept\n[[channels.telegram.accounts]]\nid = \"bot\"\nadapter_token_ref = \"secret:channel:telegram:bot\"\n",
+            )
+            .expect("config");
+            f.state.config_path = path.clone();
+
+            f.say_in("tg:-100", "tg:ann", "@bot hi", true).await;
+            assert!(f.messages().is_empty(), "groups are off");
+            set_policy(
+                &f.state,
+                &PolicyChange {
+                    channel: "telegram".into(),
+                    account_id: "bot".into(),
+                    dm_policy: None,
+                    group_policy: Some(GroupPolicy::Open),
+                },
+            )
+            .await
+            .expect("set");
+            f.replies();
+            f.say_in("tg:-100", "tg:ann", "@bot hi again", true).await;
+            assert_eq!(f.messages().len(), 1, "open at once, without a restart");
+            let text = std::fs::read_to_string(&path).expect("read");
+            assert!(
+                text.contains("# kept") && text.contains("group_policy = \"open\""),
+                "{text}"
+            );
+
+            // An account config.toml does not list is refused, and nothing changes.
+            let missing = set_policy(
+                &f.state,
+                &PolicyChange {
+                    channel: "telegram".into(),
+                    account_id: "gone".into(),
+                    dm_policy: Some(DmPolicy::Open),
+                    group_policy: None,
+                },
+            )
+            .await;
+            assert!(missing.is_err());
+            let channels = f.state.channels.load_full();
+            assert_eq!(
+                channels["telegram"].accounts[0].dm_policy,
+                DmPolicy::Allowlist
+            );
         }
 
         #[tokio::test]
@@ -4669,7 +4868,7 @@ mod tests {
                     crate::channel_router::send_permitted(
                         &state.db,
                         &state.bindings,
-                        &state.channels,
+                        &state.channels.load_full(),
                         agent,
                         "telegram",
                         "bot",

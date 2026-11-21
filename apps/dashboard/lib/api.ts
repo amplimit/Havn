@@ -611,7 +611,18 @@ export type AccountAccess = {
   }[];
 };
 
-export type ChannelAccessView = { accounts: AccountAccess[]; notify_unpaired: boolean };
+export type ChannelAccessView = {
+  accounts: AccountAccess[];
+  notify_unpaired: boolean;
+  /** Whether the bots' policies can be set here: not with trust_header, where config.toml sets them. */
+  editable: boolean;
+};
+
+/** A change of one bot's policies; what is left out stays as it is. */
+export type PolicyChange = {
+  dm_policy?: AccountAccess["dm_policy"];
+  group_policy?: AccountAccess["group_policy"];
+};
 
 /** One sender of one of an agent's bots. */
 export type SenderRef = { channel: string; account_id: string; sender_id: string; group?: boolean };
@@ -716,6 +727,11 @@ export const api = {
       request<ChannelAccessView>(`/agents/${agentId}/channel-access/refused`, {
         method: "DELETE",
         body: JSON.stringify(who),
+      }),
+    policy: (agentId: string, account: Pick<AccountAccess, "channel" | "account_id">, change: PolicyChange) =>
+      request<ChannelAccessView>(`/agents/${agentId}/channel-access/policy`, {
+        method: "PUT",
+        body: JSON.stringify({ channel: account.channel, account_id: account.account_id, ...change }),
       }),
   },
   workspace: {

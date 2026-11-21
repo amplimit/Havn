@@ -413,7 +413,7 @@ pub(crate) mod tests {
             tmpfs_mounts: Vec::new(),
             seccomp_allow_extra: Vec::new(),
             agent_dns: Vec::new(),
-            channels: Arc::new(std::collections::BTreeMap::new()),
+            channels: Default::default(),
             bindings: Arc::new(Vec::new()),
             channel_router: crate::channel_router::ChannelRouter::new(),
             dm_reject_limiter: crate::api::channel::DmRejectLimiter::new(),

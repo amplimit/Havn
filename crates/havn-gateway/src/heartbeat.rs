@@ -47,7 +47,7 @@ pub struct HeartbeatScheduler {
     registry: AgentRegistry,
     db: SqlitePool,
     bindings: Arc<Vec<ChannelBindingConfig>>,
-    channels: Arc<Channels>,
+    channels: Arc<arc_swap::ArcSwap<Channels>>,
     state: Arc<Mutex<HashMap<AgentId, Instant>>>,
 }
 
@@ -130,7 +130,7 @@ impl HeartbeatScheduler {
         registry: AgentRegistry,
         db: SqlitePool,
         bindings: Arc<Vec<ChannelBindingConfig>>,
-        channels: Arc<Channels>,
+        channels: Arc<arc_swap::ArcSwap<Channels>>,
     ) -> Self {
         Self {
             registry,
@@ -198,7 +198,8 @@ impl HeartbeatScheduler {
         // queue: an agent whose queue is full misses this tick and is
         // retried on the next pass.
         for agent in due {
-            let tick = tick_for(&self.db, &self.bindings, &self.channels, &agent).await;
+            let channels = self.channels.load_full();
+            let tick = tick_for(&self.db, &self.bindings, &channels, &agent).await;
             match self
                 .registry
                 .try_send(agent.id, GatewayToAgent::HeartbeatTick(tick))
@@ -252,7 +253,7 @@ mod tests {
             registry.clone(),
             db.clone(),
             Arc::new(Vec::new()),
-            Arc::new(Channels::new()),
+            Arc::new(arc_swap::ArcSwap::from_pointee(Channels::new())),
         );
         (scheduler, registry, db, user.id)
     }

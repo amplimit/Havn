@@ -841,14 +841,15 @@ async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
     if group {
         let off = state
             .channels
+            .load_full()
             .get(channel)
             .and_then(|entry| entry.accounts.iter().find(|a| a.id == account_id))
             .is_none_or(|a| a.group_policy == crate::config::GroupPolicy::Off);
         if off {
             return language
                 .pick(
-                    "(Groups are off for this bot: set group_policy for its account in the gateway's config.toml first.)",
-                    "（这个机器人没有开启群聊：请先在网关的 config.toml 里给它的账号设置 group_policy。）",
+                    "(Groups are off for this bot: turn them on first, on the agent's settings page under who can reach the bot, or with group_policy in the gateway's config.toml.)",
+                    "（这个机器人没有开启群聊：请先在 agent 设置页的“谁能联系机器人”里开启，或者在网关的 config.toml 里给它的账号设置 group_policy。）",
                 )
                 .into();
         }

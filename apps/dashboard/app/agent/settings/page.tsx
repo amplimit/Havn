@@ -765,10 +765,16 @@ function BotAccess({ agentId }: { agentId: string }) {
             )}
           </>
         );
-        const groups = account.group_policy === "off" ? null : (
+        const groups = (
           <>
             <h4 className="mt-3 text-xs uppercase" style={muted}>
-              groups ({account.group_policy === "open" ? "open: every group it is added to" : "those let in"})
+              groups (
+              {account.group_policy === "open"
+                ? "open: every group it is added to"
+                : account.group_policy === "allowlist"
+                  ? "those let in"
+                  : "off: group messages are not used"}
+              )
             </h4>
             {account.groups.some((g) => g.sees_all === false) && (
               <p className="text-sm" style={muted}>
@@ -828,6 +834,52 @@ function BotAccess({ agentId }: { agentId: string }) {
             <h3 className="mb-1 font-mono text-sm">
               {account.channel} · {account.account_id}
             </h3>
+            <div className="mb-2 flex flex-wrap items-center gap-3 text-sm">
+              <label className="flex items-center gap-1">
+                private chats
+                <select
+                  className="input"
+                  style={{ maxWidth: 200 }}
+                  value={account.dm_policy}
+                  disabled={busy || !view?.editable}
+                  onChange={(e) =>
+                    void run(() =>
+                      api.channels.policy(agentId, account, {
+                        dm_policy: e.target.value as AccountAccess["dm_policy"],
+                      }),
+                    )
+                  }
+                >
+                  <option value="allowlist">those let in</option>
+                  <option value="open">anyone</option>
+                </select>
+              </label>
+              <label className="flex items-center gap-1">
+                groups
+                <select
+                  className="input"
+                  style={{ maxWidth: 220 }}
+                  value={account.group_policy}
+                  disabled={busy || !view?.editable}
+                  onChange={(e) =>
+                    void run(() =>
+                      api.channels.policy(agentId, account, {
+                        group_policy: e.target.value as AccountAccess["group_policy"],
+                      }),
+                    )
+                  }
+                >
+                  <option value="off">off</option>
+                  <option value="allowlist">those let in</option>
+                  <option value="open">any group it is added to</option>
+                </select>
+              </label>
+              {!view?.editable && (
+                <span className="text-xs" style={muted}>
+                  set in config.toml (trust_header is on)
+                </span>
+              )}
+            </div>
             {account.dm_policy === "open" ? (
               <>
                 <p className="text-sm" style={muted}>

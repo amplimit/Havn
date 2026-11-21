@@ -493,7 +493,7 @@ Agents whose owner's policy has `can_schedule_cron` get a `schedule` tool, so us
 
 Cron jobs (`POST /agents/{id}/cron`) can also run on calendar times in a time zone, with a five-field cron expression or in words: `{"cron": "0 8 * * 1-5"}`, or `{"every": "daily 08:00"}` (also `weekdays`, `weekends`, `weekly mon 10:00`, `monthly 1 09:00`, `hourly :15`). The zone is `timezone` when given, else the owner's at the time the job is created; the job keeps it. Times stay local across daylight-saving changes: a time a change skips runs right after the change, and one it repeats runs once. A job that was due while the gateway was down runs once when it is back; the runs it missed before that are skipped. An agent's `set_timezone` calls are audited as `user.timezone.updated` and limited to 3 per minute per user; subagents and cross-agent queries do not get the tool.
 
-Config edits are picked up live: `allowed_origins`, `[llm] default_model` and `[[llm.models]]` apply in place, while every other change (`listen`, `db_path`, paths, `[[bindings]]`, `[[channels]]`, ...) is logged as needing a `havn gateway restart` to apply — the gateway never restarts itself. Per-agent resource limits come from the agent's role policy, not a global config block.
+Config edits are picked up live: `allowed_origins`, `[llm] default_model`, `[[llm.models]]` and `[channels]` apply in place, while every other change (`listen`, `db_path`, paths, `[[bindings]]`, ...) is logged as needing a `havn gateway restart` to apply — the gateway never restarts itself. Of `[channels]`, who may reach a bot (`dm_policy`, `allow_from`, `group_policy`, `allow_groups`, `admins`) applies to its next message; an account added, or one whose `adapter_token_ref` changed, is used by its adapter when it next connects (restart the adapter to do so now). Per-agent resource limits come from the agent's role policy, not a global config block.
 
 For non-loopback exposure, configure a reverse proxy and enable trust-header mode:
 
@@ -800,7 +800,7 @@ group_policy = "allowlist"           # "off" (the default), "allowlist" or "open
 allow_groups = ["tg:-1001234567890"] # with "allowlist"
 ```
 
-- `off`: group messages are dropped.
+- `off`: group messages are not used. A group that addresses the bot is told the bot is not used in groups yet, is listed for the owner as turned away, and the owner is told in their connected chat that groups are off for the bot and where to turn them on (no button, as letting the group in would do nothing yet).
 - `allowlist`: the groups in `allow_groups`, and those the agent's owner lets in (see "Who can reach a bot"), may use it. A group not let in that addresses the bot is told it is not let in yet, is listed for the owner as turned away, and the owner is told in their connected chat with an **Allow the group** button (`/allow group <id>`). Talk in such a group that does not address the bot is not kept.
 - `open`: every group the bot is added to. The agent can send to a group it was used in while the account is `open`.
 
@@ -816,12 +816,12 @@ A group let in lets its members use the bot there, and only there: it does not a
 
 ### Who can reach a bot
 
-An agent's settings page manages its `allowlist` bots without the CLI (**who can reach the bot**, owner only; `GET /agents/{id}/channel-access`). For each account bound to the agent, it lists:
+An agent's settings page manages its bots without the CLI (**who can reach the bot**, owner only; `GET /agents/{id}/channel-access`). For each account bound to the agent, it sets who may write to it in private chats (`dm_policy`: those let in, or anyone) and in groups (`group_policy`: off, those let in, or any group it is added to). A change is written to the account's `[[channels.<channel>.accounts]]` table in config.toml, keeping the rest of the file, and applies at once, without a restart (`PUT .../channel-access/policy`, audited as `channel_account.policy.changed`). With `trust_header` on, only config.toml sets them. It lists:
 
 - the senders in `allow_from` (changed in config.toml only);
 - the senders let in by an invite or connect code, or by the owner, and whether each is connected to a Havn account (the owner's own is marked). **remove** takes their access back from their next message (`DELETE .../channel-access/senders`); the owner's own connected account stays let in while it is connected.
 - the invite codes made for it. **make an invite code** (1 hour to 30 days) shows a code once, with a `t.me` link when the bot's username is known; an unused one can be revoked. Connect codes are their users' own and are not listed.
-- the groups it may be used in, when `group_policy` is not `off`: those in `allow_groups`, those let in by the owner (**remove**), and with `open` those it was used in;
+- the groups it may be used in: those in `allow_groups`, those let in by the owner (**remove**), and with `open` those it was used in (while groups are `off`, none is used, but those let in stay for when they are on);
 - the senders and groups it turned away recently: who, about how many times (counted as often as they are answered, at most 3 a minute), when last, and the start of what they last said, with anything that reads as a pairing code left out. **let in** admits them (`POST .../channel-access/senders`), and **dismiss** forgets them. Each account keeps the 100 who wrote last, for 30 days. Someone let in otherwise (`allow_from`, a code, the owner's connected account) who sends a code that does not work is not listed.
 
 A sender can also be let in by id.
