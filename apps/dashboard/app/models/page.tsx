@@ -15,15 +15,19 @@ import { SkeletonList } from "@/components/SkeletonList";
 
 type Price = NonNullable<ModelEntry["price"]>;
 
-// As the usage page shows dollars: with a point, whatever the locale.
+// As the usage page shows dollars: with a point and no grouping, whatever
+// the locale, so what it shows can be typed back.
 function perMillion(n: number): string {
-  return `$${n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 6 })}`;
+  return `$${n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 6, useGrouping: false })}`;
 }
 
 // A price as typed: decimal digits, with a point or a comma; nothing a
-// `Number` would read otherwise (0x10, 0b11).
+// `Number` would read otherwise (0x10, 0b11). "1,500" could be either a
+// thousand and a half or one and a half, so it is refused.
 function parsePrice(typed: string): number | null {
-  const t = typed.trim().replace(/^(\d*),(\d+)$/, "$1.$2");
+  const trimmed = typed.trim();
+  if (/^[1-9]\d{0,2},\d{3}$/.test(trimmed)) return null;
+  const t = trimmed.replace(/^(\d*),(\d+)$/, "$1.$2");
   if (!/^(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(t)) return null;
   const n = Number(t);
   return Number.isFinite(n) ? n : null;
@@ -572,13 +576,34 @@ function PriceEditor({
   const [cacheWrite, setCacheWrite] = useState("");
   const [error, setError] = useState<string | null>(null);
   const toggle = useRef<HTMLButtonElement>(null);
+  const firstField = useRef<HTMLInputElement>(null);
+  // Where focus goes once React has rendered: back to the link on close,
+  // back to the first field after a save that failed.
+  const focusToggle = useRef(false);
+  const focusFirst = useRef(false);
+
+  useEffect(() => {
+    if (!open && focusToggle.current) {
+      focusToggle.current = false;
+      toggle.current?.focus();
+    }
+  }, [open]);
+
+  useEffect(() => {
+    if (open && !busy && focusFirst.current) {
+      focusFirst.current = false;
+      firstField.current?.focus();
+    }
+  }, [open, busy]);
 
   function draft(): Price | undefined | string {
     const fields = [input, output, cacheRead, cacheWrite].map((f) => f.trim());
     if (fields.every((f) => f === "")) return undefined;
     if (fields[0] === "" || fields[1] === "") return "give both the input and the output price, or clear all four";
     const numbers = fields.map((f) => (f === "" ? undefined : parsePrice(f)));
-    if (numbers.some((n) => n === null)) return "a price is a number of dollars, 0 or more, such as 0.15";
+    if (numbers.some((n) => n === null)) {
+      return "a price is a number of dollars, 0 or more, such as 0.15 (no thousands separators)";
+    }
     const [i, o, r, w] = numbers as Array<number | undefined>;
     const out: Price = { input: i as number, output: o as number };
     if (r !== undefined) out.cache_read = r;
@@ -595,9 +620,8 @@ function PriceEditor({
   }
 
   function close() {
+    focusToggle.current = true;
     setOpen(false);
-    // Back to the link that opened it, once it is shown again.
-    requestAnimationFrame(() => toggle.current?.focus());
   }
 
   async function submit(next: Price | undefined | string) {
@@ -606,8 +630,12 @@ function PriceEditor({
       return;
     }
     setError(null);
-    if (await onSave(next)) close();
-    else setError("Not saved (see the message at the top of the page). Reset shows the price saved now.");
+    if (await onSave(next)) {
+      close();
+    } else {
+      setError("Not saved (see the message at the top of the page). Reset shows the price saved now.");
+      focusFirst.current = true;
+    }
   }
 
   const muted = { color: "var(--color-body)" };
@@ -620,8 +648,7 @@ function PriceEditor({
         type="button"
         className="mt-2 text-xs underline"
         style={muted}
-        aria-expanded={false}
-        aria-label={`price of ${entry.id}`}
+        aria-label={`${price ? "price" : "set a price"} of ${entry.id}`}
         onClick={() => {
           reset();
           setOpen(true);
@@ -635,13 +662,14 @@ function PriceEditor({
     <label className="flex flex-wrap items-center gap-2">
       <span className="w-28">{label}</span>
       <input
+        ref={first ? firstField : undefined}
         className="input tabular"
         style={{ maxWidth: 140 }}
         inputMode="decimal"
         value={value}
         placeholder={placeholder}
         disabled={!editable || busy}
-        autoFocus={first}
+        autoFocus={first && editable}
         onChange={(e) => set(e.target.value)}
         aria-label={`${label} price of ${entry.id}`}
       />
@@ -678,7 +706,7 @@ function PriceEditor({
             reset
           </button>
         )}
-        <button type="button" className="text-xs underline" onClick={close}>
+        <button type="button" className="text-xs underline" autoFocus={!editable} onClick={close}>
           close
         </button>
       </div>
