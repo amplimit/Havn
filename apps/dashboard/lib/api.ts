@@ -788,6 +788,8 @@ export const api = {
       }),
     remove: (agentId: string, jobId: string) =>
       request<void>(`/agents/${agentId}/cron/${jobId}`, { method: "DELETE" }),
+    runNow: (agentId: string, jobId: string) =>
+      request<{ run_id: string }>(`/agents/${agentId}/cron/${jobId}/run`, { method: "POST" }),
   },
   setTimezone: (timezone: string | null) =>
     request<TimezoneView>("/me/timezone", {

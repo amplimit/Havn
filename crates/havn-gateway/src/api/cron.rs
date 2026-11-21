@@ -370,6 +370,62 @@ pub async fn list_runs(
     Ok(Json(runs.into_iter().map(CronRunView::from).collect()))
 }
 
+/// `POST /agents/{id}/cron/{job_id}/run`: run a task now (issue #236),
+/// paused or not, without its wake check and without moving a recurring
+/// schedule (a one-shot is done with it). Its result goes where a
+/// scheduled run's does.
+pub async fn run_now(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path((agent_id, job_id)): Path<(String, String)>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let agent = crate::api::agents::resolve_agent(&agent_id, &user, &state).await?;
+    let job_id = parse_job(&job_id)?;
+    let job = cron::find_by_id(&state.db, job_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if job.agent_id != agent.id {
+        return Err(ApiError::NotFound);
+    }
+    // As when a task is made: the owner's policy must let them schedule.
+    let policy = crate::policy_resolver::for_owner(&state.db, &agent).await;
+    if !policy.permissions.can_schedule_cron {
+        return Err(ApiError::Forbidden(
+            "this user's policy does not allow scheduling cron jobs (can_schedule_cron=false)"
+                .into(),
+        ));
+    }
+    let run_id = state
+        .cron_scheduler
+        .run_now(&job)
+        .await
+        .map_err(|e| match e {
+            crate::cron::CronError::NotRunning => {
+                ApiError::Conflict("the agent is not running; start it first".into())
+            }
+            crate::cron::CronError::Restarting => {
+                ApiError::Conflict("the gateway is restarting; try again once it is back".into())
+            }
+            crate::cron::CronError::Busy => ApiError::Conflict(
+                "a run of this task is still going; try again when it is done".into(),
+            ),
+            other => ApiError::Internal(other.to_string()),
+        })?;
+    crate::audit::record(
+        &state.db,
+        user.id,
+        agent.team_id,
+        Some(agent.id),
+        "cron.run_now",
+        serde_json::json!({ "job_id": job_id.to_string(), "run_id": run_id }),
+    )
+    .await;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "run_id": run_id })),
+    ))
+}
+
 fn parse_job(s: &str) -> Result<CronJobId, ApiError> {
     CronJobId::from_str(s).map_err(|_| ApiError::BadRequest("invalid cron job id".into()))
 }
