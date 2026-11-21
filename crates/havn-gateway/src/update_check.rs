@@ -4,7 +4,7 @@
 use std::sync::{LazyLock, PoisonError, RwLock};
 use std::time::Duration;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// How often the gateway looks.
 const EVERY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -44,16 +44,19 @@ async fn latest(http: &reqwest::Client) -> anyhow::Result<String> {
     struct Release {
         tag_name: String,
     }
-    let release: Release = http
+    let response = http
         .get(havn_core::release::LATEST_RELEASE_API)
         .header(reqwest::header::USER_AGENT, "havn-gateway")
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .timeout(WITHIN)
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
+    // The gateway's client follows no redirect: a moved repository answers
+    // 3xx, said like any other failure.
+    if !response.status().is_success() {
+        anyhow::bail!("GitHub answered {}", response.status());
+    }
+    let release: Release = response.json().await?;
     Ok(release.tag_name)
 }
 
@@ -61,9 +64,18 @@ async fn latest(http: &reqwest::Client) -> anyhow::Result<String> {
 pub fn spawn(http: reqwest::Client) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         tokio::time::sleep(FIRST_AFTER).await;
+        let mut failed_before = false;
         loop {
             match latest(&http).await {
-                Ok(tag) => note(&tag),
+                Ok(tag) => {
+                    note(&tag);
+                    failed_before = false;
+                }
+                // Said once while it keeps failing, then quietly.
+                Err(e) if !failed_before => {
+                    warn!(error = %e, "could not look for a newer release");
+                    failed_before = true;
+                }
                 Err(e) => debug!(error = %e, "could not look for a newer release"),
             }
             tokio::time::sleep(EVERY).await;

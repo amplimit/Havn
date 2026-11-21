@@ -87,6 +87,9 @@ enum Command {
         /// directory, as `havn backup` writes one).
         #[arg(long)]
         no_backup: bool,
+        /// Let `--version` name a release older than the gateway's.
+        #[arg(long)]
+        allow_downgrade: bool,
     },
     /// Back up the gateway's and agents' databases, the agents' directories
     /// and config.toml to one archive; the gateway may keep running.
@@ -492,7 +495,8 @@ fn main() -> anyhow::Result<()> {
             version,
             check,
             no_backup,
-        } => async_runtime()?.block_on(run_update(version, check, !no_backup)),
+            allow_downgrade,
+        } => async_runtime()?.block_on(run_update(version, check, !no_backup, allow_downgrade)),
         Command::Backup { output } => async_runtime()?.block_on(run_backup(output)),
         Command::Restore { archive, force } => run_restore(&archive, force),
         Command::Agent { action } => async_runtime()?.block_on(run_agent(action)),
@@ -639,12 +643,22 @@ async fn run_backup(_output: Option<std::path::PathBuf>) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-async fn run_update(version: Option<String>, check: bool, backup: bool) -> anyhow::Result<()> {
-    update::run(version, check, backup).await
+async fn run_update(
+    version: Option<String>,
+    check: bool,
+    backup: bool,
+    downgrade: bool,
+) -> anyhow::Result<()> {
+    update::run(version, check, backup, downgrade).await
 }
 
 #[cfg(not(unix))]
-async fn run_update(_version: Option<String>, _check: bool, _backup: bool) -> anyhow::Result<()> {
+async fn run_update(
+    _version: Option<String>,
+    _check: bool,
+    _backup: bool,
+    _downgrade: bool,
+) -> anyhow::Result<()> {
     anyhow::bail!("havn update runs on the gateway's host")
 }
 
