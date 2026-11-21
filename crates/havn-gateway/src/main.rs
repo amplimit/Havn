@@ -20,6 +20,7 @@ mod egress_proxy;
 mod heartbeat;
 mod keyring;
 mod llm_proxy;
+mod metrics;
 mod model_catalog;
 mod office;
 mod outbox;
@@ -202,6 +203,7 @@ fn main() -> anyhow::Result<()> {
         let args: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(i32::from(!web_fetch::convert_main(&args)));
     }
+    metrics::start();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -682,6 +684,7 @@ async fn serve() -> anyhow::Result<()> {
     let reload_task = reload::spawn_watcher(config_path, cfg.clone(), reload_handles);
 
     // The management API, served on `listen` and under the dashboard's `/api`.
+    let metrics_state = state.clone();
     let management = Router::new()
         .route("/healthz", get(healthz))
         .route("/auth/info", get(auth::info))
@@ -936,6 +939,44 @@ async fn serve() -> anyhow::Result<()> {
         }
         None => None,
     };
+    let metrics_task = if cfg.metrics_listen.is_empty() {
+        None
+    } else {
+        let addr: SocketAddr = cfg
+            .metrics_listen
+            .parse()
+            .context("parsing metrics_listen")?;
+        // Metrics are not worth stopping the gateway for: a port taken
+        // (by another exporter, say) is said, and the rest runs.
+        match TcpListener::bind(addr).await {
+            Ok(listener) => {
+                if !addr.ip().is_loopback() {
+                    warn!(
+                        %addr,
+                        "serving metrics beyond this host: anyone who can reach metrics_listen \
+                         reads them"
+                    );
+                }
+                info!(%addr, "serving metrics at /metrics");
+                let service = Router::new()
+                    .route("/metrics", get(metrics::handler))
+                    .with_state(metrics_state);
+                let stop = stop_signals(signals.clone(), 1);
+                Some(tokio::spawn(async move {
+                    if let Err(e) = axum::serve(listener, service)
+                        .with_graceful_shutdown(stop)
+                        .await
+                    {
+                        warn!(error = %e, "metrics stopped being served");
+                    }
+                }))
+            }
+            Err(e) => {
+                warn!(%addr, error = %e, "cannot serve metrics on metrics_listen; running without them");
+                None
+            }
+        }
+    };
     let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -949,6 +990,9 @@ async fn serve() -> anyhow::Result<()> {
         }
     }
 
+    if let Some(task) = metrics_task {
+        task.abort();
+    }
     if let Some(mut task) = dashboard_task {
         tokio::select! {
             _ = &mut task => {}

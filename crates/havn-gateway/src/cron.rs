@@ -309,6 +309,7 @@ impl CronScheduler {
                     },
                 )
                 .await;
+                crate::metrics::cron_run("skipped");
                 let _ = advance_after_run(&self.db, &job, tick_at).await;
                 return;
             }
@@ -333,6 +334,7 @@ impl CronScheduler {
         if let Err(e) = self.registry.send(agent_id, frame).await {
             warn!(%job_id, %agent_id, error = %e, "could not deliver CronTick");
             self.pending_runs().remove(&run_id);
+            crate::metrics::cron_run("failure");
             return;
         }
         if let Err(e) = advance_after_run(&self.db, &job, tick_at).await {
@@ -535,12 +537,14 @@ impl CronScheduler {
             .join(&result.job_id);
         if let Err(e) = tokio::fs::create_dir_all(&output_dir).await {
             warn!(error = %e, dir = %output_dir.display(), "create_dir_all for cron output failed");
+            crate::metrics::cron_run("failure");
             return Err(CronError::Io(e));
         }
         // The run's id keeps two runs in one second apart.
         let output_path = output_dir.join(format!("{timestamp}-{}.md", result.run_id));
         if let Err(e) = tokio::fs::write(&output_path, &result.output).await {
             warn!(error = %e, file = %output_path.display(), "writing cron output failed");
+            crate::metrics::cron_run("failure");
             return Err(CronError::Io(e));
         }
 
@@ -548,6 +552,10 @@ impl CronScheduler {
             CronOutcome::Success => (RunOutcome::Success, None),
             CronOutcome::Error { message } => (RunOutcome::Error, Some(message.clone())),
         };
+        crate::metrics::cron_run(match outcome {
+            RunOutcome::Success => "success",
+            _ => "failure",
+        });
 
         record_run(
             &self.db,

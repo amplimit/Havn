@@ -15,6 +15,9 @@ pub struct GatewayConfig {
     /// Where the gateway serves the dashboard, with the API under `/api`
     /// (issue #259); empty to serve none.
     pub dashboard_listen: String,
+    /// Where the gateway serves Prometheus metrics at `/metrics` (issue
+    /// #236); empty, the default, to serve none.
+    pub metrics_listen: String,
     /// Path to the gateway's `SQLite` database file. Per locked scope, no
     /// other datastore is supported. Created on first run with WAL + foreign
     /// keys.
@@ -785,6 +788,7 @@ impl Default for GatewayConfig {
             // ClawJacked-class mitigation).
             listen: "127.0.0.1:8080".into(),
             dashboard_listen: "127.0.0.1:3000".into(),
+            metrics_listen: String::new(),
             db_path: default_data_dir().join("havn.db"),
             agent_socket_path: default_data_dir().join("agent.sock"),
             workspace_root: default_data_dir().join("agents"),
@@ -940,6 +944,30 @@ impl GatewayConfig {
                     "dashboard_listen = {:?} must be an IP address and a port of its own, not \
                      listen's or [network] egress_proxy_port; \"\" serves no dashboard",
                     parsed.dashboard_listen
+                );
+            }
+        }
+        if !parsed.metrics_listen.is_empty() {
+            let metrics = parsed
+                .metrics_listen
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .map(|addr| addr.port());
+            let dashboard = parsed
+                .dashboard_listen
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .map(|addr| addr.port());
+            if metrics.is_none()
+                || metrics == listen_port
+                || metrics == Some(port)
+                || (metrics == dashboard && !parsed.dashboard_listen.is_empty())
+            {
+                anyhow::bail!(
+                    "metrics_listen = {:?} must be an IP address and a port of its own, not \
+                     listen's, dashboard_listen's or [network] egress_proxy_port; \"\" serves no \
+                     metrics",
+                    parsed.metrics_listen
                 );
             }
         }
@@ -1662,5 +1690,27 @@ mod tests {
         );
         assert_eq!(merged[2].id, "c");
         assert_eq!(waiting, vec!["telegram/b", "telegram/c", "telegram/d"]);
+    }
+
+    #[test]
+    fn metrics_listen_is_off_by_default_and_needs_a_port_of_its_own() {
+        assert!(
+            GatewayConfig::from_toml("")
+                .expect("empty")
+                .metrics_listen
+                .is_empty()
+        );
+        let with = |value: &str| {
+            GatewayConfig::from_toml(&format!(
+                "listen = \"127.0.0.1:8080\"
+dashboard_listen = \"127.0.0.1:3000\"
+metrics_listen = \"{value}\"
+"
+            ))
+        };
+        assert!(with("127.0.0.1:9464").is_ok());
+        assert!(with("127.0.0.1:8080").is_err(), "listen's port");
+        assert!(with("127.0.0.1:3000").is_err(), "dashboard_listen's port");
+        assert!(with("not an address").is_err());
     }
 }

@@ -161,6 +161,16 @@ impl ChannelRouter {
         Self::default()
     }
 
+    /// How many accounts have an adapter connected now.
+    pub async fn connected(&self) -> usize {
+        self.inner
+            .lock()
+            .await
+            .values()
+            .filter(|s| s.tx.as_ref().is_some_and(|tx| !tx.is_closed()))
+            .count()
+    }
+
     /// Note whether `key`'s bot sees every message in `group`, as its
     /// adapter says with a message from it: `None`, that it does not know
     /// (any more). At most `GROUPS_KNOWN` groups are kept per account.
@@ -1093,5 +1103,30 @@ mod tests {
             outbound_permitted(&bs, &chs, a1, "telegram", "bot", "111"),
             Err(OutboundRefusal::UnknownAccount)
         );
+    }
+
+    #[tokio::test]
+    async fn only_adapters_still_there_count_as_connected() {
+        let router = ChannelRouter::new();
+        let (live, _live_rx) = mpsc::channel(1);
+        let (gone, gone_rx) = mpsc::channel(1);
+        router
+            .register(AccountKey::new("telegram", "a"), live)
+            .await;
+        router
+            .register(AccountKey::new("telegram", "b"), gone)
+            .await;
+        drop(gone_rx);
+        router
+            .deliver(
+                "telegram",
+                "c",
+                "tg:1",
+                None,
+                ChannelMessageContent::Text { text: "x".into() },
+            )
+            .await
+            .ok();
+        assert_eq!(router.connected().await, 1);
     }
 }

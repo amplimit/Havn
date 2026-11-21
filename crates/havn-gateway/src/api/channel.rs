@@ -865,11 +865,17 @@ async fn handle_session(
     // Outbound task: drain both mpscs, write to WS. tokio::select!
     // gives equal priority. Closes WS when either mpsc is dropped or
     // any write fails or stalls.
+    let (sent_channel, sent_account) = (channel_id.clone(), account_id.clone());
     let mut outbound = tokio::spawn(async move {
         loop {
+            // The reply this write carries, counted once it is written.
+            let mut reply = None;
             let message = tokio::select! {
                 maybe_frame = frame_rx.recv() => {
                     let Some(frame) = maybe_frame else { break };
+                    if let ChannelFrame::Outbound(o) = &frame {
+                        reply = Some(o.seq);
+                    }
                     match serde_json::to_string(&frame) {
                         Ok(s) => Message::Text(s.into()),
                         Err(e) => {
@@ -884,7 +890,11 @@ async fn handle_session(
                 }
             };
             match tokio::time::timeout(WS_SEND_TIMEOUT, ws_sink.send(message)).await {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    if let Some(seq) = reply {
+                        crate::metrics::channel_sent(&sent_channel, &sent_account, seq);
+                    }
+                }
                 Ok(Err(_)) => break,
                 Err(_) => {
                     warn!("channel adapter is not reading its WS; closing it");
@@ -1031,6 +1041,7 @@ async fn handle_session(
 /// the operator-visible signal that they need to add a binding (the
 /// startup `dangling_bindings` warning catches the inverse case).
 async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound) {
+    crate::metrics::channel_message(channel, "in");
     let agent_id_str =
         match channel_router::agent_for_account(&state.bindings, channel, &inb.account_id) {
             Some(s) => s,
