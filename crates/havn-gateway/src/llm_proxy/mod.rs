@@ -1586,35 +1586,55 @@ fn image_block(
     block_of(read, limit)
 }
 
-/// Copies made of images of workspaces, or why none could be, by the hash
-/// and length of the original: a tool loop shows an image again on each
-/// of its rounds.
-static SHRUNK: std::sync::Mutex<std::collections::VecDeque<(u64, usize, Result<Vec<u8>, String>)>> =
-    std::sync::Mutex::new(std::collections::VecDeque::new());
+/// What [`SHRUNK`] knows a copy by: the workspace, so one agent's images
+/// are never another's, and the original's hash (keyed at random for the
+/// process) and length.
+type ShrunkKey = (std::path::PathBuf, u64, usize);
+
+/// Copies made of images of workspaces, or why none could be and when: a
+/// tool loop shows an image again on each of its rounds.
+static SHRUNK: std::sync::Mutex<
+    std::collections::VecDeque<(ShrunkKey, std::time::Instant, Result<Vec<u8>, String>)>,
+> = std::sync::Mutex::new(std::collections::VecDeque::new());
 
 /// Copies [`SHRUNK`] keeps.
 const SHRUNK_KEPT: usize = 8;
 
-/// The copy `shrink` makes of `original`, once for the same bytes.
+/// Least room left among a request's images for which a copy is made.
+const MIN_COPY_ROOM: u64 = 64 * 1024;
+
+/// How long a failed copy is not tried again: a converter busy or timed
+/// out may make it later.
+const SHRUNK_FAILURE_KEPT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The copy `shrink` makes of `original` of `workspace`, once for the same
+/// bytes.
 fn shrunk(
+    workspace: &std::path::Path,
     original: &[u8],
     shrink: &dyn Fn(&[u8]) -> Result<Vec<u8>, String>,
 ) -> Result<Vec<u8>, String> {
-    use std::hash::{Hash as _, Hasher as _};
-    let mut hasher = std::hash::DefaultHasher::new();
-    original.hash(&mut hasher);
-    let key = (hasher.finish(), original.len());
+    use std::hash::BuildHasher as _;
+    static KEYS: std::sync::OnceLock<std::hash::RandomState> = std::sync::OnceLock::new();
+    let hash = KEYS
+        .get_or_init(std::hash::RandomState::new)
+        .hash_one(original);
+    let key: ShrunkKey = (workspace.to_path_buf(), hash, original.len());
     let lock = || {
         SHRUNK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     };
-    if let Some((_, _, copy)) = lock().iter().find(|(h, n, _)| (*h, *n) == key) {
-        return copy.clone();
+    {
+        let mut kept = lock();
+        kept.retain(|(_, at, copy)| copy.is_ok() || at.elapsed() < SHRUNK_FAILURE_KEPT);
+        if let Some((_, _, copy)) = kept.iter().find(|(k, _, _)| *k == key) {
+            return copy.clone();
+        }
     }
     let copy = shrink(original).map_err(|e| format!("no copy of it could be made ({e})"));
     let mut kept = lock();
-    kept.push_back((key.0, key.1, copy.clone()));
+    kept.push_back((key, std::time::Instant::now(), copy.clone()));
     if kept.len() > SHRUNK_KEPT {
         kept.pop_front();
     }
@@ -1660,12 +1680,19 @@ fn workspace_image_block(
         }
         Err(e) => return Err(format!("it cannot be read ({e})")),
     };
+    if image_type(&original).is_none() && !is_heif(&original) {
+        return Err("it is not a PNG, JPEG, GIF, WebP or HEIC image".into());
+    }
+    let limit = MAX_IMAGE_BYTES.min(room);
     let bytes = if needs_copy(&original) {
-        shrunk(&original, shrink)?
+        // No copy is made that would not fit.
+        if limit < MIN_COPY_ROOM {
+            return Err("the images of this chat are too large together".into());
+        }
+        shrunk(workspace, &original, shrink)?
     } else {
         original
     };
-    let limit = MAX_IMAGE_BYTES.min(room);
     let read = if bytes.len() as u64 > limit {
         Err(std::io::Error::from(std::io::ErrorKind::InvalidData))
     } else {
