@@ -136,7 +136,7 @@ pub async fn guarded(
         Review::Result => "",
     };
     // What is always allowed does not wait behind a question.
-    match allowed(db, &scope, tool, key, must_ask).await {
+    match allowed(db, &scope, review, tool, key, must_ask).await {
         Ok(Some(rule)) => return with_rule(run.await, Some(&rule)),
         Ok(None) => {}
         Err(failed) => return failed,
@@ -162,7 +162,7 @@ pub async fn guarded(
         );
     }
     // Allowed while this call waited for the lock.
-    match allowed(db, &scope, tool, key, must_ask).await {
+    match allowed(db, &scope, review, tool, key, must_ask).await {
         Ok(Some(rule)) => {
             drop(asking);
             return with_rule(run.await, Some(&rule));
@@ -267,21 +267,34 @@ pub async fn guarded(
     }
 }
 
-/// The rule of what is always allowed for `tool` with `key` in `scope`;
-/// none under a rule that asks every time.
+/// The rule of what is always allowed for `tool` with `key` in `scope`,
+/// or, for a reading tool, in every conversation (issue #268); none under
+/// a rule that asks every time.
 async fn allowed(
     db: &sqlx::SqlitePool,
     scope: &str,
+    review: Review,
     tool: &str,
     key: &str,
     must_ask: bool,
 ) -> Result<Option<String>, ToolResult> {
+    use havn_db::agent::conversations::{EVERY_CONVERSATION, access_of};
     if must_ask {
         return Ok(None);
     }
-    havn_db::agent::conversations::access_of(db, scope, tool, key)
+    let failed = |e: havn_db::DbError| ToolResult::Error(format!("{tool} was not run: {e}"));
+    let own = access_of(db, scope, tool, key).await.map_err(failed)?;
+    // The conversation's own rule stands; where it says nothing, the rule
+    // of every conversation does.
+    if own.as_deref().is_some_and(|rule| !rule.trim().is_empty())
+        || !(matches!(review, Review::Result) && key.is_empty())
+    {
+        return Ok(own);
+    }
+    let every = access_of(db, EVERY_CONVERSATION, tool, "")
         .await
-        .map_err(|e| ToolResult::Error(format!("{tool} was not run: {e}")))
+        .map_err(failed)?;
+    Ok(every.or(own))
 }
 
 /// Keep what the owner always allows from now on.
@@ -582,6 +595,118 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_reading_tool_allowed_everywhere_answers_in_every_conversation() {
+        use havn_db::agent::conversations::{EVERY_CONVERSATION, allow, revoke};
+        let pool = havn_db::agent::connect_in_memory().await.expect("db");
+        let found = |scope: &'static str, review: Review, tool: &'static str, key: &'static str| {
+            let pool = pool.clone();
+            async move {
+                match allowed(&pool, scope, review, tool, key, false).await {
+                    Ok(rule) => rule,
+                    Err(e) => panic!("{e:?}"),
+                }
+            }
+        };
+        assert_eq!(
+            found("ch|telegram|bot|1", Review::Result, "memory_search", "").await,
+            None
+        );
+
+        allow(
+            &pool,
+            EVERY_CONVERSATION,
+            "memory_search",
+            "",
+            "no addresses",
+        )
+        .await
+        .expect("allow");
+        assert_eq!(
+            found("ch|telegram|bot|1", Review::Result, "memory_search", "")
+                .await
+                .as_deref(),
+            Some("no addresses")
+        );
+        assert_eq!(
+            found("ch|telegram|bot|1", Review::Result, "file_read", "").await,
+            None,
+            "only the tool allowed"
+        );
+        allow(
+            &pool,
+            "ch|telegram|bot|2",
+            "memory_search",
+            "",
+            "nothing about work",
+        )
+        .await
+        .expect("allow");
+        assert_eq!(
+            found("ch|telegram|bot|2", Review::Result, "memory_search", "")
+                .await
+                .as_deref(),
+            Some("nothing about work"),
+            "the conversation's own rule wins"
+        );
+        allow(&pool, "ch|telegram|bot|3", "memory_search", "", "")
+            .await
+            .expect("allow");
+        assert_eq!(
+            found("ch|telegram|bot|3", Review::Result, "memory_search", "")
+                .await
+                .as_deref(),
+            Some("no addresses"),
+            "where its own says nothing, the rule of every conversation stands"
+        );
+        assert_eq!(
+            allowed(
+                &pool,
+                "ch|telegram|bot|1",
+                Review::Result,
+                "memory_search",
+                "",
+                true
+            )
+            .await
+            .ok()
+            .flatten(),
+            None,
+            "a rule that asks every time still asks"
+        );
+
+        // One that runs things is never allowed everywhere.
+        allow(
+            &pool,
+            EVERY_CONVERSATION,
+            "shell",
+            r#"{"command":"ls"}"#,
+            "",
+        )
+        .await
+        .expect("allow");
+        assert_eq!(
+            found(
+                "ch|telegram|bot|1",
+                Review::Call,
+                "shell",
+                r#"{"command":"ls"}"#
+            )
+            .await,
+            None
+        );
+
+        assert!(
+            revoke(&pool, EVERY_CONVERSATION, "memory_search", "")
+                .await
+                .expect("revoke")
+        );
+        assert_eq!(
+            found("ch|telegram|bot|1", Review::Result, "memory_search", "").await,
+            None
+        );
+    }
 
     #[test]
     fn viewing_an_image_in_someone_else_s_chat_is_asked_about_first() {

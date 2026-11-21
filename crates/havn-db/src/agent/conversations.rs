@@ -1442,6 +1442,11 @@ pub async fn access_of(
     Ok(row.map(|(rule,)| rule))
 }
 
+/// The scope of what the owner allows in every conversation with the
+/// agent (issue #268). No conversation's scope is it: web chats' are UUIDs,
+/// chat apps' start with `ch|`.
+pub const EVERY_CONVERSATION: &str = "*";
+
 /// Always allow `tool` with `input` in `scope`, with `rule`.
 pub async fn allow(
     pool: &SqlitePool,

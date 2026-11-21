@@ -1142,6 +1142,9 @@ pub struct AccessPut {
 #[derive(Debug, Deserialize)]
 struct Found {
     found: bool,
+    /// Made now: a tool allowed in every conversation (issue #268).
+    #[serde(default)]
+    created: bool,
 }
 
 /// `PUT /agents/{id}/access`: change the rule of what is always allowed,
@@ -1173,10 +1176,10 @@ pub async fn access_put(
         &state.db,
         user.id,
         agent.id,
-        if req.rule.is_some() {
-            "agent.tool_access.changed"
-        } else {
-            "agent.tool_access.revoked"
+        match (&req.rule, found.created) {
+            (Some(_), true) => "agent.tool_access.allowed",
+            (Some(_), false) => "agent.tool_access.changed",
+            (None, _) => "agent.tool_access.revoked",
         },
         serde_json::json!({ "scope": req.scope, "tool": req.tool }),
     )
