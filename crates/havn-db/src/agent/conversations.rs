@@ -68,7 +68,8 @@ pub async fn record(pool: &SqlitePool, channel_id: &str, role: Role, content: &s
 }
 
 /// Record a turn of chat `chat`, unless the chat was deleted meanwhile:
-/// false then, and nothing is written.
+/// false then, and nothing is written. The chat moves to the top of the
+/// list.
 pub async fn record_in_chat(
     pool: &SqlitePool,
     chat: &str,
@@ -85,8 +86,46 @@ pub async fn record_in_chat(
     };
     let id = insert_turn(&mut tx, chat, role, content, parent.as_deref()).await?;
     set_head(&mut tx, chat, Some(&id)).await?;
+    sqlx::query(
+        "UPDATE chats SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+    )
+    .bind(chat)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(Some(id))
+}
+
+/// The chat of `scope` that keeps heartbeat results (issue #226): made,
+/// titled `title`, when it has none. It is not made the active chat.
+pub async fn heartbeat_chat(pool: &SqlitePool, scope: &str, title: &str) -> Result<String> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let found: Option<(String,)> = sqlx::query_as(
+        "SELECT h.chat_id FROM heartbeat_chats h JOIN chats c ON c.id = h.chat_id          AND c.scope = h.scope WHERE h.scope = ?1",
+    )
+    .bind(scope)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((id,)) = found {
+        tx.commit().await?;
+        return Ok(id);
+    }
+    let id = Uuid::now_v7().to_string();
+    sqlx::query("INSERT INTO chats (id, scope, title) VALUES (?1, ?2, ?3)")
+        .bind(&id)
+        .bind(scope)
+        .bind(title.chars().take(MAX_TITLE_CHARS).collect::<String>())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO heartbeat_chats (scope, chat_id) VALUES (?1, ?2)          ON CONFLICT (scope) DO UPDATE SET chat_id = excluded.chat_id",
+    )
+    .bind(scope)
+    .bind(&id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(id)
 }
 
 /// Record `reply` to turn `parent` of chat `chat`. The chat continues from
@@ -667,6 +706,25 @@ pub async fn chat_of_owner(pool: &SqlitePool, chat: &str) -> Result<bool> {
     .fetch_one(pool)
     .await?;
     Ok(found)
+}
+
+/// Of `scopes`, the one whose chats have the latest message from the
+/// person; `None` when none has any.
+pub async fn last_written(pool: &SqlitePool, scopes: &[String]) -> Result<Option<String>> {
+    if scopes.is_empty() {
+        return Ok(None);
+    }
+    let scopes = serde_json::to_string(scopes).map_err(|e| DbError::InvalidValue {
+        column: "chats.scope",
+        message: e.to_string(),
+    })?;
+    let found: Option<(String,)> = sqlx::query_as(
+        "SELECT c.scope FROM chats c JOIN conversations t ON t.channel_id = c.id          WHERE c.scope IN (SELECT value FROM json_each(?1)) AND t.role = 'user'          ORDER BY t.created_at DESC, t.rowid DESC LIMIT 1",
+    )
+    .bind(scopes)
+    .fetch_optional(pool)
+    .await?;
+    Ok(found.map(|(scope,)| scope))
 }
 
 /// Note that the owner writes from `scope` (issue #218): their search
@@ -1445,6 +1503,99 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[tokio::test]
+    async fn heartbeats_keep_one_chat_of_their_own_made_again_when_deleted() {
+        let pool = crate::agent::connect_in_memory().await.expect("db");
+        let talk = chat_for(&pool, "web", None, "hi").await.expect("chat");
+        let kept = heartbeat_chat(&pool, "web", "Heartbeat")
+            .await
+            .expect("chat");
+        assert_ne!(kept, talk);
+        assert_eq!(
+            heartbeat_chat(&pool, "web", "Heartbeat")
+                .await
+                .expect("chat"),
+            kept
+        );
+        assert_eq!(
+            existing_chat(&pool, "web", None)
+                .await
+                .expect("db")
+                .as_deref(),
+            Some(talk.as_str()),
+            "the active chat stays"
+        );
+        assert_ne!(
+            heartbeat_chat(&pool, "other", "Heartbeat")
+                .await
+                .expect("chat"),
+            kept,
+            "a chat per scope"
+        );
+
+        record_in_chat(&pool, &talk, Role::User, "later")
+            .await
+            .expect("turn");
+        record_in_chat(&pool, &kept, Role::Assistant, "PULSE")
+            .await
+            .expect("turn");
+        let listed = chats(&pool, "web", 10).await.expect("db");
+        assert_eq!(listed[0].id, kept, "a new message moves its chat up");
+        assert_eq!(listed[0].title, "Heartbeat");
+
+        assert!(delete_chat(&pool, "web", &kept).await.expect("delete"));
+        let again = heartbeat_chat(&pool, "web", "Heartbeat")
+            .await
+            .expect("chat");
+        assert_ne!(again, kept, "a deleted chat is not made again under its id");
+    }
+
+    #[tokio::test]
+    async fn the_conversation_written_in_last_is_the_one_with_the_latest_message() {
+        let pool = crate::agent::connect_in_memory().await.expect("db");
+        let scopes = vec!["web".to_string(), "ch|telegram|bot|42".to_string()];
+        assert_eq!(last_written(&pool, &scopes).await.expect("db"), None);
+        let web = chat_for(&pool, "web", None, "hi").await.expect("chat");
+        record_in_chat(&pool, &web, Role::User, "hi")
+            .await
+            .expect("turn");
+        let telegram = chat_for(&pool, "ch|telegram|bot|42", None, "")
+            .await
+            .expect("chat");
+        record_in_chat(&pool, &telegram, Role::User, "there")
+            .await
+            .expect("turn");
+        assert_eq!(
+            last_written(&pool, &scopes).await.expect("db").as_deref(),
+            Some("ch|telegram|bot|42")
+        );
+        record_in_chat(&pool, &telegram, Role::Assistant, "answer")
+            .await
+            .expect("turn");
+        record_in_chat(&pool, &web, Role::User, "back")
+            .await
+            .expect("turn");
+        record_in_chat(&pool, &telegram, Role::Assistant, "a heartbeat")
+            .await
+            .expect("turn");
+        assert_eq!(
+            last_written(&pool, &scopes).await.expect("db").as_deref(),
+            Some("web"),
+            "what the agent sent does not count"
+        );
+        let other = chat_for(&pool, "ch|telegram|bot|7", None, "")
+            .await
+            .expect("chat");
+        record_in_chat(&pool, &other, Role::User, "someone else")
+            .await
+            .expect("turn");
+        assert_eq!(
+            last_written(&pool, &scopes).await.expect("db").as_deref(),
+            Some("web"),
+            "only the scopes asked about"
+        );
+    }
 
     #[tokio::test]
     async fn what_the_owner_allows_is_kept_per_conversation_tool_and_call() {

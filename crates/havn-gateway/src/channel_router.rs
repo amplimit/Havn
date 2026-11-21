@@ -465,6 +465,34 @@ pub fn outbound_permitted(
     }
 }
 
+/// [`outbound_permitted`], or the recipient was admitted by invite code
+/// (kept in the DB).
+pub async fn send_permitted(
+    db: &sqlx::SqlitePool,
+    bindings: &[ChannelBindingConfig],
+    channels: &std::collections::BTreeMap<String, ChannelEntry>,
+    agent_id: havn_core::AgentId,
+    channel: &str,
+    account_id: &str,
+    recipient: &str,
+) -> Result<(), OutboundRefusal> {
+    match outbound_permitted(bindings, channels, agent_id, channel, account_id, recipient) {
+        Err(OutboundRefusal::RecipientNotAllowed) => {
+            match havn_db::repo::channel_access::is_allowed(db, channel, account_id, recipient)
+                .await
+            {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(OutboundRefusal::RecipientNotAllowed),
+                Err(e) => {
+                    warn!(%agent_id, error = %e, "channel allowlist lookup failed");
+                    Err(OutboundRefusal::RecipientNotAllowed)
+                }
+            }
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]

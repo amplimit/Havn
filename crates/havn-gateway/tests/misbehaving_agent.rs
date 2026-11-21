@@ -430,7 +430,7 @@ impl Session {
         let mut reader = self.reader;
         tokio::spawn(async move {
             while let Ok(Some(frame)) = read_frame::<_, GatewayToAgent>(&mut reader).await {
-                if !matches!(frame, GatewayToAgent::HeartbeatTick) && tx.send(frame).is_err() {
+                if !matches!(frame, GatewayToAgent::HeartbeatTick(_)) && tx.send(frame).is_err() {
                     break;
                 }
             }

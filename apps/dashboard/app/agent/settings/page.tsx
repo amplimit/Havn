@@ -3,7 +3,7 @@
 /**
  * `/agent/settings?id=` — per-agent configuration.
  *
- * Editable today: name, model, heartbeat interval. The PATCH endpoint
+ * Editable today: name, model, heartbeat interval and where its messages go. The PATCH endpoint
  * shallow-merges config keys, so saving "model" doesn't disturb
  * "heartbeat" or any per-agent policy override the user set elsewhere.
  *
@@ -75,6 +75,8 @@ function Settings({ id }: { id: string }) {
   const [model, setModel] = useState("");
   const [models, setModels] = useState<ModelsView | null>(null);
   const [heartbeatMin, setHeartbeatMin] = useState<string>("");
+  const [heartbeatTo, setHeartbeatTo] = useState("last");
+  const [linked, setLinked] = useState<string[]>([]);
   const [language, setLanguage] = useState<"en" | "zh">("en");
 
   useEffect(() => {
@@ -96,12 +98,19 @@ function Settings({ id }: { id: string }) {
             if (!cancelled) setModels(m);
           })
           .catch(() => {});
+        api.channels
+          .links()
+          .then((l) => {
+            if (!cancelled) setLinked([...new Set(l.map((x) => x.channel))]);
+          })
+          .catch(() => {});
         const hb =
           (cfg.heartbeat as Record<string, unknown> | undefined) ?? {};
         const secs = typeof hb.interval_seconds === "number"
           ? hb.interval_seconds
           : null;
         setHeartbeatMin(secs ? String(Math.round(secs / 60)) : "");
+        setHeartbeatTo(typeof hb.deliver === "string" ? hb.deliver : "last");
       } catch (e) {
         if (!cancelled)
           setError(e instanceof Error ? e.message : String(e));
@@ -137,9 +146,19 @@ function Settings({ id }: { id: string }) {
         config.language = language === "en" ? null : language;
       }
       const hbNum = Number(heartbeatMin);
+      const heartbeat: Record<string, unknown> = {};
+      const savedHeartbeat =
+        ((agent.config as Record<string, unknown>).heartbeat as Record<string, unknown> | undefined) ?? {};
       if (heartbeatMin.trim() && Number.isFinite(hbNum) && hbNum > 0) {
-        config.heartbeat = { interval_seconds: Math.round(hbNum * 60) };
-      } else if (!heartbeatMin.trim()) {
+        heartbeat.interval_seconds = Math.round(hbNum * 60);
+      } else if (heartbeatMin.trim() && typeof savedHeartbeat.interval_seconds === "number") {
+        // An interval that is not a number of minutes leaves the saved one.
+        heartbeat.interval_seconds = savedHeartbeat.interval_seconds;
+      }
+      if (heartbeatTo !== "last") heartbeat.deliver = heartbeatTo;
+      if (Object.keys(heartbeat).length > 0) {
+        config.heartbeat = heartbeat;
+      } else if (!heartbeatMin.trim() || typeof savedHeartbeat.deliver === "string") {
         config.heartbeat = null;
       }
       const updated = await api.agents.patch(id, {
@@ -300,6 +319,28 @@ function Settings({ id }: { id: string }) {
             className="input"
             style={{ maxWidth: 160 }}
           />
+        </Field>
+
+        <Field
+          label="Heartbeat messages go to"
+          hint="Where a heartbeat that has something to say sends it. Each one is also kept in the Heartbeat chat of your web chat. A chat app needs your account there connected (see chat apps below)."
+        >
+          <select
+            value={heartbeatTo}
+            onChange={(e) => setHeartbeatTo(e.target.value)}
+            className="input"
+            style={{ maxWidth: 280 }}
+          >
+            <option value="last">Where you wrote last</option>
+            <option value="web">The web chat only</option>
+            {[...new Set([...linked, ...(["last", "web"].includes(heartbeatTo) ? [] : [heartbeatTo])])].map(
+              (c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ),
+            )}
+          </select>
         </Field>
 
         <div className="flex items-center gap-3">

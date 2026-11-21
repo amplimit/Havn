@@ -374,7 +374,14 @@ On a heartbeat the agent reads `HEARTBEAT.md` in its workspace (the settings pag
 
 - It runs with the agent's system prompt, the recent events and the skills that match, and the heartbeat's own earlier runs (its last 40 messages, a thread of its own, not any chat).
 - It has the agent's tools except `conversation_search` and those in `context_toolsets.heartbeat.disabled`, up to `tool_rounds.subagent` rounds, and may change memory as the owner. Calls that a hook would ask about are refused, and it cannot change scheduled tasks.
-- A reply that ends with `HEARTBEAT_OK` is not delivered. Any other reply goes to the agent's dashboard chat tabs open at the time, and not to chat apps.
+- A reply that ends with `HEARTBEAT_OK` is not delivered. Any other reply is kept in a chat titled Heartbeat in the owner's web chat, and is sent where `config.heartbeat.deliver` says (the settings page sets it too):
+  - `"last"`, the default: the owner's conversation with the agent they wrote in last, the web chat or a chat app account they connected (the agent's chat apps section of the settings page). The web chat when they wrote in none.
+  - `"web"`: the web chat only.
+  - A channel, such as `"telegram"`: the owner's connected account there, through the agent's bot. The web chat when there is none.
+
+  A chat-app account the agent's bot may not send to (an `allowlist` account that has not admitted it) is left out.
+
+  In the web chat it shows in the owner's open tabs, in the Heartbeat chat. In a chat app it is also kept in the chat there, so a reply there follows it. Other people's chats with the agent never get it.
 
 ## Configuration
 

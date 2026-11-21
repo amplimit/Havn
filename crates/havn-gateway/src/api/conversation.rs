@@ -278,18 +278,17 @@ pub struct LinkedScope {
 /// `user`'s channel chat scopes with `agent`. Only their own linked
 /// senders: other people's chats with the agent are not theirs to see.
 pub async fn linked_scopes(
-    state: &AppState,
-    user: &AuthedUser,
+    db: &sqlx::SqlitePool,
+    bindings: &[crate::config::ChannelBindingConfig],
+    user: havn_core::UserId,
     agent: havn_core::AgentId,
-) -> Result<Vec<LinkedScope>, ApiError> {
-    let links = havn_db::repo::channel_access::list_links(&state.db, Some(user.id))
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+) -> Result<Vec<LinkedScope>, havn_db::DbError> {
+    let links = havn_db::repo::channel_access::list_links(db, Some(user)).await?;
     let agent = agent.to_string();
     let mut scopes = Vec::new();
-    for binding in state.bindings.iter().filter(|b| {
+    for binding in bindings.iter().filter(|b| {
         b.agent_id == agent
-            && crate::channel_router::agent_for_account(&state.bindings, &b.channel, &b.account_id)
+            && crate::channel_router::agent_for_account(bindings, &b.channel, &b.account_id)
                 == Some(agent.as_str())
     }) {
         for link in links.iter().filter(|l| l.channel == binding.channel) {
@@ -319,7 +318,7 @@ async fn scope_of(
     let Some(requested) = requested else {
         return Ok(session(user, agent));
     };
-    linked_scopes(state, user, agent)
+    linked_scopes(&state.db, &state.bindings, user.id, agent)
         .await?
         .into_iter()
         .find(|l| l.scope == requested)
@@ -470,7 +469,7 @@ pub async fn channel_chats(
 ) -> Result<Json<Vec<ChannelChat>>, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
     let mut all = Vec::new();
-    for linked in linked_scopes(&state, &user, agent.id).await? {
+    for linked in linked_scopes(&state.db, &state.bindings, user.id, agent.id).await? {
         let chats: Vec<Chat> = crate::api::agents::agent_data(
             &state,
             user.id,
@@ -528,7 +527,7 @@ pub async fn chat_move(
     Json(req): Json<ChatMove>,
 ) -> Result<StatusCode, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
-    let linked = linked_scopes(&state, &user, agent.id)
+    let linked = linked_scopes(&state.db, &state.bindings, user.id, agent.id)
         .await?
         .into_iter()
         .find(|l| l.scope == req.scope)
@@ -879,7 +878,9 @@ mod scope_tests {
             id: owner,
             display_name: "owner".into(),
         };
-        let scopes = linked_scopes(&state, &me, agent).await.unwrap();
+        let scopes = linked_scopes(&state.db, &state.bindings, me.id, agent)
+            .await
+            .unwrap();
         let mine = crate::channel_id_codec::encode("telegram", "bot", "tg:mine");
         assert_eq!(
             scopes.iter().map(|s| s.scope.as_str()).collect::<Vec<_>>(),

@@ -1712,31 +1712,16 @@ async fn channel_send_permitted(
     account_id: &str,
     sender_id: &str,
 ) -> Result<(), crate::channel_router::OutboundRefusal> {
-    use crate::channel_router::OutboundRefusal;
-    match crate::channel_router::outbound_permitted(
+    crate::channel_router::send_permitted(
+        &ctx.db,
         &ctx.bindings,
         &ctx.channels,
         agent_id,
         channel,
         account_id,
         sender_id,
-    ) {
-        Ok(()) => Ok(()),
-        // Senders admitted by invite code live in the DB.
-        Err(OutboundRefusal::RecipientNotAllowed) => {
-            match havn_db::repo::channel_access::is_allowed(&ctx.db, channel, account_id, sender_id)
-                .await
-            {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(OutboundRefusal::RecipientNotAllowed),
-                Err(e) => {
-                    warn!(%agent_id, error = %e, "channel allowlist lookup failed");
-                    Err(OutboundRefusal::RecipientNotAllowed)
-                }
-            }
-        }
-        Err(refusal) => Err(refusal),
-    }
+    )
+    .await
 }
 
 /// Whether `url` names a file this gateway put in agent `agent_id`'s
@@ -1762,9 +1747,21 @@ async fn deliver_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSo
     //     deliver via channel_router to the right WS.
     //  3. Anything else — assumed to be a WebChat session
     //     UUID; route via webchat_router.
+    //  4. `broadcast:<session>` — the same as 1, for one session's tabs.
     if msg.channel_id == "broadcast" {
         let n = ctx.webchat_router.broadcast(agent_id, msg).await;
         debug!(%agent_id, sessions = n, "broadcast outbound delivered");
+        n > 0
+    } else if let Some(session) = msg.channel_id.strip_prefix(havn_proto::BROADCAST_TO) {
+        let Ok(session) = session.parse::<crate::webchat::SessionId>() else {
+            warn!(%agent_id, "dropping an outbound for a malformed web chat");
+            return false;
+        };
+        let n = ctx
+            .webchat_router
+            .broadcast_to(agent_id, session, msg)
+            .await;
+        debug!(%agent_id, tabs = n, "outbound for one web chat delivered");
         n > 0
     } else if let Some((channel, account_id, sender_id)) =
         crate::channel_id_codec::decode(&msg.channel_id)
@@ -4612,12 +4609,12 @@ mod tests {
         assert!(verdict.is_err(), "the second connection must be rejected");
         assert!(reply.is_none(), "no Welcome may be sent: {reply:?}");
         ctx.registry
-            .send(agent, GatewayToAgent::HeartbeatTick)
+            .send(agent, GatewayToAgent::HeartbeatTick(Default::default()))
             .await
             .expect("send");
         assert!(matches!(
             live_rx.recv().await,
-            Some(GatewayToAgent::HeartbeatTick)
+            Some(GatewayToAgent::HeartbeatTick(_))
         ));
     }
 
@@ -4764,5 +4761,58 @@ mod tests {
             .await
             .expect("reader");
         assert!(adapter.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn an_outbound_for_one_web_chat_reaches_only_its_tabs() {
+        let ctx = ctx_with(false, false).await;
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (agent, _rx) = connected_agent(&ctx, owner, "bot", serde_json::json!({})).await;
+        let mine = crate::webchat::session_for(&owner.to_string(), agent);
+        let theirs = crate::webchat::session_for("someone else", agent);
+        let (mine_tx, mut mine_rx) = mpsc::channel(8);
+        let (theirs_tx, mut theirs_rx) = mpsc::channel(8);
+        ctx.webchat_router.register(mine, agent, mine_tx).await;
+        ctx.webchat_router.register(theirs, agent, theirs_tx).await;
+
+        let (conn, _conn_rx) = mpsc::channel(1);
+        let mut bytes = Vec::new();
+        for channel_id in [
+            format!("{}{mine}", havn_proto::BROADCAST_TO),
+            format!("{}x", havn_proto::BROADCAST_TO),
+        ] {
+            write_frame(
+                &mut bytes,
+                &AgentToGateway::OutboundMessage(havn_core::OutboundMessage {
+                    conversation: Some("chat".into()),
+                    channel_id,
+                    content: havn_core::MessageContent::Text {
+                        text: "pulse".into(),
+                    },
+                    reply_to: None,
+                    buttons: Vec::new(),
+                    poll: None,
+                    partial: false,
+                }),
+            )
+            .await
+            .expect("encode");
+        }
+        run_reader(&mut BufReader::new(bytes.as_slice()), agent, &conn, &ctx)
+            .await
+            .expect("reader");
+        assert!(matches!(
+            mine_rx.try_recv(),
+            Ok(crate::webchat::ServerMessage::AgentMessage { broadcast: true, ref content, .. })
+                if content == "pulse"
+        ));
+        assert!(
+            mine_rx.try_recv().is_err(),
+            "a malformed web chat gets nothing"
+        );
+        assert!(theirs_rx.try_recv().is_err(), "another user's web chat");
     }
 }
