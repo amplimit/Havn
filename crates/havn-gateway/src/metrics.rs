@@ -32,11 +32,14 @@ struct Counts {
     channel_messages: BTreeMap<(String, &'static str), u64>,
     /// By outcome.
     cron_runs: BTreeMap<&'static str, u64>,
-    /// Per `channel|account`, the last reply counted as sent: a reply
+    /// Per `channel|account`, the latest replies counted as sent: a reply
     /// written again (replayed to an adapter that came back) is not
-    /// counted again.
-    sent_up_to: std::collections::HashMap<String, u64>,
+    /// counted again, in whatever order the writes come.
+    sent: std::collections::HashMap<String, std::collections::BTreeSet<u64>>,
 }
+
+/// Replies a `sent` set keeps per account: as many as a replay can send.
+const SENT_KEPT: usize = 1024;
 
 static COUNTS: LazyLock<Mutex<Counts>> = LazyLock::new(Default::default);
 static STARTED: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -112,14 +115,20 @@ pub fn channel_message(channel: &str, direction: &'static str) {
 pub fn channel_sent(channel: &str, account_id: &str, seq: u64) {
     {
         let mut counts = counts();
-        let last = counts
-            .sent_up_to
+        let seen = counts
+            .sent
             .entry(format!("{channel}|{account_id}"))
             .or_default();
-        if seq <= *last {
+        // Older than any kept: counted long ago, or past what a replay sends.
+        if seen.len() >= SENT_KEPT && seen.first().is_some_and(|first| seq < *first) {
             return;
         }
-        *last = seq;
+        if !seen.insert(seq) {
+            return;
+        }
+        while seen.len() > SENT_KEPT {
+            seen.pop_first();
+        }
     }
     channel_message(channel, "out");
 }
@@ -404,5 +413,11 @@ mod tests {
         channel_sent("metrics-sent", "bot", 5);
         channel_sent("metrics-sent", "bot", 6);
         assert_eq!(out(&render(0, 0)), Some(2));
+        // A reply buffered while the adapter was away, written after a
+        // newer one: counted too.
+        channel_sent("metrics-sent", "bot", 11);
+        channel_sent("metrics-sent", "bot", 10);
+        channel_sent("metrics-sent", "bot", 11);
+        assert_eq!(out(&render(0, 0)), Some(4));
     }
 }

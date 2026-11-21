@@ -208,7 +208,7 @@ Set `metrics_listen` in config.toml (for example `"127.0.0.1:9464"`; empty, the 
 
 - `havn_build_info{version}`, `havn_uptime_seconds`;
 - `havn_agents_connected` and `havn_channel_adapters_connected`, now;
-- `havn_llm_calls_total{provider, model, outcome}`, the LLM calls made for agents (each request an agent makes counts once, whatever credentials it tried; the gateway's own calls, such as checking a model, are not counted), where `outcome` is `ok`, `no_credential`, `unavailable`, `upstream_error`, `transport_error`, `budget_exhausted` or `other_error`;
+- `havn_llm_calls_total{provider, model, outcome}`, the LLM calls made for agents, each call to a provider counted once whatever credentials it tried (a request the gateway sends again, shortened, counts again; so does each model `web_fetch` tries). Web search through OpenRouter is not counted here, and the gateway's own calls, such as checking a model, are not counted. `outcome` is `ok`, `no_credential`, `unavailable`, `upstream_error`, `transport_error`, `budget_exhausted` or `other_error`;
 - `havn_llm_tokens_total{provider, model, direction}`, the input (cache reads and writes included) and output tokens of the calls that answered;
 - `havn_channel_messages_total{channel, direction}`, the messages adapters passed in (all of them, those turned away too) and the replies written to adapters (each part of a reply sent in parts counts; one written again after an adapter reconnects counts once);
 - `havn_cron_runs_total{outcome}`, the runs of scheduled tasks: `success`, `failure` (also one that could not be sent to its agent, or whose output could not be kept), or `skipped` by their wake check.
