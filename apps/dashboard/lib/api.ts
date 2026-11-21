@@ -575,6 +575,8 @@ export type CapabilitiesView = { subagents: Capability; agent_queries: Capabilit
 
 /** A one-time code that links a chat-app account to the caller (issue #182). */
 export type PairingCode = {
+  /** The invite's id, for an invite code made on the access page. */
+  id?: string;
   channel: string;
   account_id: string;
   code: string;

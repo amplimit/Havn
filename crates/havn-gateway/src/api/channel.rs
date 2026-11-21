@@ -1567,40 +1567,83 @@ async fn admitted_anyway(
 }
 
 /// `said` with what reads as a pairing code in it left out: only codes'
-/// hashes are kept.
+/// hashes are kept. A code is tried at the start of every ASCII word, so
+/// one next to Chinese text, or after words that look like one, is found:
+/// four groups of four, two of eight or one of sixteen, with the
+/// separators [`channel_access::normalize_code`] drops between them.
 fn without_codes(said: &str) -> String {
-    static CODE: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
-    let Some(code) = CODE.get_or_init(|| {
-        // As codes are shown (four groups of four, with dashes), or written
-        // in one: no words of a sentence run together into one.
-        regex::Regex::new(
-            r"\b(?:[0-9A-Za-z]{4}[\-\u{2010}-\u{2015}\u{2212}\u{ff0d}]){3}[0-9A-Za-z]{4}\b|\b[0-9A-Za-z]{16}\b",
-        )
+    static FORM: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    let Some(form) = FORM.get_or_init(|| {
+        let sep = r"[\s\-\u{2010}-\u{2015}\u{2212}\u{ff0d}\u{fe63}\u{ad}\u{200b}-\u{200d}\u{2060}\u{feff}]{1,3}";
+        let group = |n: usize| format!("[0-9A-Za-z]{{{n}}}");
+        regex::Regex::new(&format!(
+            "^(?:{g4}{sep}{g4}{sep}{g4}{sep}{g4}|{g8}{sep}{g8}|{g16})",
+            g4 = group(4),
+            g8 = group(8),
+            g16 = group(16),
+        ))
         .ok()
     }) else {
         return said.to_string();
     };
-    code.replace_all(said, |m: &regex::Captures<'_>| {
-        let written = &m[0];
-        // A word of sixteen letters is a word; a code has a digit or dashes
-        // nearly always.
-        let shaped = written.len() > 16 || written.chars().any(|c| c.is_ascii_digit());
-        if shaped && channel_access::normalize_code(written).is_some() {
-            "(a code)".to_string()
-        } else {
-            m[0].to_string()
+    // Words of a sentence run together read as a code now and then; a
+    // code has a digit or a dash nearly always.
+    let shaped = |written: &str| {
+        written
+            .chars()
+            .any(|c| c.is_ascii_digit() || !(c.is_ascii_alphanumeric() || c.is_whitespace()))
+    };
+    // A code ends where no letter follows, nor a dash and a letter: one
+    // found inside a longer run is part of it, and is looked for further on.
+    // What a code's groups are joined with besides spaces: what
+    // `normalize_code` drops from one.
+    let joins = |c: char| {
+        !c.is_whitespace()
+            && channel_access::normalize_code(&format!("{c}0123456789ABCDEF")).is_some()
+    };
+    let ends_there = |after: &str| {
+        let mut next = after.chars();
+        match next.next() {
+            None => true,
+            Some(c) if c.is_ascii_alphanumeric() => false,
+            Some(c) if joins(c) => !next.next().is_some_and(|n| n.is_ascii_alphanumeric()),
+            Some(_) => true,
         }
-    })
-    .into_owned()
+    };
+    let mut out = String::with_capacity(said.len());
+    let mut at = 0;
+    let mut in_word = false;
+    while let Some(c) = said[at..].chars().next() {
+        if !in_word && c.is_ascii_alphanumeric() {
+            let rest = &said[at..];
+            if let Some(found) = form.find(rest)
+                && ends_there(&rest[found.end()..])
+                && shaped(found.as_str())
+                && channel_access::normalize_code(found.as_str()).is_some()
+            {
+                out.push_str("(a code)");
+                at += found.end();
+                in_word = false;
+                continue;
+            }
+        }
+        out.push(c);
+        in_word = c.is_ascii_alphanumeric();
+        at += c.len_utf8();
+    }
+    out
 }
 
-/// `text` on one line, with every ASCII punctuation mark escaped, so the
-/// Markdown a chat app reads in it makes no link or format of it.
+/// `text` on one line, with what Markdown reads as a link or a format
+/// escaped, so a chat app that renders it shows the text as written.
 fn as_plain(text: &str) -> String {
     let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut out = String::with_capacity(line.len());
     for c in line.chars() {
-        if c.is_ascii_punctuation() {
+        if matches!(
+            c,
+            '\\' | '`' | '*' | '_' | '[' | ']' | '(' | ')' | '#' | '!' | '<' | '>' | '~' | '|'
+        ) {
             out.push('\\');
         }
         out.push(c);
@@ -2108,6 +2151,9 @@ async fn disconnect(state: &AppState, channel: &str, inb: &ChannelInbound) {
 
 #[derive(Debug, serde::Serialize)]
 pub struct PairingCode {
+    /// The invite's id, for an invite code made on the access page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub channel: String,
     pub account_id: String,
     /// Shown once: what the person sends to the bot.
@@ -2153,6 +2199,7 @@ pub async fn pairing_create(
             .filter(|u| binding.channel == "telegram" && !u.is_empty())
             .map(|u| format!("https://t.me/{u}?start={}", made.code));
         codes.push(PairingCode {
+            id: None,
             channel: binding.channel.clone(),
             account_id: acct.id.clone(),
             code: made.code,
@@ -2415,6 +2462,7 @@ pub async fn channel_invite_create(
     )
     .await;
     Ok(axum::Json(PairingCode {
+        id: Some(made.invite.id.to_string()),
         channel: req.channel,
         account_id: account.id.clone(),
         code: made.code,
@@ -3302,6 +3350,34 @@ mod tests {
             assert_eq!(f.forwarded(), vec!["tg:stranger".to_string()]);
         }
 
+        #[test]
+        fn codes_are_left_out_wherever_they_are_written() {
+            for said in [
+                "my code ABCD-EFGH-JKMN-PQRS thanks",
+                "我的码是ABCD-EFGH-JKMN-PQRS谢谢",
+                "what time does ABCD-EFGH-JKMN-PQ12",
+                "make sure ABCD EFGH JKMN PQ12 ok",
+                "ABCDEFGH JKMNPQ12",
+                "abcd\u{ad}efgh\u{200b}jkmn-pqrs",
+                "code: 0123456789ABCDEF.",
+            ] {
+                let kept = without_codes(said);
+                assert!(kept.contains("(a code)"), "{said:?} gives {kept:?}");
+                assert!(
+                    !kept.contains("PQRS") && !kept.contains("PQ12") && !kept.contains("pqrs"),
+                    "{said:?} gives {kept:?}"
+                );
+            }
+            for said in [
+                "hi, it is Bob from the shop",
+                "what time does work start",
+                "responsibilities",
+                "see you at 10:30",
+            ] {
+                assert_eq!(without_codes(said), said);
+            }
+        }
+
         #[tokio::test]
         async fn the_notice_is_plain_text_and_keeps_no_code() {
             let mut f = fixture(DmPolicy::Allowlist, &[]).await;
@@ -3320,7 +3396,7 @@ mod tests {
                 .map(|(_, text)| text)
                 .expect("notice");
             assert!(
-                notice.contains(r"\[Sign in again\]\(https\:\/\/evil\.example\) \# urgent"),
+                notice.contains(r"\[Sign in again\]\(https://evil.example\) \# urgent"),
                 "{notice}"
             );
             assert!(

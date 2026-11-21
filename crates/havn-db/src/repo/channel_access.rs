@@ -757,7 +757,8 @@ pub async fn list_allowed_on(
     rows.into_iter().map(AllowedSender::try_from).collect()
 }
 
-/// The senders `(channel, account_id)` turned away, who wrote last first.
+/// The senders `(channel, account_id)` turned away in the last
+/// [`REFUSAL_KEPT_DAYS`], who wrote last first.
 pub async fn list_refusals(
     pool: &SqlitePool,
     channel: &str,
@@ -765,10 +766,11 @@ pub async fn list_refusals(
 ) -> Result<Vec<Refusal>> {
     let rows: Vec<RefusalRow> = sqlx::query_as(
         "SELECT sender_id, first_at, last_at, count, said FROM channel_refusals \
-         WHERE channel = ?1 AND account_id = ?2 ORDER BY last_at DESC",
+         WHERE channel = ?1 AND account_id = ?2 AND last_at >= ?3 ORDER BY last_at DESC",
     )
     .bind(channel)
     .bind(account_id)
+    .bind(timestamp(Utc::now() - Duration::days(REFUSAL_KEPT_DAYS)))
     .fetch_all(pool)
     .await?;
     Ok(rows

@@ -882,7 +882,7 @@ function BotAccess({ agentId }: { agentId: string }) {
                               disabled={busy}
                               onClick={() =>
                                 void run(() => api.channels.revokeInvite(agentId, i.id)).then((ok) => {
-                                  if (ok) setMade(null);
+                                  if (ok) setMade((m) => (m?.id === i.id ? null : m));
                                 })
                               }
                             >
