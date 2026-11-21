@@ -12,6 +12,7 @@ import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import {
+  BarChart3,
   Bot,
   Boxes,
   KeyRound,
@@ -282,6 +283,7 @@ export function Sidebar() {
           <SidebarLink href="/" pathname={pathname} icon={Bot} label="all agents" />
           <SidebarLink href="/models" pathname={pathname} icon={Boxes} label="models" />
           <SidebarLink href="/credentials" pathname={pathname} icon={KeyRound} label="credentials" />
+          <SidebarLink href="/usage" pathname={pathname} icon={BarChart3} label="usage" />
           <SidebarLink href="/teams" pathname={pathname} icon={Users} label="teams" />
           <SidebarLink href="/settings" pathname={pathname} icon={SlidersHorizontal} label="settings" />
         </nav>

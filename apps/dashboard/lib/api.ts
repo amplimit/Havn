@@ -334,6 +334,40 @@ export type ModelEntry = {
   vision?: boolean;
   /** How it thinks; absent, it is not asked to. */
   thinking?: ThinkingSpec;
+  /** What its tokens cost, in US dollars per million (issue #235). */
+  price?: { input: number; output: number; cache_read?: number; cache_write?: number };
+};
+
+/** One day's use of one model by one user's agent (issue #235). */
+export type UsageRow = {
+  day: string;
+  user_id: string;
+  display_name: string;
+  agent_id: string | null;
+  agent_name: string | null;
+  /** As `[[llm.models]]` lists it. */
+  model: string;
+  calls: number;
+  tokens_in: number;
+  cache_read: number;
+  cache_write: number;
+  tokens_out: number;
+  /** US dollars at the model's price now; null without one. */
+  cost: number | null;
+};
+
+export type UsageView = {
+  since: string;
+  days: number;
+  currency: string;
+  /** Whose: a user's id, or `all`. */
+  user: string;
+  /** Whether the caller may see others' (the gateway's owner). */
+  everyone: boolean;
+  users: { user_id: string; display_name: string }[];
+  rows: UsageRow[];
+  cost: number;
+  unpriced_tokens: number;
 };
 
 /** What a model check found. */
@@ -701,6 +735,8 @@ export function workspaceFileUrl(agentId: string, path: string): string {
 }
 
 export const api = {
+  /** What model calls used (issue #235): the caller's, or `user`'s (`all`) for the gateway's owner. */
+  usage: (days = 30, user?: string) => request<UsageView>(`/usage${qs({ days, user })}`),
   me: () => request<MeView>("/me"),
   timezone: () => request<TimezoneView>("/me/timezone"),
   channels: {

@@ -1926,6 +1926,7 @@ mod tests {
             thinking: None,
             context_window: None,
             fallback: Vec::new(),
+            price: None,
         };
         let catalog = ModelCatalog {
             default_model: Some("openrouter:cheap/model".into()),

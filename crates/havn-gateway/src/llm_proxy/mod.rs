@@ -691,17 +691,36 @@ impl ReservationGuard {
             output = resp.usage.output_tokens,
             "llm usage"
         );
-        let tokens_in = i64::try_from(resp.usage.total_input_tokens()).unwrap_or(i64::MAX);
-        let tokens_out = i64::try_from(resp.usage.output_tokens).unwrap_or(i64::MAX);
-        self.settle_tokens(&resp.model, tokens_in, tokens_out).await;
+        let count = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+        self.settle_used(
+            &resp.model,
+            credential_usage::Used {
+                tokens_in: count(resp.usage.total_input_tokens()),
+                tokens_out: count(resp.usage.output_tokens),
+                cache_read: count(resp.usage.cache_read_input_tokens.unwrap_or(0)),
+                cache_write: count(resp.usage.cache_creation_input_tokens.unwrap_or(0)),
+            },
+        )
+        .await;
     }
 
-    pub(crate) async fn settle_tokens(mut self, model: &str, tokens_in: i64, tokens_out: i64) {
+    pub(crate) async fn settle_tokens(self, model: &str, tokens_in: i64, tokens_out: i64) {
+        self.settle_used(
+            model,
+            credential_usage::Used {
+                tokens_in,
+                tokens_out,
+                ..credential_usage::Used::default()
+            },
+        )
+        .await;
+    }
+
+    async fn settle_used(mut self, model: &str, used: credential_usage::Used) {
         let Some(id) = self.id.take() else { return };
         // A failed write leaves the reservation in place, which
         // over-counts rather than under-counts.
-        if let Err(e) = credential_usage::settle(&self.db, &id, model, tokens_in, tokens_out).await
-        {
+        if let Err(e) = credential_usage::settle(&self.db, &id, model, used).await {
             warn!(error = %e, "usage settlement failed (non-fatal)");
         }
     }
