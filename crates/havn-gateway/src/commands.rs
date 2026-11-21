@@ -349,6 +349,9 @@ pub struct Asker {
     pub admin_hint: &'static str,
     /// The agent's language, which its replies are in (issue #250).
     pub language: havn_core::Language,
+    /// Written in a group (issue #263), where a step waiting may be
+    /// another member's: it is named to be decided.
+    pub group: bool,
 }
 
 /// The language of agent `agent_id` (issue #250); English when it cannot
@@ -815,9 +818,9 @@ async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
             .into();
     };
     // A group (issue #263): `/allow group <id>`.
-    let (group, sender) = match args.trim().strip_prefix("group ") {
-        Some(id) => (true, id.trim()),
-        None => (false, args.trim()),
+    let (group, sender) = match args.trim().strip_prefix("group") {
+        Some(id) if id.is_empty() || id.starts_with(char::is_whitespace) => (true, id.trim()),
+        _ => (false, args.trim()),
     };
     if sender.is_empty()
         || sender.chars().any(char::is_whitespace)
@@ -901,6 +904,16 @@ async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> S
                     .then(|| state.webchat_router.owner_approval(asker.agent_id, id))
                     .flatten()
             }),
+        // In a group the step waiting may be a member's the owner did not
+        // see there (issue #263): it is named.
+        None if asker.group => {
+            return language
+                .pick(
+                    "(In a group, name the step: /approve <id> or /deny <id>, as your own chat                      with the bot shows it.)",
+                    "（在群里请写明步骤：/approve <id> 或 /deny <id>，id 见你和机器人的私聊。）",
+                )
+                .into();
+        }
         None => state
             .webchat_router
             .oldest_approval(asker.agent_id, &asker.scope),

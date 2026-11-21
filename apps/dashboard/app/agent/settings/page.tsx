@@ -722,6 +722,49 @@ function BotAccess({ agentId }: { agentId: string }) {
           sender_id,
           group,
         });
+        const refusedBlock = (
+          <>
+            <h4 className="mt-3 text-xs uppercase" style={muted}>
+              turned away recently
+            </h4>
+            {account.refused.length === 0 ? (
+              <p className="text-sm" style={muted}>
+                No one.
+              </p>
+            ) : (
+              <ul className="flex flex-col gap-2 text-sm">
+                {account.refused.map((r) => (
+                  <li key={r.sender_id}>
+                    {r.group && <span className="text-xs uppercase">group </span>}
+                    <span className="font-mono">{r.sender_id}</span>{" "}
+                    <span className="text-xs" style={muted}>
+                      {r.count} {r.count === 1 ? "message" : "messages"}, last {when(r.last_at)}
+                    </span>
+                    {r.said && <div className="text-xs wrap-anywhere">&ldquo;{r.said}&rdquo;</div>}
+                    <div className="mt-1 flex gap-2">
+                      <button
+                        type="button"
+                        className="btn-ghost"
+                        disabled={busy}
+                        onClick={() => void run(() => api.channels.allow(agentId, who(r.sender_id, r.group)))}
+                      >
+                        let in
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-ghost"
+                        disabled={busy}
+                        onClick={() => void run(() => api.channels.forget(agentId, who(r.sender_id, r.group)))}
+                      >
+                        dismiss
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </>
+        );
         const groups = account.group_policy === "off" ? null : (
           <>
             <h4 className="mt-3 text-xs uppercase" style={muted}>
@@ -746,7 +789,12 @@ function BotAccess({ agentId }: { agentId: string }) {
                     <span className="font-mono">{g.group_id}</span>
                     {g.title && <span>{g.title}</span>}
                     <span className="text-xs" style={muted}>
-                      {g.source === "owner" ? "let in by you" : "used while open"} since {when(g.since)}
+                      {g.source === "owner"
+                        ? "let in by you"
+                        : account.group_policy === "open"
+                          ? "used while open"
+                          : "used while open; no longer counts"}{" "}
+                      since {when(g.since)}
                     </span>
                     <button
                       type="button"
@@ -773,6 +821,7 @@ function BotAccess({ agentId }: { agentId: string }) {
                   Open: anyone can write to this bot.
                 </p>
                 {groups}
+                {account.refused.length > 0 && refusedBlock}
               </>
             ) : (
               <>
@@ -827,45 +876,7 @@ function BotAccess({ agentId }: { agentId: string }) {
                   </button>
                 </div>
 
-                <h4 className="mt-3 text-xs uppercase" style={muted}>
-                  turned away recently
-                </h4>
-                {account.refused.length === 0 ? (
-                  <p className="text-sm" style={muted}>
-                    No one.
-                  </p>
-                ) : (
-                  <ul className="flex flex-col gap-2 text-sm">
-                    {account.refused.map((r) => (
-                      <li key={r.sender_id}>
-                        {r.group && <span className="text-xs uppercase">group </span>}
-                        <span className="font-mono">{r.sender_id}</span>{" "}
-                        <span className="text-xs" style={muted}>
-                          {r.count} {r.count === 1 ? "message" : "messages"}, last {when(r.last_at)}
-                        </span>
-                        {r.said && <div className="text-xs wrap-anywhere">&ldquo;{r.said}&rdquo;</div>}
-                        <div className="mt-1 flex gap-2">
-                          <button
-                            type="button"
-                            className="btn-ghost"
-                            disabled={busy}
-                            onClick={() => void run(() => api.channels.allow(agentId, who(r.sender_id, r.group)))}
-                          >
-                            let in
-                          </button>
-                          <button
-                            type="button"
-                            className="btn-ghost"
-                            disabled={busy}
-                            onClick={() => void run(() => api.channels.forget(agentId, who(r.sender_id, r.group)))}
-                          >
-                            dismiss
-                          </button>
-                        </div>
-                      </li>
-                    ))}
-                  </ul>
-                )}
+                {refusedBlock}
 
                 <h4 className="mt-3 text-xs uppercase" style={muted}>
                   let in

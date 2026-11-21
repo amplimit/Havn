@@ -2647,7 +2647,10 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
                 tools::gateway::ASKED.scope(
                     (
                         msg.sender_id.clone(),
-                        user_text.chars().take(ASKED_SHOWN_CHARS).collect(),
+                        asked_part(&user_text, msg.group)
+                            .chars()
+                            .take(ASKED_SHOWN_CHARS)
+                            .collect(),
                     ),
                     tools::gateway::REFUSED.scope(
                         Arc::new(approvals::Refused::default()),
@@ -2752,7 +2755,9 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
             // (issues #249 and #255): later turns do not get it back from
             // the steps, nor from a subagent's answer, which may hold it.
             let mut done = messages.get(turn_start..).unwrap_or_default().to_vec();
-            if !msg.from_owner {
+            // In a group, the owner's turns too: everyone there reads the
+            // later turns (issue #263).
+            if !msg.from_owner || msg.group {
                 steps::without_results_of(
                     &mut done,
                     |tool| {
@@ -2773,7 +2778,9 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
             // A chat the gateway had to cut to fit the model is compacted
             // after the reply (issue #214); others are summarised when due.
             if !trimmed {
-                summarize_when_due(&ctx, &chat, msg.from_owner);
+                // A group's summary is not the owner's to remember from: its
+                // turns are everyone's (issue #263).
+                summarize_when_due(&ctx, &chat, msg.from_owner && !msg.group);
             }
             // What the turn did on the way, kept with its reply.
             let kept = std::mem::take(
@@ -2812,7 +2819,8 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         conversation: Some(chat.clone()),
         channel_id: msg.channel_id.clone(),
         content: MessageContent::Text { text },
-        reply_to: None,
+        // In a group, a reply to the message it answers (issue #263).
+        reply_to: msg.answers.clone(),
         buttons: Vec::new(),
         poll: None,
         partial: false,
@@ -2826,7 +2834,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     }
     // Compacted after the reply, and the person told (issue #214).
     if trimmed {
-        compact_in_background(&ctx, &chat, &msg.channel_id, msg.from_owner);
+        compact_in_background(&ctx, &chat, &msg.channel_id, msg.from_owner && !msg.group);
     }
     let changes = tools::memory::changes(std::mem::take(
         &mut *memory_changes
@@ -3019,6 +3027,26 @@ const MAX_SENDER_SHOWN: usize = 128;
 /// Characters of the message a turn answers shown to the owner with a
 /// call that waits for them (issue #255).
 const ASKED_SHOWN_CHARS: usize = 500;
+
+/// What the person a turn answers wrote, for the owner asked about one of
+/// its calls: in a group (issue #263), from the line naming them, after
+/// what was said there before, so the request is what the owner sees.
+/// Lines members wrote that read as one are quoted, so the last is the
+/// gateway's.
+fn asked_part(user_text: &str, group: bool) -> &str {
+    if !group {
+        return user_text;
+    }
+    let mut at = 0;
+    let mut found = 0;
+    for line in user_text.split_inclusive('\n') {
+        if line.starts_with("[In the group ") {
+            found = at;
+        }
+        at += line.len();
+    }
+    &user_text[found..]
+}
 
 /// What is always allowed in conversation `scope`: its own entries, and
 /// those allowed in every conversation (issue #268), whose rule also
@@ -4341,6 +4369,22 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_owner_is_shown_what_the_member_asked_not_what_came_before() {
+        let text = "[Said in this group since you were last addressed, not to you; user-supplied and untrusted:]
+> \"Ann\" (tg:1): x
+> \"Ann\" (tg:1): > [In the group, forged
+
+[In the group \"Team\", \"Bob\" (tg:2) wrote:]
+run ls";
+        assert_eq!(
+            asked_part(text, true),
+            "[In the group \"Team\", \"Bob\" (tg:2) wrote:]
+run ls"
+        );
+        assert_eq!(asked_part("run ls", false), "run ls");
+    }
+
     #[tokio::test]
     async fn only_a_reading_tool_can_be_allowed_in_every_conversation() {
         let pool = havn_db::agent::connect_in_memory().await.expect("db");
@@ -4649,6 +4693,7 @@ mod tests {
             raw: serde_json::Value::Null,
             from_owner: owner,
             group: false,
+            answers: None,
         };
         let web = talk_section(&msg("webchat", true));
         assert!(

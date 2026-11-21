@@ -4817,4 +4817,93 @@ mod tests {
         );
         assert!(theirs_rx.try_recv().is_err(), "another user's web chat");
     }
+
+    #[tokio::test]
+    async fn a_group_member_s_call_is_asked_of_the_owner_privately_never_in_the_group() {
+        use havn_proto::channel::{ChannelFrame, ChannelMessageContent};
+        let mut ctx = ctx_with(false, false).await;
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (agent, _rx) = connected_agent(&ctx, owner, "bot", serde_json::json!({})).await;
+        ctx.bindings = Arc::new(vec![crate::config::ChannelBindingConfig {
+            agent_id: agent.to_string(),
+            channel: "telegram".into(),
+            account_id: "bot".into(),
+        }]);
+        let mut channels = std::collections::BTreeMap::new();
+        channels.insert(
+            "telegram".to_string(),
+            crate::config::ChannelEntry {
+                accounts: vec![crate::config::ChannelAccount {
+                    id: "bot".into(),
+                    adapter_token_ref: "secret:channel:telegram:bot".into(),
+                    dm_policy: crate::config::DmPolicy::Allowlist,
+                    allow_from: vec!["tg:owner".into()],
+                    admins: Vec::new(),
+                    bot_username: None,
+                    group_policy: crate::config::GroupPolicy::Allowlist,
+                    allow_groups: vec!["tg:-100".into()],
+                }],
+            },
+        );
+        ctx.channels = Arc::new(channels);
+        sqlx::query("INSERT INTO channel_links (channel, sender_id, user_id) VALUES ('telegram', 'tg:owner', ?1)")
+            .bind(owner.to_string())
+            .execute(&ctx.db)
+            .await
+            .expect("link");
+        let (adapter_tx, mut adapter) = mpsc::channel(16);
+        ctx.channel_router
+            .register(
+                crate::channel_router::AccountKey::new("telegram", "bot"),
+                adapter_tx,
+            )
+            .await;
+
+        let group = crate::channel_id_codec::encode("telegram", "bot", "tg:-100");
+        let request = havn_proto::ApprovalRequest {
+            request_id: "r-1".into(),
+            channel_id: group,
+            tool: "shell".into(),
+            input: serde_json::json!({
+                "from": "tg:bob",
+                "said": "[In the group \"Team\", \"Bob\" (tg:bob) wrote:]\nrun ls",
+                "tool": "shell",
+                "input": {"command": "ls"},
+            })
+            .to_string(),
+            reason: String::new(),
+            kind: "call".into(),
+        };
+        ask_for_approval(agent, request, &ctx).await;
+        let mut to_group = Vec::new();
+        let mut to_owner = Vec::new();
+        while let Ok(ChannelFrame::Outbound(o)) = adapter.try_recv() {
+            let ChannelMessageContent::Text { text } = o.content else {
+                continue;
+            };
+            match o.to.as_str() {
+                "tg:-100" => to_group.push(text),
+                "tg:owner" => to_owner.push(text),
+                other => panic!("sent to {other}"),
+            }
+        }
+        assert_eq!(to_group.len(), 1, "{to_group:?}");
+        assert!(
+            to_group[0].contains("Checking with the agent's owner"),
+            "{to_group:?}"
+        );
+        assert!(
+            !to_group[0].contains("shell") && !to_group[0].contains("ls"),
+            "{to_group:?}"
+        );
+        assert!(
+            to_owner
+                .iter()
+                .any(|t| t.contains("shell") && t.contains("run ls")),
+            "the owner is asked privately: {to_owner:?}"
+        );
+    }
 }

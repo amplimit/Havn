@@ -40,6 +40,10 @@ pub struct InboundMessage {
     /// writes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub group: bool,
+    /// The platform's id of the message, in a group, that the reply
+    /// answers (issue #263): the reply goes as a reply to it there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers: Option<String>,
 }
 
 /// A file sent with a message (issue #106), saved in the agent's

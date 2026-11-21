@@ -50,6 +50,11 @@ pub struct ChannelCommands {
     pub account_id: String,
     /// In the order a menu shows them.
     pub commands: Vec<ChannelCommand>,
+    /// The gateway takes group messages (issue #263): an adapter passes
+    /// them on only to one that says so, as an older gateway would take
+    /// them for private ones.
+    #[serde(default)]
+    pub groups: bool,
 }
 
 /// One entry of [`ChannelCommands`].
