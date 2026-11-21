@@ -162,14 +162,18 @@ impl ChannelRouter {
     }
 
     /// Note whether `key`'s bot sees every message in `group`, as its
-    /// adapter says with a message from it. At most `GROUPS_KNOWN` groups
-    /// are kept per account.
-    pub async fn note_sees_all(&self, key: AccountKey, group: &str, sees_all: bool) {
+    /// adapter says with a message from it: `None`, that it does not know
+    /// (any more). At most `GROUPS_KNOWN` groups are kept per account.
+    pub async fn note_sees_all(&self, key: AccountKey, group: &str, sees_all: Option<bool>) {
         let mut map = self.inner.lock().await;
         let known = &mut map
             .entry(key)
             .or_insert_with(|| AccountState::new(None))
             .sees_all;
+        let Some(sees_all) = sees_all else {
+            known.remove(group);
+            return;
+        };
         if known.len() >= GROUPS_KNOWN && !known.contains_key(group) {
             if let Some(any) = known.keys().next().cloned() {
                 known.remove(&any);

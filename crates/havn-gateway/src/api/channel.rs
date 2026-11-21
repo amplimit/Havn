@@ -1080,16 +1080,14 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
             warn!(channel, account = %inb.account_id, error = %e, "dropping inbound: group id violates the channel_id codec");
             return;
         }
-        if let Some(sees_all) = g.sees_all {
-            state
-                .channel_router
-                .note_sees_all(
-                    crate::channel_router::AccountKey::new(channel, &inb.account_id),
-                    &g.id,
-                    sees_all,
-                )
-                .await;
-        }
+        state
+            .channel_router
+            .note_sees_all(
+                crate::channel_router::AccountKey::new(channel, &inb.account_id),
+                &g.id,
+                g.sees_all,
+            )
+            .await;
         if !group_admitted(state, channel, agent_id, &inb, g).await {
             return;
         }
@@ -4474,6 +4472,15 @@ mod tests {
                 (seen("tg:-100"), seen("tg:-200"), seen("tg:-300")),
                 (Some(false), Some(true), None)
             );
+
+            // An adapter that no longer knows (it restarted, the bot left) clears it.
+            handle_inbound(
+                &f.state,
+                "telegram",
+                say("tg:-100", "/help@bot", true, None),
+            )
+            .await;
+            assert_eq!(f.state.channel_router.sees_all(&key, "tg:-100").await, None);
         }
 
         #[tokio::test]
