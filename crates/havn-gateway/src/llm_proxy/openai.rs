@@ -512,7 +512,11 @@ fn translate_message_to_openai(
         }
         out.push(msg);
     } else if !images.is_empty() {
-        let mut parts = vec![json!({"type": "text", "text": text_parts.join("\n")})];
+        // No empty text part: some servers refuse one.
+        let mut parts = Vec::new();
+        if !text_parts.is_empty() {
+            parts.push(json!({"type": "text", "text": text_parts.join("\n")}));
+        }
         parts.extend(images);
         out.push(json!({"role": &m.role, "content": parts}));
     } else if !text_parts.is_empty() {
@@ -993,6 +997,14 @@ mod tests {
                             {"type": "text", "text": "The image chart.png:"},
                             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
                         ]
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_2",
+                        "content": [
+                            {"type": "text", "text": "The image shot.png:"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "BBBB"}}
+                        ]
                     }
                 ]),
             }],
@@ -1000,20 +1012,26 @@ mod tests {
         );
         let body = anthropic_to_openai(&r, "max_tokens", "openai").expect("translate");
         let messages = body["messages"].as_array().expect("messages");
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
         assert_eq!(messages[0]["role"], "tool");
         assert_eq!(messages[0]["content"], "The image chart.png:");
-        assert_eq!(messages[1]["role"], "user");
-        let parts = messages[1]["content"].as_array().expect("parts");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[2]["role"], "user");
+        let parts = messages[2]["content"].as_array().expect("parts");
+        let shape: Vec<String> = parts
+            .iter()
+            .map(|p| match p["image_url"]["url"].as_str() {
+                Some(url) => url.to_string(),
+                None => p["text"].as_str().unwrap_or_default().to_string(),
+            })
+            .collect();
+        assert_eq!(shape.len(), 4, "{shape:?}");
         assert!(
-            parts
-                .iter()
-                .any(|p| p["text"].as_str().is_some_and(|t| t.contains("tu_1")))
+            shape[0].contains("tu_1") && shape[2].contains("tu_2"),
+            "{shape:?}"
         );
-        assert_eq!(
-            parts.last().expect("image")["image_url"]["url"],
-            "data:image/png;base64,AAAA"
-        );
+        assert_eq!(shape[1], "data:image/png;base64,AAAA");
+        assert_eq!(shape[3], "data:image/png;base64,BBBB");
     }
 
     #[test]

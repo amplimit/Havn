@@ -209,7 +209,14 @@ pub async fn guarded(
         Review::Result => {
             let found = match run.await {
                 ToolResult::Ok(found) => found,
-                other @ (ToolResult::Error(_) | ToolResult::Image { .. }) => return other,
+                failed @ ToolResult::Error(_) => return failed,
+                // The owner looks at text: an image would reach the model
+                // unseen.
+                ToolResult::Image { .. } => {
+                    return ToolResult::Error(
+                        "an image cannot be shown to the owner to look at first".into(),
+                    );
+                }
             };
             // What the owner sees is what the model gets: what does not
             // fit is left out of both, and both are told.
@@ -575,6 +582,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn viewing_an_image_in_someone_else_s_chat_is_asked_about_first() {
+        assert!(matches!(Review::of("view_image"), Some(Review::Call)));
+        assert!(matches!(Review::of("file_read"), Some(Review::Result)));
+    }
 
     fn decision(channel: &str, id: &str, approve: bool, remember: bool) -> ApprovalDecision {
         ApprovalDecision {

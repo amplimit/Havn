@@ -852,11 +852,22 @@ fn names_workspace_images(request: &AnthropicRequest) -> bool {
     })
 }
 
+/// Whether a block of `request`, or of a tool's result in it (issue
+/// #227), is one `found` looks for.
 fn has_block(request: &AnthropicRequest, found: impl Fn(&serde_json::Value) -> bool) -> bool {
+    fn any(blocks: &[serde_json::Value], found: &dyn Fn(&serde_json::Value) -> bool) -> bool {
+        blocks.iter().any(|b| {
+            found(b)
+                || b.get("type").and_then(serde_json::Value::as_str) == Some("tool_result")
+                    && b.get("content")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|inner| any(inner, found))
+        })
+    }
     request.messages.iter().any(|m| {
         m.content
             .as_array()
-            .is_some_and(|blocks| blocks.iter().any(&found))
+            .is_some_and(|blocks| any(blocks, &found))
     })
 }
 
@@ -930,7 +941,11 @@ where
     Fut: std::future::Future<Output = Result<AnthropicResponse, ProxyError>>,
 {
     let limits_blind = limits.clone();
+    // Copies of images too large to show are made by the converter, from
+    // the blocking task (issue #227).
+    let handle = tokio::runtime::Handle::current();
     let (shown, blind, again, trimmed) = tokio::task::spawn_blocking(move || {
+        let shrink = |bytes: &[u8]| handle.block_on(crate::web_fetch::image_to_show(bytes));
         let mut request = request;
         // Documents' text goes to every model (issue #211).
         resolve_workspace_texts(&mut request, &workspace, &limits);
@@ -938,7 +953,7 @@ where
         // it has images to leave out.
         let blind =
             (show && retry_blind && names_workspace_images(&request)).then(|| request.clone());
-        resolve_workspace_images(&mut request, &workspace, show, &limits);
+        resolve_workspace_images(&mut request, &workspace, show, &limits, &shrink);
         // Kept for a second try, fitted tighter, when the provider finds it
         // too long after all: only one that comes near the window can be.
         let near = context_tokens(&request) * 2 > window_budget(&request, context, FIT_SHARE);
@@ -982,7 +997,13 @@ where
         });
     }
     // Without vision no file is read.
-    resolve_workspace_images(&mut blind, std::path::Path::new(""), false, &limits_blind);
+    resolve_workspace_images(
+        &mut blind,
+        std::path::Path::new(""),
+        false,
+        &limits_blind,
+        &|_| Err(String::new()),
+    );
     trimmed |= fit_context(&mut blind, context, FIT_SHARE);
     match send(blind).await {
         Ok(answer) => Ok(Seen {
@@ -1276,22 +1297,27 @@ pub fn too_long(e: &ProxyError) -> bool {
 /// `vision`; one the gateway made a copy of when it came ([`shown_copy`])
 /// as that copy. Every other one (not a PNG, JPEG, GIF or WebP by its first
 /// bytes, too large, missing, not a path in the workspace, one too many) becomes a
-/// line saying why. Blocking: it reads files. See [`send_seeing`] for a
-/// model that may not take them.
+/// line saying why. A file of the workspace a model cannot be shown as it
+/// is goes as the copy `shrink` makes of it. Blocking: it reads files. See
+/// [`send_seeing`] for a model that may not take them.
 pub fn resolve_workspace_images(
     request: &mut AnthropicRequest,
     workspace: &std::path::Path,
     vision: bool,
     limits: &crate::config::AttachmentLimits,
+    shrink: &dyn Fn(&[u8]) -> Result<Vec<u8>, String>,
 ) {
     let mut inbox: Option<std::io::Result<Option<crate::agent_files::WorkspaceDir>>> = None;
-    // What each path gave, so a path named again is not read again.
-    let mut seen: std::collections::HashMap<String, Result<(serde_json::Value, u64), String>> =
-        std::collections::HashMap::new();
+    // What each path gave, so a path named again is not read again; apart
+    // for a tool's result, which may name any file of the workspace.
+    let mut seen: std::collections::HashMap<
+        (bool, String),
+        Result<(serde_json::Value, u64), String>,
+    > = std::collections::HashMap::new();
     let (mut count, mut total) = (0_usize, 0_u64);
     // The newest messages first: past a limit, the oldest images are left
     // out.
-    let mut one = |block: &mut serde_json::Value| {
+    let mut one = |block: &mut serde_json::Value, nested: bool| {
         let is_ref = block.get("type").and_then(serde_json::Value::as_str) == Some("image")
             && block
                 .pointer("/source/type")
@@ -1305,18 +1331,19 @@ pub fn resolve_workspace_images(
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let key = (nested, path.clone());
         // Every block counts, a repeat of one shown too: each is a copy
         // of its bytes in the request.
         let result = if !vision {
             Err("this model cannot see images".to_string())
-        } else if let Some(Err(why)) = seen.get(&path) {
+        } else if let Some(Err(why)) = seen.get(&key) {
             Err(why.clone())
         } else if count >= limits.images {
             Err(format!(
                 "the model is shown at most {} images, the newest",
                 limits.images
             ))
-        } else if let Some(Ok((image, size))) = seen.get(&path) {
+        } else if let Some(Ok((image, size))) = seen.get(&key) {
             if total + size > limits.image_bytes {
                 Err("the images of this chat are too large together".to_string())
             } else {
@@ -1332,10 +1359,12 @@ pub fn resolve_workspace_images(
                         .and_then(|root| root.subdir(havn_core::INBOX_DIR))
                 });
                 image_block(dir, &path, room)
+            } else if nested {
+                workspace_image_block(workspace, &path, room, shrink)
             } else {
-                workspace_image_block(workspace, &path, room)
+                Err("it is not a file of the inbox".to_string())
             };
-            seen.insert(path.clone(), read.clone());
+            seen.insert(key, read.clone());
             read.map(|(image, size)| {
                 total += size;
                 count += 1;
@@ -1361,9 +1390,11 @@ pub fn resolve_workspace_images(
                     .get_mut("content")
                     .and_then(serde_json::Value::as_array_mut)
             {
-                parts.iter_mut().for_each(&mut one);
+                for part in parts {
+                    one(part, true);
+                }
             } else {
-                one(block);
+                one(block, false);
             }
         }
     }
@@ -1555,14 +1586,51 @@ fn image_block(
     block_of(read, limit)
 }
 
+/// Copies made of images of workspaces, or why none could be, by the hash
+/// and length of the original: a tool loop shows an image again on each
+/// of its rounds.
+static SHRUNK: std::sync::Mutex<std::collections::VecDeque<(u64, usize, Result<Vec<u8>, String>)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// Copies [`SHRUNK`] keeps.
+const SHRUNK_KEPT: usize = 8;
+
+/// The copy `shrink` makes of `original`, once for the same bytes.
+fn shrunk(
+    original: &[u8],
+    shrink: &dyn Fn(&[u8]) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::hash::DefaultHasher::new();
+    original.hash(&mut hasher);
+    let key = (hasher.finish(), original.len());
+    let lock = || {
+        SHRUNK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    if let Some((_, _, copy)) = lock().iter().find(|(h, n, _)| (*h, *n) == key) {
+        return copy.clone();
+    }
+    let copy = shrink(original).map_err(|e| format!("no copy of it could be made ({e})"));
+    let mut kept = lock();
+    kept.push_back((key.0, key.1, copy.clone()));
+    if kept.len() > SHRUNK_KEPT {
+        kept.pop_front();
+    }
+    copy
+}
+
 /// [`image_block`] for a file of the workspace outside the inbox, at
 /// `path` (`/`-separated, relative to the workspace root), read through
-/// [`crate::agent_files`] so no link is followed. It is shown as it is:
-/// the gateway made no copy of it.
+/// [`crate::agent_files`] so no link is followed. One a model cannot be
+/// shown as it is (too large, HEIC) goes as the copy `shrink` makes of it
+/// (issue #227); nothing is written.
 fn workspace_image_block(
     workspace: &std::path::Path,
     path: &str,
     room: u64,
+    shrink: &dyn Fn(&[u8]) -> Result<Vec<u8>, String>,
 ) -> Result<(serde_json::Value, u64), String> {
     let parts: Vec<&str> = path.split('/').collect();
     let Some((name, dirs)) = parts.split_last() else {
@@ -1583,8 +1651,27 @@ fn workspace_image_block(
             Err(e) => return Err(format!("it cannot be read ({e})")),
         };
     }
+    let most = crate::api::files::MAX_UPLOAD_BYTES as u64;
+    let original = match dir.read_bytes(name, most) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Err("it is not there any more".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(format!("it is over {most} bytes"));
+        }
+        Err(e) => return Err(format!("it cannot be read ({e})")),
+    };
+    let bytes = if needs_copy(&original) {
+        shrunk(&original, shrink)?
+    } else {
+        original
+    };
     let limit = MAX_IMAGE_BYTES.min(room);
-    block_of(dir.read_bytes(name, limit), limit)
+    let read = if bytes.len() as u64 > limit {
+        Err(std::io::Error::from(std::io::ErrorKind::InvalidData))
+    } else {
+        Ok(Some(bytes))
+    };
+    block_of(read, limit)
 }
 
 /// The image block of `read`, a file read up to `limit` bytes, or why it
@@ -2230,6 +2317,7 @@ mod tests {
             ws.path(),
             true,
             &crate::config::AttachmentLimits::default(),
+            &shown_image,
         );
         let blocks = request.messages[0].content.as_array().expect("blocks");
         // Every block counts, a repeat too: the same image a thousand
@@ -2525,7 +2613,7 @@ mod tests {
             images: 1,
             ..Default::default()
         };
-        resolve_workspace_images(&mut request, ws.path(), true, &limits);
+        resolve_workspace_images(&mut request, ws.path(), true, &limits, &shown_image);
         assert_eq!(request.messages[1].content[0]["type"], "image");
         let old = request.messages[0].content[0]["text"]
             .as_str()
@@ -2798,7 +2886,13 @@ mod tests {
             refer("inbox/c.png"),
             refer("inbox/d.heic"),
         ]]);
-        resolve_workspace_images(&mut request, ws.path(), true, &Default::default());
+        resolve_workspace_images(
+            &mut request,
+            ws.path(),
+            true,
+            &Default::default(),
+            &shown_image,
+        );
         let blocks = &request.messages[0].content;
         assert_eq!(blocks[0]["source"]["media_type"], "image/png");
         assert_eq!(blocks[0]["source"]["data"], base64(&copy));
@@ -2833,7 +2927,13 @@ mod tests {
             "/shots/page.png",
         ];
         let mut request = chat(vec![vec![result(&paths)]]);
-        resolve_workspace_images(&mut request, ws.path(), true, &Default::default());
+        resolve_workspace_images(
+            &mut request,
+            ws.path(),
+            true,
+            &Default::default(),
+            &shown_image,
+        );
         let parts = &request.messages[0].content[0]["content"];
         assert_eq!(parts[0]["text"], "The image:");
         assert_eq!(parts[1]["source"]["data"], base64(&page));
@@ -2849,7 +2949,13 @@ mod tests {
         assert!(why(5).contains("not a path in the workspace"), "{}", why(5));
 
         let mut blind = chat(vec![vec![result(&["shots/page.png"])]]);
-        resolve_workspace_images(&mut blind, ws.path(), false, &Default::default());
+        resolve_workspace_images(
+            &mut blind,
+            ws.path(),
+            false,
+            &Default::default(),
+            &shown_image,
+        );
         let line = blind.messages[0].content[0]["content"][1]["text"]
             .as_str()
             .unwrap_or_default()
@@ -2901,6 +3007,77 @@ mod tests {
             tools: None,
             system_stable: 0,
         }
+    }
+
+    #[test]
+    fn a_tall_image_a_tool_showed_goes_as_a_copy() {
+        let ws = tempfile::tempdir().expect("tmp");
+        let page = png(&noise(64, 9000, u8::MAX));
+        std::fs::write(ws.path().join("page.png"), &page).expect("page");
+        let refer = serde_json::json!({"type": "tool_result", "tool_use_id": "t", "content": [
+            {"type": "image", "source": {"type": "workspace", "path": "page.png"}},
+        ]});
+        let made = std::sync::atomic::AtomicUsize::new(0);
+        let shrink = |bytes: &[u8]| {
+            made.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            shown_image(bytes)
+        };
+        for _ in 0..2 {
+            let mut request = chat(vec![vec![refer.clone()]]);
+            resolve_workspace_images(&mut request, ws.path(), true, &Default::default(), &shrink);
+            let image = &request.messages[0].content[0]["content"][0];
+            assert_eq!(image["type"], "image", "{image}");
+            let data = image["source"]["data"].as_str().expect("data");
+            assert_ne!(data, base64(&page));
+        }
+        assert_eq!(
+            made.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a copy is made once for the same bytes"
+        );
+        // Top-level references name the inbox only.
+        let mut request = chat(vec![vec![
+            serde_json::json!({"type": "image", "source": {"type": "workspace", "path": "page.png"}}),
+        ]]);
+        resolve_workspace_images(&mut request, ws.path(), true, &Default::default(), &shrink);
+        let line = request.messages[0].content[0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(line.contains("not a file of the inbox"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_image_a_tool_showed_goes_again_as_a_note() {
+        let ws = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir_all(ws.path().join("shots")).expect("shots");
+        std::fs::write(ws.path().join("shots/a.png"), png(&noise(4, 4, u8::MAX))).expect("png");
+        let mut request = picture_request(ws.path());
+        request.messages[0].content = serde_json::json!([
+            {"type": "tool_result", "tool_use_id": "t", "content": [
+                {"type": "text", "text": "The image shots/a.png:"},
+                {"type": "image", "source": {"type": "workspace", "path": "shots/a.png"}},
+            ]},
+        ]);
+        let sent = std::sync::Mutex::new(Vec::new());
+        let seen = send_seeing(
+            request,
+            ws.path().to_path_buf(),
+            crate::config::AttachmentLimits::default(),
+            200_000,
+            true,
+            true,
+            blind_provider(&sent),
+        )
+        .await
+        .expect("join");
+        assert!(seen.result.is_ok() && seen.model_takes_none);
+        let sent = sent.into_inner().expect("lock");
+        assert_eq!(sent.len(), 2);
+        let note = sent[1].messages[0].content[0]["content"][1]["text"]
+            .as_str()
+            .expect("note");
+        assert!(note.contains("cannot see images"), "{note}");
     }
 
     /// A provider that refuses images, as OpenRouter does for a model
@@ -3127,6 +3304,7 @@ mod tests {
             ws.path(),
             true,
             &crate::config::AttachmentLimits::default(),
+            &shown_image,
         );
         let blocks = seen.messages[0].content.as_array().expect("blocks").clone();
         assert_eq!(blocks[1]["source"]["type"], "base64");
@@ -3135,7 +3313,7 @@ mod tests {
         for (n, why) in [
             (2, "not a PNG"),
             (3, "cannot be read"),
-            (4, "not a path in the workspace"),
+            (4, "not a file of the inbox"),
             (5, "not there"),
         ] {
             let text = blocks[n]["text"].as_str().unwrap_or_default();
@@ -3148,6 +3326,7 @@ mod tests {
             ws.path(),
             false,
             &crate::config::AttachmentLimits::default(),
+            &shown_image,
         );
         let blocks = blind.messages[0].content.as_array().expect("blocks");
         assert!(

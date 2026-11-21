@@ -781,7 +781,9 @@ mod tests {
                 );
                 let names = names_in(&registry(policy).schemas_for(context::CRON));
                 assert!(
-                    !names.contains(&"file_find".into()) && !names.contains(&"file_search".into())
+                    !names.contains(&"file_find".into())
+                        && !names.contains(&"file_search".into())
+                        && !names.contains(&"view_image".into())
                 );
             })
             .await;

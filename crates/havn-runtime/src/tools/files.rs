@@ -84,7 +84,7 @@ impl Tool for ViewImageTool {
     }
 
     fn description(&self) -> &'static str {
-        "Look at an image in the agent's workspace: a screenshot you took, a chart you          drew, a picture you downloaded. PNG, JPEG, GIF or WebP. Path is relative to the          workspace root. The image is shown to you with this tool's result, when your          model can see images."
+        "Look at an image in the agent's workspace: a screenshot you took, a chart you drew, a picture you downloaded. PNG, JPEG, GIF, WebP or HEIC. Path is relative to the workspace root. The image is shown to you with this tool's result, when your model can see images."
     }
 
     fn input_schema(&self) -> Value {
@@ -126,7 +126,9 @@ impl Tool for ViewImageTool {
             Err(e) => return ToolResult::Error(format!("read failed: {e}")),
         };
         if !is_image(&head[..n]) {
-            return ToolResult::Error(format!("{path} is not a PNG, JPEG, GIF or WebP image"));
+            return ToolResult::Error(format!(
+                "{path} is not a PNG, JPEG, GIF, WebP or HEIC image"
+            ));
         }
         let path = Path::new(path)
             .components()
@@ -143,14 +145,26 @@ impl Tool for ViewImageTool {
     }
 }
 
-/// Whether `head`, a file's first bytes, starts a PNG, JPEG, GIF or WebP
-/// image.
+/// Whether `head`, a file's first bytes, starts a PNG, JPEG, GIF, WebP or
+/// HEIF image (the gateway shows HEIC as a copy).
 fn is_image(head: &[u8]) -> bool {
     head.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
         || head.starts_with(&[0xFF, 0xD8, 0xFF])
         || head.starts_with(b"GIF87a")
         || head.starts_with(b"GIF89a")
         || head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP"
+        || head.len() >= 12
+            && &head[4..8] == b"ftyp"
+            && [
+                &b"heic"[..],
+                b"heix",
+                b"heim",
+                b"heis",
+                b"hevc",
+                b"mif1",
+                b"msf1",
+            ]
+            .contains(&&head[8..12])
 }
 
 pub struct FileWriteTool;
