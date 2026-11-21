@@ -323,7 +323,7 @@ pub async fn complete_with_provider(
     llm: &LlmConfig,
 ) -> Result<AnthropicResponse, ProxyError> {
     let route = route(provider_name, max_output_tokens, llm)?;
-    complete_through(
+    let result = complete_through(
         db,
         http,
         keyring,
@@ -333,7 +333,9 @@ pub async fn complete_with_provider(
         llm.max_tokens_ceiling,
         None,
     )
-    .await
+    .await;
+    crate::metrics::llm_call(provider_name, &request.model, &result);
+    result
 }
 
 /// [`complete_with_provider`], streaming: the reply's text goes to `text`
@@ -355,7 +357,7 @@ pub async fn stream_with_provider(
     text: &provider::TextSink,
 ) -> Result<AnthropicResponse, ProxyError> {
     let route = route(provider_name, max_output_tokens, llm)?;
-    complete_through(
+    let result = complete_through(
         db,
         http,
         keyring,
@@ -365,7 +367,9 @@ pub async fn stream_with_provider(
         llm.max_tokens_ceiling,
         Some(text),
     )
-    .await
+    .await;
+    crate::metrics::llm_call(provider_name, &request.model, &result);
+    result
 }
 
 fn route<'a>(

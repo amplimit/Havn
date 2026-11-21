@@ -202,6 +202,19 @@ install.sh does this when it finds npm); without it, the port says how. See
 [apps/dashboard/README.md](apps/dashboard/README.md) for the development
 server (`npm run dev`).
 
+### Metrics
+
+Set `metrics_listen` in config.toml (for example `"127.0.0.1:9464"`; empty, the default, serves none) for the gateway to serve Prometheus metrics at `/metrics` there, in the text format, with no login: keep it on loopback or a network only your Prometheus reaches (the gateway warns when it is not loopback). It must be a port of its own, and applies on `havn gateway restart`. The counters start at zero when the gateway starts:
+
+- `havn_build_info{version}`, `havn_uptime_seconds`;
+- `havn_agents_connected` and `havn_channel_adapters_connected`, now;
+- `havn_llm_calls_total{provider, model, outcome}`, the LLM calls made for agents, where `outcome` is `ok`, `no_credential`, `unavailable`, `upstream_error`, `transport_error`, `budget_exhausted` or `other_error`;
+- `havn_llm_tokens_total{provider, model, direction}`, the input (cache reads and writes included) and output tokens of the calls that answered;
+- `havn_channel_messages_total{channel, direction}`, the messages adapters passed in and the gateway sent out;
+- `havn_cron_runs_total{outcome}`, the runs of scheduled tasks: `success`, `failure`, or `skipped` by their wake check.
+
+A counter keeps at most 1000 label sets; past that, a new model or channel is counted as `other`.
+
 ## Project Structure
 
 ```

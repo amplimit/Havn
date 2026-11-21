@@ -161,6 +161,16 @@ impl ChannelRouter {
         Self::default()
     }
 
+    /// How many accounts have an adapter connected now.
+    pub async fn connected(&self) -> usize {
+        self.inner
+            .lock()
+            .await
+            .values()
+            .filter(|s| s.tx.as_ref().is_some_and(|tx| !tx.is_closed()))
+            .count()
+    }
+
     /// Note whether `key`'s bot sees every message in `group`, as its
     /// adapter says with a message from it: `None`, that it does not know
     /// (any more). At most `GROUPS_KNOWN` groups are kept per account.
@@ -325,7 +335,10 @@ impl ChannelRouter {
         // Never wait on the adapter: it serves every agent bound to its
         // account, and the caller is an agent's reader loop.
         match tx.try_send(frame) {
-            Ok(()) => Ok(seq),
+            Ok(()) => {
+                crate::metrics::channel_message(&key.channel, "out");
+                Ok(seq)
+            }
             Err(mpsc::error::TrySendError::Closed(_)) => Err(DeliverError::WriterClosed),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 warn!(

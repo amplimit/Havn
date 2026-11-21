@@ -1031,6 +1031,7 @@ async fn handle_session(
 /// the operator-visible signal that they need to add a binding (the
 /// startup `dangling_bindings` warning catches the inverse case).
 async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound) {
+    crate::metrics::channel_message(channel, "in");
     let agent_id_str =
         match channel_router::agent_for_account(&state.bindings, channel, &inb.account_id) {
             Some(s) => s,

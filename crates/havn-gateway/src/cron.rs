@@ -309,6 +309,7 @@ impl CronScheduler {
                     },
                 )
                 .await;
+                crate::metrics::cron_run("skipped");
                 let _ = advance_after_run(&self.db, &job, tick_at).await;
                 return;
             }
@@ -548,6 +549,10 @@ impl CronScheduler {
             CronOutcome::Success => (RunOutcome::Success, None),
             CronOutcome::Error { message } => (RunOutcome::Error, Some(message.clone())),
         };
+        crate::metrics::cron_run(match outcome {
+            RunOutcome::Success => "success",
+            _ => "failure",
+        });
 
         record_run(
             &self.db,
