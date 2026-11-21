@@ -908,7 +908,12 @@ async fn serve() -> anyhow::Result<()> {
         .route("/v1/llm/anthropic", post(api::llm::anthropic))
         // Called from outside, often through a proxy under another name:
         // not limited to this host's names (issue #236).
-        .route("/hooks/{id}", post(api::webhooks::call))
+        .route(
+            "/hooks/{id}",
+            post(api::webhooks::call).layer(axum::extract::DefaultBodyLimit::max(
+                api::webhooks::MAX_BODY_BYTES,
+            )),
+        )
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 

@@ -218,6 +218,19 @@ pub async fn update(
     let instructions = instructions_of(&req.instructions)?;
     let deliver = deliver_of(&state, &agent, &req.deliver)?;
     webhooks::update(&state.db, found.id, &instructions, &deliver).await?;
+    crate::audit::record(
+        &state.db,
+        user.id,
+        agent.team_id,
+        Some(agent.id),
+        "webhook.updated",
+        serde_json::json!({
+            "webhook_id": found.id.to_string(),
+            "deliver": deliver,
+            "instructions_changed": instructions != found.instructions,
+        }),
+    )
+    .await;
     let updated = webhooks::find(&state.db, found.id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -281,8 +294,15 @@ fn hex(bytes: &[u8]) -> String {
 /// token, as `X-Havn-Token`, or as the key of the body's HMAC-SHA256 in
 /// `X-Hub-Signature-256` (or `X-Havn-Signature-256`), `sha256=<hex>`.
 fn holds_secret(secret: &str, headers: &HeaderMap, body: &[u8]) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    if let Some(token) = header("authorization").and_then(|v| v.strip_prefix("Bearer ")) {
+    let bearer = header("authorization")
+        .and_then(|v| v.trim().split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token);
+    if let Some(token) = bearer {
         return same(token.trim().as_bytes(), secret.as_bytes());
     }
     if let Some(token) = header("x-havn-token") {
@@ -350,6 +370,11 @@ pub async fn call(
     let Some(hook) = webhooks::find(&state.db, id).await? else {
         return Err(refused());
     };
+    if state.supervisor.shutting_down() {
+        return Err(ApiError::Unavailable(
+            "the gateway is restarting; call again once it is back".into(),
+        ));
+    }
     if !holds_secret(&hook.secret, &headers, &body) {
         return Err(refused());
     }
@@ -458,6 +483,16 @@ mod tests {
         assert!(holds_secret(
             secret,
             &with("authorization", "Bearer s3cret".into()),
+            body
+        ));
+        assert!(holds_secret(
+            secret,
+            &with("authorization", "bearer s3cret".into()),
+            body
+        ));
+        assert!(!holds_secret(
+            "",
+            &with("x-havn-token", String::new()),
             body
         ));
         assert!(holds_secret(

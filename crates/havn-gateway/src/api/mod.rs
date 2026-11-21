@@ -52,6 +52,10 @@ pub enum ApiError {
     #[error("too many requests: {0}")]
     TooManyRequests(String),
 
+    /// Not now: the gateway is restarting.
+    #[error("unavailable: {0}")]
+    Unavailable(String),
+
     #[error("bad request: {0}")]
     BadRequest(String),
 
@@ -114,6 +118,7 @@ impl IntoResponse for ApiError {
             Self::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
             Self::Conflict(_) => (StatusCode::CONFLICT, self.to_string()),
             Self::TooManyRequests(_) => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
+            Self::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
             Self::Forbidden(_) => (StatusCode::FORBIDDEN, self.to_string()),

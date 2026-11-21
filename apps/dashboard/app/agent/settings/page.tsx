@@ -1781,11 +1781,13 @@ function Webhooks({ agentId }: { agentId: string }) {
       </h2>
       <p className="mb-3 text-sm" style={muted}>
         An address that other systems (an alert, a CI build, a form) call to have the agent act on what they send.
-        What a call brings is treated as from someone other than you: calls that need you wait for your approval,
-        and your memory is not used. Each webhook has its own chat in the web chat. It is served under the
-        gateway&apos;s <span className="font-mono">listen</span> address (put it behind your proxy for outside
-        callers); a caller sends the secret as <span className="font-mono">Authorization: Bearer</span> or signs
-        the body with it (<span className="font-mono">X-Hub-Signature-256</span>, as GitHub does).
+        What a call brings is treated as from someone other than you: reading tools and calls that run things wait
+        for your approval, nothing is saved to your memory, and it cannot make tasks or ask other agents. Each
+        webhook has its own chat in the web chat. It is served under the gateway&apos;s{" "}
+        <span className="font-mono">listen</span> address (put it behind your proxy for outside callers); a caller
+        sends the secret as <span className="font-mono">Authorization: Bearer</span> or{" "}
+        <span className="font-mono">X-Havn-Token</span>, or signs the body with it (
+        <span className="font-mono">X-Hub-Signature-256</span>, as GitHub does).
       </p>
       {error && (
         <p className="mb-2 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
@@ -1901,7 +1903,9 @@ function Webhooks({ agentId }: { agentId: string }) {
                   disabled={busy}
                   onClick={() => {
                     if (window.confirm(`Delete the webhook ${hook.name}? Calls to it are refused from now on.`)) {
-                      void act(() => api.webhooks.remove(agentId, hook.id));
+                      void act(() => api.webhooks.remove(agentId, hook.id)).then((ok) => {
+                        if (ok && made?.id === hook.id) setMade(null);
+                      });
                     }
                   }}
                 >

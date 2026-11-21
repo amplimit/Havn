@@ -1412,6 +1412,21 @@ async fn ask_owner_for_someone_else(
     let bots: Vec<(String, String)> = match decoded {
         Some((channel, account, _)) => vec![(channel.to_string(), account.to_string())],
         None if request.channel_id.starts_with(WEBHOOK_CONVERSATION) => {
+            // Only for a webhook of this agent's.
+            let theirs = request.channel_id[WEBHOOK_CONVERSATION.len()..]
+                .parse::<uuid::Uuid>()
+                .ok();
+            let found = match theirs {
+                Some(id) => havn_db::repo::webhooks::find(&ctx.db, id)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            if found.is_none_or(|hook| hook.agent_id != agent_id) {
+                warn!(%agent_id, "an approval for a webhook that is not the agent's; not asked");
+                return;
+            }
             let agent = agent_id.to_string();
             ctx.bindings
                 .iter()
@@ -1459,7 +1474,18 @@ async fn ask_owner_for_someone_else(
     let Ok(links) = havn_db::repo::channel_access::list_links(&ctx.db, Some(owner)).await else {
         return;
     };
-    let shown = question(request, language);
+    let mut shown = question(request, language);
+    if decoded.is_none() {
+        shown = format!(
+            "{}\n\n{shown}",
+            language.pick(
+                "(This came with a call of a webhook: always allowing it there allows it for every \
+                 later call of that webhook, from whoever holds its secret.)",
+                "（这来自一次 webhook 调用：在那里永久允许，就是对这个 webhook 之后的每次调用都允许，\
+                 不论调用的是谁，只要持有它的密钥。）",
+            )
+        );
+    }
     for (channel, account) in &bots {
         for link in links.iter().filter(|l| &l.channel == channel) {
             let dm = crate::channel_id_codec::encode(channel, account, &link.sender_id);

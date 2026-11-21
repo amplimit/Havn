@@ -158,7 +158,7 @@ pub async fn webhook_chat(
         .execute(&mut *tx)
         .await?;
     sqlx::query(
-        "INSERT INTO webhook_chats (webhook_id, scope, chat_id) VALUES (?1, ?2, ?3)          ON CONFLICT (webhook_id) DO UPDATE SET scope = excluded.scope, chat_id = excluded.chat_id",
+        "INSERT INTO webhook_chats (webhook_id, scope, chat_id) VALUES (?1, ?2, ?3)          ON CONFLICT (webhook_id, scope) DO UPDATE SET chat_id = excluded.chat_id",
     )
     .bind(webhook_id)
     .bind(scope)
@@ -167,6 +167,17 @@ pub async fn webhook_chat(
     .await?;
     tx.commit().await?;
     Ok(id)
+}
+
+/// Whether `chat` keeps a webhook's calls (issue #236): what is in it came
+/// from outside, so it is never the owner's.
+pub async fn is_webhook_chat(pool: &SqlitePool, chat: &str) -> Result<bool> {
+    let (found,): (bool,) =
+        sqlx::query_as("SELECT EXISTS (SELECT 1 FROM webhook_chats WHERE chat_id = ?1)")
+            .bind(chat)
+            .fetch_one(pool)
+            .await?;
+    Ok(found)
 }
 
 /// Record `reply` to turn `parent` of chat `chat`. The chat continues from
@@ -741,7 +752,7 @@ const TRIGRAM_CHARS: usize = 3;
 pub async fn chat_of_owner(pool: &SqlitePool, chat: &str) -> Result<bool> {
     let (found,): (bool,) = sqlx::query_as(
         "SELECT EXISTS (SELECT 1 FROM chats c JOIN owner_scopes o ON o.scope = c.scope \
-         WHERE c.id = ?1)",
+         WHERE c.id = ?1 AND c.id NOT IN (SELECT chat_id FROM webhook_chats))",
     )
     .bind(chat)
     .fetch_one(pool)
@@ -812,6 +823,8 @@ pub async fn search_chats(
         );
     }
     sql.push_str(" AND c.role IN ('user', 'assistant')");
+    // What webhooks brought is no one's to search (issue #236).
+    sql.push_str(" AND h.id NOT IN (SELECT chat_id FROM webhook_chats)");
     for _ in &short {
         sql.push_str(" AND c.content LIKE ? ESCAPE '\\'");
     }
@@ -1639,6 +1652,24 @@ mod tests {
             moved,
             "made again when deleted"
         );
+
+        // Never the owner's, though in the owner's scope, and not searched.
+        note_owner_scope(&pool, "web").await.expect("owner");
+        assert!(chat_of_owner(&pool, &talk).await.expect("db"));
+        assert!(!chat_of_owner(&pool, &alerts).await.expect("db"));
+        assert!(is_webhook_chat(&pool, &alerts).await.expect("db"));
+        assert!(!is_webhook_chat(&pool, &talk).await.expect("db"));
+        record_in_chat(&pool, &alerts, Role::Assistant, "zebracorn outage")
+            .await
+            .expect("turn");
+        record_in_chat(&pool, &talk, Role::User, "zebracorn party")
+            .await
+            .expect("turn");
+        let found = search_chats(&pool, "web", true, "zebracorn", 10)
+            .await
+            .expect("search");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].chat, talk);
     }
 
     #[tokio::test]
