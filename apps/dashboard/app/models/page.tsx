@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ApiError,
   LLM_PROVIDERS as PROVIDERS,
@@ -11,13 +11,23 @@ import {
   type ModelsView,
   type ThinkingSpec,
 } from "@/lib/api";
+import { SkeletonList } from "@/components/SkeletonList";
 
 type Price = NonNullable<ModelEntry["price"]>;
 
+// As the usage page shows dollars: with a point, whatever the locale.
 function perMillion(n: number): string {
-  return `$${n.toLocaleString(undefined, { maximumFractionDigits: 6 })}`;
+  return `$${n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 6 })}`;
 }
-import { SkeletonList } from "@/components/SkeletonList";
+
+// A price as typed: decimal digits, with a point or a comma; nothing a
+// `Number` would read otherwise (0x10, 0b11).
+function parsePrice(typed: string): number | null {
+  const t = typed.trim().replace(/^(\d*),(\d+)$/, "$1.$2");
+  if (!/^(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(t)) return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : null;
+}
 
 export default function ModelsPage() {
   const [view, setView] = useState<ModelsView | null>(null);
@@ -311,7 +321,10 @@ export default function ModelsPage() {
                   </span>
                 )}
                 {m.price && (
-                  <span className="pill pill-stopped tabular" title="dollars per million tokens">
+                  <span
+                    className="pill pill-stopped tabular"
+                    title={`dollars per million tokens; cache reads ${perMillion(m.price.cache_read ?? m.price.input)}, cache writes ${perMillion(m.price.cache_write ?? m.price.input)}`}
+                  >
                     {perMillion(m.price.input)} in / {perMillion(m.price.output)} out
                   </span>
                 )}
@@ -333,7 +346,8 @@ export default function ModelsPage() {
               />
               <PriceEditor
                 entry={m}
-                editable={editable && !busy}
+                editable={editable}
+                busy={busy}
                 onSave={(price) =>
                   save(
                     view.default_model,
@@ -441,7 +455,7 @@ function ThinkingEditor({
   const muted = { color: "var(--color-body)" };
   if (!open) {
     return (
-      <button type="button" className="mt-2 text-xs underline" style={muted} onClick={() => setOpen(true)}>
+      <button type="button" className="mt-2 mr-3 text-xs underline" style={muted} onClick={() => setOpen(true)}>
         {spec ? "thinking settings" : "set up thinking"}
       </button>
     );
@@ -540,30 +554,32 @@ function ThinkingEditor({
 function PriceEditor({
   entry,
   editable,
+  busy,
   onSave,
 }: {
   entry: ModelEntry;
+  /** Whether the list may be changed here (not with trust_header). */
   editable: boolean;
+  busy: boolean;
   onSave: (price: Price | undefined) => Promise<boolean>;
 }) {
   const price = entry.price;
   const shown = (n: number | undefined) => (n === undefined ? "" : String(n));
   const [open, setOpen] = useState(false);
-  const [input, setInput] = useState(shown(price?.input));
-  const [output, setOutput] = useState(shown(price?.output));
-  const [cacheRead, setCacheRead] = useState(shown(price?.cache_read));
-  const [cacheWrite, setCacheWrite] = useState(shown(price?.cache_write));
+  const [input, setInput] = useState("");
+  const [output, setOutput] = useState("");
+  const [cacheRead, setCacheRead] = useState("");
+  const [cacheWrite, setCacheWrite] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const toggle = useRef<HTMLButtonElement>(null);
 
   function draft(): Price | undefined | string {
     const fields = [input, output, cacheRead, cacheWrite].map((f) => f.trim());
     if (fields.every((f) => f === "")) return undefined;
     if (fields[0] === "" || fields[1] === "") return "give both the input and the output price, or clear all four";
-    const numbers = fields.map((f) => (f === "" ? undefined : Number(f)));
-    if (numbers.some((n) => n !== undefined && (!Number.isFinite(n) || n < 0 || Object.is(n, -0)))) {
-      return "a price is a number of dollars, 0 or more";
-    }
-    const [i, o, r, w] = numbers;
+    const numbers = fields.map((f) => (f === "" ? undefined : parsePrice(f)));
+    if (numbers.some((n) => n === null)) return "a price is a number of dollars, 0 or more, such as 0.15";
+    const [i, o, r, w] = numbers as Array<number | undefined>;
     const out: Price = { input: i as number, output: o as number };
     if (r !== undefined) out.cache_read = r;
     if (w !== undefined) out.cache_write = w;
@@ -578,22 +594,34 @@ function PriceEditor({
     setError(null);
   }
 
+  function close() {
+    setOpen(false);
+    // Back to the link that opened it, once it is shown again.
+    requestAnimationFrame(() => toggle.current?.focus());
+  }
+
   async function submit(next: Price | undefined | string) {
     if (typeof next === "string") {
       setError(next);
       return;
     }
     setError(null);
-    if (await onSave(next)) setOpen(false);
+    if (await onSave(next)) close();
+    else setError("Not saved (see the message at the top of the page). Reset shows the price saved now.");
   }
 
   const muted = { color: "var(--color-body)" };
+  // Where only config.toml may change it, a model without one has nothing to show.
+  if (!editable && !price) return null;
   if (!open) {
     return (
       <button
+        ref={toggle}
         type="button"
-        className="mt-2 ml-3 text-xs underline"
+        className="mt-2 text-xs underline"
         style={muted}
+        aria-expanded={false}
+        aria-label={`price of ${entry.id}`}
         onClick={() => {
           reset();
           setOpen(true);
@@ -603,7 +631,7 @@ function PriceEditor({
       </button>
     );
   }
-  const field = (label: string, value: string, set: (v: string) => void, placeholder: string) => (
+  const field = (label: string, value: string, set: (v: string) => void, placeholder: string, first = false) => (
     <label className="flex flex-wrap items-center gap-2">
       <span className="w-28">{label}</span>
       <input
@@ -612,33 +640,49 @@ function PriceEditor({
         inputMode="decimal"
         value={value}
         placeholder={placeholder}
-        disabled={!editable}
+        disabled={!editable || busy}
+        autoFocus={first}
         onChange={(e) => set(e.target.value)}
         aria-label={`${label} price of ${entry.id}`}
       />
     </label>
   );
   return (
-    <div className="mt-3 grid gap-2 text-sm" style={muted}>
+    <form
+      className="mt-3 grid gap-2 text-sm"
+      style={muted}
+      aria-label={`price of ${entry.id}`}
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (editable && !busy) void submit(draft());
+      }}
+    >
       <p className="text-xs">US dollars per million tokens, as the provider lists them.</p>
-      {field("input", input, setInput, "3")}
+      {field("input", input, setInput, "3", true)}
       {field("output", output, setOutput, "15")}
       {field("cache read", cacheRead, setCacheRead, "as input")}
       {field("cache write", cacheWrite, setCacheWrite, "as input")}
       <div className="flex flex-wrap items-center gap-2">
-        <button type="button" className="btn-ghost" disabled={!editable} onClick={() => void submit(draft())}>
-          save
-        </button>
-        {price && (
-          <button type="button" className="btn-ghost" disabled={!editable} onClick={() => void submit(undefined)}>
+        {editable && (
+          <button type="submit" className="btn-ghost" disabled={busy}>
+            save
+          </button>
+        )}
+        {editable && price && (
+          <button type="button" className="btn-ghost" disabled={busy} onClick={() => void submit(undefined)}>
             clear
           </button>
         )}
-        <button type="button" className="text-xs underline" onClick={() => setOpen(false)}>
+        {editable && (
+          <button type="button" className="text-xs underline" onClick={reset}>
+            reset
+          </button>
+        )}
+        <button type="button" className="text-xs underline" onClick={close}>
           close
         </button>
       </div>
       {error && <p role="alert" style={{ color: "var(--color-ruby)" }}>{error}</p>}
-    </div>
+    </form>
   );
 }
