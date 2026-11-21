@@ -770,6 +770,14 @@ function BotAccess({ agentId }: { agentId: string }) {
             <h4 className="mt-3 text-xs uppercase" style={muted}>
               groups ({account.group_policy === "open" ? "open: every group it is added to" : "those let in"})
             </h4>
+            {account.groups.some((g) => g.sees_all === false) && (
+              <p className="text-sm" style={muted}>
+                In the groups marked &quot;mentions do not reach it&quot;, the bot does not see every message, so a
+                mention that is not a reply does not reach it: members reply to its messages or send it commands. On
+                Telegram, turn its privacy mode off with BotFather (/setprivacy), then remove the bot from each such
+                group and add it again.
+              </p>
+            )}
             {account.allow_groups.length === 0 && account.groups.length === 0 ? (
               <p className="text-sm" style={muted}>
                 None yet.
@@ -788,6 +796,11 @@ function BotAccess({ agentId }: { agentId: string }) {
                   <li key={`group-${g.group_id}`} className="flex flex-wrap items-center gap-2">
                     <span className="font-mono">{g.group_id}</span>
                     {g.title && <span>{g.title}</span>}
+                    {g.sees_all === false && (
+                      <span className="text-xs" style={muted}>
+                        mentions do not reach it
+                      </span>
+                    )}
                     <span className="text-xs" style={muted}>
                       {g.source === "owner"
                         ? "let in by you"

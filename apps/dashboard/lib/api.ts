@@ -601,7 +601,14 @@ export type AccountAccess = {
   /** Groups in config.toml, removed only there. */
   allow_groups: string[];
   /** Groups let in by the owner (`owner`), or used while the account was open (`open`). */
-  groups: { group_id: string; title: string; source: "owner" | "open"; since: string }[];
+  groups: {
+    group_id: string;
+    title: string;
+    source: "owner" | "open";
+    since: string;
+    /** Whether the bot sees every message there; null when its adapter has not said since the gateway started. */
+    sees_all: boolean | null;
+  }[];
 };
 
 export type ChannelAccessView = { accounts: AccountAccess[]; notify_unpaired: boolean };

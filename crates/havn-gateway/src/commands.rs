@@ -857,10 +857,24 @@ async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
         )
         .await
         {
-            Ok(true) => language.pick(
-                format!("(The group {sender} can use this bot now.)"),
-                format!("（群 {sender} 现在可以使用这个机器人了。）"),
-            ),
+            Ok(true) => {
+                let sees_all = state
+                    .channel_router
+                    .sees_all(
+                        &crate::channel_router::AccountKey::new(channel, account_id),
+                        sender,
+                    )
+                    .await;
+                let hint = if sees_all == Some(false) {
+                    format!(" {}", language.of(crate::api::channel::UNSEEN_MENTIONS))
+                } else {
+                    String::new()
+                };
+                language.pick(
+                    format!("(The group {sender} can use this bot now.){hint}"),
+                    format!("（群 {sender} 现在可以使用这个机器人了。）{hint}"),
+                )
+            }
             Ok(false) => language.pick(
                 format!("(The group {sender} could already use this bot.)"),
                 format!("（群 {sender} 本来就可以使用这个机器人。）"),

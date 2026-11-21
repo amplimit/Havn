@@ -97,6 +97,9 @@ struct AccountState {
     /// catches up, so a long replay cannot fill the queue and look like a
     /// stall. A replay by a superseded connection never matches.
     replaying: Option<mpsc::Sender<ChannelFrame>>,
+    /// Per group id, whether the bot sees every message there, as its
+    /// adapter last said with a message from it.
+    sees_all: HashMap<String, bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +108,9 @@ struct ReplayEntry {
     frame: ChannelFrame,
     inserted_at: Instant,
 }
+
+/// Groups whose `sees_all` an account keeps at most.
+const GROUPS_KNOWN: usize = 1000;
 
 /// The first seq of an account: microseconds since the epoch, past the
 /// seqs of a gateway that ran before (unless it gave more than one frame
@@ -123,6 +129,7 @@ impl AccountState {
             next_seq: first_seq(),
             replay: VecDeque::new(),
             replaying: None,
+            sees_all: HashMap::new(),
         }
     }
 }
@@ -152,6 +159,47 @@ impl ChannelRouter {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Note whether `key`'s bot sees every message in `group`, as its
+    /// adapter says with a message from it: `None`, that it does not know
+    /// (any more). At most `GROUPS_KNOWN` groups are kept per account.
+    pub async fn note_sees_all(&self, key: AccountKey, group: &str, sees_all: Option<bool>) {
+        let mut map = self.inner.lock().await;
+        let known = &mut map
+            .entry(key)
+            .or_insert_with(|| AccountState::new(None))
+            .sees_all;
+        let Some(sees_all) = sees_all else {
+            known.remove(group);
+            return;
+        };
+        if known.len() >= GROUPS_KNOWN && !known.contains_key(group) {
+            if let Some(any) = known.keys().next().cloned() {
+                known.remove(&any);
+            }
+        }
+        known.insert(group.to_string(), sees_all);
+    }
+
+    /// Whether `key`'s bot sees every message in `group`, as its adapter
+    /// last said; `None` before it said (or since the gateway started).
+    pub async fn sees_all(&self, key: &AccountKey, group: &str) -> Option<bool> {
+        self.inner
+            .lock()
+            .await
+            .get(key)
+            .and_then(|s| s.sees_all.get(group).copied())
+    }
+
+    /// What `key`'s adapter last said of each of its groups.
+    pub async fn groups_seeing(&self, key: &AccountKey) -> HashMap<String, bool> {
+        self.inner
+            .lock()
+            .await
+            .get(key)
+            .map(|s| s.sees_all.clone())
+            .unwrap_or_default()
     }
 
     /// Register a connected adapter's outbound mpsc. If an
