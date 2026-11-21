@@ -19,10 +19,6 @@ use crate::auth::AuthedUser;
 const DAYS: u32 = 30;
 const MAX_DAYS: u32 = 366;
 
-/// The providers whose calls are model calls; others recorded beside them
-/// (web search backends) are counted as searches.
-const LLM_PROVIDERS: [&str; 4] = ["anthropic", "openai", "openrouter", "gemini"];
-
 #[derive(Debug, Deserialize)]
 pub struct UsageQuery {
     pub days: Option<u32>,
@@ -157,7 +153,9 @@ pub async fn usage(
     let (mut calls, mut tokens, mut cost) = (0, 0, 0.0);
     let (mut unpriced_tokens, mut unsettled_calls, mut searches) = (0, 0, 0);
     for d in found {
-        if !LLM_PROVIDERS.contains(&d.provider.as_str()) {
+        // Calls of a provider the proxy does not dispatch to are of a web
+        // search backend (Brave, Tavily, Exa): counted as searches.
+        if crate::llm_proxy::dispatch_provider(&d.provider).is_err() {
             searches += d.calls;
             continue;
         }
@@ -181,7 +179,8 @@ pub async fn usage(
         let (agent_key, mut agent_label) = match (&d.agent_id, &d.agent_name) {
             (Some(id), Some(name)) => (id.clone(), name.clone()),
             (Some(id), None) => (id.clone(), "(a deleted agent)".to_string()),
-            (None, _) => (String::new(), "(no agent)".to_string()),
+            // Per user: everyone's calls with no agent are not one line.
+            (None, _) => (format!("none:{}", d.user_id), "(no agent)".to_string()),
         };
         if whose.is_none() {
             agent_label = format!("{agent_label} ({})", d.display_name);
@@ -368,6 +367,11 @@ mod tests {
         let all = ask(&state, owner, Some("all")).await.expect("all");
         assert_eq!(all.calls, 4);
         assert_eq!(all.by_user.len(), 2);
+        assert_eq!(
+            all.by_agent.len(),
+            2,
+            "each user's calls with no agent are their own line"
+        );
         let theirs_by_owner = ask(&state, owner, Some(&other.to_string()))
             .await
             .expect("theirs");

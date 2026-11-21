@@ -38,7 +38,7 @@ function Table({ title, buckets }: { title: string; buckets: UsageBucket[] }) {
       <table className="w-full text-sm tabular">
         <tbody>
           {buckets.map((b) => (
-            <tr key={b.key || b.label}>
+            <tr key={b.key}>
               <td className="py-1 pr-3 font-mono wrap-anywhere">{b.label}</td>
               <td className="py-1 pr-3 text-right" style={muted}>
                 {b.calls} {b.calls === 1 ? "call" : "calls"}
@@ -67,8 +67,9 @@ export default function UsagePage() {
   // What was loaded, and for which window and user: other data than the
   // one asked for is not shown as if it were.
   const [loaded, setLoaded] = useState<{ key: string; view: UsageView } | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [failed, setFailed] = useState<{ key: string; error: string } | null>(null);
   const key = `${days}|${user ?? ""}`;
+  const error = failed?.key === key ? failed.error : null;
   const view = loaded?.key === key ? loaded.view : null;
   const everyone = loaded?.view.everyone ?? false;
   const users = loaded?.view.users ?? [];
@@ -80,11 +81,11 @@ export default function UsagePage() {
       .then((v) => {
         if (!cancelled) {
           setLoaded({ key: `${days}|${user ?? ""}`, view: v });
-          setError(null);
         }
       })
       .catch((e: unknown) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+        if (!cancelled)
+          setFailed({ key: `${days}|${user ?? ""}`, error: e instanceof Error ? e.message : String(e) });
       });
     return () => {
       cancelled = true;

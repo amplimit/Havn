@@ -2195,7 +2195,7 @@ pub fn is_provider(name: &str) -> bool {
     dispatch_provider(name).is_ok()
 }
 
-fn dispatch_provider(name: &str) -> Result<&'static dyn LlmProvider, ProxyError> {
+pub(crate) fn dispatch_provider(name: &str) -> Result<&'static dyn LlmProvider, ProxyError> {
     // Static dispatch — providers are stateless or hold only `&'static`
     // config (default base URL, extra headers), so each lives as a const
     // value; the operator's `[llm.base_url]` travels in the `Route`.
