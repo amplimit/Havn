@@ -1698,7 +1698,7 @@ function ScheduledTasks({ agentId }: { agentId: string }) {
                   type="button"
                   className="btn-ghost"
                   disabled={busy}
-                  title="run it now, without moving its schedule"
+                  title="run it now; a recurring task keeps its schedule, a one-shot is done"
                   onClick={() => act(() => api.cron.runNow(agentId, job.id))}
                 >
                   run now

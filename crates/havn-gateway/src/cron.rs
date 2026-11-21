@@ -62,6 +62,10 @@ const CRON_OUTPUT_CAP: usize = 256 * 1024;
 /// result is indistinguishable from an unsolicited one.
 const PENDING_RUN_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 
+/// How long a run of a task keeps it from being run now again: one that
+/// gave no result in that long (its agent restarted, say) no longer does.
+const RUN_NOW_BUSY: Duration = Duration::from_secs(15 * 60);
+
 #[derive(Clone, Copy, Debug)]
 struct WakeCheckCreds {
     uid: u32,
@@ -184,11 +188,19 @@ impl CronScheduler {
     }
 
     /// Run `job` now, as its owner asked (issue #236): without its wake
-    /// check, and without moving its schedule. Its result goes where a
-    /// scheduled run's does. The run's id.
+    /// check, and without moving a recurring schedule; a one-shot that has
+    /// not run is done with it. Its result goes where a scheduled run's
+    /// does. Not while a run of it is still going. The run's id.
     pub async fn run_now(&self, job: &CronJob) -> Result<String, CronError> {
         if !self.registry.is_connected(job.agent_id).await {
             return Err(CronError::NotRunning);
+        }
+        let going = self
+            .pending_runs()
+            .values()
+            .any(|run| run.job_id == job.id && run.dispatched.elapsed() < RUN_NOW_BUSY);
+        if going {
+            return Err(CronError::Busy);
         }
         let run_id = self.track_dispatch(job.agent_id, job.id);
         let frame = GatewayToAgent::CronTick(CronTick {
@@ -201,7 +213,17 @@ impl CronScheduler {
         if let Err(e) = self.registry.send(job.agent_id, frame).await {
             warn!(job_id = %job.id, error = %e, "could not deliver a CronTick run now");
             self.pending_runs().remove(&run_id);
-            return Err(CronError::NotRunning);
+            return Err(match e {
+                crate::agent_registry::SendError::Draining => CronError::Restarting,
+                _ => CronError::NotRunning,
+            });
+        }
+        // A reminder run now is not run again at its time.
+        if job.enabled
+            && matches!(job.schedule, Schedule::At { .. })
+            && let Err(e) = advance_after_run(&self.db, job, Utc::now()).await
+        {
+            warn!(job_id = %job.id, error = %e, "could not mark a one-shot run now as done");
         }
         Ok(run_id)
     }
@@ -495,7 +517,8 @@ impl CronScheduler {
             warn!(error = %e, dir = %output_dir.display(), "create_dir_all for cron output failed");
             return Err(CronError::Io(e));
         }
-        let output_path = output_dir.join(format!("{timestamp}.md"));
+        // The run's id keeps two runs in one second apart.
+        let output_path = output_dir.join(format!("{timestamp}-{}.md", result.run_id));
         if let Err(e) = tokio::fs::write(&output_path, &result.output).await {
             warn!(error = %e, file = %output_path.display(), "writing cron output failed");
             return Err(CronError::Io(e));
@@ -621,6 +644,10 @@ pub enum CronError {
     ExpiredRun(String),
     #[error("the agent is not running")]
     NotRunning,
+    #[error("the gateway is restarting")]
+    Restarting,
+    #[error("a run of this task is still going")]
+    Busy,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("db: {0}")]
@@ -984,9 +1011,65 @@ mod tests {
             after.next_run_at, job.next_run_at,
             "the schedule does not move"
         );
+        assert!(
+            matches!(s.run_now(&job).await, Err(CronError::Busy)),
+            "not again while it is going"
+        );
         s.record_result(agent_id, result_for(job_id, &run_id, "done".into()))
             .await
             .expect("its result is taken as a run's");
+        let runs = cron::list_runs_for_job(&pool, job_id, 10)
+            .await
+            .expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].output_path.contains(&run_id),
+            "{}",
+            runs[0].output_path
+        );
+        assert!(after.enabled, "a recurring task stays as it was");
+
+        // A paused task runs, and stays paused.
+        cron::set_enabled(&pool, job_id, false)
+            .await
+            .expect("pause");
+        let paused = cron::find_by_id(&pool, job_id)
+            .await
+            .expect("find")
+            .expect("job");
+        s.run_now(&paused).await.expect("run paused");
+        assert!(rx.recv().await.is_some());
+        let still = cron::find_by_id(&pool, job_id)
+            .await
+            .expect("find")
+            .expect("job");
+        assert!(!still.enabled);
+
+        // A reminder run now is done: it does not run again at its time.
+        let at = Utc::now() + chrono::Duration::hours(1);
+        let one = cron::create(
+            &pool,
+            cron::NewCronJob {
+                chat: None,
+                agent_id,
+                name: "r",
+                prompt: "call Anna",
+                schedule: &Schedule::At { instant: at },
+                next_run_at: at,
+                wake_check: None,
+                deliver: "local",
+                enabled_toolsets: &[],
+            },
+        )
+        .await
+        .expect("one-shot");
+        s.run_now(&one).await.expect("run one-shot");
+        assert!(rx.recv().await.is_some());
+        let done = cron::find_by_id(&pool, one.id)
+            .await
+            .expect("find")
+            .expect("job");
+        assert!(!done.enabled, "a one-shot run now is done");
     }
 
     #[tokio::test]

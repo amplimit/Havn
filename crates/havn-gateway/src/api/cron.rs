@@ -371,8 +371,9 @@ pub async fn list_runs(
 }
 
 /// `POST /agents/{id}/cron/{job_id}/run`: run a task now (issue #236),
-/// paused or not, without its wake check and without moving its schedule.
-/// Its result goes where a scheduled run's does.
+/// paused or not, without its wake check and without moving a recurring
+/// schedule (a one-shot is done with it). Its result goes where a
+/// scheduled run's does.
 pub async fn run_now(
     State(state): State<AppState>,
     user: AuthedUser,
@@ -386,6 +387,14 @@ pub async fn run_now(
     if job.agent_id != agent.id {
         return Err(ApiError::NotFound);
     }
+    // As when a task is made: the owner's policy must let them schedule.
+    let policy = crate::policy_resolver::for_owner(&state.db, &agent).await;
+    if !policy.permissions.can_schedule_cron {
+        return Err(ApiError::Forbidden(
+            "this user's policy does not allow scheduling cron jobs (can_schedule_cron=false)"
+                .into(),
+        ));
+    }
     let run_id = state
         .cron_scheduler
         .run_now(&job)
@@ -394,6 +403,12 @@ pub async fn run_now(
             crate::cron::CronError::NotRunning => {
                 ApiError::Conflict("the agent is not running; start it first".into())
             }
+            crate::cron::CronError::Restarting => {
+                ApiError::Conflict("the gateway is restarting; try again once it is back".into())
+            }
+            crate::cron::CronError::Busy => ApiError::Conflict(
+                "a run of this task is still going; try again when it is done".into(),
+            ),
             other => ApiError::Internal(other.to_string()),
         })?;
     crate::audit::record(
