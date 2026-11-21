@@ -179,6 +179,33 @@ fn unpack(archive: &[u8], to: &Path) -> anyhow::Result<Vec<String>> {
     Ok(names)
 }
 
+/// `dir`'s mark that an update runs there, removed when it ends.
+struct Updating(PathBuf);
+
+impl Updating {
+    fn take(dir: &Path) -> anyhow::Result<Self> {
+        let path = dir.join(".havn-update.lock");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(Self(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => bail!(
+                "another havn update runs ({} is there; remove it if none does)",
+                path.display()
+            ),
+            Err(e) => Err(e).with_context(|| format!("writing {}", path.display())),
+        }
+    }
+}
+
+impl Drop for Updating {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// What [`swap`] did: the binaries it replaced (the old kept as
 /// `<name>.old`) and those it added.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -235,16 +262,27 @@ fn swap(dir: &Path, from: &Path, names: &[String]) -> anyhow::Result<Swapped> {
 }
 
 /// Undo [`swap`] in `dir`: the binaries it replaced get their old ones
-/// back, and those it added are removed.
+/// back, and those it added are removed. Every one is tried; the errors
+/// together.
 fn restore(dir: &Path, swapped: &Swapped) -> anyhow::Result<()> {
+    let mut failed = Vec::new();
     for name in &swapped.replaced {
-        std::fs::rename(dir.join(format!("{name}.old")), dir.join(name))
-            .with_context(|| format!("putting the old {name} back"))?;
+        if let Err(e) = std::fs::rename(dir.join(format!("{name}.old")), dir.join(name)) {
+            failed.push(format!("the old {name}: {e}"));
+        }
     }
     for name in &swapped.added {
-        let _ = std::fs::remove_file(dir.join(name));
+        if let Err(e) = std::fs::remove_file(dir.join(name))
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            failed.push(format!("the new {name}: {e}"));
+        }
     }
-    Ok(())
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        bail!("could not put back {}", failed.join("; "))
+    }
 }
 
 fn systemctl(args: &[&str]) -> Option<String> {
@@ -257,21 +295,41 @@ fn systemctl(args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// The process of the gateway that runs as the systemd unit, if one does.
-fn unit_gateway() -> Option<u32> {
-    systemctl(&["is-active", "--quiet", UNIT])?;
-    systemctl(&["show", "-p", "MainPID", "--value", UNIT])?
-        .parse()
-        .ok()
-        .filter(|pid| *pid > 0)
+/// Whether the unit's `state` is one the gateway runs, or is starting, in.
+fn unit_up(state: &str) -> bool {
+    matches!(state, "active" | "activating" | "reloading")
 }
 
-/// `HAVN_CONFIG` and `HOME` of process `pid`, as it runs.
-fn environment_of(pid: u32) -> (Option<OsString>, Option<OsString>) {
+/// The process of the gateway that runs as the systemd unit, if one does;
+/// an error while it is starting or stopping, to try again then.
+fn unit_gateway() -> anyhow::Result<Option<u32>> {
+    let shown =
+        systemctl(&["show", "-p", "ActiveState", "-p", "MainPID", UNIT]).unwrap_or_default();
+    let (state, pid) = (field(&shown, "ActiveState"), field(&shown, "MainPID"));
+    if state == "active" {
+        return Ok(pid.parse().ok().filter(|pid| *pid > 0));
+    }
+    if unit_up(&state) || state == "deactivating" {
+        bail!("the gateway's unit {UNIT} is {state}: run havn update once it runs or is stopped");
+    }
+    Ok(None)
+}
+
+/// A `havn-gateway` process that runs on this host, however it was started.
+fn gateway_process() -> Option<u32> {
+    std::fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .find_map(|entry| {
+            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+            let comm = std::fs::read_to_string(entry.path().join("comm")).ok()?;
+            (comm.trim() == "havn-gateway").then_some(pid)
+        })
+}
+
+/// `HAVN_CONFIG` and `HOME` in `raw`, a process's `environ`.
+fn environment_in(raw: &[u8]) -> (Option<OsString>, Option<OsString>) {
     use std::os::unix::ffi::OsStrExt as _;
-    let Ok(raw) = std::fs::read(format!("/proc/{pid}/environ")) else {
-        return (None, None);
-    };
     let mut config = None;
     let mut home = None;
     for pair in raw.split(|b| *b == 0) {
@@ -284,20 +342,35 @@ fn environment_of(pid: u32) -> (Option<OsString>, Option<OsString>) {
     (config, home)
 }
 
+/// `HAVN_CONFIG` and `HOME` of process `pid`, as it runs.
+fn environment_of(pid: u32) -> anyhow::Result<(Option<OsString>, Option<OsString>)> {
+    let raw = std::fs::read(format!("/proc/{pid}/environ")).with_context(|| {
+        format!("reading the gateway's environment (pid {pid}): run it as root")
+    })?;
+    Ok(environment_in(&raw))
+}
+
+/// The value of `key` in `systemctl show` output `shown`.
+fn field(shown: &str, key: &str) -> String {
+    shown
+        .lines()
+        .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `(ActiveState, NRestarts)` in `systemctl show` output `shown`.
+fn parse_unit_state(shown: &str) -> (String, u64) {
+    (
+        field(shown, "ActiveState"),
+        field(shown, "NRestarts").parse().unwrap_or(0),
+    )
+}
+
 /// `(ActiveState, NRestarts)` of the unit.
 fn unit_state() -> (String, u64) {
-    let shown =
-        systemctl(&["show", "-p", "ActiveState", "-p", "NRestarts", UNIT]).unwrap_or_default();
-    let field = |key: &str| {
-        shown
-            .lines()
-            .find_map(|l| l.strip_prefix(&format!("{key}=")))
-            .unwrap_or_default()
-            .to_string()
-    };
-    (
-        field("ActiveState"),
-        field("NRestarts").parse().unwrap_or(0),
+    parse_unit_state(
+        &systemctl(&["show", "-p", "ActiveState", "-p", "NRestarts", UNIT]).unwrap_or_default(),
     )
 }
 
@@ -351,7 +424,8 @@ async fn comes_up_as(listen: &str, version: &str, restarts: u64) -> anyhow::Resu
             return Ok(true);
         }
         let (state, now) = unit_state();
-        if state == "failed" || now > restarts {
+        // Failed, stopped, or restarted by systemd: not coming up.
+        if (!state.is_empty() && !unit_up(&state)) || now > restarts {
             return Ok(false);
         }
         if said.elapsed() > Duration::from_secs(15) {
@@ -376,10 +450,11 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let http = client()?;
     // The gateway as systemd runs it: its config and the release it is.
-    let pid = unit_gateway();
-    let (config, home) = pid
-        .map(environment_of)
-        .unwrap_or_else(|| (std::env::var_os("HAVN_CONFIG"), std::env::var_os("HOME")));
+    let pid = unit_gateway()?;
+    let (config, home) = match pid {
+        Some(pid) => environment_of(pid)?,
+        None => (std::env::var_os("HAVN_CONFIG"), std::env::var_os("HOME")),
+    };
     let install = crate::backup::Install::in_env(config.as_deref(), home.as_deref())?;
     let cfg = if install.config.exists() {
         let text = std::fs::read_to_string(&install.config)
@@ -390,13 +465,12 @@ pub async fn run(
     };
     let listen = paths::listen_addr(&cfg);
     let probe = reqwest::Client::builder().no_proxy().build()?;
-    let running = match pid {
-        Some(_) => answering(&probe, &listen).await,
-        None => None,
+    let current = match pid {
+        Some(_) => answering(&probe, &listen).await.ok_or_else(|| {
+            anyhow!("the gateway does not answer at {listen}: run havn update once it does")
+        })?,
+        None => env!("CARGO_PKG_VERSION").to_string(),
     };
-    let current = running
-        .clone()
-        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
 
     let tag = match version {
         Some(tag) => {
@@ -417,15 +491,19 @@ pub async fn run(
         Some(tag) => tag,
         None => latest(&http).await?,
     };
-    if check || !asked {
-        if !release::newer(&tag, &current) {
-            println!("Havn {current} is the latest release.");
-            return Ok(());
-        }
-        if check {
+    if check {
+        if release::newer(&tag, &current) {
             println!("{tag} is out (this is {current}): `havn update` installs it.");
-            return Ok(());
+        } else if asked {
+            println!("{tag} is not newer than {current}.");
+        } else {
+            println!("Havn {current} is the latest release.");
         }
+        return Ok(());
+    }
+    if !asked && !release::newer(&tag, &current) {
+        println!("Havn {current} is the latest release.");
+        return Ok(());
     }
     if release::newer(&current, &tag) && !downgrade {
         bail!(
@@ -433,13 +511,16 @@ pub async fn run(
              migrated (--allow-downgrade to try, with a backup to restore)"
         );
     }
-    if pid.is_none()
-        && let Some(holder) = crate::gateway::running_gateway(&cfg)
-    {
-        bail!(
-            "a gateway runs ({holder}), not as the systemd unit {UNIT}: stop it, run havn update, \
-             then start it again"
-        );
+    if pid.is_none() {
+        let other = gateway_process()
+            .map(|pid| format!("pid {pid}"))
+            .or_else(|| crate::gateway::running_gateway(&cfg));
+        if let Some(holder) = other {
+            bail!(
+                "a gateway runs ({holder}), not as the systemd unit {UNIT}: stop it, run havn \
+                 update, then start it again"
+            );
+        }
     }
 
     let archive_name = release::archive_for(std::env::consts::ARCH)
@@ -465,6 +546,8 @@ pub async fn run(
             dir.display()
         );
     }
+    // One update at a time: each would undo the other's files.
+    let _updating = Updating::take(&dir)?;
 
     println!("Downloading Havn {tag} for {}…", std::env::consts::ARCH);
     let url = format!("{}/{tag}/{archive_name}", release::RELEASE_DOWNLOADS);
@@ -513,7 +596,9 @@ pub async fn run(
         return Ok(());
     }
     eprintln!("The gateway did not come up as {tag}; putting the previous binaries back.");
-    restore(&dir, &swapped)?;
+    if let Err(e) = restore(&dir, &swapped) {
+        eprintln!("{e:#}");
+    }
     let back = match restart_unit() {
         Ok(restarts) => comes_up_as(&listen, &current, restarts).await?,
         Err(_) => false,
@@ -575,6 +660,41 @@ mod tests {
         let borrowed: Vec<(&str, tar::EntryType)> =
             entries.iter().map(|(p, k)| (p.as_str(), *k)).collect();
         archive(&borrowed)
+    }
+
+    #[test]
+    fn the_unit_s_state_and_the_gateway_s_environment_are_read() {
+        let shown = "NRestarts=2\nActiveState=activating\n";
+        assert_eq!(parse_unit_state(shown), ("activating".to_string(), 2));
+        assert_eq!(parse_unit_state(""), (String::new(), 0));
+        assert_eq!(
+            field("ActiveStateX=no\nActiveState=active", "ActiveState"),
+            "active"
+        );
+        assert!(
+            unit_up("active")
+                && unit_up("activating")
+                && !unit_up("inactive")
+                && !unit_up("failed")
+        );
+        let (config, home) = environment_in(
+            b"PATH=/bin\0HAVN_CONFIG=/etc/havn/config.toml\0HOME=/root\0HAVN_CONFIGX=no",
+        );
+        assert_eq!(
+            config.as_deref(),
+            Some(std::ffi::OsStr::new("/etc/havn/config.toml"))
+        );
+        assert_eq!(home.as_deref(), Some(std::ffi::OsStr::new("/root")));
+        assert_eq!(environment_in(b""), (None, None));
+    }
+
+    #[test]
+    fn one_update_runs_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Updating::take(dir.path()).unwrap();
+        assert!(Updating::take(dir.path()).is_err());
+        drop(first);
+        assert!(Updating::take(dir.path()).is_ok());
     }
 
     #[test]
@@ -653,6 +773,12 @@ mod tests {
             );
         }
         restore(dir.path(), &swapped).unwrap();
+        // Done again, every one is tried and the misses said together.
+        let again = restore(dir.path(), &swapped).unwrap_err().to_string();
+        assert!(
+            again.contains("havn-init") && again.contains("havn-gateway"),
+            "{again}"
+        );
         for name in BINARIES {
             assert_eq!(
                 std::fs::read_to_string(dir.path().join(name)).unwrap(),
