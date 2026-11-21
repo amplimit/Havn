@@ -36,6 +36,7 @@ pub mod search;
 pub mod skills;
 pub mod team_credentials;
 pub mod teams;
+pub mod usage;
 pub mod webchat_ws;
 pub mod webhooks;
 

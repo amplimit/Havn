@@ -35,6 +35,79 @@ pub struct ModelEntry {
     /// every credential (issue #216), the first the agent's policy allows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback: Vec<String>,
+    /// What its tokens cost (issue #235), for the usage page; unset, its
+    /// use is shown in tokens only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<ModelPrice>,
+}
+
+/// What a model's tokens cost, in US dollars per million tokens. Cache
+/// reads and writes cost what input does when unset.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPrice {
+    pub input: f64,
+    pub output: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<f64>,
+}
+
+impl ModelPrice {
+    fn bits(&self) -> [Option<u64>; 4] {
+        [
+            Some(self.input.to_bits()),
+            Some(self.output.to_bits()),
+            self.cache_read.map(f64::to_bits),
+            self.cache_write.map(f64::to_bits),
+        ]
+    }
+
+    /// What `input` tokens (`cache_read` and `cache_write` of them from and
+    /// to a cache) and `output` tokens cost, in US dollars.
+    #[must_use]
+    pub fn cost(&self, input: i64, cache_read: i64, cache_write: i64, output: i64) -> f64 {
+        #[allow(clippy::cast_precision_loss, reason = "token counts, far below 2^52")]
+        let count = |n: i64| n.max(0) as f64;
+        let plain = count(input - cache_read - cache_write);
+        (plain * self.input
+            + count(cache_read) * self.cache_read.unwrap_or(self.input)
+            + count(cache_write) * self.cache_write.unwrap_or(self.input)
+            + count(output) * self.output)
+            / 1_000_000.0
+    }
+
+    fn validate(&self, id: &str) -> anyhow::Result<()> {
+        let prices = [
+            Some(self.input),
+            Some(self.output),
+            self.cache_read,
+            self.cache_write,
+        ];
+        if prices
+            .into_iter()
+            .flatten()
+            .any(|p| !p.is_finite() || p.is_sign_negative())
+        {
+            anyhow::bail!("[[llm.models]] {id:?}: a price is a number of dollars, 0 or more");
+        }
+        Ok(())
+    }
+}
+
+impl PartialEq for ModelPrice {
+    fn eq(&self, other: &Self) -> bool {
+        self.bits() == other.bits()
+    }
+}
+
+impl Eq for ModelPrice {}
+
+impl std::hash::Hash for ModelPrice {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.bits().hash(state);
+    }
 }
 
 /// How a model can be asked to think, as its admin set it.
@@ -257,6 +330,7 @@ mod context_tests {
             thinking: None,
             context_window: window,
             fallback: Vec::new(),
+            price: None,
         };
         assert_eq!(
             entry("anthropic:claude-sonnet-4-6", None).context(),
@@ -367,6 +441,9 @@ impl ModelCatalog {
                     "[[llm.models]] {:?}: max_output_tokens must be at least 1",
                     entry.id
                 );
+            }
+            if let Some(price) = &entry.price {
+                price.validate(&entry.id)?;
             }
             if let Some(thinking) = &entry.thinking {
                 thinking.validate(&entry.id)?;
@@ -668,6 +745,23 @@ fn write_checked(
                 }
                 table["fallback"] = value(list);
             }
+            match &entry.price {
+                Some(price) => {
+                    let mut inline = toml_edit::InlineTable::new();
+                    inline.insert("input", price.input.into());
+                    inline.insert("output", price.output.into());
+                    if let Some(p) = price.cache_read {
+                        inline.insert("cache_read", p.into());
+                    }
+                    if let Some(p) = price.cache_write {
+                        inline.insert("cache_write", p.into());
+                    }
+                    table["price"] = value(inline);
+                }
+                None => {
+                    table.remove("price");
+                }
+            }
             models.push(table);
         }
         llm.insert("models", Item::ArrayOfTables(models));
@@ -903,6 +997,7 @@ pub async fn upgrade(
                         thinking: None,
                         context_window: None,
                         fallback: Vec::new(),
+                        price: None,
                     })
                     .collect(),
             };
@@ -1006,6 +1101,7 @@ mod tests {
             thinking: None,
             context_window: None,
             fallback: Vec::new(),
+            price: None,
         };
         let mut c = ModelCatalog::default();
         c.models = vec![
@@ -1071,6 +1167,7 @@ mod tests {
             }),
             context_window: None,
             fallback: Vec::new(),
+            price: None,
         });
         c.validate().expect("valid");
         let dir = tempfile::tempdir().expect("dir");
@@ -1105,6 +1202,7 @@ mod tests {
             thinking: None,
             context_window: None,
             fallback: Vec::new(),
+            price: None,
         }
     }
 
@@ -1585,5 +1683,77 @@ mod tests {
             "the rewrite is kept: {}",
             a.0
         );
+    }
+
+    #[test]
+    fn a_price_gives_what_tokens_cost_with_cache_reads_and_writes_apart() {
+        let price = ModelPrice {
+            input: 3.0,
+            output: 15.0,
+            cache_read: Some(0.3),
+            cache_write: None,
+        };
+        // 1M input (200k read from cache, 100k written), 100k output.
+        let cost = price.cost(1_000_000, 200_000, 100_000, 100_000);
+        let wanted = 0.7 * 3.0 + 0.2 * 0.3 + 0.1 * 3.0 + 0.1 * 15.0;
+        assert!((cost - wanted).abs() < 1e-9, "{cost} {wanted}");
+        assert!((price.cost(0, 0, 0, 0)).abs() < f64::EPSILON);
+
+        let entry: ModelEntry = toml::from_str(
+            "id = \"anthropic:claude\"\nprice = { input = 3.0, output = 15.0, cache_read = 0.3 }",
+        )
+        .expect("entry");
+        assert_eq!(entry.price, Some(price));
+        let negative: ModelEntry =
+            toml::from_str("id = \"a:b\"\nprice = { input = -1.0, output = 1.0 }").expect("entry");
+        let catalog = ModelCatalog {
+            default_model: None,
+            title_model: None,
+            models: vec![negative],
+        };
+        assert!(catalog.validate().is_err());
+        assert!(
+            toml::from_str::<ModelEntry>("id = \"a:b\"\nprice = { input = 1.0 }").is_err(),
+            "output is needed"
+        );
+    }
+
+    #[test]
+    fn a_price_is_written_to_config_toml_changed_and_cleared() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[llm]\n[[llm.models]]\nid = \"anthropic:a\"\n").expect("write");
+        let read = || -> ModelCatalog {
+            let cfg: crate::config::GatewayConfig =
+                toml::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+            cfg.llm.catalog()
+        };
+        let mut catalog = read();
+        let priced = ModelPrice {
+            input: 3.0,
+            output: 15.0,
+            cache_read: Some(0.3),
+            cache_write: None,
+        };
+        for price in [
+            Some(priced),
+            Some(ModelPrice {
+                input: 1.5,
+                ..priced
+            }),
+            None,
+        ] {
+            let expected = catalog.version();
+            catalog.models[0].price = price;
+            assert!(write_if_unchanged(&path, &expected, &catalog).expect("write"));
+            assert_eq!(read().models[0].price, price);
+            assert_eq!(read().version(), catalog.version(), "the file is what runs");
+        }
+        let negative = ModelPrice {
+            input: -0.0,
+            ..priced
+        };
+        catalog.models[0].price = Some(negative);
+        assert!(catalog.validate().is_err(), "-0 is refused too");
     }
 }

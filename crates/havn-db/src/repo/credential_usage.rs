@@ -89,8 +89,9 @@ pub async fn reserve(pool: &SqlitePool, r: Reservation<'_>) -> Result<Option<Res
            FROM used \
          ) \
          INSERT INTO credential_usages \
-           (id, credential_id, user_id, agent_id, provider, model, tokens_in, tokens_out) \
-         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, tokens_out FROM allowance \
+           (id, credential_id, user_id, agent_id, provider, model, asked_model, tokens_in, \
+            tokens_out, settled) \
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, tokens_out, 0 FROM allowance \
          WHERE tokens_out >= ?9 AND (?14 <= 0 OR user_requests < ?14) \
          RETURNING tokens_out",
     )
@@ -114,24 +115,97 @@ pub async fn reserve(pool: &SqlitePool, r: Reservation<'_>) -> Result<Option<Res
     Ok(tokens_out.map(|tokens_out| Reserved { id, tokens_out }))
 }
 
-/// Replace a reservation with the usage the provider reported.
-pub async fn settle(
-    pool: &SqlitePool,
-    id: &str,
-    model: &str,
-    tokens_in: i64,
-    tokens_out: i64,
-) -> Result<()> {
+/// What a call used, as its provider reported it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Used {
+    /// Every input token, those read from and written to a cache included.
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    /// Of `tokens_in`, those read from the provider's prompt cache.
+    pub cache_read: i64,
+    /// Of `tokens_in`, those written to it.
+    pub cache_write: i64,
+}
+
+/// Replace a reservation with the usage the provider reported, under the
+/// name `model` it answered with.
+pub async fn settle(pool: &SqlitePool, id: &str, model: &str, used: Used) -> Result<()> {
     sqlx::query(
-        "UPDATE credential_usages SET model = ?2, tokens_in = ?3, tokens_out = ?4 WHERE id = ?1",
+        "UPDATE credential_usages SET model = ?2, tokens_in = ?3, tokens_out = ?4, \
+         cache_read_tokens = ?5, cache_write_tokens = ?6, settled = 1 WHERE id = ?1",
     )
     .bind(id)
     .bind(model)
-    .bind(tokens_in)
-    .bind(tokens_out)
+    .bind(used.tokens_in)
+    .bind(used.tokens_out)
+    .bind(used.cache_read)
+    .bind(used.cache_write)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// One day's use of one model by one user's agent (or no agent): see
+/// [`usage_by_day`].
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct DayUsage {
+    /// `YYYY-MM-DD`, UTC.
+    pub day: String,
+    pub user_id: String,
+    pub display_name: String,
+    pub agent_id: Option<String>,
+    pub agent_name: Option<String>,
+    pub provider: String,
+    /// As `[[llm.models]]` names it after the provider: the model asked
+    /// for, or for calls from before that was kept, the one that answered.
+    pub model: String,
+    pub calls: i64,
+    pub tokens_in: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+    pub tokens_out: i64,
+    /// Of `calls`, those not settled: at their reserved most.
+    pub unsettled: i64,
+}
+
+/// Model calls since `since_rfc3339` by day, user, agent and model, the
+/// latest day first: of user `user`, or of everyone when `None`
+/// (issue #235).
+pub async fn usage_by_day(
+    pool: &SqlitePool,
+    user: Option<UserId>,
+    since_rfc3339: &str,
+) -> Result<Vec<DayUsage>> {
+    // Two statements, so each uses its index: (user_id, created_at) for one
+    // user, created_at for everyone.
+    let filter = if user.is_some() {
+        "cu.user_id = ?2 AND cu.created_at >= ?1"
+    } else {
+        "cu.created_at >= ?1"
+    };
+    let sql = format!(
+        "SELECT substr(cu.created_at, 1, 10) AS day, cu.user_id, u.display_name, \
+                cu.agent_id, a.name AS agent_name, cu.provider, \
+                CASE WHEN cu.asked_model != '' THEN cu.asked_model ELSE cu.model END AS model, \
+                COUNT(*) AS calls, \
+                COALESCE(SUM(cu.tokens_in), 0) AS tokens_in, \
+                COALESCE(SUM(cu.cache_read_tokens), 0) AS cache_read, \
+                COALESCE(SUM(cu.cache_write_tokens), 0) AS cache_write, \
+                COALESCE(SUM(cu.tokens_out), 0) AS tokens_out, \
+                COALESCE(SUM(CASE WHEN cu.settled = 0 THEN 1 ELSE 0 END), 0) AS unsettled \
+         FROM credential_usages cu \
+         JOIN users u ON u.id = cu.user_id \
+         LEFT JOIN agents a ON a.id = cu.agent_id \
+         WHERE {filter} \
+         GROUP BY day, cu.user_id, cu.agent_id, cu.provider, \
+                  CASE WHEN cu.asked_model != '' THEN cu.asked_model ELSE cu.model END \
+         ORDER BY day DESC, SUM(cu.tokens_in + cu.tokens_out) DESC"
+    );
+    let mut query = sqlx::query_as::<_, DayUsage>(&sql).bind(since_rfc3339);
+    if let Some(user) = user {
+        query = query.bind(user.to_string());
+    }
+    Ok(query.fetch_all(pool).await?)
 }
 
 /// Drop a reservation whose request did not reach the provider or failed.
@@ -398,9 +472,18 @@ mod tests {
         assert_eq!(r.tokens_out, 100);
         assert_eq!(total(&pool, &f).await.agent_tokens, 110);
 
-        settle(&pool, &r.id, "claude-sonnet-4-6-20260101", 7, 3)
-            .await
-            .expect("settle");
+        settle(
+            &pool,
+            &r.id,
+            "claude-sonnet-4-6-20260101",
+            Used {
+                tokens_in: 7,
+                tokens_out: 3,
+                ..Used::default()
+            },
+        )
+        .await
+        .expect("settle");
         let t = total(&pool, &f).await;
         assert_eq!(
             (t.credential_tokens, t.agent_tokens, t.user_requests),
@@ -431,7 +514,33 @@ mod tests {
             .await
             .expect("reserve")
             .expect("granted");
-        settle(&pool, &r.id, "m", 40, 60).await.expect("settle");
+        settle(
+            &pool,
+            &r.id,
+            "m",
+            Used {
+                tokens_in: 40,
+                tokens_out: 60,
+                cache_read: 30,
+                cache_write: 5,
+            },
+        )
+        .await
+        .expect("settle");
+        // The model asked for is kept for pricing; the cache split too.
+        let days = usage_by_day(&pool, None, DAY).await.expect("days");
+        let row = days
+            .iter()
+            .find(|d| d.tokens_in == 40)
+            .expect("the settled call");
+        assert_eq!(
+            (row.cache_read, row.cache_write, row.tokens_out),
+            (30, 5, 60)
+        );
+        assert_ne!(
+            row.model, "m",
+            "the model asked for, not the one that answered"
+        );
         crate::repo::agents::delete(&pool, f.agent_id)
             .await
             .expect("delete agent");

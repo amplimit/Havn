@@ -722,9 +722,17 @@ mod tests {
             .await
             .expect("reserve")
             .expect("no caps");
-            settle(db, &reserved.id, "m", tokens, 0)
-                .await
-                .expect("settle");
+            settle(
+                db,
+                &reserved.id,
+                "m",
+                havn_db::repo::credential_usage::Used {
+                    tokens_in: tokens,
+                    ..havn_db::repo::credential_usage::Used::default()
+                },
+            )
+            .await
+            .expect("settle");
         };
         // Counted: team credential, and team agent on a personal credential.
         spend(f.member.id, team_cred, Some(own_agent), 10).await;

@@ -567,8 +567,13 @@ fn gemini_to_anthropic(raw: &Value, model: &str) -> Result<AnthropicResponse, St
         .get("usageMetadata")
         .and_then(|u| {
             let count = |key: &str| u.get(key).and_then(Value::as_u64).unwrap_or(0);
+            // The prompt count includes what came from its cache (issue
+            // #235): kept apart, as Anthropic reports it.
+            let prompt = u.get("promptTokenCount")?.as_u64()?;
+            let cached = count("cachedContentTokenCount").min(prompt);
             Some(AnthropicUsage {
-                input_tokens: u.get("promptTokenCount")?.as_u64()?,
+                input_tokens: prompt - cached,
+                cache_read_input_tokens: (cached > 0).then_some(cached),
                 output_tokens: count("candidatesTokenCount") + count("thoughtsTokenCount"),
                 ..AnthropicUsage::default()
             })
@@ -871,6 +876,15 @@ mod tests {
         partial["usageMetadata"] = json!({"candidatesTokenCount": 2});
         let canon = gemini_to_anthropic(&partial, "gemini-2.5-pro").expect("parse");
         assert!(canon.usage.unreported);
+
+        // What came from its cache is kept apart, the whole the same.
+        let mut cached = raw.clone();
+        cached["usageMetadata"]["promptTokenCount"] = json!(100);
+        cached["usageMetadata"]["cachedContentTokenCount"] = json!(60);
+        let canon = gemini_to_anthropic(&cached, "gemini-2.5-pro").expect("parse");
+        assert_eq!(canon.usage.input_tokens, 40);
+        assert_eq!(canon.usage.cache_read_input_tokens, Some(60));
+        assert_eq!(canon.usage.total_input_tokens(), 100);
     }
 
     #[test]

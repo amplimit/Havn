@@ -1244,6 +1244,7 @@ mod tests {
                     thinking: None,
                     context_window: None,
                     fallback: Vec::new(),
+                    price: None,
                 }],
             }));
         assert!(check_model(&state, None).is_ok());

@@ -872,6 +872,7 @@ async fn serve() -> anyhow::Result<()> {
         )
         .route("/teams/{id}/agents", get(api::teams::list_agents))
         .route("/teams/{id}/usage", get(api::teams::usage))
+        .route("/usage", get(api::usage::usage))
         .route("/teams/{id}/audit-log", get(api::audit::list_for_team))
         .route(
             "/teams/{id}/members",

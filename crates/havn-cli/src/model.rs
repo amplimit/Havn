@@ -26,6 +26,9 @@ pub struct ModelEntry {
     /// Models that answer in its place when it is unavailable (issue #216).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback: Vec<String>,
+    /// What its tokens cost (issue #235), kept as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,6 +122,7 @@ pub async fn add(
         thinking: None,
         context_window,
         fallback: Vec::new(),
+        price: None,
     });
     let default_model = if make_default {
         Some(id)

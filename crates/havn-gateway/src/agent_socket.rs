@@ -3788,6 +3788,7 @@ mod tests {
                     thinking: None,
                     context_window: None,
                     fallback: Vec::new(),
+                    price: None,
                 }],
             }));
     }
@@ -3978,6 +3979,7 @@ mod tests {
                         thinking: None,
                         context_window: None,
                         fallback: Vec::new(),
+                        price: None,
                     })
                     .collect(),
             }));
