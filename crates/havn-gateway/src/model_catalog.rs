@@ -88,7 +88,7 @@ impl ModelPrice {
         if prices
             .into_iter()
             .flatten()
-            .any(|p| !p.is_finite() || p < 0.0)
+            .any(|p| !p.is_finite() || p.is_sign_negative())
         {
             anyhow::bail!("[[llm.models]] {id:?}: a price is a number of dollars, 0 or more");
         }
@@ -744,6 +744,23 @@ fn write_checked(
                     list.push(id.as_str());
                 }
                 table["fallback"] = value(list);
+            }
+            match &entry.price {
+                Some(price) => {
+                    let mut inline = toml_edit::InlineTable::new();
+                    inline.insert("input", price.input.into());
+                    inline.insert("output", price.output.into());
+                    if let Some(p) = price.cache_read {
+                        inline.insert("cache_read", p.into());
+                    }
+                    if let Some(p) = price.cache_write {
+                        inline.insert("cache_write", p.into());
+                    }
+                    table["price"] = value(inline);
+                }
+                None => {
+                    table.remove("price");
+                }
             }
             models.push(table);
         }
@@ -1699,5 +1716,44 @@ mod tests {
             toml::from_str::<ModelEntry>("id = \"a:b\"\nprice = { input = 1.0 }").is_err(),
             "output is needed"
         );
+    }
+
+    #[test]
+    fn a_price_is_written_to_config_toml_changed_and_cleared() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[llm]\n[[llm.models]]\nid = \"anthropic:a\"\n").expect("write");
+        let read = || -> ModelCatalog {
+            let cfg: crate::config::GatewayConfig =
+                toml::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+            cfg.llm.catalog()
+        };
+        let mut catalog = read();
+        let priced = ModelPrice {
+            input: 3.0,
+            output: 15.0,
+            cache_read: Some(0.3),
+            cache_write: None,
+        };
+        for price in [
+            Some(priced),
+            Some(ModelPrice {
+                input: 1.5,
+                ..priced
+            }),
+            None,
+        ] {
+            let expected = catalog.version();
+            catalog.models[0].price = price;
+            assert!(write_if_unchanged(&path, &expected, &catalog).expect("write"));
+            assert_eq!(read().models[0].price, price);
+            assert_eq!(read().version(), catalog.version(), "the file is what runs");
+        }
+        let negative = ModelPrice {
+            input: -0.0,
+            ..priced
+        };
+        catalog.models[0].price = Some(negative);
+        assert!(catalog.validate().is_err(), "-0 is refused too");
     }
 }

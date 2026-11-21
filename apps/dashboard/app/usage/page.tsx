@@ -6,8 +6,8 @@
  * `[[llm.models]]`. The gateway's owner can look at anyone's, or everyone's.
  */
 
-import { useEffect, useMemo, useState } from "react";
-import { api, type UsageRow, type UsageView } from "@/lib/api";
+import { useEffect, useState } from "react";
+import { api, type UsageBucket, type UsageView } from "@/lib/api";
 
 const WINDOWS: Array<{ days: number; label: string }> = [
   { days: 7, label: "7d" },
@@ -28,26 +28,50 @@ function dollars(n: number): string {
   return n >= 1 ? `$${n.toFixed(2)}` : `$${n.toFixed(4)}`;
 }
 
-/** Rows summed by `key`, the most costly (then most used) first. */
-function byKey(rows: UsageRow[], key: (r: UsageRow) => string) {
-  const out = new Map<string, { calls: number; tokens: number; cost: number; unpriced: boolean }>();
-  for (const r of rows) {
-    const k = key(r);
-    const sum = out.get(k) ?? { calls: 0, tokens: 0, cost: 0, unpriced: false };
-    sum.calls += r.calls;
-    sum.tokens += r.tokens_in + r.tokens_out;
-    if (r.cost === null) sum.unpriced = true;
-    else sum.cost += r.cost;
-    out.set(k, sum);
-  }
-  return [...out.entries()].sort((a, b) => b[1].cost - a[1].cost || b[1].tokens - a[1].tokens);
+function Table({ title, buckets }: { title: string; buckets: UsageBucket[] }) {
+  if (buckets.length === 0) return null;
+  return (
+    <section className="card px-4 py-3">
+      <h2 className="mb-2 text-xs uppercase tracking-wider" style={muted}>
+        {title}
+      </h2>
+      <table className="w-full text-sm tabular">
+        <tbody>
+          {buckets.map((b) => (
+            <tr key={b.key || b.label}>
+              <td className="py-1 pr-3 font-mono wrap-anywhere">{b.label}</td>
+              <td className="py-1 pr-3 text-right" style={muted}>
+                {b.calls} {b.calls === 1 ? "call" : "calls"}
+              </td>
+              <td className="py-1 pr-3 text-right">{tokens(b.tokens)}</td>
+              <td className="py-1 text-right">
+                {dollars(b.cost)}
+                {b.unpriced && (
+                  <span style={muted} title="some of it is of a model without a price">
+                    {" "}
+                    +
+                  </span>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
+  );
 }
 
 export default function UsagePage() {
   const [days, setDays] = useState(30);
   const [user, setUser] = useState<string | undefined>(undefined);
-  const [view, setView] = useState<UsageView | null>(null);
+  // What was loaded, and for which window and user: other data than the
+  // one asked for is not shown as if it were.
+  const [loaded, setLoaded] = useState<{ key: string; view: UsageView } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const key = `${days}|${user ?? ""}`;
+  const view = loaded?.key === key ? loaded.view : null;
+  const everyone = loaded?.view.everyone ?? false;
+  const users = loaded?.view.users ?? [];
 
   useEffect(() => {
     let cancelled = false;
@@ -55,7 +79,7 @@ export default function UsagePage() {
       .usage(days, user)
       .then((v) => {
         if (!cancelled) {
-          setView(v);
+          setLoaded({ key: `${days}|${user ?? ""}`, view: v });
           setError(null);
         }
       })
@@ -67,24 +91,8 @@ export default function UsagePage() {
     };
   }, [days, user]);
 
-  const rows = useMemo(() => view?.rows ?? [], [view]);
-  const tables: Array<[string, Array<[string, { calls: number; tokens: number; cost: number; unpriced: boolean }]>]> =
-    useMemo(
-      () => [
-        ["by day", byKey(rows, (r) => r.day).sort((a, b) => (a[0] < b[0] ? 1 : -1))],
-        ["by agent", byKey(rows, (r) => r.agent_name ?? "(no agent)")],
-        ["by model", byKey(rows, (r) => r.model)],
-        ...(view?.user === "all"
-          ? [["by user", byKey(rows, (r) => r.display_name)] as [string, ReturnType<typeof byKey>]]
-          : []),
-      ],
-      [rows, view?.user],
-    );
-  const calls = rows.reduce((n, r) => n + r.calls, 0);
-  const used = rows.reduce((n, r) => n + r.tokens_in + r.tokens_out, 0);
-
   return (
-    <div className="grid gap-6">
+    <div className="mx-auto grid max-w-4xl gap-6 px-4 py-8">
       <h1 className="display-h2">usage</h1>
       {error && (
         <p className="card px-4 py-3 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
@@ -92,7 +100,7 @@ export default function UsagePage() {
         </p>
       )}
       <div className="flex flex-wrap items-center gap-3 text-sm">
-        <span style={muted}>window:</span>
+        <span style={muted}>window (UTC days):</span>
         {WINDOWS.map((w) => (
           <button
             key={w.days}
@@ -106,7 +114,7 @@ export default function UsagePage() {
             {w.label}
           </button>
         ))}
-        {view?.everyone && (
+        {everyone && (
           <select
             className="input ml-auto"
             style={{ maxWidth: 220 }}
@@ -116,7 +124,7 @@ export default function UsagePage() {
           >
             <option value="">mine</option>
             <option value="all">everyone</option>
-            {view.users.map((u) => (
+            {users.map((u) => (
               <option key={u.user_id} value={u.user_id}>
                 {u.display_name}
               </option>
@@ -143,56 +151,49 @@ export default function UsagePage() {
               <p className="text-xs uppercase tracking-wider" style={muted}>
                 tokens
               </p>
-              <p className="text-xl tabular">{tokens(used)}</p>
+              <p className="text-xl tabular">{tokens(view.tokens)}</p>
             </div>
             <div>
               <p className="text-xs uppercase tracking-wider" style={muted}>
                 calls
               </p>
-              <p className="text-xl tabular">{calls}</p>
+              <p className="text-xl tabular">{view.calls}</p>
             </div>
           </section>
-          {view.unpriced_tokens > 0 && (
-            <p className="text-xs" style={muted}>
-              {tokens(view.unpriced_tokens)} tokens are of models without a price, and not in the cost: give a model
-              a <span className="font-mono">price</span> in <span className="font-mono">[[llm.models]]</span> in the
-              gateway&apos;s config.toml (dollars per million tokens). Costs use the prices set now.
-            </p>
-          )}
-          {rows.length === 0 ? (
+          <div className="grid gap-1 text-xs" style={muted}>
+            {view.unpriced_tokens > 0 && (
+              <p>
+                {tokens(view.unpriced_tokens)} tokens are of models without a price, and not in the cost: give a
+                model a <span className="font-mono">price</span> in{" "}
+                <span className="font-mono">[[llm.models]]</span> in the gateway&apos;s config.toml (dollars per
+                million tokens). Costs use the prices set now.
+              </p>
+            )}
+            {view.unsettled_calls > 0 && (
+              <p>
+                {view.unsettled_calls} {view.unsettled_calls === 1 ? "call is" : "calls are"} still running or got no
+                usage from the provider, and {view.unsettled_calls === 1 ? "counts" : "count"} at what was reserved
+                for {view.unsettled_calls === 1 ? "it" : "them"}, the most.
+              </p>
+            )}
+            {view.searches > 0 && (
+              <p>
+                {view.searches} {view.searches === 1 ? "search" : "searches"} through a search backend, not counted
+                here.
+              </p>
+            )}
+          </div>
+          {view.calls === 0 ? (
             <p className="card px-4 py-6 text-sm" style={muted}>
               No model calls in this window.
             </p>
           ) : (
-            tables.map(([title, entries]) => (
-              <section key={title} className="card px-4 py-3">
-                <h2 className="mb-2 text-xs uppercase tracking-wider" style={muted}>
-                  {title}
-                </h2>
-                <table className="w-full text-sm tabular">
-                  <tbody>
-                    {entries.map(([name, sum]) => (
-                      <tr key={name}>
-                        <td className="py-1 pr-3 font-mono wrap-anywhere">{name}</td>
-                        <td className="py-1 pr-3 text-right" style={muted}>
-                          {sum.calls} {sum.calls === 1 ? "call" : "calls"}
-                        </td>
-                        <td className="py-1 pr-3 text-right">{tokens(sum.tokens)}</td>
-                        <td className="py-1 text-right">
-                          {dollars(sum.cost)}
-                          {sum.unpriced && (
-                            <span style={muted} title="some of it is of a model without a price">
-                              {" "}
-                              +
-                            </span>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </section>
-            ))
+            <>
+              <Table title="by day" buckets={view.by_day} />
+              <Table title="by agent" buckets={view.by_agent} />
+              <Table title="by model" buckets={view.by_model} />
+              <Table title="by user" buckets={view.by_user} />
+            </>
           )}
         </>
       )}

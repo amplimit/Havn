@@ -1,7 +1,8 @@
-//! `GET /usage` (issue #235): what a user's model calls used, by day, agent
-//! and model, in tokens, and in US dollars for the models whose price
+//! `GET /usage` (issue #235): what a user's model calls used, by day, agent,
+//! model and user, in tokens, and in US dollars for the models whose price
 //! `[[llm.models]]` gives. The gateway's owner sees everyone's.
 
+use std::collections::BTreeMap;
 use std::str::FromStr as _;
 
 use axum::Json;
@@ -18,6 +19,10 @@ use crate::auth::AuthedUser;
 const DAYS: u32 = 30;
 const MAX_DAYS: u32 = 366;
 
+/// The providers whose calls are model calls; others recorded beside them
+/// (web search backends) are counted as searches.
+const LLM_PROVIDERS: [&str; 4] = ["anthropic", "openai", "openrouter", "gemini"];
+
 #[derive(Debug, Deserialize)]
 pub struct UsageQuery {
     pub days: Option<u32>,
@@ -26,43 +31,49 @@ pub struct UsageQuery {
     pub user: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct UsageRow {
-    /// `YYYY-MM-DD`, UTC.
-    pub day: String,
-    pub user_id: String,
-    pub display_name: String,
-    /// `None` for calls made for no agent (a model check, say).
-    pub agent_id: Option<String>,
-    pub agent_name: Option<String>,
-    /// As `[[llm.models]]` lists it: `provider:model`.
-    pub model: String,
+/// One line of a table: a day, an agent, a model or a user.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct Bucket {
+    /// What it is: the day, an agent's or a user's id, or the model.
+    pub key: String,
+    /// What to call it.
+    pub label: String,
     pub calls: i64,
-    pub tokens_in: i64,
-    pub cache_read: i64,
-    pub cache_write: i64,
-    pub tokens_out: i64,
-    /// In US dollars, at the price the model has now; `None` for a model
-    /// without one.
-    pub cost: Option<f64>,
+    pub tokens: i64,
+    /// US dollars at the prices set now, of its priced calls.
+    pub cost: f64,
+    /// Whether some of its calls are of a model without a price.
+    pub unpriced: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct UsageView {
+    /// The start of the first day shown, UTC.
     pub since: DateTime<Utc>,
     pub days: u32,
     pub currency: &'static str,
     /// Whose this is: a user's id, or `all`.
     pub user: String,
-    /// Whether the caller may see everyone's (the gateway's owner).
+    /// Whether the caller may see others' (the gateway's owner).
     pub everyone: bool,
     /// The users the caller may pick, for the gateway's owner.
     pub users: Vec<UserChoice>,
-    pub rows: Vec<UsageRow>,
+    pub calls: i64,
+    pub tokens: i64,
     /// The cost of the calls of priced models.
     pub cost: f64,
     /// Tokens of models without a price, not in `cost`.
     pub unpriced_tokens: i64,
+    /// Calls not settled (still running, or whose provider reported no
+    /// usage): counted at what was reserved for them, their most.
+    pub unsettled_calls: i64,
+    /// Searches through a search backend, counted apart.
+    pub searches: i64,
+    pub by_day: Vec<Bucket>,
+    pub by_agent: Vec<Bucket>,
+    pub by_model: Vec<Bucket>,
+    /// When everyone's is shown.
+    pub by_user: Vec<Bucket>,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,65 +82,116 @@ pub struct UserChoice {
     pub display_name: String,
 }
 
+/// Sums by key.
+#[derive(Default)]
+struct Table(BTreeMap<String, Bucket>);
+
+impl Table {
+    fn add(&mut self, key: &str, label: &str, calls: i64, tokens: i64, cost: Option<f64>) {
+        let bucket = self.0.entry(key.to_string()).or_insert_with(|| Bucket {
+            key: key.to_string(),
+            label: label.to_string(),
+            calls: 0,
+            tokens: 0,
+            cost: 0.0,
+            unpriced: false,
+        });
+        bucket.calls += calls;
+        bucket.tokens += tokens;
+        match cost {
+            Some(c) => bucket.cost += c,
+            None => bucket.unpriced = true,
+        }
+    }
+
+    /// The most costly first, then the most used.
+    fn by_cost(self) -> Vec<Bucket> {
+        let mut out: Vec<Bucket> = self.0.into_values().collect();
+        out.sort_by(|a, b| b.cost.total_cmp(&a.cost).then(b.tokens.cmp(&a.tokens)));
+        out
+    }
+
+    /// The latest first.
+    fn by_key_down(self) -> Vec<Bucket> {
+        self.0.into_values().rev().collect()
+    }
+}
+
 /// `GET /usage?days=30&user=<id|all>`.
 pub async fn usage(
     State(state): State<AppState>,
     user: AuthedUser,
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<UsageView>, ApiError> {
-    let owner = user.id == state.bootstrap_user_id;
+    // With trust_header there is no one owner of the gateway: each sees
+    // their own, as the gateway's settings are config.toml's there.
+    let owner = user.id == state.bootstrap_user_id && state.trusted_proxies.is_none();
+    let refused = || ApiError::Forbidden("only the gateway's owner sees others' usage".into());
     let whose: Option<UserId> = match q.user.as_deref() {
         None => Some(user.id),
         Some("all") if owner => None,
+        Some("all") => return Err(refused()),
         Some(id) => {
             let id =
                 UserId::from_str(id).map_err(|_| ApiError::BadRequest("not a user id".into()))?;
             if id != user.id && !owner {
-                return Err(ApiError::Forbidden(
-                    "only the gateway's owner sees others' usage".into(),
-                ));
+                return Err(refused());
             }
             Some(id)
         }
     };
     let days = q.days.unwrap_or(DAYS).clamp(1, MAX_DAYS);
-    let since = Utc::now() - ChronoDuration::days(days.into());
+    // Whole UTC days, today the last.
+    let first = Utc::now().date_naive() - ChronoDuration::days(i64::from(days) - 1);
+    let since = first
+        .and_hms_opt(0, 0, 0)
+        .map_or_else(Utc::now, |t| t.and_utc());
     let since_rfc = since.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
     let found = havn_db::repo::credential_usage::usage_by_day(&state.db, whose, &since_rfc).await?;
     let catalog = state.models.load();
-    let mut cost = 0.0;
-    let mut unpriced_tokens = 0;
-    let rows = found
-        .into_iter()
-        .map(|d| {
-            let model = format!("{}:{}", d.provider, d.model);
-            let price = catalog
-                .models
-                .iter()
-                .find(|m| m.id == model)
-                .and_then(|m| m.price);
-            let row_cost =
-                price.map(|p| p.cost(d.tokens_in, d.cache_read, d.cache_write, d.tokens_out));
-            match row_cost {
-                Some(c) => cost += c,
-                None => unpriced_tokens += d.tokens_in + d.tokens_out,
-            }
-            UsageRow {
-                day: d.day,
-                user_id: d.user_id,
-                display_name: d.display_name,
-                agent_id: d.agent_id,
-                agent_name: d.agent_name,
-                model,
-                calls: d.calls,
-                tokens_in: d.tokens_in,
-                cache_read: d.cache_read,
-                cache_write: d.cache_write,
-                tokens_out: d.tokens_out,
-                cost: row_cost,
-            }
-        })
-        .collect();
+
+    let mut by_day = Table::default();
+    let mut by_agent = Table::default();
+    let mut by_model = Table::default();
+    let mut by_user = Table::default();
+    let (mut calls, mut tokens, mut cost) = (0, 0, 0.0);
+    let (mut unpriced_tokens, mut unsettled_calls, mut searches) = (0, 0, 0);
+    for d in found {
+        if !LLM_PROVIDERS.contains(&d.provider.as_str()) {
+            searches += d.calls;
+            continue;
+        }
+        let model = format!("{}:{}", d.provider, d.model);
+        let price = catalog
+            .models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.price);
+        let row_cost =
+            price.map(|p| p.cost(d.tokens_in, d.cache_read, d.cache_write, d.tokens_out));
+        let row_tokens = d.tokens_in + d.tokens_out;
+        calls += d.calls;
+        tokens += row_tokens;
+        unsettled_calls += d.unsettled;
+        match row_cost {
+            Some(c) => cost += c,
+            None => unpriced_tokens += row_tokens,
+        }
+        by_day.add(&d.day, &d.day, d.calls, row_tokens, row_cost);
+        let (agent_key, mut agent_label) = match (&d.agent_id, &d.agent_name) {
+            (Some(id), Some(name)) => (id.clone(), name.clone()),
+            (Some(id), None) => (id.clone(), "(a deleted agent)".to_string()),
+            (None, _) => (String::new(), "(no agent)".to_string()),
+        };
+        if whose.is_none() {
+            agent_label = format!("{agent_label} ({})", d.display_name);
+        }
+        by_agent.add(&agent_key, &agent_label, d.calls, row_tokens, row_cost);
+        by_model.add(&model, &model, d.calls, row_tokens, row_cost);
+        if whose.is_none() {
+            by_user.add(&d.user_id, &d.display_name, d.calls, row_tokens, row_cost);
+        }
+    }
     let users = if owner {
         havn_db::repo::users::list(&state.db)
             .await?
@@ -149,9 +211,16 @@ pub async fn usage(
         user: whose.map_or_else(|| "all".to_string(), |u| u.to_string()),
         everyone: owner,
         users,
-        rows,
+        calls,
+        tokens,
         cost,
         unpriced_tokens,
+        unsettled_calls,
+        searches,
+        by_day: by_day.by_key_down(),
+        by_agent: by_agent.by_cost(),
+        by_model: by_model.by_cost(),
+        by_user: by_user.by_cost(),
     }))
 }
 
@@ -161,16 +230,24 @@ mod tests {
 
     use super::*;
 
-    async fn spend(state: &AppState, user: UserId, model: &str, tokens_in: i64, tokens_out: i64) {
+    async fn spend(
+        state: &AppState,
+        user: UserId,
+        provider: &str,
+        model: &str,
+        used: (i64, i64),
+        settled: bool,
+    ) {
         use havn_db::repo::credential_usage::{Caps, Reservation, Used, reserve, settle};
         let scope_id = user.to_string();
+        let name = format!("k{}", uuid::Uuid::now_v7());
         let cred = havn_db::repo::credentials::create(
             &state.db,
             havn_db::repo::credentials::NewCredential {
                 scope: havn_db::repo::credentials::CredentialScope::User,
                 scope_id: &scope_id,
-                provider: "anthropic",
-                name: None,
+                provider,
+                name: Some(&name),
                 api_key_ciphertext: b"x",
                 priority: 0,
                 limits: serde_json::json!({}),
@@ -184,10 +261,10 @@ mod tests {
                 credential_id: cred.id,
                 user_id: user,
                 agent_id: None,
-                provider: "anthropic",
+                provider,
                 model,
-                tokens_in,
-                max_tokens_out: tokens_out,
+                tokens_in: used.0,
+                max_tokens_out: used.1,
                 min_tokens_out: 0,
                 caps: Caps::default(),
                 day_start: "1970-01-01T00:00:00.000Z",
@@ -197,18 +274,20 @@ mod tests {
         .await
         .expect("reserve")
         .expect("room");
-        settle(
-            &state.db,
-            &reserved.id,
-            "answered-as",
-            Used {
-                tokens_in,
-                tokens_out,
-                ..Used::default()
-            },
-        )
-        .await
-        .expect("settle");
+        if settled {
+            settle(
+                &state.db,
+                &reserved.id,
+                "answered-as",
+                Used {
+                    tokens_in: used.0,
+                    tokens_out: used.1,
+                    ..Used::default()
+                },
+            )
+            .await
+            .expect("settle");
+        }
     }
 
     fn authed(id: UserId) -> AuthedUser {
@@ -216,6 +295,19 @@ mod tests {
             id,
             display_name: "u".into(),
         }
+    }
+
+    async fn ask(state: &AppState, who: UserId, user: Option<&str>) -> Result<UsageView, ApiError> {
+        usage(
+            State(state.clone()),
+            authed(who),
+            Query(UsageQuery {
+                days: None,
+                user: user.map(str::to_string),
+            }),
+        )
+        .await
+        .map(|Json(v)| v)
     }
 
     #[tokio::test]
@@ -238,71 +330,71 @@ mod tests {
             serde_json::from_value(serde_json::json!({"id": "anthropic:free"})).expect("entry"),
         ];
         state.models.store(std::sync::Arc::new(catalog));
-        spend(&state, owner, "priced", 1_000_000, 100_000).await;
-        spend(&state, owner, "free", 500, 50).await;
-        spend(&state, other, "priced", 10, 10).await;
-
-        let Json(mine) = usage(
-            State(state.clone()),
-            authed(owner),
-            Query(UsageQuery {
-                days: None,
-                user: None,
-            }),
+        spend(
+            &state,
+            owner,
+            "anthropic",
+            "priced",
+            (1_000_000, 100_000),
+            true,
         )
-        .await
-        .expect("mine");
-        assert_eq!(mine.rows.len(), 2);
+        .await;
+        spend(&state, owner, "anthropic", "free", (500, 50), true).await;
+        spend(&state, owner, "anthropic", "free", (100, 900), false).await;
+        spend(&state, owner, "brave", "web_search", (1, 0), true).await;
+        spend(&state, other, "anthropic", "priced", (10, 10), true).await;
+
+        let mine = ask(&state, owner, None).await.expect("mine");
         assert!((mine.cost - 3.0).abs() < 1e-9, "{}", mine.cost);
-        assert_eq!(mine.unpriced_tokens, 550);
+        assert_eq!(mine.unpriced_tokens, 1550);
+        assert_eq!((mine.calls, mine.unsettled_calls, mine.searches), (3, 1, 1));
         assert!(
-            mine.rows
+            mine.by_model
                 .iter()
-                .any(|r| r.model == "anthropic:priced" && r.cost.is_some())
+                .any(|b| b.key == "anthropic:priced" && !b.unpriced)
         );
         assert!(
-            mine.rows
+            mine.by_model
                 .iter()
-                .any(|r| r.model == "anthropic:free" && r.cost.is_none())
+                .any(|b| b.key == "anthropic:free" && b.unpriced)
         );
-        assert!(mine.everyone && mine.users.len() >= 2);
+        assert!(
+            !mine.by_model.iter().any(|b| b.key.starts_with("brave")),
+            "a search is not a model"
+        );
+        assert_eq!(mine.by_day.len(), 1);
+        assert!(mine.by_user.is_empty() && mine.everyone && mine.users.len() >= 2);
 
-        let Json(all) = usage(
-            State(state.clone()),
-            authed(owner),
-            Query(UsageQuery {
-                days: Some(7),
-                user: Some("all".into()),
-            }),
-        )
-        .await
-        .expect("all");
-        assert_eq!(all.rows.len(), 3);
+        let all = ask(&state, owner, Some("all")).await.expect("all");
+        assert_eq!(all.calls, 4);
+        assert_eq!(all.by_user.len(), 2);
+        let theirs_by_owner = ask(&state, owner, Some(&other.to_string()))
+            .await
+            .expect("theirs");
+        assert_eq!(theirs_by_owner.calls, 1);
 
         // Someone else sees theirs only.
-        let Json(theirs) = usage(
-            State(state.clone()),
-            authed(other),
-            Query(UsageQuery {
-                days: None,
-                user: None,
-            }),
-        )
-        .await
-        .expect("theirs");
-        assert_eq!(theirs.rows.len(), 1);
+        let theirs = ask(&state, other, None).await.expect("theirs");
+        assert_eq!(theirs.calls, 1);
         assert!(!theirs.everyone && theirs.users.is_empty());
-        for asked in ["all".to_string(), owner.to_string()] {
-            let refused = usage(
-                State(state.clone()),
-                authed(other),
-                Query(UsageQuery {
-                    days: None,
-                    user: Some(asked),
-                }),
-            )
-            .await;
-            assert!(refused.is_err());
-        }
+        assert!(matches!(
+            ask(&state, other, Some("all")).await,
+            Err(ApiError::Forbidden(_))
+        ));
+        assert!(matches!(
+            ask(&state, other, Some(&owner.to_string())).await,
+            Err(ApiError::Forbidden(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn with_trust_header_no_one_sees_others_usage() {
+        let (state, owner) = crate::auth::tests::state_with(true).await;
+        let mine = ask(&state, owner, None).await.expect("mine");
+        assert!(!mine.everyone);
+        assert!(matches!(
+            ask(&state, owner, Some("all")).await,
+            Err(ApiError::Forbidden(_))
+        ));
     }
 }

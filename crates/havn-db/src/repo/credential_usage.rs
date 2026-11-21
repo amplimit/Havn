@@ -90,8 +90,8 @@ pub async fn reserve(pool: &SqlitePool, r: Reservation<'_>) -> Result<Option<Res
          ) \
          INSERT INTO credential_usages \
            (id, credential_id, user_id, agent_id, provider, model, asked_model, tokens_in, \
-            tokens_out) \
-         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, tokens_out FROM allowance \
+            tokens_out, settled) \
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, tokens_out, 0 FROM allowance \
          WHERE tokens_out >= ?9 AND (?14 <= 0 OR user_requests < ?14) \
          RETURNING tokens_out",
     )
@@ -132,7 +132,7 @@ pub struct Used {
 pub async fn settle(pool: &SqlitePool, id: &str, model: &str, used: Used) -> Result<()> {
     sqlx::query(
         "UPDATE credential_usages SET model = ?2, tokens_in = ?3, tokens_out = ?4, \
-         cache_read_tokens = ?5, cache_write_tokens = ?6 WHERE id = ?1",
+         cache_read_tokens = ?5, cache_write_tokens = ?6, settled = 1 WHERE id = ?1",
     )
     .bind(id)
     .bind(model)
@@ -164,6 +164,8 @@ pub struct DayUsage {
     pub cache_read: i64,
     pub cache_write: i64,
     pub tokens_out: i64,
+    /// Of `calls`, those not settled: at their reserved most.
+    pub unsettled: i64,
 }
 
 /// Model calls since `since_rfc3339` by day, user, agent and model, the
@@ -174,7 +176,14 @@ pub async fn usage_by_day(
     user: Option<UserId>,
     since_rfc3339: &str,
 ) -> Result<Vec<DayUsage>> {
-    Ok(sqlx::query_as::<_, DayUsage>(
+    // Two statements, so each uses its index: (user_id, created_at) for one
+    // user, created_at for everyone.
+    let filter = if user.is_some() {
+        "cu.user_id = ?2 AND cu.created_at >= ?1"
+    } else {
+        "cu.created_at >= ?1"
+    };
+    let sql = format!(
         "SELECT substr(cu.created_at, 1, 10) AS day, cu.user_id, u.display_name, \
                 cu.agent_id, a.name AS agent_name, cu.provider, \
                 CASE WHEN cu.asked_model != '' THEN cu.asked_model ELSE cu.model END AS model, \
@@ -182,19 +191,21 @@ pub async fn usage_by_day(
                 COALESCE(SUM(cu.tokens_in), 0) AS tokens_in, \
                 COALESCE(SUM(cu.cache_read_tokens), 0) AS cache_read, \
                 COALESCE(SUM(cu.cache_write_tokens), 0) AS cache_write, \
-                COALESCE(SUM(cu.tokens_out), 0) AS tokens_out \
+                COALESCE(SUM(cu.tokens_out), 0) AS tokens_out, \
+                COALESCE(SUM(CASE WHEN cu.settled = 0 THEN 1 ELSE 0 END), 0) AS unsettled \
          FROM credential_usages cu \
          JOIN users u ON u.id = cu.user_id \
          LEFT JOIN agents a ON a.id = cu.agent_id \
-         WHERE cu.created_at >= ?1 AND (?2 IS NULL OR cu.user_id = ?2) \
+         WHERE {filter} \
          GROUP BY day, cu.user_id, cu.agent_id, cu.provider, \
                   CASE WHEN cu.asked_model != '' THEN cu.asked_model ELSE cu.model END \
-         ORDER BY day DESC, SUM(cu.tokens_in + cu.tokens_out) DESC",
-    )
-    .bind(since_rfc3339)
-    .bind(user.map(|u| u.to_string()))
-    .fetch_all(pool)
-    .await?)
+         ORDER BY day DESC, SUM(cu.tokens_in + cu.tokens_out) DESC"
+    );
+    let mut query = sqlx::query_as::<_, DayUsage>(&sql).bind(since_rfc3339);
+    if let Some(user) = user {
+        query = query.bind(user.to_string());
+    }
+    Ok(query.fetch_all(pool).await?)
 }
 
 /// Drop a reservation whose request did not reach the provider or failed.
