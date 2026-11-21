@@ -74,7 +74,11 @@ pub struct ToolHook {
 impl ToolHook {
     /// Whether the rule is about `tool`: its name, a prefix ending in `*`,
     /// and `file_write` covering `file_edit`, which changes the same files.
+    /// `view_image` reads files: a rule about `file_read` covers it.
     fn covers(&self, tool: &str) -> bool {
+        if tool == "view_image" && self.covers("file_read") {
+            return true;
+        }
         match self.tool.strip_suffix('*') {
             Some(prefix) => tool.starts_with(prefix),
             None => self.tool == tool || (self.tool == "file_write" && tool == "file_edit"),
@@ -527,6 +531,26 @@ mod tests {
         assert_eq!(kept, MAX_HOOK_PATTERNS);
         assert!(matches!(set.veto("shell", "q0"), Veto::Deny { .. }));
         assert!(matches!(set.veto("file_read", "x"), Veto::Allow));
+    }
+
+    #[test]
+    fn rules_about_reading_files_cover_viewing_images() {
+        let set = set_with(
+            "pre_tool_use:\n  - tool: file_read\n    deny: [\"^private/\"]\n  - tool: file_*\n    ask: [\"^shared/\"]\n  - tool: file_write\n    deny: [\"^out/\"]\n",
+        );
+        assert!(matches!(
+            set.veto("view_image", "private/a.png"),
+            Veto::Deny { .. }
+        ));
+        assert!(matches!(
+            set.veto("view_image", "shared/a.png"),
+            Veto::Ask { .. }
+        ));
+        assert!(
+            matches!(set.veto("view_image", "out/a.png"), Veto::Allow),
+            "writing is not reading"
+        );
+        assert!(matches!(set.veto("view_image", "a.png"), Veto::Allow));
     }
 
     #[test]

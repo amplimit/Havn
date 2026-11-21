@@ -253,6 +253,8 @@ fn translate_message_to_gemini(m: &AnthropicMessage) -> Result<Value, String> {
         .ok_or_else(|| format!("message.content must be string or array, got {}", m.content))?;
 
     let mut parts: Vec<Value> = Vec::with_capacity(blocks.len());
+    // Images tools showed (issue #227), after every response, each named.
+    let mut shown: Vec<Value> = Vec::new();
     for block in blocks {
         let kind = block
             .get("type")
@@ -286,6 +288,16 @@ fn translate_message_to_gemini(m: &AnthropicMessage) -> Result<Value, String> {
                 let content = match block.get("content") {
                     Some(Value::String(s)) => json!({"result": s}),
                     Some(Value::Array(a)) => {
+                        let id = block
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or(name);
+                        for image in a.iter().filter(|p| super::openai::is_base64_image(p)) {
+                            shown.push(
+                                json!({"text": format!("(The image the tool call {id} showed:)")}),
+                            );
+                            shown.push(inline_data(image));
+                        }
                         let combined: String = a
                             .iter()
                             .filter_map(|p| p.get("text").and_then(Value::as_str))
@@ -303,12 +315,7 @@ fn translate_message_to_gemini(m: &AnthropicMessage) -> Result<Value, String> {
             "image" | "audio"
                 if block.pointer("/source/type").and_then(Value::as_str) == Some("base64") =>
             {
-                parts.push(json!({
-                    "inline_data": {
-                        "mime_type": block.pointer("/source/media_type").and_then(Value::as_str).unwrap_or("image/png"),
-                        "data": block.pointer("/source/data").and_then(Value::as_str).unwrap_or_default(),
-                    }
-                }));
+                parts.push(inline_data(block));
             }
             // A model's reasoning is not sent back to it.
             "thinking" | "redacted_thinking" => {}
@@ -322,7 +329,18 @@ fn translate_message_to_gemini(m: &AnthropicMessage) -> Result<Value, String> {
         }
     }
 
+    parts.append(&mut shown);
     Ok(json!({"role": role, "parts": parts}))
+}
+
+/// Base64 block `block` (an image, audio) as an `inline_data` part.
+fn inline_data(block: &Value) -> Value {
+    json!({
+        "inline_data": {
+            "mime_type": block.pointer("/source/media_type").and_then(Value::as_str).unwrap_or("image/png"),
+            "data": block.pointer("/source/data").and_then(Value::as_str).unwrap_or_default(),
+        }
+    })
 }
 
 fn translate_tools_to_gemini(tools: &Value) -> Result<Value, String> {
@@ -645,6 +663,58 @@ mod tests {
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0]["role"], "user");
         assert_eq!(contents[0]["parts"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn an_image_a_tool_showed_follows_its_response() {
+        let r = req(
+            vec![AnthropicMessage {
+                role: "user".into(),
+                content: json!([
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_1",
+                        "content": [
+                            {"type": "text", "text": "The image chart.png:"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+                        ]
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_2",
+                        "content": [
+                            {"type": "text", "text": "The image shot.png:"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "BBBB"}}
+                        ]
+                    }
+                ]),
+            }],
+            None,
+        );
+        let body = anthropic_to_gemini(&r).expect("translate");
+        let parts = body["contents"][0]["parts"].as_array().expect("parts");
+        assert_eq!(parts.len(), 6, "{parts:?}");
+        assert_eq!(
+            parts[0]["functionResponse"]["response"]["result"],
+            "The image chart.png:"
+        );
+        assert!(
+            parts[1].get("functionResponse").is_some(),
+            "responses first"
+        );
+        assert!(
+            parts[2]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("tu_1"))
+        );
+        assert_eq!(parts[3]["inline_data"]["mime_type"], "image/png");
+        assert_eq!(parts[3]["inline_data"]["data"], "AAAA");
+        assert!(
+            parts[4]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("tu_2"))
+        );
+        assert_eq!(parts[5]["inline_data"]["data"], "BBBB");
     }
 
     #[test]

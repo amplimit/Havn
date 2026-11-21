@@ -74,6 +74,12 @@ pub struct ToolCtx {
 pub enum ToolResult {
     Ok(String),
     Error(String),
+    /// `text`, and the image at workspace path `path` shown to the model
+    /// with it (issue #227). The gateway reads the file.
+    Image {
+        text: String,
+        path: String,
+    },
 }
 
 impl ToolResult {
@@ -91,7 +97,7 @@ impl ToolResult {
     )]
     pub fn text(&self) -> &str {
         match self {
-            Self::Ok(s) | Self::Error(s) => s,
+            Self::Ok(s) | Self::Error(s) | Self::Image { text: s, .. } => s,
         }
     }
 }
@@ -157,6 +163,7 @@ impl ToolRegistry {
             Arc::new(files::FileEditTool),
             Arc::new(files::FileFindTool),
             Arc::new(files::FileSearchTool),
+            Arc::new(files::ViewImageTool),
         ];
         if policy.permissions.can_use_shell {
             tools.push(Arc::new(shell::ShellTool));
@@ -320,7 +327,8 @@ impl ToolRegistry {
                 entry.disabled.iter().any(|d| {
                     d == tool_name
                         || (d == "file_write" && tool_name == "file_edit")
-                        || (d == "file_read" && matches!(tool_name, "file_find" | "file_search"))
+                        || (d == "file_read"
+                            && matches!(tool_name, "file_find" | "file_search" | "view_image"))
                         || (d == "shell" && tool_name == "process")
                 })
             })
@@ -525,7 +533,7 @@ fn flatten_input_for_hook(tool: &str, input: &serde_json::Value) -> String {
     match tool {
         "shell" => pick("command"),
         "web_fetch" => pick("url"),
-        "file_read" | "file_write" | "file_edit" => pick("path"),
+        "file_read" | "file_write" | "file_edit" | "view_image" => pick("path"),
         "file_find" | "file_search" => pick("path"),
         "memory_search" => pick("query"),
         "memory_remember" | "memory_forget" => pick("key"),
@@ -773,7 +781,9 @@ mod tests {
                 );
                 let names = names_in(&registry(policy).schemas_for(context::CRON));
                 assert!(
-                    !names.contains(&"file_find".into()) && !names.contains(&"file_search".into())
+                    !names.contains(&"file_find".into())
+                        && !names.contains(&"file_search".into())
+                        && !names.contains(&"view_image".into())
                 );
             })
             .await;

@@ -68,7 +68,7 @@ impl Review {
         match tool {
             "memory_search" | "file_read" | "file_find" | "file_search" => Some(Self::Result),
             "shell" | "process" | "file_write" | "file_edit" | "skill_manage" | "send_file"
-            | "set_timezone" => Some(Self::Call),
+            | "set_timezone" | "view_image" => Some(Self::Call),
             _ if tool.starts_with("mcp__") => Some(Self::Call),
             _ => None,
         }
@@ -210,6 +210,13 @@ pub async fn guarded(
             let found = match run.await {
                 ToolResult::Ok(found) => found,
                 failed @ ToolResult::Error(_) => return failed,
+                // The owner looks at text: an image would reach the model
+                // unseen.
+                ToolResult::Image { .. } => {
+                    return ToolResult::Error(
+                        "an image cannot be shown to the owner to look at first".into(),
+                    );
+                }
             };
             // What the owner sees is what the model gets: what does not
             // fit is left out of both, and both are told.
@@ -336,6 +343,10 @@ fn with_rule(result: ToolResult, rule: Option<&str>) -> ToolResult {
     match result {
         ToolResult::Ok(text) => ToolResult::Ok(format!("{text}{rule}")),
         ToolResult::Error(text) => ToolResult::Error(format!("{text}{rule}")),
+        ToolResult::Image { text, path } => ToolResult::Image {
+            text: format!("{text}{rule}"),
+            path,
+        },
     }
 }
 
@@ -571,6 +582,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn viewing_an_image_in_someone_else_s_chat_is_asked_about_first() {
+        assert!(matches!(Review::of("view_image"), Some(Review::Call)));
+        assert!(matches!(Review::of("file_read"), Some(Review::Result)));
+    }
 
     fn decision(channel: &str, id: &str, approve: bool, remember: bool) -> ApprovalDecision {
         ApprovalDecision {

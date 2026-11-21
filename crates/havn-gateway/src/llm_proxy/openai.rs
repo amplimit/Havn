@@ -409,14 +409,25 @@ fn translate_message_to_openai(
                     .ok_or("tool_result block missing 'tool_use_id'")?;
                 // Anthropic allows tool_result.content to be either a
                 // string or an array of {type:"text", text: ...} blocks.
-                // Flatten to a single string for OpenAI.
+                // Flatten to a single string for OpenAI. A tool message
+                // carries no image (issue #227): one a tool showed goes in
+                // the user message that follows the results, named so.
                 let content = match block.get("content") {
                     Some(Value::String(s)) => s.clone(),
-                    Some(Value::Array(parts)) => parts
-                        .iter()
-                        .filter_map(|p| p.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
+                    Some(Value::Array(parts)) => {
+                        for part in parts.iter().filter(|p| is_base64_image(p)) {
+                            images.push(json!({
+                                "type": "text",
+                                "text": format!("(The image the tool call {tool_use_id} showed:)"),
+                            }));
+                            images.push(image_url(part));
+                        }
+                        parts
+                            .iter()
+                            .filter_map(|p| p.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
                     Some(other) => other.to_string(),
                     None => String::new(),
                 };
@@ -430,18 +441,7 @@ fn translate_message_to_openai(
                 if m.role == "user"
                     && block.pointer("/source/type").and_then(Value::as_str) == Some("base64") =>
             {
-                let media = block
-                    .pointer("/source/media_type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("image/png");
-                let data = block
-                    .pointer("/source/data")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                images.push(json!({
-                    "type": "image_url",
-                    "image_url": {"url": format!("data:{media};base64,{data}")},
-                }));
+                images.push(image_url(block));
             }
             // Audio (issue #164, a transcription), as an `input_audio` part.
             "audio"
@@ -512,7 +512,11 @@ fn translate_message_to_openai(
         }
         out.push(msg);
     } else if !images.is_empty() {
-        let mut parts = vec![json!({"type": "text", "text": text_parts.join("\n")})];
+        // No empty text part: some servers refuse one.
+        let mut parts = Vec::new();
+        if !text_parts.is_empty() {
+            parts.push(json!({"type": "text", "text": text_parts.join("\n")}));
+        }
         parts.extend(images);
         out.push(json!({"role": &m.role, "content": parts}));
     } else if !text_parts.is_empty() {
@@ -520,6 +524,28 @@ fn translate_message_to_openai(
     }
 
     Ok(())
+}
+
+/// Whether `block` is an image given as base64.
+pub(super) fn is_base64_image(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("image")
+        && block.pointer("/source/type").and_then(Value::as_str) == Some("base64")
+}
+
+/// Base64 image block `block` as an `image_url` part.
+fn image_url(block: &Value) -> Value {
+    let media = block
+        .pointer("/source/media_type")
+        .and_then(Value::as_str)
+        .unwrap_or("image/png");
+    let data = block
+        .pointer("/source/data")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    json!({
+        "type": "image_url",
+        "image_url": {"url": format!("data:{media};base64,{data}")},
+    })
 }
 
 fn translate_tools_to_openai(tools: &Value) -> Result<Value, String> {
@@ -956,6 +982,56 @@ mod tests {
         assert_eq!(messages[0]["role"], "tool");
         assert_eq!(messages[0]["tool_call_id"], "tu_1");
         assert_eq!(messages[0]["content"], "file1\nfile2");
+    }
+
+    #[test]
+    fn an_image_a_tool_showed_follows_its_result_as_a_user_message() {
+        let r = req(
+            vec![AnthropicMessage {
+                role: "user".into(),
+                content: json!([
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_1",
+                        "content": [
+                            {"type": "text", "text": "The image chart.png:"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+                        ]
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_2",
+                        "content": [
+                            {"type": "text", "text": "The image shot.png:"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "BBBB"}}
+                        ]
+                    }
+                ]),
+            }],
+            None,
+        );
+        let body = anthropic_to_openai(&r, "max_tokens", "openai").expect("translate");
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "tool");
+        assert_eq!(messages[0]["content"], "The image chart.png:");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[2]["role"], "user");
+        let parts = messages[2]["content"].as_array().expect("parts");
+        let shape: Vec<String> = parts
+            .iter()
+            .map(|p| match p["image_url"]["url"].as_str() {
+                Some(url) => url.to_string(),
+                None => p["text"].as_str().unwrap_or_default().to_string(),
+            })
+            .collect();
+        assert_eq!(shape.len(), 4, "{shape:?}");
+        assert!(
+            shape[0].contains("tu_1") && shape[2].contains("tu_2"),
+            "{shape:?}"
+        );
+        assert_eq!(shape[1], "data:image/png;base64,AAAA");
+        assert_eq!(shape[3], "data:image/png;base64,BBBB");
     }
 
     #[test]

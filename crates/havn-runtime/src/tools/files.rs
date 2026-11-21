@@ -1,5 +1,5 @@
-//! `file_read`, `file_write`, `file_edit`, `file_find` and `file_search`
-//! tools — workspace-scoped filesystem access.
+//! `file_read`, `file_write`, `file_edit`, `file_find`, `file_search` and
+//! `view_image` tools — workspace-scoped filesystem access.
 //!
 //! Path safety: reject absolute paths and any `..` parent-traversal
 //! component. Landlock and the namespace spawner's minimal rootfs add
@@ -70,6 +70,101 @@ impl Tool for FileReadTool {
             Err(e) => ToolResult::Error(format!("read failed: {e}")),
         }
     }
+}
+
+/// `view_image` (issue #227): an image of the workspace shown to the
+/// model with the tool's result. The gateway reads the file and applies the
+/// image limits and the model's `vision`.
+pub struct ViewImageTool;
+
+#[async_trait]
+impl Tool for ViewImageTool {
+    fn name(&self) -> &'static str {
+        "view_image"
+    }
+
+    fn description(&self) -> &'static str {
+        "Look at an image in the agent's workspace: a screenshot you took, a chart you drew, a picture you downloaded. PNG, JPEG, GIF, WebP or HEIC. Path is relative to the workspace root. The image is shown to you with this tool's result, when your model can see images."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Relative path within the workspace." }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, input: Value) -> ToolResult {
+        let Some(path) = input.get("path").and_then(Value::as_str) else {
+            return ToolResult::Error("missing required field: path".into());
+        };
+        let resolved = match safe_join(&ctx.workspace_dir, path) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::Error(e),
+        };
+        match tokio::fs::symlink_metadata(&resolved).await {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return ToolResult::Error(format!("not a file: {path}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return ToolResult::Error(format!("file not found: {path}"));
+            }
+            Err(e) => return ToolResult::Error(format!("read failed: {e}")),
+        }
+        let mut head = [0_u8; 12];
+        let read = match tokio::fs::File::open(&resolved).await {
+            Ok(mut file) => {
+                use tokio::io::AsyncReadExt as _;
+                file.read(&mut head).await
+            }
+            Err(e) => Err(e),
+        };
+        let n = match read {
+            Ok(n) => n,
+            Err(e) => return ToolResult::Error(format!("read failed: {e}")),
+        };
+        if !is_image(&head[..n]) {
+            return ToolResult::Error(format!(
+                "{path} is not a PNG, JPEG, GIF, WebP or HEIC image"
+            ));
+        }
+        let path = Path::new(path)
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        ToolResult::Image {
+            text: format!("The image {path}:"),
+            path,
+        }
+    }
+}
+
+/// Whether `head`, a file's first bytes, starts a PNG, JPEG, GIF, WebP or
+/// HEIF image (the gateway shows HEIC as a copy).
+fn is_image(head: &[u8]) -> bool {
+    head.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+        || head.starts_with(&[0xFF, 0xD8, 0xFF])
+        || head.starts_with(b"GIF87a")
+        || head.starts_with(b"GIF89a")
+        || head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP"
+        || head.len() >= 12
+            && &head[4..8] == b"ftyp"
+            && [
+                &b"heic"[..],
+                b"heix",
+                b"heim",
+                b"heis",
+                b"hevc",
+                b"mif1",
+                b"msf1",
+            ]
+            .contains(&&head[8..12])
 }
 
 pub struct FileWriteTool;
@@ -1245,8 +1340,46 @@ mod tests {
 
     fn text_of(r: ToolResult) -> String {
         match r {
-            ToolResult::Ok(s) => s,
+            ToolResult::Ok(s) | ToolResult::Image { text: s, .. } => s,
             ToolResult::Error(e) => panic!("tool error: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_image_of_the_workspace_is_shown_by_its_path() {
+        let ctx = ctx().await;
+        put(
+            &ctx,
+            "shots/page.png",
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0],
+        )
+        .await;
+        put(&ctx, "notes.txt", b"just text").await;
+        let view = |path: &str| ViewImageTool.execute(&ctx, json!({"path": path}));
+        match view("./shots//page.png").await {
+            ToolResult::Image { path, .. } => assert_eq!(path, "shots/page.png"),
+            other => panic!("{other:?}"),
+        }
+        for (path, why) in [
+            ("notes.txt", "not a PNG"),
+            ("missing.png", "not found"),
+            ("shots", "not a file"),
+            ("../x.png", ".."),
+            ("/etc/x.png", "absolute"),
+        ] {
+            match view(path).await {
+                ToolResult::Error(e) => assert!(e.contains(why), "{path}: {e}"),
+                other => panic!("{path}: {other:?}"),
+            }
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                ctx.workspace_dir.join("shots/page.png"),
+                ctx.workspace_dir.join("link.png"),
+            )
+            .expect("link");
+            assert!(view("link.png").await.is_error(), "a link is not followed");
         }
     }
 
