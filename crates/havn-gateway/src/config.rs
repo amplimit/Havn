@@ -473,9 +473,10 @@ impl Default for AttachmentLimits {
 /// `running`'s accounts with who may reach each taken from `new` (issue
 /// #273): `dm_policy`, `allow_from`, `group_policy`, `allow_groups`,
 /// `admins` and `bot_username`, which apply to the next message. The
-/// accounts themselves stay as they run: those `new` adds or drops, or
-/// gives another `adapter_token_ref`, are named in the second part, as
-/// they wait for a restart (an adapter's session was let in by its token).
+/// accounts themselves stay as they run, each with the `adapter_token_ref`
+/// its adapter's session was let in by: those `new` adds or drops, or
+/// gives another token, are named in the second part, as they wait for a
+/// restart.
 #[must_use]
 pub fn with_policies_of(
     running: &std::collections::BTreeMap<String, ChannelEntry>,
@@ -491,16 +492,18 @@ pub fn with_policies_of(
             let found = new
                 .get(channel)
                 .and_then(|e| e.accounts.iter().find(|a| a.id == account.id));
-            match found {
-                Some(next) if next.adapter_token_ref == account.adapter_token_ref => {
-                    account.dm_policy = next.dm_policy;
-                    account.allow_from.clone_from(&next.allow_from);
-                    account.group_policy = next.group_policy;
-                    account.allow_groups.clone_from(&next.allow_groups);
-                    account.admins.clone_from(&next.admins);
-                    account.bot_username.clone_from(&next.bot_username);
-                }
-                _ => waiting.push(format!("{channel}/{}", account.id)),
+            let Some(next) = found else {
+                waiting.push(format!("{channel}/{}", account.id));
+                continue;
+            };
+            account.dm_policy = next.dm_policy;
+            account.allow_from.clone_from(&next.allow_from);
+            account.group_policy = next.group_policy;
+            account.allow_groups.clone_from(&next.allow_groups);
+            account.admins.clone_from(&next.admins);
+            account.bot_username.clone_from(&next.bot_username);
+            if next.adapter_token_ref != account.adapter_token_ref {
+                waiting.push(format!("{channel}/{}", account.id));
             }
         }
     }
@@ -529,8 +532,8 @@ fn set_kept(table: &mut toml_edit::Table, key: &str, text: &str) {
 
 /// Set the policies given of the account `account_id` of `channel` in the
 /// config file at `path` (issue #273), keeping the rest of the file as it
-/// is: `dm_policy` for private chats, `group_policy` for groups. The file
-/// as written must load, else it is put back as it was: what loaded.
+/// is: `dm_policy` for private chats, `group_policy` for groups. What is
+/// written must load, else the file is left as it is: what loaded.
 pub fn write_account_policy(
     path: &std::path::Path,
     channel: &str,
@@ -572,17 +575,11 @@ pub fn write_account_policy(
     if let Some(policy) = group_policy {
         set_kept(account, "group_policy", policy.name());
     }
-    crate::model_catalog::replace_file(&target, doc.to_string().as_bytes())?;
-    match GatewayConfig::load_from(&target) {
-        Ok(loaded) => Ok(loaded),
-        Err(e) => {
-            crate::model_catalog::replace_file(&target, raw.as_bytes())
-                .with_context(|| format!("putting {} back as it was", target.display()))?;
-            Err(e.context(
-                "config.toml has changes the gateway could not load; fix the file, then retry",
-            ))
-        }
-    }
+    let written = doc.to_string();
+    let loaded = GatewayConfig::from_toml(&written)
+        .context("config.toml has changes the gateway could not load; fix the file, then retry")?;
+    crate::model_catalog::replace_file(&target, written.as_bytes())?;
+    Ok(loaded)
 }
 
 /// Set `[workspace] browse` in the config file at `path`, keeping the rest
@@ -902,8 +899,12 @@ impl GatewayConfig {
     /// watcher (spec §8.4). Errors propagate so the watcher can roll back to
     /// the last known good snapshot.
     pub fn load_from(path: &std::path::Path) -> anyhow::Result<Self> {
-        let raw = std::fs::read_to_string(path)?;
-        let mut parsed: Self = toml::from_str(&raw)?;
+        Self::from_toml(&std::fs::read_to_string(path)?)
+    }
+
+    /// The config `raw` holds, checked as [`Self::load_from`] checks a file.
+    pub fn from_toml(raw: &str) -> anyhow::Result<Self> {
+        let mut parsed: Self = toml::from_str(raw)?;
         parsed.validate_channel_ids()?;
         parsed.warn_channel_texts();
         parsed.validate_llm()?;
@@ -1604,15 +1605,14 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(text.contains("dm_policy = \"open\" # only us"), "{text}");
 
-        // A file the gateway could not load is put back as it was.
-        let broken = "[[channels.telegram.accounts]]\nid = \"bot\"\nadapter_token_ref = \"secret:channel:telegram:bot\"\n[[bindings]]\nagent_id = \"a\"\nchannel = \"slack\"\naccount_id = \"nope\"\n";
+        // A file the gateway could not load is left as it is.
+        let broken = "[llm]\nmax_tokens_ceiling = 0\n[[channels.telegram.accounts]]\nid = \"bot\"\nadapter_token_ref = \"secret:channel:telegram:bot\"\n";
         std::fs::write(&path, broken).expect("write");
-        if GatewayConfig::load_from(&path).is_err() {
-            assert!(
-                write_account_policy(&path, "telegram", "bot", Some(DmPolicy::Open), None).is_err()
-            );
-            assert_eq!(std::fs::read_to_string(&path).expect("read"), broken);
-        }
+        assert!(GatewayConfig::load_from(&path).is_err());
+        assert!(
+            write_account_policy(&path, "telegram", "bot", Some(DmPolicy::Open), None).is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), broken);
     }
 
     #[test]
@@ -1651,11 +1651,14 @@ mod tests {
         assert_eq!(merged.len(), 3, "none added or dropped");
         assert_eq!(merged[0].group_policy, GroupPolicy::Open);
         assert_eq!(merged[0].allow_from, vec!["tg:1".to_string()]);
-        assert_eq!(merged[1].adapter_token_ref, "secret:b");
+        assert_eq!(
+            merged[1].adapter_token_ref, "secret:b",
+            "the session's token stays"
+        );
         assert_eq!(
             merged[1].dm_policy,
-            DmPolicy::Allowlist,
-            "another token waits whole"
+            DmPolicy::Open,
+            "who may reach it does not wait"
         );
         assert_eq!(merged[2].id, "c");
         assert_eq!(waiting, vec!["telegram/b", "telegram/c", "telegram/d"]);
