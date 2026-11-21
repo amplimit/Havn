@@ -158,7 +158,7 @@ function Settings({ id }: { id: string }) {
       if (heartbeatTo !== "last") heartbeat.deliver = heartbeatTo;
       if (Object.keys(heartbeat).length > 0) {
         config.heartbeat = heartbeat;
-      } else if (!heartbeatMin.trim()) {
+      } else if (!heartbeatMin.trim() || typeof savedHeartbeat.deliver === "string") {
         config.heartbeat = null;
       }
       const updated = await api.agents.patch(id, {
