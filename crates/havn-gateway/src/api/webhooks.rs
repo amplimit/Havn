@@ -370,13 +370,14 @@ pub async fn call(
     let Some(hook) = webhooks::find(&state.db, id).await? else {
         return Err(refused());
     };
+    if !holds_secret(&hook.secret, &headers, &body) {
+        return Err(refused());
+    }
+    // After the secret, so a restart does not tell which ids are there.
     if state.supervisor.shutting_down() {
         return Err(ApiError::Unavailable(
             "the gateway is restarting; call again once it is back".into(),
         ));
-    }
-    if !holds_secret(&hook.secret, &headers, &body) {
-        return Err(refused());
     }
     if body.len() > MAX_BODY_BYTES {
         return Err(ApiError::BadRequest(format!(

@@ -868,7 +868,8 @@ pub async fn around(
                           c.created_at FROM conversations c JOIN chats h ON h.id = c.channel_id";
     let found: Option<ChatTurnRow> = sqlx::query_as(&format!(
         "{SELECT} WHERE c.id = ?1 AND (h.scope = ?2 OR (?3 AND h.scope IN \
-             (SELECT scope FROM owner_scopes)))"
+             (SELECT scope FROM owner_scopes))) \
+             AND h.id NOT IN (SELECT chat_id FROM webhook_chats)"
     ))
     .bind(turn)
     .bind(scope)
@@ -955,7 +956,8 @@ pub async fn chats_titled(
                    AND t.parent_id IS NULL AND t.role = 'user' \
                  ORDER BY t.created_at, t.rowid LIMIT 1) AS first_turn \
          FROM chats c \
-         WHERE (c.scope = ? OR (? AND c.scope IN (SELECT scope FROM owner_scopes)))",
+         WHERE (c.scope = ? OR (? AND c.scope IN (SELECT scope FROM owner_scopes))) \
+         AND c.id NOT IN (SELECT chat_id FROM webhook_chats)",
     );
     for _ in &terms {
         sql.push_str(" AND c.title LIKE ? ESCAPE '\\'");
