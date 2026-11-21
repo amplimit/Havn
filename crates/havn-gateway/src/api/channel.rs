@@ -1359,6 +1359,9 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
     };
     // Whether the owner writes, through a linked account (issue #221).
     let from_owner = owner_linked(state, channel, agent_id, &inb.sender_id).await;
+    // Whether the message itself said nothing: a file lost with it is told,
+    // whatever label a group's gets.
+    let said_nothing = matches!(&content, MessageContent::Text { text } if text.trim().is_empty());
     // In a group, the message says who wrote it, after what was said
     // there since the bot was last addressed; a choice made too. What is
     // not text is said as text, so it is named too.
@@ -1523,8 +1526,7 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
     let mut msg = msg;
     if !new_chat && msg.branch.is_none() && !named.is_empty() {
         msg.attachments = take_received(agent_id, channel, &inb.account_id, &inb.sender_id, &named);
-        let empty = matches!(&msg.content, MessageContent::Text { text } if text.trim().is_empty());
-        if msg.attachments.is_empty() && empty {
+        if msg.attachments.is_empty() && said_nothing {
             tell_sender(
                 state,
                 channel,
@@ -1897,9 +1899,10 @@ fn in_group(
             line.to_string()
         }
     };
-    let text = text
-        .replace("\r\n", "\n")
-        .replace(['\r', '\u{85}', '\u{2028}', '\u{2029}'], "\n");
+    let text = text.replace("\r\n", "\n").replace(
+        ['\r', '\u{0B}', '\u{0C}', '\u{85}', '\u{2028}', '\u{2029}'],
+        "\n",
+    );
     let mut out = String::new();
     if !earlier.is_empty() {
         out.push_str(
@@ -3164,6 +3167,14 @@ pub async fn channel_sender_remove(
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
     reaching_account(&state, &agent.id, &req.channel, &req.account_id)?;
     let removed = if req.group {
+        // Written again when it next writes, while the account is open.
+        if let Ok(mut known) = OPEN_GROUPS.lock() {
+            known.remove(&channel_id_codec::encode(
+                &req.channel,
+                &req.account_id,
+                &req.sender_id,
+            ));
+        }
         channel_access::revoke_group(&state.db, &req.channel, &req.account_id, &req.sender_id)
             .await
             .map_err(|e| crate::api::ApiError::Internal(e.to_string()))?

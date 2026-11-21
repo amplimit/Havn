@@ -839,6 +839,19 @@ async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
             .into();
     };
     if group {
+        let off = state
+            .channels
+            .get(channel)
+            .and_then(|entry| entry.accounts.iter().find(|a| a.id == account_id))
+            .is_none_or(|a| a.group_policy == crate::config::GroupPolicy::Off);
+        if off {
+            return language
+                .pick(
+                    "(Groups are off for this bot: set group_policy for its account in the gateway's config.toml first.)",
+                    "（这个机器人没有开启群聊：请先在网关的 config.toml 里给它的账号设置 group_policy。）",
+                )
+                .into();
+        }
         return match crate::api::channel::admit_group_of(
             state, &agent, channel, account_id, sender, &asker.who,
         )
@@ -909,7 +922,7 @@ async fn decide(state: &AppState, asker: &Asker, approve: bool, args: &str) -> S
         None if asker.group => {
             return language
                 .pick(
-                    "(In a group, name the step: /approve <id> or /deny <id>, as your own chat                      with the bot shows it.)",
+                    "(In a group, name the step: /approve <id> or /deny <id>, as your own chat with the bot shows it.)",
                     "（在群里请写明步骤：/approve <id> 或 /deny <id>，id 见你和机器人的私聊。）",
                 )
                 .into();
