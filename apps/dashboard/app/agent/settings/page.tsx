@@ -683,7 +683,7 @@ function BotAccess({ agentId }: { agentId: string }) {
           {error}
         </p>
       )}
-      {view && view.accounts.some((a) => a.dm_policy === "allowlist" || a.group_policy === "allowlist") && (
+      {view && view.accounts.some((a) => a.dm_policy === "allowlist" || a.group_policy !== "open") && (
         <label className="mb-4 flex items-center gap-2 text-sm">
           <input
             type="checkbox"
@@ -745,7 +745,8 @@ function BotAccess({ agentId }: { agentId: string }) {
                       <button
                         type="button"
                         className="btn-ghost"
-                        disabled={busy}
+                        disabled={busy || (r.group && account.group_policy === "off")}
+                        title={r.group && account.group_policy === "off" ? "turn groups on first" : undefined}
                         onClick={() => void run(() => api.channels.allow(agentId, who(r.sender_id, r.group)))}
                       >
                         let in
@@ -842,13 +843,11 @@ function BotAccess({ agentId }: { agentId: string }) {
                   style={{ maxWidth: 200 }}
                   value={account.dm_policy}
                   disabled={busy || !view?.editable}
-                  onChange={(e) =>
-                    void run(() =>
-                      api.channels.policy(agentId, account, {
-                        dm_policy: e.target.value as AccountAccess["dm_policy"],
-                      }),
-                    )
-                  }
+                  onChange={(e) => {
+                    const next = e.target.value as AccountAccess["dm_policy"];
+                    if (next === "open" && !window.confirm("Let anyone on the platform write to this bot?")) return;
+                    void run(() => api.channels.policy(agentId, account, { dm_policy: next }));
+                  }}
                 >
                   <option value="allowlist">those let in</option>
                   <option value="open">anyone</option>
@@ -861,13 +860,11 @@ function BotAccess({ agentId }: { agentId: string }) {
                   style={{ maxWidth: 220 }}
                   value={account.group_policy}
                   disabled={busy || !view?.editable}
-                  onChange={(e) =>
-                    void run(() =>
-                      api.channels.policy(agentId, account, {
-                        group_policy: e.target.value as AccountAccess["group_policy"],
-                      }),
-                    )
-                  }
+                  onChange={(e) => {
+                    const next = e.target.value as AccountAccess["group_policy"];
+                    if (next === "open" && !window.confirm("Let every group this bot is added to use it?")) return;
+                    void run(() => api.channels.policy(agentId, account, { group_policy: next }));
+                  }}
                 >
                   <option value="off">off</option>
                   <option value="allowlist">those let in</option>

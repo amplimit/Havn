@@ -265,21 +265,18 @@ impl ReloadHandles {
                     "hot-reloaded the transcription of audio"
                 );
             } else if path.starts_with("channels") {
-                let before = self.channels.load_full();
-                let moved = new.channels.iter().any(|(name, entry)| {
-                    entry.accounts.iter().any(|account| {
-                        before
-                            .get(name)
-                            .and_then(|e| e.accounts.iter().find(|a| a.id == account.id))
-                            .is_none_or(|a| a.adapter_token_ref != account.adapter_token_ref)
-                    })
+                let mut waiting = Vec::new();
+                self.channels.rcu(|running| {
+                    let (merged, left) = crate::config::with_policies_of(running, &new.channels);
+                    waiting = left;
+                    Arc::new(merged)
                 });
-                self.channels.store(Arc::new(new.channels.clone()));
-                info!("hot-reloaded the channel accounts");
-                if moved {
+                info!("hot-reloaded who may reach the channel accounts");
+                if !waiting.is_empty() {
                     warn!(
-                        "a channel account was added or its adapter_token_ref changed: its adapter \
-                         connects with it when it next connects (restart it to do so now)"
+                        accounts = ?waiting,
+                        "channel accounts were added, dropped or given another adapter_token_ref; \
+                         run `havn gateway restart` to apply that"
                     );
                 }
             } else if path.starts_with("attachments") {

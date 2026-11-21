@@ -752,6 +752,25 @@ async fn record(
     Ok(due && recent < REFUSAL_NOTICES_PER_HOUR)
 }
 
+/// Let the owner be told again of the groups turned away on `(channel,
+/// account_id)`: they were told while groups were off there, and now they
+/// are on (issue #273).
+pub async fn forget_group_notices(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE channel_refusals SET notified_at = NULL \
+         WHERE channel = ?1 AND account_id = ?2 AND is_group = 1",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Note that the owner was told about `sender_id` at `now`.
 pub async fn refusal_told(
     pool: &SqlitePool,

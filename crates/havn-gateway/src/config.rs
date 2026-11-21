@@ -470,16 +470,74 @@ impl Default for AttachmentLimits {
     }
 }
 
+/// `running`'s accounts with who may reach each taken from `new` (issue
+/// #273): `dm_policy`, `allow_from`, `group_policy`, `allow_groups`,
+/// `admins` and `bot_username`, which apply to the next message. The
+/// accounts themselves stay as they run: those `new` adds or drops, or
+/// gives another `adapter_token_ref`, are named in the second part, as
+/// they wait for a restart (an adapter's session was let in by its token).
+#[must_use]
+pub fn with_policies_of(
+    running: &std::collections::BTreeMap<String, ChannelEntry>,
+    new: &std::collections::BTreeMap<String, ChannelEntry>,
+) -> (
+    std::collections::BTreeMap<String, ChannelEntry>,
+    Vec<String>,
+) {
+    let mut merged = running.clone();
+    let mut waiting = Vec::new();
+    for (channel, entry) in &mut merged {
+        for account in &mut entry.accounts {
+            let found = new
+                .get(channel)
+                .and_then(|e| e.accounts.iter().find(|a| a.id == account.id));
+            match found {
+                Some(next) if next.adapter_token_ref == account.adapter_token_ref => {
+                    account.dm_policy = next.dm_policy;
+                    account.allow_from.clone_from(&next.allow_from);
+                    account.group_policy = next.group_policy;
+                    account.allow_groups.clone_from(&next.allow_groups);
+                    account.admins.clone_from(&next.admins);
+                    account.bot_username.clone_from(&next.bot_username);
+                }
+                _ => waiting.push(format!("{channel}/{}", account.id)),
+            }
+        }
+    }
+    for (channel, entry) in new {
+        for account in &entry.accounts {
+            let running_it = running
+                .get(channel)
+                .is_some_and(|e| e.accounts.iter().any(|a| a.id == account.id));
+            if !running_it {
+                waiting.push(format!("{channel}/{}", account.id));
+            }
+        }
+    }
+    (merged, waiting)
+}
+
+/// Set `key` of `table` to `text`, keeping what was written around the
+/// old value (a comment after it).
+fn set_kept(table: &mut toml_edit::Table, key: &str, text: &str) {
+    let mut value = toml_edit::Value::from(text);
+    if let Some(old) = table.get(key).and_then(toml_edit::Item::as_value) {
+        *value.decor_mut() = old.decor().clone();
+    }
+    table[key] = toml_edit::Item::Value(value);
+}
+
 /// Set the policies given of the account `account_id` of `channel` in the
 /// config file at `path` (issue #273), keeping the rest of the file as it
-/// is: `dm_policy` for private chats, `group_policy` for groups.
+/// is: `dm_policy` for private chats, `group_policy` for groups. The file
+/// as written must load, else it is put back as it was: what loaded.
 pub fn write_account_policy(
     path: &std::path::Path,
     channel: &str,
     account_id: &str,
     dm_policy: Option<DmPolicy>,
     group_policy: Option<GroupPolicy>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<GatewayConfig> {
     use anyhow::Context as _;
     let target =
         std::fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?;
@@ -509,12 +567,22 @@ pub fn write_account_policy(
             )
         })?;
     if let Some(policy) = dm_policy {
-        account["dm_policy"] = toml_edit::value(policy.name());
+        set_kept(account, "dm_policy", policy.name());
     }
     if let Some(policy) = group_policy {
-        account["group_policy"] = toml_edit::value(policy.name());
+        set_kept(account, "group_policy", policy.name());
     }
-    crate::model_catalog::replace_file(&target, doc.to_string().as_bytes())
+    crate::model_catalog::replace_file(&target, doc.to_string().as_bytes())?;
+    match GatewayConfig::load_from(&target) {
+        Ok(loaded) => Ok(loaded),
+        Err(e) => {
+            crate::model_catalog::replace_file(&target, raw.as_bytes())
+                .with_context(|| format!("putting {} back as it was", target.display()))?;
+            Err(e.context(
+                "config.toml has changes the gateway could not load; fix the file, then retry",
+            ))
+        }
+    }
 }
 
 /// Set `[workspace] browse` in the config file at `path`, keeping the rest
@@ -1525,5 +1593,71 @@ mod tests {
             write_account_policy(&path, "telegram", "gone", Some(DmPolicy::Open), None).is_err()
         );
         assert!(write_account_policy(&path, "slack", "bot", Some(DmPolicy::Open), None).is_err());
+
+        // A comment after a value stays with it.
+        std::fs::write(
+            &path,
+            "[[channels.telegram.accounts]]\nid = \"bot\"\nadapter_token_ref = \"secret:channel:telegram:bot\"\ndm_policy = \"allowlist\" # only us\n",
+        )
+        .expect("write");
+        write_account_policy(&path, "telegram", "bot", Some(DmPolicy::Open), None).expect("dm");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("dm_policy = \"open\" # only us"), "{text}");
+
+        // A file the gateway could not load is put back as it was.
+        let broken = "[[channels.telegram.accounts]]\nid = \"bot\"\nadapter_token_ref = \"secret:channel:telegram:bot\"\n[[bindings]]\nagent_id = \"a\"\nchannel = \"slack\"\naccount_id = \"nope\"\n";
+        std::fs::write(&path, broken).expect("write");
+        if GatewayConfig::load_from(&path).is_err() {
+            assert!(
+                write_account_policy(&path, "telegram", "bot", Some(DmPolicy::Open), None).is_err()
+            );
+            assert_eq!(std::fs::read_to_string(&path).expect("read"), broken);
+        }
+    }
+
+    #[test]
+    fn a_reload_takes_who_may_reach_an_account_and_leaves_the_accounts_as_they_run() {
+        let account = |id: &str, token: &str| ChannelAccount {
+            id: id.into(),
+            adapter_token_ref: token.into(),
+            dm_policy: DmPolicy::Allowlist,
+            allow_from: Vec::new(),
+            admins: Vec::new(),
+            bot_username: None,
+            group_policy: GroupPolicy::Off,
+            allow_groups: Vec::new(),
+        };
+        let mut running = std::collections::BTreeMap::new();
+        running.insert(
+            "telegram".to_string(),
+            ChannelEntry {
+                accounts: vec![
+                    account("a", "secret:a"),
+                    account("b", "secret:b"),
+                    account("c", "secret:c"),
+                ],
+            },
+        );
+        let mut new = running.clone();
+        let accounts = &mut new.get_mut("telegram").expect("telegram").accounts;
+        accounts[0].group_policy = GroupPolicy::Open;
+        accounts[0].allow_from = vec!["tg:1".into()];
+        accounts[1].adapter_token_ref = "secret:b2".into();
+        accounts[1].dm_policy = DmPolicy::Open;
+        accounts.remove(2);
+        accounts.push(account("d", "secret:d"));
+        let (merged, waiting) = with_policies_of(&running, &new);
+        let merged = &merged["telegram"].accounts;
+        assert_eq!(merged.len(), 3, "none added or dropped");
+        assert_eq!(merged[0].group_policy, GroupPolicy::Open);
+        assert_eq!(merged[0].allow_from, vec!["tg:1".to_string()]);
+        assert_eq!(merged[1].adapter_token_ref, "secret:b");
+        assert_eq!(
+            merged[1].dm_policy,
+            DmPolicy::Allowlist,
+            "another token waits whole"
+        );
+        assert_eq!(merged[2].id, "c");
+        assert_eq!(waiting, vec!["telegram/b", "telegram/c", "telegram/d"]);
     }
 }

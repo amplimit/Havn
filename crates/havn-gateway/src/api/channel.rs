@@ -2263,11 +2263,11 @@ async fn tell_owner(
             let title = as_plain(title);
             language.pick(
                 format!(
-                    "The group \"{title}\" ({about}) wrote to this bot, but groups are off for it, so {} did not get this: {said}. Turn groups on for the bot on the agent's settings page, under who can reach the bot, then let the group in.",
+                    "The group \"{title}\" ({about}) wrote to this bot, but groups are off for it, so {} did not get this: {said}. Turn groups on for the bot on the agent's settings page, under who can reach the bot, then let the group in there or with /allow group {about}.",
                     agent.name
                 ),
                 format!(
-                    "群「{title}」（{about}）给这个机器人发了消息，但它没有开启群聊，所以 {} 没有收到：{said}。可以在 agent 设置页的“谁能联系机器人”里开启群聊，再放行这个群。",
+                    "群「{title}」（{about}）给这个机器人发了消息，但它没有开启群聊，所以 {} 没有收到：{said}。可以在 agent 设置页的“谁能联系机器人”里开启群聊，再在那里或用 /allow group {about} 放行这个群。",
                     agent.name
                 ),
             )
@@ -3218,6 +3218,13 @@ pub async fn channel_sender_allow(
         return Err(crate::api::ApiError::BadRequest("not a sender id".into()));
     }
     if req.group {
+        let off = reaching_account(&state, &agent.id, &req.channel, &req.account_id)?.group_policy
+            == crate::config::GroupPolicy::Off;
+        if off {
+            return Err(crate::api::ApiError::Conflict(
+                "groups are off for this bot; turn them on first".into(),
+            ));
+        }
         admit_group_of(
             &state,
             &agent,
@@ -3274,53 +3281,72 @@ pub async fn channel_policy_set(
             "give dm_policy, group_policy or both".into(),
         ));
     }
-    set_policy(&state, &req).await?;
-    crate::audit::record(
-        &state.db,
-        user.id,
-        agent.team_id,
-        Some(agent.id),
-        "channel_account.policy.changed",
-        serde_json::json!({
-            "channel": req.channel,
-            "account_id": req.account_id,
-            "dm_policy": req.dm_policy.map(crate::config::DmPolicy::name),
-            "group_policy": req.group_policy.map(crate::config::GroupPolicy::name),
-        }),
-    )
-    .await;
+    if let Some((was_dm, was_groups)) = set_policy(&state, &req).await? {
+        crate::audit::record(
+            &state.db,
+            user.id,
+            agent.team_id,
+            Some(agent.id),
+            "channel_account.policy.changed",
+            serde_json::json!({
+                "channel": req.channel,
+                "account_id": req.account_id,
+                "dm_policy": req.dm_policy.map(crate::config::DmPolicy::name),
+                "group_policy": req.group_policy.map(crate::config::GroupPolicy::name),
+                "was": {
+                    "dm_policy": was_dm.name(),
+                    "group_policy": was_groups.name(),
+                },
+            }),
+        )
+        .await;
+    }
     Ok(axum::Json(channel_access_view(&state, &agent).await?))
 }
 
-/// Write `change` to config.toml and apply it, without waiting for the
-/// file to be read again.
-async fn set_policy(state: &AppState, change: &PolicyChange) -> Result<(), crate::api::ApiError> {
+/// Write `change` to config.toml and apply what loads from it, without
+/// waiting for the file to be read again. The policies it had, or `None`
+/// when it changes nothing. A file that does not hold the account as a
+/// `[[channels.<channel>.accounts]]` table, or that the gateway could not
+/// load, is a conflict, and nothing changes.
+async fn set_policy(
+    state: &AppState,
+    change: &PolicyChange,
+) -> Result<Option<(crate::config::DmPolicy, crate::config::GroupPolicy)>, crate::api::ApiError> {
     let _writing = state.models_write.lock().await;
+    let was = state
+        .channels
+        .load_full()
+        .get(&change.channel)
+        .and_then(|entry| entry.accounts.iter().find(|a| a.id == change.account_id))
+        .map(|a| (a.dm_policy, a.group_policy))
+        .ok_or(crate::api::ApiError::NotFound)?;
+    if change.dm_policy.is_none_or(|p| p == was.0) && change.group_policy.is_none_or(|p| p == was.1)
+    {
+        return Ok(None);
+    }
     let path = state.config_path.clone();
     let (channel, account_id) = (change.channel.clone(), change.account_id.clone());
     let (dm_policy, group_policy) = (change.dm_policy, change.group_policy);
-    tokio::task::spawn_blocking(move || {
+    let loaded = tokio::task::spawn_blocking(move || {
         crate::config::write_account_policy(&path, &channel, &account_id, dm_policy, group_policy)
     })
     .await
     .map_err(|e| crate::api::ApiError::Internal(e.to_string()))?
-    .map_err(|e| crate::api::ApiError::Internal(format!("{e:#}")))?;
-    let mut channels = (*state.channels.load_full()).clone();
-    if let Some(account) = channels.get_mut(&change.channel).and_then(|entry| {
-        entry
-            .accounts
-            .iter_mut()
-            .find(|a| a.id == change.account_id)
-    }) {
-        if let Some(policy) = dm_policy {
-            account.dm_policy = policy;
-        }
-        if let Some(policy) = group_policy {
-            account.group_policy = policy;
-        }
+    .map_err(|e| crate::api::ApiError::Conflict(format!("{e:#}")))?;
+    state.channels.rcu(|running| {
+        std::sync::Arc::new(crate::config::with_policies_of(running, &loaded.channels).0)
+    });
+    // Groups turned away while groups were off may be told of again.
+    if was.1 == crate::config::GroupPolicy::Off
+        && group_policy.is_some_and(|p| p != crate::config::GroupPolicy::Off)
+        && let Err(e) =
+            channel_access::forget_group_notices(&state.db, &change.channel, &change.account_id)
+                .await
+    {
+        warn!(error = %e, "could not let the owner be told again of groups turned away");
     }
-    state.channels.store(std::sync::Arc::new(channels));
-    Ok(())
+    Ok(Some(was))
 }
 
 /// `DELETE /agents/{id}/channel-access/senders`: take back a sender's
@@ -4553,6 +4579,25 @@ mod tests {
             assert!(
                 text.contains("# kept") && text.contains("group_policy = \"open\""),
                 "{text}"
+            );
+
+            // The same again changes nothing, and writes nothing.
+            std::fs::write(&path, "# hand edit\n").expect("touch");
+            let again = set_policy(
+                &f.state,
+                &PolicyChange {
+                    channel: "telegram".into(),
+                    account_id: "bot".into(),
+                    dm_policy: Some(DmPolicy::Allowlist),
+                    group_policy: Some(GroupPolicy::Open),
+                },
+            )
+            .await
+            .expect("same");
+            assert!(again.is_none());
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read"),
+                "# hand edit\n"
             );
 
             // An account config.toml does not list is refused, and nothing changes.

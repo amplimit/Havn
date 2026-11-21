@@ -114,9 +114,9 @@ struct AppState {
     /// Channel-adapter accounts keyed by channel id (spec §3.4). Source
     /// of truth for "which (channel, account) pairs are allowed to open
     /// a `/api/v1/channel` WS"; the WS handler rejects connections for
-    /// pairs not declared here. A snapshot taken at startup — edits are
-    /// restart-class (spec §8.4 / §3.5): the config watcher logs that a
-    /// `[[channels]]` change needs `havn gateway restart`.
+    /// pairs not declared here. Who may reach each account is reloaded
+    /// live (issue #273); adding, dropping an account or changing its
+    /// `adapter_token_ref` waits for `havn gateway restart`.
     pub channels: std::sync::Arc<
         arc_swap::ArcSwap<std::collections::BTreeMap<String, crate::config::ChannelEntry>>,
     >,
