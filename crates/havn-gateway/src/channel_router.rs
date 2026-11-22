@@ -573,8 +573,17 @@ async fn group_permitted(
         crate::config::GroupPolicy::Allowlist => false,
         crate::config::GroupPolicy::Open => true,
     };
-    // A thread or a group in a space (issue #285) may be sent to while
-    // what it is part of may use the bot.
+    // A space (a server, issue #285) is not a place to send to.
+    match havn_db::repo::channel_access::is_space(db, channel, account_id, recipient).await {
+        Ok(false) => {}
+        Ok(true) => return Err(OutboundRefusal::RecipientNotAllowed),
+        Err(e) => {
+            warn!(error = %e, "group kind lookup failed");
+            return Err(OutboundRefusal::RecipientNotAllowed);
+        }
+    }
+    // A thread or a group in a space may be sent to while what it is part
+    // of may use the bot.
     let parents =
         match havn_db::repo::channel_access::parents_of(db, channel, account_id, recipient).await {
             Ok(parents) => parents,

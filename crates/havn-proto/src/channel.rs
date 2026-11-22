@@ -133,7 +133,9 @@ pub struct ChannelGroup {
     pub space: Option<ChannelPlace>,
     /// A conversation within the group (issue #285), such as a thread in
     /// a Discord channel: it has its own chats, and replies go to it. It
-    /// may use the bot while its group may.
+    /// may use the bot while its group may. Its id names one conversation
+    /// of the account: unique across its groups, not only within one (a
+    /// message naming a thread kept under another group is dropped).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<ChannelPlace>,
 }

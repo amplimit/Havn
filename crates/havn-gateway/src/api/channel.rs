@@ -439,8 +439,7 @@ pub async fn upload(
                 .chain(q.space.as_deref())
                 .collect();
             for id in &ids {
-                channel_id_codec::validate_channel_id_part("group", id)
-                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+                place_id(id).map_err(|e| ApiError::BadRequest(e.to_string()))?;
             }
             group_may(&state, &q.channel, &q.account, &ids).await
         }
@@ -1099,12 +1098,11 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
             .chain(g.space.as_ref().map(|p| p.id.as_str()))
             .chain(g.thread.as_ref().map(|p| p.id.as_str()));
         for id in places {
-            if let Err(e) = channel_id_codec::validate_channel_id_part("group", id) {
-                warn!(channel, account = %inb.account_id, error = %e, "dropping inbound: group id violates the channel_id codec");
+            if let Err(e) = place_id(id) {
+                warn!(channel, account = %inb.account_id, error = %e, "dropping inbound: not a group id");
                 return;
             }
         }
-        note_parents(state, channel, &inb.account_id, g).await;
         state
             .channel_router
             .note_sees_all(
@@ -1113,7 +1111,17 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
                 g.sees_all,
             )
             .await;
+        // The server of a channel that addresses the bot is kept before it
+        // is let in, so letting the server in finds the channel turned away;
+        // its thread only once it is let in, so a server not let in adds
+        // a row for each channel, not for each mention.
+        if g.addressed {
+            note_parents(state, channel, &inb.account_id, g, false).await;
+        }
         if !group_admitted(state, channel, agent_id, &inb, g).await {
+            return;
+        }
+        if !note_parents(state, channel, &inb.account_id, g, true).await {
             return;
         }
         if !g.addressed {
@@ -1431,7 +1439,12 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
                 } => format!("«a file: {filename}» {}", caption.unwrap_or_default()),
                 _ => String::new(),
             };
-            let earlier = earlier_in(channel, &inb.account_id, conversation_of(g));
+            // What was said in the channel, and then in the thread.
+            let mut earlier = Vec::new();
+            if g.thread.is_some() {
+                earlier = earlier_in(channel, &inb.account_id, &g.id);
+            }
+            earlier.extend(earlier_in(channel, &inb.account_id, conversation_of(g)));
             MessageContent::Text {
                 text: in_group(g, &inb.sender_id, from_owner, &earlier, &said),
             }
@@ -1824,19 +1837,18 @@ const GROUP_CONTEXT_CHARS: usize = 500;
 /// Groups kept at once; past it, the one quiet longest is dropped.
 const GROUP_CONTEXT_GROUPS: usize = 200;
 
-/// How a group member is named to the agent: their name as a JSON
-/// string, and their id.
 /// The conversation a group's message is in (issue #285): its thread, or
 /// the group.
 fn conversation_of(g: &havn_proto::channel::ChannelGroup) -> &str {
     g.thread.as_ref().map_or(g.id.as_str(), |t| t.id.as_str())
 }
 
-/// The groups whose being let in lets `g`'s message in: the group, and
-/// the space it is part of (issue #285).
+/// The groups whose being let in lets `g`'s message in: the group, the
+/// space it is part of, and its thread (issue #285).
 fn letting_in(g: &havn_proto::channel::ChannelGroup) -> Vec<&str> {
     std::iter::once(g.id.as_str())
         .chain(g.space.as_ref().map(|p| p.id.as_str()))
+        .chain(g.thread.as_ref().map(|p| p.id.as_str()))
         .collect()
 }
 
@@ -1862,23 +1874,43 @@ static KNOWN_PARENTS: std::sync::LazyLock<std::sync::Mutex<std::collections::Has
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
 /// Keep what `g`'s group and thread are part of (issue #285), so the agent
-/// can send to them later while one of these may use the bot.
+/// can send to them later while one of these may use the bot; the thread
+/// only `with_thread`. Whether the message goes on: a thread kept as part
+/// of another channel does not, as a thread id names one conversation of
+/// the account.
 async fn note_parents(
     state: &AppState,
     channel: &str,
     account_id: &str,
     g: &havn_proto::channel::ChannelGroup,
-) {
-    let space = g
-        .space
-        .as_ref()
-        .map(|p| (p.id.as_str(), p.title.as_deref().unwrap_or_default()));
-    let group = (g.id.as_str(), g.title.as_deref().unwrap_or_default());
-    let mut links: Vec<(&str, Vec<(&str, &str)>)> = Vec::new();
+    with_thread: bool,
+) -> bool {
+    use channel_access::{PARENT_GROUP, PARENT_SPACE, Parent};
+    let cut = |title: Option<&str>| -> String {
+        title
+            .unwrap_or_default()
+            .trim()
+            .chars()
+            .take(channel_access::REFUSAL_SAID_CHARS)
+            .collect()
+    };
+    let space_title = cut(g.space.as_ref().and_then(|p| p.title.as_deref()));
+    let group_title = cut(g.title.as_deref());
+    let space = g.space.as_ref().map(|p| Parent {
+        id: &p.id,
+        kind: PARENT_SPACE,
+        title: &space_title,
+    });
+    let group = Parent {
+        id: &g.id,
+        kind: PARENT_GROUP,
+        title: &group_title,
+    };
+    let mut links: Vec<(&str, Vec<Parent<'_>>)> = Vec::new();
     if let Some(space) = space {
         links.push((g.id.as_str(), vec![space]));
     }
-    if let Some(thread) = &g.thread {
+    if let Some(thread) = g.thread.as_ref().filter(|_| with_thread) {
         links.push((
             thread.id.as_str(),
             std::iter::once(group).chain(space).collect(),
@@ -1890,7 +1922,7 @@ async fn note_parents(
             channel_id_codec::encode(channel, account_id, child),
             parents
                 .iter()
-                .map(|(id, title)| format!("{id}={title}"))
+                .map(|p| format!("{}={}", p.id, p.title))
                 .collect::<Vec<_>>()
                 .join(",")
         );
@@ -1900,6 +1932,19 @@ async fn note_parents(
             .unwrap_or(false);
         if known {
             continue;
+        }
+        if child != g.id {
+            match channel_access::group_of(&state.db, channel, account_id, child).await {
+                Ok(Some(kept)) if kept != g.id => {
+                    warn!(channel, account = %account_id, thread = %child, "dropping inbound: the thread is kept as part of another channel");
+                    return false;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(channel, error = %e, "could not look up a thread's channel; dropping");
+                    return false;
+                }
+            }
         }
         match channel_access::note_parents(&state.db, channel, account_id, child, &parents).await {
             Ok(_) => {
@@ -1913,6 +1958,7 @@ async fn note_parents(
             Err(e) => warn!(channel, error = %e, "could not keep what a group is part of"),
         }
     }
+    true
 }
 
 /// Whether one of `ids` is let in to use `(channel, account_id)`: in the
@@ -1938,6 +1984,21 @@ async fn any_allowed(
     Ok(false)
 }
 
+/// The longest id of a group, its space or its thread.
+const MAX_PLACE_ID_BYTES: usize = 256;
+
+/// Whether `id` may name a group, a space or a thread: a channel id part,
+/// on one line, without spaces (it is typed in `/allow group`), short.
+fn place_id(id: &str) -> anyhow::Result<()> {
+    channel_id_codec::validate_channel_id_part("group", id).map_err(anyhow::Error::msg)?;
+    if id.len() > MAX_PLACE_ID_BYTES || id.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        anyhow::bail!("a group id is at most {MAX_PLACE_ID_BYTES} bytes, without spaces");
+    }
+    Ok(())
+}
+
+/// How a group member is named to the agent: their name as a JSON
+/// string, and their id.
 fn member(g: &havn_proto::channel::ChannelGroup, sender_id: &str) -> String {
     format!(
         "{} ({sender_id})",
@@ -2200,11 +2261,12 @@ async fn group_refused(
     warn!(channel, account = %inb.account_id, group = %g.id, "group_policy: not forwarding a message from a group not let in");
     {
         let language = crate::commands::language_of(state, agent_id).await;
+        // Where the message was written: its thread, or the group.
         tell_sender(
             state,
             channel,
             &inb.account_id,
-            &g.id,
+            conversation_of(g),
             &inb.channel_message_id,
             if off {
                 language.pick(
@@ -2408,7 +2470,11 @@ async fn tell_owner(
         }
         Some(title) => {
             let title = match space.and_then(|p| p.title.as_deref()) {
-                Some(space) => format!("{} / {}", as_plain(space), as_plain(title)),
+                Some(space) => format!(
+                    "{} / {}",
+                    as_plain(&shown_name(space)),
+                    as_plain(&shown_name(title))
+                ),
                 None => as_plain(title),
             };
             language.pick(
@@ -2495,9 +2561,9 @@ pub(crate) async fn admit_group_of(
     group_id: &str,
     from: &str,
 ) -> Result<bool, havn_db::DbError> {
-    // A space (issue #285) is named by the groups in it.
+    // A space (issue #285) is named by the groups in it, and is told
+    // nothing: its channels that were turned away are, as it lets them in.
     let title = channel_access::parent_title(&state.db, channel, account_id, group_id).await?;
-    let refused = channel_access::forget_refusal(&state.db, channel, account_id, group_id).await?;
     let new = channel_access::admit_group(
         &state.db,
         channel,
@@ -2507,17 +2573,15 @@ pub(crate) async fn admit_group_of(
         channel_access::GROUP_BY_OWNER,
     )
     .await?;
-    // Where the welcome goes: the groups in it that were turned away (a
-    // space's, issue #285; their refusals forgotten, as it lets them in),
-    // and the group itself when it was, or when none of them was.
     let mut told = Vec::new();
-    for child in channel_access::children_of(&state.db, channel, account_id, group_id).await? {
-        if channel_access::forget_refusal(&state.db, channel, account_id, &child).await? {
-            told.push(child);
+    if channel_access::is_space(&state.db, channel, account_id, group_id).await? {
+        for group in channel_access::groups_in(&state.db, channel, account_id, group_id).await? {
+            if channel_access::forget_group_refusal(&state.db, channel, account_id, &group).await? {
+                told.push(group);
+            }
         }
-    }
-    if refused || told.is_empty() {
-        told.insert(0, group_id.to_string());
+    } else {
+        told.push(group_id.to_string());
     }
     let on = state
         .channels
@@ -2537,17 +2601,11 @@ pub(crate) async fn admit_group_of(
                 "account_id": account_id,
                 "group_id": group_id,
                 "from": from,
+                "told": told,
             }),
         )
         .await;
         let language = havn_core::Language::of_config(&agent.config);
-        let sees_all = state
-            .channel_router
-            .sees_all(
-                &crate::channel_router::AccountKey::new(channel, account_id),
-                group_id,
-            )
-            .await;
         // A mention is named only where it is known to reach the bot; a
         // reply and a command reach it in any case.
         let command = state
@@ -2557,7 +2615,7 @@ pub(crate) async fn admit_group_of(
             .and_then(|entry| entry.accounts.iter().find(|a| a.id == account_id))
             .and_then(|a| a.bot_username.as_deref())
             .map_or_else(|| "/help".to_string(), |bot| format!("/help@{bot}"));
-        let welcome = ChannelMessageContent::Text {
+        let welcome = |sees_all: Option<bool>| ChannelMessageContent::Text {
             text: if sees_all == Some(true) {
                 language
                     .pick(
@@ -2574,9 +2632,16 @@ pub(crate) async fn admit_group_of(
         };
         if on {
             for place in &told {
+                let sees_all = state
+                    .channel_router
+                    .sees_all(
+                        &crate::channel_router::AccountKey::new(channel, account_id),
+                        place,
+                    )
+                    .await;
                 if let Err(e) = state
                     .channel_router
-                    .deliver(channel, account_id, place, None, welcome.clone())
+                    .deliver(channel, account_id, place, None, welcome(sees_all))
                     .await
                 {
                     warn!(error = %e, "could not tell a group let in");
@@ -5090,18 +5155,22 @@ mod tests {
                 id: id.into(),
                 title: Some(title.into()),
             };
+            let in_place =
+                |space: (&str, &str), channel: (&str, &str), thread: (&str, &str), text: &str| {
+                    let mut inb = text_from("dc:ann", text);
+                    inb.group = Some(havn_proto::channel::ChannelGroup {
+                        id: channel.0.into(),
+                        title: Some(channel.1.into()),
+                        sender_name: Some("Ann".into()),
+                        addressed: true,
+                        sees_all: Some(true),
+                        space: Some(place(space.0, space.1)),
+                        thread: Some(place(thread.0, thread.1)),
+                    });
+                    inb
+                };
             let in_thread = |channel: (&str, &str), thread: (&str, &str), text: &str| {
-                let mut inb = text_from("dc:ann", text);
-                inb.group = Some(havn_proto::channel::ChannelGroup {
-                    id: channel.0.into(),
-                    title: Some(channel.1.into()),
-                    sender_name: Some("Ann".into()),
-                    addressed: true,
-                    sees_all: Some(true),
-                    space: Some(place("dc:s1", "Acme")),
-                    thread: Some(place(thread.0, thread.1)),
-                });
-                inb
+                in_place(("dc:s1", "Acme"), channel, thread, text)
             };
 
             // A server not let in: the channel is told, and the owner is
@@ -5124,7 +5193,11 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(told, ["dc:c1"], "the channel is told, not the server");
+            assert_eq!(
+                told,
+                ["dc:t1"],
+                "told where it was written, not in the server"
+            );
             let notice = notice.expect("the owner is told");
             let data: Vec<&str> = notice.buttons[0].iter().map(|b| b.data.as_str()).collect();
             assert_eq!(data, ["/allow group dc:s1", "/allow group dc:c1"]);
@@ -5210,6 +5283,7 @@ mod tests {
             assert!(may("dc:t2").await, "a thread of a server let in");
             assert!(may("dc:c2").await, "a channel of a server let in");
             assert!(!may("dc:t9").await, "a thread never seen");
+            assert!(!may("dc:s1").await, "a server is not a place to send to");
 
             // Only the channel let in: another channel of the server is not.
             channel_access::revoke_group(&f.state.db, "telegram", "bot", "dc:s1")
@@ -5233,6 +5307,70 @@ mod tests {
             assert_eq!(messages.len(), 1, "{messages:?}");
             assert!(may("dc:t4").await);
             assert!(!may("dc:t2").await, "its server is no longer let in");
+
+            // A thread kept under one channel and named under another is
+            // dropped, and so is an id with a space in it.
+            handle_inbound(
+                &f.state,
+                "telegram",
+                in_thread(("dc:c1", "general"), ("dc:t2", "bug"), "moved"),
+            )
+            .await;
+            handle_inbound(
+                &f.state,
+                "telegram",
+                in_thread(("dc:c 1", "general"), ("dc:t6", "x"), "spaced"),
+            )
+            .await;
+            assert!(f.messages().is_empty());
+
+            // A server listed in allow_groups lets its channels in.
+            f.groups(GroupPolicy::Allowlist, &["dc:s9"]);
+            handle_inbound(
+                &f.state,
+                "telegram",
+                in_place(
+                    ("dc:s9", "Nine"),
+                    ("dc:c9", "nine"),
+                    ("dc:t90", "x"),
+                    "listed",
+                ),
+            )
+            .await;
+            assert_eq!(f.messages().len(), 1);
+
+            // A server let in when none of its channels is waiting is told
+            // nothing: it is not a place to send to.
+            f.groups(GroupPolicy::Allowlist, &[]);
+            handle_inbound(
+                &f.state,
+                "telegram",
+                in_place(
+                    ("dc:s7", "Seven"),
+                    ("dc:c7", "seven"),
+                    ("dc:t70", "x"),
+                    "hi",
+                ),
+            )
+            .await;
+            f.replies();
+            channel_access::forget_group_refusal(&f.state.db, "telegram", "bot", "dc:c7")
+                .await
+                .expect("forget");
+            f.send("tg:owner", "/allow group dc:s7").await;
+            let replies = f.replies();
+            assert!(
+                replies
+                    .iter()
+                    .all(|(to, _)| to != "dc:s7" && to != "dc:c7" && to != "dc:t70"),
+                "{replies:?}"
+            );
+            assert!(
+                replies
+                    .iter()
+                    .any(|(to, t)| to == "tg:owner" && t.contains("can use this bot now")),
+                "{replies:?}"
+            );
         }
 
         #[tokio::test]
