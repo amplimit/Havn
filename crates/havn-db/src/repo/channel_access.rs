@@ -1099,6 +1099,28 @@ pub async fn groups_in(
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
+/// Whether `id` was kept as a server's channel (issue #285).
+pub async fn is_channel_of_space(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    id: &str,
+) -> Result<bool> {
+    let (found,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM channel_group_parents \
+         WHERE channel = ?1 AND account_id = ?2 AND child_id = ?3 AND parent_kind = 'space' \
+           AND NOT EXISTS (SELECT 1 FROM channel_group_parents t \
+                           WHERE t.channel = ?1 AND t.account_id = ?2 AND t.child_id = ?3 \
+                             AND t.parent_kind = 'group'))",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    Ok(found)
+}
+
 /// Whether `id` was kept as a server (issue #285).
 pub async fn is_space(
     pool: &SqlitePool,

@@ -1097,9 +1097,15 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
         let places = std::iter::once(g.id.as_str())
             .chain(g.space.as_ref().map(|p| p.id.as_str()))
             .chain(g.thread.as_ref().map(|p| p.id.as_str()));
+        let mut seen = std::collections::HashSet::new();
         for id in places {
             if let Err(e) = place_id(id) {
                 warn!(channel, account = %inb.account_id, error = %e, "dropping inbound: not a group id");
+                return;
+            }
+            // A group, its space and its thread are three places.
+            if !seen.insert(id) {
+                warn!(channel, account = %inb.account_id, "dropping inbound: a group named as its own space or thread");
                 return;
             }
         }
@@ -1933,17 +1939,38 @@ async fn note_parents(
         if known {
             continue;
         }
-        if child != g.id {
+        // A place is one kind of place: a thread is not a channel or a
+        // server kept before, nor a channel a thread, and a thread is part
+        // of one channel.
+        let clash = if child == g.id {
+            channel_access::group_of(&state.db, channel, account_id, child)
+                .await
+                .map(|kept| kept.is_some())
+        } else {
             match channel_access::group_of(&state.db, channel, account_id, child).await {
-                Ok(Some(kept)) if kept != g.id => {
-                    warn!(channel, account = %account_id, thread = %child, "dropping inbound: the thread is kept as part of another channel");
-                    return false;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(channel, error = %e, "could not look up a thread's channel; dropping");
-                    return false;
-                }
+                Ok(Some(kept)) => Ok(kept != g.id),
+                Ok(None) => match channel_access::is_space(&state.db, channel, account_id, child)
+                    .await
+                {
+                    Ok(true) => Ok(true),
+                    Ok(false) => {
+                        channel_access::is_channel_of_space(&state.db, channel, account_id, child)
+                            .await
+                    }
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            }
+        };
+        match clash {
+            Ok(false) => {}
+            Ok(true) => {
+                warn!(channel, account = %account_id, place = %child, "dropping inbound: a place named as another kind of place, or a thread of another channel");
+                return false;
+            }
+            Err(e) => {
+                warn!(channel, error = %e, "could not look up what a place is; dropping");
+                return false;
             }
         }
         match channel_access::note_parents(&state.db, channel, account_id, child, &parents).await {
@@ -5320,6 +5347,27 @@ mod tests {
                 &f.state,
                 "telegram",
                 in_thread(("dc:c 1", "general"), ("dc:t6", "x"), "spaced"),
+            )
+            .await;
+            assert!(f.messages().is_empty());
+
+            // A thread named with a channel's id, or a server's, is dropped.
+            handle_inbound(
+                &f.state,
+                "telegram",
+                in_thread(("dc:c1", "general"), ("dc:c2", "dev"), "a channel"),
+            )
+            .await;
+            handle_inbound(
+                &f.state,
+                "telegram",
+                in_thread(("dc:c1", "general"), ("dc:s1", "Acme"), "a server"),
+            )
+            .await;
+            handle_inbound(
+                &f.state,
+                "telegram",
+                in_thread(("dc:c1", "general"), ("dc:c1", "general"), "itself"),
             )
             .await;
             assert!(f.messages().is_empty());
