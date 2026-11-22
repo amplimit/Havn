@@ -2309,23 +2309,38 @@ async fn group_refused(
         } else {
             g.id.as_str()
         };
+        // A server's channel is called one (issue #293); the owner is told
+        // where to let it in.
+        let owner = owner_linked(state, channel, agent_id, &inb.sender_id).await;
+        let text = match (off, g.space.is_some(), owner) {
+            (true, _, _) => language.pick(
+                "This bot is not used in groups yet; its owner can turn groups on.",
+                "这个机器人还没开启群聊，需要机器人的所有者开启。",
+            ),
+            (false, true, false) => language.pick(
+                "This channel is not let in to use this bot yet; its owner can let it in.",
+                "这个频道还没被放行使用这个机器人，需要机器人的所有者放行。",
+            ),
+            (false, true, true) => language.pick(
+                "This channel is not let in to use this bot yet: let it in, or the whole server, from the notice in your private chat with the bot.",
+                "这个频道还没被放行使用这个机器人：可以在你和机器人的私聊里，从通知中放行这个频道或整个服务器。",
+            ),
+            (false, false, false) => language.pick(
+                "This group is not let in to use this bot yet; its owner can let it in.",
+                "这个群还没被放行使用这个机器人，需要机器人的所有者放行。",
+            ),
+            (false, false, true) => language.pick(
+                "This group is not let in to use this bot yet: let it in from the notice in your private chat with the bot.",
+                "这个群还没被放行使用这个机器人：可以在你和机器人的私聊里，从通知中放行它。",
+            ),
+        };
         tell_sender(
             state,
             channel,
             &inb.account_id,
             to,
             &inb.channel_message_id,
-            if off {
-                language.pick(
-                    "This bot is not used in groups yet; its owner can turn groups on.",
-                    "这个机器人还没开启群聊，需要机器人的所有者开启。",
-                )
-            } else {
-                language.pick(
-                    "This group is not let in to use this bot yet; its owner can let it in.",
-                    "这个群还没被放行使用这个机器人，需要机器人的所有者放行。",
-                )
-            },
+            text,
         )
         .await;
     }
@@ -2335,25 +2350,32 @@ async fn group_refused(
     };
     let said = format!("{}: {}", member(g, &inb.sender_id), without_codes(&said));
     let now = chrono::Utc::now();
+    // Its title with its server's, as "Server / channel", kept to name it
+    // when it is let in (issue #293).
+    let title = g.title.as_deref().map(shown_name).unwrap_or_default();
+    let title = match g.space.as_ref().and_then(|p| p.title.as_deref()) {
+        Some(space) => format!("{} / {title}", shown_name(space)),
+        None => title,
+    };
     match channel_access::record_group_refusal(
         &state.db,
         channel,
         &inb.account_id,
         &g.id,
+        &title,
         &said,
         now,
     )
     .await
     {
         Ok(true) => {
-            let title = g.title.as_deref().unwrap_or_default();
             tell_owner(
                 state,
                 channel,
                 &inb.account_id,
                 agent_id,
                 &g.id,
-                Some(title),
+                Some(&title),
                 g.space.as_ref(),
                 off,
                 &said,
@@ -2516,29 +2538,28 @@ async fn tell_owner(
             )
         }
         Some(title) => {
-            let title = match space.and_then(|p| p.title.as_deref()) {
-                Some(space) => format!(
-                    "{} / {}",
-                    as_plain(&shown_name(space)),
-                    as_plain(&shown_name(title))
-                ),
-                None => as_plain(title),
+            let title = as_plain(title);
+            // A server's channel is called one (issue #293).
+            let (kind, kind_zh, ask, ask_zh) = if space.is_some() {
+                ("channel", "频道", "Let it use the bot?", "要放行吗？")
+            } else {
+                ("group", "群", "Let the group use it?", "要放行这个群吗？")
             };
             language.pick(
                 format!(
-                    "The group \"{title}\" ({about}) is not let in to use this bot, so {} did not get this: {said}. {}",
+                    "The {kind} \"{title}\" ({about}) is not let in to use this bot, so {} did not get this: {said}. {}",
                     agent.name,
                     if fits {
-                        "Let the group use it?"
+                        ask
                     } else {
                         "Let it in from the agent's settings page, under who can reach the bot."
                     }
                 ),
                 format!(
-                    "群「{title}」（{about}）还没被放行使用这个机器人，所以 {} 没有收到：{said}。{}",
+                    "{kind_zh}「{title}」（{about}）还没被放行使用这个机器人，所以 {} 没有收到：{said}。{}",
                     agent.name,
                     if fits {
-                        "要放行这个群吗？"
+                        ask_zh
                     } else {
                         "可以在 agent 设置页的“谁能联系机器人”里放行。"
                     }
@@ -2597,6 +2618,44 @@ async fn tell_owner(
     }
 }
 
+/// How place `id` on `(channel, account_id)` is named to the owner (issue
+/// #293): what it is, a server, a server's channel or a group, and what it
+/// is called, or its id when no title was kept; as ("server \"Acme\"",
+/// "服务器「Acme」").
+pub(crate) async fn place_named(
+    state: &AppState,
+    channel: &str,
+    account_id: &str,
+    id: &str,
+) -> (String, String) {
+    let db = &state.db;
+    let (kind, kind_zh) = if channel_access::is_space(db, channel, account_id, id)
+        .await
+        .unwrap_or(false)
+    {
+        ("server", "服务器")
+    } else if channel_access::is_channel_of_space(db, channel, account_id, id)
+        .await
+        .unwrap_or(false)
+    {
+        ("channel", "频道")
+    } else {
+        ("group", "群")
+    };
+    let title = channel_access::place_title(db, channel, account_id, id)
+        .await
+        .unwrap_or_default();
+    let title = as_plain(&title);
+    if title.is_empty() {
+        (format!("{kind} {id}"), format!("{kind_zh} {id}"))
+    } else {
+        (
+            format!("{kind} \"{title}\""),
+            format!("{kind_zh}「{title}」"),
+        )
+    }
+}
+
 /// Let group `group_id` use `(channel, account_id)`, bound to `agent`, as
 /// its owner asked (issue #263): audited, and the group is told. Whether
 /// it was not let in by them yet.
@@ -2610,7 +2669,7 @@ pub(crate) async fn admit_group_of(
 ) -> Result<bool, havn_db::DbError> {
     // A space (issue #285) is named by the groups in it, and is told
     // nothing: its channels that were turned away are, as it lets them in.
-    let title = channel_access::parent_title(&state.db, channel, account_id, group_id).await?;
+    let title = channel_access::place_title(&state.db, channel, account_id, group_id).await?;
     let new = channel_access::admit_group(
         &state.db,
         channel,
@@ -2662,20 +2721,26 @@ pub(crate) async fn admit_group_of(
             .and_then(|entry| entry.accounts.iter().find(|a| a.id == account_id))
             .and_then(|a| a.bot_username.as_deref())
             .map_or_else(|| "/help".to_string(), |bot| format!("/help@{bot}"));
-        let welcome = |sees_all: Option<bool>| ChannelMessageContent::Text {
-            text: if sees_all == Some(true) {
-                language
-                    .pick(
-                        "This group can use the bot now: mention it, or reply to it.",
-                        "这个群现在可以使用这个机器人了：@ 它，或者回复它的消息。",
-                    )
-                    .to_string()
+        // A server's channel is called one (issue #293).
+        let welcome = |sees_all: Option<bool>, of_server: bool| {
+            let (this, this_zh) = if of_server {
+                ("This channel", "这个频道")
             } else {
-                language.pick(
-                    format!("This group can use the bot now: reply to one of its messages, or send it a command such as {command}."),
-                    format!("这个群现在可以使用这个机器人了：回复它的消息，或者给它发命令，比如 {command}。"),
-                )
-            },
+                ("This group", "这个群")
+            };
+            ChannelMessageContent::Text {
+                text: if sees_all == Some(true) {
+                    language.pick(
+                        format!("{this} can use the bot now: mention it, or reply to it."),
+                        format!("{this_zh}现在可以使用这个机器人了：@ 它，或者回复它的消息。"),
+                    )
+                } else {
+                    language.pick(
+                        format!("{this} can use the bot now: reply to one of its messages, or send it a command such as {command}."),
+                        format!("{this_zh}现在可以使用这个机器人了：回复它的消息，或者给它发命令，比如 {command}。"),
+                    )
+                },
+            }
         };
         if on {
             for place in &told {
@@ -2686,9 +2751,19 @@ pub(crate) async fn admit_group_of(
                         place,
                     )
                     .await;
+                let of_server =
+                    channel_access::is_channel_of_space(&state.db, channel, account_id, place)
+                        .await
+                        .unwrap_or(false);
                 if let Err(e) = state
                     .channel_router
-                    .deliver(channel, account_id, place, None, welcome(sees_all))
+                    .deliver(
+                        channel,
+                        account_id,
+                        place,
+                        None,
+                        welcome(sees_all, of_server),
+                    )
                     .await
                 {
                     warn!(error = %e, "could not tell a group let in");

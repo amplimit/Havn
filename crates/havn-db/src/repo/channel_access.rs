@@ -663,31 +663,40 @@ pub async fn record_refusal(
     said: &str,
     now: DateTime<Utc>,
 ) -> Result<bool> {
-    record(pool, channel, account_id, sender_id, false, said, now).await
+    record(pool, channel, account_id, sender_id, None, said, now).await
 }
 
-/// [`record_refusal`] for group `group_id` (issue #263), where `said`
-/// says who wrote.
+/// [`record_refusal`] for group `group_id` (issue #263), titled `title`
+/// (issue #293), where `said` says who wrote.
 pub async fn record_group_refusal(
     pool: &SqlitePool,
     channel: &str,
     account_id: &str,
     group_id: &str,
+    title: &str,
     said: &str,
     now: DateTime<Utc>,
 ) -> Result<bool> {
-    record(pool, channel, account_id, group_id, true, said, now).await
+    record(pool, channel, account_id, group_id, Some(title), said, now).await
 }
 
+/// A refusal of `sender_id`, or of a group of that id with its title.
 async fn record(
     pool: &SqlitePool,
     channel: &str,
     account_id: &str,
     sender_id: &str,
-    is_group: bool,
+    group_title: Option<&str>,
     said: &str,
     now: DateTime<Utc>,
 ) -> Result<bool> {
+    let is_group = group_title.is_some();
+    let title: String = group_title
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(REFUSAL_SAID_CHARS)
+        .collect();
     let said: String = said.trim().chars().take(REFUSAL_SAID_CHARS).collect();
     let at = timestamp(now);
     let day_ago = timestamp(now - REFUSAL_NOTICE_EVERY);
@@ -704,12 +713,13 @@ async fn record(
     .await?;
     sqlx::query(
         "INSERT INTO channel_refusals \
-             (channel, account_id, sender_id, first_at, last_at, said, is_group) \
-         VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?7) \
+             (channel, account_id, sender_id, first_at, last_at, said, is_group, title) \
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?7, ?8) \
          ON CONFLICT (channel, account_id, sender_id) DO UPDATE SET \
              first_at = CASE WHEN last_at < ?6 THEN excluded.first_at ELSE first_at END, \
              count = CASE WHEN last_at < ?6 THEN 1 ELSE count + 1 END, \
-             last_at = excluded.last_at, said = excluded.said",
+             last_at = excluded.last_at, said = excluded.said, \
+             title = CASE WHEN excluded.title != '' THEN excluded.title ELSE title END",
     )
     .bind(channel)
     .bind(account_id)
@@ -718,6 +728,7 @@ async fn record(
     .bind(&said)
     .bind(timestamp(now - Duration::days(REFUSAL_KEPT_DAYS)))
     .bind(is_group)
+    .bind(&title)
     .execute(&mut *tx)
     .await?;
     if before.is_none() {
@@ -1161,6 +1172,34 @@ pub async fn parent_title(
     Ok(found.map(|(t,)| t).unwrap_or_default())
 }
 
+/// What place `id` is called (issue #293): the title it was let in with,
+/// else the one it was turned away with, else the one a group part of it
+/// named it by; empty when none was kept.
+pub async fn place_title(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    id: &str,
+) -> Result<String> {
+    let (title,): (String,) = sqlx::query_as(
+        "SELECT COALESCE( \
+           (SELECT NULLIF(title, '') FROM channel_groups \
+            WHERE channel = ?1 AND account_id = ?2 AND group_id = ?3), \
+           (SELECT NULLIF(title, '') FROM channel_refusals \
+            WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 AND is_group = 1), \
+           (SELECT parent_title FROM channel_group_parents \
+            WHERE channel = ?1 AND account_id = ?2 AND parent_id = ?3 AND parent_title != '' \
+            ORDER BY noted_at DESC LIMIT 1), \
+           '')",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    Ok(title)
+}
+
 /// Forget that group `group_id` was turned away (issue #285); whether it
 /// was. A sender's refusal of the same id stays.
 pub async fn forget_group_refusal(
@@ -1531,7 +1570,7 @@ mod tests {
                 .await
                 .expect("forget")
         );
-        record_group_refusal(&pool, "discord", "bot", "discord:c9", "hi", Utc::now())
+        record_group_refusal(&pool, "discord", "bot", "discord:c9", "", "hi", Utc::now())
             .await
             .expect("refused");
         assert!(
@@ -1539,6 +1578,68 @@ mod tests {
                 .await
                 .expect("forget")
         );
+    }
+
+    #[tokio::test]
+    async fn a_place_is_called_by_the_title_it_was_let_in_or_turned_away_with() {
+        let pool = crate::connect_in_memory().await.expect("db");
+        let title = |id: &'static str| {
+            let pool = pool.clone();
+            async move {
+                place_title(&pool, "discord", "bot", id)
+                    .await
+                    .expect("title")
+            }
+        };
+        assert_eq!(title("discord:c1").await, "");
+        record_group_refusal(
+            &pool,
+            "discord",
+            "bot",
+            "discord:c1",
+            "Acme / general",
+            "hi",
+            Utc::now(),
+        )
+        .await
+        .expect("refused");
+        assert_eq!(title("discord:c1").await, "Acme / general");
+        // Turned away again with no title, it keeps the one it had.
+        record_group_refusal(&pool, "discord", "bot", "discord:c1", "", "hi", Utc::now())
+            .await
+            .expect("refused");
+        assert_eq!(title("discord:c1").await, "Acme / general");
+        admit_group(
+            &pool,
+            "discord",
+            "bot",
+            "discord:c1",
+            "Acme / chat",
+            GROUP_BY_OWNER,
+        )
+        .await
+        .expect("admit");
+        assert_eq!(title("discord:c1").await, "Acme / chat");
+        // A server is named by its channels.
+        note_parents(
+            &pool,
+            "discord",
+            "bot",
+            "discord:c1",
+            &[Parent {
+                id: "discord:s1",
+                kind: PARENT_SPACE,
+                title: "Acme",
+            }],
+        )
+        .await
+        .expect("note");
+        assert_eq!(title("discord:s1").await, "Acme");
+        // A sender's refusal names no place.
+        record_refusal(&pool, "discord", "bot", "discord:9", "hi", Utc::now())
+            .await
+            .expect("refused");
+        assert_eq!(title("discord:9").await, "");
     }
 
     #[tokio::test]
@@ -1554,9 +1655,17 @@ mod tests {
         };
         assert!(!allowed(true).await);
         assert!(
-            record_group_refusal(&pool, "telegram", "bot", "tg:-100", "Ann: hi", Utc::now())
-                .await
-                .expect("refused")
+            record_group_refusal(
+                &pool,
+                "telegram",
+                "bot",
+                "tg:-100",
+                "Team",
+                "Ann: hi",
+                Utc::now()
+            )
+            .await
+            .expect("refused")
         );
         assert!(list_refusals(&pool, "telegram", "bot").await.expect("list")[0].group);
 

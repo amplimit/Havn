@@ -63,6 +63,11 @@ pub struct ChannelCommand {
     /// Without the slash: lowercase letters, digits and `_`.
     pub name: String,
     pub description: String,
+    /// What it takes after its name (issue #294), as `[number|name]`;
+    /// empty when it takes nothing. Absent from an older gateway: it may
+    /// take anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<String>,
 }
 
 /// Adapter → gateway: one inbound user message.

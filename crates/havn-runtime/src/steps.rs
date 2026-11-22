@@ -81,13 +81,17 @@ pub fn without_note(reply: &str) -> &str {
     reply
 }
 
+/// Whether any of a turn's `messages` calls a tool.
+pub fn calls_a_tool(messages: &[Value]) -> bool {
+    messages.iter().any(|m| has_block(m, "tool_use"))
+}
+
 /// The steps of a turn, from its `messages` (those the tool loop added
 /// after the history), as JSON to keep; `None` for a turn that called no
 /// tool, whose reply is all there is. `reply` is the reply kept, which can
 /// say more than the model did (that it was stopped, an error).
 pub fn of_turn(messages: &[Value], reply: &str) -> Option<String> {
-    let calls_a_tool = messages.iter().any(|m| has_block(m, "tool_use"));
-    if !calls_a_tool {
+    if !calls_a_tool(messages) {
         return None;
     }
     let mut kept: Vec<Value> = messages.iter().map(without_reasoning).collect();

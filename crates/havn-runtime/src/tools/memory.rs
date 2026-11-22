@@ -433,9 +433,15 @@ impl Tool for ConversationSearchTool {
             );
         };
         let current = super::gateway::CHAT.try_with(Clone::clone).ok();
-        let owner = super::gateway::FROM_OWNER
-            .try_with(|owner| *owner)
+        // In a group, what it finds is read by everyone there: the owner's
+        // other chats stay out of it (issue #291).
+        let in_group = super::gateway::IN_GROUP
+            .try_with(|group| *group)
             .unwrap_or(false);
+        let owner = !in_group
+            && super::gateway::FROM_OWNER
+                .try_with(|owner| *owner)
+                .unwrap_or(false);
         if let Some(turn) = input.get("turn").and_then(Value::as_str) {
             return match conversations::around(&ctx.agent_db, &scope, owner, turn, CONTEXT_TURNS)
                 .await
@@ -909,6 +915,47 @@ mod tests {
                     .execute(&ctx, json!({"query": "京都"}))
                     .await;
                 assert!(r.is_error(), "outside a chat: {}", r.text());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_owner_s_search_in_a_group_keeps_to_that_group() {
+        super::super::gateway::FROM_OWNER
+            .scope(true, async {
+                use conversations::Role;
+                let ctx = ctx().await;
+                let private =
+                    chat_turn(&ctx, "dm", CHAT_A, Role::User, "我的体检报告在抽屉里").await;
+                conversations::note_owner_scope(&ctx.agent_db, "dm")
+                    .await
+                    .expect("note");
+                conversations::note_owner_scope(&ctx.agent_db, "web")
+                    .await
+                    .expect("note");
+                chat_turn(&ctx, "group", CHAT_B, Role::User, "体检报告什么时候出").await;
+
+                // From another chat of theirs, the owner finds their own.
+                let r = search_as(&ctx, "web", "elsewhere", json!({"query": "体检报告"})).await;
+                assert!(r.text().contains("抽屉"), "{}", r.text());
+
+                let in_group = |input: Value| {
+                    super::super::gateway::IN_GROUP
+                        .scope(true, search_as(&ctx, "group", CHAT_B, input))
+                };
+                let r = in_group(json!({"query": "体检报告"})).await;
+                assert!(
+                    r.text().contains("什么时候出"),
+                    "the group's own: {}",
+                    r.text()
+                );
+                assert!(
+                    !r.text().contains("抽屉"),
+                    "a private chat, in a group: {}",
+                    r.text()
+                );
+                let r = in_group(json!({"turn": private})).await;
+                assert!(r.is_error(), "{}", r.text());
             })
             .await;
     }

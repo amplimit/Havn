@@ -2926,36 +2926,39 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     {
         warn!(error = %e, "could not note the owner's conversation");
     }
-    let (final_text, failed) = match tools::gateway::CONVERSATION
+    let (final_text, failed) = match tools::gateway::IN_GROUP
         .scope(
-            msg.channel_id.clone(),
-            tools::gateway::FROM_OWNER.scope(
-                msg.from_owner,
-                tools::gateway::ASKED.scope(
-                    (
-                        msg.sender_id.clone(),
-                        asked_part(&user_text, msg.group)
-                            .chars()
-                            .take(ASKED_SHOWN_CHARS)
-                            .collect(),
-                    ),
-                    tools::gateway::REFUSED.scope(
-                        Arc::new(approvals::Refused::default()),
-                        tools::gateway::CHAT.scope(
-                            chat.clone(),
-                            tools::memory::MEMORY_CHANGES.scope(
-                                Arc::clone(&memory_changes),
-                                tool_loop::TRACE.scope(
-                                    Arc::clone(&turn_trace),
-                                    run_tool_loop(
-                                        &ctx,
-                                        crate::tools::context::WEBCHAT,
-                                        &mut messages,
-                                        &augmented,
-                                        Some(stop),
-                                        chat_model,
-                                        chat_thinking,
-                                        segments.clone(),
+            msg.group,
+            tools::gateway::CONVERSATION.scope(
+                msg.channel_id.clone(),
+                tools::gateway::FROM_OWNER.scope(
+                    msg.from_owner,
+                    tools::gateway::ASKED.scope(
+                        (
+                            msg.sender_id.clone(),
+                            asked_part(&user_text, msg.group)
+                                .chars()
+                                .take(ASKED_SHOWN_CHARS)
+                                .collect(),
+                        ),
+                        tools::gateway::REFUSED.scope(
+                            Arc::new(approvals::Refused::default()),
+                            tools::gateway::CHAT.scope(
+                                chat.clone(),
+                                tools::memory::MEMORY_CHANGES.scope(
+                                    Arc::clone(&memory_changes),
+                                    tool_loop::TRACE.scope(
+                                        Arc::clone(&turn_trace),
+                                        run_tool_loop(
+                                            &ctx,
+                                            crate::tools::context::WEBCHAT,
+                                            &mut messages,
+                                            &augmented,
+                                            Some(stop),
+                                            chat_model,
+                                            chat_thinking,
+                                            segments.clone(),
+                                        ),
                                     ),
                                 ),
                             ),
@@ -2966,6 +2969,14 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         )
         .await
     {
+        // A model that said nothing and called no tool answered nothing:
+        // told as a failure, not left as silence (issue #292).
+        Ok(text)
+            if text.trim().is_empty()
+                && !steps::calls_a_tool(messages.get(turn_start..).unwrap_or_default()) =>
+        {
+            (text, Some(EMPTY_ANSWER.to_string()))
+        }
         Ok(text) => (text, None),
         // A turn that failed (issue #217): not a reply.
         Err(tool_loop::RunError::Llm(detail)) => (String::new(), Some(detail)),
@@ -3816,6 +3827,9 @@ const NO_ANSWER: [&str; 2] = [
     "（这条消息没有得到回答。）",
 ];
 
+/// The failure of a turn whose model answered with nothing (issue #292).
+const EMPTY_ANSWER: &str = "the model gave an empty answer";
+
 /// What a person is told when their message could not be answered (issue
 /// #217), by the kind of failure `detail` says, without its details; and
 /// whether trying again may help.
@@ -3827,6 +3841,11 @@ fn failure_text(detail: &str) -> (String, bool) {
                 "something went wrong on the agent's side.",
                 "agent 这边出了问题。",
             ),
+            true,
+        )
+    } else if d == EMPTY_ANSWER {
+        (
+            lang().pick("it gave an empty answer.", "它给出了一个空的回答。"),
             true,
         )
     } else if d.contains("is unavailable") || d.contains("overloaded") || d.contains(" 429") {
@@ -4989,6 +5008,8 @@ run ls"
     #[test]
     fn a_failure_is_told_by_its_kind_without_its_details() {
         let told = |d: &str| failure_text(d).0;
+        let (empty, again) = failure_text(EMPTY_ANSWER);
+        assert!(empty.contains("empty answer") && again, "{empty}");
         let (unavailable, again) = failure_text(
             "the provider \"openrouter\" is unavailable (upstream 503: secret body) after 4 tries",
         );
