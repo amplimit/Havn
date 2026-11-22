@@ -981,6 +981,206 @@ pub async fn revoke_group(
     Ok(res.rows_affected() > 0)
 }
 
+/// A server, which may be let in as a whole but is never sent to.
+pub const PARENT_SPACE: &str = "space";
+/// A channel, of which a thread is part.
+pub const PARENT_GROUP: &str = "group";
+
+/// What a group is part of, for [`note_parents`].
+#[derive(Debug, Clone, Copy)]
+pub struct Parent<'a> {
+    pub id: &'a str,
+    /// [`PARENT_SPACE`] or [`PARENT_GROUP`].
+    pub kind: &'a str,
+    pub title: &'a str,
+}
+
+/// Keep what group `child_id` is part of (issue #285): each of
+/// `parents`, with its title (kept when one is given, the newest last).
+/// Whether any of it was not kept before.
+pub async fn note_parents(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    child_id: &str,
+    parents: &[Parent<'_>],
+) -> Result<bool> {
+    let mut new = false;
+    for parent in parents {
+        let title: String = parent
+            .title
+            .trim()
+            .chars()
+            .take(REFUSAL_SAID_CHARS)
+            .collect();
+        let res = sqlx::query(
+            "INSERT INTO channel_group_parents \
+               (channel, account_id, child_id, parent_id, parent_kind, parent_title, noted_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT (channel, account_id, child_id, parent_id) DO UPDATE SET \
+                 parent_title = excluded.parent_title, noted_at = excluded.noted_at \
+             WHERE excluded.parent_title != '' AND excluded.parent_title != parent_title",
+        )
+        .bind(channel)
+        .bind(account_id)
+        .bind(child_id)
+        .bind(parent.id)
+        .bind(parent.kind)
+        .bind(&title)
+        .bind(timestamp(Utc::now()))
+        .execute(pool)
+        .await?;
+        new |= res.rows_affected() > 0;
+    }
+    Ok(new)
+}
+
+/// The groups `child_id` is part of, as kept (issue #285).
+pub async fn parents_of(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    child_id: &str,
+) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT parent_id FROM channel_group_parents \
+         WHERE channel = ?1 AND account_id = ?2 AND child_id = ?3 ORDER BY parent_id",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(child_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// The channel thread `child_id` was kept as part of, if any (issue #285).
+pub async fn group_of(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    child_id: &str,
+) -> Result<Option<String>> {
+    let found: Option<(String,)> = sqlx::query_as(
+        "SELECT parent_id FROM channel_group_parents \
+         WHERE channel = ?1 AND account_id = ?2 AND child_id = ?3 AND parent_kind = 'group' \
+         ORDER BY noted_at LIMIT 1",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(child_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(found.map(|(id,)| id))
+}
+
+/// The groups kept as part of server `space_id` (issue #285): its
+/// channels, not their threads.
+pub async fn groups_in(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    space_id: &str,
+) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT p.child_id FROM channel_group_parents p \
+         WHERE p.channel = ?1 AND p.account_id = ?2 AND p.parent_id = ?3 \
+           AND p.parent_kind = 'space' \
+           AND NOT EXISTS (SELECT 1 FROM channel_group_parents t \
+                           WHERE t.channel = p.channel AND t.account_id = p.account_id \
+                             AND t.child_id = p.child_id AND t.parent_kind = 'group') \
+         ORDER BY p.child_id",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(space_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Whether `id` was kept as a server's channel (issue #285).
+pub async fn is_channel_of_space(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    id: &str,
+) -> Result<bool> {
+    let (found,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM channel_group_parents \
+         WHERE channel = ?1 AND account_id = ?2 AND child_id = ?3 AND parent_kind = 'space' \
+           AND NOT EXISTS (SELECT 1 FROM channel_group_parents t \
+                           WHERE t.channel = ?1 AND t.account_id = ?2 AND t.child_id = ?3 \
+                             AND t.parent_kind = 'group'))",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    Ok(found)
+}
+
+/// Whether `id` was kept as a server (issue #285).
+pub async fn is_space(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    id: &str,
+) -> Result<bool> {
+    let (found,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM channel_group_parents \
+         WHERE channel = ?1 AND account_id = ?2 AND parent_id = ?3 AND parent_kind = 'space')",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    Ok(found)
+}
+
+/// The newest title kept for `parent_id`, as a group named it its parent
+/// (issue #285); empty when none was.
+pub async fn parent_title(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    parent_id: &str,
+) -> Result<String> {
+    let found: Option<(String,)> = sqlx::query_as(
+        "SELECT parent_title FROM channel_group_parents \
+         WHERE channel = ?1 AND account_id = ?2 AND parent_id = ?3 AND parent_title != '' \
+         ORDER BY noted_at DESC LIMIT 1",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(parent_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(found.map(|(t,)| t).unwrap_or_default())
+}
+
+/// Forget that group `group_id` was turned away (issue #285); whether it
+/// was. A sender's refusal of the same id stays.
+pub async fn forget_group_refusal(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    group_id: &str,
+) -> Result<bool> {
+    let res = sqlx::query(
+        "DELETE FROM channel_refusals \
+         WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 AND is_group = 1",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(group_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// Forget that `sender_id` was turned away; whether they were.
 pub async fn forget_refusal(
     pool: &SqlitePool,
@@ -1223,6 +1423,122 @@ mod tests {
             .expect("list");
         assert_eq!(refused[0].count, 1);
         assert!(refused[0].first_at > Utc::now() - Duration::hours(1));
+    }
+
+    #[tokio::test]
+    async fn a_group_keeps_what_it_is_part_of_and_their_titles() {
+        let pool = crate::connect_in_memory().await.expect("db");
+        let space = |title| Parent {
+            id: "discord:s1",
+            kind: PARENT_SPACE,
+            title,
+        };
+        let general = Parent {
+            id: "discord:c1",
+            kind: PARENT_GROUP,
+            title: "general",
+        };
+        let note = |child: &'static str, parents: Vec<Parent<'static>>| {
+            let pool = pool.clone();
+            async move {
+                note_parents(&pool, "discord", "bot", child, &parents)
+                    .await
+                    .expect("note")
+            }
+        };
+        assert!(note("discord:t1", vec![general, space("")]).await);
+        assert!(
+            !note("discord:t1", vec![general, space("")]).await,
+            "nothing new"
+        );
+        note("discord:c1", vec![space("Acme")]).await;
+        assert_eq!(
+            parents_of(&pool, "discord", "bot", "discord:t1")
+                .await
+                .expect("parents"),
+            ["discord:c1", "discord:s1"]
+        );
+        assert!(
+            parents_of(&pool, "discord", "other", "discord:t1")
+                .await
+                .expect("other")
+                .is_empty()
+        );
+        assert_eq!(
+            group_of(&pool, "discord", "bot", "discord:t1")
+                .await
+                .expect("group"),
+            Some("discord:c1".into())
+        );
+        assert_eq!(
+            group_of(&pool, "discord", "bot", "discord:c1")
+                .await
+                .expect("none"),
+            None
+        );
+        assert_eq!(
+            groups_in(&pool, "discord", "bot", "discord:s1")
+                .await
+                .expect("groups"),
+            ["discord:c1"],
+            "its channels, not their threads"
+        );
+        assert!(
+            is_space(&pool, "discord", "bot", "discord:s1")
+                .await
+                .expect("space")
+        );
+        assert!(
+            !is_space(&pool, "discord", "bot", "discord:c1")
+                .await
+                .expect("channel")
+        );
+        assert_eq!(
+            parent_title(&pool, "discord", "bot", "discord:s1")
+                .await
+                .expect("title"),
+            "Acme"
+        );
+        // A title once kept is not lost to one not given; a new one is the
+        // one named.
+        note("discord:c1", vec![space("")]).await;
+        assert_eq!(
+            parent_title(&pool, "discord", "bot", "discord:s1")
+                .await
+                .expect("title"),
+            "Acme"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        note("discord:c2", vec![space("Acme Inc")]).await;
+        assert_eq!(
+            parent_title(&pool, "discord", "bot", "discord:s1")
+                .await
+                .expect("title"),
+            "Acme Inc"
+        );
+        assert_eq!(
+            parent_title(&pool, "discord", "bot", "discord:x")
+                .await
+                .expect("none"),
+            ""
+        );
+        // A group's refusal is forgotten; a sender's of the same id stays.
+        record_refusal(&pool, "discord", "bot", "discord:c1", "hi", Utc::now())
+            .await
+            .expect("refused");
+        assert!(
+            !forget_group_refusal(&pool, "discord", "bot", "discord:c1")
+                .await
+                .expect("forget")
+        );
+        record_group_refusal(&pool, "discord", "bot", "discord:c9", "hi", Utc::now())
+            .await
+            .expect("refused");
+        assert!(
+            forget_group_refusal(&pool, "discord", "bot", "discord:c9")
+                .await
+                .expect("forget")
+        );
     }
 
     #[tokio::test]
