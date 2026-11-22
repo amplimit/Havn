@@ -981,6 +981,96 @@ pub async fn revoke_group(
     Ok(res.rows_affected() > 0)
 }
 
+/// Keep what group `child_id` is part of (issue #285): each of
+/// `parents`, with its title (kept when one is given). Whether any of it
+/// was not kept before.
+pub async fn note_parents(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    child_id: &str,
+    parents: &[(&str, &str)],
+) -> Result<bool> {
+    let mut new = false;
+    for (parent_id, title) in parents {
+        let title: String = title.trim().chars().take(REFUSAL_SAID_CHARS).collect();
+        let res = sqlx::query(
+            "INSERT INTO channel_group_parents (channel, account_id, child_id, parent_id, parent_title) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (channel, account_id, child_id, parent_id) DO UPDATE SET \
+                 parent_title = excluded.parent_title \
+             WHERE excluded.parent_title != '' AND excluded.parent_title != parent_title",
+        )
+        .bind(channel)
+        .bind(account_id)
+        .bind(child_id)
+        .bind(parent_id)
+        .bind(&title)
+        .execute(pool)
+        .await?;
+        new |= res.rows_affected() > 0;
+    }
+    Ok(new)
+}
+
+/// The groups `child_id` is part of, as kept (issue #285).
+pub async fn parents_of(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    child_id: &str,
+) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT parent_id FROM channel_group_parents \
+         WHERE channel = ?1 AND account_id = ?2 AND child_id = ?3 ORDER BY parent_id",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(child_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// The groups kept as part of `parent_id` (issue #285).
+pub async fn children_of(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    parent_id: &str,
+) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT child_id FROM channel_group_parents \
+         WHERE channel = ?1 AND account_id = ?2 AND parent_id = ?3 ORDER BY child_id",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(parent_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// The title kept for `parent_id`, as a group named it its parent (issue
+/// #285); empty when none was.
+pub async fn parent_title(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    parent_id: &str,
+) -> Result<String> {
+    let found: Option<(String,)> = sqlx::query_as(
+        "SELECT parent_title FROM channel_group_parents \
+         WHERE channel = ?1 AND account_id = ?2 AND parent_id = ?3 AND parent_title != '' LIMIT 1",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(parent_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(found.map(|(t,)| t).unwrap_or_default())
+}
+
 /// Forget that `sender_id` was turned away; whether they were.
 pub async fn forget_refusal(
     pool: &SqlitePool,
@@ -1223,6 +1313,72 @@ mod tests {
             .expect("list");
         assert_eq!(refused[0].count, 1);
         assert!(refused[0].first_at > Utc::now() - Duration::hours(1));
+    }
+
+    #[tokio::test]
+    async fn a_group_keeps_what_it_is_part_of_and_their_titles() {
+        let pool = crate::connect_in_memory().await.expect("db");
+        let parents = [("discord:c1", "general"), ("discord:s1", "")];
+        assert!(
+            note_parents(&pool, "discord", "bot", "discord:t1", &parents)
+                .await
+                .expect("note")
+        );
+        assert!(
+            !note_parents(&pool, "discord", "bot", "discord:t1", &parents)
+                .await
+                .expect("again"),
+            "nothing new"
+        );
+        note_parents(
+            &pool,
+            "discord",
+            "bot",
+            "discord:c1",
+            &[("discord:s1", "Acme")],
+        )
+        .await
+        .expect("note");
+        assert_eq!(
+            parents_of(&pool, "discord", "bot", "discord:t1")
+                .await
+                .expect("parents"),
+            ["discord:c1", "discord:s1"]
+        );
+        assert!(
+            parents_of(&pool, "discord", "other", "discord:t1")
+                .await
+                .expect("other")
+                .is_empty()
+        );
+        assert_eq!(
+            children_of(&pool, "discord", "bot", "discord:s1")
+                .await
+                .expect("children"),
+            ["discord:c1", "discord:t1"]
+        );
+        assert_eq!(
+            parent_title(&pool, "discord", "bot", "discord:s1")
+                .await
+                .expect("title"),
+            "Acme"
+        );
+        // A title once kept is not lost to one not given.
+        note_parents(&pool, "discord", "bot", "discord:c1", &[("discord:s1", "")])
+            .await
+            .expect("note");
+        assert_eq!(
+            parent_title(&pool, "discord", "bot", "discord:s1")
+                .await
+                .expect("title"),
+            "Acme"
+        );
+        assert_eq!(
+            parent_title(&pool, "discord", "bot", "discord:x")
+                .await
+                .expect("none"),
+            ""
+        );
     }
 
     #[tokio::test]

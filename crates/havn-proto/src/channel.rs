@@ -126,6 +126,26 @@ pub struct ChannelGroup {
     /// a reply never reaches it. `None` when the adapter does not say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sees_all: Option<bool>,
+    /// The larger group this one is part of (issue #285), such as the
+    /// Discord server of a channel: the owner may let it in as a whole,
+    /// and then every group in it may use the bot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<ChannelPlace>,
+    /// A conversation within the group (issue #285), such as a thread in
+    /// a Discord channel: it has its own chats, and replies go to it. It
+    /// may use the bot while its group may.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<ChannelPlace>,
+}
+
+/// A space or a thread of a [`ChannelGroup`] (issue #285).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelPlace {
+    /// Platform-prefixed, as a group's (`discord:123`).
+    pub id: String,
+    /// Its name, as the platform shows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// Gateway → adapter: one assistant-turn reply to deliver.

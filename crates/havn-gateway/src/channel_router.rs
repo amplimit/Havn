@@ -573,19 +573,31 @@ async fn group_permitted(
         crate::config::GroupPolicy::Allowlist => false,
         crate::config::GroupPolicy::Open => true,
     };
-    if account.allow_groups.iter().any(|g| g == recipient) {
-        return Ok(());
-    }
-    match havn_db::repo::channel_access::group_allowed(db, channel, account_id, recipient, open)
-        .await
-    {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(OutboundRefusal::RecipientNotAllowed),
-        Err(e) => {
-            warn!(error = %e, "group allowlist lookup failed");
-            Err(OutboundRefusal::RecipientNotAllowed)
+    // A thread or a group in a space (issue #285) may be sent to while
+    // what it is part of may use the bot.
+    let parents =
+        match havn_db::repo::channel_access::parents_of(db, channel, account_id, recipient).await {
+            Ok(parents) => parents,
+            Err(e) => {
+                warn!(error = %e, "group parents lookup failed");
+                return Err(OutboundRefusal::RecipientNotAllowed);
+            }
+        };
+    for id in std::iter::once(recipient).chain(parents.iter().map(String::as_str)) {
+        if account.allow_groups.iter().any(|g| g == id) {
+            return Ok(());
+        }
+        match havn_db::repo::channel_access::group_allowed(db, channel, account_id, id, open).await
+        {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => {
+                warn!(error = %e, "group allowlist lookup failed");
+                return Err(OutboundRefusal::RecipientNotAllowed);
+            }
         }
     }
+    Err(OutboundRefusal::RecipientNotAllowed)
 }
 
 #[cfg(test)]
