@@ -2979,7 +2979,15 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
                     &SHOWN_BY_TOOLS,
                 ) =>
         {
-            (text, Some(EMPTY_ANSWER.to_string()))
+            // After tools that may have done part of it, trying again may
+            // do it twice: it is not offered.
+            let tools = steps::calls_a_tool(messages.get(turn_start..).unwrap_or_default());
+            let detail = if tools {
+                EMPTY_AFTER_TOOLS
+            } else {
+                EMPTY_ANSWER
+            };
+            (text, Some(detail.to_string()))
         }
         Ok(text) => (text, None),
         // A turn that failed (issue #217): not a reply.
@@ -3834,6 +3842,9 @@ const NO_ANSWER: [&str; 2] = [
 /// The failure of a turn whose model answered with nothing (issue #292).
 const EMPTY_ANSWER: &str = "the model gave an empty answer";
 
+/// [`EMPTY_ANSWER`], after the turn called tools.
+const EMPTY_AFTER_TOOLS: &str = "the model gave an empty answer after using tools";
+
 /// The gateway's tools that put something in front of the person (a
 /// file, a question): a turn that called one answered, without a word.
 const SHOWN_BY_TOOLS: [&str; 2] = ["send_file", "ask_choice"];
@@ -3855,6 +3866,14 @@ fn failure_text(detail: &str) -> (String, bool) {
         (
             lang().pick("it gave an empty answer.", "它给出了一个空的回答。"),
             true,
+        )
+    } else if d == EMPTY_AFTER_TOOLS {
+        (
+            lang().pick(
+                "it gave an empty answer after using its tools, which may have done some of what was asked.",
+                "它在使用工具之后给出了一个空的回答，这些工具可能已经完成了部分请求。",
+            ),
+            false,
         )
     } else if d.contains("is unavailable") || d.contains("overloaded") || d.contains(" 429") {
         (
@@ -5018,6 +5037,8 @@ run ls"
         let told = |d: &str| failure_text(d).0;
         let (empty, again) = failure_text(EMPTY_ANSWER);
         assert!(empty.contains("empty answer") && again, "{empty}");
+        let (after, again) = failure_text(EMPTY_AFTER_TOOLS);
+        assert!(after.contains("after using its tools") && !again, "{after}");
         let (unavailable, again) = failure_text(
             "the provider \"openrouter\" is unavailable (upstream 503: secret body) after 4 tries",
         );
