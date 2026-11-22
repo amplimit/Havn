@@ -357,6 +357,10 @@ pub struct UploadQuery {
     /// The space that group is part of (issue #285), let in with it.
     #[serde(default)]
     pub space: Option<String>,
+    /// The thread it was sent in (issue #288), which may be let in on its
+    /// own.
+    #[serde(default)]
+    pub thread: Option<String>,
 }
 
 /// A file a channel's sender sent, waiting for the message that carries it.
@@ -437,6 +441,7 @@ pub async fn upload(
         Some(group) => {
             let ids: Vec<&str> = std::iter::once(group.as_str())
                 .chain(q.space.as_deref())
+                .chain(q.thread.as_deref())
                 .collect();
             for id in &ids {
                 place_id(id).map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -2165,8 +2170,8 @@ fn in_group(
 /// Told to the owner who lets a group in where the bot does not see every
 /// message.
 pub(crate) const UNSEEN_MENTIONS: [&str; 2] = [
-    "The bot does not see every message in that group, so a mention that is not a reply does not reach it. On Telegram, turn its privacy mode off with BotFather (/setprivacy), then remove the bot from the group and add it again.",
-    "这个机器人在那个群里看不到所有消息，所以单纯 @ 它的消息它收不到。在 Telegram 上，用 BotFather 的 /setprivacy 关掉它的隐私模式，然后把它移出群再重新拉进来。",
+    "The bot does not see every message in that group. On Telegram a mention that is not a reply does not reach it: turn its privacy mode off with BotFather (/setprivacy), then remove the bot from the group and add it again. On Discord only messages that mention it do: turn on its Message Content intent in the Developer Portal (Bot, Privileged Gateway Intents), then restart its adapter.",
+    "这个机器人在那个群里看不到所有消息。在 Telegram 上，单纯 @ 它的消息它收不到：用 BotFather 的 /setprivacy 关掉它的隐私模式，然后把它移出群再重新拉进来。在 Discord 上，它只收得到 @ 它的消息：在 Developer Portal 里打开它的 Message Content intent（Bot 页面的 Privileged Gateway Intents），再重启它的 adapter。",
 ];
 
 /// Groups kept as used while their account was open, so each is written
@@ -2288,12 +2293,27 @@ async fn group_refused(
     warn!(channel, account = %inb.account_id, group = %g.id, "group_policy: not forwarding a message from a group not let in");
     {
         let language = crate::commands::language_of(state, agent_id).await;
-        // Where the message was written: its thread, or the group.
+        // Where the message was written: its thread when the gateway kept
+        // it (it was let in before), else the group, so that a refusal
+        // does not open a thread (issue #288).
+        let kept = match &g.thread {
+            Some(t) => channel_access::group_of(&state.db, channel, &inb.account_id, &t.id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|kept| kept == g.id),
+            None => false,
+        };
+        let to = if kept {
+            conversation_of(g)
+        } else {
+            g.id.as_str()
+        };
         tell_sender(
             state,
             channel,
             &inb.account_id,
-            conversation_of(g),
+            to,
             &inb.channel_message_id,
             if off {
                 language.pick(
@@ -5222,8 +5242,8 @@ mod tests {
             }
             assert_eq!(
                 told,
-                ["dc:t1"],
-                "told where it was written, not in the server"
+                ["dc:c1"],
+                "told in the channel: the thread is not opened for a refusal"
             );
             let notice = notice.expect("the owner is told");
             let data: Vec<&str> = notice.buttons[0].iter().map(|b| b.data.as_str()).collect();
@@ -5332,6 +5352,8 @@ mod tests {
             .await;
             let messages = f.messages();
             assert_eq!(messages.len(), 1, "{messages:?}");
+            let refused: Vec<String> = f.replies().into_iter().map(|(to, _)| to).collect();
+            assert!(refused.iter().any(|to| to == "dc:c2"), "{refused:?}");
             assert!(may("dc:t4").await);
             assert!(!may("dc:t2").await, "its server is no longer let in");
 
