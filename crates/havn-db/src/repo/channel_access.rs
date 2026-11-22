@@ -1172,9 +1172,9 @@ pub async fn parent_title(
     Ok(found.map(|(t,)| t).unwrap_or_default())
 }
 
-/// What place `id` is called (issue #293): the title it was let in with,
-/// else the one it was turned away with, else the one a group part of it
-/// named it by; empty when none was kept.
+/// What place `id` is called (issue #293): the title it was turned away
+/// with, the newest, while it is; else the one it was let in with; else
+/// the one a group part of it named it by; empty when none was kept.
 pub async fn place_title(
     pool: &SqlitePool,
     channel: &str,
@@ -1183,10 +1183,10 @@ pub async fn place_title(
 ) -> Result<String> {
     let (title,): (String,) = sqlx::query_as(
         "SELECT COALESCE( \
-           (SELECT NULLIF(title, '') FROM channel_groups \
-            WHERE channel = ?1 AND account_id = ?2 AND group_id = ?3), \
            (SELECT NULLIF(title, '') FROM channel_refusals \
             WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 AND is_group = 1), \
+           (SELECT NULLIF(title, '') FROM channel_groups \
+            WHERE channel = ?1 AND account_id = ?2 AND group_id = ?3), \
            (SELECT parent_title FROM channel_group_parents \
             WHERE channel = ?1 AND account_id = ?2 AND parent_id = ?3 AND parent_title != '' \
             ORDER BY noted_at DESC LIMIT 1), \
@@ -1620,6 +1620,30 @@ mod tests {
         .await
         .expect("admit");
         assert_eq!(title("discord:c1").await, "Acme / chat");
+        // Kept under an old title and turned away under a new one, it is
+        // called by the new one.
+        admit_group(
+            &pool,
+            "discord",
+            "bot",
+            "discord:c2",
+            "chat",
+            GROUP_WHILE_OPEN,
+        )
+        .await
+        .expect("open");
+        record_group_refusal(
+            &pool,
+            "discord",
+            "bot",
+            "discord:c2",
+            "Acme / chat",
+            "hi",
+            Utc::now(),
+        )
+        .await
+        .expect("refused");
+        assert_eq!(title("discord:c2").await, "Acme / chat");
         // A server is named by its channels.
         note_parents(
             &pool,

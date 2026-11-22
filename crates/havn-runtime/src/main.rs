@@ -2969,11 +2969,15 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         )
         .await
     {
-        // A model that said nothing and called no tool answered nothing:
-        // told as a failure, not left as silence (issue #292).
+        // A model that said nothing, and sent nothing with a tool,
+        // answered nothing: told as a failure, not left as silence (issue
+        // #292).
         Ok(text)
             if text.trim().is_empty()
-                && !steps::calls_a_tool(messages.get(turn_start..).unwrap_or_default()) =>
+                && !steps::calls_any(
+                    messages.get(turn_start..).unwrap_or_default(),
+                    &SHOWN_BY_TOOLS,
+                ) =>
         {
             (text, Some(EMPTY_ANSWER.to_string()))
         }
@@ -3829,6 +3833,10 @@ const NO_ANSWER: [&str; 2] = [
 
 /// The failure of a turn whose model answered with nothing (issue #292).
 const EMPTY_ANSWER: &str = "the model gave an empty answer";
+
+/// The gateway's tools that put something in front of the person (a
+/// file, a question): a turn that called one answered, without a word.
+const SHOWN_BY_TOOLS: [&str; 2] = ["send_file", "ask_choice"];
 
 /// What a person is told when their message could not be answered (issue
 /// #217), by the kind of failure `detail` says, without its details; and

@@ -86,6 +86,22 @@ pub fn calls_a_tool(messages: &[Value]) -> bool {
     messages.iter().any(|m| has_block(m, "tool_use"))
 }
 
+/// Whether any of a turn's `messages` calls one of the tools `names`.
+pub fn calls_any(messages: &[Value], names: &[&str]) -> bool {
+    messages.iter().any(|m| {
+        m.get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                blocks.iter().any(|b| {
+                    block_type(b) == Some("tool_use")
+                        && b.get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| names.contains(&name))
+                })
+            })
+    })
+}
+
 /// The steps of a turn, from its `messages` (those the tool loop added
 /// after the history), as JSON to keep; `None` for a turn that called no
 /// tool, whose reply is all there is. `reply` is the reply kept, which can
@@ -330,6 +346,26 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn a_turn_is_told_by_the_tools_it_called() {
+        let turn = vec![
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "text", "text": "Looking."},
+                {"type": "tool_use", "id": "a", "name": "memory_search", "input": {}}
+            ]}),
+            serde_json::json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "nothing"}
+            ]}),
+        ];
+        assert!(super::calls_a_tool(&turn));
+        assert!(super::calls_any(&turn, &["memory_search"]));
+        assert!(!super::calls_any(&turn, &["send_file", "ask_choice"]));
+        assert!(
+            !super::calls_any(&turn[1..], &["memory_search"]),
+            "a result is no call"
+        );
+    }
 
     fn turn() -> Vec<Value> {
         vec![
