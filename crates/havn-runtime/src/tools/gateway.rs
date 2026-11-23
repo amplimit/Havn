@@ -35,6 +35,9 @@ tokio::task_local! {
     /// The turn answers the agent's owner (issue #218): their search
     /// covers the chats of every scope they write from.
     pub static FROM_OWNER: bool;
+    /// The turn answers a message in a group, which others read: the
+    /// owner's search there covers that group's chats only (issue #291).
+    pub static IN_GROUP: bool;
     /// Who wrote the message the turn answers, and what they wrote (cut
     /// short), for the owner to see when a call in it waits for them
     /// (issue #255).

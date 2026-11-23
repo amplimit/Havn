@@ -268,6 +268,7 @@ pub fn menu() -> Vec<havn_proto::channel::ChannelCommand> {
         .map(|c| havn_proto::channel::ChannelCommand {
             name: c.name.to_string(),
             description: c.about.to_string(),
+            args: Some(c.args.to_string()),
         })
         .collect()
 }
@@ -853,11 +854,14 @@ async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
                 )
                 .into();
         }
-        return match crate::api::channel::admit_group_of(
+        let admitted = crate::api::channel::admit_group_of(
             state, &agent, channel, account_id, sender, &asker.who,
         )
-        .await
-        {
+        .await;
+        // Named as the notice named it (issue #293).
+        let (place, place_zh) =
+            crate::api::channel::place_named(state, channel, account_id, sender).await;
+        return match admitted {
             Ok(true) => {
                 let sees_all = state
                     .channel_router
@@ -872,17 +876,17 @@ async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
                     String::new()
                 };
                 language.pick(
-                    format!("(The group {sender} can use this bot now.){hint}"),
-                    format!("（群 {sender} 现在可以使用这个机器人了。）{hint}"),
+                    format!("(The {place} can use this bot now.){hint}"),
+                    format!("（{place_zh}现在可以使用这个机器人了。）{hint}"),
                 )
             }
             Ok(false) => language.pick(
-                format!("(The group {sender} could already use this bot.)"),
-                format!("（群 {sender} 本来就可以使用这个机器人。）"),
+                format!("(The {place} could already use this bot.)"),
+                format!("（{place_zh}本来就可以使用这个机器人。）"),
             ),
             Err(e) => language.pick(
-                format!("(Could not let the group {sender} in: {e}.)"),
-                format!("（没能放行群 {sender}：{e}。）"),
+                format!("(Could not let the {place} in: {e}.)"),
+                format!("（没能放行{place_zh}：{e}。）"),
             ),
         };
     }
@@ -1190,7 +1194,16 @@ mod tests {
             }
             assert!(!c.about.is_empty() && c.about.len() <= 256);
         }
-        assert_eq!(menu().len(), COMMANDS.len());
+        let menu = menu();
+        assert_eq!(menu.len(), COMMANDS.len());
+        // Each says what it takes (issue #294): /new nothing, /model a name.
+        let args = |name: &str| {
+            menu.iter()
+                .find(|c| c.name == name)
+                .and_then(|c| c.args.clone())
+        };
+        assert_eq!(args("new").as_deref(), Some(""));
+        assert!(args("model").is_some_and(|a| a.contains("name")));
     }
 
     fn entry(id: &str, label: Option<&str>) -> ModelEntry {
