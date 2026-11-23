@@ -1220,7 +1220,17 @@ pub async fn known_as(
     id: &str,
 ) -> Result<Known> {
     let (group, sender): (bool, bool) = sqlx::query_as(
-        "SELECT            EXISTS (SELECT 1 FROM channel_refusals                    WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 AND is_group = 1)            OR EXISTS (SELECT 1 FROM channel_groups                    WHERE channel = ?1 AND account_id = ?2 AND group_id = ?3)            OR EXISTS (SELECT 1 FROM channel_group_parents                    WHERE channel = ?1 AND account_id = ?2 AND (child_id = ?3 OR parent_id = ?3)),            EXISTS (SELECT 1 FROM channel_refusals                    WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 AND is_group = 0)            OR EXISTS (SELECT 1 FROM channel_allowlist                    WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3)",
+        "SELECT \
+           EXISTS (SELECT 1 FROM channel_refusals \
+                   WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 AND is_group = 1) \
+           OR EXISTS (SELECT 1 FROM channel_groups \
+                   WHERE channel = ?1 AND account_id = ?2 AND group_id = ?3) \
+           OR EXISTS (SELECT 1 FROM channel_group_parents \
+                   WHERE channel = ?1 AND account_id = ?2 AND (child_id = ?3 OR parent_id = ?3)), \
+           EXISTS (SELECT 1 FROM channel_refusals \
+                   WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 AND is_group = 0) \
+           OR EXISTS (SELECT 1 FROM channel_allowlist \
+                   WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3)",
     )
     .bind(channel)
     .bind(account_id)
