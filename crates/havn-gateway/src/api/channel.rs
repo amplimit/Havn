@@ -2720,7 +2720,18 @@ pub(crate) async fn admit_group_of(
             }
         }
     } else {
-        told.push(group_id.to_string());
+        // One a group it is part of let in was welcomed then.
+        let mut through = false;
+        for parent in channel_access::parents_of(&state.db, channel, account_id, group_id).await? {
+            if channel_access::group_allowed(&state.db, channel, account_id, &parent, false).await?
+            {
+                through = true;
+                break;
+            }
+        }
+        if !through {
+            told.push(group_id.to_string());
+        }
     }
     let on = state
         .channels
@@ -5434,6 +5445,16 @@ mod tests {
                 "{replies:?}"
             );
             assert!(!replies.iter().any(|(to, _)| to == "dc:s1"), "{replies:?}");
+            // Let in on its own after, it is not welcomed again.
+            f.send("tg:owner", "/allow group dc:c1").await;
+            let replies = f.replies();
+            assert!(
+                replies
+                    .iter()
+                    .any(|(to, t)| to == "tg:owner" && t.contains("can use this bot now")),
+                "{replies:?}"
+            );
+            assert!(!replies.iter().any(|(to, _)| to == "dc:c1"), "{replies:?}");
             let allowed = channel_access::list_groups_on(&f.state.db, "telegram", "bot")
                 .await
                 .expect("groups");
