@@ -2780,12 +2780,21 @@ function ToolStep({ step }: { step: Extract<TraceItem, { kind: "step" }> }) {
       }
     >
       <div className="mb-2 ml-5 mt-1 flex flex-col gap-2">
-        <TraceBlock label="input" text={step.input} />
+        <TraceBlock label="input" text={readable(step.input)} />
         {inner > 0 && <TraceList items={step.steps ?? []} leftOut={step.left_out ?? 0} />}
         <TraceBlock label={step.error ? "error" : "result"} text={step.result} />
       </div>
     </Fold>
   );
+}
+
+/** A call's input as JSON laid out to read, or as it was when it is not JSON. */
+function readable(input: string): string {
+  try {
+    return JSON.stringify(JSON.parse(input), null, 2);
+  } catch {
+    return input;
+  }
 }
 
 /** A call's input or result, as it was, scrolling within its own box. */
@@ -2801,7 +2810,8 @@ function TraceBlock({ label, text }: { label: string; text: string }) {
           maxHeight: 240,
           whiteSpace: "pre-wrap",
           wordBreak: "break-word",
-          background: "var(--color-surface-muted)",
+          background: "var(--color-surface)",
+          border: "1px solid var(--color-border-default)",
         }}
       >
         {text}
