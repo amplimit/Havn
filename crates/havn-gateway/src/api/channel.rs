@@ -4579,6 +4579,20 @@ mod tests {
             f.send("tg:stranger", "/allow tg:stranger").await;
             assert!(!f.allowed("tg:stranger").await);
 
+            // A person is not let in as a group (issue #298).
+            f.replies();
+            f.send("tg:owner", "/allow group tg:stranger").await;
+            let replies = f.replies();
+            assert!(
+                replies.len() == 1 && replies[0].1.contains("not a group"),
+                "{replies:?}"
+            );
+            assert!(
+                !channel_access::group_allowed(&f.state.db, "telegram", "bot", "tg:stranger", true)
+                    .await
+                    .expect("group")
+            );
+
             f.send("tg:owner", "/allow tg:stranger").await;
             assert!(f.allowed("tg:stranger").await);
             let replies = f.replies();

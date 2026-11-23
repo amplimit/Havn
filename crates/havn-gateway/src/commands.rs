@@ -848,10 +848,17 @@ async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
             );
         }
     };
-    // Known as a group, it is one; `group` says so of what is known.
+    // Known as a group, it is one; a person is not made one by `group`. A
+    // group once let in as a person is known as a group again once it writes.
     let group = match known {
         channel_access::Known::Group | channel_access::Known::Both => true,
-        channel_access::Known::Sender => named_group,
+        channel_access::Known::Sender if named_group => {
+            return language.pick(
+                format!("({sender} is someone who wrote to this bot, not a group: send /allow {sender}.)"),
+                format!("（{sender} 是给这个机器人发过消息的人，不是群：请发 /allow {sender}。）"),
+            );
+        }
+        channel_access::Known::Sender => false,
         // A group whose messages it saw, though none was to it.
         channel_access::Known::Nothing
             if state
