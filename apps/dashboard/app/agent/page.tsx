@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import {
@@ -74,6 +74,8 @@ type Bubble = {
   buttons?: ChoiceButton[][];
   poll?: ChoicePoll;
   answered?: boolean;
+  /** New while the page is open, not loaded from history: it fades in. */
+  fresh?: boolean;
 };
 
 const AGENT_POLL_MS = 5000;
@@ -264,6 +266,9 @@ function Chat({ id }: { id: string }) {
   // and those shown now. Kept apart from `live` so a call ends at once.
   const doneCalls = useRef(new Set<string>());
   const liveCalls = useRef(new Set<string>());
+  // The reply's own text was on screen as it was written: the reply that
+  // replaces it does not fade in again.
+  const liveText = useRef(false);
   const pending = waiting > 0;
   // Tool calls of the running reply that wait for the user.
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
@@ -545,7 +550,10 @@ function Chat({ id }: { id: string }) {
             liveCalls.current.add(msg.call);
             // The call's reasoning or its reply, each pieced together alike.
             const key = msg.thinking ? "thinking" : "text";
-            if (!msg.thinking) setStep(null);
+            if (!msg.thinking) {
+              setStep(null);
+              liveText.current = true;
+            }
             setLive((prev) => {
               const i = prev.findIndex((p) => p.call === msg.call);
               const entry = i < 0 ? { call: msg.call, text: "", thinking: "" } : prev[i];
@@ -632,6 +640,7 @@ function Chat({ id }: { id: string }) {
           // A question the agent asked comes in the middle of its turn,
           // which goes on.
           const asking = msg.type === "agent_message" && Boolean(msg.buttons?.length || msg.poll);
+          const written = liveText.current;
           if (msg.type === "agent_message" && !asking) {
             if (!msg.broadcast) {
               choicesWaiting.current = Math.max(0, choicesWaiting.current - 1);
@@ -645,7 +654,7 @@ function Chat({ id }: { id: string }) {
             endLive();
           }
           if (msg.type === "agent_message") {
-            pushBubble("agent", msg.content, { buttons: msg.buttons, poll: msg.poll });
+            pushBubble("agent", msg.content, { buttons: msg.buttons, poll: msg.poll, fresh: !written });
           } else if (msg.type === "error") {
             pushBubble("system", `error: ${msg.message}`);
           }
@@ -762,6 +771,7 @@ function Chat({ id }: { id: string }) {
   // with its next whole text.
   function clearLive() {
     liveCalls.current.clear();
+    liveText.current = false;
     setLive([]);
   }
 
@@ -769,6 +779,7 @@ function Chat({ id }: { id: string }) {
   function endLive() {
     for (const call of liveCalls.current) doneCalls.current.add(call);
     liveCalls.current.clear();
+    liveText.current = false;
     // The oldest are forgotten; their text stopped coming long ago.
     for (const call of doneCalls.current) {
       if (doneCalls.current.size <= 500) break;
@@ -780,7 +791,7 @@ function Chat({ id }: { id: string }) {
   function pushBubble(role: Bubble["role"], content: string, extra: Partial<Bubble> = {}) {
     setBubbles((prev) => [
       ...prev,
-      { ...extra, id: bubbleIdRef.current++, role, content, ts: Date.now() },
+      { fresh: true, ...extra, id: bubbleIdRef.current++, role, content, ts: Date.now() },
     ]);
   }
 
@@ -1833,7 +1844,7 @@ function Bubble({
   const isSystem = bubble.role === "system";
   return (
     <div
-      className={`flex flex-col gap-1.5 ${align}`}
+      className={`flex flex-col gap-1.5 ${align}${bubble.fresh ? " enter" : ""}`}
       data-turn={bubble.turn}
       style={
         found
@@ -1895,7 +1906,7 @@ function Bubble({
               title="Edit and send again; the messages after it stay on their own branch. What tools already did (files written, messages sent) is not undone."
               label="edit"
             >
-              <Pencil size={12} className="shrink-0" aria-hidden="true" />
+              <Pencil size={14} className="shrink-0" aria-hidden="true" />
               edit
             </RowButton>
           )}
@@ -1906,7 +1917,7 @@ function Bubble({
               title="Answer your last message before this reply again; this reply stays as another version. What tools already did is not undone."
               label="regenerate"
             >
-              <RefreshCw size={12} className="shrink-0" aria-hidden="true" />
+              <RefreshCw size={14} className="shrink-0" aria-hidden="true" />
               regenerate
             </RowButton>
           )}
@@ -2388,7 +2399,7 @@ function RowButton({
       disabled={disabled}
       title={title}
       aria-label={label}
-      className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 transition-colors disabled:opacity-40"
+      className="inline-flex items-center gap-1 rounded px-2 py-1 transition-colors hover:bg-[rgba(100,116,141,0.08)] disabled:opacity-40"
       style={{ background: "transparent" }}
     >
       {children}
@@ -2438,25 +2449,23 @@ function ActionRow({
 
   return (
     <div
-      className={`mt-1 flex gap-2 px-1 ${align === "end" ? "justify-end" : "justify-start"}`}
-      style={{ fontSize: 11, color: "var(--color-body)" }}
+      className={`mt-0.5 flex gap-1 ${align === "end" ? "justify-end" : "justify-start"}`}
+      style={{ fontSize: 13, color: "var(--color-body)" }}
     >
       <button
         type="button"
         onClick={onCopy}
         title="copy markdown source"
         aria-label={copied ? "copied" : "copy message"}
-        className="rounded px-1.5 py-0.5 transition-colors"
-        style={{ background: "transparent" }}
-        onMouseEnter={(e) =>
-          (e.currentTarget.style.background = "rgba(100,116,141,0.08)")
-        }
-        onMouseLeave={(e) =>
-          (e.currentTarget.style.background = "transparent")
-        }
+        className="rounded px-2 py-1 transition-colors hover:bg-[rgba(100,116,141,0.08)]"
+        style={{ background: "transparent", color: copied ? "var(--color-success-text)" : undefined }}
       >
         <span className="inline-flex items-center gap-1">
-          {copied ? <Check size={12} className="shrink-0" aria-hidden="true" /> : <Copy size={12} className="shrink-0" aria-hidden="true" />}
+          {copied ? (
+            <Check size={14} className="enter shrink-0" aria-hidden="true" />
+          ) : (
+            <Copy size={14} className="shrink-0" aria-hidden="true" />
+          )}
           {copied ? "copied" : "copy"}
         </span>
       </button>
@@ -2466,17 +2475,11 @@ function ActionRow({
           onClick={onRetry}
           title="re-send the previous user message"
           aria-label="retry"
-          className="rounded px-1.5 py-0.5 transition-colors"
+          className="rounded px-2 py-1 transition-colors hover:bg-[rgba(100,116,141,0.08)]"
           style={{ background: "transparent" }}
-          onMouseEnter={(e) =>
-            (e.currentTarget.style.background = "rgba(100,116,141,0.08)")
-          }
-          onMouseLeave={(e) =>
-            (e.currentTarget.style.background = "transparent")
-          }
         >
           <span className="inline-flex items-center gap-1">
-            <RotateCcw size={12} className="shrink-0" aria-hidden="true" />
+            <RotateCcw size={14} className="shrink-0" aria-hidden="true" />
             retry
           </span>
         </button>
@@ -2486,13 +2489,6 @@ function ActionRow({
   );
 }
 
-/**
- * Inline "agent is replying" placeholder. Three pulsing dots in an
- * agent-shaped bubble — same styling as a real agent message so the
- * eye doesn't have to retrain. Replaced by the actual reply when
- * `agent_message` arrives (parent flips `pending` to false).
- */
-/** The reply as the model writes it, before the reply itself comes. */
 /**
  * The chat's model and how much it thinks, for this chat only: the model
  * menu as on the agent's settings page; the thinking menu with off first,
@@ -2574,7 +2570,7 @@ function LiveThinking({ text }: { text: string }) {
     if (el) el.scrollTop = el.scrollHeight;
   }, [text]);
   return (
-    <div className="flex flex-col items-start">
+    <div className="enter flex flex-col items-start">
       <div
         className="w-full px-3 py-2 text-xs"
         style={{ maxWidth: "min(85%, 720px)", color: "var(--color-body)" }}
@@ -2593,6 +2589,76 @@ function LiveThinking({ text }: { text: string }) {
   );
 }
 
+/**
+ * A part that opens on a click: its head always shown, with an arrow that
+ * turns, and what it holds, which opens and closes with a short motion.
+ * What it holds is made the first time it opens, after `onOpen`.
+ */
+function Fold({
+  head,
+  onOpen,
+  className,
+  style,
+  children,
+}: {
+  head: React.ReactNode;
+  onOpen?: () => void;
+  className?: string;
+  style?: React.CSSProperties;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const [made, setMade] = useState(false);
+  const id = useId();
+  return (
+    <div className={className} style={style}>
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={id}
+        onClick={() => {
+          if (!open) {
+            onOpen?.();
+            setMade(true);
+          }
+          setOpen(!open);
+        }}
+        className="flex w-full min-w-0 items-center gap-1.5 rounded py-0.5 text-left transition-colors hover:text-[var(--color-deep-navy)]"
+      >
+        <ChevronRight size={14} className="fold-arrow shrink-0" data-open={open} aria-hidden="true" />
+        {head}
+      </button>
+      <div id={id} className="fold" data-open={open} inert={!open}>
+        <div>{made && children}</div>
+      </div>
+    </div>
+  );
+}
+
+/** Text on one line, its runs of white space as one space. */
+function oneLine(text: string): string {
+  return text.slice(0, 400).replace(/\s+/g, " ").trim();
+}
+
+/** A tool call's input in a few words: the query, address, command or path it was given. */
+function briefInput(input: string): string {
+  let value: unknown;
+  try {
+    value = JSON.parse(input);
+  } catch {
+    return oneLine(input);
+  }
+  if (typeof value === "string") return oneLine(value);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "";
+  const fields = value as Record<string, unknown>;
+  for (const key of ["query", "url", "command", "path", "pattern", "question", "task", "text", "name"]) {
+    const field = fields[key];
+    if (typeof field === "string" && field.trim()) return oneLine(field);
+  }
+  const first = Object.values(fields).find((v) => typeof v === "string" && v.trim());
+  return typeof first === "string" ? oneLine(first) : "";
+}
+
 /** How long, in words a person reads: "12 s", "3 min". */
 function took(ms: number): string {
   const s = Math.max(1, Math.round(ms / 1000));
@@ -2600,9 +2666,9 @@ function took(ms: number): string {
 }
 
 /**
- * What a reply's turn did on the way, folded into one line: the model's
- * reasoning and each tool call, with its input and result, read when
- * opened.
+ * What a reply's turn did on the way, folded into one line: opened, the
+ * model's reasoning and each tool call, one line each, each opened in turn
+ * for the whole of it.
  */
 function TraceFold({
   agentId,
@@ -2621,67 +2687,126 @@ function TraceFold({
   const [trace, setTrace] = useState<TurnTrace | null>(null);
   const [error, setError] = useState<string | null>(null);
   const parts = [
-    summary.thought ? "thought" : null,
+    summary.thought ? "Thought" : null,
     summary.steps > 0 ? `${summary.steps} step${summary.steps === 1 ? "" : "s"}` : null,
   ].filter(Boolean);
-  const muted = { color: "var(--color-body)" };
   return (
-    <details
-      className="text-xs"
-      style={{ maxWidth: "min(85%, 720px)", ...muted }}
-      onToggle={(e) => {
-        if (!e.currentTarget.open || trace) return;
+    <Fold
+      className="w-full text-[13px]"
+      style={{ maxWidth: "min(85%, 720px)", color: "var(--color-body)" }}
+      head={
+        <span>
+          {parts.join(" · ")} · {took(summary.ms)}
+        </span>
+      }
+      onOpen={() => {
+        if (trace) return;
+        setError(null);
         api.chats.trace(agentId, chat, turn, scope ?? undefined).then(setTrace, (err: unknown) =>
           setError(err instanceof Error ? err.message : String(err)),
         );
       }}
     >
-      <summary className="cursor-pointer select-none">
-        {parts.join(" · ")} · {took(summary.ms)}
-      </summary>
       {!trace ? (
-        <p className="mt-2 pl-3" role={error ? "alert" : undefined}>
+        <p className="mt-1 pl-5" role={error ? "alert" : undefined}>
           {error ?? "loading…"}
         </p>
       ) : (
-      <TraceList items={trace.items} leftOut={trace.left_out} />
+        <TraceList items={trace.items} leftOut={trace.left_out} />
       )}
-    </details>
+    </Fold>
   );
 }
 
-/** What a turn did, in order; a subagent's own steps under its call. */
+/** What a turn did, in order, a line each; a subagent's own steps under its call. */
 function TraceList({ items, leftOut }: { items: TraceItem[]; leftOut: number }) {
   return (
-    <ol className="mt-2 flex flex-col gap-2 border-l-2 pl-3" style={{ borderColor: "var(--color-border-default)" }}>
-      {items.map((item, i) =>
-        item.kind === "thinking" ? (
-          <li key={i} style={{ whiteSpace: "pre-wrap" }}>
-            {item.text}
-          </li>
-        ) : (
-          <li key={i}>
-            <div className="font-mono" style={{ color: item.error ? "var(--color-ruby)" : "var(--color-deep-navy)" }}>
-              {item.tool}
-              {item.error && " (failed)"}
-            </div>
-            <pre className="mt-1 overflow-x-auto font-mono" style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-              {item.input}
-            </pre>
-            {item.steps && item.steps.length > 0 && (
-              <TraceList items={item.steps} leftOut={item.left_out ?? 0} />
-            )}
-            <pre
-              className="mt-1 overflow-y-auto font-mono"
-              style={{ maxHeight: 200, whiteSpace: "pre-wrap", wordBreak: "break-word", opacity: 0.85 }}
-            >
-              {item.result}
-            </pre>
-          </li>
-        ),
-      )}
-      {leftOut > 0 && <li>…and {leftOut} more, not kept.</li>}
+    <ol
+      className="ml-[7px] mt-0.5 flex flex-col gap-0.5 border-l pl-3"
+      style={{ borderColor: "var(--color-border-default)" }}
+    >
+      {items.map((item, i) => (
+        <li key={i}>
+          {item.kind === "thinking" ? <ThinkingStep text={item.text} /> : <ToolStep step={item} />}
+        </li>
+      ))}
+      {leftOut > 0 && <li className="py-0.5">…and {leftOut} more, not kept.</li>}
     </ol>
+  );
+}
+
+/** The model's reasoning: its first words, and opened, all of it. */
+function ThinkingStep({ text }: { text: string }) {
+  return (
+    <Fold
+      head={
+        <>
+          <span className="shrink-0 font-medium" style={{ color: "var(--color-label)" }}>
+            Thinking
+          </span>
+          <span className="min-w-0 truncate">{oneLine(text)}</span>
+        </>
+      }
+    >
+      <div className="mb-2 ml-5 mt-1 overflow-y-auto" style={{ maxHeight: 320, whiteSpace: "pre-wrap" }}>
+        {text}
+      </div>
+    </Fold>
+  );
+}
+
+/** A tool call: its name and what it was given, and opened, its input and result. */
+function ToolStep({ step }: { step: Extract<TraceItem, { kind: "step" }> }) {
+  const brief = briefInput(step.input);
+  const inner = step.steps?.length ?? 0;
+  return (
+    <Fold
+      head={
+        <>
+          <span
+            className="shrink-0 font-mono"
+            style={{ color: step.error ? "var(--color-warning-text)" : "var(--color-label)" }}
+          >
+            {step.tool}
+          </span>
+          {brief && <span className="min-w-0 truncate">{brief}</span>}
+          {inner > 0 && <span className="shrink-0">· {inner} step{inner === 1 ? "" : "s"}</span>}
+          {step.error && (
+            <span className="shrink-0" style={{ color: "var(--color-warning-text)" }}>
+              · failed
+            </span>
+          )}
+        </>
+      }
+    >
+      <div className="mb-2 ml-5 mt-1 flex flex-col gap-2">
+        <TraceBlock label="input" text={step.input} />
+        {inner > 0 && <TraceList items={step.steps ?? []} leftOut={step.left_out ?? 0} />}
+        <TraceBlock label={step.error ? "error" : "result"} text={step.result} />
+      </div>
+    </Fold>
+  );
+}
+
+/** A call's input or result, as it was, scrolling within its own box. */
+function TraceBlock({ label, text }: { label: string; text: string }) {
+  return (
+    <div>
+      <div className="mb-0.5 font-medium" style={{ color: "var(--color-label)" }}>
+        {label}
+      </div>
+      <pre
+        className="overflow-y-auto rounded px-2 py-1.5 font-mono text-xs"
+        style={{
+          maxHeight: 240,
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+          background: "var(--color-surface-muted)",
+        }}
+      >
+        {text}
+      </pre>
+    </div>
   );
 }
 
@@ -2781,9 +2906,10 @@ function OwnerApproval({
   );
 }
 
+/** The reply as the model writes it, before the reply itself comes. */
 function LiveBubble({ text }: { text: string }) {
   return (
-    <div className="flex flex-col items-start">
+    <div className="enter flex flex-col items-start">
       <div
         className="px-4 py-3"
         style={{
@@ -2831,11 +2957,34 @@ function stepText({ tool, detail }: Step): string {
   return detail ? `${verb}: ${detail}` : verb;
 }
 
+/**
+ * Inline "agent is replying" placeholder. Three pulsing dots in an
+ * agent-shaped bubble — same styling as a real agent message so the
+ * eye doesn't have to retrain. Replaced by the actual reply when
+ * `agent_message` arrives (parent flips `pending` to false). Above it,
+ * the step running, which fades in as each one starts.
+ */
 function TypingBubble({ step }: { step: Step | null }) {
   return (
-    <div className="flex flex-col items-start gap-1">
+    <div className="enter flex flex-col items-start gap-1">
       {step && (
-        <p className="wrap-anywhere px-1 text-xs" style={{ color: "var(--color-body)" }} role="status">
+        <p
+          key={stepText(step)}
+          className="enter flex items-center gap-1.5 wrap-anywhere px-1 text-xs"
+          style={{ color: "var(--color-body)" }}
+          role="status"
+        >
+          <span
+            aria-hidden="true"
+            className="shrink-0"
+            style={{
+              width: 6,
+              height: 6,
+              borderRadius: "50%",
+              background: "var(--color-stripe-purple)",
+              animation: "havn-breathe 1.6s ease-in-out infinite",
+            }}
+          />
           {stepText(step)}
         </p>
       )}
@@ -2984,11 +3133,11 @@ function Composer({
             </ComposerTab>
           </div>
           <span className="text-xs" style={{ color: "var(--color-body)" }}>
-            <kbd className="font-mono" style={{ fontSize: 11 }}>
+            <kbd className="font-mono" style={{ fontSize: 12 }}>
               Enter
             </kbd>{" "}
             to send ·{" "}
-            <kbd className="font-mono" style={{ fontSize: 11 }}>
+            <kbd className="font-mono" style={{ fontSize: 12 }}>
               Shift+Enter
             </kbd>{" "}
             new line · markdown

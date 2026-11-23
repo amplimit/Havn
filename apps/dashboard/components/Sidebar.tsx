@@ -296,7 +296,7 @@ export function Sidebar() {
 
 const LOGO_STYLE: React.CSSProperties = {
   color: "var(--color-deep-navy)",
-  fontWeight: 300,
+  fontWeight: 600,
   fontSize: 22,
   letterSpacing: "-0.4px",
   lineHeight: 1,
@@ -305,7 +305,7 @@ const LOGO_STYLE: React.CSSProperties = {
 function SectionTitle({ children }: { children: React.ReactNode }) {
   return (
     <div
-      className="mb-1 px-2 py-1 text-[11px] uppercase tracking-wider"
+      className="mb-1 px-2 py-1 text-xs font-medium uppercase tracking-wider"
       style={{ color: "var(--color-body)" }}
     >
       {children}
@@ -347,7 +347,7 @@ function SidebarLink({
 function VersionLine({ gateway, newer }: { gateway: string | null; newer: string | null }) {
   const mismatch = gateway !== null && gateway !== DASHBOARD_VERSION;
   return (
-    <div className="mt-3 px-2 text-[11px] tabular" style={{ color: "var(--color-body)" }}>
+    <div className="mt-3 px-2 text-xs tabular" style={{ color: "var(--color-body)" }}>
       <p>
         dashboard {DASHBOARD_VERSION}
         {gateway !== null && <> · gateway {gateway}</>}
