@@ -1200,6 +1200,41 @@ pub async fn place_title(
     Ok(title)
 }
 
+/// What `(channel, account_id)` knows an id as (issue #298).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Known {
+    /// A group or server: turned away, let in, or named by a group in it.
+    Group,
+    /// A sender: turned away or let in.
+    Sender,
+    /// Both: a group and a sender share the id.
+    Both,
+    Nothing,
+}
+
+/// What `(channel, account_id)` knows `id` as (issue #298).
+pub async fn known_as(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    id: &str,
+) -> Result<Known> {
+    let (group, sender): (bool, bool) = sqlx::query_as(
+        "SELECT            EXISTS (SELECT 1 FROM channel_refusals                    WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 AND is_group = 1)            OR EXISTS (SELECT 1 FROM channel_groups                    WHERE channel = ?1 AND account_id = ?2 AND group_id = ?3)            OR EXISTS (SELECT 1 FROM channel_group_parents                    WHERE channel = ?1 AND account_id = ?2 AND (child_id = ?3 OR parent_id = ?3)),            EXISTS (SELECT 1 FROM channel_refusals                    WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 AND is_group = 0)            OR EXISTS (SELECT 1 FROM channel_allowlist                    WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3)",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    Ok(match (group, sender) {
+        (true, true) => Known::Both,
+        (true, false) => Known::Group,
+        (false, true) => Known::Sender,
+        (false, false) => Known::Nothing,
+    })
+}
+
 /// Forget that group `group_id` was turned away (issue #285); whether it
 /// was. A sender's refusal of the same id stays.
 pub async fn forget_group_refusal(
@@ -1577,6 +1612,55 @@ mod tests {
             forget_group_refusal(&pool, "discord", "bot", "discord:c9")
                 .await
                 .expect("forget")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_id_is_known_as_what_was_seen_by_it() {
+        let pool = crate::connect_in_memory().await.expect("db");
+        let known = |id: &'static str| {
+            let pool = pool.clone();
+            async move { known_as(&pool, "discord", "bot", id).await.expect("known") }
+        };
+        assert_eq!(known("test2").await, Known::Nothing);
+        record_group_refusal(&pool, "discord", "bot", "discord:c1", "", "hi", Utc::now())
+            .await
+            .expect("refused");
+        assert_eq!(known("discord:c1").await, Known::Group);
+        // A server is known by the channels in it.
+        note_parents(
+            &pool,
+            "discord",
+            "bot",
+            "discord:c1",
+            &[Parent {
+                id: "discord:s1",
+                kind: PARENT_SPACE,
+                title: "Acme",
+            }],
+        )
+        .await
+        .expect("noted");
+        assert_eq!(known("discord:s1").await, Known::Group);
+        record_refusal(&pool, "discord", "bot", "discord:u1", "hi", Utc::now())
+            .await
+            .expect("refused");
+        assert_eq!(known("discord:u1").await, Known::Sender);
+        // Let in, it is still known.
+        admit(&pool, "discord", "bot", "discord:u1")
+            .await
+            .expect("admitted");
+        assert_eq!(known("discord:u1").await, Known::Sender);
+        admit(&pool, "discord", "bot", "discord:c1")
+            .await
+            .expect("admitted");
+        assert_eq!(known("discord:c1").await, Known::Both);
+        // Another account does not know them.
+        assert_eq!(
+            known_as(&pool, "discord", "other", "discord:c1")
+                .await
+                .expect("known"),
+            Known::Nothing
         );
     }
 

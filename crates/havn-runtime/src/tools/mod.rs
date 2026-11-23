@@ -414,14 +414,17 @@ impl ToolRegistry {
             return ToolResult::Error(format!("unknown tool: {name}"));
         };
         // In a conversation that is not the owner's, what runs, changes or
-        // reads things waits for the owner (issue #255).
-        let review = if gateway::FROM_OWNER
+        // reads things waits for the owner (issue #255). In a group, which
+        // others read, what reads things waits for them though they wrote
+        // (issue #297).
+        let owner = gateway::FROM_OWNER
             .try_with(|owner| *owner)
-            .unwrap_or(false)
-        {
-            None
-        } else {
-            crate::approvals::Review::of(name)
+            .unwrap_or(false);
+        let in_group = gateway::IN_GROUP.try_with(|group| *group).unwrap_or(false);
+        let review = match crate::approvals::Review::of(name) {
+            _ if owner && !in_group => None,
+            Some(crate::approvals::Review::Call) if owner => None,
+            review => review,
         };
         let mut must_ask = false;
         if let Some(hooks) = &self.hooks {
@@ -724,6 +727,23 @@ mod tests {
         }
         let res = gateway::FROM_OWNER.scope(true, read()).await;
         assert!(res.text().contains("the owner's note"), "{}", res.text());
+        // Issue #297: in a group, which others read, the owner's turn reads
+        // through them too; what they ask to be done is done.
+        let res = gateway::IN_GROUP
+            .scope(true, gateway::FROM_OWNER.scope(true, read()))
+            .await;
+        assert!(res.is_error(), "{}", res.text());
+        assert!(!res.text().contains("the owner's note"), "{}", res.text());
+        let write = reg.execute_for(
+            context::WEBCHAT,
+            "file_write",
+            serde_json::json!({"path": "out.md", "content": "done"}),
+            &env,
+        );
+        let res = gateway::IN_GROUP
+            .scope(true, gateway::FROM_OWNER.scope(true, write))
+            .await;
+        assert!(!res.is_error(), "{}", res.text());
     }
 
     #[tokio::test]
