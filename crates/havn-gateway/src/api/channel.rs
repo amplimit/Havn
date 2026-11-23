@@ -2720,7 +2720,18 @@ pub(crate) async fn admit_group_of(
             }
         }
     } else {
-        told.push(group_id.to_string());
+        // One a group it is part of let in was welcomed then.
+        let mut through = false;
+        for parent in channel_access::parents_of(&state.db, channel, account_id, group_id).await? {
+            if channel_access::group_allowed(&state.db, channel, account_id, &parent, false).await?
+            {
+                through = true;
+                break;
+            }
+        }
+        if !through {
+            told.push(group_id.to_string());
+        }
     }
     let on = state
         .channels
@@ -4579,6 +4590,20 @@ mod tests {
             f.send("tg:stranger", "/allow tg:stranger").await;
             assert!(!f.allowed("tg:stranger").await);
 
+            // A person is not let in as a group (issue #298).
+            f.replies();
+            f.send("tg:owner", "/allow group tg:stranger").await;
+            let replies = f.replies();
+            assert!(
+                replies.len() == 1 && replies[0].1.contains("not a group"),
+                "{replies:?}"
+            );
+            assert!(
+                !channel_access::group_allowed(&f.state.db, "telegram", "bot", "tg:stranger", true)
+                    .await
+                    .expect("group")
+            );
+
             f.send("tg:owner", "/allow tg:stranger").await;
             assert!(f.allowed("tg:stranger").await);
             let replies = f.replies();
@@ -4900,9 +4925,23 @@ mod tests {
                 .expect("refused");
             assert!(refused[0].group && refused[0].sender_id == "tg:-100");
 
-            // Only the owner lets a group in.
+            // An id the bot has not seen lets nothing in, and the hint's
+            // example is this platform's (issue #298).
+            f.send("tg:owner", "/allow test2").await;
+            f.send("tg:owner", "/allow Team / chat").await;
+            let replies = f.replies();
+            assert!(replies[0].1.contains("has not seen test2"), "{replies:?}");
+            assert!(replies[1].1.contains("/allow tg:123"), "{replies:?}");
+            assert!(
+                !channel_access::is_allowed(&f.state.db, "telegram", "bot", "test2")
+                    .await
+                    .expect("allowed")
+            );
+
+            // Only the owner lets a group in; a group's id is let in as a
+            // group without the word (issue #298).
             f.send("tg:ann", "/allow group tg:-100").await;
-            f.send("tg:owner", "/allow group tg:-100").await;
+            f.send("tg:owner", "/allow tg:-100").await;
             let replies = f.replies();
             assert!(
                 replies
@@ -4914,6 +4953,30 @@ mod tests {
                 replies.iter().any(|(to, _)| to == "tg:-100"),
                 "the group is told: {replies:?}"
             );
+            assert!(
+                !replies
+                    .iter()
+                    .any(|(to, t)| to == "tg:-100" && t.contains("Paired")),
+                "not as a person: {replies:?}"
+            );
+            assert!(
+                !channel_access::is_allowed(&f.state.db, "telegram", "bot", "tg:-100")
+                    .await
+                    .expect("allowed")
+            );
+            // Let in as a person before, it is still taken for the group.
+            channel_access::admit(&f.state.db, "telegram", "bot", "tg:-100")
+                .await
+                .expect("admitted");
+            f.send("tg:owner", "/allow tg:-100").await;
+            let replies = f.replies();
+            assert!(
+                replies[0].1.contains("could already use this bot"),
+                "{replies:?}"
+            );
+            channel_access::revoke_sender(&f.state.db, "telegram", "bot", "tg:-100")
+                .await
+                .expect("revoked");
             f.say_in("tg:-100", "tg:ann", "@bot hello", true).await;
             let got = f.messages();
             assert_eq!(got.len(), 1);
@@ -5076,7 +5139,27 @@ mod tests {
                 "kept per group"
             );
 
-            // Not known (the gateway restarted, say): what works in any mode, and no advice.
+            // A group the bot has not seen is not let in (issue #298).
+            f.send("tg:owner", "/allow group tg:-300").await;
+            let replies = f.replies();
+            assert!(
+                replies.len() == 1 && replies[0].1.contains("has not seen tg:-300"),
+                "{replies:?}"
+            );
+
+            // Turned away before the gateway restarted, say: whether it sees
+            // every message is not known: what works in any mode, and no advice.
+            channel_access::record_group_refusal(
+                &f.state.db,
+                "telegram",
+                "bot",
+                "tg:-300",
+                "Team",
+                "hi",
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("refused");
             let (owner, welcome) = allow(&mut f, "tg:-300").await;
             assert!(!owner.contains("/setprivacy"), "{owner}");
             assert!(
@@ -5362,6 +5445,16 @@ mod tests {
                 "{replies:?}"
             );
             assert!(!replies.iter().any(|(to, _)| to == "dc:s1"), "{replies:?}");
+            // Let in on its own after, it is not welcomed again.
+            f.send("tg:owner", "/allow group dc:c1").await;
+            let replies = f.replies();
+            assert!(
+                replies
+                    .iter()
+                    .any(|(to, t)| to == "tg:owner" && t.contains("can use this bot now")),
+                "{replies:?}"
+            );
+            assert!(!replies.iter().any(|(to, _)| to == "dc:c1"), "{replies:?}");
             let allowed = channel_access::list_groups_on(&f.state.db, "telegram", "bot")
                 .await
                 .expect("groups");

@@ -5,6 +5,7 @@
 
 use havn_core::AgentId;
 use havn_db::repo::agents as agents_repo;
+use havn_db::repo::channel_access;
 use havn_proto::{ChatCommand, ChatCommandKind};
 use tracing::warn;
 
@@ -810,7 +811,7 @@ async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
             )
             .into();
     }
-    let Some((channel, account_id, _)) = crate::channel_id_codec::decode(&asker.scope) else {
+    let Some((channel, account_id, chat)) = crate::channel_id_codec::decode(&asker.scope) else {
         return language
             .pick(
                 "(Send it in your chat with the bot they wrote to, or use the agent's settings page.)",
@@ -819,7 +820,7 @@ async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
             .into();
     };
     // A group (issue #263): `/allow group <id>`.
-    let (group, sender) = match args.trim().strip_prefix("group") {
+    let (named_group, sender) = match args.trim().strip_prefix("group") {
         Some(id) if id.is_empty() || id.starts_with(char::is_whitespace) => (true, id.trim()),
         _ => (false, args.trim()),
     };
@@ -827,13 +828,57 @@ async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
         || sender.chars().any(char::is_whitespace)
         || crate::channel_id_codec::validate_channel_id_part("sender_id", sender).is_err()
     {
-        return language
-            .pick(
-                "(Send /allow and who, such as /allow tg:123.)",
-                "（发 /allow 加对方，比如 /allow tg:123。）",
-            )
-            .into();
+        // An id as this platform writes them (issue #298).
+        let example = match chat.split_once(':') {
+            Some((platform, _)) => format!("{platform}:123"),
+            None => "123".to_string(),
+        };
+        return language.pick(
+            format!("(Send /allow and the id the notice gave, such as /allow {example}.)"),
+            format!("（发 /allow 加通知里给出的编号，比如 /allow {example}。）"),
+        );
     }
+    // Only what the bot knows by that id, as what it is (issue #298).
+    let known = match channel_access::known_as(&state.db, channel, account_id, sender).await {
+        Ok(known) => known,
+        Err(e) => {
+            return language.pick(
+                format!("(Could not let {sender} in: {e}.)"),
+                format!("（没能放行 {sender}：{e}。）"),
+            );
+        }
+    };
+    // Known as a group, it is one; a person is not made one by `group`. A
+    // group once let in as a person is known as a group again once it writes.
+    let group = match known {
+        channel_access::Known::Group | channel_access::Known::Both => true,
+        channel_access::Known::Sender if named_group => {
+            return language.pick(
+                format!("({sender} is someone who wrote to this bot, not a group: send /allow {sender}.)"),
+                format!("（{sender} 是给这个机器人发过消息的人，不是群：请发 /allow {sender}。）"),
+            );
+        }
+        channel_access::Known::Sender => false,
+        // A group whose messages it saw, though none was to it.
+        channel_access::Known::Nothing
+            if state
+                .channel_router
+                .sees_all(
+                    &crate::channel_router::AccountKey::new(channel, account_id),
+                    sender,
+                )
+                .await
+                .is_some() =>
+        {
+            true
+        }
+        channel_access::Known::Nothing => {
+            return language.pick(
+                format!("(This bot has not seen {sender} lately: no one and no group by that id was turned away or let in. Use the id a notice gave; for an old notice, have them write to the bot again.)"),
+                format!("（这个机器人最近没见过 {sender}：没有哪个人或群以这个编号被拒绝或放行过。请用通知里给出的编号；通知太旧的话，请对方再给机器人发一次消息。）"),
+            );
+        }
+    };
     let Ok(Some(agent)) = agents_repo::find_by_id(&state.db, asker.agent_id).await else {
         return language
             .pick("(The agent is gone.)", "（这个 agent 不在了。）")

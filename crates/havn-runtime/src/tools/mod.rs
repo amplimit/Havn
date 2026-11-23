@@ -414,11 +414,14 @@ impl ToolRegistry {
             return ToolResult::Error(format!("unknown tool: {name}"));
         };
         // In a conversation that is not the owner's, what runs, changes or
-        // reads things waits for the owner (issue #255).
-        let review = if gateway::FROM_OWNER
+        // reads things waits for the owner (issue #255). So it does in a
+        // group, though they wrote (issue #297): others read it, and their
+        // lines come with the owner's.
+        let owner = gateway::FROM_OWNER
             .try_with(|owner| *owner)
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        let in_group = gateway::IN_GROUP.try_with(|group| *group).unwrap_or(false);
+        let review = if owner && !in_group {
             None
         } else {
             crate::approvals::Review::of(name)
@@ -724,6 +727,24 @@ mod tests {
         }
         let res = gateway::FROM_OWNER.scope(true, read()).await;
         assert!(res.text().contains("the owner's note"), "{}", res.text());
+        // Issue #297: in a group, which others read, the owner's turn reads
+        // and runs things through them too.
+        let res = gateway::IN_GROUP
+            .scope(true, gateway::FROM_OWNER.scope(true, read()))
+            .await;
+        assert!(res.is_error(), "{}", res.text());
+        assert!(!res.text().contains("the owner's note"), "{}", res.text());
+        let write = reg.execute_for(
+            context::WEBCHAT,
+            "file_write",
+            serde_json::json!({"path": "out.md", "content": "done"}),
+            &env,
+        );
+        let res = gateway::IN_GROUP
+            .scope(true, gateway::FROM_OWNER.scope(true, write))
+            .await;
+        assert!(res.is_error(), "{}", res.text());
+        assert!(!dir.path().join("out.md").exists());
     }
 
     #[tokio::test]

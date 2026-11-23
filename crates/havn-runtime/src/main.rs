@@ -2901,9 +2901,10 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         summary.as_deref(),
         // The owner's chats only, on any channel (issue #218): someone
         // else's does not fill the agent's memory, nor get its saved facts
-        // in front of it (memory_search still answers them).
-        msg.from_owner,
-        msg.from_owner,
+        // in front of it (memory_search still answers them). Nor does a
+        // group's, which others read, though the owner wrote (issue #297).
+        opens_memory(&msg),
+        opens_memory(&msg),
         Some(&with_rules(&ctx.pool, &msg, talk_section(&msg)).await),
     )
     .await;
@@ -3515,6 +3516,12 @@ fn time_section(now: chrono::DateTime<chrono::Utc>, zone: chrono_tz::Tz) -> Stri
     ))
 }
 
+/// Whether the turn answering `msg` may be given what memory holds: the
+/// owner's, outside a group, which others read (issue #297).
+fn opens_memory(msg: &InboundMessage) -> bool {
+    msg.from_owner && !msg.group
+}
+
 /// Build a per-turn system prompt by appending sections to the frozen base
 /// (per-call only — the base stays untouched per spec §9.4):
 ///
@@ -3533,7 +3540,8 @@ fn time_section(now: chrono::DateTime<chrono::Utc>, zone: chrono_tz::Tz) -> Stri
 /// cache with the conversation after it (issue #220).
 /// `summary`: of the turns before the ones given (issue #105); `owner`:
 /// the turn answers the owner in the dashboard, who may be told to save
-/// what they say about themselves.
+/// what they say about themselves; `memory_open`: the turn may be given
+/// what memory holds, the owner's saved facts with `owner` too.
 async fn augment_with_skills(
     ctx: &Ctx,
     base: &SystemPrompt,
@@ -3555,8 +3563,9 @@ async fn augment_with_skills(
     }
 
     // What is saved about the owner and their work (issue #218), in every
-    // chat of theirs, on any channel; not put in front of anyone else's.
-    if owner {
+    // chat of theirs, on any channel; not put in front of anyone else's,
+    // nor in a group's (issue #297).
+    if owner && memory_open {
         match saved_facts(&ctx.pool).await {
             Ok(Some(section)) => augmented = augmented.augmented(&section),
             Ok(None) => {}
@@ -5091,6 +5100,12 @@ run ls"
         assert!(stranger.contains("\"tg:42\""));
         let linked = talk_section(&msg("telegram", true));
         assert!(linked.contains("is your owner."), "{linked}");
+        // Memory is put in front of the owner's own chats only (issue #297).
+        assert!(opens_memory(&msg("telegram", true)));
+        assert!(!opens_memory(&msg("telegram", false)));
+        let mut in_group = msg("telegram", true);
+        in_group.group = true;
+        assert!(!opens_memory(&in_group));
         let mut odd = msg("telegram", false);
         odd.sender_id = format!("tg:\u{202E}{}", "x".repeat(500));
         let shown = talk_section(&odd);
