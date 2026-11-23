@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { Suspense } from "react";
 import "./globals.css";
-import { Sidebar } from "@/components/Sidebar";
+import { PageContent, Sidebar } from "@/components/Sidebar";
 
 export const metadata: Metadata = {
   title: "havn dashboard",
@@ -26,7 +26,7 @@ export default function RootLayout({
           <div className="flex min-h-screen flex-col md:flex-row">
             <Sidebar />
             <main id="main" tabIndex={-1} className="min-w-0 flex-1 overflow-x-hidden focus:outline-none">
-              {children}
+              <PageContent>{children}</PageContent>
             </main>
           </div>
         </Suspense>

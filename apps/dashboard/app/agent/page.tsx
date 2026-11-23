@@ -10,10 +10,10 @@ import {
   type ChatCommand,
   type ChatSearch,
   thinkingChoices,
+  modelName,
   type ChannelChat,
   type ChatSummary,
   type ConversationTurn,
-  type EmbeddingStatus,
   type MeView,
   type SentFile,
   type TraceItem,
@@ -30,13 +30,18 @@ import type {
   ServerMessage,
 } from "@/lib/protocol";
 import {
+  ArrowUp,
   BookOpen,
+  Bot,
   Brain,
+  CalendarClock,
   Check,
   Copy,
+  Database,
+  Eye,
   FileText,
   FolderOpen,
-  Layers,
+  Globe,
   MessageSquarePlus,
   MessagesSquare,
   Paperclip,
@@ -47,7 +52,10 @@ import {
   RotateCcw,
   Search,
   Settings,
+  Square,
+  Terminal,
   Trash2,
+  Wrench,
   X,
 } from "lucide-react";
 
@@ -235,7 +243,6 @@ function Chat({ id }: { id: string }) {
 
   const [agent, setAgent] = useState<AgentView | null>(null);
   const [me, setMe] = useState<MeView | null>(null);
-  const [embedding, setEmbedding] = useState<EmbeddingStatus | null>(null);
   // Whether the agent's workspace can be browsed (issue #177).
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   useEffect(() => {
@@ -355,24 +362,6 @@ function Chat({ id }: { id: string }) {
   const bubbleIdRef = useRef(0);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  // System-level embedding status (spec §9.4 v0.7). Fetched once
-  // on mount — config rarely changes mid-session and stale info
-  // here just shows the wrong pill briefly. Failure is silently
-  // swallowed (the chat works fine without knowing the embedder).
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const e = await api.embedding();
-        if (!cancelled) setEmbedding(e);
-      } catch {
-        // shrug — non-fatal
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   // Initial /me — fetched once. The user identity doesn't change for
   // the life of a page, and re-fetching it every poll caused the WS
@@ -1123,22 +1112,19 @@ function Chat({ id }: { id: string }) {
       <div className={`${showChats ? "hidden" : "flex"} min-w-0 flex-1 flex-col md:flex`}>
         {/* Header */}
         <div
-          className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-4 sm:px-8"
+          className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-b px-4 py-2.5 sm:px-8"
           style={{ borderColor: "var(--color-border-default)" }}
         >
-          <div>
-            <h1 className="display-h3">{agent.name}</h1>
-            <p
-              className="font-mono text-xs"
-              style={{ color: "var(--color-body)" }}
-            >
-              {agent.id}
-            </p>
+          <div className="flex min-w-0 items-center gap-2">
+            <h1 className="display-h3 truncate" title={`agent ${agent.id}`}>
+              {agent.name}
+            </h1>
+            <ConnectionPill state={wsState} agent={agent} />
           </div>
-          <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+          <div className="flex flex-wrap items-center gap-0.5">
             <button
               type="button"
-              className="btn-ghost inline-flex items-center gap-1.5 md:hidden"
+              className="tool-button text-sm md:hidden"
               onClick={() => setShowChats(true)}
             >
               <MessagesSquare size={16} className="shrink-0" aria-hidden="true" />
@@ -1146,7 +1132,7 @@ function Chat({ id }: { id: string }) {
             </button>
             <button
               type="button"
-              className="btn-ghost inline-flex items-center gap-1.5"
+              className="tool-button text-sm md:hidden"
               onClick={() => openChatById(null)}
               title="Start a new chat; this one stays in the list"
             >
@@ -1155,7 +1141,7 @@ function Chat({ id }: { id: string }) {
             </button>
             <Link
               href={`/agent/memory?id=${agent.id}`}
-              className="btn-ghost inline-flex items-center gap-1.5"
+              className="tool-button text-sm"
               title="See what the agent remembers about you"
             >
               <Brain size={16} className="shrink-0" aria-hidden="true" />
@@ -1163,7 +1149,7 @@ function Chat({ id }: { id: string }) {
             </Link>
             <Link
               href={`/agent/skills?id=${agent.id}`}
-              className="btn-ghost inline-flex items-center gap-1.5"
+              className="tool-button text-sm"
               title="Installed skills + curator log"
             >
               <BookOpen size={16} className="shrink-0" aria-hidden="true" />
@@ -1172,7 +1158,7 @@ function Chat({ id }: { id: string }) {
             {workspaceOpen && (
               <Link
                 href={`/agent/workspace?id=${agent.id}`}
-                className="btn-ghost inline-flex items-center gap-1.5"
+                className="tool-button text-sm"
                 title="Browse the files in the agent's workspace"
               >
                 <FolderOpen size={16} className="shrink-0" aria-hidden="true" />
@@ -1181,14 +1167,12 @@ function Chat({ id }: { id: string }) {
             )}
             <Link
               href={`/agent/settings?id=${agent.id}`}
-              className="btn-ghost inline-flex items-center gap-1.5"
+              className="tool-button text-sm"
               title="Rename, change model, edit policy"
             >
               <Settings size={16} className="shrink-0" aria-hidden="true" />
               settings
             </Link>
-            <MemoryPill embedding={embedding} />
-            <ConnectionPill state={wsState} agent={agent} />
           </div>
         </div>
 
@@ -2063,6 +2047,7 @@ function MessageInput({
   placeholder,
   autoFocus,
   label,
+  bare,
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -2073,6 +2058,8 @@ function MessageInput({
   placeholder?: string;
   autoFocus?: boolean;
   label: string;
+  /** Inside a panel that draws the frame: no border of its own. */
+  bare?: boolean;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
   useEffect(() => {
@@ -2114,15 +2101,16 @@ function MessageInput({
       autoFocus={autoFocus}
       aria-label={label}
       rows={2}
-      className="input w-full"
+      className={bare ? "block w-full bg-transparent outline-none placeholder:text-[var(--color-body)]" : "input w-full"}
       style={{
         resize: "none",
         overflowY: "auto",
         minHeight: 56,
         maxHeight: 320,
         fontFamily: "inherit",
-        padding: "10px 12px",
+        padding: bare ? "12px 12px 4px" : "10px 12px",
         lineHeight: 1.45,
+        ...(bare ? { fontSize: 15, color: "var(--color-deep-navy)" } : {}),
       }}
     />
   );
@@ -2515,32 +2503,32 @@ function ChatModelMenus({
   const thinking = chatThinking && choices.includes(chatThinking) ? chatThinking : fallback;
   const name = (id: string | null) => {
     const m = models.models.find((x) => x.id === id);
-    return m?.label ?? id ?? "default";
+    return id ? modelName(id, m?.label) : "default";
   };
   const thinkingName = (c: string) =>
     c === "off" ? "thinking off" : c === "on" ? "thinking on" : spec?.style === "budget" ? `think ${Number(c).toLocaleString()} tokens` : `think ${c}`;
   return (
     <>
       <select
-        className="input text-sm"
-        style={{ maxWidth: 220, padding: "4px 8px" }}
+        className="composer-select"
+        style={{ maxWidth: 220 }}
         aria-label="model of this chat"
-        title="The model of this chat; others keep theirs"
+        title={`The model of this chat; others keep theirs. Now: ${model ?? "the default"}`}
         value={chatModel ?? ""}
         disabled={disabled}
         onChange={(e) => onSettings({ model: e.target.value || null })}
       >
         <option value="">{name(agentModel)} (agent&apos;s)</option>
         {models.models.map((m) => (
-          <option key={m.id} value={m.id}>
-            {m.label ?? m.id}
+          <option key={m.id} value={m.id} title={m.id}>
+            {modelName(m.id, m.label)}
             {m.id === agentModel ? " (kept for this chat)" : ""}
           </option>
         ))}
       </select>
       <select
-        className="input text-sm"
-        style={{ maxWidth: 200, padding: "4px 8px" }}
+        className="composer-select"
+        style={{ maxWidth: 180 }}
         aria-label="thinking of this chat"
         title={spec ? "How much this chat's model thinks" : "This model is not set up to think"}
         value={spec ? thinking : "off"}
@@ -2688,7 +2676,7 @@ function TraceFold({
   const [error, setError] = useState<string | null>(null);
   const parts = [
     summary.thought ? "Thought" : null,
-    summary.steps > 0 ? `${summary.steps} step${summary.steps === 1 ? "" : "s"}` : null,
+    summary.steps > 0 ? `${summary.steps} tool call${summary.steps === 1 ? "" : "s"}` : null,
   ].filter(Boolean);
   return (
     <Fold
@@ -2741,7 +2729,8 @@ function ThinkingStep({ text }: { text: string }) {
     <Fold
       head={
         <>
-          <span className="shrink-0 font-medium" style={{ color: "var(--color-label)" }}>
+          <Brain size={14} className="shrink-0" aria-hidden="true" style={{ color: "var(--color-stripe-purple-mid)" }} />
+          <span className="shrink-0 font-medium" style={{ color: "var(--color-deep-navy)" }}>
             Thinking
           </span>
           <span className="min-w-0 truncate">{oneLine(text)}</span>
@@ -2763,9 +2752,10 @@ function ToolStep({ step }: { step: Extract<TraceItem, { kind: "step" }> }) {
     <Fold
       head={
         <>
+          <ToolIcon tool={step.tool} color={step.error ? "var(--color-warning-text)" : "var(--color-label)"} />
           <span
-            className="shrink-0 font-mono"
-            style={{ color: step.error ? "var(--color-warning-text)" : "var(--color-label)" }}
+            className="shrink-0 font-mono font-medium"
+            style={{ color: step.error ? "var(--color-warning-text)" : "var(--color-deep-navy)" }}
           >
             {step.tool}
           </span>
@@ -2786,6 +2776,20 @@ function ToolStep({ step }: { step: Extract<TraceItem, { kind: "step" }> }) {
       </div>
     </Fold>
   );
+}
+
+/** The icon of a tool, by what it does. */
+function ToolIcon({ tool, color }: { tool: string; color: string }) {
+  const look = { size: 14, className: "shrink-0", "aria-hidden": true, style: { color } } as const;
+  if (tool === "web_search") return <Search {...look} />;
+  if (tool === "web_fetch") return <Globe {...look} />;
+  if (tool === "shell" || tool === "process") return <Terminal {...look} />;
+  if (tool.startsWith("file_") || tool === "send_file" || tool === "view_image") return <FileText {...look} />;
+  if (tool.startsWith("memory_")) return <Database {...look} />;
+  if (tool === "conversation_search") return <MessagesSquare {...look} />;
+  if (tool === "subagent_spawn" || tool === "agent_query") return <Bot {...look} />;
+  if (tool === "schedule") return <CalendarClock {...look} />;
+  return <Wrench {...look} />;
 }
 
 /** A call's input as JSON laid out to read, or as it was when it is not JSON. */
@@ -3102,6 +3106,8 @@ function Composer({
       : commands.filter((c) => c.name.startsWith(typed) || c.aliases.some((a) => a.startsWith(typed)));
   const canSend = (draft.trim() !== "" || attached.length > 0) && uploading === 0;
   const [tab, setTab] = useState<"write" | "preview">("write");
+  // Nothing to preview once the text is gone: back to writing.
+  if (tab === "preview" && !draft.trim()) setTab("write");
   // The composer is ready whenever the WS is up. A message sent while a
   // reply runs waits in the agent and is answered after it, in order.
   const ready = wsState === "open";
@@ -3117,60 +3123,15 @@ function Composer({
         e.preventDefault();
         if (ready) onAttach(Array.from(e.dataTransfer.files));
       }}
-      className="border-t px-4 py-3 sm:px-8"
-      style={{ borderColor: "var(--color-border-default)" }}
+      className="px-4 pb-4 pt-2 sm:px-8"
     >
       <div className="mx-auto max-w-3xl">
-        {/* Tab strip */}
-        <div className="mb-2 flex items-center justify-between">
-          <div
-            className="flex gap-1 text-sm"
-            role="tablist"
-            aria-label="Composer mode"
-          >
-            <ComposerTab
-              active={tab === "write"}
-              onClick={() => setTab("write")}
-            >
-              Write
-            </ComposerTab>
-            <ComposerTab
-              active={tab === "preview"}
-              onClick={() => setTab("preview")}
-              disabled={!draft.trim()}
-            >
-              Preview
-            </ComposerTab>
-          </div>
-          <span className="text-xs" style={{ color: "var(--color-body)" }}>
-            <kbd className="font-mono" style={{ fontSize: 12 }}>
-              Enter
-            </kbd>{" "}
-            to send ·{" "}
-            <kbd className="font-mono" style={{ fontSize: 12 }}>
-              Shift+Enter
-            </kbd>{" "}
-            new line · markdown
-          </span>
-        </div>
-
-        {(attached.length > 0 || uploading > 0) && (
-          <div className="mb-2 flex flex-wrap items-center gap-2">
-            <AttachmentCards agentId={agentId} files={attached} onRemove={(i) => onDetach(attached[i].path)} />
-            {uploading > 0 && (
-              <span className="inline-flex items-center gap-1 text-xs" role="status" style={{ color: "var(--color-body)" }}>
-                <Spinner /> uploading
-              </span>
-            )}
-          </div>
-        )}
-
         {suggested.length > 0 && tab === "write" && (
           <ul
-            className="card mb-2 overflow-y-auto py-1 text-sm"
+            className="card enter mb-2 overflow-y-auto py-1 text-sm"
             role="listbox"
             aria-label="Commands"
-            style={{ maxHeight: 240, backgroundColor: "var(--color-surface)" }}
+            style={{ maxHeight: 240, backgroundColor: "var(--color-surface)", boxShadow: "var(--shadow-ambient)" }}
           >
             {suggested.map((c) => (
               <li key={c.name}>
@@ -3197,179 +3158,142 @@ function Composer({
           </ul>
         )}
 
-        {/* Body */}
-        {tab === "write" ? (
-          <MessageInput
-            placeholder={
-              ready
-                ? "Message the agent: Enter sends, Shift+Enter starts a new line, files can be pasted or dropped"
-                : "Waiting for agent connection…"
-            }
-            value={draft}
-            onChange={setDraft}
-            onEnter={() => {
-              if (ready && canSend) onSubmit();
-            }}
-            onFiles={(files) => {
-              if (ready) onAttach(files);
-            }}
-            disabled={!ready}
-            label="message"
-          />
-        ) : (
-          <div
-            className="card w-full overflow-y-auto px-4 py-3"
-            style={{
-              minHeight: 84,
-              maxHeight: 360,
-              backgroundColor: "var(--color-surface)",
-            }}
-          >
-            {draft.trim() ? (
-              <Markdown>{draft}</Markdown>
-            ) : (
-              <span style={{ color: "var(--color-body)" }}>
-                Nothing to preview yet.
-              </span>
-            )}
-          </div>
-        )}
+        {/* One panel: what is attached, the text (or its preview), and a
+            bar of what goes with it. */}
+        <div className="composer">
+          {(attached.length > 0 || uploading > 0) && (
+            <div className="flex flex-wrap items-center gap-2 px-3 pt-3">
+              <AttachmentCards agentId={agentId} files={attached} onRemove={(i) => onDetach(attached[i].path)} />
+              {uploading > 0 && (
+                <span className="inline-flex items-center gap-1 text-xs" role="status" style={{ color: "var(--color-body)" }}>
+                  <Spinner /> uploading
+                </span>
+              )}
+            </div>
+          )}
 
-        {/* Action row */}
-        <div className="mt-2 flex items-center justify-end gap-3">
-          <input
-            ref={fileInput}
-            type="file"
-            multiple
-            hidden
-            onChange={(e) => {
-              onAttach(Array.from(e.target.files ?? []));
-              e.target.value = "";
-            }}
-          />
-          <button
-            type="button"
-            className="btn-ghost mr-auto inline-flex items-center gap-1.5"
-            onClick={() => fileInput.current?.click()}
-            disabled={!ready}
-            title="Attach files: they are saved in the agent's inbox/ and sent with your message (up to 25 MB each)"
-          >
-            <Paperclip size={16} className="shrink-0" aria-hidden="true" />
-            attach
-          </button>
-          {models && models.models.length > 0 && (
-            <ChatModelMenus
-              models={models}
-              chatModel={chatModel}
-              chatThinking={chatThinking}
+          {tab === "write" ? (
+            <MessageInput
+              bare
+              placeholder={
+                ready
+                  ? "Message the agent: Enter sends, Shift+Enter starts a new line, files can be pasted or dropped"
+                  : "Waiting for agent connection…"
+              }
+              value={draft}
+              onChange={setDraft}
+              onEnter={() => {
+                if (ready && canSend) onSubmit();
+              }}
+              onFiles={(files) => {
+                if (ready) onAttach(files);
+              }}
               disabled={!ready}
-              onSettings={onSettings}
+              label="message"
             />
-          )}
-          {pending && (
-            <span
-              className="flex items-center gap-2 text-sm"
-              style={{ color: "var(--color-body)" }}
-              role="status"
+          ) : (
+            <div
+              className="w-full overflow-y-auto px-3 pb-1 pt-3"
+              style={{ minHeight: 56, maxHeight: 360, color: "var(--color-deep-navy)" }}
+              aria-label="preview of the message"
             >
-              <Spinner /> replying
-              {waiting > 1 && `, ${waiting - 1} queued`}
-            </span>
+              <Markdown>{draft}</Markdown>
+            </div>
           )}
-          {pending && (
+
+          <div className="flex flex-wrap items-center gap-1 px-2 pb-2">
+            <input
+              ref={fileInput}
+              type="file"
+              multiple
+              hidden
+              onChange={(e) => {
+                onAttach(Array.from(e.target.files ?? []));
+                e.target.value = "";
+              }}
+            />
             <button
               type="button"
-              className="btn-ghost"
-              onClick={onStop}
-              disabled={wsState !== "open"}
-              title="Stop the reply in progress; queued messages still get answered"
+              className="tool-button"
+              onClick={() => fileInput.current?.click()}
+              disabled={!ready}
+              title="Attach files: they are saved in the agent's inbox/ and sent with your message (up to 25 MB each)"
+              aria-label="attach files"
             >
-              stop
+              <Paperclip size={16} className="shrink-0" aria-hidden="true" />
             </button>
-          )}
-          <button
-            type="submit"
-            className="btn-primary"
-            disabled={!ready || !canSend}
-            style={{ minWidth: 110 }}
-          >
-            {pending ? "queue" : "send"}
-          </button>
+            <button
+              type="button"
+              className="tool-button"
+              aria-pressed={tab === "preview"}
+              onClick={() => setTab(tab === "write" ? "preview" : "write")}
+              disabled={tab === "write" && !draft.trim()}
+              title={tab === "write" ? "Preview the message as it will show (markdown)" : "Back to writing"}
+            >
+              {tab === "write" ? (
+                <Eye size={16} className="shrink-0" aria-hidden="true" />
+              ) : (
+                <Pencil size={16} className="shrink-0" aria-hidden="true" />
+              )}
+              <span className="text-[13px]">{tab === "write" ? "preview" : "write"}</span>
+            </button>
+            {models && models.models.length > 0 && (
+              <ChatModelMenus
+                models={models}
+                chatModel={chatModel}
+                chatThinking={chatThinking}
+                disabled={!ready}
+                onSettings={onSettings}
+              />
+            )}
+            <div className="ml-auto flex items-center gap-2">
+              {pending && (
+                <span
+                  className="enter flex items-center gap-1.5 text-[13px]"
+                  style={{ color: "var(--color-body)" }}
+                  role="status"
+                >
+                  <span
+                    aria-hidden="true"
+                    className="shrink-0"
+                    style={{
+                      width: 6,
+                      height: 6,
+                      borderRadius: "50%",
+                      background: "var(--color-stripe-purple)",
+                      animation: "havn-breathe 1.6s ease-in-out infinite",
+                    }}
+                  />
+                  replying
+                  {waiting > 1 && `, ${waiting - 1} queued`}
+                </span>
+              )}
+              {pending && (
+                <button
+                  type="button"
+                  className="tool-button"
+                  onClick={onStop}
+                  disabled={wsState !== "open"}
+                  title="Stop the reply in progress; queued messages still get answered"
+                >
+                  <Square size={14} className="shrink-0" aria-hidden="true" />
+                  <span className="text-[13px]">stop</span>
+                </button>
+              )}
+              <button
+                type="submit"
+                className="btn-primary inline-flex items-center gap-1.5"
+                disabled={!ready || !canSend}
+                style={{ padding: "7px 14px", fontSize: 14 }}
+              >
+                <ArrowUp size={16} className="shrink-0" aria-hidden="true" />
+                {pending ? "queue" : "send"}
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </form>
-  );
-}
-
-function ComposerTab({
-  active,
-  disabled,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  disabled?: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={active}
-      disabled={disabled}
-      onClick={onClick}
-      className="px-3 py-1.5 text-sm transition-colors"
-      style={{
-        borderBottom: active
-          ? "2px solid var(--color-stripe-purple)"
-          : "2px solid transparent",
-        color: active
-          ? "var(--color-stripe-purple)"
-          : "var(--color-body)",
-        background: "transparent",
-        opacity: disabled ? 0.4 : 1,
-        cursor: disabled ? "not-allowed" : "pointer",
-      }}
-    >
-      {children}
-    </button>
-  );
-}
-
-/**
- * Tiny diagnostic pill in the chat header showing whether retrieval
- * (memory **and** skills — they share the same embedding provider per
- * spec §13 Phase 3) is hybrid (vector + keyword) or keyword-only.
- * Helps users know when their semantic-near queries should work vs
- * when they need to use the actual words from the saved fact / skill
- * description.
- */
-function MemoryPill({ embedding }: { embedding: EmbeddingStatus | null }) {
-  if (!embedding) return null;
-  const hybrid = embedding.hybrid_enabled;
-  const provider = embedding.provider;
-  const label = hybrid ? provider : "keyword-only";
-  const LabelIcon = hybrid ? Layers : Search;
-  const tip = hybrid
-    ? `Hybrid retrieval (memory + skills): vector (${provider}) + BM25 keyword. Semantic-near queries work even with no shared words.`
-    : "FTS5 keyword-only (memory + skills). Set [embedding] in config.toml to enable hybrid retrieval.";
-  return (
-    <span
-      className="pill pill-stopped"
-      title={tip}
-      style={{
-        background: hybrid
-          ? "rgba(83, 58, 253, 0.08)"
-          : "var(--color-surface-muted)",
-        color: hybrid
-          ? "var(--color-stripe-purple)"
-          : "var(--color-body)",
-      }}
-    >
-      <LabelIcon size={12} className="shrink-0" aria-hidden="true" />
-      {label}
-    </span>
   );
 }
 

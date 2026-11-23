@@ -10,13 +10,15 @@
 
 import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   BarChart3,
   Bot,
   Boxes,
   KeyRound,
   Menu,
+  PanelLeftClose,
+  PanelLeftOpen,
   Plus,
   SlidersHorizontal,
   TriangleAlert,
@@ -30,6 +32,39 @@ const POLL_MS = 5000;
 const DASHBOARD_VERSION = process.env.NEXT_PUBLIC_DASHBOARD_VERSION ?? "unknown";
 
 const ACTIVE_BG = "rgba(83, 58, 253, 0.07)";
+/** Where the browser keeps whether the sidebar is narrowed to its icons. */
+const NARROW_KEY = "havn.sidebar.narrow";
+// Without storage, the choice lasts while the page is open.
+let narrowHere = false;
+const narrowListeners = new Set<() => void>();
+
+function narrowStored(): boolean {
+  try {
+    const value = localStorage.getItem(NARROW_KEY);
+    return value === null ? narrowHere : value === "1";
+  } catch {
+    return narrowHere;
+  }
+}
+
+function storeNarrow(value: boolean) {
+  narrowHere = value;
+  try {
+    localStorage.setItem(NARROW_KEY, value ? "1" : "0");
+  } catch {
+    // Kept for this page only.
+  }
+  for (const listener of narrowListeners) listener();
+}
+
+function onNarrow(listener: () => void): () => void {
+  narrowListeners.add(listener);
+  window.addEventListener("storage", listener);
+  return () => {
+    narrowListeners.delete(listener);
+    window.removeEventListener("storage", listener);
+  };
+}
 const NO_VERSION = "version not reported";
 
 export function Sidebar() {
@@ -44,6 +79,12 @@ export function Sidebar() {
   const [newerRelease, setNewerRelease] = useState<string | null>(null);
   // Below the md breakpoint the sidebar is a drawer behind a menu button.
   const [open, setOpen] = useState(false);
+  // From md up it can be narrowed to its icons, as this browser remembers.
+  const narrow = useSyncExternalStore(onNarrow, narrowStored, () => false);
+  const toggleNarrow = () => storeNarrow(!narrow);
+  // Classes that apply from md up while narrowed.
+  const wideOnly = narrow ? "md:sr-only" : "";
+  const centred = narrow ? "md:justify-center md:px-0" : "";
   const menuButton = useRef<HTMLButtonElement>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
   const wasOpen = useRef(false);
@@ -155,7 +196,9 @@ export function Sidebar() {
         aria-label="Navigation"
         role={open ? "dialog" : undefined}
         aria-modal={open ? true : undefined}
-        className={`fixed inset-y-0 left-0 z-50 flex w-72 max-w-[85vw] flex-col overflow-y-auto overscroll-contain border-r transition-[translate] duration-200 md:sticky md:top-0 md:z-auto md:h-screen md:w-64 md:max-w-none md:shrink-0 md:translate-x-0 ${
+        className={`fixed inset-y-0 left-0 z-50 flex w-72 max-w-[85vw] flex-col overflow-y-auto overflow-x-hidden overscroll-contain border-r transition-[translate] duration-200 md:sticky md:top-0 md:z-auto md:h-screen md:max-w-none md:shrink-0 md:translate-x-0 md:transition-[width] ${
+          narrow ? "md:w-16" : "md:w-64"
+        } ${
           open
             ? "translate-x-0"
             : "max-md:invisible max-md:-translate-x-full max-md:transition-[translate,visibility]"
@@ -169,10 +212,25 @@ export function Sidebar() {
           if ((e.target as HTMLElement).closest("a")) setOpen(false);
         }}
       >
-      <div className="flex items-center justify-between">
-        <Link href="/" className="px-5 py-5" style={LOGO_STYLE}>
+      <div className={`flex items-center justify-between ${narrow ? "md:justify-center" : ""}`}>
+        <Link href="/" className={`px-5 py-5 ${narrow ? "md:hidden" : ""}`} style={LOGO_STYLE}>
           havn
         </Link>
+        <button
+          type="button"
+          onClick={toggleNarrow}
+          aria-label={narrow ? "Widen the sidebar" : "Narrow the sidebar to icons"}
+          title={narrow ? "Widen the sidebar" : "Narrow the sidebar to icons"}
+          aria-expanded={!narrow}
+          aria-controls="sidebar"
+          className={`tool-button hidden md:inline-flex ${narrow ? "my-4" : "mr-2"}`}
+        >
+          {narrow ? (
+            <PanelLeftOpen size={18} aria-hidden="true" />
+          ) : (
+            <PanelLeftClose size={18} aria-hidden="true" />
+          )}
+        </button>
         <button
           ref={closeButton}
           type="button"
@@ -185,8 +243,8 @@ export function Sidebar() {
         </button>
       </div>
 
-      <div className="px-3">
-        <SectionTitle>Agents</SectionTitle>
+      <div className={narrow ? "px-3 md:px-2" : "px-3"}>
+        <SectionTitle className={wideOnly}>Agents</SectionTitle>
         <nav aria-label="Agents" className="flex flex-col gap-0.5">
           {agents === null && !error && (
             <div className="px-2 py-2 text-sm" style={{ color: "var(--color-body)" }}>
@@ -210,16 +268,18 @@ export function Sidebar() {
               <Link
                 key={a.id}
                 href={href}
+                title={narrow ? `${a.name} (${pillLabel(a.status, a.connected)})` : undefined}
                 aria-current={active && pathname === "/agent" ? "page" : active ? "true" : undefined}
-                className="flex items-center justify-between gap-2 rounded px-2 py-1.5 text-sm transition-colors hover:bg-[rgba(83,58,253,0.05)]"
+                className={`flex items-center justify-between gap-2 rounded px-2 py-1.5 text-sm transition-colors hover:bg-[rgba(83,58,253,0.05)] ${centred}`}
                 style={{
                   backgroundColor: active ? ACTIVE_BG : undefined,
                   color: active ? "var(--color-stripe-purple)" : "var(--color-deep-navy)",
                   borderRadius: "var(--radius-tight)",
                 }}
               >
-                <span className="truncate">{a.name}</span>
-                <span className={pillClass(a.status, a.connected)}>
+                {narrow && <Initial name={a.name} live={a.status === "running" && a.connected} />}
+                <span className={`truncate ${wideOnly}`}>{a.name}</span>
+                <span className={`${pillClass(a.status, a.connected)} ${narrow ? "md:hidden" : ""}`}>
                   {pillLabel(a.status, a.connected)}
                 </span>
               </Link>
@@ -227,20 +287,21 @@ export function Sidebar() {
           })}
         </nav>
 
-        <div className="mt-3 px-1">
+        <div className={narrow ? "mt-3 px-1 md:px-0" : "mt-3 px-1"}>
           <Link
             href="/agents/new"
-            className="btn-ghost flex w-full items-center justify-center gap-1.5 text-sm"
+            title={narrow ? "new agent" : undefined}
+            className={`btn-ghost flex w-full items-center justify-center gap-1.5 text-sm ${narrow ? "md:px-0" : ""}`}
           >
             <Plus size={16} className="shrink-0" aria-hidden="true" />
-            new agent
+            <span className={wideOnly}>new agent</span>
           </Link>
         </div>
       </div>
 
       {teams.length > 0 && (
-        <div className="mt-3 px-3">
-          <SectionTitle>Teams</SectionTitle>
+        <div className={narrow ? "mt-3 px-3 md:px-2" : "mt-3 px-3"}>
+          <SectionTitle className={wideOnly}>Teams</SectionTitle>
           <nav aria-label="Teams" className="flex flex-col gap-0.5">
             {teams.map((t) => {
               const href = `/team?id=${t.id}`;
@@ -249,18 +310,20 @@ export function Sidebar() {
                 <Link
                   key={t.id}
                   href={href}
+                  title={narrow ? t.name : undefined}
                   aria-current={active && pathname === "/team" ? "page" : active ? "true" : undefined}
-                  className="flex items-center justify-between gap-2 rounded px-2 py-1.5 text-sm transition-colors hover:bg-[rgba(83,58,253,0.05)]"
+                  className={`flex items-center justify-between gap-2 rounded px-2 py-1.5 text-sm transition-colors hover:bg-[rgba(83,58,253,0.05)] ${centred}`}
                   style={{
                     backgroundColor: active ? ACTIVE_BG : undefined,
                     color: active ? "var(--color-stripe-purple)" : "var(--color-deep-navy)",
                     borderRadius: "var(--radius-tight)",
                   }}
                 >
-                  <span className="truncate">{t.name}</span>
+                  {narrow && <Initial name={t.name} />}
+                  <span className={`truncate ${wideOnly}`}>{t.name}</span>
                   {t.is_admin && (
                     <span
-                      className="pill"
+                      className={`pill ${narrow ? "md:hidden" : ""}`}
                       title="you're an admin of this team"
                       style={{
                         background: "rgba(83, 58, 253, 0.1)",
@@ -277,20 +340,35 @@ export function Sidebar() {
         </div>
       )}
 
-      <div className="mt-auto flex flex-col gap-0.5 px-3 pb-4">
-        <SectionTitle>Manage</SectionTitle>
+      <div className={`mt-auto flex flex-col gap-0.5 pb-4 ${narrow ? "px-3 md:px-2" : "px-3"}`}>
+        <SectionTitle className={wideOnly}>Manage</SectionTitle>
         <nav aria-label="Manage" className="flex flex-col gap-0.5">
-          <SidebarLink href="/" pathname={pathname} icon={Bot} label="all agents" />
-          <SidebarLink href="/models" pathname={pathname} icon={Boxes} label="models" />
-          <SidebarLink href="/credentials" pathname={pathname} icon={KeyRound} label="credentials" />
-          <SidebarLink href="/usage" pathname={pathname} icon={BarChart3} label="usage" />
-          <SidebarLink href="/teams" pathname={pathname} icon={Users} label="teams" />
-          <SidebarLink href="/settings" pathname={pathname} icon={SlidersHorizontal} label="settings" />
+          <SidebarLink href="/" pathname={pathname} icon={Bot} label="all agents" narrow={narrow} />
+          <SidebarLink href="/models" pathname={pathname} icon={Boxes} label="models" narrow={narrow} />
+          <SidebarLink href="/credentials" pathname={pathname} icon={KeyRound} label="credentials" narrow={narrow} />
+          <SidebarLink href="/usage" pathname={pathname} icon={BarChart3} label="usage" narrow={narrow} />
+          <SidebarLink href="/teams" pathname={pathname} icon={Users} label="teams" narrow={narrow} />
+          <SidebarLink href="/settings" pathname={pathname} icon={SlidersHorizontal} label="settings" narrow={narrow} />
         </nav>
-        <VersionLine gateway={gatewayVersion} newer={newerRelease} />
+        <div className={narrow ? "md:hidden" : ""}>
+          <VersionLine gateway={gatewayVersion} newer={newerRelease} />
+        </div>
       </div>
       </aside>
     </>
+  );
+}
+
+/**
+ * The page beside the sidebar: shown again with a short fade when the page
+ * changes, while the sidebar stays as it is.
+ */
+export function PageContent({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname();
+  return (
+    <div key={pathname} className="page-enter">
+      {children}
+    </div>
   );
 }
 
@@ -302,10 +380,29 @@ const LOGO_STYLE: React.CSSProperties = {
   lineHeight: 1,
 };
 
-function SectionTitle({ children }: { children: React.ReactNode }) {
+/** An agent or team in the narrowed sidebar: its first letter, with a dot while it runs. */
+function Initial({ name, live }: { name: string; live?: boolean }) {
+  return (
+    <span
+      aria-hidden="true"
+      className="relative hidden h-8 w-8 shrink-0 items-center justify-center rounded text-sm font-semibold md:flex"
+      style={{ backgroundColor: "var(--color-surface-muted)", border: "1px solid var(--color-border-default)" }}
+    >
+      {name.trim().charAt(0).toUpperCase() || "?"}
+      {live && (
+        <span
+          className="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full"
+          style={{ backgroundColor: "var(--color-success)", border: "2px solid var(--color-surface)" }}
+        />
+      )}
+    </span>
+  );
+}
+
+function SectionTitle({ children, className = "" }: { children: React.ReactNode; className?: string }) {
   return (
     <div
-      className="mb-1 px-2 py-1 text-xs font-medium uppercase tracking-wider"
+      className={`mb-1 px-2 py-1 text-xs font-medium uppercase tracking-wider ${className}`}
       style={{ color: "var(--color-body)" }}
     >
       {children}
@@ -318,18 +415,22 @@ function SidebarLink({
   pathname,
   icon: Icon,
   label,
+  narrow,
 }: {
   href: string;
   pathname: string | null;
   icon: LucideIcon;
   label: string;
+  /** Narrowed to its icon from md up. */
+  narrow: boolean;
 }) {
   const active = pathname === href;
   return (
     <Link
       href={href}
+      title={narrow ? label : undefined}
       aria-current={active ? "page" : undefined}
-      className="flex items-center gap-2 rounded px-2 py-1.5 text-sm transition-colors hover:bg-[rgba(83,58,253,0.05)]"
+      className={`flex items-center gap-2 rounded px-2 py-1.5 text-sm transition-colors hover:bg-[rgba(83,58,253,0.05)] ${narrow ? "md:justify-center md:py-2" : ""}`}
       style={{
         backgroundColor: active ? ACTIVE_BG : undefined,
         color: active ? "var(--color-stripe-purple)" : "var(--color-deep-navy)",
@@ -337,7 +438,7 @@ function SidebarLink({
       }}
     >
       <Icon size={16} className="shrink-0" aria-hidden="true" />
-      {label}
+      <span className={narrow ? "md:sr-only" : ""}>{label}</span>
     </Link>
   );
 }

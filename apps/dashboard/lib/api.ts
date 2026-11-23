@@ -326,6 +326,13 @@ export function thinkingChoices(spec: ThinkingSpec): string[] {
   return out;
 }
 
+/** A model as people read it: its label, else its name without the provider and vendor. */
+export function modelName(id: string, label?: string): string {
+  if (label) return label;
+  const name = id.slice(id.indexOf(":") + 1);
+  return name.slice(name.lastIndexOf("/") + 1) || id;
+}
+
 export type ModelEntry = {
   id: string;
   label?: string;
