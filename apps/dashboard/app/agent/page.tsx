@@ -2511,7 +2511,7 @@ function ChatModelMenus({
     <>
       <select
         className="composer-select"
-        style={{ maxWidth: 220 }}
+        style={{ maxWidth: 300 }}
         aria-label="model of this chat"
         title={`The model of this chat; others keep theirs. Now: ${model ?? "the default"}`}
         value={chatModel ?? ""}

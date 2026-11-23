@@ -291,6 +291,81 @@
     top: 12px;
   }
 
+  /* The chat's composer: one panel holding the text and a bar of tools. */
+  .composer {
+    background-color: var(--color-surface);
+    border: 1px solid var(--color-border-default);
+    border-radius: var(--radius-large);
+    transition: border-color 120ms ease, box-shadow 120ms ease;
+  }
+  .composer:focus-within {
+    border-color: var(--color-stripe-purple);
+    box-shadow: 0 0 0 3px rgba(83, 58, 253, 0.12);
+  }
+  .composer-select {
+    background-color: transparent;
+    border: 0;
+    border-radius: var(--radius-tight);
+    padding: 6px 6px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--color-label);
+    text-overflow: ellipsis;
+    transition: background-color 120ms ease;
+  }
+  .composer-select:hover:not(:disabled) {
+    background-color: rgba(100, 116, 141, 0.08);
+  }
+  .composer-select:disabled {
+    opacity: 0.5;
+  }
+
+  /* A quiet button: an icon, often a word, no frame until hovered. */
+  .tool-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    border-radius: var(--radius-tight);
+    color: var(--color-label);
+    font-weight: 500;
+    transition: background-color 120ms ease, color 120ms ease;
+  }
+  .tool-button:hover:not(:disabled) {
+    background-color: rgba(100, 116, 141, 0.08);
+    color: var(--color-deep-navy);
+  }
+  .tool-button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .tool-button[aria-pressed="true"] {
+    background-color: rgba(83, 58, 253, 0.07);
+    color: var(--color-stripe-purple);
+  }
+
+  /* A menu over the page: the one place, with dialogs, that casts a shadow. */
+  .menu {
+    background-color: var(--color-surface);
+    border: 1px solid var(--color-border-default);
+    border-radius: var(--radius-comfortable);
+    box-shadow: var(--shadow-standard);
+  }
+  .menu-item {
+    padding: 6px 12px;
+    text-align: left;
+    font-size: 14px;
+    color: var(--color-deep-navy);
+    transition: background-color 120ms ease;
+  }
+  .menu-item:hover:not(:disabled) {
+    background-color: rgba(100, 116, 141, 0.08);
+  }
+  .menu-item:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
   /* === Display headlines (DESIGN.md §3) === */
   .display-h1 {
     font-size: 30px;
@@ -428,81 +503,6 @@
 @keyframes havn-typing {
   0%, 80%, 100% { opacity: 0.25; transform: translateY(0); }
   40% { opacity: 1; transform: translateY(-2px); }
-}
-
-/* The chat's composer: one panel holding the text and a bar of tools. */
-.composer {
-  background-color: var(--color-surface);
-  border: 1px solid var(--color-border-default);
-  border-radius: var(--radius-large);
-  transition: border-color 120ms ease, box-shadow 120ms ease;
-}
-.composer:focus-within {
-  border-color: var(--color-stripe-purple);
-  box-shadow: 0 0 0 3px rgba(83, 58, 253, 0.12);
-}
-.composer-select {
-  background-color: transparent;
-  border: 0;
-  border-radius: var(--radius-tight);
-  padding: 6px 6px;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--color-label);
-  text-overflow: ellipsis;
-  transition: background-color 120ms ease;
-}
-.composer-select:hover:not(:disabled) {
-  background-color: rgba(100, 116, 141, 0.08);
-}
-.composer-select:disabled {
-  opacity: 0.5;
-}
-
-/* A quiet button: an icon, often a word, no frame until hovered. */
-.tool-button {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 8px;
-  border-radius: var(--radius-tight);
-  color: var(--color-label);
-  font-weight: 500;
-  transition: background-color 120ms ease, color 120ms ease;
-}
-.tool-button:hover:not(:disabled) {
-  background-color: rgba(100, 116, 141, 0.08);
-  color: var(--color-deep-navy);
-}
-.tool-button:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-.tool-button[aria-pressed="true"] {
-  background-color: rgba(83, 58, 253, 0.07);
-  color: var(--color-stripe-purple);
-}
-
-/* A menu over the page: the one place, with dialogs, that casts a shadow. */
-.menu {
-  background-color: var(--color-surface);
-  border: 1px solid var(--color-border-default);
-  border-radius: var(--radius-comfortable);
-  box-shadow: var(--shadow-standard);
-}
-.menu-item {
-  padding: 6px 12px;
-  text-align: left;
-  font-size: 14px;
-  color: var(--color-deep-navy);
-  transition: background-color 120ms ease;
-}
-.menu-item:hover:not(:disabled) {
-  background-color: rgba(100, 116, 141, 0.08);
-}
-.menu-item:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
 }
 
 /* Something new on screen (a message, a step): it fades in and rises a
