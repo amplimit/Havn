@@ -848,10 +848,10 @@ async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
             );
         }
     };
+    // Known as a group, it is one; `group` says so of what is known.
     let group = match known {
-        channel_access::Known::Group => true,
-        channel_access::Known::Sender => false,
-        channel_access::Known::Both => named_group,
+        channel_access::Known::Group | channel_access::Known::Both => true,
+        channel_access::Known::Sender => named_group,
         // A group whose messages it saw, though none was to it.
         channel_access::Known::Nothing
             if state
@@ -867,8 +867,8 @@ async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
         }
         channel_access::Known::Nothing => {
             return language.pick(
-                format!("(This bot has not seen {sender}: no one and no group by that id was turned away or let in. Use the id a notice gave.)"),
-                format!("（这个机器人没见过 {sender}：没有哪个人或群以这个编号被拒绝或放行过。请用通知里给出的编号。）"),
+                format!("(This bot has not seen {sender} lately: no one and no group by that id was turned away or let in. Use the id a notice gave; for an old notice, have them write to the bot again.)"),
+                format!("（这个机器人最近没见过 {sender}：没有哪个人或群以这个编号被拒绝或放行过。请用通知里给出的编号；通知太旧的话，请对方再给机器人发一次消息。）"),
             );
         }
     };

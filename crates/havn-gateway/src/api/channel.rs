@@ -4939,6 +4939,19 @@ mod tests {
                     .await
                     .expect("allowed")
             );
+            // Let in as a person before, it is still taken for the group.
+            channel_access::admit(&f.state.db, "telegram", "bot", "tg:-100")
+                .await
+                .expect("admitted");
+            f.send("tg:owner", "/allow tg:-100").await;
+            let replies = f.replies();
+            assert!(
+                replies[0].1.contains("could already use this bot"),
+                "{replies:?}"
+            );
+            channel_access::revoke_sender(&f.state.db, "telegram", "bot", "tg:-100")
+                .await
+                .expect("revoked");
             f.say_in("tg:-100", "tg:ann", "@bot hello", true).await;
             let got = f.messages();
             assert_eq!(got.len(), 1);

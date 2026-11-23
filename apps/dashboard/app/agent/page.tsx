@@ -2700,7 +2700,7 @@ function OwnerApproval({
   onDecide: (approve: boolean, remember: boolean, note?: string) => void;
 }) {
   const [note, setNote] = useState("");
-  let shown: { from?: string; said?: string; input?: unknown; found?: string } = {};
+  let shown: { from?: string; said?: string; input?: unknown; found?: string; owner?: boolean } = {};
   try {
     const parsed: unknown = JSON.parse(request.input);
     shown = parsed && typeof parsed === "object" ? (parsed as typeof shown) : { found: request.input };
@@ -2719,7 +2719,12 @@ function OwnerApproval({
       <p className="mb-1">
         <strong>{before ? "Let the agent run this?" : "Let the agent use what this gave?"}</strong>{" "}
         <span className="font-mono">{request.tool}</span>{" "}
-        <span style={muted}>Someone other than you asked{request.conversation ? ` (${request.conversation})` : ""}.</span>
+        <span style={muted}>
+          {shown.owner
+            ? "You asked in a group, which the others there read; always allowing it there allows it for each of them too"
+            : "Someone other than you asked"}
+          {request.conversation ? ` (${request.conversation})` : ""}.
+        </span>
       </p>
       <dl className="mb-2 grid gap-1 text-xs" style={{ gridTemplateColumns: "auto 1fr" }}>
         <dt style={muted}>from</dt>

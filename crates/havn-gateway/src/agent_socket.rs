@@ -1538,17 +1538,32 @@ fn question(request: &havn_proto::ApprovalRequest, language: havn_core::Language
             .unwrap_or_default(),
     );
     let id = &request.request_id;
+    // The owner's own turn in a group (issue #297): others read it, and
+    // always allowing there allows it for each of them.
+    let owner = shown
+        .get("owner")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let asked = if owner {
+        language.pick(
+            "You asked in a group, which the others there read; always allowing it there \
+             allows it for each of them too",
+            "你在群里提问，群里其他人都看得到；在那里永久允许，也就对他们每个人都允许了",
+        )
+    } else {
+        language.pick("Someone other than you asked", "有不是你的人提问")
+    };
     if request.kind == "call" {
         return language.pick(
             format!(
-                "Someone other than you asked, and the agent wants to run {tool}.\n\nFrom: \
+                "{asked}, and the agent wants to run {tool}.\n\nFrom: \
                  {from}\nThey wrote: {said}\n\nIt would run with:\n{input}\nAllow it once, \
                  always allow this exact call in that conversation, or deny with the buttons. To \
                  add what not to say, send /approve {id} followed by it (or /approve always {id} \
                  ...)."
             ),
             format!(
-                "有不是你的人提问，agent 想运行 {tool}。\n\n来自：{from}\n对方写的：{said}\n\n要运行\
+                "{asked}，agent 想运行 {tool}。\n\n来自：{from}\n对方写的：{said}\n\n要运行\
                  的内容：\n{input}\n用按钮选择：允许这一次、在那个对话里永久允许这一条，或拒绝。要附一\
                  句不能说什么，发 /approve {id} 后面跟上说明（或者 /approve always {id} ……）。"
             ),
@@ -1557,13 +1572,13 @@ fn question(request: &havn_proto::ApprovalRequest, language: havn_core::Language
     let found = block(&field("found"));
     language.pick(
         format!(
-            "Someone other than you asked, and the agent used {tool}.\n\nFrom: {from}\nThey \
+            "{asked}, and the agent used {tool}.\n\nFrom: {from}\nThey \
              wrote: {said}\nWith:\n{input}\n\nIt gave (the agent gets exactly this):\n{found}\n\
              Use it, always allow {tool} in that conversation, or deny with the buttons. To add \
              what not to say, send /approve {id} followed by it (or /approve always {id} ...)."
         ),
         format!(
-            "有不是你的人提问，agent 用了 {tool}。\n\n来自：{from}\n对方写的：{said}\n输入：\n\
+            "{asked}，agent 用了 {tool}。\n\n来自：{from}\n对方写的：{said}\n输入：\n\
              {input}\n\n得到的内容（agent 会原样拿到这些）：\n{found}\n用按钮选择：使用、在那个对话\
              里永久允许 {tool}，或拒绝。要附一句不能说什么，发 /approve {id} 后面跟上说明（或者 \
              /approve always {id} ……）。"
@@ -4956,6 +4971,48 @@ mod tests {
                 .iter()
                 .any(|t| t.contains("shell") && t.contains("run ls")),
             "the owner is asked privately: {to_owner:?}"
+        );
+        assert!(
+            to_owner
+                .iter()
+                .all(|t| t.starts_with("Someone other than you")),
+            "{to_owner:?}"
+        );
+
+        // The owner's own turn in the group (issue #297): told it was theirs,
+        // and what always allowing there means.
+        let request = havn_proto::ApprovalRequest {
+            request_id: "r-2".into(),
+            channel_id: crate::channel_id_codec::encode("telegram", "bot", "tg:-200"),
+            tool: "memory_search".into(),
+            input: serde_json::json!({
+                "from": "tg:owner",
+                "said": "when do I fly home?",
+                "tool": "memory_search",
+                "input": {"query": "fly home"},
+                "found": "2026-12-26",
+                "owner": true,
+            })
+            .to_string(),
+            reason: String::new(),
+            kind: "result".into(),
+        };
+        ask_for_approval(agent, request, &ctx).await;
+        let mut to_owner = Vec::new();
+        while let Ok(ChannelFrame::Outbound(o)) = adapter.try_recv() {
+            if let ChannelMessageContent::Text { text } = o.content
+                && o.to == "tg:owner"
+            {
+                to_owner.push(text);
+            }
+        }
+        assert!(
+            to_owner
+                .iter()
+                .any(|t| t.starts_with("You asked in a group")
+                    && t.contains("for each of them")
+                    && !t.contains("Someone other than you")),
+            "{to_owner:?}"
         );
     }
 }

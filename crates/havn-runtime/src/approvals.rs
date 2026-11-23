@@ -176,9 +176,12 @@ pub async fn guarded(
     let (from, said) = crate::tools::gateway::ASKED
         .try_with(Clone::clone)
         .unwrap_or_default();
+    // The owner's own turn in a group (issue #297).
+    let owner = crate::tools::gateway::FROM_OWNER
+        .try_with(|owner| *owner)
+        .unwrap_or(false);
     let shown = |found: Option<&str>| {
-        let mut shown =
-            serde_json::json!({ "from": from, "said": said, "tool": tool, "input": input });
+        let mut shown = serde_json::json!({ "from": from, "said": said, "tool": tool, "input": input, "owner": owner });
         if let Some(found) = found {
             shown["found"] = found.into();
         }

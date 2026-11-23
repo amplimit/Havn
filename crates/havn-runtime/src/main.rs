@@ -2903,7 +2903,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
         // else's does not fill the agent's memory, nor get its saved facts
         // in front of it (memory_search still answers them). Nor does a
         // group's, which others read, though the owner wrote (issue #297).
-        msg.from_owner,
+        opens_memory(&msg),
         opens_memory(&msg),
         Some(&with_rules(&ctx.pool, &msg, talk_section(&msg)).await),
     )
