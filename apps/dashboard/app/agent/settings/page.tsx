@@ -358,15 +358,9 @@ function Settings({ id }: { id: string }) {
           >
             {busy ? "saving…" : "save"}
           </button>
-          {saved && (
-            <span
-              className="text-xs"
-              style={{ color: "var(--color-success-text)" }}
-              role="status"
-            >
-              saved · the agent uses it from its next start
-            </span>
-          )}
+          <span className="text-xs" style={{ color: "var(--color-success-text)" }} role="status">
+            {saved ? "saved · the agent uses it from its next start" : ""}
+          </span>
         </div>
       </form>
       <TimezoneEditor />
@@ -403,12 +397,12 @@ function Settings({ id }: { id: string }) {
         className="mt-10 card px-4 py-4"
         style={{ borderColor: "rgba(234, 34, 97, 0.3)" }}
       >
-        <h2
+        <h3
           className="display-h3 mb-2"
           style={{ color: "var(--color-ruby)" }}
         >
           danger zone
-        </h2>
+        </h3>
         <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
           Delete this agent and everything it owns: workspace files,
           conversation history, typed memory, skills, cron jobs.
@@ -445,7 +439,7 @@ const GROUPS = [
 function Group({ id, children }: { id: (typeof GROUPS)[number]["id"]; children: React.ReactNode }) {
   const title = GROUPS.find((g) => g.id === id)?.title ?? id;
   return (
-    <section id={id} aria-labelledby={`${id}-title`} className="settings-group scroll-mt-6 pt-12 first-of-type:pt-0">
+    <section id={id} aria-labelledby={`${id}-title`} className="settings-group scroll-mt-28 pt-12 first-of-type:pt-0 md:scroll-mt-16 lg:scroll-mt-10">
       <h2
         id={`${id}-title`}
         className="border-b pb-2 text-xs font-semibold uppercase tracking-wider"
@@ -485,14 +479,31 @@ function SettingsNav() {
     onScroll();
     window.addEventListener("scroll", onScroll, { passive: true });
     window.addEventListener("resize", onScroll);
+    const grows = new ResizeObserver(onScroll);
+    grows.observe(document.body);
+    const asked = window.location.hash.slice(1);
+    const shown = GROUPS.some((g) => g.id === asked)
+      ? window.setTimeout(() => document.getElementById(asked)?.scrollIntoView(), 400)
+      : 0;
     return () => {
       cancelAnimationFrame(frame);
+      window.clearTimeout(shown);
+      grows.disconnect();
       window.removeEventListener("scroll", onScroll);
       window.removeEventListener("resize", onScroll);
     };
   }, []);
+  const row = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const nav = row.current;
+    const link = nav?.querySelector<HTMLElement>('[aria-current="location"]');
+    if (!nav || !link || nav.scrollWidth <= nav.clientWidth) return;
+    // Along the row only: the page does not move.
+    nav.scrollTo({ left: link.offsetLeft - nav.clientWidth / 2 + link.offsetWidth / 2 });
+  }, [current]);
   return (
     <nav
+      ref={row}
       aria-label="Settings"
       className="sticky top-15 z-10 -mx-4 md:top-0 mb-6 flex gap-1 overflow-x-auto border-b px-4 py-2 lg:top-10 lg:mx-0 lg:mb-0 lg:flex-col lg:self-start lg:overflow-visible lg:border-0 lg:px-0 lg:py-0"
       style={{ backgroundColor: "var(--color-surface)", borderColor: "var(--color-border-default)" }}
@@ -576,7 +587,7 @@ function BootstrapEditor({ agentId }: { agentId: string }) {
 
   return (
     <section className="mt-10 card px-4 py-4">
-      <h2 className="display-h3 mb-2">bootstrap files</h2>
+      <h3 className="display-h3 mb-2">bootstrap files</h3>
       <p className="mb-4 text-sm" style={{ color: "var(--color-body)" }}>
         Three plain-text files in the agent&apos;s workspace that drive
         persona, durable user-facing facts, and heartbeat behaviour.
@@ -777,9 +788,9 @@ function BotAccess({ agentId }: { agentId: string }) {
   if (view && view.accounts.length === 0) return null;
   return (
     <section className="mt-10 card px-4 py-4" aria-labelledby="bot-access-title">
-      <h2 id="bot-access-title" className="display-h3 mb-2">
+      <h3 id="bot-access-title" className="display-h3 mb-2">
         who can reach the bot
-      </h2>
+      </h3>
       <p className="mb-3 text-sm" style={muted}>
         On an allowlist bot, only the people let in reach the agent: those in config.toml, those who
         sent an invite code, and those you let in here. Someone who writes without being let in is
@@ -1219,9 +1230,9 @@ function ChannelPairing({ agentId }: { agentId: string }) {
   const muted = { color: "var(--color-body)" };
   return (
     <section className="mt-10 card px-4 py-4" aria-labelledby="pairing-title">
-      <h2 id="pairing-title" className="display-h3 mb-2">
+      <h3 id="pairing-title" className="display-h3 mb-2">
         chat apps
-      </h2>
+      </h3>
       <p className="mb-3 text-sm" style={muted}>
         Connect your Telegram account to your Havn account: then this agent&apos;s bot (and your
         other agents&apos; bots) answers you without a code from the server, and you can use the
@@ -1323,9 +1334,9 @@ function WorkspaceAccessEditor({ agentId }: { agentId: string }) {
   if (!view) return error ? <p className="mt-10 text-sm" role="alert">{error}</p> : null;
   return (
     <section className="mt-10 card px-4 py-4" aria-labelledby="workspace-title">
-      <h2 id="workspace-title" className="display-h3 mb-2">
+      <h3 id="workspace-title" className="display-h3 mb-2">
         workspace browsing
-      </h2>
+      </h3>
       <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
         A read-only page of the files in the agent&apos;s workspace: folders, previews of text
         and images, downloads. Only you see it.
@@ -1388,9 +1399,9 @@ function TitlesEditor({ agentId }: { agentId: string }) {
   if (!view) return error ? <p className="mt-10 text-sm" role="alert">{error}</p> : null;
   return (
     <section className="mt-10 card px-4 py-4" aria-labelledby="titles-title">
-      <h2 id="titles-title" className="display-h3 mb-2">
+      <h3 id="titles-title" className="display-h3 mb-2">
         chat titles
-      </h2>
+      </h3>
       <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
         A model names each new chat from its first message, while the agent answers it.
         Off, a chat is named after the start of its first message. Written by{" "}
@@ -1481,9 +1492,9 @@ function AccessEditor({ agentId }: { agentId: string }) {
   const muted = { color: "var(--color-body)" };
   return (
     <section className="mt-10 card px-4 py-4" aria-labelledby="access-title">
-      <h2 id="access-title" className="display-h3 mb-2">
+      <h3 id="access-title" className="display-h3 mb-2">
         tools in other people&apos;s conversations
-      </h2>
+      </h3>
       <p className="mb-3 text-sm" style={muted}>
         When someone other than you is talking to the agent, you decide before it runs or changes
         anything, and before it uses what it read (memory, files). These are always allowed, with your
@@ -1644,9 +1655,9 @@ function CapabilitiesEditor({ agentId }: { agentId: string }) {
   ];
   return (
     <section className="mt-10 card px-4 py-4" aria-labelledby="capabilities-title">
-      <h2 id="capabilities-title" className="display-h3 mb-2">
+      <h3 id="capabilities-title" className="display-h3 mb-2">
         working with other agents
-      </h2>
+      </h3>
       <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
         Applies on the agent&apos;s next start.
       </p>
@@ -1728,9 +1739,9 @@ function ApprovalsEditor({ agentId }: { agentId: string }) {
   if (!view) return error ? <p className="mt-10 text-sm" role="alert">{error}</p> : null;
   return (
     <section className="mt-10 card px-4 py-4" aria-labelledby="approvals-title">
-      <h2 id="approvals-title" className="display-h3 mb-2">
+      <h3 id="approvals-title" className="display-h3 mb-2">
         tools that need your approval
-      </h2>
+      </h3>
       <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
         Every call of these tools waits until you approve it in the chat, or with
         /approve in a channel; unanswered calls are refused after 10 minutes, and
@@ -1801,9 +1812,9 @@ function ScheduledTasks({ agentId }: { agentId: string }) {
   if (!jobs) return error ? <p className="mt-10 text-sm" role="alert">{error}</p> : null;
   return (
     <section className="mt-10 card px-4 py-4" aria-labelledby="tasks-title">
-      <h2 id="tasks-title" className="display-h3 mb-2">
+      <h3 id="tasks-title" className="display-h3 mb-2">
         scheduled tasks
-      </h2>
+      </h3>
       <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
         Reminders and recurring jobs. Ask the agent in chat to create one, such as
         &quot;remind me at 17:00 to call Anna&quot; or &quot;every weekday at 9, summarise
@@ -1921,9 +1932,9 @@ function Webhooks({ agentId }: { agentId: string }) {
   if (!hooks) return error ? <p className="mt-10 text-sm" role="alert">{error}</p> : null;
   return (
     <section className="mt-10 card px-4 py-4" aria-labelledby="webhooks-title">
-      <h2 id="webhooks-title" className="display-h3 mb-2">
+      <h3 id="webhooks-title" className="display-h3 mb-2">
         webhooks
-      </h2>
+      </h3>
       <p className="mb-3 text-sm" style={muted}>
         An address that other systems (an alert, a CI build, a form) call to have the agent act on what they send.
         What a call brings is treated as from someone other than you: reading tools and calls that run things wait
@@ -2116,9 +2127,9 @@ function TimezoneEditor() {
   if (!view) return error ? <p className="mt-10 text-sm" role="alert">{error}</p> : null;
   return (
     <section className="mt-10 card px-4 py-4" aria-labelledby="timezone-title">
-      <h2 id="timezone-title" className="display-h3 mb-2">
+      <h3 id="timezone-title" className="display-h3 mb-2">
         your time zone
-      </h2>
+      </h3>
       <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
         All your agents tell the time in it, and read &quot;tomorrow at 9&quot; in it. It
         applies at once.{" "}
@@ -2223,9 +2234,9 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
 
   return (
     <section className="mt-10 card px-4 py-4" aria-labelledby="web-access-title">
-      <h2 id="web-access-title" className="display-h3 mb-2">
+      <h3 id="web-access-title" className="display-h3 mb-2">
         web access
-      </h2>
+      </h3>
       <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
         Changes apply on the agent&apos;s next start.
         <span className="ml-2" style={{ color: "var(--color-success-text)" }} role="status">
@@ -2619,7 +2630,7 @@ function McpEditor({ agentId }: { agentId: string }) {
 
   return (
     <section className="mt-10 card px-4 py-4">
-      <h2 className="display-h3 mb-2">MCP servers</h2>
+      <h3 className="display-h3 mb-2">MCP servers</h3>
       <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
         Model Context Protocol servers: stdio binaries the operator
         installed, which the agent can invoke as
@@ -2981,7 +2992,7 @@ function RetrievalEditor({
 
   return (
     <section className="mt-10 card px-4 py-4">
-      <h2 className="display-h3 mb-2">retrieval layer</h2>
+      <h3 className="display-h3 mb-2">retrieval layer</h3>
       <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
         Hybrid retrieval (vector + BM25 keyword) drives both typed
         memory and skill discovery — one config, both surfaces. Switch
@@ -3175,29 +3186,41 @@ function Field({
   children: React.ReactNode;
 }) {
   return (
-    <label className="grid gap-1.5">
-      <span
-        className="text-sm"
-        style={{ color: "var(--color-label)", fontWeight: 400 }}
-      >
-        {label}
-      </span>
-      {children}
+    <div className="grid gap-1.5">
+      <label className="grid gap-1.5">
+        <span
+          className="text-sm"
+          style={{ color: "var(--color-label)", fontWeight: 400 }}
+        >
+          {label}
+        </span>
+        {children}
+      </label>
       <Hint text={hint} />
-    </label>
+    </div>
   );
 }
 
-/** Longer than this, a hint shows its first line and the rest on asking. */
-const HINT_SHOWN = 110;
-
-/** A setting's description: one line, and all of it on "more". */
+/** A setting's description: one line, and all of it on "more" when it is longer. */
 function Hint({ text }: { text: string }) {
   const [all, setAll] = useState(false);
-  const long = text.length > HINT_SHOWN;
+  const [long, setLong] = useState(false);
+  const line = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    const el = line.current;
+    if (!el) return;
+    const measure = () => {
+      if (!all) setLong(el.scrollHeight > el.clientHeight + 1);
+    };
+    const watch = new ResizeObserver(measure);
+    watch.observe(el);
+    return () => watch.disconnect();
+  }, [all, text]);
   return (
     <span className="flex items-start gap-1 text-xs" style={{ color: "var(--color-body)" }}>
-      <span className={long && !all ? "line-clamp-1" : undefined}>{text}</span>
+      <span ref={line} className={all ? undefined : "line-clamp-1"}>
+        {text}
+      </span>
       {long && (
         <button
           type="button"
