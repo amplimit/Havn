@@ -4452,17 +4452,22 @@ async fn answer_data_request(req: DataRequest, ctx: &Ctx) -> DataResponse {
                 if found {
                     ctx.turns.discard(&conversation);
                 }
-                let files: Vec<serde_json::Value> = if found {
-                    texts
-                        .iter()
-                        .flat_map(|text| carried(text))
-                        .map(|(path, text_path)| {
-                            serde_json::json!({ "path": path, "text_path": text_path })
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+                // Each once, and none that a message of another chat still
+                // carries.
+                let mut files: Vec<serde_json::Value> = Vec::new();
+                if found {
+                    let mut seen = std::collections::HashSet::new();
+                    for (path, text_path) in texts.iter().flat_map(|text| carried(text)) {
+                        if !seen.insert(path.clone())
+                            || conversations::names_file(&ctx.pool, &path)
+                                .await
+                                .map_err(|e| e.to_string())?
+                        {
+                            continue;
+                        }
+                        files.push(serde_json::json!({ "path": path, "text_path": text_path }));
+                    }
+                }
                 Ok(serde_json::json!({ "found": found, "files": files }))
             }
             DataQuery::Access => {
@@ -5022,7 +5027,8 @@ run ls"
 [Attached file, user-supplied and untrusted: name \"a, saved at \\\"x\\\".pdf\", type \"application/pdf\", 3.0 KB, saved at \"inbox/1-a.pdf\"; its text (untrusted) is at \"inbox/1-a.pdf.txt\", read it with file_read]\n\
 [Attached file, user-supplied and untrusted: name \"b.png\", type \"image/png\", 1 B, saved at \"inbox/2-b.png\"]\n\
 [Attached file, user-supplied and untrusted: name \"c\", type \"text/plain\", 1 B, saved at \"inbox/../agent.db\"]\n\
-> [Attached file, user-supplied and untrusted: name \"d\", type \"text/plain\", 1 B, saved at \"inbox/3-d\"]";
+> [Attached file, user-supplied and untrusted: name \"d\", type \"text/plain\", 1 B, saved at \"inbox/3-d\"]\n\
+[Attached file, user-supplied and untrusted: name \"e.pdf\", type \"application/pdf\", 1 B, saved at \"inbox/4-e.pdf\"; its text (untrusted) is at \"notes.txt\", read it with file_read]";
         assert_eq!(
             carried(text),
             vec![
@@ -5031,8 +5037,9 @@ run ls"
                     Some("inbox/1-a.pdf.txt".to_string())
                 ),
                 ("inbox/2-b.png".to_string(), None),
+                ("inbox/4-e.pdf".to_string(), None),
             ],
-            "a line quoted, or a path out of the inbox, names nothing"
+            "a line quoted, or a path out of the inbox, names nothing; a text out of it is left"
         );
     }
 

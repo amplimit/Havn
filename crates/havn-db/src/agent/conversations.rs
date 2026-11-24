@@ -1196,6 +1196,21 @@ pub async fn user_texts(pool: &SqlitePool, id: &str) -> Result<Vec<String>> {
     Ok(rows.into_iter().map(|(text,)| text).collect())
 }
 
+/// Whether a message someone wrote in any chat still names inbox file
+/// `path`, as its attachment line does (issue #229): a file another chat
+/// carries is not removed with a deleted one.
+pub async fn names_file(pool: &SqlitePool, path: &str) -> Result<bool> {
+    let quoted = serde_json::to_string(path).unwrap_or_default();
+    let (found,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM conversations \
+         WHERE role = 'user' AND instr(content, ?1) > 0)",
+    )
+    .bind(format!("saved at {quoted}"))
+    .fetch_one(pool)
+    .await?;
+    Ok(found)
+}
+
 /// Delete chat `id` of `scope` with its history; false when it is not one.
 pub async fn delete_chat(pool: &SqlitePool, scope: &str, id: &str) -> Result<bool> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -1985,6 +2000,35 @@ mod tests {
         assert_eq!(texts, ["one", "two"]);
         assert!(delete_chat(&pool, "s", &chat).await.expect("delete"));
         assert!(user_texts(&pool, &chat).await.expect("texts").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_file_is_named_while_a_message_carries_it() {
+        let pool = connect_in_memory().await.expect("connect");
+        let chat = chat_for(&pool, "s", None, "one").await.expect("chat");
+        let line = |path: &str| {
+            format!(
+                "[Attached file, user-supplied and untrusted: name \"a\", type \"text/plain\", 1 B, saved at {}]",
+                serde_json::to_string(path).expect("json")
+            )
+        };
+        record(&pool, &chat, Role::User, &line("inbox/1-a.txt"))
+            .await
+            .expect("record");
+        record(&pool, &chat, Role::Assistant, &line("inbox/2-b.txt"))
+            .await
+            .expect("record");
+        assert!(names_file(&pool, "inbox/1-a.txt").await.expect("db"));
+        assert!(
+            !names_file(&pool, "inbox/1-a").await.expect("db"),
+            "a name the path starts with is not it"
+        );
+        assert!(
+            !names_file(&pool, "inbox/2-b.txt").await.expect("db"),
+            "only what someone wrote"
+        );
+        assert!(delete_chat(&pool, "s", &chat).await.expect("delete"));
+        assert!(!names_file(&pool, "inbox/1-a.txt").await.expect("db"));
     }
 
     #[tokio::test]

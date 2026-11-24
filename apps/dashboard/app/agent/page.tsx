@@ -3250,7 +3250,7 @@ async function readChat(
 ): Promise<ExportedChat> {
   const [history, sent] = await Promise.all([
     api.conversation.list(agentId, EXPORT_LIMIT, chat, scope ?? undefined),
-    scope ? Promise.resolve([]) : api.outbox.list(agentId, chat),
+    api.outbox.list(agentId, chat),
   ]);
   const messages = history.turns
     .filter((t) => t.role === "user" || t.role === "assistant")
@@ -3311,11 +3311,9 @@ function saveFile(name: string, type: string, text: string) {
 
 /** A file name from a chat's title: its letters and digits, joined by dashes. */
 function exportName(title: string, ext: string): string {
-  const base = title
-    .normalize("NFKC")
-    .replace(/[^\p{L}\p{N}]+/gu, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 60);
+  const dashed = title.normalize("NFKC").replace(/[^\p{L}\p{M}\p{N}]+/gu, "-");
+  // Cut by characters, not UTF-16 units, then trimmed of dashes.
+  const base = Array.from(dashed).slice(0, 60).join("").replace(/^-+|-+$/g, "");
   return `${base || "chat"}.${ext}`;
 }
 
