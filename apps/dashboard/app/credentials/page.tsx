@@ -167,8 +167,9 @@ export default function CredentialsPage() {
               </optgroup>
               {endpoints.length > 0 && (
                 <optgroup label="[llm.endpoints], if it asks for a key">
+                  {/* Stored as llm:<name>, the only name the gateway looks it up by. */}
                   {endpoints.map((e) => (
-                    <option key={e.name} value={e.name}>
+                    <option key={e.name} value={`llm:${e.name}`}>
                       {e.name}
                     </option>
                   ))}

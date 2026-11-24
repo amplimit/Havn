@@ -273,7 +273,10 @@ pub enum ProxyError {
     Db(#[from] havn_db::DbError),
     #[error("invalid response body: {0}")]
     InvalidResponse(String),
-    #[error("unknown provider: {0:?}")]
+    #[error(
+        "unknown provider {0:?}: not built in, nor an endpoint of [llm.endpoints] the gateway \
+         runs (one added to config.toml takes `havn gateway restart`)"
+    )]
     UnknownProvider(String),
     #[error("token budget exhausted: {0}")]
     BudgetExhausted(String),
@@ -465,7 +468,14 @@ async fn complete_through(
     let request = with_max_tokens(request, max_tokens);
     let request = request.as_ref();
 
-    let chain = resolve_for_user(db, billing.user_id, billing.agent_team, route.name).await?;
+    // An endpoint's keys are `llm:<name>` only: a bare name may be any
+    // other kind of key's.
+    let lookup = if route.keyless {
+        format!("llm:{}", route.name)
+    } else {
+        route.name.to_string()
+    };
+    let chain = resolve_for_user(db, billing.user_id, billing.agent_team, &lookup).await?;
     // An endpoint the caller has no key for is called without one (issue
     // #232): a local server takes none.
     let chain: Vec<Option<Credential>> = if !chain.is_empty() {
@@ -489,6 +499,9 @@ async fn complete_through(
     let mut sent = false;
     // The last failure that passes, the calls made, and since when.
     let mut passing: Option<String> = None;
+    // An endpoint's last refusal that does not pass, with its status: said
+    // as it is, with how to add a key, rather than as no credential.
+    let mut refused: Option<(u16, String)> = None;
     let mut tries = 0_u32;
     let started = std::time::Instant::now();
     for cred in chain {
@@ -617,20 +630,13 @@ async fn complete_through(
             }
             Attempt::Disable { reason } => {
                 guard.release().await;
-                let Some(id) = cred_id else {
-                    return Err(ProxyError::Upstream {
-                        status: 401,
-                        message: format!(
-                            "{reason}; the endpoint wants a key: add one with `havn credential \
-                             add {} <key>`",
-                            route.name
-                        ),
-                    });
-                };
-                warn!(credential_id = %shown, %reason, "disabling credential");
-                let _ = havn_db::repo::credentials::set_enabled(db, id, false)
-                    .await
-                    .map_err(|e| warn!(error = %e, "failed to disable credential"));
+                if let Some(id) = cred_id {
+                    warn!(credential_id = %shown, %reason, "disabling credential");
+                    let _ = havn_db::repo::credentials::set_enabled(db, id, false)
+                        .await
+                        .map_err(|e| warn!(error = %e, "failed to disable credential"));
+                }
+                refused = Some((401, reason));
             }
             Attempt::TryNext {
                 reason, transient, ..
@@ -639,6 +645,8 @@ async fn complete_through(
                 warn!(credential_id = %shown, %reason, "skipping credential, trying next");
                 if transient {
                     passing = Some(reason);
+                } else {
+                    refused = Some((402, reason));
                 }
             }
             Attempt::Fatal(e) => {
@@ -662,6 +670,23 @@ async fn complete_through(
             provider: route.name.to_string(),
             reason: short_reason(&reason),
             tries,
+        });
+    }
+    if route.keyless
+        && let Some((status, reason)) = refused
+    {
+        let hint = if status == 401 {
+            format!(
+                "; the endpoint wants a key it takes: add one with `havn credential add llm:{} \
+                 <key>`",
+                route.name
+            )
+        } else {
+            String::new()
+        };
+        return Err(ProxyError::Upstream {
+            status,
+            message: format!("{reason}{hint}"),
         });
     }
     Err(exhausted.map_or_else(
@@ -4176,30 +4201,34 @@ mod tests {
             assert!(matches!(err, ProxyError::NoCredential(_)), "{err}");
         }
 
+        async fn key(db: &SqlitePool, user: UserId, provider: &str) {
+            create_cred(
+                db,
+                NewCredential {
+                    scope: CredentialScope::User,
+                    scope_id: &user.to_string(),
+                    provider,
+                    name: None,
+                    api_key_ciphertext: ciphertext(),
+                    priority: 1,
+                    limits: json!({}),
+                },
+            )
+            .await
+            .expect("credential");
+        }
+
         #[tokio::test]
-        async fn an_endpoint_s_key_is_the_one_stored_under_its_name() {
+        async fn an_endpoint_s_key_is_the_one_stored_as_llm_and_its_name() {
             let (base, seen) = serve(StatusCode::OK).await;
             let db = havn_db::connect_in_memory().await.expect("db");
             let user = create_user(&db, NewUser { display_name: "u" })
                 .await
                 .expect("user")
                 .id;
-            for provider in ["llm:ollama", "lan"] {
-                create_cred(
-                    &db,
-                    NewCredential {
-                        scope: CredentialScope::User,
-                        scope_id: &user.to_string(),
-                        provider,
-                        name: None,
-                        api_key_ciphertext: ciphertext(),
-                        priority: 1,
-                        limits: json!({}),
-                    },
-                )
-                .await
-                .expect("credential");
-            }
+            key(&db, user, "llm:ollama").await;
+            // A bare name could be any other key's: not looked up.
+            key(&db, user, "lan").await;
             let llm = llm(&base);
             call(&db, user, "ollama", &llm, &hi())
                 .await
@@ -4208,8 +4237,54 @@ mod tests {
             assert_eq!(headers["authorization"], "Bearer sk-test");
             call(&db, user, "lan", &llm, &hi()).await.expect("answer");
             let (_, headers, _) = seen.lock().unwrap().pop().expect("a call");
-            assert_eq!(headers["x-api-key"], "sk-test");
-            assert!(rows(&db).await.iter().all(|(cred, _)| cred.is_some()));
+            assert!(headers.get("x-api-key").is_none(), "{headers:?}");
+            let creds: Vec<(bool, String)> = rows(&db)
+                .await
+                .into_iter()
+                .map(|(cred, provider)| (cred.is_some(), provider))
+                .collect();
+            assert_eq!(
+                creds,
+                vec![(true, "ollama".to_string()), (false, "lan".to_string())]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_streamed_call_without_a_key_sends_none() {
+            let (base, seen) = serve(StatusCode::OK).await;
+            let db = havn_db::connect_in_memory().await.expect("db");
+            let user = create_user(&db, NewUser { display_name: "u" })
+                .await
+                .expect("user")
+                .id;
+            let llm = llm(&base);
+            let streamed = Arc::new(Mutex::new(String::new()));
+            let into = Arc::clone(&streamed);
+            let sink = move |event: provider::TextEvent<'_>| {
+                if let provider::TextEvent::Text(piece) = event {
+                    into.lock().unwrap().push_str(piece);
+                }
+            };
+            for endpoint in ["ollama", "lan"] {
+                stream_with_provider(
+                    &db,
+                    &http_client().expect("client"),
+                    &KeyRing::from_passphrase(PASSPHRASE),
+                    &Billing::user(user),
+                    endpoint,
+                    None,
+                    &hi(),
+                    &llm,
+                    &sink,
+                )
+                .await
+                .expect("answer");
+                let (_, headers, body) = seen.lock().unwrap().pop().expect("a call");
+                assert_eq!(body["stream"], true, "{endpoint}");
+                assert!(headers.get("authorization").is_none(), "{headers:?}");
+                assert!(headers.get("x-api-key").is_none(), "{headers:?}");
+            }
+            assert_eq!(*streamed.lock().unwrap(), "okok");
         }
 
         #[tokio::test]
@@ -4220,15 +4295,21 @@ mod tests {
                 .await
                 .expect("user")
                 .id;
+            let wants_a_key = |err: &ProxyError| {
+                matches!(err, ProxyError::Upstream { status: 401, message }
+                    if message.contains("havn credential add llm:ollama"))
+            };
             let err = call(&db, user, "ollama", &llm(&base), &hi())
                 .await
                 .expect_err("401");
-            assert!(
-                matches!(&err, ProxyError::Upstream { status: 401, message }
-                    if message.contains("havn credential add ollama")),
-                "{err}"
-            );
+            assert!(wants_a_key(&err), "{err}");
             assert!(rows(&db).await.is_empty(), "the reservation is released");
+            // A key it refuses is disabled, and said the same way.
+            key(&db, user, "llm:ollama").await;
+            let err = call(&db, user, "ollama", &llm(&base), &hi())
+                .await
+                .expect_err("401");
+            assert!(wants_a_key(&err), "{err}");
         }
     }
 }

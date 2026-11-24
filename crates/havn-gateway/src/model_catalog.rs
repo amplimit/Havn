@@ -426,7 +426,18 @@ impl ModelCatalog {
     pub fn validate(&self, endpoints: &crate::config::Endpoints) -> anyhow::Result<()> {
         let mut seen = HashSet::new();
         for entry in &self.models {
-            let api = split_model_ref(&entry.id).and_then(|(p, _)| endpoints.api_of(p));
+            let split = split_model_ref(&entry.id);
+            let api = split.and_then(|(p, _)| endpoints.api_of(p));
+            if let Some((provider, _)) = split
+                && api.is_none()
+            {
+                anyhow::bail!(
+                    "[[llm.models]] {:?} names the endpoint {provider:?}, which is not one of \
+                     [llm.endpoints] (the gateway takes an endpoint added to config.toml, and \
+                     drops one removed, on `havn gateway restart`)",
+                    entry.id
+                );
+            }
             if api.is_none() {
                 let providers: Vec<&str> = crate::llm_proxy::PROVIDERS
                     .iter()
@@ -585,13 +596,11 @@ fn entry_table(value: toml_edit::Value) -> anyhow::Result<Table> {
 // file a symlink points to), keeping the rest of the file, comments
 // included, and the comments of entries that stay. The entries go right
 // after the other `[llm]` tables, or before the first table when there are
-// none. A missing file is created. Its models may name `endpoints`.
-pub fn write_to_file(
-    path: &Path,
-    catalog: &ModelCatalog,
-    endpoints: &crate::config::Endpoints,
-) -> anyhow::Result<()> {
-    write_checked(path, catalog, endpoints, None).map(|_| ())
+// none. A missing file is created. Nothing is written when the gateway
+// could not load the file with the list ([`Unloadable`]): its models must
+// name the file's own `[llm.endpoints]`.
+pub fn write_to_file(path: &Path, catalog: &ModelCatalog) -> anyhow::Result<()> {
+    write_checked(path, catalog, None).map(|_| ())
 }
 
 // Like `write_to_file`, but only if the file's list still has `version`;
@@ -600,20 +609,23 @@ pub fn write_if_unchanged(
     path: &Path,
     version: &str,
     catalog: &ModelCatalog,
-    endpoints: &crate::config::Endpoints,
 ) -> anyhow::Result<bool> {
-    write_checked(path, catalog, endpoints, Some(version))
+    write_checked(path, catalog, Some(version))
 }
+
+/// Why a model list was not written: config.toml with it is not one the
+/// gateway could load.
+#[derive(Debug, thiserror::Error)]
+#[error("config.toml would not load with this model list: {0}")]
+pub struct Unloadable(pub String);
 
 fn write_checked(
     path: &Path,
     catalog: &ModelCatalog,
-    endpoints: &crate::config::Endpoints,
     expected: Option<&str>,
 ) -> anyhow::Result<bool> {
     use anyhow::Context as _;
 
-    catalog.validate(endpoints)?;
     let target: PathBuf = match std::fs::canonicalize(path) {
         Ok(p) => p,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
@@ -785,7 +797,12 @@ fn write_checked(
         llm.insert("models", Item::ArrayOfTables(models));
     }
 
-    replace_file(&target, doc.to_string().as_bytes())?;
+    // Checked as the gateway loads it at its next start.
+    let written = doc.to_string();
+    if let Err(e) = crate::config::GatewayConfig::from_toml(&written) {
+        return Err(Unloadable(format!("{e:#}")).into());
+    }
+    replace_file(&target, written.as_bytes())?;
     Ok(true)
 }
 
@@ -1023,7 +1040,7 @@ pub async fn upgrade(
             };
             let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
             // Of the built-in providers only, as the agents named them.
-            match write_to_file(config_path, &catalog, &crate::config::Endpoints::default()) {
+            match write_to_file(config_path, &catalog) {
                 Ok(()) => {
                     info!(
                         path = %config_path.display(),
@@ -1136,7 +1153,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "").expect("write");
-        write_to_file(&path, &c, &NO_ENDPOINTS).expect("written");
+        write_to_file(&path, &c).expect("written");
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(text.contains("vision = true"), "{text}");
         assert!(text.contains("vision = false"), "{text}");
@@ -1144,13 +1161,13 @@ mod tests {
         assert_eq!(read_from_file(&path).expect("read back"), c);
         // Unset again, the line goes.
         c.models[1].vision = None;
-        write_to_file(&path, &c, &NO_ENDPOINTS).expect("written");
+        write_to_file(&path, &c).expect("written");
         let text = std::fs::read_to_string(&path).expect("read");
         assert_eq!(text.matches("vision").count(), 1, "{text}");
         // A context window set is written and read back (issue #214).
         c.models[2].context_window = Some(20_000);
         c.models[2].fallback = vec!["openrouter:a/seeing".into()];
-        write_to_file(&path, &c, &NO_ENDPOINTS).expect("written");
+        write_to_file(&path, &c).expect("written");
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(text.contains("context_window = 20000"), "{text}");
         assert!(
@@ -1197,7 +1214,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "").expect("write");
-        write_to_file(&path, &c, &NO_ENDPOINTS).expect("written");
+        write_to_file(&path, &c).expect("written");
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(text.contains("thinking = { style = \"effort\""), "{text}");
         assert_eq!(read_from_file(&path).expect("read back"), c);
@@ -1394,7 +1411,7 @@ mod tests {
             Some("openai:gpt-5"),
         );
         c.models[0].label = Some("Opus".into());
-        write_to_file(&path, &c, &NO_ENDPOINTS).unwrap();
+        write_to_file(&path, &c).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         for kept in [
             "# operator notes",
@@ -1421,10 +1438,10 @@ mod tests {
         assert!(!cfg.trust_header.enabled);
         assert_eq!(read_from_file(&path).unwrap(), c);
 
-        write_to_file(&path, &catalog(&[], None), &NO_ENDPOINTS).unwrap();
+        write_to_file(&path, &catalog(&[], None)).unwrap();
         assert_eq!(parsed(&path).llm.catalog(), ModelCatalog::default());
         assert!(lists_models(&path).unwrap(), "an emptied list stays a list");
-        write_to_file(&path, &catalog(&["openai:gpt-5"], None), &NO_ENDPOINTS).unwrap();
+        write_to_file(&path, &catalog(&["openai:gpt-5"], None)).unwrap();
         assert_eq!(
             parsed(&path).llm.catalog(),
             catalog(&["openai:gpt-5"], None)
@@ -1441,7 +1458,7 @@ mod tests {
         )
         .unwrap();
         let c = catalog(&["openai:gpt-5"], Some("openai:gpt-5"));
-        write_to_file(&path, &c, &NO_ENDPOINTS).unwrap();
+        write_to_file(&path, &c).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("listen ="), "{text}");
         let reload = text.find("[reload]").unwrap();
@@ -1459,7 +1476,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "llm = { max_tokens_ceiling = 1000 }\n").unwrap();
         let c = catalog(&["openai:gpt-5"], None);
-        write_to_file(&path, &c, &NO_ENDPOINTS).unwrap();
+        write_to_file(&path, &c).unwrap();
         assert_eq!(parsed(&path).llm.catalog(), c);
         assert_eq!(parsed(&path).llm.max_tokens_ceiling, 1000);
 
@@ -1469,7 +1486,7 @@ mod tests {
         )
         .unwrap();
         let c = catalog(&["gemini:gemini-2.5-pro", "openai:gpt-5"], None);
-        write_to_file(&path, &c, &NO_ENDPOINTS).unwrap();
+        write_to_file(&path, &c).unwrap();
         assert_eq!(parsed(&path).llm.catalog(), c);
     }
 
@@ -1482,7 +1499,7 @@ mod tests {
         std::fs::write(&real, "listen = \"127.0.0.1:8080\"\n").unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let c = catalog(&["openai:gpt-5"], None);
-        write_to_file(&link, &c, &NO_ENDPOINTS).unwrap();
+        write_to_file(&link, &c).unwrap();
         assert!(
             std::fs::symlink_metadata(&link)
                 .unwrap()
@@ -1500,7 +1517,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-        write_to_file(&path, &catalog(&["openai:gpt-5"], None), &NO_ENDPOINTS).unwrap();
+        write_to_file(&path, &catalog(&["openai:gpt-5"], None)).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o640
@@ -1513,7 +1530,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub/config.toml");
         let c = catalog(&["openrouter:deepseek/deepseek-r1:free"], None);
-        write_to_file(&path, &c, &NO_ENDPOINTS).unwrap();
+        write_to_file(&path, &c).unwrap();
         assert_eq!(parsed(&path).llm.catalog(), c);
         assert_eq!(
             read_from_file(&dir.path().join("none.toml")).unwrap(),
@@ -1690,28 +1707,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let first = catalog(&["openai:gpt-5"], None);
-        assert!(
-            write_if_unchanged(
-                &path,
-                &ModelCatalog::default().version(),
-                &first,
-                &NO_ENDPOINTS
-            )
-            .unwrap()
-        );
+        assert!(write_if_unchanged(&path, &ModelCatalog::default().version(), &first).unwrap());
         let other = catalog(&["gemini:gemini-2.5-pro"], None);
-        assert!(
-            !write_if_unchanged(
-                &path,
-                &ModelCatalog::default().version(),
-                &other,
-                &NO_ENDPOINTS
-            )
-            .unwrap()
-        );
+        assert!(!write_if_unchanged(&path, &ModelCatalog::default().version(), &other).unwrap());
         assert_eq!(read_from_file(&path).unwrap(), first);
-        assert!(write_if_unchanged(&path, &first.version(), &other, &NO_ENDPOINTS).unwrap());
+        assert!(write_if_unchanged(&path, &first.version(), &other).unwrap());
         assert_eq!(read_from_file(&path).unwrap(), other);
+    }
+
+    #[test]
+    fn a_list_is_written_only_with_the_endpoints_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        let c = catalog(&["ollama:qwen3"], None);
+        let err = write_to_file(&path, &c).expect_err("no such endpoint in the file");
+        assert!(err.downcast_ref::<Unloadable>().is_some(), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("endpoint \"ollama\""),
+            "{err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "",
+            "nothing written"
+        );
+        std::fs::write(
+            &path,
+            "[llm.endpoints.ollama]\napi = \"openai\"\nbase_url = \"http://127.0.0.1:11434/v1\"\n",
+        )
+        .unwrap();
+        write_to_file(&path, &c).expect("written");
+        assert_eq!(read_from_file(&path).unwrap(), c);
     }
 
     #[cfg(unix)]
@@ -1720,7 +1747,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        write_to_file(&path, &catalog(&["openai:gpt-5"], None), &NO_ENDPOINTS).unwrap();
+        write_to_file(&path, &catalog(&["openai:gpt-5"], None)).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o644
@@ -1734,7 +1761,7 @@ mod tests {
         mark_upgrade(&db).await;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        write_to_file(&path, &catalog(&[], None), &NO_ENDPOINTS).unwrap();
+        write_to_file(&path, &catalog(&[], None)).unwrap();
         let c = upgrade(&db, &path, ModelCatalog::default()).await.unwrap();
         assert_eq!(c, ModelCatalog::default());
         assert_eq!(parsed(&path).llm.catalog(), ModelCatalog::default());
@@ -1844,7 +1871,7 @@ mod tests {
         ] {
             let expected = catalog.version();
             catalog.models[0].price = price;
-            assert!(write_if_unchanged(&path, &expected, &catalog, &NO_ENDPOINTS).expect("write"));
+            assert!(write_if_unchanged(&path, &expected, &catalog).expect("write"));
             assert_eq!(read().models[0].price, price);
             assert_eq!(read().version(), catalog.version(), "the file is what runs");
         }

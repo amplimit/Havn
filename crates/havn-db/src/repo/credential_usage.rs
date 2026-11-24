@@ -536,6 +536,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usage_rows_and_their_indexes_survive_migration_0025() {
+        use sqlx::migrate::Migrator;
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::borrow::Cow;
+
+        #[derive(Debug, PartialEq, sqlx::FromRow)]
+        struct Row {
+            id: String,
+            credential_id: Option<String>,
+            user_id: String,
+            agent_id: Option<String>,
+            provider: String,
+            model: String,
+            tokens_in: i64,
+            tokens_out: i64,
+            created_at: String,
+            cache_read_tokens: i64,
+            cache_write_tokens: i64,
+            asked_model: String,
+            settled: i64,
+        }
+        async fn all(pool: &SqlitePool) -> Vec<Row> {
+            sqlx::query_as(
+                "SELECT id, credential_id, user_id, agent_id, provider, model, tokens_in, \
+                 tokens_out, created_at, cache_read_tokens, cache_write_tokens, asked_model, \
+                 settled FROM credential_usages ORDER BY id",
+            )
+            .fetch_all(pool)
+            .await
+            .expect("rows")
+        }
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .in_memory(true)
+                    .foreign_keys(true),
+            )
+            .await
+            .expect("connect");
+        let before = Migrator {
+            migrations: Cow::Owned(
+                crate::MIGRATOR
+                    .iter()
+                    .filter(|m| m.version < 25)
+                    .cloned()
+                    .collect(),
+            ),
+            ..Migrator::DEFAULT
+        };
+        before.run(&pool).await.expect("migrate up to 0024");
+        let f = fixture(&pool).await;
+        let settled = reserve(&pool, reservation(&f, 10, 100, Caps::default()))
+            .await
+            .expect("reserve")
+            .expect("granted");
+        settle(
+            &pool,
+            &settled.id,
+            "m",
+            Used {
+                tokens_in: 40,
+                tokens_out: 60,
+                cache_read: 30,
+                cache_write: 5,
+            },
+        )
+        .await
+        .expect("settle");
+        reserve(&pool, reservation(&f, 1, 2, Caps::default()))
+            .await
+            .expect("reserve")
+            .expect("granted");
+        let rows = all(&pool).await;
+        assert_eq!(rows.len(), 2);
+
+        crate::MIGRATOR.run(&pool).await.expect("migrate to latest");
+        assert_eq!(all(&pool).await, rows);
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' \
+             AND tbl_name = 'credential_usages' AND name LIKE 'idx_%' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("indexes");
+        assert_eq!(
+            indexes,
+            [
+                "idx_credusage_agent_time",
+                "idx_credusage_credential_time",
+                "idx_credusage_time",
+                "idx_credusage_user_time",
+            ]
+        );
+        // And a call without a credential is recorded now.
+        reserve(
+            &pool,
+            Reservation {
+                credential_id: None,
+                ..reservation(&f, 1, 2, Caps::default())
+            },
+        )
+        .await
+        .expect("reserve")
+        .expect("granted");
+        assert_eq!(all(&pool).await.len(), 3);
+    }
+
+    #[tokio::test]
     async fn deleting_an_agent_keeps_its_usage() {
         let pool = connect_in_memory().await.expect("connect");
         let f = fixture(&pool).await;

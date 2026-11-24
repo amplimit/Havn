@@ -106,8 +106,8 @@ pub async fn put(
         title_model,
         models: req.models,
     };
-    // Of the endpoints the gateway runs with: one added to config.toml
-    // since takes a restart to be called.
+    // Of the endpoints the gateway runs with, so that it can call them; the
+    // write checks the file's own, so that it can start with them.
     catalog
         .validate(&state.llm.endpoints)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -120,25 +120,38 @@ pub async fn put(
     let applied = tokio::task::spawn_blocking(move || {
         // The file is compared, not the running list: a hand edit the
         // watcher has not applied yet must not be overwritten either.
-        if model_catalog::write_if_unchanged(&path, &expected, &written, &llm.endpoints)? {
-            return Ok(None);
-        }
-        // Retrying only helps if the gateway can load what is there now.
-        Ok::<_, anyhow::Error>(Some(match crate::config::GatewayConfig::load_from(&path) {
-            Ok(_) => {
-                "the model list changed since it was read; load it again and retry".to_string()
+        match model_catalog::write_if_unchanged(&path, &expected, &written) {
+            Ok(true) => return Ok(None),
+            Ok(false) => {}
+            Err(e) if e.is::<model_catalog::Unloadable>() => {
+                return Ok(Some(ApiError::BadRequest(e.to_string())));
             }
-            Err(e) => format!(
-                "config.toml has changes the gateway could not load ({e:#}); fix the file, \
-                 then retry"
-            ),
-        }))
+            Err(e) => return Err(e),
+        }
+        // Retrying only helps if the gateway can load what is there now,
+        // and run its models.
+        Ok::<_, anyhow::Error>(Some(ApiError::Conflict(
+            match crate::config::GatewayConfig::load_from(&path) {
+                Ok(cfg) => match cfg.llm.catalog().validate(&llm.endpoints) {
+                    Ok(()) => "the model list changed since it was read; load it again and retry"
+                        .to_string(),
+                    Err(e) => format!(
+                        "config.toml lists models the running gateway cannot use yet ({e}); \
+                         run `havn gateway restart`, then retry"
+                    ),
+                },
+                Err(e) => format!(
+                    "config.toml has changes the gateway could not load ({e:#}); fix the file, \
+                     then retry"
+                ),
+            },
+        )))
     })
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?
     .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
-    if let Some(conflict) = applied {
-        return Err(ApiError::Conflict(conflict));
+    if let Some(refused) = applied {
+        return Err(refused);
     }
     let ids: Vec<String> = catalog.models.iter().map(|m| m.id.clone()).collect();
     let default_model = catalog.default_model.clone();
@@ -403,7 +416,10 @@ mod tests {
         )
         .await
         .expect_err("no such endpoint");
-        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+        assert!(
+            matches!(&err, ApiError::BadRequest(m) if m.contains("havn gateway restart")),
+            "{err:?}"
+        );
 
         let mut llm = crate::config::LlmConfig::default();
         llm.endpoints.0.insert(
@@ -414,6 +430,27 @@ mod tests {
             },
         );
         state.llm = Arc::new(llm);
+        // Running, but gone from config.toml: the gateway could not start
+        // with the list, so it is not written.
+        let _ = std::fs::remove_file(&state.config_path);
+        let err = put(
+            State(state.clone()),
+            user(user_id),
+            body(&first, &["ollama:qwen3"]),
+        )
+        .await
+        .expect_err("not in the file");
+        assert!(
+            matches!(&err, ApiError::BadRequest(m) if m.contains("endpoint \"ollama\"")),
+            "{err:?}"
+        );
+        assert!(!state.config_path.exists(), "nothing written");
+
+        std::fs::write(
+            &state.config_path,
+            "[llm.endpoints.ollama]\napi = \"openai\"\nbase_url = \"http://127.0.0.1:11434/v1\"\n",
+        )
+        .unwrap();
         let view = put(
             State(state.clone()),
             user(user_id),
@@ -514,7 +551,7 @@ mod tests {
             title_model: None,
             models: vec![],
         };
-        model_catalog::write_to_file(&state.config_path, &edited, &state.llm.endpoints).unwrap();
+        model_catalog::write_to_file(&state.config_path, &edited).unwrap();
         let err = put(
             State(state.clone()),
             user(user_id),
