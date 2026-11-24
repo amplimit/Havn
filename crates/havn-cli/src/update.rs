@@ -10,6 +10,12 @@
 //! Only a gateway that runs as the systemd unit `havn` is restarted: one
 //! that runs otherwise is not touched (stop it first), and with none
 //! running the binaries are only put in place.
+//!
+//! Then (issue #312) each channel adapter on the machine, as listed in
+//! [`COMPONENTS`] or found by its systemd unit, is given its own latest
+//! release the same way: checked, put in place with the old binary kept,
+//! its units restarted and watched, and its old binary put back alone when
+//! they do not come up. Packs are found and reported, not updated.
 
 use std::ffi::OsString;
 use std::io::Read as _;
@@ -39,6 +45,60 @@ const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 /// Bytes of one binary the command takes from an archive.
 const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 
+/// The channel adapters and packs on this machine, kept by `havn update`
+/// and by their setup.
+const COMPONENTS: &str = "/etc/havn/components.toml";
+
+/// Where unit files are looked for, in the order systemd prefers them.
+const UNIT_DIRS: [&str; 3] = [
+    "/etc/systemd/system",
+    "/usr/local/lib/systemd/system",
+    "/lib/systemd/system",
+];
+
+/// Where packs install themselves, one directory each.
+const PACKS: &str = "/opt/havn";
+
+/// The channel adapters whose repository is known, by their binary's name
+/// (the repository's name under amplimit).
+const ADAPTERS: [&str; 3] = [
+    "havn-channel-telegram",
+    "havn-channel-discord",
+    "havn-channel-lark",
+];
+
+/// Packs that install no directory of their own name: theirs, and the
+/// directory under [`PACKS`] that shows one is installed.
+const KNOWN_PACKS: [(&str, &str); 1] = [("havn-pack-browser", "playwright-cli")];
+
+/// What an adapter logs when it has connected to the gateway.
+const CONNECTED: &str = "havn WS connected";
+
+/// How a release's notes name the oldest gateway it works with:
+/// `Requires Havn >= 0.2.12` on a line, read in lower case.
+const REQUIRES: &str = "requires havn";
+
+/// Where the adapters' releases install their binary. One found elsewhere
+/// was put there otherwise (built from source, a package): it is updated
+/// only when [`COMPONENTS`] lists it.
+const RELEASE_DIR: &str = "/usr/local/bin";
+
+/// How long a restarted adapter is watched: it must stay active for
+/// `settle`, and, if the one before it had connected to the gateway, have
+/// connected within `within`.
+#[derive(Debug, Clone, Copy)]
+struct Watch {
+    settle: Duration,
+    within: Duration,
+    poll: Duration,
+}
+
+const WATCH: Watch = Watch {
+    settle: Duration::from_secs(5),
+    within: Duration::from_secs(60),
+    poll: Duration::from_secs(1),
+};
+
 fn client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent("havn-cli")
@@ -48,18 +108,24 @@ fn client() -> anyhow::Result<reqwest::Client> {
         .context("building the HTTP client")
 }
 
-/// The latest release's tag.
-async fn latest(http: &reqwest::Client) -> anyhow::Result<String> {
+/// The tag and notes of the latest release at `api` (GitHub's address of a
+/// repository's latest release); `None` when the repository has none.
+async fn latest(http: &reqwest::Client, api: &str) -> anyhow::Result<Option<(String, String)>> {
     #[derive(serde::Deserialize)]
     struct Release {
         tag_name: String,
+        #[serde(default)]
+        body: Option<String>,
     }
     let response = http
-        .get(release::LATEST_RELEASE_API)
+        .get(api)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .send()
         .await
         .context("asking GitHub for the latest release")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
     if !response.status().is_success() {
         bail!(
             "GitHub answered {} for the latest release",
@@ -76,7 +142,7 @@ async fn latest(http: &reqwest::Client) -> anyhow::Result<String> {
             release.tag_name
         );
     }
-    Ok(release.tag_name)
+    Ok(Some((release.tag_name, release.body.unwrap_or_default())))
 }
 
 async fn fetch(http: &reqwest::Client, url: &str) -> anyhow::Result<Vec<u8>> {
@@ -134,10 +200,10 @@ fn a_binary(name: &str) -> bool {
 }
 
 /// Unpack the release's binaries from `archive` (a `.tar.gz`) into `to`:
-/// regular files named as [`a_binary`], by their base name, at most
-/// [`MAX_BINARY_BYTES`] each. Their names, sorted; an error when one of
-/// [`BINARIES`] is missing.
-fn unpack(archive: &[u8], to: &Path) -> anyhow::Result<Vec<String>> {
+/// regular files named as [`a_binary`] or as one of `required`, by their
+/// base name, at most [`MAX_BINARY_BYTES`] each. Their names, sorted; an
+/// error when one of `required` is missing.
+fn unpack(archive: &[u8], to: &Path, required: &[&str]) -> anyhow::Result<Vec<String>> {
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
     let mut names = Vec::new();
     for entry in tar.entries().context("reading the archive")? {
@@ -150,7 +216,8 @@ fn unpack(archive: &[u8], to: &Path) -> anyhow::Result<Vec<String>> {
         else {
             continue;
         };
-        if !a_binary(&name) || !entry.header().entry_type().is_file() {
+        let wanted = a_binary(&name) || required.contains(&name.as_str());
+        if !wanted || !entry.header().entry_type().is_file() {
             continue;
         }
         if entry.header().size().unwrap_or(u64::MAX) > MAX_BINARY_BYTES {
@@ -169,7 +236,7 @@ fn unpack(archive: &[u8], to: &Path) -> anyhow::Result<Vec<String>> {
             names.push(name);
         }
     }
-    for name in BINARIES {
+    for name in required {
         if !names.iter().any(|n| n == name) {
             bail!("the archive has no {name}");
         }
@@ -180,6 +247,7 @@ fn unpack(archive: &[u8], to: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 /// `dir`'s mark that an update runs there, removed when it ends.
+#[derive(Debug)]
 struct Updating(PathBuf);
 
 impl Updating {
@@ -216,9 +284,11 @@ struct Swapped {
 
 /// Put each of `names` from `from` in place of the one in `dir`, the old one
 /// kept as `<name>.old`: linked there first, then replaced in one rename, so
-/// it is never missing. All or none.
-fn swap(dir: &Path, from: &Path, names: &[String]) -> anyhow::Result<Swapped> {
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+/// it is never missing. A new binary is mode 755, or with `keep` (an
+/// adapter's) has the old one's owner, mode and file capabilities. All or
+/// none.
+fn swap(dir: &Path, from: &Path, names: &[String], keep: bool) -> anyhow::Result<Swapped> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
     let mut done = Swapped::default();
     let result = (|| -> anyhow::Result<()> {
         for name in names {
@@ -233,8 +303,23 @@ fn swap(dir: &Path, from: &Path, names: &[String]) -> anyhow::Result<Swapped> {
             std::io::copy(&mut std::fs::File::open(from.join(name))?, &mut out)
                 .with_context(|| format!("writing {name} into {}", dir.display()))?;
             drop(out);
-            std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o755))?;
             let current = dir.join(name);
+            let was = std::fs::metadata(&current).ok().filter(|_| keep);
+            if let Some(was) = &was {
+                let made = std::fs::metadata(&fresh)?;
+                if (made.uid(), made.gid()) != (was.uid(), was.gid()) {
+                    std::os::unix::fs::chown(&fresh, Some(was.uid()), Some(was.gid()))
+                        .with_context(|| format!("giving the new {name} the old one's owner"))?;
+                }
+            }
+            let mode = was
+                .as_ref()
+                .map_or(0o755, |m| m.permissions().mode() & 0o777);
+            std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(mode))?;
+            if was.is_some() {
+                copy_capabilities(&current, &fresh)
+                    .with_context(|| format!("giving the new {name} the old one's capabilities"))?;
+            }
             let old = dir.join(format!("{name}.old"));
             if current.exists() {
                 let _ = std::fs::remove_file(&old);
@@ -259,6 +344,51 @@ fn swap(dir: &Path, from: &Path, names: &[String]) -> anyhow::Result<Swapped> {
         return Err(e);
     }
     Ok(done)
+}
+
+/// Give `to` the file capabilities (`security.capability`) `from` has.
+#[cfg(target_os = "linux")]
+fn copy_capabilities(from: &Path, to: &Path) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let name = c"security.capability";
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes())?;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes())?;
+    let mut value = [0u8; 256];
+    // SAFETY: both strings are NUL-terminated and `value` is as long as said.
+    let len = unsafe {
+        libc::getxattr(
+            from.as_ptr(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    if len < 0 {
+        let e = std::io::Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(libc::ENODATA | libc::ENOTSUP) => Ok(()),
+            _ => Err(e.into()),
+        };
+    }
+    // SAFETY: as above; `len` bytes of `value` were written.
+    let set = unsafe {
+        libc::setxattr(
+            to.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            len as usize,
+            0,
+        )
+    };
+    if set != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn copy_capabilities(_from: &Path, _to: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 /// Undo [`swap`] in `dir`: the binaries it replaced get their old ones
@@ -367,24 +497,25 @@ fn parse_unit_state(shown: &str) -> (String, u64) {
     )
 }
 
-/// `(ActiveState, NRestarts)` of the unit.
-fn unit_state() -> (String, u64) {
+/// `(ActiveState, NRestarts)` of `unit`.
+fn unit_state(unit: &str) -> (String, u64) {
     parse_unit_state(
-        &systemctl(&["show", "-p", "ActiveState", "-p", "NRestarts", UNIT]).unwrap_or_default(),
+        &systemctl(&["show", "-p", "ActiveState", "-p", "NRestarts", unit]).unwrap_or_default(),
     )
 }
 
-fn restart_unit() -> anyhow::Result<u64> {
+/// Restart `unit`; how many times systemd had restarted it before.
+fn restart_unit(unit: &str) -> anyhow::Result<u64> {
     // A start that failed before can leave the unit failed, or past
     // systemd's start limit: cleared first.
-    let _ = systemctl(&["reset-failed", UNIT]);
-    let (_, restarts) = unit_state();
+    let _ = systemctl(&["reset-failed", unit]);
+    let (_, restarts) = unit_state(unit);
     let status = std::process::Command::new("systemctl")
-        .args(["restart", UNIT])
+        .args(["restart", unit])
         .status()
-        .context("running systemctl restart havn")?;
+        .with_context(|| format!("running systemctl restart {unit}"))?;
     if !status.success() {
-        bail!("systemctl restart havn failed");
+        bail!("systemctl restart {unit} failed");
     }
     Ok(restarts)
 }
@@ -423,7 +554,7 @@ async fn comes_up_as(listen: &str, version: &str, restarts: u64) -> anyhow::Resu
         {
             return Ok(true);
         }
-        let (state, now) = unit_state();
+        let (state, now) = unit_state(UNIT);
         // Failed, stopped, or restarted by systemd: not coming up.
         if (!state.is_empty() && !unit_up(&state)) || now > restarts {
             return Ok(false);
@@ -437,9 +568,55 @@ async fn comes_up_as(listen: &str, version: &str, restarts: u64) -> anyhow::Resu
     Ok(false)
 }
 
-/// `havn update`: install release `version` (the latest when `None`), or
-/// with `check` only say whether a newer one is out. With `backup`, the
-/// installation is backed up first: the new gateway migrates its
+/// The directory of this `havn`, where the gateway's binaries are put.
+fn install_dir() -> anyhow::Result<PathBuf> {
+    Ok(std::env::current_exe()
+        .context("finding this havn")?
+        .canonicalize()
+        .context("finding this havn")?
+        .parent()
+        .ok_or_else(|| anyhow!("this havn is in no directory"))?
+        .to_path_buf())
+}
+
+/// One line of the report: a component, the version it was, the release
+/// looked at, and what was done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Row {
+    name: String,
+    from: String,
+    to: String,
+    result: String,
+    failed: bool,
+}
+
+impl Row {
+    fn new(name: &str, from: &str, to: &str, result: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+            result: result.to_string(),
+            failed: false,
+        }
+    }
+}
+
+/// The gateway after its step: its line of the report, the version it
+/// runs now (with `--check`, the one it would), the address it answers
+/// at, and the update's lock, held for the adapters.
+#[derive(Debug)]
+struct Gateway {
+    row: Row,
+    now: String,
+    listen: String,
+    updating: Option<Updating>,
+}
+
+/// `havn update`: install release `version` of the gateway (the latest
+/// when `None`), then, unless `only_gateway`, the latest release of each
+/// channel adapter; with `check` only say which are out. With `backup`,
+/// the installation is backed up first: the new gateway migrates its
 /// databases, which the old binaries put back may not open. A release
 /// older than the gateway's needs `downgrade`.
 pub async fn run(
@@ -447,8 +624,78 @@ pub async fn run(
     check: bool,
     backup: bool,
     downgrade: bool,
+    only_gateway: bool,
 ) -> anyhow::Result<()> {
     let http = client()?;
+    // The adapters' list is read first: a bad one stops the update before
+    // the gateway's.
+    let gathered = if only_gateway {
+        None
+    } else {
+        let unit_dirs: Vec<&Path> = UNIT_DIRS.iter().map(Path::new).collect();
+        Some(gather(
+            Path::new(COMPONENTS),
+            &unit_dirs,
+            Path::new(PACKS),
+            &System,
+            check,
+        )?)
+    };
+    let gateway = gateway(&http, version, check, backup, downgrade).await;
+    let Some(gathered) = gathered else {
+        return gateway.map(|_| ());
+    };
+    let gateway = gateway.inspect_err(|_| {
+        eprintln!("The channel adapters were not updated, as the gateway was not.");
+    })?;
+    // One update at a time: the gateway's lock, or one taken now.
+    let _updating = match gateway.updating {
+        Some(lock) => Some(lock),
+        None if check => None,
+        None => Some(Updating::take(&install_dir()?)?),
+    };
+    let probe = reqwest::Client::builder().no_proxy().build()?;
+    let gateway_up = !check && answering(&probe, &gateway.listen).await.is_some();
+    let mut rows = vec![gateway.row];
+    rows.extend(
+        update_components(
+            &http,
+            &Github::default(),
+            gathered,
+            &gateway.now,
+            gateway_up,
+            check,
+            &System,
+            WATCH,
+        )
+        .await,
+    );
+    let head = if check {
+        ["component", "installed", "latest", "result"]
+    } else {
+        ["component", "from", "to", "result"]
+    };
+    println!();
+    print!("{}", table(head, &rows));
+    let failed: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.failed)
+        .map(|r| r.name.as_str())
+        .collect();
+    if !check && !failed.is_empty() {
+        bail!("not updated: {}", failed.join(", "));
+    }
+    Ok(())
+}
+
+/// The gateway's step of [`run`].
+async fn gateway(
+    http: &reqwest::Client,
+    version: Option<String>,
+    check: bool,
+    backup: bool,
+    downgrade: bool,
+) -> anyhow::Result<Gateway> {
     // The gateway as systemd runs it: its config and the release it is.
     let pid = unit_gateway()?;
     let (config, home) = match pid {
@@ -489,21 +736,34 @@ pub async fn run(
     let asked = tag.is_some();
     let tag = match tag {
         Some(tag) => tag,
-        None => latest(&http).await?,
+        None => {
+            latest(http, release::LATEST_RELEASE_API)
+                .await?
+                .ok_or_else(|| anyhow!("GitHub has no release of Havn"))?
+                .0
+        }
+    };
+    let stays = |result: &str, now: &str| Gateway {
+        row: Row::new("gateway", &current, &tag, result),
+        now: now.to_string(),
+        listen: listen.clone(),
+        updating: None,
     };
     if check {
-        if release::newer(&tag, &current) {
+        return Ok(if release::newer(&tag, &current) {
             println!("{tag} is out (this is {current}): `havn update` installs it.");
+            stays("newer release out", tag.trim_start_matches('v'))
         } else if asked {
             println!("{tag} is not newer than {current}.");
+            stays("current", &current)
         } else {
             println!("Havn {current} is the latest release.");
-        }
-        return Ok(());
+            stays("current", &current)
+        });
     }
     if !asked && !release::newer(&tag, &current) {
         println!("Havn {current} is the latest release.");
-        return Ok(());
+        return Ok(stays("current", &current));
     }
     if release::newer(&current, &tag) && !downgrade {
         bail!(
@@ -525,13 +785,7 @@ pub async fn run(
 
     let archive_name = release::archive_for(std::env::consts::ARCH)
         .ok_or_else(|| anyhow!("there is no release of Havn for {}", std::env::consts::ARCH))?;
-    let dir: PathBuf = std::env::current_exe()
-        .context("finding this havn")?
-        .canonicalize()
-        .context("finding this havn")?
-        .parent()
-        .ok_or_else(|| anyhow!("this havn is in no directory"))?
-        .to_path_buf();
+    let dir = install_dir()?;
     let stage = tempfile::Builder::new()
         .prefix("havn-update-")
         .tempdir()
@@ -547,14 +801,14 @@ pub async fn run(
         );
     }
     // One update at a time: each would undo the other's files.
-    let _updating = Updating::take(&dir)?;
+    let updating = Updating::take(&dir)?;
 
     println!("Downloading Havn {tag} for {}…", std::env::consts::ARCH);
     let url = format!("{}/{tag}/{archive_name}", release::RELEASE_DOWNLOADS);
-    let archive = fetch(&http, &url).await?;
-    let sums = fetch(&http, &format!("{url}.sha256")).await?;
+    let archive = fetch(http, &url).await?;
+    let sums = fetch(http, &format!("{url}.sha256")).await?;
     verify(&archive, &String::from_utf8_lossy(&sums))?;
-    let names = unpack(&archive, stage.path())?;
+    let names = unpack(&archive, stage.path(), &BINARIES)?;
 
     if backup {
         let output = home
@@ -569,18 +823,24 @@ pub async fn run(
             .context("backing up first (--no-backup skips it)")?;
         println!("Backed up to {}.", output.display());
     }
-    let swapped = swap(&dir, stage.path(), &names)?;
+    let swapped = swap(&dir, stage.path(), &names, false)?;
     println!(
         "Installed {tag} in {} (the previous binaries are kept as *.old).",
         dir.display()
     );
 
+    let moved = |result: &str| Gateway {
+        row: Row::new("gateway", &current, &tag, result),
+        now: tag.clone(),
+        listen: listen.clone(),
+        updating: Some(updating),
+    };
     if pid.is_none() {
         println!("No gateway runs as the systemd unit {UNIT}: start it to use {tag}.");
-        return Ok(());
+        return Ok(moved("installed; not running"));
     }
     println!("Restarting the gateway…");
-    let came_up = match restart_unit() {
+    let came_up = match restart_unit(UNIT) {
         Ok(restarts) => comes_up_as(&listen, &tag, restarts).await?,
         Err(e) => {
             eprintln!("{e:#}");
@@ -589,17 +849,14 @@ pub async fn run(
     };
     if came_up {
         println!("The gateway runs {tag}. Agents start on it as they are restarted.");
-        println!(
-            "Channel adapters (Telegram, Lark) are updated on their own, and the release's \
-             havn.service is not installed over yours."
-        );
-        return Ok(());
+        println!("The release's havn.service is not installed over yours.");
+        return Ok(moved("updated"));
     }
     eprintln!("The gateway did not come up as {tag}; putting the previous binaries back.");
     if let Err(e) = restore(&dir, &swapped) {
         eprintln!("{e:#}");
     }
-    let back = match restart_unit() {
+    let back = match restart_unit(UNIT) {
         Ok(restarts) => comes_up_as(&listen, &current, restarts).await?,
         Err(_) => false,
     };
@@ -615,6 +872,919 @@ pub async fn run(
         "{tag} did not start, and {current}, put back, does not answer either: see the gateway's \
          log{restore_hint}"
     )
+}
+
+/// Where GitHub's API and its release downloads are.
+#[derive(Debug, Clone)]
+struct Github {
+    api: String,
+    downloads: String,
+}
+
+impl Default for Github {
+    fn default() -> Self {
+        Self {
+            api: "https://api.github.com".to_string(),
+            downloads: "https://github.com".to_string(),
+        }
+    }
+}
+
+/// What [`COMPONENTS`] holds: the channel adapters and packs on this
+/// machine.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct Components {
+    #[serde(default, rename = "adapter", skip_serializing_if = "Vec::is_empty")]
+    adapters: Vec<Adapter>,
+    #[serde(default, rename = "pack", skip_serializing_if = "Vec::is_empty")]
+    packs: Vec<Pack>,
+}
+
+/// A channel adapter: a binary from the releases of `repo` (`owner/name`),
+/// run by `units`, at `version` when last looked at; left alone with
+/// `skip`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct Adapter {
+    name: String,
+    #[serde(default)]
+    repo: String,
+    binary: PathBuf,
+    #[serde(default)]
+    units: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    skip: bool,
+}
+
+/// A capability pack, installed at `path` by the setup of `repo`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct Pack {
+    name: String,
+    #[serde(default)]
+    repo: String,
+    path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    skip: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl Components {
+    /// The list at `path`; an empty one when there is none.
+    fn read(path: &Path) -> anyhow::Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    /// Write the list to `path` in one rename, keeping the file's mode
+    /// (0600 for a new one; its directory, if missing, made 0700).
+    fn write(&self, path: &Path) -> anyhow::Result<()> {
+        use std::io::Write as _;
+        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+        let text = format!(
+            "# The channel adapters and packs on this machine (see Upgrading in Havn's\n\
+             # README). havn update rewrites this file: comments are not kept.\n\n{}",
+            toml::to_string(self).context("writing the components")?
+        );
+        if let Some(dir) = path.parent()
+            && !dir.exists()
+        {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .with_context(|| format!("making {}", dir.display()))?;
+        }
+        let mode = std::fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o7777);
+        let fresh = path.with_extension("toml.tmp");
+        let _ = std::fs::remove_file(&fresh);
+        let written = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&fresh)?;
+            file.write_all(text.as_bytes())?;
+            drop(file);
+            std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(mode))?;
+            std::fs::rename(&fresh, path)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&fresh);
+        }
+        written.with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// Add what was `found` and is not listed: an adapter by its binary (a
+    /// listed one gains the units found running it), a pack by its name or
+    /// path. A found adapter whose binary is not in [`RELEASE_DIR`] is not
+    /// added but returned.
+    fn add(&mut self, found: Self) -> Vec<Adapter> {
+        let mut unmanaged = Vec::new();
+        for adapter in found.adapters {
+            match self
+                .adapters
+                .iter_mut()
+                .find(|a| a.binary == adapter.binary)
+            {
+                Some(listed) => {
+                    if listed.repo.is_empty() {
+                        listed.repo = adapter.repo;
+                    }
+                    for unit in adapter.units {
+                        if !listed.units.contains(&unit) {
+                            listed.units.push(unit);
+                        }
+                    }
+                }
+                None if adapter.binary.parent() == Some(Path::new(RELEASE_DIR)) => {
+                    self.adapters.push(adapter);
+                }
+                None => unmanaged.push(adapter),
+            }
+        }
+        for pack in found.packs {
+            if !self
+                .packs
+                .iter()
+                .any(|p| p.name == pack.name || p.path == pack.path)
+            {
+                self.packs.push(pack);
+            }
+        }
+        unmanaged
+    }
+}
+
+/// The unit's name and the binaries it runs, from `systemctl show -p Id
+/// -p ExecStart` output `shown` (drop-ins applied; an alias shows the
+/// unit's own name). Each command is a `{ path=… ; argv[]=… ; … }`.
+fn parse_exec(shown: &str) -> (String, Vec<PathBuf>) {
+    let paths = shown
+        .lines()
+        .filter_map(|line| line.strip_prefix("ExecStart="))
+        .flat_map(|value| value.split("{ path=").skip(1))
+        .filter_map(|rest| rest.split([' ', ';']).next())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .collect();
+    (field(shown, "Id"), paths)
+}
+
+/// Whether the file at `path` names a channel adapter's binary.
+fn names_adapter(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|text| text.contains("havn-channel-"))
+}
+
+/// The units in `unit_dirs` (templates left out) whose file, or a drop-in
+/// for it, names a channel adapter's binary: those systemd may run one in.
+fn candidate_units(unit_dirs: &[&Path]) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for dir in unit_dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        names.extend(
+            entries
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n.ends_with(".service") && !n.contains('@')),
+        );
+    }
+    names
+        .into_iter()
+        .filter(|unit| {
+            unit_dirs.iter().any(|dir| {
+                names_adapter(&dir.join(unit))
+                    || std::fs::read_dir(dir.join(format!("{unit}.d"))).is_ok_and(|drop_ins| {
+                        drop_ins.flatten().any(|d| {
+                            d.path().extension().is_some_and(|e| e == "conf")
+                                && names_adapter(&d.path())
+                        })
+                    })
+            })
+        })
+        .collect()
+}
+
+/// The channel adapters that units in `unit_dirs` run, as systemd resolves
+/// the units (drop-ins applied, an alias once), and the packs under
+/// `packs`.
+fn discover(unit_dirs: &[&Path], packs: &Path, host: &impl Host) -> Components {
+    let mut found = Components::default();
+    let mut seen = std::collections::HashSet::new();
+    for unit in candidate_units(unit_dirs) {
+        let (id, binaries) = host.exec(&unit);
+        let unit = if id.is_empty() { unit } else { id };
+        if !seen.insert(unit.clone()) {
+            continue;
+        }
+        for binary in binaries {
+            let Some(name) = binary.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.starts_with("havn-channel-") || !a_binary(name) {
+                continue;
+            }
+            match found.adapters.iter_mut().find(|a| a.binary == binary) {
+                Some(adapter) => {
+                    if !adapter.units.contains(&unit) {
+                        adapter.units.push(unit.clone());
+                    }
+                }
+                None => found.adapters.push(Adapter {
+                    name: name.to_string(),
+                    repo: if ADAPTERS.contains(&name) {
+                        format!("amplimit/{name}")
+                    } else {
+                        String::new()
+                    },
+                    binary,
+                    units: vec![unit.clone()],
+                    version: None,
+                    skip: false,
+                }),
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(packs) {
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort();
+        for path in dirs {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let known = KNOWN_PACKS.iter().find(|(_, dir)| *dir == name);
+            let (name, repo) = match known {
+                Some((pack, _)) => ((*pack).to_string(), format!("amplimit/{pack}")),
+                None if path.join("SKILL.md").is_file() || path.join("setup.sh").is_file() => {
+                    (name.to_string(), String::new())
+                }
+                None => continue,
+            };
+            found.packs.push(Pack {
+                name,
+                repo,
+                path,
+                version: None,
+                skip: false,
+            });
+        }
+    }
+    found
+}
+
+/// What a release's `notes` say of the oldest gateway it works with:
+/// `None` when no line says, else that version, or the line when it names
+/// none that can be read. The line holds `Requires Havn >= X.Y.Z` in any
+/// case, with Markdown, `:` or `≥` about it.
+fn requires(notes: &str) -> Option<Result<String, String>> {
+    notes.lines().find_map(|line| {
+        let plain: String = line
+            .to_lowercase()
+            .replace('≥', ">=")
+            .chars()
+            .map(|c| {
+                if matches!(c, '`' | '*' | '_' | ':') {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let plain = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+        let at = plain.find(REQUIRES)?;
+        let word = |c: char| c.is_alphanumeric() || c == '-';
+        let after = &plain[at + REQUIRES.len()..];
+        if plain[..at].ends_with(word) || after.starts_with(word) {
+            return None;
+        }
+        // Then a version: `>=` first, or its first digit.
+        let rest = after.trim_start();
+        let rest = match rest.strip_prefix(">=") {
+            Some(rest) => rest.trim_start(),
+            None if rest
+                .trim_start_matches('v')
+                .starts_with(|c: char| c.is_ascii_digit()) =>
+            {
+                rest
+            }
+            None => return None,
+        };
+        let version = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(['.', ',', ';', ')', '!'])
+            .trim_start_matches('v');
+        Some(match release::parse_version(version) {
+            Some(_) => Ok(version.to_string()),
+            None => Err(line.trim().to_string()),
+        })
+    })
+}
+
+/// What to do with a component at `installed`, given its latest release
+/// `tag` with `notes`, beside a gateway at `gateway`.
+#[derive(Debug, PartialEq, Eq)]
+enum Plan {
+    Current,
+    Skip(String),
+    Install,
+}
+
+fn plan(installed: Option<&str>, tag: &str, notes: &str, gateway: &str) -> Plan {
+    if installed.is_some_and(|v| release::parse_version(v).is_some() && !release::newer(tag, v)) {
+        return Plan::Current;
+    }
+    match requires(notes) {
+        Some(Ok(min)) if release::newer(&min, gateway) => {
+            Plan::Skip(format!("{tag} needs Havn {min} or later"))
+        }
+        Some(Err(line)) => Plan::Skip(format!(
+            "{tag} says it needs a Havn whose version cannot be read: {line:?}"
+        )),
+        _ => Plan::Install,
+    }
+}
+
+/// A unit as `systemctl show` gives it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Shown {
+    state: String,
+    restarts: u64,
+    invocation: String,
+    pid: u32,
+}
+
+/// What updating a component asks of the machine, apart so tests can
+/// stand in for systemd.
+trait Host {
+    /// The version `binary --version` says it is; as nobody, when
+    /// `unprivileged`.
+    fn version(&self, binary: &Path, unprivileged: bool) -> Option<String>;
+    /// The unit's own name and the binaries it runs.
+    fn exec(&self, unit: &str) -> (String, Vec<PathBuf>);
+    /// The unit as it is now.
+    fn show(&self, unit: &str) -> Shown;
+    /// Restart the unit; how many times systemd had restarted it before.
+    fn restart(&self, unit: &str) -> anyhow::Result<u64>;
+    /// Whether the unit's run `invocation` logged `line`.
+    fn logged(&self, invocation: &str, line: &str) -> bool;
+    /// The binary process `pid` runs.
+    fn exe(&self, pid: u32) -> Option<PathBuf>;
+}
+
+/// The user `--version` runs as, unprivileged.
+const NOBODY: u32 = 65534;
+
+/// This machine, through systemd.
+#[derive(Debug)]
+struct System;
+
+impl Host for System {
+    fn version(&self, binary: &Path, unprivileged: bool) -> Option<String> {
+        let mut command = std::process::Command::new(binary);
+        command
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unprivileged && unsafe { libc::geteuid() } == 0 {
+            use std::os::unix::process::CommandExt as _;
+            command.uid(NOBODY).gid(NOBODY);
+        }
+        let mut child = command.spawn().ok()?;
+        // One that does not know --version could start running instead.
+        let started = Instant::now();
+        loop {
+            match child.try_wait().ok()? {
+                Some(_) => break,
+                None if started.elapsed() > Duration::from_secs(10) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        let mut out = String::new();
+        child.stdout.take()?.read_to_string(&mut out).ok()?;
+        version_in(&out)
+    }
+
+    fn exec(&self, unit: &str) -> (String, Vec<PathBuf>) {
+        parse_exec(&systemctl(&["show", "-p", "Id", "-p", "ExecStart", unit]).unwrap_or_default())
+    }
+
+    fn show(&self, unit: &str) -> Shown {
+        let shown = systemctl(&[
+            "show",
+            "-p",
+            "ActiveState",
+            "-p",
+            "NRestarts",
+            "-p",
+            "InvocationID",
+            "-p",
+            "MainPID",
+            unit,
+        ])
+        .unwrap_or_default();
+        let (state, restarts) = parse_unit_state(&shown);
+        Shown {
+            state,
+            restarts,
+            invocation: field(&shown, "InvocationID"),
+            pid: field(&shown, "MainPID").parse().unwrap_or(0),
+        }
+    }
+
+    fn restart(&self, unit: &str) -> anyhow::Result<u64> {
+        restart_unit(unit)
+    }
+
+    fn logged(&self, invocation: &str, line: &str) -> bool {
+        if invocation.is_empty() || !invocation.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return false;
+        }
+        std::process::Command::new("journalctl")
+            .args(["-o", "cat", "--no-pager"])
+            .arg(format!("_SYSTEMD_INVOCATION_ID={invocation}"))
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains(line))
+    }
+
+    fn exe(&self, pid: u32) -> Option<PathBuf> {
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+}
+
+/// The version in `--version` output such as `havn-channel-telegram 0.2.11`.
+fn version_in(out: &str) -> Option<String> {
+    let version = out.lines().next()?.split_whitespace().last()?;
+    release::parse_version(version)?;
+    Some(version.trim_start_matches('v').to_string())
+}
+
+/// Restart `unit` and watch it: after `watch.settle` it must be active,
+/// running `binary`, without systemd having restarted it, and with
+/// `connect`, have logged that it connected to the gateway, within
+/// `watch.within`.
+async fn restart_watched(
+    host: &impl Host,
+    unit: &str,
+    binary: &Path,
+    connect: bool,
+    watch: Watch,
+) -> Result<(), String> {
+    let before = host.restart(unit).map_err(|e| format!("{e:#}"))?;
+    let started = Instant::now();
+    let mut invocation: Option<String> = None;
+    loop {
+        let now = host.show(unit);
+        if !now.state.is_empty() && !unit_up(&now.state) {
+            return Err(format!("{unit} is {}", now.state));
+        }
+        let rerun = invocation
+            .as_ref()
+            .is_some_and(|first| !now.invocation.is_empty() && *first != now.invocation);
+        if now.restarts > before || rerun {
+            return Err(format!("{unit} exited and systemd restarted it"));
+        }
+        if invocation.is_none() && !now.invocation.is_empty() {
+            invocation = Some(now.invocation.clone());
+        }
+        let active = now.state == "active";
+        // Just after the restart the process may not have exec'd the binary
+        // yet (it is still systemd's): another binary fails only once it
+        // has had `watch.settle`. One replaced since it started reads
+        // `<path> (deleted)`, which is not the binary either.
+        let exe = if active && now.pid > 0 {
+            host.exe(now.pid)
+        } else {
+            None
+        };
+        let runs_it = exe.as_deref() == Some(binary);
+        let settled = started.elapsed() >= watch.settle;
+        if let Some(exe) = &exe
+            && !runs_it
+            && settled
+        {
+            return Err(format!(
+                "{unit} runs {}, not {}",
+                exe.display(),
+                binary.display()
+            ));
+        }
+        let connected = !connect || (active && host.logged(&now.invocation, CONNECTED));
+        if runs_it && connected && settled {
+            return Ok(());
+        }
+        if started.elapsed() >= watch.within {
+            return Err(if !active {
+                format!("{unit} did not start")
+            } else if exe.is_none() {
+                format!("cannot tell what {unit} runs")
+            } else {
+                format!("{unit} did not connect to the gateway")
+            });
+        }
+        tokio::time::sleep(watch.poll).await;
+    }
+}
+
+/// Put release `tag` of `adapter` in place from `archive` (checked against
+/// `sums`; its binary is `name`), and restart and watch each of its units
+/// that runs, once each: one whose run had connected to the gateway, when
+/// `gateway_up`, must connect again. On failure the old binary is put back
+/// and the units restarted on it. What was done, or what failed.
+async fn install(
+    adapter: &Adapter,
+    name: &str,
+    tag: &str,
+    archive: &[u8],
+    sums: &str,
+    gateway_up: bool,
+    host: &impl Host,
+    watch: Watch,
+) -> Result<String, String> {
+    let error = |e: anyhow::Error| format!("{e:#}");
+    verify(archive, sums).map_err(error)?;
+    let binary = adapter
+        .binary
+        .canonicalize()
+        .with_context(|| format!("finding {}", adapter.binary.display()))
+        .map_err(error)?;
+    let (Some(dir), Some(file)) = (binary.parent(), binary.file_name().and_then(|n| n.to_str()))
+    else {
+        return Err(format!("{} is not a binary's path", binary.display()));
+    };
+    let stage = tempfile::Builder::new()
+        .prefix("havn-update-")
+        .tempdir()
+        .context("making a directory to unpack into")
+        .map_err(error)?;
+    unpack(archive, stage.path(), &[name]).map_err(error)?;
+    if file != name {
+        std::fs::rename(stage.path().join(name), stage.path().join(file))
+            .context("unpacking")
+            .map_err(error)?;
+    }
+    // Each unit by its own name, so an alias is restarted once.
+    let mut units: Vec<String> = Vec::new();
+    for unit in &adapter.units {
+        let (id, _) = host.exec(unit);
+        let unit = if id.is_empty() { unit.clone() } else { id };
+        if !units.contains(&unit) {
+            units.push(unit);
+        }
+    }
+    let mut running: Vec<(&str, bool)> = Vec::new();
+    for unit in &units {
+        let shown = host.show(unit);
+        if unit_up(&shown.state) {
+            let connect = gateway_up && host.logged(&shown.invocation, CONNECTED);
+            running.push((unit.as_str(), connect));
+        }
+    }
+    let swapped = swap(dir, stage.path(), &[file.to_string()], true).map_err(error)?;
+
+    let mut restarted = Vec::new();
+    let mut failure = match host.version(&binary, false) {
+        Some(v) if release::parse_version(&v) == release::parse_version(tag) => None,
+        Some(v) => Some(format!("the new binary says it is {v}")),
+        None => Some("the new binary does not run here".to_string()),
+    };
+    if failure.is_none() {
+        for (unit, connect) in &running {
+            restarted.push(*unit);
+            if let Err(e) = restart_watched(host, unit, &binary, *connect, watch).await {
+                failure = Some(e);
+                break;
+            }
+        }
+    }
+    let Some(failure) = failure else {
+        let stopped: Vec<&str> = units
+            .iter()
+            .map(String::as_str)
+            .filter(|u| !running.iter().any(|(r, _)| r == u))
+            .collect();
+        return Ok(if running.is_empty() {
+            "installed; no unit of it runs".to_string()
+        } else if stopped.is_empty() {
+            "updated".to_string()
+        } else {
+            format!("updated; not started: {}", stopped.join(", "))
+        });
+    };
+    if let Err(e) = restore(dir, &swapped) {
+        return Err(format!(
+            "{failure}; putting the old binary back failed: {e:#}"
+        ));
+    }
+    let mut down = Vec::new();
+    for unit in restarted {
+        if restart_watched(host, unit, &binary, false, watch)
+            .await
+            .is_err()
+        {
+            down.push(unit);
+        }
+    }
+    Err(if down.is_empty() {
+        format!("{failure}; the old binary is back")
+    } else {
+        format!(
+            "{failure}; the old binary is back, but {} does not run",
+            down.join(", ")
+        )
+    })
+}
+
+/// Whether `repo` is `owner/name` as GitHub has them; its name.
+fn repo_name(repo: &str) -> Option<&str> {
+    let (owner, name) = repo.split_once('/')?;
+    let fine = |s: &str| {
+        !s.is_empty()
+            && !s.starts_with('.')
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    (fine(owner) && fine(name)).then_some(name)
+}
+
+/// Whether GitHub has the repository whose API address is `api`.
+async fn exists(http: &reqwest::Client, api: &str) -> anyhow::Result<bool> {
+    let response = http
+        .get(api)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .context("asking GitHub for the repository")?;
+    match response.status() {
+        reqwest::StatusCode::NOT_FOUND => Ok(false),
+        status if status.is_success() => Ok(true),
+        status => bail!("GitHub answered {status} for the repository"),
+    }
+}
+
+/// The step of one channel adapter: look at its latest release and, unless
+/// `check`, install it. `adapter.version` is kept up to date. With `check`
+/// the version recorded is taken before asking the binary, which then runs
+/// as nobody.
+async fn adapter_step(
+    http: &reqwest::Client,
+    github: &Github,
+    adapter: &mut Adapter,
+    gateway: &str,
+    check: bool,
+    gateway_up: bool,
+    host: &impl Host,
+    watch: Watch,
+) -> Row {
+    let recorded = adapter.version.clone();
+    let mut row = Row::new(&adapter.name, recorded.as_deref().unwrap_or("-"), "-", "");
+    let failed = |mut row: Row, why: String| {
+        row.result = format!("failed: {why}");
+        row.failed = true;
+        row
+    };
+    if adapter.skip {
+        row.result = format!("skipped: skip = true in {COMPONENTS}");
+        return row;
+    }
+    if !adapter.binary.exists() {
+        row.result = format!("skipped: {} is not there", adapter.binary.display());
+        return row;
+    }
+    let installed = if check {
+        recorded.or_else(|| host.version(&adapter.binary, true))
+    } else {
+        host.version(&adapter.binary, false).or(recorded)
+    };
+    if let Some(v) = &installed {
+        row.from.clone_from(v);
+        adapter.version = Some(v.clone());
+    }
+    let Some(name) = repo_name(&adapter.repo) else {
+        row.result = format!("skipped: no repo for it in {COMPONENTS}");
+        return row;
+    };
+    let repo = format!("{}/repos/{}", github.api, adapter.repo);
+    let (tag, notes) = match latest(http, &format!("{repo}/releases/latest")).await {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            return match exists(http, &repo).await {
+                Ok(true) => {
+                    row.result = "skipped: it has no release".to_string();
+                    row
+                }
+                Ok(false) => failed(row, format!("repository {} not found", adapter.repo)),
+                Err(e) => failed(row, format!("{e:#}")),
+            };
+        }
+        Err(e) => return failed(row, format!("{e:#}")),
+    };
+    row.to.clone_from(&tag);
+    match plan(installed.as_deref(), &tag, &notes, gateway) {
+        Plan::Current => {
+            row.result = "current".to_string();
+            return row;
+        }
+        Plan::Skip(why) => {
+            row.result = format!("skipped: {why}");
+            return row;
+        }
+        Plan::Install if check => {
+            row.result = "newer release out".to_string();
+            return row;
+        }
+        Plan::Install => {}
+    }
+    let Some(arch) = release::archive_for(std::env::consts::ARCH)
+        .and_then(|a| a.strip_prefix("havn-"))
+        .and_then(|a| a.strip_suffix(".tar.gz"))
+    else {
+        row.result = format!("skipped: no release for {}", std::env::consts::ARCH);
+        return row;
+    };
+    let url = format!(
+        "{}/{}/releases/download/{tag}/{name}-{arch}.tar.gz",
+        github.downloads, adapter.repo
+    );
+    println!("Downloading {name} {tag}…");
+    let fetched = async {
+        let archive = fetch(http, &url).await?;
+        let sums = fetch(http, &format!("{url}.sha256")).await?;
+        anyhow::Ok((archive, sums))
+    }
+    .await;
+    let (archive, sums) = match fetched {
+        Ok(fetched) => fetched,
+        Err(e) => return failed(row, format!("{e:#}")),
+    };
+    let sums = String::from_utf8_lossy(&sums);
+    match install(
+        adapter, name, &tag, &archive, &sums, gateway_up, host, watch,
+    )
+    .await
+    {
+        Ok(result) => {
+            adapter.version = Some(tag.trim_start_matches('v').to_string());
+            row.result = result;
+            row
+        }
+        Err(e) => failed(row, e),
+    }
+}
+
+/// The report: a table of `rows` under `head`.
+fn table(head: [&str; 4], rows: &[Row]) -> String {
+    let cells: Vec<[&str; 4]> = std::iter::once(head)
+        .chain(rows.iter().map(|r| {
+            [
+                r.name.as_str(),
+                r.from.as_str(),
+                r.to.as_str(),
+                r.result.as_str(),
+            ]
+        }))
+        .collect();
+    let mut widths = [0; 3];
+    for row in &cells {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let mut out = String::new();
+    for row in &cells {
+        for (width, cell) in widths.iter().copied().zip(row) {
+            out.push_str(&format!("{cell:<width$}  "));
+        }
+        out.push_str(row[3]);
+        out.push('\n');
+    }
+    out
+}
+
+/// What the adapters' step works on, gathered before the gateway's: the
+/// list as read from `path`, the list with what was found added, the
+/// adapters found but not managed, and why the list could not be read.
+#[derive(Debug)]
+struct Gathered {
+    path: PathBuf,
+    read: Components,
+    list: Components,
+    unmanaged: Vec<Adapter>,
+    unread: Option<String>,
+}
+
+/// Read the list at `path` and add what units in `unit_dirs` and `packs`
+/// show; with `check`, a list that cannot be read is said, not an error.
+fn gather(
+    path: &Path,
+    unit_dirs: &[&Path],
+    packs: &Path,
+    host: &impl Host,
+    check: bool,
+) -> anyhow::Result<Gathered> {
+    let (read, unread) = match Components::read(path) {
+        Ok(list) => (list, None),
+        Err(e) if check => (Components::default(), Some(format!("{e:#}"))),
+        Err(e) => return Err(e.context("--only gateway updates the gateway without it")),
+    };
+    let mut list = read.clone();
+    let unmanaged = list.add(discover(unit_dirs, packs, host));
+    Ok(Gathered {
+        path: path.to_path_buf(),
+        read,
+        list,
+        unmanaged,
+        unread,
+    })
+}
+
+/// The adapters' and packs' step of [`run`], after the gateway's (which
+/// runs `gateway` now): a row for each. The list is written back when it
+/// changed, unless `check`.
+async fn update_components(
+    http: &reqwest::Client,
+    github: &Github,
+    mut gathered: Gathered,
+    gateway: &str,
+    gateway_up: bool,
+    check: bool,
+    host: &impl Host,
+    watch: Watch,
+) -> Vec<Row> {
+    let mut rows = Vec::new();
+    if let Some(why) = &gathered.unread {
+        rows.push(Row::new(
+            "components.toml",
+            "-",
+            "-",
+            &format!("not read: {why}"),
+        ));
+    }
+    for adapter in &mut gathered.list.adapters {
+        rows.push(
+            adapter_step(
+                http, github, adapter, gateway, check, gateway_up, host, watch,
+            )
+            .await,
+        );
+    }
+    for adapter in &gathered.unmanaged {
+        rows.push(Row::new(
+            &adapter.name,
+            "-",
+            "-",
+            &format!(
+                "not managed: {} is not in {RELEASE_DIR}; list it in {COMPONENTS} to update it",
+                adapter.binary.display()
+            ),
+        ));
+    }
+    for pack in &gathered.list.packs {
+        let result = if pack.skip {
+            format!("skipped: skip = true in {COMPONENTS}")
+        } else {
+            "not updated by havn update: run its setup.sh".to_string()
+        };
+        rows.push(Row::new(
+            &pack.name,
+            pack.version.as_deref().unwrap_or("-"),
+            "-",
+            &result,
+        ));
+    }
+    if !check
+        && gathered.list != gathered.read
+        && let Err(e) = gathered.list.write(&gathered.path)
+    {
+        eprintln!("{e:#}");
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -722,7 +1892,7 @@ mod tests {
         let mut entries = files(&names);
         // What must not be taken: a link named as a binary, a path out.
         entries.push(("dist/havn-bar".into(), tar::EntryType::Symlink));
-        let got = unpack(&of(&entries), to.path()).unwrap();
+        let got = unpack(&of(&entries), to.path(), &BINARIES).unwrap();
         assert_eq!(
             got,
             vec![
@@ -738,7 +1908,7 @@ mod tests {
         assert!(!to.path().join("havn-bar").exists());
         let short = tempfile::tempdir().unwrap();
         assert!(
-            unpack(&of(&files(&BINARIES[..3])), short.path()).is_err(),
+            unpack(&of(&files(&BINARIES[..3])), short.path(), &BINARIES).is_err(),
             "a missing binary"
         );
         assert!(!a_binary("havn-../x") && !a_binary("havn-") && !a_binary("havnx"));
@@ -758,7 +1928,7 @@ mod tests {
         for name in &names {
             std::fs::write(from.path().join(name), format!("new {name}")).unwrap();
         }
-        let swapped = swap(dir.path(), from.path(), &names).unwrap();
+        let swapped = swap(dir.path(), from.path(), &names, false).unwrap();
         assert_eq!(swapped.added, vec!["havn-foo".to_string()]);
         for name in &names {
             assert_eq!(
@@ -792,7 +1962,7 @@ mod tests {
 
         // One missing from what is installed: none is changed.
         std::fs::remove_file(from.path().join("havn-init")).unwrap();
-        assert!(swap(dir.path(), from.path(), &names).is_err());
+        assert!(swap(dir.path(), from.path(), &names, false).is_err());
         for name in BINARIES {
             assert_eq!(
                 std::fs::read_to_string(dir.path().join(name)).unwrap(),
@@ -801,5 +1971,950 @@ mod tests {
             assert!(!dir.path().join(format!(".{name}.new")).exists());
         }
         assert!(!dir.path().join("havn-foo").exists());
+    }
+
+    #[test]
+    fn a_new_binary_keeps_the_old_one_s_mode_and_an_adapter_s_own_name_is_unpacked() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let from = tempfile::tempdir().unwrap();
+        let old = dir.path().join("havn-channel-x");
+        std::fs::write(&old, "old").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o750)).unwrap();
+        for name in ["havn-channel-x", "havn-channel-y"] {
+            std::fs::write(from.path().join(name), "new").unwrap();
+        }
+        let names = vec!["havn-channel-x".to_string(), "havn-channel-y".to_string()];
+        swap(dir.path(), from.path(), &names, true).unwrap();
+        let mode = |name: &str| {
+            std::fs::metadata(dir.path().join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode("havn-channel-x"), 0o750);
+        assert_eq!(mode("havn-channel-y"), 0o755, "none before it");
+        // The gateway's binaries are 755, as before.
+        swap(dir.path(), from.path(), &names, false).unwrap();
+        assert_eq!(mode("havn-channel-x"), 0o755);
+
+        let to = tempfile::tempdir().unwrap();
+        let entries = files(&["tg-bridge", "README"]);
+        assert_eq!(
+            unpack(&of(&entries), to.path(), &["tg-bridge"]).unwrap(),
+            vec!["tg-bridge"]
+        );
+        assert!(unpack(&of(&entries), to.path(), &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn units_that_run_an_adapter_as_systemd_has_them_and_packs_are_found() {
+        let shown = "Id=tg.service\nExecStart={ path=/usr/local/bin/havn-channel-telegram ; \
+                     argv[]=/usr/local/bin/havn-channel-telegram --config /etc/c.toml ; \
+                     ignore_errors=no ; pid=0 }\nExecStart={ path=/opt/y ; argv[]=/opt/y }\n";
+        assert_eq!(
+            parse_exec(shown),
+            (
+                "tg.service".to_string(),
+                vec![
+                    PathBuf::from("/usr/local/bin/havn-channel-telegram"),
+                    PathBuf::from("/opt/y")
+                ]
+            )
+        );
+        assert_eq!(parse_exec(""), (String::new(), Vec::new()));
+        let argv = "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env x                     --state-path=/usr/local/bin/havn-channel-x ; ignore_errors=no }
+";
+        assert_eq!(parse_exec(argv).1, vec![PathBuf::from("/usr/bin/env")]);
+
+        let etc = tempfile::tempdir().unwrap();
+        let lib = tempfile::tempdir().unwrap();
+        let mentions = "[Service]\nExecStart=/usr/local/bin/havn-channel-telegram\n";
+        for (dir, unit, text) in [
+            (etc.path(), "tg.service", mentions),
+            (etc.path(), "alias.service", mentions),
+            (
+                etc.path(),
+                "tg2.service",
+                "[Service]\nExecStart=/usr/bin/true\n",
+            ),
+            (
+                etc.path(),
+                "odd.service",
+                "ExecStart=/opt/havn-channel-odd\n",
+            ),
+            (
+                etc.path(),
+                "plain.service",
+                "[Service]\nExecStart=/usr/bin/true\n",
+            ),
+            (etc.path(), "tpl@.service", mentions),
+            (etc.path(), "dc.timer", mentions),
+            (
+                lib.path(),
+                "dc.service",
+                "ExecStart=/usr/local/bin/havn-channel-discord\n",
+            ),
+        ] {
+            std::fs::write(dir.join(unit), text).unwrap();
+        }
+        // A drop-in that makes a unit run an adapter.
+        std::fs::create_dir(etc.path().join("tg2.service.d")).unwrap();
+        std::fs::write(
+            etc.path().join("tg2.service.d/override.conf"),
+            "[Service]\nExecStart=\nExecStart=/usr/local/bin/havn-channel-telegram\n",
+        )
+        .unwrap();
+        assert_eq!(
+            candidate_units(&[etc.path(), lib.path()]),
+            vec![
+                "alias.service",
+                "dc.service",
+                "odd.service",
+                "tg.service",
+                "tg2.service"
+            ]
+        );
+
+        let packs = tempfile::tempdir().unwrap();
+        for dir in ["playwright-cli", "chromium", "maps", "empty"] {
+            std::fs::create_dir(packs.path().join(dir)).unwrap();
+        }
+        std::fs::write(packs.path().join("maps/SKILL.md"), "skill").unwrap();
+        std::fs::write(packs.path().join("notes"), "a file").unwrap();
+
+        let telegram = "/usr/local/bin/havn-channel-telegram";
+        let fake = Fake {
+            execs: vec![
+                ("tg.service", "tg.service", telegram),
+                ("alias.service", "tg.service", telegram),
+                ("tg2.service", "tg2.service", telegram),
+                ("odd.service", "odd.service", "/opt/havn-channel-odd"),
+                (
+                    "plain.service",
+                    "plain.service",
+                    "/usr/local/bin/havn-channel-plain",
+                ),
+                (
+                    "dc.service",
+                    "dc.service",
+                    "/usr/local/bin/havn-channel-discord",
+                ),
+            ],
+            ..Fake::new(Path::new("/nonexistent"))
+        };
+        let found = discover(&[etc.path(), lib.path()], packs.path(), &fake);
+        let adapters: Vec<(&str, &str, Vec<&str>)> = found
+            .adapters
+            .iter()
+            .map(|a| {
+                (
+                    a.name.as_str(),
+                    a.repo.as_str(),
+                    a.units.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            adapters,
+            vec![
+                (
+                    "havn-channel-telegram",
+                    "amplimit/havn-channel-telegram",
+                    vec!["tg.service", "tg2.service"]
+                ),
+                (
+                    "havn-channel-discord",
+                    "amplimit/havn-channel-discord",
+                    vec!["dc.service"]
+                ),
+                ("havn-channel-odd", "", vec!["odd.service"]),
+            ]
+        );
+        let packs: Vec<(&str, &str)> = found
+            .packs
+            .iter()
+            .map(|p| (p.name.as_str(), p.repo.as_str()))
+            .collect();
+        assert_eq!(
+            packs,
+            vec![
+                ("maps", ""),
+                ("havn-pack-browser", "amplimit/havn-pack-browser")
+            ]
+        );
+
+        // Only one in the releases' directory is taken without being listed.
+        let mut list = Components::default();
+        let unmanaged = list.add(found);
+        assert_eq!(list.adapters.len(), 2);
+        assert_eq!(unmanaged.len(), 1);
+        assert_eq!(unmanaged[0].binary, Path::new("/opt/havn-channel-odd"));
+    }
+
+    fn listed(name: &str, binary: &str, units: &[&str]) -> Adapter {
+        Adapter {
+            name: name.into(),
+            repo: format!("amplimit/{name}"),
+            binary: binary.into(),
+            units: units.iter().map(|u| (*u).to_string()).collect(),
+            version: None,
+            skip: false,
+        }
+    }
+
+    #[test]
+    fn the_list_keeps_what_it_says_gains_what_was_found_and_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("havn/components.toml");
+        assert_eq!(Components::read(&path).unwrap(), Components::default());
+        let mut list = Components {
+            adapters: vec![Adapter {
+                name: "tg".into(),
+                repo: String::new(),
+                version: Some("0.2.9".into()),
+                skip: true,
+                ..listed(
+                    "tg",
+                    "/usr/local/bin/havn-channel-telegram",
+                    &["tg.service"],
+                )
+            }],
+            packs: vec![Pack {
+                name: "maps".into(),
+                repo: "someone/maps".into(),
+                path: "/opt/havn/maps".into(),
+                version: None,
+                skip: false,
+            }],
+        };
+        list.write(&path).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# The channel adapters") && text.contains("skip = true"));
+        assert_eq!(Components::read(&path).unwrap(), list);
+
+        list.add(Components {
+            adapters: vec![
+                listed(
+                    "havn-channel-telegram",
+                    "/usr/local/bin/havn-channel-telegram",
+                    &["tg.service", "tg2.service"],
+                ),
+                listed(
+                    "havn-channel-discord",
+                    "/usr/local/bin/havn-channel-discord",
+                    &["dc.service"],
+                ),
+            ],
+            packs: vec![Pack {
+                name: "other-name".into(),
+                repo: String::new(),
+                path: "/opt/havn/maps".into(),
+                version: None,
+                skip: false,
+            }],
+        });
+        assert_eq!(list.adapters.len(), 2);
+        let tg = &list.adapters[0];
+        assert_eq!(tg.name, "tg", "its name as listed");
+        assert_eq!(tg.repo, "amplimit/havn-channel-telegram");
+        assert_eq!(tg.units, vec!["tg.service", "tg2.service"]);
+        assert_eq!(tg.version.as_deref(), Some("0.2.9"));
+        assert_eq!(list.packs.len(), 1, "the same pack by its path");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        list.write(&path).unwrap();
+        assert_eq!(mode(&path), 0o640, "an existing file's mode is kept");
+        assert_eq!(Components::read(&path).unwrap(), list);
+
+        assert!(Components::read(path.parent().unwrap()).is_err());
+        std::fs::write(&path, "[[adapter]]\nname = 1\n").unwrap();
+        assert!(Components::read(&path).is_err());
+        std::fs::write(
+            &path,
+            "[[adapter]]\nname = \"x\"\nbinary = \"/usr/local/bin/x\"\nunit = \"x.service\"\n",
+        )
+        .unwrap();
+        assert!(Components::read(&path).is_err(), "an unknown key");
+    }
+
+    #[test]
+    fn a_release_is_installed_only_when_newer_and_the_gateway_is_new_enough() {
+        for (notes, wanted) in [
+            ("## Changes\n* Requires Havn >= 0.2.12.\n", "0.2.12"),
+            ("**Requires Havn ≥ `v0.3.0`**", "0.3.0"),
+            ("Requires: Havn >= 0.2.13", "0.2.13"),
+            (
+                "This release requires Havn >= 0.2.13 (for threads).",
+                "0.2.13",
+            ),
+            ("requires havn>=0.2.14", "0.2.14"),
+            ("- Requires _Havn_ 0.2.15 or later", "0.2.15"),
+        ] {
+            assert_eq!(requires(notes), Some(Ok(wanted.to_string())), "{notes}");
+        }
+        assert_eq!(
+            requires("Requires Havn >= soon"),
+            Some(Err("Requires Havn >= soon".to_string()))
+        );
+        assert_eq!(requires(""), None);
+        assert_eq!(requires("Works with any Havn"), None);
+        for unrelated in [
+            "Logging in requires havn-gateway auth.",
+            "This requires Havn to restart.",
+            "Prerequires havn >= 0.2.12",
+        ] {
+            assert_eq!(requires(unrelated), None, "{unrelated}");
+        }
+        assert_eq!(
+            requires(
+                "Requires havn-gateway auth
+Requires Havn >= 0.2.12"
+            ),
+            Some(Ok("0.2.12".to_string())),
+            "a later line still says"
+        );
+
+        assert_eq!(plan(Some("0.2.11"), "v0.2.11", "", "0.2.12"), Plan::Current);
+        assert_eq!(plan(Some("0.2.12"), "v0.2.11", "", "0.2.12"), Plan::Current);
+        assert_eq!(plan(Some("0.2.9"), "v0.2.11", "", "0.2.12"), Plan::Install);
+        assert_eq!(plan(None, "v0.2.11", "", "0.2.12"), Plan::Install);
+        assert_eq!(
+            plan(
+                Some("0.2.9"),
+                "v0.2.13",
+                "Requires Havn >= 0.2.13",
+                "0.2.12"
+            ),
+            Plan::Skip("v0.2.13 needs Havn 0.2.13 or later".into())
+        );
+        assert_eq!(
+            plan(
+                Some("0.2.9"),
+                "v0.2.13",
+                "Requires Havn >= 0.2.12",
+                "0.2.12"
+            ),
+            Plan::Install
+        );
+        assert!(matches!(
+            plan(Some("0.2.9"), "v0.2.13", "Requires Havn >= next", "0.2.12"),
+            Plan::Skip(why) if why.contains("cannot be read")
+        ));
+        assert_eq!(
+            version_in("havn-channel-telegram 0.2.11\n"),
+            Some("0.2.11".into())
+        );
+        assert_eq!(version_in("error: unexpected argument"), None);
+        assert_eq!(
+            repo_name("amplimit/havn-channel-lark"),
+            Some("havn-channel-lark")
+        );
+        for bad in ["", "amplimit", "a/b/c", "../x", "a/..", "a/b?c"] {
+            assert_eq!(repo_name(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_report_is_a_table() {
+        let mut failed = Row::new("havn-channel-lark", "0.2.9", "v0.2.11", "failed: x");
+        failed.failed = true;
+        let rows = [Row::new("gateway", "0.2.11", "v0.2.12", "updated"), failed];
+        assert_eq!(
+            table(["component", "from", "to", "result"], &rows),
+            "component          from    to       result\n\
+             gateway            0.2.11  v0.2.12  updated\n\
+             havn-channel-lark  0.2.9   v0.2.11  failed: x\n"
+        );
+    }
+
+    /// A machine whose adapter units run a binary that holds its version as
+    /// text. On the new binary (not `old`), the units in `failing` fail,
+    /// systemd restarts them on its own with `flapping`, and they connect
+    /// only with `connects`. They run `elsewhere` when it is set, ran
+    /// before when `running`, and the old binary goes missing on the first
+    /// restart with `lose_old`. For the first `executor` looks after each
+    /// restart, the process is still systemd's. `execs` are the units'
+    /// `ExecStart=`.
+    struct Fake {
+        binary: PathBuf,
+        old: &'static str,
+        failing: Vec<&'static str>,
+        flapping: bool,
+        connects: bool,
+        running: bool,
+        elsewhere: Option<PathBuf>,
+        lose_old: bool,
+        executor: u32,
+        looks: std::cell::Cell<u32>,
+        execs: Vec<(&'static str, &'static str, &'static str)>,
+        restarted: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Fake {
+        fn new(binary: &Path) -> Self {
+            Self {
+                binary: binary.to_path_buf(),
+                old: "0.2.9",
+                failing: Vec::new(),
+                flapping: false,
+                connects: true,
+                running: true,
+                elsewhere: None,
+                lose_old: false,
+                executor: 0,
+                looks: std::cell::Cell::new(0),
+                execs: Vec::new(),
+                restarted: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn installed(&self) -> String {
+            std::fs::read_to_string(&self.binary)
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        }
+
+        fn fresh(&self) -> bool {
+            self.installed() != self.old
+        }
+    }
+
+    impl Host for Fake {
+        fn version(&self, binary: &Path, _unprivileged: bool) -> Option<String> {
+            version_in(&std::fs::read_to_string(binary).ok()?)
+        }
+
+        fn exec(&self, unit: &str) -> (String, Vec<PathBuf>) {
+            self.execs
+                .iter()
+                .find(|(u, ..)| *u == unit)
+                .map_or((String::new(), Vec::new()), |(_, id, binary)| {
+                    ((*id).to_string(), vec![PathBuf::from(binary)])
+                })
+        }
+
+        fn show(&self, unit: &str) -> Shown {
+            let started = !self.restarted.borrow().is_empty();
+            let state = if !started {
+                if self.running { "active" } else { "inactive" }
+            } else if self.fresh() && self.failing.contains(&unit) {
+                "failed"
+            } else {
+                "active"
+            };
+            Shown {
+                state: state.into(),
+                restarts: u64::from(started && self.fresh() && self.flapping),
+                invocation: format!("{:032x}", self.restarted.borrow().len()),
+                pid: 42,
+            }
+        }
+
+        fn restart(&self, unit: &str) -> anyhow::Result<u64> {
+            if self.lose_old {
+                let _ = std::fs::remove_file(self.binary.with_file_name("havn-channel-test.old"));
+            }
+            self.restarted.borrow_mut().push(unit.to_string());
+            self.looks.set(0);
+            Ok(0)
+        }
+
+        fn logged(&self, _invocation: &str, line: &str) -> bool {
+            line == CONNECTED && (self.connects || !self.fresh())
+        }
+
+        fn exe(&self, _pid: u32) -> Option<PathBuf> {
+            let looks = self.looks.get();
+            self.looks.set(looks + 1);
+            if looks < self.executor {
+                return Some(EXECUTOR.into());
+            }
+            Some(
+                self.elsewhere
+                    .clone()
+                    .unwrap_or_else(|| self.binary.clone()),
+            )
+        }
+    }
+
+    const EXECUTOR: &str = "/usr/lib/systemd/systemd-executor";
+
+    const QUICK: Watch = Watch {
+        settle: Duration::ZERO,
+        within: Duration::from_millis(30),
+        poll: Duration::from_millis(1),
+    };
+
+    /// The archive of an adapter's release `version` and its checksum.
+    fn release_of(version: &str) -> (Vec<u8>, String) {
+        let mut out = Vec::new();
+        {
+            let gz = flate2::write::GzEncoder::new(&mut out, flate2::Compression::fast());
+            let mut tar = tar::Builder::new(gz);
+            for (path, body) in [("havn-channel-test", version), ("config.example.toml", "x")] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o755);
+                header.set_path(path).unwrap();
+                header.set_cksum();
+                tar.append(&header, body.as_bytes()).unwrap();
+            }
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let sum: String = Sha256::digest(&out)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        (out, sum)
+    }
+
+    /// An adapter installed at version 0.2.9 in `dir`, with the archive and
+    /// checksum of its release `version`.
+    fn adapter_at(dir: &Path, version: &str) -> (Adapter, Vec<u8>, String) {
+        let binary = dir.canonicalize().unwrap().join("havn-channel-test");
+        std::fs::write(&binary, "0.2.9").unwrap();
+        let (archive, sum) = release_of(version);
+        let adapter = Adapter {
+            binary,
+            ..listed("havn-channel-test", "", &["test.service"])
+        };
+        (adapter, archive, sum)
+    }
+
+    async fn install_on(
+        fake: &Fake,
+        adapter: &Adapter,
+        archive: &[u8],
+        sums: &str,
+        gateway_up: bool,
+        watch: Watch,
+    ) -> Result<String, String> {
+        install(
+            adapter,
+            "havn-channel-test",
+            "v0.2.11",
+            archive,
+            sums,
+            gateway_up,
+            fake,
+            watch,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_adapter_is_installed_restarted_and_kept_when_it_comes_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        let fake = Fake::new(&adapter.binary);
+        let watch = Watch {
+            settle: Duration::from_millis(20),
+            within: Duration::from_millis(500),
+            poll: Duration::from_millis(1),
+        };
+        let started = Instant::now();
+        assert_eq!(
+            install_on(&fake, &adapter, &archive, &sums, true, watch).await,
+            Ok("updated".into())
+        );
+        assert!(started.elapsed() >= watch.settle, "watched for a while");
+        assert_eq!(fake.installed(), "0.2.11");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("havn-channel-test.old")).unwrap(),
+            "0.2.9"
+        );
+        assert_eq!(*fake.restarted.borrow(), vec!["test.service"]);
+        assert!(!dir.path().join("config.example.toml").exists());
+
+        // A unit that does not run is not started.
+        let (adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        let fake = Fake {
+            running: false,
+            ..Fake::new(&adapter.binary)
+        };
+        assert_eq!(
+            install_on(&fake, &adapter, &archive, &sums, true, QUICK).await,
+            Ok("installed; no unit of it runs".into())
+        );
+        assert_eq!(fake.installed(), "0.2.11");
+        assert!(fake.restarted.borrow().is_empty());
+
+        // With no gateway answering, it need not connect.
+        let (adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        let fake = Fake {
+            connects: false,
+            ..Fake::new(&adapter.binary)
+        };
+        assert_eq!(
+            install_on(&fake, &adapter, &archive, &sums, false, QUICK).await,
+            Ok("updated".into())
+        );
+
+        // Still systemd's for a moment after each restart: not a failure.
+        let (adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        let fake = Fake {
+            executor: 3,
+            ..Fake::new(&adapter.binary)
+        };
+        assert_eq!(
+            install_on(&fake, &adapter, &archive, &sums, true, watch).await,
+            Ok("updated".into())
+        );
+        assert_eq!(fake.installed(), "0.2.11");
+
+        // A unit under two names is restarted once.
+        let (mut adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        adapter.units.push("alias.service".into());
+        let fake = Fake {
+            execs: vec![("alias.service", "test.service", "")],
+            ..Fake::new(&adapter.binary)
+        };
+        assert_eq!(
+            install_on(&fake, &adapter, &archive, &sums, true, QUICK).await,
+            Ok("updated".into())
+        );
+        assert_eq!(*fake.restarted.borrow(), vec!["test.service"]);
+    }
+
+    async fn fails(fake: &Fake, adapter: &Adapter, archive: &[u8], sums: &str) -> String {
+        install_on(fake, adapter, archive, sums, true, QUICK)
+            .await
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn an_adapter_that_does_not_come_up_gets_its_old_binary_back() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // It fails to start: back to the old one, restarted on it.
+        let (adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        let fake = Fake {
+            failing: vec!["test.service"],
+            ..Fake::new(&adapter.binary)
+        };
+        let failed = fails(&fake, &adapter, &archive, &sums).await;
+        assert!(
+            failed.contains("test.service is failed") && failed.ends_with("old binary is back"),
+            "{failed}"
+        );
+        assert_eq!(fake.installed(), "0.2.9");
+        assert_eq!(
+            *fake.restarted.borrow(),
+            vec!["test.service", "test.service"]
+        );
+
+        // systemd restarts it on its own.
+        let (adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        let fake = Fake {
+            flapping: true,
+            ..Fake::new(&adapter.binary)
+        };
+        let failed = fails(&fake, &adapter, &archive, &sums).await;
+        assert!(failed.contains("systemd restarted it"), "{failed}");
+        assert_eq!(fake.installed(), "0.2.9");
+
+        // It runs but does not connect, as the old one had.
+        let (adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        let fake = Fake {
+            connects: false,
+            ..Fake::new(&adapter.binary)
+        };
+        let failed = fails(&fake, &adapter, &archive, &sums).await;
+        assert!(
+            failed.contains("did not connect to the gateway"),
+            "{failed}"
+        );
+        assert_eq!(fake.installed(), "0.2.9");
+
+        // The unit runs another binary (a drop-in, say).
+        let (adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        let fake = Fake {
+            elsewhere: Some("/usr/bin/havn-channel-test".into()),
+            ..Fake::new(&adapter.binary)
+        };
+        let failed = fails(&fake, &adapter, &archive, &sums).await;
+        assert!(
+            failed.contains("runs /usr/bin/havn-channel-test, not"),
+            "{failed}"
+        );
+        assert_eq!(fake.installed(), "0.2.9");
+
+        // Still systemd's when it has had its time: not the binary.
+        let (adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        let fake = Fake {
+            executor: u32::MAX,
+            ..Fake::new(&adapter.binary)
+        };
+        let watch = Watch {
+            settle: Duration::from_millis(20),
+            within: Duration::from_millis(500),
+            poll: Duration::from_millis(1),
+        };
+        let started = Instant::now();
+        let failed = install_on(&fake, &adapter, &archive, &sums, true, watch)
+            .await
+            .unwrap_err();
+        assert!(
+            failed.contains(&format!("runs {EXECUTOR}, not")),
+            "{failed}"
+        );
+        assert!(started.elapsed() >= watch.settle, "not before the settle");
+        assert_eq!(fake.installed(), "0.2.9");
+
+        // The second unit fails after the first came up: both go back.
+        let (mut adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        adapter.units.push("second.service".into());
+        let fake = Fake {
+            failing: vec!["second.service"],
+            ..Fake::new(&adapter.binary)
+        };
+        let failed = fails(&fake, &adapter, &archive, &sums).await;
+        assert!(failed.starts_with("second.service is failed"), "{failed}");
+        assert_eq!(fake.installed(), "0.2.9");
+        assert_eq!(
+            *fake.restarted.borrow(),
+            vec![
+                "test.service",
+                "second.service",
+                "test.service",
+                "second.service"
+            ]
+        );
+
+        // The old binary cannot be put back.
+        let (adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        let fake = Fake {
+            failing: vec!["test.service"],
+            lose_old: true,
+            ..Fake::new(&adapter.binary)
+        };
+        let failed = fails(&fake, &adapter, &archive, &sums).await;
+        assert!(
+            failed.contains("putting the old binary back failed"),
+            "{failed}"
+        );
+        assert_eq!(fake.restarted.borrow().len(), 1, "not restarted again");
+
+        // Not the release it should be: put back before any restart.
+        let (adapter, archive, sums) = adapter_at(dir.path(), "0.2.10");
+        let fake = Fake::new(&adapter.binary);
+        let failed = fails(&fake, &adapter, &archive, &sums).await;
+        assert!(failed.contains("says it is 0.2.10"), "{failed}");
+        assert_eq!(fake.installed(), "0.2.9");
+        assert!(fake.restarted.borrow().is_empty());
+
+        // A download that is not the release's: nothing is touched.
+        let (adapter, archive, _) = adapter_at(dir.path(), "0.2.11");
+        let fake = Fake::new(&adapter.binary);
+        fails(&fake, &adapter, &archive, "00").await;
+        assert_eq!(fake.installed(), "0.2.9");
+        assert!(fake.restarted.borrow().is_empty());
+    }
+
+    /// An HTTP server answering each path in `routes` with its status and
+    /// body, and 404 to any other; its address.
+    async fn serve(routes: Vec<(String, u16, Vec<u8>)>) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let path = request.split_whitespace().nth(1).unwrap_or_default();
+                let (status, body) = routes
+                    .iter()
+                    .find(|(p, ..)| p == path)
+                    .map_or((404, &[][..]), |(_, status, body)| (*status, &body[..]));
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body).await;
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn the_adapters_in_the_list_are_updated_and_the_list_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        let bin = adapter.binary.parent().unwrap().to_path_buf();
+        for name in ["gone", "empty", "later", "held"] {
+            std::fs::write(bin.join(format!("havn-channel-{name}")), "0.2.9").unwrap();
+        }
+        let arch = release::archive_for(std::env::consts::ARCH)
+            .unwrap()
+            .strip_prefix("havn-")
+            .unwrap()
+            .strip_suffix(".tar.gz")
+            .unwrap();
+        let download = format!(
+            "/amplimit/havn-channel-test/releases/download/v0.2.11/havn-channel-test-{arch}.tar.gz"
+        );
+        let base = serve(vec![
+            (
+                "/repos/amplimit/havn-channel-test/releases/latest".into(),
+                200,
+                br#"{"tag_name":"v0.2.11","body":"Requires Havn >= 0.2.12"}"#.to_vec(),
+            ),
+            (download.clone(), 200, archive),
+            (
+                format!("{download}.sha256"),
+                200,
+                format!("{sums}  havn-channel-test.tar.gz\n").into_bytes(),
+            ),
+            ("/repos/amplimit/empty".into(), 200, b"{}".to_vec()),
+            (
+                "/repos/amplimit/later/releases/latest".into(),
+                200,
+                br#"{"tag_name":"v0.3.0","body":"Requires Havn >= 0.3.0"}"#.to_vec(),
+            ),
+        ])
+        .await;
+        let github = Github {
+            api: base.clone(),
+            downloads: base,
+        };
+        let path = dir.path().join("etc/components.toml");
+        std::fs::create_dir(dir.path().join("etc")).unwrap();
+        let entry = |name: &str, repo: &str, extra: &str| {
+            format!(
+                "[[adapter]]\nname = \"{name}\"\nrepo = \"{repo}\"\nbinary = \"{}\"\n{extra}\n",
+                bin.join(format!("havn-channel-{name}")).display()
+            )
+        };
+        std::fs::write(
+            &path,
+            [
+                entry(
+                    "test",
+                    "amplimit/havn-channel-test",
+                    "units = [\"test.service\"]",
+                ),
+                entry("gone", "amplimit/gone", ""),
+                entry("empty", "amplimit/empty", ""),
+                entry("later", "amplimit/later", ""),
+                entry("held", "amplimit/held", "skip = true"),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let units = tempfile::tempdir().unwrap();
+        std::fs::write(
+            units.path().join("odd.service"),
+            "ExecStart=/opt/havn-channel-odd\n",
+        )
+        .unwrap();
+        let fake = Fake {
+            execs: vec![("odd.service", "odd.service", "/opt/havn-channel-odd")],
+            ..Fake::new(&adapter.binary)
+        };
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let nothing = Path::new("/nonexistent");
+
+        let gathered = gather(&path, &[units.path()], nothing, &fake, false).unwrap();
+        let rows = update_components(
+            &http, &github, gathered, "0.2.12", true, false, &fake, QUICK,
+        )
+        .await;
+        let got: Vec<(&str, &str, &str, &str, bool)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.name.as_str(),
+                    r.from.as_str(),
+                    r.to.as_str(),
+                    r.result.as_str(),
+                    r.failed,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("test", "0.2.9", "v0.2.11", "updated", false),
+                (
+                    "gone",
+                    "0.2.9",
+                    "-",
+                    "failed: repository amplimit/gone not found",
+                    true
+                ),
+                ("empty", "0.2.9", "-", "skipped: it has no release", false),
+                (
+                    "later",
+                    "0.2.9",
+                    "v0.3.0",
+                    "skipped: v0.3.0 needs Havn 0.3.0 or later",
+                    false
+                ),
+                (
+                    "held",
+                    "-",
+                    "-",
+                    "skipped: skip = true in /etc/havn/components.toml",
+                    false
+                ),
+                (
+                    "havn-channel-odd",
+                    "-",
+                    "-",
+                    "not managed: /opt/havn-channel-odd is not in /usr/local/bin; list it in \
+                     /etc/havn/components.toml to update it",
+                    false
+                ),
+            ]
+        );
+        let kept = Components::read(&path).unwrap();
+        let versions: Vec<Option<&str>> =
+            kept.adapters.iter().map(|a| a.version.as_deref()).collect();
+        assert_eq!(
+            versions,
+            vec![
+                Some("0.2.11"),
+                Some("0.2.9"),
+                Some("0.2.9"),
+                Some("0.2.9"),
+                None
+            ]
+        );
+        assert_eq!(kept.adapters.len(), 5, "the unmanaged one is not added");
+
+        // Checked again: the recorded versions, and nothing written.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let gathered = gather(&path, &[units.path()], nothing, &fake, true).unwrap();
+        let rows = update_components(
+            &http, &github, gathered, "0.2.12", false, true, &fake, QUICK,
+        )
+        .await;
+        assert_eq!(rows[0].result, "current");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // A list that cannot be read stops an update, not a check.
+        let unreadable = dir.path().join("etc");
+        assert!(gather(&unreadable, &[], nothing, &fake, false).is_err());
+        let gathered = gather(&unreadable, &[], nothing, &fake, true).unwrap();
+        let rows = update_components(
+            &http, &github, gathered, "0.2.12", false, true, &fake, QUICK,
+        )
+        .await;
+        assert!(rows[0].result.starts_with("not read: reading"), "{rows:?}");
     }
 }
