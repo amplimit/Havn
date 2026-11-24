@@ -47,6 +47,7 @@ import {
   RotateCcw,
   Search,
   Settings,
+  Download,
   Trash2,
   X,
 } from "lucide-react";
@@ -1176,6 +1177,17 @@ function Chat({ id }: { id: string }) {
               <Settings size={16} className="shrink-0" aria-hidden="true" />
               settings
             </Link>
+            <ExportMenu
+              agentId={agent.id}
+              agentName={agent.name}
+              chat={chat}
+              scope={scope}
+              title={
+                (scope
+                  ? channelChats.find((c) => c.id === chat && c.scope === scope)?.title
+                  : chats.find((c) => c.id === chat)?.title) || "chat"
+              }
+            />
             <MemoryPill embedding={embedding} />
             <ConnectionPill state={wsState} agent={agent} />
           </div>
@@ -3210,6 +3222,161 @@ function MemoryPill({ embedding }: { embedding: EmbeddingStatus | null }) {
     >
       <LabelIcon size={12} className="shrink-0" aria-hidden="true" />
       {label}
+    </span>
+  );
+}
+
+/** The most messages an export reads: the newest of a longer chat. */
+const EXPORT_LIMIT = 500;
+
+/** A chat's messages as a file to keep (issue #229). */
+type ExportedChat = {
+  chat: { id: string; title: string };
+  agent: { id: string; name: string };
+  exported_at: string;
+  /** Fewer than the chat holds: its newest only. */
+  newest_only: boolean;
+  messages: { role: "you" | "agent"; at: string; text: string; files: { name: string; path: string }[] }[];
+  sent_files: { name: string; caption?: string; at: string }[];
+};
+
+/** Chat `chat` of agent `agentId`, its branch on screen, read for export. */
+async function readChat(
+  agentId: string,
+  agentName: string,
+  chat: string,
+  title: string,
+  scope: string | null,
+): Promise<ExportedChat> {
+  const [history, sent] = await Promise.all([
+    api.conversation.list(agentId, EXPORT_LIMIT, chat, scope ?? undefined),
+    scope ? Promise.resolve([]) : api.outbox.list(agentId, chat),
+  ]);
+  const messages = history.turns
+    .filter((t) => t.role === "user" || t.role === "assistant")
+    .map((t) => {
+      const { text, files } = t.role === "user" ? splitMessage(t.content) : { text: t.content, files: [] };
+      return {
+        role: t.role === "user" ? ("you" as const) : ("agent" as const),
+        at: t.created_at,
+        text,
+        files: files.map((f) => ({ name: f.name, path: f.path })),
+      };
+    });
+  return {
+    chat: { id: chat, title },
+    agent: { id: agentId, name: agentName },
+    exported_at: new Date().toISOString(),
+    newest_only: history.turns.length >= EXPORT_LIMIT,
+    messages,
+    sent_files: sent.map((f) => ({ name: f.name, caption: f.caption, at: f.created_at })),
+  };
+}
+
+/** An exported chat as Markdown: a heading per message, its files listed. */
+function chatMarkdown(c: ExportedChat): string {
+  const when = (at: string) => new Date(at).toLocaleString();
+  const lines = [
+    `# ${c.chat.title}`,
+    "",
+    `A chat with ${c.agent.name}, exported ${when(c.exported_at)}.` +
+      (c.newest_only ? ` Its newest ${EXPORT_LIMIT} messages only.` : ""),
+  ];
+  for (const m of c.messages) {
+    lines.push("", `## ${m.role === "you" ? "You" : c.agent.name} · ${when(m.at)}`, "", m.text.trim());
+    if (m.files.length > 0) {
+      lines.push("", ...m.files.map((f) => `- Attached: ${f.name} (${f.path})`));
+    }
+  }
+  if (c.sent_files.length > 0) {
+    lines.push("", "## Files the agent sent", "");
+    for (const f of c.sent_files) {
+      lines.push(`- ${f.name}${f.caption ? `: ${f.caption}` : ""} (${when(f.at)})`);
+    }
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+/** Hand `text` to the browser as a file named `name`. */
+function saveFile(name: string, type: string, text: string) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = name;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/** A file name from a chat's title: its letters and digits, joined by dashes. */
+function exportName(title: string, ext: string): string {
+  const base = title
+    .normalize("NFKC")
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+  return `${base || "chat"}.${ext}`;
+}
+
+/**
+ * The chat on screen, saved as a file: Markdown to read, or JSON with each
+ * message, the files it carried and those the agent sent. Its branch on
+ * screen, up to its newest 500 messages.
+ */
+function ExportMenu({
+  agentId,
+  agentName,
+  chat,
+  title,
+  scope,
+}: {
+  agentId: string;
+  agentName: string;
+  chat: string | null;
+  title: string;
+  scope: string | null;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  async function save(format: "md" | "json") {
+    if (!chat) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const read = await readChat(agentId, agentName, chat, title, scope);
+      if (format === "md") saveFile(exportName(title, "md"), "text/markdown;charset=utf-8", chatMarkdown(read));
+      else saveFile(exportName(title, "json"), "application/json", `${JSON.stringify(read, null, 2)}\n`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <span className="inline-flex items-center gap-1" title="Save this chat as a file">
+      <Download size={16} className="shrink-0" aria-hidden="true" style={{ color: "var(--color-body)" }} />
+      <select
+        className="input text-sm"
+        style={{ width: "auto", padding: "4px 8px" }}
+        aria-label="export this chat"
+        value=""
+        disabled={!chat || busy}
+        onChange={(e) => {
+          const format = e.target.value;
+          e.target.value = "";
+          if (format === "md" || format === "json") void save(format);
+        }}
+      >
+        <option value="">{busy ? "exporting…" : "export"}</option>
+        <option value="md">as Markdown</option>
+        <option value="json">as JSON</option>
+      </select>
+      {error && (
+        <span role="alert" className="text-xs" style={{ color: "var(--color-warning-text)" }}>
+          {error}
+        </span>
+      )}
     </span>
   );
 }

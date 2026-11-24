@@ -1186,6 +1186,16 @@ pub async fn move_chat(pool: &SqlitePool, from: &str, id: &str, to: &str) -> Res
     Ok(Some(left.rows_affected() > 0))
 }
 
+/// What the person wrote in chat `id`, on every branch (issue #229).
+pub async fn user_texts(pool: &SqlitePool, id: &str) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT content FROM conversations WHERE channel_id = ?1 AND role = 'user'")
+            .bind(id)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(text,)| text).collect())
+}
+
 /// Delete chat `id` of `scope` with its history; false when it is not one.
 pub async fn delete_chat(pool: &SqlitePool, scope: &str, id: &str) -> Result<bool> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -1951,6 +1961,30 @@ mod tests {
             .await
             .expect("chat");
         assert_eq!(other, mine);
+    }
+
+    #[tokio::test]
+    async fn a_chat_s_user_texts_are_its_person_s_on_every_branch() {
+        let pool = connect_in_memory().await.expect("connect");
+        let chat = chat_for(&pool, "s", None, "one").await.expect("chat");
+        let other = chat_for(&pool, "t", None, "elsewhere").await.expect("chat");
+        record(&pool, &chat, Role::User, "one")
+            .await
+            .expect("record");
+        record(&pool, &chat, Role::Assistant, "a reply")
+            .await
+            .expect("record");
+        record(&pool, &chat, Role::User, "two")
+            .await
+            .expect("record");
+        record(&pool, &other, Role::User, "not this chat")
+            .await
+            .expect("record");
+        let mut texts = user_texts(&pool, &chat).await.expect("texts");
+        texts.sort();
+        assert_eq!(texts, ["one", "two"]);
+        assert!(delete_chat(&pool, "s", &chat).await.expect("delete"));
+        assert!(user_texts(&pool, &chat).await.expect("texts").is_empty());
     }
 
     #[tokio::test]
