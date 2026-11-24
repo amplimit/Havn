@@ -380,17 +380,24 @@ pub async fn with_transcript(
 /// Remove a received file no message carried, its text and the copy shown
 /// of it, from the inbox of `workspace`.
 pub fn discard(workspace: &std::path::Path, attachment: &Attachment) {
+    discard_path(workspace, &attachment.path, attachment.text_path.as_deref());
+}
+
+/// Remove inbox file `path` of `workspace`, its text at `text_path` and
+/// the copy shown of it: a file sent unused, or one of a deleted chat
+/// (issue #229). Nothing outside the inbox is touched.
+pub fn discard_path(workspace: &std::path::Path, path: &str, text_path: Option<&str>) {
     let Ok(inbox) = inbox(workspace) else {
         return;
     };
-    let name = |path: &String| {
+    let name = |path: &str| {
         path.strip_prefix(INBOX_DIR)
             .and_then(|rest| rest.strip_prefix('/'))
             .map(str::to_string)
     };
-    let copy = name(&attachment.path).map(|file| crate::llm_proxy::shown_copy(&file));
-    let names = std::iter::once(&attachment.path)
-        .chain(attachment.text_path.as_ref())
+    let copy = name(path).map(|file| crate::llm_proxy::shown_copy(&file));
+    let names = std::iter::once(path)
+        .chain(text_path)
         .filter_map(name)
         .chain(copy);
     for name in names {
@@ -1354,6 +1361,30 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed)
         );
         let _ = std::fs::remove_file(&state.config_path);
+    }
+
+    #[test]
+    fn a_deleted_chat_s_file_goes_with_its_text_and_copy_and_nothing_else() {
+        let ws = tempfile::tempdir().unwrap();
+        let inbox = ws.path().join(INBOX_DIR);
+        std::fs::create_dir_all(&inbox).unwrap();
+        let copy = crate::llm_proxy::shown_copy("1-a.png");
+        for name in ["1-a.png", "1-a.png.txt", copy.as_str(), "2-b.png"] {
+            std::fs::write(inbox.join(name), b"x").unwrap();
+        }
+        std::fs::write(ws.path().join("secret"), b"x").unwrap();
+        discard_path(ws.path(), "inbox/1-a.png", Some("inbox/1-a.png.txt"));
+        discard_path(ws.path(), "inbox/../secret", None);
+        discard_path(ws.path(), "secret", None);
+        let left: std::collections::BTreeSet<String> = std::fs::read_dir(&inbox)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["2-b.png".to_string()].into());
+        assert!(
+            ws.path().join("secret").exists(),
+            "nothing outside the inbox"
+        );
     }
 
     #[test]

@@ -230,6 +230,22 @@ struct Found {
     found: bool,
 }
 
+/// A deleted chat, and the inbox files its messages carried (issue #229);
+/// an older runtime names none.
+#[derive(Deserialize)]
+struct Deleted {
+    found: bool,
+    #[serde(default)]
+    files: Vec<Carried>,
+}
+
+#[derive(Deserialize)]
+struct Carried {
+    path: String,
+    #[serde(default)]
+    text_path: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct BranchSwitch {
     pub turn: String,
@@ -703,7 +719,7 @@ pub async fn chat_delete(
 ) -> Result<StatusCode, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
     let conversation = chat_param(Some(chat))?.unwrap_or_default();
-    let deleted: Found = crate::api::agents::agent_data(
+    let deleted: Deleted = crate::api::agents::agent_data(
         &state,
         user.id,
         agent.id,
@@ -719,12 +735,30 @@ pub async fn chat_delete(
     }
     // Its tasks report to the conversation, no longer to the chat.
     havn_db::repo::cron::forget_chat(&state.db, agent.id, &conversation).await?;
+    // The files it carried go with it: those sent in it, by the person and
+    // by the agent (issue #229).
+    let workspace = crate::api::agents::workspace_for(&state, agent.id);
+    let outbox = crate::outbox::dir(&state.workspace_root, agent.id);
+    let chat = conversation.clone();
+    let files = deleted.files;
+    let named = tokio::task::spawn_blocking(move || {
+        for file in &files {
+            crate::api::files::discard_path(&workspace, &file.path, file.text_path.as_deref());
+        }
+        let sent = crate::outbox::list(&outbox, Some(&chat), usize::MAX);
+        for file in &sent {
+            crate::outbox::remove(&outbox, &file.id);
+        }
+        files.len() + sent.len()
+    })
+    .await
+    .unwrap_or(0);
     crate::audit::record_agent_action(
         &state.db,
         user.id,
         agent.id,
         "agent.chat.deleted",
-        serde_json::json!({ "conversation": conversation }),
+        serde_json::json!({ "conversation": conversation, "files_named": named }),
     )
     .await;
     Ok(StatusCode::NO_CONTENT)

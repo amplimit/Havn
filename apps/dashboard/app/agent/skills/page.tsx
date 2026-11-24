@@ -158,7 +158,7 @@ function Skills({ id }: { id: string }) {
           <section className="mb-10">
             <h2 className="display-h3 mb-3">
               active skills{" "}
-              <span style={{ color: "var(--color-body)", fontWeight: 300 }}>
+              <span style={{ color: "var(--color-body)" }}>
                 ({active.length})
               </span>
             </h2>
@@ -224,7 +224,7 @@ function Skills({ id }: { id: string }) {
             <section className="mb-10">
               <h2 className="display-h3 mb-3">
                 archived (audit){" "}
-                <span style={{ color: "var(--color-body)", fontWeight: 300 }}>
+                <span style={{ color: "var(--color-body)" }}>
                   ({archived.length})
                 </span>
               </h2>
@@ -262,7 +262,7 @@ function Skills({ id }: { id: string }) {
           <section>
             <h2 className="display-h3 mb-3">
               curator log{" "}
-              <span style={{ color: "var(--color-body)", fontWeight: 300 }}>
+              <span style={{ color: "var(--color-body)" }}>
                 ({reports.length})
               </span>
             </h2>

@@ -732,6 +732,9 @@ function BotAccess({ agentId }: { agentId: string }) {
           sender_id,
           group,
         });
+        // A server let in already is not offered again.
+        const inAlready = (space: string) =>
+          account.allow_groups.includes(space) || account.groups.some((g) => g.group_id === space);
         const refusedBlock = (
           <>
             <h4 className="mt-3 text-xs uppercase" style={muted}>
@@ -745,13 +748,40 @@ function BotAccess({ agentId }: { agentId: string }) {
               <ul className="flex flex-col gap-2 text-sm">
                 {account.refused.map((r) => (
                   <li key={r.sender_id}>
-                    {r.group && <span className="text-xs uppercase">group </span>}
+                    {r.group && (
+                      <span className="text-xs uppercase">{r.space ? "channel " : "group "}</span>
+                    )}
+                    {r.title && <span>{r.title} </span>}
                     <span className="font-mono">{r.sender_id}</span>{" "}
                     <span className="text-xs" style={muted}>
                       {r.count} {r.count === 1 ? "message" : "messages"}, last {when(r.last_at)}
                     </span>
+                    {r.space && (
+                      <div className="text-xs" style={muted}>
+                        in the server {r.space.title || r.space.id}
+                        {r.space.title && <span className="font-mono"> ({r.space.id})</span>}
+                      </div>
+                    )}
                     {r.said && <div className="text-xs wrap-anywhere">&ldquo;{r.said}&rdquo;</div>}
-                    <div className="mt-1 flex gap-2">
+                    <div className="mt-1 flex flex-wrap gap-2">
+                      {r.space && !inAlready(r.space.id) && (
+                        <button
+                          type="button"
+                          className="btn-ghost"
+                          disabled={busy || account.group_policy === "off"}
+                          title={
+                            account.group_policy === "off"
+                              ? "turn groups on first"
+                              : "Every channel of the server, those made later too, for everyone in it"
+                          }
+                          onClick={() => {
+                            const space = r.space;
+                            if (space) void run(() => api.channels.allow(agentId, who(space.id, true)));
+                          }}
+                        >
+                          let in the whole server
+                        </button>
+                      )}
                       <button
                         type="button"
                         className="btn-ghost"
@@ -759,7 +789,7 @@ function BotAccess({ agentId }: { agentId: string }) {
                         title={r.group && account.group_policy === "off" ? "turn groups on first" : undefined}
                         onClick={() => void run(() => api.channels.allow(agentId, who(r.sender_id, r.group)))}
                       >
-                        let in
+                        {r.space ? "let in this channel" : "let in"}
                       </button>
                       <button
                         type="button"
@@ -811,8 +841,18 @@ function BotAccess({ agentId }: { agentId: string }) {
                 ))}
                 {account.groups.map((g) => (
                   <li key={`group-${g.group_id}`} className="flex flex-wrap items-center gap-2">
+                    {g.space && (
+                      <span className="pill pill-stopped" title="Every channel of the server, those made later too">
+                        server
+                      </span>
+                    )}
                     <span className="font-mono">{g.group_id}</span>
                     {g.title && <span>{g.title}</span>}
+                    {g.in_space && (
+                      <span className="text-xs" style={muted}>
+                        in the server {g.in_space.title || g.in_space.id}
+                      </span>
+                    )}
                     {g.sees_all === false && (
                       <span className="text-xs" style={muted}>
                         mentions do not reach it
@@ -2560,20 +2600,20 @@ function McpEditor({ agentId }: { agentId: string }) {
                     <td className="py-2 pr-2">
                       <code
                         className="font-mono"
-                        style={{ fontSize: 11 }}
+                        style={{ fontSize: 12 }}
                       >
                         {cfg.binary}
                       </code>
                     </td>
                     <td
                       className="py-2 pr-2"
-                      style={{ fontSize: 11, color: "var(--color-body)" }}
+                      style={{ fontSize: 12, color: "var(--color-body)" }}
                     >
                       {cfg.args.length > 0 ? cfg.args.join(" ") : "—"}
                     </td>
                     <td
                       className="py-2 pr-2"
-                      style={{ fontSize: 11, color: "var(--color-body)" }}
+                      style={{ fontSize: 12, color: "var(--color-body)" }}
                     >
                       {cfg.extra_paths_rw.length === 0 &&
                       cfg.extra_paths_ro.length === 0

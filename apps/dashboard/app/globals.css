@@ -2,9 +2,10 @@
  * havn dashboard — design tokens (DESIGN.md / Stripe-inspired).
  *
  * sohne-var is a Stripe-proprietary font. We use Inter Variable as the
- * closest open substitute and recreate the *system* — light weights at
- * display sizes, negative tracking, OpenType `ss01` where Inter ships an
- * alternate, blue-tinted shadow stack. Numbers in tabular contexts use
+ * closest open substitute and recreate the *system*: negative tracking at
+ * display sizes, OpenType `ss01` where Inter ships an alternate, a
+ * blue-tinted shadow stack. Text is 400, controls 500 and headings 600,
+ * since lighter weights read faint on the light surfaces. Numbers in tabular contexts use
  * `tnum`. The visual rhythm of DESIGN.md transfers; only the glyph
  * shapes differ.
  */
@@ -98,9 +99,9 @@
   body {
     background-color: var(--color-surface);
     color: var(--color-body);
-    font-weight: 300;
+    font-weight: 400;
     font-size: 16px;
-    line-height: 1.4;
+    line-height: 1.5;
   }
 
   h1,
@@ -110,7 +111,7 @@
   h5,
   h6 {
     color: var(--color-heading);
-    font-weight: 300;
+    font-weight: 600;
     /* Letter-spacing decreases as size grows (DESIGN.md §3). Component
      * styles refine the per-size value; this is the baseline. */
     letter-spacing: -0.01em;
@@ -163,16 +164,18 @@
     color: #ffffff;
     padding: 8px 16px;
     border-radius: var(--radius-tight);
-    font-weight: 400;
-    font-size: 16px;
+    font-weight: 500;
+    font-size: 15px;
     line-height: 1;
     transition: background-color 120ms ease;
   }
   .btn-primary:hover:not(:disabled) {
     background-color: var(--color-stripe-purple-hover);
   }
+  /* Disabled, it is grey: a pale purple reads as still active. */
   .btn-primary:disabled {
-    opacity: 0.5;
+    background-color: var(--color-border-default);
+    color: var(--color-body);
     cursor: not-allowed;
   }
 
@@ -181,7 +184,7 @@
     color: var(--color-stripe-purple);
     padding: 8px 16px;
     border-radius: var(--radius-tight);
-    font-weight: 400;
+    font-weight: 500;
     border: 1px solid var(--color-stripe-purple-light);
     transition: background-color 120ms ease;
   }
@@ -194,7 +197,7 @@
     color: var(--color-ruby);
     padding: 8px 16px;
     border-radius: var(--radius-tight);
-    font-weight: 400;
+    font-weight: 500;
     border: 1px solid rgba(234, 34, 97, 0.3);
     transition: background-color 120ms ease;
   }
@@ -207,14 +210,14 @@
     background-color: var(--color-surface);
     border: 1px solid var(--color-border-default);
     border-radius: var(--radius-comfortable);
-    box-shadow: var(--shadow-ambient);
   }
 
+  /* Content on a page has a thin border only; shadows are for what floats
+   * over the page (menus, dialogs). */
   .card-elevated {
     background-color: var(--color-surface);
     border: 1px solid var(--color-border-default);
     border-radius: var(--radius-large);
-    box-shadow: var(--shadow-elevated);
   }
 
   /* === Inputs (DESIGN.md §4) === */
@@ -240,7 +243,7 @@
   .label {
     color: var(--color-label);
     font-size: 14px;
-    font-weight: 400;
+    font-weight: 500;
     margin-bottom: 6px;
     display: block;
   }
@@ -252,8 +255,8 @@
     gap: 4px;
     padding: 1px 6px;
     border-radius: var(--radius-tight);
-    font-size: 11px;
-    font-weight: 400;
+    font-size: 12px;
+    font-weight: 500;
     line-height: 1.4;
   }
   .pill-running {
@@ -290,26 +293,101 @@
     top: 12px;
   }
 
+  /* The chat's composer: one panel holding the text and a bar of tools. */
+  .composer {
+    background-color: var(--color-surface);
+    border: 1px solid var(--color-border-default);
+    border-radius: var(--radius-large);
+    transition: border-color 120ms ease, box-shadow 120ms ease;
+  }
+  .composer:focus-within {
+    border-color: var(--color-stripe-purple);
+    box-shadow: 0 0 0 3px rgba(83, 58, 253, 0.12);
+  }
+  .composer-select {
+    background-color: transparent;
+    border: 0;
+    border-radius: var(--radius-tight);
+    padding: 6px 6px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--color-label);
+    text-overflow: ellipsis;
+    transition: background-color 120ms ease;
+  }
+  .composer-select:hover:not(:disabled) {
+    background-color: rgba(100, 116, 141, 0.08);
+  }
+  .composer-select:disabled {
+    opacity: 0.5;
+  }
+
+  /* A quiet button: an icon, often a word, no frame until hovered. */
+  .tool-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    border-radius: var(--radius-tight);
+    color: var(--color-label);
+    font-weight: 500;
+    transition: background-color 120ms ease, color 120ms ease;
+  }
+  .tool-button:hover:not(:disabled) {
+    background-color: rgba(100, 116, 141, 0.08);
+    color: var(--color-deep-navy);
+  }
+  .tool-button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .tool-button[aria-pressed="true"] {
+    background-color: rgba(83, 58, 253, 0.07);
+    color: var(--color-stripe-purple);
+  }
+
+  /* A menu over the page: the one place, with dialogs, that casts a shadow. */
+  .menu {
+    background-color: var(--color-surface);
+    border: 1px solid var(--color-border-default);
+    border-radius: var(--radius-comfortable);
+    box-shadow: var(--shadow-standard);
+  }
+  .menu-item {
+    padding: 6px 12px;
+    text-align: left;
+    font-size: 14px;
+    color: var(--color-deep-navy);
+    transition: background-color 120ms ease;
+  }
+  .menu-item:hover:not(:disabled) {
+    background-color: rgba(100, 116, 141, 0.08);
+  }
+  .menu-item:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
   /* === Display headlines (DESIGN.md §3) === */
   .display-h1 {
-    font-size: 48px;
-    line-height: 1.15;
-    font-weight: 300;
-    letter-spacing: -0.96px;
+    font-size: 30px;
+    line-height: 1.2;
+    font-weight: 600;
+    letter-spacing: -0.5px;
     color: var(--color-heading);
   }
   .display-h2 {
-    font-size: 32px;
-    line-height: 1.1;
-    font-weight: 300;
-    letter-spacing: -0.64px;
+    font-size: 24px;
+    line-height: 1.2;
+    font-weight: 600;
+    letter-spacing: -0.36px;
     color: var(--color-heading);
   }
   .display-h3 {
-    font-size: 22px;
-    line-height: 1.1;
-    font-weight: 300;
-    letter-spacing: -0.22px;
+    font-size: 18px;
+    line-height: 1.3;
+    font-weight: 600;
+    letter-spacing: -0.18px;
     color: var(--color-heading);
   }
 }
@@ -317,12 +395,12 @@
 /* Phone widths: smaller display type so headings fit 390px. */
 @media (max-width: 639px) {
   .display-h1 {
-    font-size: 34px;
-    letter-spacing: -0.6px;
-  }
-  .display-h2 {
     font-size: 26px;
     letter-spacing: -0.4px;
+  }
+  .display-h2 {
+    font-size: 22px;
+    letter-spacing: -0.3px;
   }
 }
 
@@ -334,20 +412,20 @@
   /* Inherit text color from parent (bubble) so user/agent contrast stays */
   color: inherit;
   font-size: 16px;
-  line-height: 1.5;
+  line-height: 1.65;
 }
 .markdown > *:first-child { margin-top: 0; }
 .markdown > *:last-child { margin-bottom: 0; }
-.markdown p { margin: 0.5em 0; }
+.markdown p { margin: 0.75em 0; }
 .markdown h1,
 .markdown h2,
 .markdown h3,
 .markdown h4 {
-  font-weight: 400;
+  font-weight: 600;
   letter-spacing: -0.01em;
   color: inherit;
-  margin: 0.8em 0 0.3em;
-  line-height: 1.2;
+  margin: 1.2em 0 0.4em;
+  line-height: 1.3;
 }
 .markdown h1 { font-size: 1.4em; }
 .markdown h2 { font-size: 1.25em; }
@@ -355,10 +433,17 @@
 .markdown h4 { font-size: 1em; }
 .markdown ul,
 .markdown ol {
-  margin: 0.5em 0;
+  margin: 0.75em 0;
   padding-left: 1.5em;
 }
-.markdown li { margin: 0.2em 0; }
+.markdown ul { list-style: disc; }
+.markdown ol { list-style: decimal; }
+.markdown ul ul { list-style: circle; }
+.markdown ul ul ul { list-style: square; }
+.markdown li { margin: 0.35em 0; }
+.markdown li > ul,
+.markdown li > ol { margin: 0.25em 0; }
+.markdown li::marker { color: var(--color-body); }
 .markdown li > input[type="checkbox"] {
   margin-right: 0.4em;
   vertical-align: middle;
@@ -413,7 +498,7 @@
 }
 .markdown th {
   background: var(--color-surface-muted);
-  font-weight: 400;
+  font-weight: 600;
 }
 .markdown hr {
   border: 0;
@@ -427,6 +512,83 @@
 @keyframes havn-typing {
   0%, 80%, 100% { opacity: 0.25; transform: translateY(0); }
   40% { opacity: 1; transform: translateY(-2px); }
+}
+
+/* Something new on screen (a message, a step): it fades in and rises a
+ * little, once. */
+@keyframes havn-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+.enter {
+  animation: havn-enter 200ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+/* Another page: it fades in, without moving. */
+@keyframes havn-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.page-enter {
+  animation: havn-fade 160ms ease-out both;
+}
+
+/* A part that opens and closes: its height and opacity move together,
+ * the arrow beside its head turns. Closed, it keeps no height. */
+.fold {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition:
+    grid-template-rows 200ms cubic-bezier(0.2, 0, 0, 1),
+    opacity 200ms cubic-bezier(0.2, 0, 0, 1);
+}
+.fold[data-open="true"] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+.fold > * {
+  min-height: 0;
+  overflow: hidden;
+}
+.fold-arrow {
+  transition: transform 200ms cubic-bezier(0.2, 0, 0, 1);
+}
+.fold-arrow[data-open="true"] {
+  transform: rotate(90deg);
+}
+
+/* The reply being written: its height follows its text with a short motion. */
+.live-grow {
+  overflow: hidden;
+  transition: height 160ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* A line still at work (the model thinking): a highlight runs over it. */
+@keyframes havn-shimmer {
+  from { background-position: 100% 0; }
+  to { background-position: 0% 0; }
+}
+.shimmer {
+  background-image: linear-gradient(
+    90deg,
+    var(--color-body) 0%,
+    var(--color-body) 40%,
+    var(--color-stripe-purple-mid) 50%,
+    var(--color-body) 60%,
+    var(--color-body) 100%
+  );
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: havn-shimmer 2s linear infinite;
+}
+
+/* A status that is still going: a dot that breathes. */
+@keyframes havn-breathe {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
 }
 
 /* Spinner — used inside the send button when the model is replying. */
