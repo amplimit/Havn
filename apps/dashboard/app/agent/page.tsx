@@ -2510,8 +2510,8 @@ function ChatModelMenus({
   return (
     <>
       <select
-        className="composer-select"
-        style={{ maxWidth: 300 }}
+        className="composer-select min-w-0"
+        style={{ maxWidth: 280 }}
         aria-label="model of this chat"
         title={`The model of this chat; others keep theirs. Now: ${model ?? "the default"}`}
         value={chatModel ?? ""}
@@ -2527,7 +2527,7 @@ function ChatModelMenus({
         ))}
       </select>
       <select
-        className="composer-select"
+        className="composer-select min-w-0"
         style={{ maxWidth: 180 }}
         aria-label="thinking of this chat"
         title={spec ? "How much this chat's model thinks" : "This model is not set up to think"}
@@ -3201,7 +3201,7 @@ function Composer({
             </div>
           )}
 
-          <div className="flex flex-wrap items-center gap-1 px-2 pb-2">
+          <div className="flex flex-wrap items-center gap-1 px-2 pb-2 sm:flex-nowrap">
             <input
               ref={fileInput}
               type="file"
@@ -3238,15 +3238,17 @@ function Composer({
               <span className="text-[13px]">{tab === "write" ? "preview" : "write"}</span>
             </button>
             {models && models.models.length > 0 && (
-              <ChatModelMenus
-                models={models}
-                chatModel={chatModel}
-                chatThinking={chatThinking}
-                disabled={!ready}
-                onSettings={onSettings}
-              />
+              <div className="flex min-w-0 items-center gap-1">
+                <ChatModelMenus
+                  models={models}
+                  chatModel={chatModel}
+                  chatThinking={chatThinking}
+                  disabled={!ready}
+                  onSettings={onSettings}
+                />
+              </div>
             )}
-            <div className="ml-auto flex items-center gap-2">
+            <div className="ml-auto flex shrink-0 items-center gap-2">
               {pending && (
                 <span
                   className="enter flex items-center gap-1.5 text-[13px]"
