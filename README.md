@@ -697,6 +697,8 @@ A model names each new chat from its first message, while the agent answers it (
 
 ### Tools in other people's conversations
 
+`SOUL.md` and `USER.md`, the files the agent's settings page edits under "bootstrap files", are in the agent's prompt in every chat: other people's and groups' too, without asking the owner. They are public to anyone who can talk to the bot, so `USER.md` holds only what anyone may know about the owner (a name, how to address them, a language); what should stay private belongs in the agent's memory, used in the owner's own chats only (see below).
+
 The agent's memory, workspace and machine are its owner's. In a conversation with someone else (a person the owner admitted to a chat-app account, anyone on an `open` account), recent events are not put in the prompt, and the tools that reach them wait for the owner:
 
 | Tools | The owner is asked |
