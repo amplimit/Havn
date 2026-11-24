@@ -724,6 +724,9 @@ function BotAccess({ agentId }: { agentId: string }) {
           sender_id,
           group,
         });
+        // A server let in already is not offered again.
+        const inAlready = (space: string) =>
+          account.allow_groups.includes(space) || account.groups.some((g) => g.group_id === space);
         const refusedBlock = (
           <>
             <h4 className="mt-3 text-xs uppercase" style={muted}>
@@ -753,7 +756,7 @@ function BotAccess({ agentId }: { agentId: string }) {
                     )}
                     {r.said && <div className="text-xs wrap-anywhere">&ldquo;{r.said}&rdquo;</div>}
                     <div className="mt-1 flex flex-wrap gap-2">
-                      {r.space && (
+                      {r.space && !inAlready(r.space.id) && (
                         <button
                           type="button"
                           className="btn-ghost"

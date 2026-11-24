@@ -3335,30 +3335,28 @@ pub struct RefusedView {
     pub space: Option<PlaceView>,
 }
 
-/// The server group `id` is part of (issue #287): its own, or, for a
-/// thread, its channel's.
+/// The server group `id` is part of, by the newest name its groups gave
+/// it (issue #287).
 async fn space_of(
     db: &sqlx::SqlitePool,
     channel: &str,
     account_id: &str,
     id: &str,
 ) -> Result<Option<PlaceView>, havn_db::DbError> {
-    let mut next = vec![id.to_string()];
-    for _ in 0..2 {
-        let mut up = Vec::new();
-        for child in &next {
-            for parent in channel_access::parents_of(db, channel, account_id, child).await? {
-                if channel_access::is_space(db, channel, account_id, &parent).await? {
-                    let title =
-                        channel_access::place_title(db, channel, account_id, &parent).await?;
-                    return Ok(Some(PlaceView { id: parent, title }));
-                }
-                up.push(parent);
-            }
-        }
-        next = up;
+    Ok(channel_access::space_of(db, channel, account_id, id)
+        .await?
+        .map(|(id, title)| PlaceView { id, title }))
+}
+
+/// A group's own name: a server's channel is kept as "Server / channel",
+/// and the server is named beside it (issue #287).
+fn own_title(title: String, space: Option<&PlaceView>) -> String {
+    match space {
+        Some(space) if !space.title.is_empty() => title
+            .strip_prefix(&format!("{} / ", space.title))
+            .map_or(title.clone(), str::to_string),
+        _ => title,
     }
-    Ok(None)
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -3442,14 +3440,14 @@ async fn channel_access_view(
             .map_err(internal)?
         {
             let (title, space) = if r.group {
-                (
+                let space = space_of(&state.db, channel, &account.id, &r.sender_id)
+                    .await
+                    .map_err(internal)?;
+                let title =
                     channel_access::place_title(&state.db, channel, &account.id, &r.sender_id)
                         .await
-                        .map_err(internal)?,
-                    space_of(&state.db, channel, &account.id, &r.sender_id)
-                        .await
-                        .map_err(internal)?,
-                )
+                        .map_err(internal)?;
+                (own_title(title, space.as_ref()), space)
             } else {
                 (String::new(), None)
             };
@@ -3505,7 +3503,7 @@ async fn channel_access_view(
             groups.push(GroupView {
                 sees_all: seeing.get(&g.group_id).copied(),
                 group_id: g.group_id,
-                title: g.title,
+                title: own_title(g.title, in_space.as_ref()),
                 source: g.source,
                 since: g.registered_at,
                 space,
@@ -5496,7 +5494,34 @@ mod tests {
                     title: "Acme".into()
                 })
             );
-            assert!(!channel.title.is_empty(), "{channel:?}");
+            assert_eq!(channel.title, "general", "named once, the server beside it");
+            assert!(
+                !refused.iter().any(|r| r.sender_id == "dc:t287"),
+                "a thread is turned away as its channel: {refused:?}"
+            );
+
+            // A group of no server is named as it is, with none.
+            let mut lone = text_from("tg:ann", "hi");
+            lone.group = Some(havn_proto::channel::ChannelGroup {
+                id: "tg:-287".into(),
+                title: Some("Team".into()),
+                sender_name: Some("Ann".into()),
+                addressed: true,
+                sees_all: Some(true),
+                space: None,
+                thread: None,
+            });
+            handle_inbound(&f.state, "telegram", lone).await;
+            let view = channel_access_get(st(), user(), id())
+                .await
+                .expect("view")
+                .0;
+            let team = view.accounts[0]
+                .refused
+                .iter()
+                .find(|r| r.sender_id == "tg:-287")
+                .unwrap_or_else(|| panic!("{:?}", view.accounts[0].refused));
+            assert!(team.space.is_none() && team.title == "Team", "{team:?}");
 
             // The server let in from the page: listed as a server; a channel
             // of it let in after names it.
@@ -5514,7 +5539,15 @@ mod tests {
                 view.accounts[0]
                     .groups
                     .iter()
-                    .any(|g| g.group_id == "dc:s287" && g.space)
+                    .any(|g| g.group_id == "dc:s287" && g.space && g.title == "Acme")
+            );
+            assert!(
+                !view.accounts[0]
+                    .refused
+                    .iter()
+                    .any(|r| r.sender_id == "dc:c287"),
+                "its channel is no longer turned away: {:?}",
+                view.accounts[0].refused
             );
             let view = channel_sender_allow(st(), user(), id(), Json(group("dc:c287")))
                 .await
@@ -5530,6 +5563,7 @@ mod tests {
                 .iter()
                 .find(|g| g.group_id == "dc:c287")
                 .unwrap_or_else(|| panic!("{groups:?}"));
+            // Its name went with its refusal when the server was let in.
             assert!(!channel.space, "{channel:?}");
             assert_eq!(
                 channel.in_space.as_ref().map(|s| s.id.as_str()),
