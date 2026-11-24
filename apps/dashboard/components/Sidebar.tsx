@@ -81,6 +81,12 @@ export function Sidebar() {
   const [open, setOpen] = useState(false);
   // From md up it can be narrowed to its icons, as this browser remembers.
   const narrow = useSyncExternalStore(onNarrow, narrowStored, () => false);
+  // Set after the first frame: a sidebar loaded narrow does not shrink on screen.
+  const [moving, setMoving] = useState(false);
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => setMoving(true));
+    return () => cancelAnimationFrame(frame);
+  }, []);
   const toggleNarrow = () => storeNarrow(!narrow);
   // Classes that apply from md up while narrowed.
   const wideOnly = narrow ? "md:sr-only" : "";
@@ -196,7 +202,7 @@ export function Sidebar() {
         aria-label="Navigation"
         role={open ? "dialog" : undefined}
         aria-modal={open ? true : undefined}
-        className={`fixed inset-y-0 left-0 z-50 flex w-72 max-w-[85vw] flex-col overflow-y-auto overflow-x-hidden overscroll-contain border-r transition-[translate] duration-200 md:sticky md:top-0 md:z-auto md:h-screen md:max-w-none md:shrink-0 md:translate-x-0 md:transition-[width] ${
+        className={`fixed inset-y-0 left-0 z-50 flex w-72 max-w-[85vw] flex-col overflow-y-auto overflow-x-hidden overscroll-contain border-r transition-[translate] duration-200 md:sticky md:top-0 md:z-auto md:h-screen md:max-w-none md:shrink-0 md:translate-x-0 ${moving ? "md:transition-[width]" : ""} ${
           narrow ? "md:w-16" : "md:w-64"
         } ${
           open

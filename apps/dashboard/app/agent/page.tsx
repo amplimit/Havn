@@ -274,11 +274,21 @@ function Chat({ id }: { id: string }) {
   // and those shown now. Kept apart from `live` so a call ends at once.
   const doneCalls = useRef(new Set<string>());
   const liveCalls = useRef(new Set<string>());
+  // The frame of the easing that follows a reply being written, while it runs.
+  const following = useRef(0);
   // The reader is at the bottom of the chat (within 80 pixels): it follows
   // what comes; scrolled up, it stays, with a button back to the latest.
   const atBottom = useRef(true);
   const lastTop = useRef(0);
+  const touchY = useRef<number | null>(null);
   const [away, setAway] = useState(false);
+  // The reader moved up: the chat stops following, and offers the way back.
+  function leaveBottom() {
+    atBottom.current = false;
+    cancelAnimationFrame(following.current);
+    following.current = 0;
+    setAway(true);
+  }
   // The reply's own text was on screen as it was written: the reply that
   // replaces it does not fade in again.
   const liveText = useRef(false);
@@ -719,6 +729,8 @@ function Chat({ id }: { id: string }) {
       jumpedAt.current = Date.now();
       const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
       el.scrollIntoView({ block: "center", behavior: reduce ? "auto" : "smooth" });
+      atBottom.current = false;
+      setAway(true);
       setFound(jump.turn);
       setTimeout(() => setFound((f) => (f === jump.turn ? null : f)), 4000);
       return;
@@ -752,7 +764,6 @@ function Chat({ id }: { id: string }) {
   // As the reply being written grows, follow it, unless the user scrolled
   // up to read.
   const liveLength = live.reduce((n, p) => n + p.text.length + p.thinking.length, 0);
-  const following = useRef(0);
   useEffect(() => {
     const el = scrollRef.current;
     if (!el || liveLength === 0 || !atBottom.current || following.current) return;
@@ -1162,9 +1173,12 @@ function Chat({ id }: { id: string }) {
               <ConnectionPill state={wsState} agent={agent} />
             </p>
             <h1 className="truncate text-base font-semibold" style={{ color: "var(--color-heading)" }}>
-              {(scope
-                ? channelChats.find((c) => c.id === chat && c.scope === scope)?.title
-                : chats.find((c) => c.id === chat)?.title) || (chat ? "untitled" : "new chat")}
+              {(() => {
+                const shown = scope
+                  ? channelChats.find((c) => c.id === chat && c.scope === scope)
+                  : chats.find((c) => c.id === chat);
+                return shown ? shown.title || "untitled" : "new chat";
+              })()}
             </h1>
           </div>
           <div className="flex flex-wrap items-center gap-0.5">
@@ -1244,9 +1258,23 @@ function Chat({ id }: { id: string }) {
             const el = e.currentTarget;
             const up = el.scrollTop < lastTop.current - 2;
             lastTop.current = el.scrollTop;
-            if (el.scrollHeight - el.scrollTop - el.clientHeight < 80) atBottom.current = true;
+            if (el.scrollHeight - el.scrollTop - el.clientHeight < 8) atBottom.current = true;
             else if (up) atBottom.current = false;
             if (away === atBottom.current) setAway(!atBottom.current);
+          }}
+          onWheel={(e) => {
+            if (e.deltaY < 0) leaveBottom();
+          }}
+          onTouchStart={(e) => {
+            touchY.current = e.touches[0]?.clientY ?? null;
+          }}
+          onTouchMove={(e) => {
+            const y = e.touches[0]?.clientY;
+            // A finger moving down scrolls the chat up.
+            if (touchY.current !== null && y !== undefined && y > touchY.current + 4) leaveBottom();
+          }}
+          onKeyDown={(e) => {
+            if (["PageUp", "ArrowUp", "Home"].includes(e.key)) leaveBottom();
           }}
           className="relative flex-1 overflow-y-auto px-4 py-6 sm:px-8"
           style={{ backgroundColor: "var(--color-surface)" }}
@@ -2577,9 +2605,13 @@ function ChatModelMenus({
   const choices = spec ? thinkingChoices(spec) : [];
   const fallback = spec?.default ?? choices[0] ?? "off";
   const thinking = chatThinking && choices.includes(chatThinking) ? chatThinking : fallback;
+  const short = (m: { id: string; label?: string }) => {
+    const name = modelName(m.id, m.label);
+    return models.models.filter((x) => modelName(x.id, x.label) === name).length > 1 ? m.id : name;
+  };
   const name = (id: string | null) => {
     const m = models.models.find((x) => x.id === id);
-    return id ? modelName(id, m?.label) : "default";
+    return id ? short(m ?? { id }) : "default";
   };
   const thinkingName = (c: string) =>
     c === "off" ? "thinking off" : c === "on" ? "thinking on" : spec?.style === "budget" ? `think ${Number(c).toLocaleString()} tokens` : `think ${c}`;
@@ -2597,7 +2629,7 @@ function ChatModelMenus({
         <option value="">{name(agentModel)} (agent&apos;s)</option>
         {models.models.map((m) => (
           <option key={m.id} value={m.id} title={m.id}>
-            {modelName(m.id, m.label)}
+            {short(m)}
             {m.id === agentModel ? " (kept for this chat)" : ""}
           </option>
         ))}
@@ -2819,7 +2851,7 @@ function TraceList({ items, leftOut }: { items: TraceItem[]; leftOut: number }) 
             className="py-0.5 underline decoration-dotted underline-offset-2 hover:text-[var(--color-deep-navy)]"
             onClick={() => setAll(true)}
           >
-            show all {items.length} steps
+            show {items.length - STEPS_SHOWN} more
           </button>
         </li>
       )}
@@ -3129,27 +3161,24 @@ function stepText({ tool, detail }: Step): string {
 function TypingBubble({ step }: { step: Step | null }) {
   return (
     <div className="enter flex flex-col items-start gap-1">
-      {step && (
-        <p
-          key={stepText(step)}
-          className="enter flex items-center gap-1.5 wrap-anywhere px-1 text-xs"
-          style={{ color: "var(--color-body)" }}
-          role="status"
-        >
-          <span
-            aria-hidden="true"
-            className="shrink-0"
-            style={{
-              width: 6,
-              height: 6,
-              borderRadius: "50%",
-              background: "var(--color-stripe-purple)",
-              animation: "havn-breathe 1.6s ease-in-out infinite",
-            }}
-          />
-          {stepText(step)}
-        </p>
-      )}
+      <p className="wrap-anywhere px-1 text-xs" style={{ color: "var(--color-body)" }} role="status">
+        {step && (
+          <span key={stepText(step)} className="enter flex items-center gap-1.5">
+            <span
+              aria-hidden="true"
+              className="shrink-0"
+              style={{
+                width: 6,
+                height: 6,
+                borderRadius: "50%",
+                background: "var(--color-stripe-purple)",
+                animation: "havn-breathe 1.6s ease-in-out infinite",
+              }}
+            />
+            {stepText(step)}
+          </span>
+        )}
+      </p>
       <div
         className="flex items-center gap-1 py-2"
         style={{ color: "var(--color-body)" }}

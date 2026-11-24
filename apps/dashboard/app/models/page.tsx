@@ -414,7 +414,13 @@ function MoreMenu({ label, children }: { label: string; children: React.ReactNod
     const close = (e: Event) => {
       const el = menu.current;
       if (!el?.open) return;
-      if (e instanceof KeyboardEvent ? e.key === "Escape" : !el.contains(e.target as Node)) el.open = false;
+      if (e instanceof KeyboardEvent) {
+        if (e.key !== "Escape") return;
+        el.open = false;
+        el.querySelector("summary")?.focus();
+      } else if (!el.contains(e.target as Node)) {
+        el.open = false;
+      }
     };
     document.addEventListener("click", close);
     document.addEventListener("keydown", close);
@@ -431,7 +437,10 @@ function MoreMenu({ label, children }: { label: string; children: React.ReactNod
       <div
         className="menu enter absolute right-0 z-20 mt-1 flex min-w-40 flex-col py-1"
         onClick={(e) => {
-          if ((e.target as HTMLElement).closest("button")) menu.current?.removeAttribute("open");
+          if ((e.target as HTMLElement).closest("button")) {
+            menu.current?.removeAttribute("open");
+            menu.current?.querySelector("summary")?.focus();
+          }
         }}
       >
         {children}
