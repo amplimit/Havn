@@ -486,6 +486,14 @@ function BootstrapEditor({ agentId }: { agentId: string }) {
         Each saves independently. Empty
         body deletes the file.
       </p>
+      <p className="mb-4 text-sm" role="note" style={{ color: "var(--color-warning-text)" }}>
+        SOUL.md and USER.md are in the agent&apos;s prompt in every chat: other people&apos;s
+        it is open to, and groups&apos;, as well as yours. Write in them only what anyone who
+        can talk to the bot may know. What should stay between you and the agent belongs in
+        its memory (ask it to remember in your own chat, or add it on the memory page): that
+        is put in the prompt of your own private chats only, and elsewhere the agent reaches it
+        only by searching memory, which waits for your review unless you allowed it.
+      </p>
       {error && (
         <div
           className="mb-3 px-3 py-2 text-sm"
@@ -510,8 +518,8 @@ function BootstrapEditor({ agentId }: { agentId: string }) {
         justSaved={savedSystem}
       />
       <BootstrapFileEditor
-        title="USER.md — what the agent knows about you"
-        hint="Durable user-facing facts the agent should always have in scope. Frozen-prompt rules apply: edits take effect on next start."
+        title="USER.md — what anyone talking to the agent may know about you"
+        hint="Facts about you the agent has in scope in every chat, others' and groups' included: your name, how to address you, the language you like. Not private details; those go in memory. Edits take effect on the agent's next start."
         value={user}
         onChange={setUser}
         loaded={loaded?.user ?? ""}

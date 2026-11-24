@@ -6,8 +6,8 @@
 //!
 //! | File          | What it holds                                    | When edits take effect             |
 //! | ------------- | ------------------------------------------------ | ---------------------------------- |
-//! | `SOUL.md`     | Persona + identity (tone, values, name, purpose) | Next agent restart (frozen prompt) |
-//! | `USER.md`     | Durable facts about the user the agent should always have in scope | Next agent restart (frozen prompt) |
+//! | `SOUL.md`     | Persona + identity (tone, values, name, purpose); in every chat, so public (issue #300) | Next agent restart (frozen prompt) |
+//! | `USER.md`     | Facts about the user the agent has in scope in every chat, others' and groups' included (issue #300) | Next agent restart (frozen prompt) |
 //! | `HEARTBEAT.md`| Plain-language instructions for the periodic self-tick (§9.6) | Next heartbeat tick (re-read fresh — the deliberate exception to the frozen-prompt invariant) |
 //!
 //! The files live at `<workspace>/<NAME>.md`. Pre-Phase 3 the only
