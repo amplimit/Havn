@@ -464,21 +464,32 @@ function Group({ id, children }: { id: (typeof GROUPS)[number]["id"]; children: 
  */
 function SettingsNav() {
   const [current, setCurrent] = useState<string>(GROUPS[0].id);
+  // The group in view: the last whose heading has reached the top part of
+  // the window; at the end of the page, the last group.
   useEffect(() => {
-    const seen = new Map<string, boolean>();
-    const watch = new IntersectionObserver(
-      (entries) => {
-        for (const e of entries) seen.set(e.target.id, e.isIntersecting);
-        const first = GROUPS.find((g) => seen.get(g.id));
-        if (first) setCurrent(first.id);
-      },
-      { rootMargin: "0px 0px -60% 0px" },
-    );
-    for (const g of GROUPS) {
-      const el = document.getElementById(g.id);
-      if (el) watch.observe(el);
-    }
-    return () => watch.disconnect();
+    let frame = 0;
+    const look = () => {
+      frame = 0;
+      const line = window.innerHeight * 0.25;
+      let found: string = GROUPS[0].id;
+      for (const g of GROUPS) {
+        const el = document.getElementById(g.id);
+        if (el && el.getBoundingClientRect().top <= line) found = g.id;
+      }
+      const end = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2;
+      setCurrent(end ? GROUPS[GROUPS.length - 1].id : found);
+    };
+    const onScroll = () => {
+      if (!frame) frame = requestAnimationFrame(look);
+    };
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("resize", onScroll);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("scroll", onScroll);
+      window.removeEventListener("resize", onScroll);
+    };
   }, []);
   return (
     <nav
