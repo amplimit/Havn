@@ -283,7 +283,14 @@ function Chat({ id }: { id: string }) {
   const touchY = useRef<number | null>(null);
   const [away, setAway] = useState(false);
   // The reader moved up: the chat stops following, and offers the way back.
-  function leaveBottom() {
+  // Not when the chat cannot move up, nor when a box inside it that still
+  // can (the reasoning, a step, a code block) takes the move.
+  function leaveBottom(from: EventTarget | null) {
+    const el = scrollRef.current;
+    if (!el || el.scrollTop <= 0 || el.scrollHeight <= el.clientHeight) return;
+    for (let node = from instanceof Element ? from : null; node && node !== el; node = node.parentElement) {
+      if (node.scrollTop > 0 && node.scrollHeight > node.clientHeight) return;
+    }
     atBottom.current = false;
     cancelAnimationFrame(following.current);
     following.current = 0;
@@ -1258,12 +1265,15 @@ function Chat({ id }: { id: string }) {
             const el = e.currentTarget;
             const up = el.scrollTop < lastTop.current - 2;
             lastTop.current = el.scrollTop;
-            if (el.scrollHeight - el.scrollTop - el.clientHeight < 8) atBottom.current = true;
-            else if (up) atBottom.current = false;
+            if (el.scrollHeight - el.scrollTop - el.clientHeight < 8) {
+              if (!up) atBottom.current = true;
+            } else if (up) {
+              atBottom.current = false;
+            }
             if (away === atBottom.current) setAway(!atBottom.current);
           }}
           onWheel={(e) => {
-            if (e.deltaY < 0) leaveBottom();
+            if (e.deltaY < 0) leaveBottom(e.target);
           }}
           onTouchStart={(e) => {
             touchY.current = e.touches[0]?.clientY ?? null;
@@ -1271,10 +1281,11 @@ function Chat({ id }: { id: string }) {
           onTouchMove={(e) => {
             const y = e.touches[0]?.clientY;
             // A finger moving down scrolls the chat up.
-            if (touchY.current !== null && y !== undefined && y > touchY.current + 4) leaveBottom();
+            if (touchY.current !== null && y !== undefined && y > touchY.current + 4) leaveBottom(e.target);
           }}
           onKeyDown={(e) => {
-            if (["PageUp", "ArrowUp", "Home"].includes(e.key)) leaveBottom();
+            const typing = (e.target as HTMLElement).closest("input, textarea, select, [contenteditable]");
+            if (!typing && ["PageUp", "ArrowUp", "Home"].includes(e.key)) leaveBottom(e.target);
           }}
           className="relative flex-1 overflow-y-auto px-4 py-6 sm:px-8"
           style={{ backgroundColor: "var(--color-surface)" }}
