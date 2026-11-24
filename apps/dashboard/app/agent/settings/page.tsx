@@ -219,7 +219,9 @@ function Settings({ id }: { id: string }) {
   }
 
   return (
-    <div className="mx-auto max-w-3xl px-4 py-8 sm:px-8 sm:py-10">
+    <div className="mx-auto max-w-5xl px-4 py-8 sm:px-8 sm:py-10 lg:grid lg:grid-cols-[11rem_minmax(0,1fr)] lg:gap-10">
+      <SettingsNav />
+      <div className="min-w-0 max-w-3xl">
       <header className="mb-6">
         <Link
           href={`/agent?id=${id}`}
@@ -250,6 +252,7 @@ function Settings({ id }: { id: string }) {
         </div>
       )}
 
+      <Group id="basics">
       <form onSubmit={onSave} className="grid gap-6">
         <Field
           label="Name"
@@ -359,29 +362,38 @@ function Settings({ id }: { id: string }) {
             <span
               className="text-xs"
               style={{ color: "var(--color-success-text)" }}
+              role="status"
             >
-              saved · changes apply on next spawn
+              saved · the agent uses it from its next start
             </span>
           )}
         </div>
       </form>
-
-      <BootstrapEditor agentId={id} />
-
-      <WebAccessEditor agentId={id} />
       <TimezoneEditor />
+      <TitlesEditor agentId={id} />
+      </Group>
+
+      <Group id="prompt">
+      <BootstrapEditor agentId={id} />
       <ScheduledTasks agentId={id} />
       <Webhooks agentId={id} />
-      <TitlesEditor agentId={id} />
-      <CapabilitiesEditor agentId={id} />
-      <AccessEditor agentId={id} />
-      <WorkspaceAccessEditor agentId={id} />
+      </Group>
+
+      <Group id="chat-apps">
       <ChannelPairing agentId={id} />
       <BotAccess agentId={id} />
+      </Group>
+
+      <Group id="tools">
       <ApprovalsEditor agentId={id} />
-
+      <AccessEditor agentId={id} />
+      <WebAccessEditor agentId={id} />
+      <WorkspaceAccessEditor agentId={id} />
+      <CapabilitiesEditor agentId={id} />
       <McpEditor agentId={id} />
+      </Group>
 
+      <Group id="advanced">
       {embedding && (
         <RetrievalEditor embedding={embedding} onChange={(next) => setEmbedding(next)} />
       )}
@@ -414,7 +426,81 @@ function Settings({ id }: { id: string }) {
           delete agent
         </button>
       </section>
+      </Group>
+      </div>
     </div>
+  );
+}
+
+/** The page's groups of settings, in order, as its navigation lists them. */
+const GROUPS = [
+  { id: "basics", title: "Basics" },
+  { id: "prompt", title: "Prompt and schedule" },
+  { id: "chat-apps", title: "Chat apps" },
+  { id: "tools", title: "Tools and permissions" },
+  { id: "advanced", title: "Advanced" },
+] as const;
+
+/** One group of settings, under its heading, which the navigation links to. */
+function Group({ id, children }: { id: (typeof GROUPS)[number]["id"]; children: React.ReactNode }) {
+  const title = GROUPS.find((g) => g.id === id)?.title ?? id;
+  return (
+    <section id={id} aria-labelledby={`${id}-title`} className="settings-group scroll-mt-6 pt-12 first-of-type:pt-0">
+      <h2
+        id={`${id}-title`}
+        className="border-b pb-2 text-xs font-semibold uppercase tracking-wider"
+        style={{ color: "var(--color-body)", borderColor: "var(--color-border-default)" }}
+      >
+        {title}
+      </h2>
+      {children}
+    </section>
+  );
+}
+
+/**
+ * The groups of the page as links: beside it on a wide screen, the one in
+ * view marked; a row above it on a narrow one.
+ */
+function SettingsNav() {
+  const [current, setCurrent] = useState<string>(GROUPS[0].id);
+  useEffect(() => {
+    const seen = new Map<string, boolean>();
+    const watch = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) seen.set(e.target.id, e.isIntersecting);
+        const first = GROUPS.find((g) => seen.get(g.id));
+        if (first) setCurrent(first.id);
+      },
+      { rootMargin: "0px 0px -60% 0px" },
+    );
+    for (const g of GROUPS) {
+      const el = document.getElementById(g.id);
+      if (el) watch.observe(el);
+    }
+    return () => watch.disconnect();
+  }, []);
+  return (
+    <nav
+      aria-label="Settings"
+      className="sticky top-15 z-10 -mx-4 md:top-0 mb-6 flex gap-1 overflow-x-auto border-b px-4 py-2 lg:top-10 lg:mx-0 lg:mb-0 lg:flex-col lg:self-start lg:overflow-visible lg:border-0 lg:px-0 lg:py-0"
+      style={{ backgroundColor: "var(--color-surface)", borderColor: "var(--color-border-default)" }}
+    >
+      {GROUPS.map((g) => (
+        <a
+          key={g.id}
+          href={`#${g.id}`}
+          aria-current={current === g.id ? "location" : undefined}
+          className="shrink-0 rounded px-2 py-1.5 text-sm transition-colors hover:bg-[rgba(83,58,253,0.05)]"
+          style={{
+            backgroundColor: current === g.id ? "rgba(83, 58, 253, 0.07)" : undefined,
+            color: current === g.id ? "var(--color-stripe-purple)" : "var(--color-deep-navy)",
+          }}
+        >
+          {g.title}
+        </a>
+      ))}
+    </nav>
   );
 }
 
@@ -3086,9 +3172,34 @@ function Field({
         {label}
       </span>
       {children}
-      <span className="text-xs" style={{ color: "var(--color-body)" }}>
-        {hint}
-      </span>
+      <Hint text={hint} />
     </label>
+  );
+}
+
+/** Longer than this, a hint shows its first line and the rest on asking. */
+const HINT_SHOWN = 110;
+
+/** A setting's description: one line, and all of it on "more". */
+function Hint({ text }: { text: string }) {
+  const [all, setAll] = useState(false);
+  const long = text.length > HINT_SHOWN;
+  return (
+    <span className="flex items-start gap-1 text-xs" style={{ color: "var(--color-body)" }}>
+      <span className={long && !all ? "line-clamp-1" : undefined}>{text}</span>
+      {long && (
+        <button
+          type="button"
+          className="shrink-0 underline decoration-dotted underline-offset-2"
+          aria-expanded={all}
+          onClick={(e) => {
+            e.preventDefault();
+            setAll(!all);
+          }}
+        >
+          {all ? "less" : "more"}
+        </button>
+      )}
+    </span>
   );
 }
