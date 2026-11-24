@@ -3,9 +3,11 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
+import { Layers, Search } from "lucide-react";
 import {
   ApiError,
   api,
+  type EmbeddingStatus,
   type MemoryEntry,
   type MemoryExpiry,
   type MemoryKind,
@@ -59,6 +61,7 @@ export default function MemoryPage() {
 function Memory({ id }: { id: string }) {
 
   const [entries, setEntries] = useState<MemoryEntry[] | null>(null);
+  const [embedding, setEmbedding] = useState<EmbeddingStatus | null>(null);
   const [uninitialised, setUninitialised] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingForget, setPendingForget] = useState<string | null>(null);
@@ -79,6 +82,20 @@ function Memory({ id }: { id: string }) {
       setError(e instanceof Error ? e.message : String(e));
     }
   }
+
+  // How memory is searched (spec §9.4 v0.7), the same for every agent.
+  useEffect(() => {
+    let cancelled = false;
+    api.embedding().then(
+      (e) => {
+        if (!cancelled) setEmbedding(e);
+      },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -171,7 +188,10 @@ function Memory({ id }: { id: string }) {
         >
           ← back to chat
         </Link>
-        <h1 className="display-h1">what the agent remembers about you</h1>
+        <div className="flex flex-wrap items-center gap-3">
+          <h1 className="display-h1">what the agent remembers about you</h1>
+          <RetrievalPill embedding={embedding} />
+        </div>
         <p
           className="mt-2 max-w-2xl"
           style={{ color: "var(--color-body)", fontSize: 18, lineHeight: 1.4 }}
@@ -580,6 +600,34 @@ function SourcePill({ source }: { source: MemoryEntry["source"] }) {
       }}
     >
       inferred
+    </span>
+  );
+}
+
+/**
+ * Whether retrieval (memory **and** skills — they share the same embedding
+ * provider per spec §13 Phase 3) is hybrid (vector + keyword) or
+ * keyword-only: whether semantic-near queries work, or the words of the
+ * saved fact or skill description are needed.
+ */
+function RetrievalPill({ embedding }: { embedding: EmbeddingStatus | null }) {
+  if (!embedding) return null;
+  const hybrid = embedding.hybrid_enabled;
+  const LabelIcon = hybrid ? Layers : Search;
+  const tip = hybrid
+    ? `Hybrid retrieval (memory + skills): vector (${embedding.provider}) + BM25 keyword. Semantic-near queries work even with no shared words.`
+    : "FTS5 keyword-only (memory + skills). Set [embedding] in config.toml to enable hybrid retrieval.";
+  return (
+    <span
+      className="pill pill-stopped"
+      title={tip}
+      style={{
+        background: hybrid ? "rgba(83, 58, 253, 0.08)" : "var(--color-surface-muted)",
+        color: hybrid ? "var(--color-stripe-purple)" : "var(--color-body)",
+      }}
+    >
+      <LabelIcon size={12} className="shrink-0" aria-hidden="true" />
+      {hybrid ? `search: ${embedding.provider} + keywords` : "search: keywords only"}
     </span>
   );
 }

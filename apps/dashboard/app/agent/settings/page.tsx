@@ -2592,20 +2592,20 @@ function McpEditor({ agentId }: { agentId: string }) {
                     <td className="py-2 pr-2">
                       <code
                         className="font-mono"
-                        style={{ fontSize: 11 }}
+                        style={{ fontSize: 12 }}
                       >
                         {cfg.binary}
                       </code>
                     </td>
                     <td
                       className="py-2 pr-2"
-                      style={{ fontSize: 11, color: "var(--color-body)" }}
+                      style={{ fontSize: 12, color: "var(--color-body)" }}
                     >
                       {cfg.args.length > 0 ? cfg.args.join(" ") : "—"}
                     </td>
                     <td
                       className="py-2 pr-2"
-                      style={{ fontSize: 11, color: "var(--color-body)" }}
+                      style={{ fontSize: 12, color: "var(--color-body)" }}
                     >
                       {cfg.extra_paths_rw.length === 0 &&
                       cfg.extra_paths_ro.length === 0
