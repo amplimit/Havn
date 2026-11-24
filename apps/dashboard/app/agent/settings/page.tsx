@@ -13,7 +13,7 @@
  * is currently running so the user knows to expect that.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { cloneElement, isValidElement, useCallback, useEffect, useId, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
@@ -479,15 +479,28 @@ function SettingsNav() {
     onScroll();
     window.addEventListener("scroll", onScroll, { passive: true });
     window.addEventListener("resize", onScroll);
-    const grows = new ResizeObserver(onScroll);
-    grows.observe(document.body);
+    // A group the address names is shown, and kept in view while what is
+    // above it loads, until the reader moves the page or two seconds pass.
     const asked = window.location.hash.slice(1);
-    const shown = GROUPS.some((g) => g.id === asked)
-      ? window.setTimeout(() => document.getElementById(asked)?.scrollIntoView(), 400)
-      : 0;
+    let holding = GROUPS.some((g) => g.id === asked);
+    const hold = () => {
+      if (holding) document.getElementById(asked)?.scrollIntoView();
+    };
+    const release = () => {
+      holding = false;
+    };
+    hold();
+    const until = window.setTimeout(release, 2000);
+    for (const kind of ["wheel", "touchstart", "keydown"]) window.addEventListener(kind, release, { passive: true });
+    const grows = new ResizeObserver(() => {
+      hold();
+      onScroll();
+    });
+    grows.observe(document.body);
     return () => {
       cancelAnimationFrame(frame);
-      window.clearTimeout(shown);
+      window.clearTimeout(until);
+      for (const kind of ["wheel", "touchstart", "keydown"]) window.removeEventListener(kind, release);
       grows.disconnect();
       window.removeEventListener("scroll", onScroll);
       window.removeEventListener("resize", onScroll);
@@ -990,9 +1003,9 @@ function BotAccess({ agentId }: { agentId: string }) {
         );
         return (
           <div key={key} className="mb-6">
-            <h3 className="mb-1 font-mono text-sm">
+            <h4 className="mb-1 font-mono text-sm">
               {account.channel} · {account.account_id}
-            </h3>
+            </h4>
             <div className="mb-2 flex flex-wrap items-center gap-3 text-sm">
               <label className="flex items-center gap-1">
                 private chats
@@ -1098,9 +1111,9 @@ function BotAccess({ agentId }: { agentId: string }) {
 
                 {refusedBlock}
 
-                <h4 className="mt-3 text-xs uppercase" style={muted}>
+                <h5 className="mt-3 text-xs uppercase" style={muted}>
                   let in
-                </h4>
+                </h5>
                 {account.allow_from.length === 0 && account.allowed.length === 0 ? (
                   <p className="text-sm" style={muted}>
                     No one yet.
@@ -1141,9 +1154,9 @@ function BotAccess({ agentId }: { agentId: string }) {
 
                 {account.invites.length > 0 && (
                   <>
-                    <h4 className="mt-3 text-xs uppercase" style={muted}>
+                    <h5 className="mt-3 text-xs uppercase" style={muted}>
                       invite codes
-                    </h4>
+                    </h5>
                     <ul className="flex flex-col gap-1 text-sm">
                       {account.invites.map((i) => (
                         <li key={i.id} className="flex flex-wrap items-center gap-2">
@@ -3185,6 +3198,11 @@ function Field({
   hint: string;
   children: React.ReactNode;
 }) {
+  const hintId = useId();
+  // The control is described by the hint beside it.
+  const control = isValidElement<{ "aria-describedby"?: string }>(children)
+    ? cloneElement(children, { "aria-describedby": hintId })
+    : children;
   return (
     <div className="grid gap-1.5">
       <label className="grid gap-1.5">
@@ -3194,15 +3212,15 @@ function Field({
         >
           {label}
         </span>
-        {children}
+        {control}
       </label>
-      <Hint text={hint} />
+      <Hint id={hintId} text={hint} />
     </div>
   );
 }
 
 /** A setting's description: one line, and all of it on "more" when it is longer. */
-function Hint({ text }: { text: string }) {
+function Hint({ id, text }: { id: string; text: string }) {
   const [all, setAll] = useState(false);
   const [long, setLong] = useState(false);
   const line = useRef<HTMLSpanElement>(null);
@@ -3218,7 +3236,7 @@ function Hint({ text }: { text: string }) {
   }, [all, text]);
   return (
     <span className="flex items-start gap-1 text-xs" style={{ color: "var(--color-body)" }}>
-      <span ref={line} className={all ? undefined : "line-clamp-1"}>
+      <span ref={line} id={id} className={all ? undefined : "line-clamp-1"}>
         {text}
       </span>
       {long && (
