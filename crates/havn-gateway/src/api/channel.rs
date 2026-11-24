@@ -3282,6 +3282,18 @@ pub struct GroupView {
     /// Whether the bot sees every message there, as its adapter last said;
     /// `None` when it has not said since the gateway started.
     pub sees_all: Option<bool>,
+    /// A server let in as a whole, with every channel in it (issue #287).
+    pub space: bool,
+    /// The server a channel let in is part of.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_space: Option<PlaceView>,
+}
+
+/// A server, by its id and the title it was last seen with (issue #287).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PlaceView {
+    pub id: String,
+    pub title: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -3315,6 +3327,38 @@ pub struct RefusedView {
     pub last_at: chrono::DateTime<chrono::Utc>,
     pub count: i64,
     pub said: String,
+    /// What a group is called, as it was last seen (issue #287).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// The server a group is part of, which can be let in whole.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space: Option<PlaceView>,
+}
+
+/// The server group `id` is part of (issue #287): its own, or, for a
+/// thread, its channel's.
+async fn space_of(
+    db: &sqlx::SqlitePool,
+    channel: &str,
+    account_id: &str,
+    id: &str,
+) -> Result<Option<PlaceView>, havn_db::DbError> {
+    let mut next = vec![id.to_string()];
+    for _ in 0..2 {
+        let mut up = Vec::new();
+        for child in &next {
+            for parent in channel_access::parents_of(db, channel, account_id, child).await? {
+                if channel_access::is_space(db, channel, account_id, &parent).await? {
+                    let title =
+                        channel_access::place_title(db, channel, account_id, &parent).await?;
+                    return Ok(Some(PlaceView { id: parent, title }));
+                }
+                up.push(parent);
+            }
+        }
+        next = up;
+    }
+    Ok(None)
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -3392,19 +3436,34 @@ async fn channel_access_view(
                 used_by: i.used_by_sender,
             })
             .collect();
-        let refused = channel_access::list_refusals(&state.db, channel, &account.id)
+        let mut refused = Vec::new();
+        for r in channel_access::list_refusals(&state.db, channel, &account.id)
             .await
             .map_err(internal)?
-            .into_iter()
-            .map(|r| RefusedView {
+        {
+            let (title, space) = if r.group {
+                (
+                    channel_access::place_title(&state.db, channel, &account.id, &r.sender_id)
+                        .await
+                        .map_err(internal)?,
+                    space_of(&state.db, channel, &account.id, &r.sender_id)
+                        .await
+                        .map_err(internal)?,
+                )
+            } else {
+                (String::new(), None)
+            };
+            refused.push(RefusedView {
                 sender_id: r.sender_id,
                 group: r.group,
                 first_at: r.first_at,
                 last_at: r.last_at,
                 count: r.count,
                 said: r.said,
-            })
-            .collect();
+                title,
+                space,
+            });
+        }
         let mut allowed = Vec::new();
         for a in channel_access::list_allowed_on(&state.db, channel, &account.id)
             .await
@@ -3428,6 +3487,31 @@ async fn channel_access_view(
                 &account.id,
             ))
             .await;
+        let mut groups = Vec::new();
+        for g in channel_access::list_groups_on(&state.db, channel, &account.id)
+            .await
+            .map_err(internal)?
+        {
+            let space = channel_access::is_space(&state.db, channel, &account.id, &g.group_id)
+                .await
+                .map_err(internal)?;
+            let in_space = if space {
+                None
+            } else {
+                space_of(&state.db, channel, &account.id, &g.group_id)
+                    .await
+                    .map_err(internal)?
+            };
+            groups.push(GroupView {
+                sees_all: seeing.get(&g.group_id).copied(),
+                group_id: g.group_id,
+                title: g.title,
+                source: g.source,
+                since: g.registered_at,
+                space,
+                in_space,
+            });
+        }
         accounts.push(AccountAccess {
             channel: channel.to_string(),
             account_id: account.id.clone(),
@@ -3445,18 +3529,7 @@ async fn channel_access_view(
                 crate::config::GroupPolicy::Open => "open",
             },
             allow_groups: account.allow_groups.clone(),
-            groups: channel_access::list_groups_on(&state.db, channel, &account.id)
-                .await
-                .map_err(internal)?
-                .into_iter()
-                .map(|g| GroupView {
-                    sees_all: seeing.get(&g.group_id).copied(),
-                    group_id: g.group_id,
-                    title: g.title,
-                    source: g.source,
-                    since: g.registered_at,
-                })
-                .collect(),
+            groups,
         });
     }
     Ok(ChannelAccessView {
@@ -5370,6 +5443,99 @@ mod tests {
             );
             f.groups(GroupPolicy::Off, &["tg:-400"]);
             assert!(!group_may(&f.state, "telegram", "bot", &["tg:-400"]).await);
+        }
+
+        #[tokio::test]
+        async fn the_access_page_names_a_channel_s_server_and_lets_it_in_whole() {
+            use crate::config::GroupPolicy;
+            use axum::extract::{Json, Path};
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            f.groups(GroupPolicy::Allowlist, &[]);
+            let place = |id: &str, title: &str| havn_proto::channel::ChannelPlace {
+                id: id.into(),
+                title: Some(title.into()),
+            };
+            // Ids of its own: the parents noted are kept for the process.
+            let mut inb = text_from("dc:ann", "hi");
+            inb.group = Some(havn_proto::channel::ChannelGroup {
+                id: "dc:c287".into(),
+                title: Some("general".into()),
+                sender_name: Some("Ann".into()),
+                addressed: true,
+                sees_all: Some(true),
+                space: Some(place("dc:s287", "Acme")),
+                thread: Some(place("dc:t287", "plans")),
+            });
+            handle_inbound(&f.state, "telegram", inb).await;
+            let agent = agent_repo::list_for_owner(&f.state.db, f.owner)
+                .await
+                .expect("agents")
+                .remove(0);
+            let (owner, state) = (f.owner, f.state.clone());
+            let user = || crate::auth::AuthedUser {
+                id: owner,
+                display_name: "owner".into(),
+            };
+            let id = || Path(agent.id.to_string());
+            let st = || State(state.clone());
+
+            let view = channel_access_get(st(), user(), id())
+                .await
+                .expect("view")
+                .0;
+            let refused = &view.accounts[0].refused;
+            let channel = refused
+                .iter()
+                .find(|r| r.sender_id == "dc:c287")
+                .unwrap_or_else(|| panic!("{refused:?}"));
+            assert!(channel.group);
+            assert_eq!(
+                channel.space,
+                Some(PlaceView {
+                    id: "dc:s287".into(),
+                    title: "Acme".into()
+                })
+            );
+            assert!(!channel.title.is_empty(), "{channel:?}");
+
+            // The server let in from the page: listed as a server; a channel
+            // of it let in after names it.
+            let group = |sender: &str| SenderChange {
+                channel: "telegram".into(),
+                account_id: "bot".into(),
+                sender_id: sender.into(),
+                group: true,
+            };
+            let view = channel_sender_allow(st(), user(), id(), Json(group("dc:s287")))
+                .await
+                .expect("server")
+                .0;
+            assert!(
+                view.accounts[0]
+                    .groups
+                    .iter()
+                    .any(|g| g.group_id == "dc:s287" && g.space)
+            );
+            let view = channel_sender_allow(st(), user(), id(), Json(group("dc:c287")))
+                .await
+                .expect("channel")
+                .0;
+            let groups = &view.accounts[0].groups;
+            let server = groups
+                .iter()
+                .find(|g| g.group_id == "dc:s287")
+                .unwrap_or_else(|| panic!("{groups:?}"));
+            assert!(server.space && server.in_space.is_none(), "{server:?}");
+            let channel = groups
+                .iter()
+                .find(|g| g.group_id == "dc:c287")
+                .unwrap_or_else(|| panic!("{groups:?}"));
+            assert!(!channel.space, "{channel:?}");
+            assert_eq!(
+                channel.in_space.as_ref().map(|s| s.id.as_str()),
+                Some("dc:s287")
+            );
+            while f.adapter.try_recv().is_ok() {}
         }
 
         #[tokio::test]

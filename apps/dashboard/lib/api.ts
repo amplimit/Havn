@@ -649,8 +649,17 @@ export type AccountAccess = {
   /** `yours`: connected to the owner's Havn account, which removing does not shut out. */
   allowed: { sender_id: string; since: string; by_code: boolean; connected: boolean; yours: boolean }[];
   invites: { id: string; status: "active" | "used" | "expired" | "revoked"; created_at: string; expires_at: string; used_by?: string }[];
-  /** `group`: a group turned away (issue #263). */
-  refused: { sender_id: string; group: boolean; first_at: string; last_at: string; count: number; said: string }[];
+  /** `group`: a group turned away (issue #263), with what it is called and the server it is part of (issue #287). */
+  refused: {
+    sender_id: string;
+    group: boolean;
+    first_at: string;
+    last_at: string;
+    count: number;
+    said: string;
+    title?: string;
+    space?: { id: string; title: string };
+  }[];
   group_policy: "off" | "allowlist" | "open";
   /** Groups in config.toml, removed only there. */
   allow_groups: string[];
@@ -662,6 +671,10 @@ export type AccountAccess = {
     since: string;
     /** Whether the bot sees every message there; null when its adapter has not said since the gateway started. */
     sees_all: boolean | null;
+    /** A server let in as a whole, every channel in it (issue #287). */
+    space: boolean;
+    /** The server a channel let in is part of. */
+    in_space?: { id: string; title: string };
   }[];
 };
 
