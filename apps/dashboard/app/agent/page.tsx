@@ -30,6 +30,7 @@ import type {
   ServerMessage,
 } from "@/lib/protocol";
 import {
+  ArrowDown,
   ArrowUp,
   BookOpen,
   Bot,
@@ -273,6 +274,10 @@ function Chat({ id }: { id: string }) {
   // and those shown now. Kept apart from `live` so a call ends at once.
   const doneCalls = useRef(new Set<string>());
   const liveCalls = useRef(new Set<string>());
+  // The reader is at the bottom of the chat (within 80 pixels): it follows
+  // what comes; scrolled up, it stays, with a button back to the latest.
+  const atBottom = useRef(true);
+  const [away, setAway] = useState(false);
   // The reply's own text was on screen as it was written: the reply that
   // replaces it does not fade in again.
   const liveText = useRef(false);
@@ -693,6 +698,7 @@ function Chat({ id }: { id: string }) {
     if ((jump && jump.chat === chatIdRef.current) || Date.now() - jumpedAt.current < JUMP_HOLD_MS) {
       return;
     }
+    if (!atBottom.current) return;
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     scrollRef.current?.scrollTo({
       top: scrollRef.current.scrollHeight,
@@ -744,7 +750,6 @@ function Chat({ id }: { id: string }) {
 
   // As the reply being written grows, follow it, unless the user scrolled
   // up to read.
-  const atBottom = useRef(true);
   const liveLength = live.reduce((n, p) => n + p.text.length + p.thinking.length, 0);
   useEffect(() => {
     const el = scrollRef.current;
@@ -801,6 +806,8 @@ function Chat({ id }: { id: string }) {
 
   function sendText(text: string, files: Attachment[] = []) {
     if ((!text.trim() && files.length === 0) || !chatRef.current || wsState !== "open") return;
+    atBottom.current = true;
+    setAway(false);
     // A command (alone, without files) is not a message: the page does
     // what it has a button for, and the gateway answers the rest.
     const command = files.length === 0 ? commandIn(text) : null;
@@ -991,6 +998,9 @@ function Chat({ id }: { id: string }) {
     // A found message of another chat is no longer to be shown.
     if (jumpTo.current && jumpTo.current.chat !== next) jumpTo.current = null;
     if (next !== null && next === chatIdRef.current && nextScope === scopeRef.current) return;
+    // Another chat opens at its end.
+    atBottom.current = true;
+    setAway(false);
     const previous = chatIdRef.current;
     const target = next ?? newChatId();
     selectChat(target, nextScope);
@@ -1115,11 +1125,18 @@ function Chat({ id }: { id: string }) {
           className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-b px-4 py-2.5 sm:px-8"
           style={{ borderColor: "var(--color-border-default)" }}
         >
-          <div className="flex min-w-0 items-center gap-2">
-            <h1 className="display-h3 truncate" title={`agent ${agent.id}`}>
-              {agent.name}
+          <div className="min-w-0">
+            <p className="flex items-center gap-2 text-xs" style={{ color: "var(--color-body)" }}>
+              <span className="truncate font-medium" title={`agent ${agent.id}`}>
+                {agent.name}
+              </span>
+              <ConnectionPill state={wsState} agent={agent} />
+            </p>
+            <h1 className="truncate text-base font-semibold" style={{ color: "var(--color-heading)" }}>
+              {(scope
+                ? channelChats.find((c) => c.id === chat && c.scope === scope)?.title
+                : chats.find((c) => c.id === chat)?.title) || (chat ? "untitled" : "new chat")}
             </h1>
-            <ConnectionPill state={wsState} agent={agent} />
           </div>
           <div className="flex flex-wrap items-center gap-0.5">
             <button
@@ -1197,11 +1214,12 @@ function Chat({ id }: { id: string }) {
           onScroll={(e) => {
             const el = e.currentTarget;
             atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+            if (away === atBottom.current) setAway(!atBottom.current);
           }}
-          className="flex-1 overflow-y-auto px-4 py-6 sm:px-8"
-          style={{ backgroundColor: "var(--color-surface-muted)" }}
+          className="relative flex-1 overflow-y-auto px-4 py-6 sm:px-8"
+          style={{ backgroundColor: "var(--color-surface)" }}
         >
-          <div className="mx-auto flex max-w-3xl flex-col gap-3">
+          <div className="mx-auto flex max-w-3xl flex-col gap-4">
             {bubbles.length === 0 && (
               <div
                 className="card px-5 py-12 text-center"
@@ -1341,6 +1359,32 @@ function Chat({ id }: { id: string }) {
             )}
             {pending && <TypingBubble step={step} />}
           </div>
+          {away && (
+            <div className="pointer-events-none sticky bottom-0 flex justify-center pt-2">
+              <button
+                type="button"
+                className="tool-button enter pointer-events-auto text-sm"
+                style={{
+                  backgroundColor: "var(--color-surface)",
+                  border: "1px solid var(--color-border-default)",
+                  boxShadow: "var(--shadow-ambient)",
+                  borderRadius: 999,
+                  padding: "6px 14px",
+                }}
+                onClick={() => {
+                  const el = scrollRef.current;
+                  if (!el) return;
+                  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+                  atBottom.current = true;
+                  setAway(false);
+                  el.scrollTo({ top: el.scrollHeight, behavior: reduce ? "auto" : "smooth" });
+                }}
+              >
+                <ArrowDown size={14} className="shrink-0" aria-hidden="true" />
+                latest
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Composer; a channel chat continues in its app, or moves here */}
@@ -1477,7 +1521,7 @@ function ChatList({
       <div className="p-3">
         <button
           type="button"
-          className="btn-primary inline-flex w-full items-center justify-center gap-1.5"
+          className="btn-ghost inline-flex w-full items-center justify-center gap-1.5"
           onClick={() => onOpen(null)}
         >
           <MessageSquarePlus size={16} className="shrink-0" aria-hidden="true" />
@@ -1844,14 +1888,14 @@ function Bubble({
       )}
       {(!message || message.text) && (
       <div
-        className="px-4 py-2.5"
+        className={bubble.role === "agent" ? "w-full" : "px-4 py-2.5"}
         style={{
-          maxWidth: "min(85%, 720px)",
+          maxWidth: bubble.role === "agent" ? "100%" : "min(85%, 720px)",
           borderRadius: "var(--radius-large)",
           ...(bubble.role === "you"
             ? {
-                backgroundColor: "var(--color-stripe-purple)",
-                color: "white",
+                backgroundColor: "rgba(83, 58, 253, 0.08)",
+                color: "var(--color-deep-navy)",
               }
             : isSystem
               ? {
@@ -1862,10 +1906,7 @@ function Bubble({
                   fontSize: 12,
                 }
               : {
-                  backgroundColor: "var(--color-surface)",
                   color: "var(--color-deep-navy)",
-                  border: "1px solid var(--color-border-default)",
-                  boxShadow: "var(--shadow-ambient)",
                 }),
         }}
       >
@@ -2560,8 +2601,8 @@ function LiveThinking({ text }: { text: string }) {
   return (
     <div className="enter flex flex-col items-start">
       <div
-        className="w-full px-3 py-2 text-xs"
-        style={{ maxWidth: "min(85%, 720px)", color: "var(--color-body)" }}
+        className="w-full py-1 text-xs"
+        style={{ color: "var(--color-body)" }}
         aria-live="off"
       >
         <div className="mb-1 font-medium">thinking…</div>
@@ -2681,7 +2722,7 @@ function TraceFold({
   return (
     <Fold
       className="w-full text-[13px]"
-      style={{ maxWidth: "min(85%, 720px)", color: "var(--color-body)" }}
+      style={{ color: "var(--color-body)" }}
       head={
         <span>
           {parts.join(" · ")} · {took(summary.ms)}
@@ -2706,19 +2747,35 @@ function TraceFold({
   );
 }
 
+/** Steps shown at once; a longer turn shows the rest when asked. */
+const STEPS_SHOWN = 8;
+
 /** What a turn did, in order, a line each; a subagent's own steps under its call. */
 function TraceList({ items, leftOut }: { items: TraceItem[]; leftOut: number }) {
+  const [all, setAll] = useState(items.length <= STEPS_SHOWN + 2);
+  const shown = all ? items : items.slice(0, STEPS_SHOWN);
   return (
     <ol
       className="ml-[7px] mt-0.5 flex flex-col gap-0.5 border-l pl-3"
       style={{ borderColor: "var(--color-border-default)" }}
     >
-      {items.map((item, i) => (
+      {shown.map((item, i) => (
         <li key={i}>
           {item.kind === "thinking" ? <ThinkingStep text={item.text} /> : <ToolStep step={item} />}
         </li>
       ))}
-      {leftOut > 0 && <li className="py-0.5">…and {leftOut} more, not kept.</li>}
+      {!all && (
+        <li>
+          <button
+            type="button"
+            className="py-0.5 underline decoration-dotted underline-offset-2 hover:text-[var(--color-deep-navy)]"
+            onClick={() => setAll(true)}
+          >
+            show all {items.length} steps
+          </button>
+        </li>
+      )}
+      {all && leftOut > 0 && <li className="py-0.5">…and {leftOut} more, not kept.</li>}
     </ol>
   );
 }
@@ -2746,7 +2803,7 @@ function ThinkingStep({ text }: { text: string }) {
 
 /** A tool call: its name and what it was given, and opened, its input and result. */
 function ToolStep({ step }: { step: Extract<TraceItem, { kind: "step" }> }) {
-  const brief = briefInput(step.input);
+  const { did, what } = stepWords(step.tool, step.input);
   const inner = step.steps?.length ?? 0;
   return (
     <Fold
@@ -2754,12 +2811,12 @@ function ToolStep({ step }: { step: Extract<TraceItem, { kind: "step" }> }) {
         <>
           <ToolIcon tool={step.tool} color={step.error ? "var(--color-warning-text)" : "var(--color-label)"} />
           <span
-            className="shrink-0 font-mono font-medium"
+            className="shrink-0 font-medium"
             style={{ color: step.error ? "var(--color-warning-text)" : "var(--color-deep-navy)" }}
           >
-            {step.tool}
+            {did}
           </span>
-          {brief && <span className="min-w-0 truncate">{brief}</span>}
+          {what && <span className="min-w-0 truncate">{what}</span>}
           {inner > 0 && <span className="shrink-0">· {inner} step{inner === 1 ? "" : "s"}</span>}
           {step.error && (
             <span className="shrink-0" style={{ color: "var(--color-warning-text)" }}>
@@ -2770,7 +2827,7 @@ function ToolStep({ step }: { step: Extract<TraceItem, { kind: "step" }> }) {
       }
     >
       <div className="mb-2 ml-5 mt-1 flex flex-col gap-2">
-        <TraceBlock label="input" text={readable(step.input)} />
+        <TraceBlock label={`input to ${step.tool}`} text={readable(step.input)} />
         {inner > 0 && <TraceList items={step.steps ?? []} leftOut={step.left_out ?? 0} />}
         <TraceBlock label={step.error ? "error" : "result"} text={step.result} />
       </div>
@@ -2790,6 +2847,49 @@ function ToolIcon({ tool, color }: { tool: string; color: string }) {
   if (tool === "subagent_spawn" || tool === "agent_query") return <Bot {...look} />;
   if (tool === "schedule") return <CalendarClock {...look} />;
   return <Wrench {...look} />;
+}
+
+/** A tool call as a person reads it: what was done, and to what. */
+function stepWords(tool: string, input: string): { did: string; what: string } {
+  const brief = briefInput(input);
+  const words: Record<string, string> = {
+    web_search: "Searched the web",
+    web_fetch: "Read",
+    memory_search: "Searched memory",
+    memory_remember: "Remembered",
+    memory_store: "Remembered",
+    memory_forget: "Forgot",
+    conversation_search: "Searched past chats",
+    file_read: "Read file",
+    file_write: "Wrote file",
+    file_edit: "Edited file",
+    file_find: "Found files",
+    file_search: "Searched files",
+    shell: "Ran",
+    process: "Checked a command",
+    send_file: "Sent",
+    view_image: "Looked at",
+    schedule: "Scheduled",
+    set_timezone: "Set the time zone",
+    skill_manage: "Updated a skill",
+    subagent_spawn: "Handed off",
+    agent_query: "Asked another agent",
+    ask_choice: "Asked",
+  };
+  if (tool === "web_fetch") {
+    try {
+      const url = new URL(brief);
+      const path = url.pathname === "/" ? "" : url.pathname;
+      return { did: "Read", what: `${url.hostname.replace(/^www\./, "")}${path}` };
+    } catch {
+      return { did: "Read", what: brief };
+    }
+  }
+  if (tool.startsWith("mcp__")) {
+    const [, server, name] = tool.split("__");
+    return { did: `Used ${name ?? tool}`, what: server ? `(${server}) ${brief}` : brief };
+  }
+  return { did: words[tool] ?? tool, what: brief };
 }
 
 /** A call's input as JSON laid out to read, or as it was when it is not JSON. */
@@ -2924,18 +3024,7 @@ function OwnerApproval({
 function LiveBubble({ text }: { text: string }) {
   return (
     <div className="enter flex flex-col items-start">
-      <div
-        className="px-4 py-3"
-        style={{
-          maxWidth: "min(85%, 720px)",
-          borderRadius: "var(--radius-large)",
-          backgroundColor: "var(--color-surface)",
-          color: "var(--color-deep-navy)",
-          border: "1px solid var(--color-border-default)",
-          boxShadow: "var(--shadow-ambient)",
-        }}
-        aria-live="polite"
-      >
+      <div className="w-full" style={{ color: "var(--color-deep-navy)" }} aria-live="polite">
         <Markdown>{text}</Markdown>
       </div>
     </div>
@@ -3003,15 +3092,8 @@ function TypingBubble({ step }: { step: Step | null }) {
         </p>
       )}
       <div
-        className="flex items-center gap-1 px-4 py-3"
-        style={{
-          maxWidth: "min(85%, 720px)",
-          borderRadius: "var(--radius-large)",
-          backgroundColor: "var(--color-surface)",
-          color: "var(--color-body)",
-          border: "1px solid var(--color-border-default)",
-          boxShadow: "var(--shadow-ambient)",
-        }}
+        className="flex items-center gap-1 py-2"
+        style={{ color: "var(--color-body)" }}
         aria-label="agent is replying"
       >
         <Dot delayMs={0} />
