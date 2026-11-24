@@ -4453,19 +4453,28 @@ async fn answer_data_request(req: DataRequest, ctx: &Ctx) -> DataResponse {
                     ctx.turns.discard(&conversation);
                 }
                 // Each once, and none that a message of another chat still
-                // carries.
+                // carries; when that cannot be told, the file stays. Its
+                // text is where its line says, or, for a voice note whose
+                // line holds the transcript, next to it.
                 let mut files: Vec<serde_json::Value> = Vec::new();
                 if found {
                     let mut seen = std::collections::HashSet::new();
                     for (path, text_path) in texts.iter().flat_map(|text| carried(text)) {
-                        if !seen.insert(path.clone())
-                            || conversations::names_file(&ctx.pool, &path)
+                        let named = |file: String| async move {
+                            conversations::names_file(&ctx.pool, &file)
                                 .await
-                                .map_err(|e| e.to_string())?
-                        {
+                                .unwrap_or(true)
+                        };
+                        if !seen.insert(path.clone()) || named(path.clone()).await {
                             continue;
                         }
-                        files.push(serde_json::json!({ "path": path, "text_path": text_path }));
+                        let text = text_path.unwrap_or_else(|| format!("{path}.txt"));
+                        let text = if named(text.clone()).await {
+                            None
+                        } else {
+                            Some(text)
+                        };
+                        files.push(serde_json::json!({ "path": path, "text_path": text }));
                     }
                 }
                 Ok(serde_json::json!({ "found": found, "files": files }))

@@ -743,13 +743,7 @@ pub async fn chat_delete(
     let files = deleted.files;
     let named = tokio::task::spawn_blocking(move || {
         for file in &files {
-            // A voice note's transcript is kept as its text is, next to it,
-            // though its line carries the transcript itself.
-            let text = file
-                .text_path
-                .clone()
-                .unwrap_or_else(|| format!("{}.txt", file.path));
-            crate::api::files::discard_path(&workspace, &file.path, Some(&text));
+            crate::api::files::discard_path(&workspace, &file.path, file.text_path.as_deref());
         }
         let sent = crate::outbox::list(&outbox, Some(&chat), usize::MAX);
         for file in &sent {
@@ -764,7 +758,7 @@ pub async fn chat_delete(
         user.id,
         agent.id,
         "agent.chat.deleted",
-        serde_json::json!({ "conversation": conversation, "files": named }),
+        serde_json::json!({ "conversation": conversation, "files_named": named }),
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
