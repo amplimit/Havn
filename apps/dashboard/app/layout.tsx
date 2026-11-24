@@ -25,7 +25,7 @@ export default function RootLayout({
         <Suspense>
           <div className="flex min-h-screen flex-col md:flex-row">
             <Sidebar />
-            <main id="main" tabIndex={-1} className="min-w-0 flex-1 overflow-x-hidden focus:outline-none">
+            <main id="main" tabIndex={-1} className="min-w-0 flex-1 overflow-x-clip focus:outline-none">
               <PageContent>{children}</PageContent>
             </main>
           </div>
