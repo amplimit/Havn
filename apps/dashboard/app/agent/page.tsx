@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import {
@@ -10,10 +10,10 @@ import {
   type ChatCommand,
   type ChatSearch,
   thinkingChoices,
+  modelName,
   type ChannelChat,
   type ChatSummary,
   type ConversationTurn,
-  type EmbeddingStatus,
   type MeView,
   type SentFile,
   type TraceItem,
@@ -30,13 +30,19 @@ import type {
   ServerMessage,
 } from "@/lib/protocol";
 import {
+  ArrowDown,
+  ArrowUp,
   BookOpen,
+  Bot,
   Brain,
+  CalendarClock,
   Check,
   Copy,
+  Database,
+  Eye,
   FileText,
   FolderOpen,
-  Layers,
+  Globe,
   MessageSquarePlus,
   MessagesSquare,
   Paperclip,
@@ -47,8 +53,11 @@ import {
   RotateCcw,
   Search,
   Settings,
+  Square,
+  Terminal,
   Download,
   Trash2,
+  Wrench,
   X,
 } from "lucide-react";
 
@@ -75,6 +84,8 @@ type Bubble = {
   buttons?: ChoiceButton[][];
   poll?: ChoicePoll;
   answered?: boolean;
+  /** New while the page is open, not loaded from history: it fades in. */
+  fresh?: boolean;
 };
 
 const AGENT_POLL_MS = 5000;
@@ -234,7 +245,6 @@ function Chat({ id }: { id: string }) {
 
   const [agent, setAgent] = useState<AgentView | null>(null);
   const [me, setMe] = useState<MeView | null>(null);
-  const [embedding, setEmbedding] = useState<EmbeddingStatus | null>(null);
   // Whether the agent's workspace can be browsed (issue #177).
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   useEffect(() => {
@@ -265,6 +275,31 @@ function Chat({ id }: { id: string }) {
   // and those shown now. Kept apart from `live` so a call ends at once.
   const doneCalls = useRef(new Set<string>());
   const liveCalls = useRef(new Set<string>());
+  // The frame of the easing that follows a reply being written, while it runs.
+  const following = useRef(0);
+  // The reader is at the bottom of the chat (within 80 pixels): it follows
+  // what comes; scrolled up, it stays, with a button back to the latest.
+  const atBottom = useRef(true);
+  const lastTop = useRef(0);
+  const touchY = useRef<number | null>(null);
+  const [away, setAway] = useState(false);
+  // The reader moved up: the chat stops following, and offers the way back.
+  // Not when the chat cannot move up, nor when a box inside it that still
+  // can (the reasoning, a step, a code block) takes the move.
+  function leaveBottom(from: EventTarget | null) {
+    const el = scrollRef.current;
+    if (!el || el.scrollTop <= 0 || el.scrollHeight <= el.clientHeight) return;
+    for (let node = from instanceof Element ? from : null; node && node !== el; node = node.parentElement) {
+      if (node.scrollTop > 0 && node.scrollHeight > node.clientHeight) return;
+    }
+    atBottom.current = false;
+    cancelAnimationFrame(following.current);
+    following.current = 0;
+    setAway(true);
+  }
+  // The reply's own text was on screen as it was written: the reply that
+  // replaces it does not fade in again.
+  const liveText = useRef(false);
   const pending = waiting > 0;
   // Tool calls of the running reply that wait for the user.
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
@@ -351,24 +386,6 @@ function Chat({ id }: { id: string }) {
   const bubbleIdRef = useRef(0);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  // System-level embedding status (spec §9.4 v0.7). Fetched once
-  // on mount — config rarely changes mid-session and stale info
-  // here just shows the wrong pill briefly. Failure is silently
-  // swallowed (the chat works fine without knowing the embedder).
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const e = await api.embedding();
-        if (!cancelled) setEmbedding(e);
-      } catch {
-        // shrug — non-fatal
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   // Initial /me — fetched once. The user identity doesn't change for
   // the life of a page, and re-fetching it every poll caused the WS
@@ -546,7 +563,10 @@ function Chat({ id }: { id: string }) {
             liveCalls.current.add(msg.call);
             // The call's reasoning or its reply, each pieced together alike.
             const key = msg.thinking ? "thinking" : "text";
-            if (!msg.thinking) setStep(null);
+            if (!msg.thinking) {
+              setStep(null);
+              liveText.current = true;
+            }
             setLive((prev) => {
               const i = prev.findIndex((p) => p.call === msg.call);
               const entry = i < 0 ? { call: msg.call, text: "", thinking: "" } : prev[i];
@@ -633,6 +653,7 @@ function Chat({ id }: { id: string }) {
           // A question the agent asked comes in the middle of its turn,
           // which goes on.
           const asking = msg.type === "agent_message" && Boolean(msg.buttons?.length || msg.poll);
+          const written = liveText.current;
           if (msg.type === "agent_message" && !asking) {
             if (!msg.broadcast) {
               choicesWaiting.current = Math.max(0, choicesWaiting.current - 1);
@@ -646,7 +667,7 @@ function Chat({ id }: { id: string }) {
             endLive();
           }
           if (msg.type === "agent_message") {
-            pushBubble("agent", msg.content, { buttons: msg.buttons, poll: msg.poll });
+            pushBubble("agent", msg.content, { buttons: msg.buttons, poll: msg.poll, fresh: !written });
           } else if (msg.type === "error") {
             pushBubble("system", `error: ${msg.message}`);
           }
@@ -696,6 +717,7 @@ function Chat({ id }: { id: string }) {
     if ((jump && jump.chat === chatIdRef.current) || Date.now() - jumpedAt.current < JUMP_HOLD_MS) {
       return;
     }
+    if (!atBottom.current) return;
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     scrollRef.current?.scrollTo({
       top: scrollRef.current.scrollHeight,
@@ -715,6 +737,8 @@ function Chat({ id }: { id: string }) {
       jumpedAt.current = Date.now();
       const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
       el.scrollIntoView({ block: "center", behavior: reduce ? "auto" : "smooth" });
+      atBottom.current = false;
+      setAway(true);
       setFound(jump.turn);
       setTimeout(() => setFound((f) => (f === jump.turn ? null : f)), 4000);
       return;
@@ -747,12 +771,38 @@ function Chat({ id }: { id: string }) {
 
   // As the reply being written grows, follow it, unless the user scrolled
   // up to read.
-  const atBottom = useRef(true);
   const liveLength = live.reduce((n, p) => n + p.text.length + p.thinking.length, 0);
   useEffect(() => {
     const el = scrollRef.current;
-    if (el && liveLength > 0 && atBottom.current) el.scrollTo({ top: el.scrollHeight });
+    if (!el || liveLength === 0 || !atBottom.current || following.current) return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      el.scrollTop = el.scrollHeight;
+      return;
+    }
+    // It keeps easing while the reply's height still moves, and stops once
+    // the bottom has held for a quarter of a second.
+    let held = 0;
+    const ease = () => {
+      const gap = el.scrollHeight - el.clientHeight - el.scrollTop;
+      if (!atBottom.current) {
+        following.current = 0;
+        return;
+      }
+      if (gap <= 1) {
+        held += 1;
+        if (held > 15) {
+          following.current = 0;
+          return;
+        }
+      } else {
+        held = 0;
+        el.scrollTop += Math.max(1, gap * 0.2);
+      }
+      following.current = requestAnimationFrame(ease);
+    };
+    following.current = requestAnimationFrame(ease);
   }, [liveLength]);
+  useEffect(() => () => cancelAnimationFrame(following.current), []);
 
   // A file card, once per file.
   function addFile(url: string, name: string, caption: string | undefined, ts: number) {
@@ -763,6 +813,7 @@ function Chat({ id }: { id: string }) {
   // with its next whole text.
   function clearLive() {
     liveCalls.current.clear();
+    liveText.current = false;
     setLive([]);
   }
 
@@ -770,6 +821,7 @@ function Chat({ id }: { id: string }) {
   function endLive() {
     for (const call of liveCalls.current) doneCalls.current.add(call);
     liveCalls.current.clear();
+    liveText.current = false;
     // The oldest are forgotten; their text stopped coming long ago.
     for (const call of doneCalls.current) {
       if (doneCalls.current.size <= 500) break;
@@ -781,7 +833,7 @@ function Chat({ id }: { id: string }) {
   function pushBubble(role: Bubble["role"], content: string, extra: Partial<Bubble> = {}) {
     setBubbles((prev) => [
       ...prev,
-      { ...extra, id: bubbleIdRef.current++, role, content, ts: Date.now() },
+      { fresh: true, ...extra, id: bubbleIdRef.current++, role, content, ts: Date.now() },
     ]);
   }
 
@@ -802,6 +854,8 @@ function Chat({ id }: { id: string }) {
 
   function sendText(text: string, files: Attachment[] = []) {
     if ((!text.trim() && files.length === 0) || !chatRef.current || wsState !== "open") return;
+    atBottom.current = true;
+    setAway(false);
     // A command (alone, without files) is not a message: the page does
     // what it has a button for, and the gateway answers the rest.
     const command = files.length === 0 ? commandIn(text) : null;
@@ -992,6 +1046,9 @@ function Chat({ id }: { id: string }) {
     // A found message of another chat is no longer to be shown.
     if (jumpTo.current && jumpTo.current.chat !== next) jumpTo.current = null;
     if (next !== null && next === chatIdRef.current && nextScope === scopeRef.current) return;
+    // Another chat opens at its end.
+    atBottom.current = true;
+    setAway(false);
     const previous = chatIdRef.current;
     const target = next ?? newChatId();
     selectChat(target, nextScope);
@@ -1113,22 +1170,29 @@ function Chat({ id }: { id: string }) {
       <div className={`${showChats ? "hidden" : "flex"} min-w-0 flex-1 flex-col md:flex`}>
         {/* Header */}
         <div
-          className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-4 sm:px-8"
+          className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-b px-4 py-2.5 sm:px-8"
           style={{ borderColor: "var(--color-border-default)" }}
         >
-          <div>
-            <h1 className="display-h3">{agent.name}</h1>
-            <p
-              className="font-mono text-xs"
-              style={{ color: "var(--color-body)" }}
-            >
-              {agent.id}
+          <div className="min-w-0">
+            <p className="flex items-center gap-2 text-xs" style={{ color: "var(--color-body)" }}>
+              <span className="truncate font-medium" title={`agent ${agent.id}`}>
+                {agent.name}
+              </span>
+              <ConnectionPill state={wsState} agent={agent} />
             </p>
+            <h1 className="truncate text-base font-semibold" style={{ color: "var(--color-heading)" }}>
+              {(() => {
+                const shown = scope
+                  ? channelChats.find((c) => c.id === chat && c.scope === scope)
+                  : chats.find((c) => c.id === chat);
+                return shown ? shown.title || "untitled" : "new chat";
+              })()}
+            </h1>
           </div>
-          <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+          <div className="flex flex-wrap items-center gap-0.5">
             <button
               type="button"
-              className="btn-ghost inline-flex items-center gap-1.5 md:hidden"
+              className="tool-button text-sm md:hidden"
               onClick={() => setShowChats(true)}
             >
               <MessagesSquare size={16} className="shrink-0" aria-hidden="true" />
@@ -1136,7 +1200,7 @@ function Chat({ id }: { id: string }) {
             </button>
             <button
               type="button"
-              className="btn-ghost inline-flex items-center gap-1.5"
+              className="tool-button text-sm md:hidden"
               onClick={() => openChatById(null)}
               title="Start a new chat; this one stays in the list"
             >
@@ -1145,7 +1209,7 @@ function Chat({ id }: { id: string }) {
             </button>
             <Link
               href={`/agent/memory?id=${agent.id}`}
-              className="btn-ghost inline-flex items-center gap-1.5"
+              className="tool-button text-sm"
               title="See what the agent remembers about you"
             >
               <Brain size={16} className="shrink-0" aria-hidden="true" />
@@ -1153,7 +1217,7 @@ function Chat({ id }: { id: string }) {
             </Link>
             <Link
               href={`/agent/skills?id=${agent.id}`}
-              className="btn-ghost inline-flex items-center gap-1.5"
+              className="tool-button text-sm"
               title="Installed skills + curator log"
             >
               <BookOpen size={16} className="shrink-0" aria-hidden="true" />
@@ -1162,7 +1226,7 @@ function Chat({ id }: { id: string }) {
             {workspaceOpen && (
               <Link
                 href={`/agent/workspace?id=${agent.id}`}
-                className="btn-ghost inline-flex items-center gap-1.5"
+                className="tool-button text-sm"
                 title="Browse the files in the agent's workspace"
               >
                 <FolderOpen size={16} className="shrink-0" aria-hidden="true" />
@@ -1171,7 +1235,7 @@ function Chat({ id }: { id: string }) {
             )}
             <Link
               href={`/agent/settings?id=${agent.id}`}
-              className="btn-ghost inline-flex items-center gap-1.5"
+              className="tool-button text-sm"
               title="Rename, change model, edit policy"
             >
               <Settings size={16} className="shrink-0" aria-hidden="true" />
@@ -1188,8 +1252,6 @@ function Chat({ id }: { id: string }) {
                   : chats.find((c) => c.id === chat)?.title) || "chat"
               }
             />
-            <MemoryPill embedding={embedding} />
-            <ConnectionPill state={wsState} agent={agent} />
           </div>
         </div>
 
@@ -1213,12 +1275,34 @@ function Chat({ id }: { id: string }) {
           ref={scrollRef}
           onScroll={(e) => {
             const el = e.currentTarget;
-            atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+            const up = el.scrollTop < lastTop.current - 2;
+            lastTop.current = el.scrollTop;
+            if (el.scrollHeight - el.scrollTop - el.clientHeight < 8) {
+              if (!up) atBottom.current = true;
+            } else if (up) {
+              atBottom.current = false;
+            }
+            if (away === atBottom.current) setAway(!atBottom.current);
           }}
-          className="flex-1 overflow-y-auto px-4 py-6 sm:px-8"
-          style={{ backgroundColor: "var(--color-surface-muted)" }}
+          onWheel={(e) => {
+            if (e.deltaY < 0) leaveBottom(e.target);
+          }}
+          onTouchStart={(e) => {
+            touchY.current = e.touches[0]?.clientY ?? null;
+          }}
+          onTouchMove={(e) => {
+            const y = e.touches[0]?.clientY;
+            // A finger moving down scrolls the chat up.
+            if (touchY.current !== null && y !== undefined && y > touchY.current + 4) leaveBottom(e.target);
+          }}
+          onKeyDown={(e) => {
+            const typing = (e.target as HTMLElement).closest("input, textarea, select, [contenteditable]");
+            if (!typing && ["PageUp", "ArrowUp", "Home"].includes(e.key)) leaveBottom(e.target);
+          }}
+          className="relative flex-1 overflow-y-auto px-4 py-6 sm:px-8"
+          style={{ backgroundColor: "var(--color-surface)" }}
         >
-          <div className="mx-auto flex max-w-3xl flex-col gap-3">
+          <div className="mx-auto flex max-w-3xl flex-col gap-4">
             {bubbles.length === 0 && (
               <div
                 className="card px-5 py-12 text-center"
@@ -1351,13 +1435,42 @@ function Chat({ id }: { id: string }) {
               ),
             )}
             {pending && live.some((p) => p.thinking.trim() !== "") && (
-              <LiveThinking text={live.map((p) => p.thinking.trim()).filter(Boolean).join("\n\n")} />
+              <LiveThinking
+                text={live.map((p) => p.thinking.trim()).filter(Boolean).join("\n\n")}
+                active={!live.some((p) => p.text.trim() !== "")}
+              />
             )}
             {pending && live.some((p) => p.text.trim() !== "") && (
               <LiveBubble text={live.map((p) => p.text.trim()).filter(Boolean).join("\n\n")} />
             )}
             {pending && <TypingBubble step={step} />}
           </div>
+          {away && (
+            <div className="pointer-events-none sticky bottom-0 flex justify-center pt-2">
+              <button
+                type="button"
+                className="tool-button enter pointer-events-auto text-sm"
+                style={{
+                  backgroundColor: "var(--color-surface)",
+                  border: "1px solid var(--color-border-default)",
+                  boxShadow: "var(--shadow-ambient)",
+                  borderRadius: 999,
+                  padding: "6px 14px",
+                }}
+                onClick={() => {
+                  const el = scrollRef.current;
+                  if (!el) return;
+                  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+                  atBottom.current = true;
+                  setAway(false);
+                  el.scrollTo({ top: el.scrollHeight, behavior: reduce ? "auto" : "smooth" });
+                }}
+              >
+                <ArrowDown size={14} className="shrink-0" aria-hidden="true" />
+                latest
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Composer; a channel chat continues in its app, or moves here */}
@@ -1494,7 +1607,7 @@ function ChatList({
       <div className="p-3">
         <button
           type="button"
-          className="btn-primary inline-flex w-full items-center justify-center gap-1.5"
+          className="btn-ghost inline-flex w-full items-center justify-center gap-1.5"
           onClick={() => onOpen(null)}
         >
           <MessageSquarePlus size={16} className="shrink-0" aria-hidden="true" />
@@ -1845,7 +1958,7 @@ function Bubble({
   const isSystem = bubble.role === "system";
   return (
     <div
-      className={`flex flex-col gap-1.5 ${align}`}
+      className={`flex flex-col gap-1.5 ${align}${bubble.fresh ? " enter" : ""}`}
       data-turn={bubble.turn}
       style={
         found
@@ -1861,14 +1974,14 @@ function Bubble({
       )}
       {(!message || message.text) && (
       <div
-        className="px-4 py-2.5"
+        className={bubble.role === "agent" ? "w-full" : "px-4 py-2.5"}
         style={{
-          maxWidth: "min(85%, 720px)",
+          maxWidth: bubble.role === "agent" ? "100%" : "min(85%, 720px)",
           borderRadius: "var(--radius-large)",
           ...(bubble.role === "you"
             ? {
-                backgroundColor: "var(--color-stripe-purple)",
-                color: "white",
+                backgroundColor: "rgba(83, 58, 253, 0.08)",
+                color: "var(--color-deep-navy)",
               }
             : isSystem
               ? {
@@ -1879,10 +1992,7 @@ function Bubble({
                   fontSize: 12,
                 }
               : {
-                  backgroundColor: "var(--color-surface)",
                   color: "var(--color-deep-navy)",
-                  border: "1px solid var(--color-border-default)",
-                  boxShadow: "var(--shadow-ambient)",
                 }),
         }}
       >
@@ -1907,7 +2017,7 @@ function Bubble({
               title="Edit and send again; the messages after it stay on their own branch. What tools already did (files written, messages sent) is not undone."
               label="edit"
             >
-              <Pencil size={12} className="shrink-0" aria-hidden="true" />
+              <Pencil size={14} className="shrink-0" aria-hidden="true" />
               edit
             </RowButton>
           )}
@@ -1918,7 +2028,7 @@ function Bubble({
               title="Answer your last message before this reply again; this reply stays as another version. What tools already did is not undone."
               label="regenerate"
             >
-              <RefreshCw size={12} className="shrink-0" aria-hidden="true" />
+              <RefreshCw size={14} className="shrink-0" aria-hidden="true" />
               regenerate
             </RowButton>
           )}
@@ -2064,6 +2174,7 @@ function MessageInput({
   placeholder,
   autoFocus,
   label,
+  bare,
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -2074,6 +2185,8 @@ function MessageInput({
   placeholder?: string;
   autoFocus?: boolean;
   label: string;
+  /** Inside a panel that draws the frame: no border of its own. */
+  bare?: boolean;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
   useEffect(() => {
@@ -2115,15 +2228,16 @@ function MessageInput({
       autoFocus={autoFocus}
       aria-label={label}
       rows={2}
-      className="input w-full"
+      className={bare ? "block w-full bg-transparent outline-none placeholder:text-[var(--color-body)]" : "input w-full"}
       style={{
         resize: "none",
         overflowY: "auto",
         minHeight: 56,
         maxHeight: 320,
         fontFamily: "inherit",
-        padding: "10px 12px",
+        padding: bare ? "12px 12px 4px" : "10px 12px",
         lineHeight: 1.45,
+        ...(bare ? { fontSize: 15, color: "var(--color-deep-navy)" } : {}),
       }}
     />
   );
@@ -2400,7 +2514,7 @@ function RowButton({
       disabled={disabled}
       title={title}
       aria-label={label}
-      className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 transition-colors disabled:opacity-40"
+      className="inline-flex items-center gap-1 rounded px-2 py-1 transition-colors hover:bg-[rgba(100,116,141,0.08)] disabled:opacity-40"
       style={{ background: "transparent" }}
     >
       {children}
@@ -2450,25 +2564,23 @@ function ActionRow({
 
   return (
     <div
-      className={`mt-1 flex gap-2 px-1 ${align === "end" ? "justify-end" : "justify-start"}`}
-      style={{ fontSize: 11, color: "var(--color-body)" }}
+      className={`mt-0.5 flex gap-1 ${align === "end" ? "justify-end" : "justify-start"}`}
+      style={{ fontSize: 13, color: "var(--color-body)" }}
     >
       <button
         type="button"
         onClick={onCopy}
         title="copy markdown source"
         aria-label={copied ? "copied" : "copy message"}
-        className="rounded px-1.5 py-0.5 transition-colors"
-        style={{ background: "transparent" }}
-        onMouseEnter={(e) =>
-          (e.currentTarget.style.background = "rgba(100,116,141,0.08)")
-        }
-        onMouseLeave={(e) =>
-          (e.currentTarget.style.background = "transparent")
-        }
+        className="rounded px-2 py-1 transition-colors hover:bg-[rgba(100,116,141,0.08)]"
+        style={{ background: "transparent", color: copied ? "var(--color-success-text)" : undefined }}
       >
         <span className="inline-flex items-center gap-1">
-          {copied ? <Check size={12} className="shrink-0" aria-hidden="true" /> : <Copy size={12} className="shrink-0" aria-hidden="true" />}
+          {copied ? (
+            <Check size={14} className="enter shrink-0" aria-hidden="true" />
+          ) : (
+            <Copy size={14} className="shrink-0" aria-hidden="true" />
+          )}
           {copied ? "copied" : "copy"}
         </span>
       </button>
@@ -2478,17 +2590,11 @@ function ActionRow({
           onClick={onRetry}
           title="re-send the previous user message"
           aria-label="retry"
-          className="rounded px-1.5 py-0.5 transition-colors"
+          className="rounded px-2 py-1 transition-colors hover:bg-[rgba(100,116,141,0.08)]"
           style={{ background: "transparent" }}
-          onMouseEnter={(e) =>
-            (e.currentTarget.style.background = "rgba(100,116,141,0.08)")
-          }
-          onMouseLeave={(e) =>
-            (e.currentTarget.style.background = "transparent")
-          }
         >
           <span className="inline-flex items-center gap-1">
-            <RotateCcw size={12} className="shrink-0" aria-hidden="true" />
+            <RotateCcw size={14} className="shrink-0" aria-hidden="true" />
             retry
           </span>
         </button>
@@ -2498,13 +2604,6 @@ function ActionRow({
   );
 }
 
-/**
- * Inline "agent is replying" placeholder. Three pulsing dots in an
- * agent-shaped bubble — same styling as a real agent message so the
- * eye doesn't have to retrain. Replaced by the actual reply when
- * `agent_message` arrives (parent flips `pending` to false).
- */
-/** The reply as the model writes it, before the reply itself comes. */
 /**
  * The chat's model and how much it thinks, for this chat only: the model
  * menu as on the agent's settings page; the thinking menu with off first,
@@ -2529,34 +2628,38 @@ function ChatModelMenus({
   const choices = spec ? thinkingChoices(spec) : [];
   const fallback = spec?.default ?? choices[0] ?? "off";
   const thinking = chatThinking && choices.includes(chatThinking) ? chatThinking : fallback;
+  const short = (m: { id: string; label?: string }) => {
+    const name = modelName(m.id, m.label);
+    return models.models.filter((x) => modelName(x.id, x.label) === name).length > 1 ? m.id : name;
+  };
   const name = (id: string | null) => {
     const m = models.models.find((x) => x.id === id);
-    return m?.label ?? id ?? "default";
+    return id ? short(m ?? { id }) : "default";
   };
   const thinkingName = (c: string) =>
     c === "off" ? "thinking off" : c === "on" ? "thinking on" : spec?.style === "budget" ? `think ${Number(c).toLocaleString()} tokens` : `think ${c}`;
   return (
     <>
       <select
-        className="input text-sm"
-        style={{ maxWidth: 220, padding: "4px 8px" }}
+        className="composer-select min-w-0"
+        style={{ maxWidth: 280 }}
         aria-label="model of this chat"
-        title="The model of this chat; others keep theirs"
+        title={`The model of this chat; others keep theirs. Now: ${model ?? "the default"}`}
         value={chatModel ?? ""}
         disabled={disabled}
         onChange={(e) => onSettings({ model: e.target.value || null })}
       >
         <option value="">{name(agentModel)} (agent&apos;s)</option>
         {models.models.map((m) => (
-          <option key={m.id} value={m.id}>
-            {m.label ?? m.id}
+          <option key={m.id} value={m.id} title={m.id}>
+            {short(m)}
             {m.id === agentModel ? " (kept for this chat)" : ""}
           </option>
         ))}
       </select>
       <select
-        className="input text-sm"
-        style={{ maxWidth: 200, padding: "4px 8px" }}
+        className="composer-select min-w-0"
+        style={{ maxWidth: 180 }}
         aria-label="thinking of this chat"
         title={spec ? "How much this chat's model thinks" : "This model is not set up to think"}
         value={spec ? thinking : "off"}
@@ -2579,30 +2682,113 @@ function ChatModelMenus({
 }
 
 /** The reasoning of the reply being written, as it arrives. */
-function LiveThinking({ text }: { text: string }) {
+// Its head says what it is on now, its latest line, and while the model
+// still thinks, a highlight runs over it; a click folds the rest away.
+function LiveThinking({ text, active }: { text: string; active: boolean }) {
   const box = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const el = box.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [text]);
+  const lines = text.split("\n").filter((line) => line.trim() !== "");
+  const now = oneLine(lines[lines.length - 1] ?? "");
   return (
-    <div className="flex flex-col items-start">
-      <div
-        className="w-full px-3 py-2 text-xs"
-        style={{ maxWidth: "min(85%, 720px)", color: "var(--color-body)" }}
-        aria-live="off"
+    <div className="enter w-full text-[13px]" style={{ color: "var(--color-body)" }} aria-live="off">
+      <Fold
+        opened
+        head={
+          <>
+            <Brain size={14} className="shrink-0" aria-hidden="true" style={{ color: "var(--color-stripe-purple-mid)" }} />
+            <span className={`min-w-0 truncate ${active ? "shimmer" : ""}`}>
+              <span className="font-medium">Thinking</span>
+              {now && <> · {now}</>}
+            </span>
+          </>
+        }
       >
-        <div className="mb-1 font-medium">thinking…</div>
         <div
           ref={box}
-          className="overflow-y-auto border-l-2 pl-3"
+          className="mb-1 ml-5 mt-1 overflow-y-auto border-l-2 pl-3"
           style={{ maxHeight: 160, whiteSpace: "pre-wrap", borderColor: "var(--color-border-default)" }}
         >
           {text}
         </div>
+      </Fold>
+    </div>
+  );
+}
+
+/**
+ * A part that opens on a click: its head always shown, with an arrow that
+ * turns, and what it holds, which opens and closes with a short motion.
+ * What it holds is made the first time it opens, after `onOpen`.
+ */
+function Fold({
+  head,
+  onOpen,
+  opened = false,
+  className,
+  style,
+  children,
+}: {
+  head: React.ReactNode;
+  onOpen?: () => void;
+  /** Open when it is first shown. */
+  opened?: boolean;
+  className?: string;
+  style?: React.CSSProperties;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(opened);
+  const [made, setMade] = useState(opened);
+  const id = useId();
+  return (
+    <div className={className} style={style}>
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={id}
+        onClick={() => {
+          if (!open) {
+            onOpen?.();
+            setMade(true);
+          }
+          setOpen(!open);
+        }}
+        className="flex w-full min-w-0 items-center gap-1.5 rounded py-0.5 text-left transition-colors hover:text-[var(--color-deep-navy)]"
+      >
+        <ChevronRight size={14} className="fold-arrow shrink-0" data-open={open} aria-hidden="true" />
+        {head}
+      </button>
+      <div id={id} className="fold" data-open={open} inert={!open}>
+        <div>{made && children}</div>
       </div>
     </div>
   );
+}
+
+/** Text on one line, its runs of white space as one space. */
+function oneLine(text: string): string {
+  return text.slice(0, 400).replace(/\s+/g, " ").trim();
+}
+
+/** A tool call's input in a few words: the query, address, command or path it was given. */
+function briefInput(input: string): string {
+  let value: unknown;
+  try {
+    value = JSON.parse(input);
+  } catch {
+    return oneLine(input);
+  }
+  if (typeof value === "string") return oneLine(value);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "";
+  const fields = value as Record<string, unknown>;
+  for (const key of ["query", "url", "command", "path", "pattern", "question", "task", "text", "name"]) {
+    const field = fields[key];
+    if (typeof field === "string" && field.trim()) return oneLine(field);
+  }
+  const first = Object.values(fields).find((v) => typeof v === "string" && v.trim());
+  return typeof first === "string" ? oneLine(first) : "";
 }
 
 /** How long, in words a person reads: "12 s", "3 min". */
@@ -2612,9 +2798,9 @@ function took(ms: number): string {
 }
 
 /**
- * What a reply's turn did on the way, folded into one line: the model's
- * reasoning and each tool call, with its input and result, read when
- * opened.
+ * What a reply's turn did on the way, folded into one line: opened, the
+ * model's reasoning and each tool call, one line each, each opened in turn
+ * for the whole of it.
  */
 function TraceFold({
   agentId,
@@ -2633,67 +2819,211 @@ function TraceFold({
   const [trace, setTrace] = useState<TurnTrace | null>(null);
   const [error, setError] = useState<string | null>(null);
   const parts = [
-    summary.thought ? "thought" : null,
-    summary.steps > 0 ? `${summary.steps} step${summary.steps === 1 ? "" : "s"}` : null,
+    summary.thought ? "Thought" : null,
+    summary.steps > 0 ? `${summary.steps} tool call${summary.steps === 1 ? "" : "s"}` : null,
   ].filter(Boolean);
-  const muted = { color: "var(--color-body)" };
   return (
-    <details
-      className="text-xs"
-      style={{ maxWidth: "min(85%, 720px)", ...muted }}
-      onToggle={(e) => {
-        if (!e.currentTarget.open || trace) return;
+    <Fold
+      className="w-full text-[13px]"
+      style={{ color: "var(--color-body)" }}
+      head={
+        <span>
+          {parts.join(" · ")} · {took(summary.ms)}
+        </span>
+      }
+      onOpen={() => {
+        if (trace) return;
+        setError(null);
         api.chats.trace(agentId, chat, turn, scope ?? undefined).then(setTrace, (err: unknown) =>
           setError(err instanceof Error ? err.message : String(err)),
         );
       }}
     >
-      <summary className="cursor-pointer select-none">
-        {parts.join(" · ")} · {took(summary.ms)}
-      </summary>
       {!trace ? (
-        <p className="mt-2 pl-3" role={error ? "alert" : undefined}>
+        <p className="mt-1 pl-5" role={error ? "alert" : undefined}>
           {error ?? "loading…"}
         </p>
       ) : (
-      <TraceList items={trace.items} leftOut={trace.left_out} />
+        <TraceList items={trace.items} leftOut={trace.left_out} />
       )}
-    </details>
+    </Fold>
   );
 }
 
-/** What a turn did, in order; a subagent's own steps under its call. */
+/** Steps shown at once; a longer turn shows the rest when asked. */
+const STEPS_SHOWN = 8;
+
+/** What a turn did, in order, a line each; a subagent's own steps under its call. */
 function TraceList({ items, leftOut }: { items: TraceItem[]; leftOut: number }) {
+  const [all, setAll] = useState(items.length <= STEPS_SHOWN + 2);
+  const shown = all ? items : items.slice(0, STEPS_SHOWN);
   return (
-    <ol className="mt-2 flex flex-col gap-2 border-l-2 pl-3" style={{ borderColor: "var(--color-border-default)" }}>
-      {items.map((item, i) =>
-        item.kind === "thinking" ? (
-          <li key={i} style={{ whiteSpace: "pre-wrap" }}>
-            {item.text}
-          </li>
-        ) : (
-          <li key={i}>
-            <div className="font-mono" style={{ color: item.error ? "var(--color-ruby)" : "var(--color-deep-navy)" }}>
-              {item.tool}
-              {item.error && " (failed)"}
-            </div>
-            <pre className="mt-1 overflow-x-auto font-mono" style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-              {item.input}
-            </pre>
-            {item.steps && item.steps.length > 0 && (
-              <TraceList items={item.steps} leftOut={item.left_out ?? 0} />
-            )}
-            <pre
-              className="mt-1 overflow-y-auto font-mono"
-              style={{ maxHeight: 200, whiteSpace: "pre-wrap", wordBreak: "break-word", opacity: 0.85 }}
-            >
-              {item.result}
-            </pre>
-          </li>
-        ),
+    <ol
+      className="ml-[7px] mt-0.5 flex flex-col gap-0.5 border-l pl-3"
+      style={{ borderColor: "var(--color-border-default)" }}
+    >
+      {shown.map((item, i) => (
+        <li key={i}>
+          {item.kind === "thinking" ? <ThinkingStep text={item.text} /> : <ToolStep step={item} />}
+        </li>
+      ))}
+      {!all && (
+        <li>
+          <button
+            type="button"
+            className="py-0.5 underline decoration-dotted underline-offset-2 hover:text-[var(--color-deep-navy)]"
+            onClick={() => setAll(true)}
+          >
+            show {items.length - STEPS_SHOWN} more
+          </button>
+        </li>
       )}
-      {leftOut > 0 && <li>…and {leftOut} more, not kept.</li>}
+      {all && leftOut > 0 && <li className="py-0.5">…and {leftOut} more, not kept.</li>}
     </ol>
+  );
+}
+
+/** The model's reasoning: its first words, and opened, all of it. */
+function ThinkingStep({ text }: { text: string }) {
+  return (
+    <Fold
+      head={
+        <>
+          <Brain size={14} className="shrink-0" aria-hidden="true" style={{ color: "var(--color-stripe-purple-mid)" }} />
+          <span className="shrink-0 font-medium" style={{ color: "var(--color-deep-navy)" }}>
+            Thinking
+          </span>
+          <span className="min-w-0 truncate">{oneLine(text)}</span>
+        </>
+      }
+    >
+      <div className="mb-2 ml-5 mt-1 overflow-y-auto" style={{ maxHeight: 320, whiteSpace: "pre-wrap" }}>
+        {text}
+      </div>
+    </Fold>
+  );
+}
+
+/** A tool call: its name and what it was given, and opened, its input and result. */
+function ToolStep({ step }: { step: Extract<TraceItem, { kind: "step" }> }) {
+  const { did, what } = stepWords(step.tool, step.input);
+  const inner = step.steps?.length ?? 0;
+  return (
+    <Fold
+      head={
+        <>
+          <ToolIcon tool={step.tool} color={step.error ? "var(--color-warning-text)" : "var(--color-label)"} />
+          <span
+            className="shrink-0 font-medium"
+            style={{ color: step.error ? "var(--color-warning-text)" : "var(--color-deep-navy)" }}
+          >
+            {did}
+          </span>
+          {what && <span className="min-w-0 truncate">{what}</span>}
+          {inner > 0 && <span className="shrink-0">· {inner} step{inner === 1 ? "" : "s"}</span>}
+          {step.error && (
+            <span className="shrink-0" style={{ color: "var(--color-warning-text)" }}>
+              · failed
+            </span>
+          )}
+        </>
+      }
+    >
+      <div className="mb-2 ml-5 mt-1 flex flex-col gap-2">
+        <TraceBlock label={`input to ${step.tool}`} text={readable(step.input)} />
+        {inner > 0 && <TraceList items={step.steps ?? []} leftOut={step.left_out ?? 0} />}
+        <TraceBlock label={step.error ? "error" : "result"} text={step.result} />
+      </div>
+    </Fold>
+  );
+}
+
+/** The icon of a tool, by what it does. */
+function ToolIcon({ tool, color }: { tool: string; color: string }) {
+  const look = { size: 14, className: "shrink-0", "aria-hidden": true, style: { color } } as const;
+  if (tool === "web_search") return <Search {...look} />;
+  if (tool === "web_fetch") return <Globe {...look} />;
+  if (tool === "shell" || tool === "process") return <Terminal {...look} />;
+  if (tool.startsWith("file_") || tool === "send_file" || tool === "view_image") return <FileText {...look} />;
+  if (tool.startsWith("memory_")) return <Database {...look} />;
+  if (tool === "conversation_search") return <MessagesSquare {...look} />;
+  if (tool === "subagent_spawn" || tool === "agent_query") return <Bot {...look} />;
+  if (tool === "schedule") return <CalendarClock {...look} />;
+  return <Wrench {...look} />;
+}
+
+/** A tool call as a person reads it: what was done, and to what. */
+function stepWords(tool: string, input: string): { did: string; what: string } {
+  const brief = briefInput(input);
+  const words: Record<string, string> = {
+    web_search: "Searched the web",
+    web_fetch: "Read",
+    memory_search: "Searched memory",
+    memory_remember: "Remembered",
+    memory_store: "Remembered",
+    memory_forget: "Forgot",
+    conversation_search: "Searched past chats",
+    file_read: "Read file",
+    file_write: "Wrote file",
+    file_edit: "Edited file",
+    file_find: "Found files",
+    file_search: "Searched files",
+    shell: "Ran",
+    process: "Checked a command",
+    send_file: "Sent",
+    view_image: "Looked at",
+    schedule: "Scheduled",
+    set_timezone: "Set the time zone",
+    skill_manage: "Updated a skill",
+    subagent_spawn: "Handed off",
+    agent_query: "Asked another agent",
+    ask_choice: "Asked",
+  };
+  if (tool === "web_fetch") {
+    try {
+      const url = new URL(brief);
+      const path = url.pathname === "/" ? "" : url.pathname;
+      return { did: "Read", what: `${url.hostname.replace(/^www\./, "")}${path}` };
+    } catch {
+      return { did: "Read", what: brief };
+    }
+  }
+  if (tool.startsWith("mcp__")) {
+    const [, server, name] = tool.split("__");
+    return { did: `Used ${name ?? tool}`, what: server ? `(${server}) ${brief}` : brief };
+  }
+  return { did: words[tool] ?? tool, what: brief };
+}
+
+/** A call's input as JSON laid out to read, or as it was when it is not JSON. */
+function readable(input: string): string {
+  try {
+    return JSON.stringify(JSON.parse(input), null, 2);
+  } catch {
+    return input;
+  }
+}
+
+/** A call's input or result, as it was, scrolling within its own box. */
+function TraceBlock({ label, text }: { label: string; text: string }) {
+  return (
+    <div>
+      <div className="mb-0.5 font-medium" style={{ color: "var(--color-label)" }}>
+        {label}
+      </div>
+      <pre
+        className="overflow-y-auto rounded px-2 py-1.5 font-mono text-xs"
+        style={{
+          maxHeight: 240,
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+          background: "var(--color-surface)",
+          border: "1px solid var(--color-border-default)",
+        }}
+      >
+        {text}
+      </pre>
+    </div>
   );
 }
 
@@ -2793,22 +3123,23 @@ function OwnerApproval({
   );
 }
 
+/** The reply as the model writes it, before the reply itself comes. */
 function LiveBubble({ text }: { text: string }) {
+  const inner = useRef<HTMLDivElement>(null);
+  const [height, setHeight] = useState<number | undefined>(undefined);
+  useEffect(() => {
+    const el = inner.current;
+    if (!el) return;
+    const watch = new ResizeObserver(() => setHeight(el.offsetHeight));
+    watch.observe(el);
+    return () => watch.disconnect();
+  }, []);
   return (
-    <div className="flex flex-col items-start">
-      <div
-        className="px-4 py-3"
-        style={{
-          maxWidth: "min(85%, 720px)",
-          borderRadius: "var(--radius-large)",
-          backgroundColor: "var(--color-surface)",
-          color: "var(--color-deep-navy)",
-          border: "1px solid var(--color-border-default)",
-          boxShadow: "var(--shadow-ambient)",
-        }}
-        aria-live="polite"
-      >
-        <Markdown>{text}</Markdown>
+    <div className="enter flex flex-col items-start">
+      <div className="live-grow w-full" style={{ height }}>
+        <div ref={inner} style={{ color: "var(--color-deep-navy)" }} aria-live="polite">
+          <Markdown>{text}</Markdown>
+        </div>
       </div>
     </div>
   );
@@ -2843,24 +3174,37 @@ function stepText({ tool, detail }: Step): string {
   return detail ? `${verb}: ${detail}` : verb;
 }
 
+/**
+ * Inline "agent is replying" placeholder. Three pulsing dots in an
+ * agent-shaped bubble — same styling as a real agent message so the
+ * eye doesn't have to retrain. Replaced by the actual reply when
+ * `agent_message` arrives (parent flips `pending` to false). Above it,
+ * the step running, which fades in as each one starts.
+ */
 function TypingBubble({ step }: { step: Step | null }) {
   return (
-    <div className="flex flex-col items-start gap-1">
-      {step && (
-        <p className="wrap-anywhere px-1 text-xs" style={{ color: "var(--color-body)" }} role="status">
-          {stepText(step)}
-        </p>
-      )}
+    <div className="enter flex flex-col items-start gap-1">
+      <p className="wrap-anywhere px-1 text-xs" style={{ color: "var(--color-body)" }} role="status">
+        {step && (
+          <span key={stepText(step)} className="enter flex items-center gap-1.5">
+            <span
+              aria-hidden="true"
+              className="shrink-0"
+              style={{
+                width: 6,
+                height: 6,
+                borderRadius: "50%",
+                background: "var(--color-stripe-purple)",
+                animation: "havn-breathe 1.6s ease-in-out infinite",
+              }}
+            />
+            {stepText(step)}
+          </span>
+        )}
+      </p>
       <div
-        className="flex items-center gap-1 px-4 py-3"
-        style={{
-          maxWidth: "min(85%, 720px)",
-          borderRadius: "var(--radius-large)",
-          backgroundColor: "var(--color-surface)",
-          color: "var(--color-body)",
-          border: "1px solid var(--color-border-default)",
-          boxShadow: "var(--shadow-ambient)",
-        }}
+        className="flex items-center gap-1 py-2"
+        style={{ color: "var(--color-body)" }}
         aria-label="agent is replying"
       >
         <Dot delayMs={0} />
@@ -2955,6 +3299,8 @@ function Composer({
       : commands.filter((c) => c.name.startsWith(typed) || c.aliases.some((a) => a.startsWith(typed)));
   const canSend = (draft.trim() !== "" || attached.length > 0) && uploading === 0;
   const [tab, setTab] = useState<"write" | "preview">("write");
+  // Nothing to preview once the text is gone: back to writing.
+  if (tab === "preview" && !draft.trim()) setTab("write");
   // The composer is ready whenever the WS is up. A message sent while a
   // reply runs waits in the agent and is answered after it, in order.
   const ready = wsState === "open";
@@ -2970,60 +3316,15 @@ function Composer({
         e.preventDefault();
         if (ready) onAttach(Array.from(e.dataTransfer.files));
       }}
-      className="border-t px-4 py-3 sm:px-8"
-      style={{ borderColor: "var(--color-border-default)" }}
+      className="px-4 pb-4 pt-2 sm:px-8"
     >
       <div className="mx-auto max-w-3xl">
-        {/* Tab strip */}
-        <div className="mb-2 flex items-center justify-between">
-          <div
-            className="flex gap-1 text-sm"
-            role="tablist"
-            aria-label="Composer mode"
-          >
-            <ComposerTab
-              active={tab === "write"}
-              onClick={() => setTab("write")}
-            >
-              Write
-            </ComposerTab>
-            <ComposerTab
-              active={tab === "preview"}
-              onClick={() => setTab("preview")}
-              disabled={!draft.trim()}
-            >
-              Preview
-            </ComposerTab>
-          </div>
-          <span className="text-xs" style={{ color: "var(--color-body)" }}>
-            <kbd className="font-mono" style={{ fontSize: 11 }}>
-              Enter
-            </kbd>{" "}
-            to send ·{" "}
-            <kbd className="font-mono" style={{ fontSize: 11 }}>
-              Shift+Enter
-            </kbd>{" "}
-            new line · markdown
-          </span>
-        </div>
-
-        {(attached.length > 0 || uploading > 0) && (
-          <div className="mb-2 flex flex-wrap items-center gap-2">
-            <AttachmentCards agentId={agentId} files={attached} onRemove={(i) => onDetach(attached[i].path)} />
-            {uploading > 0 && (
-              <span className="inline-flex items-center gap-1 text-xs" role="status" style={{ color: "var(--color-body)" }}>
-                <Spinner /> uploading
-              </span>
-            )}
-          </div>
-        )}
-
         {suggested.length > 0 && tab === "write" && (
           <ul
-            className="card mb-2 overflow-y-auto py-1 text-sm"
+            className="card enter mb-2 overflow-y-auto py-1 text-sm"
             role="listbox"
             aria-label="Commands"
-            style={{ maxHeight: 240, backgroundColor: "var(--color-surface)" }}
+            style={{ maxHeight: 240, backgroundColor: "var(--color-surface)", boxShadow: "var(--shadow-ambient)" }}
           >
             {suggested.map((c) => (
               <li key={c.name}>
@@ -3050,179 +3351,144 @@ function Composer({
           </ul>
         )}
 
-        {/* Body */}
-        {tab === "write" ? (
-          <MessageInput
-            placeholder={
-              ready
-                ? "Message the agent: Enter sends, Shift+Enter starts a new line, files can be pasted or dropped"
-                : "Waiting for agent connection…"
-            }
-            value={draft}
-            onChange={setDraft}
-            onEnter={() => {
-              if (ready && canSend) onSubmit();
-            }}
-            onFiles={(files) => {
-              if (ready) onAttach(files);
-            }}
-            disabled={!ready}
-            label="message"
-          />
-        ) : (
-          <div
-            className="card w-full overflow-y-auto px-4 py-3"
-            style={{
-              minHeight: 84,
-              maxHeight: 360,
-              backgroundColor: "var(--color-surface)",
-            }}
-          >
-            {draft.trim() ? (
-              <Markdown>{draft}</Markdown>
-            ) : (
-              <span style={{ color: "var(--color-body)" }}>
-                Nothing to preview yet.
-              </span>
-            )}
-          </div>
-        )}
+        {/* One panel: what is attached, the text (or its preview), and a
+            bar of what goes with it. */}
+        <div className="composer">
+          {(attached.length > 0 || uploading > 0) && (
+            <div className="flex flex-wrap items-center gap-2 px-3 pt-3">
+              <AttachmentCards agentId={agentId} files={attached} onRemove={(i) => onDetach(attached[i].path)} />
+              {uploading > 0 && (
+                <span className="inline-flex items-center gap-1 text-xs" role="status" style={{ color: "var(--color-body)" }}>
+                  <Spinner /> uploading
+                </span>
+              )}
+            </div>
+          )}
 
-        {/* Action row */}
-        <div className="mt-2 flex items-center justify-end gap-3">
-          <input
-            ref={fileInput}
-            type="file"
-            multiple
-            hidden
-            onChange={(e) => {
-              onAttach(Array.from(e.target.files ?? []));
-              e.target.value = "";
-            }}
-          />
-          <button
-            type="button"
-            className="btn-ghost mr-auto inline-flex items-center gap-1.5"
-            onClick={() => fileInput.current?.click()}
-            disabled={!ready}
-            title="Attach files: they are saved in the agent's inbox/ and sent with your message (up to 25 MB each)"
-          >
-            <Paperclip size={16} className="shrink-0" aria-hidden="true" />
-            attach
-          </button>
-          {models && models.models.length > 0 && (
-            <ChatModelMenus
-              models={models}
-              chatModel={chatModel}
-              chatThinking={chatThinking}
+          {tab === "write" ? (
+            <MessageInput
+              bare
+              placeholder={
+                ready
+                  ? "Message the agent: Enter sends, Shift+Enter starts a new line, files can be pasted or dropped"
+                  : "Waiting for agent connection…"
+              }
+              value={draft}
+              onChange={setDraft}
+              onEnter={() => {
+                if (ready && canSend) onSubmit();
+              }}
+              onFiles={(files) => {
+                if (ready) onAttach(files);
+              }}
               disabled={!ready}
-              onSettings={onSettings}
+              label="message"
             />
-          )}
-          {pending && (
-            <span
-              className="flex items-center gap-2 text-sm"
-              style={{ color: "var(--color-body)" }}
-              role="status"
+          ) : (
+            <div
+              className="w-full overflow-y-auto px-3 pb-1 pt-3"
+              style={{ minHeight: 56, maxHeight: 360, color: "var(--color-deep-navy)" }}
+              aria-label="preview of the message"
             >
-              <Spinner /> replying
-              {waiting > 1 && `, ${waiting - 1} queued`}
-            </span>
+              <Markdown>{draft}</Markdown>
+            </div>
           )}
-          {pending && (
+
+          <div className="flex flex-wrap items-center gap-1 px-2 pb-2 sm:flex-nowrap">
+            <input
+              ref={fileInput}
+              type="file"
+              multiple
+              hidden
+              onChange={(e) => {
+                onAttach(Array.from(e.target.files ?? []));
+                e.target.value = "";
+              }}
+            />
             <button
               type="button"
-              className="btn-ghost"
-              onClick={onStop}
-              disabled={wsState !== "open"}
-              title="Stop the reply in progress; queued messages still get answered"
+              className="tool-button"
+              onClick={() => fileInput.current?.click()}
+              disabled={!ready}
+              title="Attach files: they are saved in the agent's inbox/ and sent with your message (up to 25 MB each)"
+              aria-label="attach files"
             >
-              stop
+              <Paperclip size={16} className="shrink-0" aria-hidden="true" />
             </button>
-          )}
-          <button
-            type="submit"
-            className="btn-primary"
-            disabled={!ready || !canSend}
-            style={{ minWidth: 110 }}
-          >
-            {pending ? "queue" : "send"}
-          </button>
+            <button
+              type="button"
+              className="tool-button"
+              aria-pressed={tab === "preview"}
+              onClick={() => setTab(tab === "write" ? "preview" : "write")}
+              disabled={tab === "write" && !draft.trim()}
+              title={tab === "write" ? "Preview the message as it will show (markdown)" : "Back to writing"}
+            >
+              {tab === "write" ? (
+                <Eye size={16} className="shrink-0" aria-hidden="true" />
+              ) : (
+                <Pencil size={16} className="shrink-0" aria-hidden="true" />
+              )}
+              <span className="text-[13px]">{tab === "write" ? "preview" : "write"}</span>
+            </button>
+            {models && models.models.length > 0 && (
+              <div className="flex min-w-0 items-center gap-1">
+                <ChatModelMenus
+                  models={models}
+                  chatModel={chatModel}
+                  chatThinking={chatThinking}
+                  disabled={!ready}
+                  onSettings={onSettings}
+                />
+              </div>
+            )}
+            <div className="ml-auto flex shrink-0 items-center gap-2">
+              {pending && (
+                <span
+                  className="enter flex items-center gap-1.5 text-[13px]"
+                  style={{ color: "var(--color-body)" }}
+                  role="status"
+                >
+                  <span
+                    aria-hidden="true"
+                    className="shrink-0"
+                    style={{
+                      width: 6,
+                      height: 6,
+                      borderRadius: "50%",
+                      background: "var(--color-stripe-purple)",
+                      animation: "havn-breathe 1.6s ease-in-out infinite",
+                    }}
+                  />
+                  replying
+                  {waiting > 1 && `, ${waiting - 1} queued`}
+                </span>
+              )}
+              {pending && (
+                <button
+                  type="button"
+                  className="tool-button"
+                  onClick={onStop}
+                  disabled={wsState !== "open"}
+                  title="Stop the reply in progress; queued messages still get answered"
+                >
+                  <Square size={14} className="shrink-0" aria-hidden="true" />
+                  <span className="text-[13px]">stop</span>
+                </button>
+              )}
+              <button
+                type="submit"
+                className="btn-primary inline-flex items-center gap-1.5"
+                disabled={!ready || !canSend}
+                style={{ padding: "7px 14px", fontSize: 14 }}
+              >
+                <ArrowUp size={16} className="shrink-0" aria-hidden="true" />
+                {pending ? "queue" : "send"}
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </form>
-  );
-}
-
-function ComposerTab({
-  active,
-  disabled,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  disabled?: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={active}
-      disabled={disabled}
-      onClick={onClick}
-      className="px-3 py-1.5 text-sm transition-colors"
-      style={{
-        borderBottom: active
-          ? "2px solid var(--color-stripe-purple)"
-          : "2px solid transparent",
-        color: active
-          ? "var(--color-stripe-purple)"
-          : "var(--color-body)",
-        background: "transparent",
-        opacity: disabled ? 0.4 : 1,
-        cursor: disabled ? "not-allowed" : "pointer",
-      }}
-    >
-      {children}
-    </button>
-  );
-}
-
-/**
- * Tiny diagnostic pill in the chat header showing whether retrieval
- * (memory **and** skills — they share the same embedding provider per
- * spec §13 Phase 3) is hybrid (vector + keyword) or keyword-only.
- * Helps users know when their semantic-near queries should work vs
- * when they need to use the actual words from the saved fact / skill
- * description.
- */
-function MemoryPill({ embedding }: { embedding: EmbeddingStatus | null }) {
-  if (!embedding) return null;
-  const hybrid = embedding.hybrid_enabled;
-  const provider = embedding.provider;
-  const label = hybrid ? provider : "keyword-only";
-  const LabelIcon = hybrid ? Layers : Search;
-  const tip = hybrid
-    ? `Hybrid retrieval (memory + skills): vector (${provider}) + BM25 keyword. Semantic-near queries work even with no shared words.`
-    : "FTS5 keyword-only (memory + skills). Set [embedding] in config.toml to enable hybrid retrieval.";
-  return (
-    <span
-      className="pill pill-stopped"
-      title={tip}
-      style={{
-        background: hybrid
-          ? "rgba(83, 58, 253, 0.08)"
-          : "var(--color-surface-muted)",
-        color: hybrid
-          ? "var(--color-stripe-purple)"
-          : "var(--color-body)",
-      }}
-    >
-      <LabelIcon size={12} className="shrink-0" aria-hidden="true" />
-      {label}
-    </span>
   );
 }
 
@@ -3355,8 +3621,7 @@ function ExportMenu({
     <span className="inline-flex items-center gap-1" title="Save this chat as a file">
       <Download size={16} className="shrink-0" aria-hidden="true" style={{ color: "var(--color-body)" }} />
       <select
-        className="input text-sm"
-        style={{ width: "auto", padding: "4px 8px" }}
+        className="composer-select"
         aria-label="export this chat"
         value=""
         disabled={!chat || busy}

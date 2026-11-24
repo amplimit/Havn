@@ -1132,6 +1132,28 @@ pub async fn is_channel_of_space(
     Ok(found)
 }
 
+/// The server group `child_id` is part of, with the newest title a group
+/// gave it (issue #287): a channel's, or a thread's, which is kept with
+/// its server too.
+pub async fn space_of(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    child_id: &str,
+) -> Result<Option<(String, String)>> {
+    let found: Option<(String, String)> = sqlx::query_as(
+        "SELECT parent_id, parent_title FROM channel_group_parents \
+         WHERE channel = ?1 AND account_id = ?2 AND child_id = ?3 AND parent_kind = 'space' \
+         ORDER BY noted_at DESC LIMIT 1",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(child_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(found)
+}
+
 /// Whether `id` was kept as a server (issue #285).
 pub async fn is_space(
     pool: &SqlitePool,
