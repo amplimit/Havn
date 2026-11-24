@@ -277,6 +277,7 @@ function Chat({ id }: { id: string }) {
   // The reader is at the bottom of the chat (within 80 pixels): it follows
   // what comes; scrolled up, it stays, with a button back to the latest.
   const atBottom = useRef(true);
+  const lastTop = useRef(0);
   const [away, setAway] = useState(false);
   // The reply's own text was on screen as it was written: the reply that
   // replaces it does not fade in again.
@@ -751,10 +752,38 @@ function Chat({ id }: { id: string }) {
   // As the reply being written grows, follow it, unless the user scrolled
   // up to read.
   const liveLength = live.reduce((n, p) => n + p.text.length + p.thinking.length, 0);
+  const following = useRef(0);
   useEffect(() => {
     const el = scrollRef.current;
-    if (el && liveLength > 0 && atBottom.current) el.scrollTo({ top: el.scrollHeight });
+    if (!el || liveLength === 0 || !atBottom.current || following.current) return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      el.scrollTop = el.scrollHeight;
+      return;
+    }
+    // It keeps easing while the reply's height still moves, and stops once
+    // the bottom has held for a quarter of a second.
+    let held = 0;
+    const ease = () => {
+      const gap = el.scrollHeight - el.clientHeight - el.scrollTop;
+      if (!atBottom.current) {
+        following.current = 0;
+        return;
+      }
+      if (gap <= 1) {
+        held += 1;
+        if (held > 15) {
+          following.current = 0;
+          return;
+        }
+      } else {
+        held = 0;
+        el.scrollTop += Math.max(1, gap * 0.2);
+      }
+      following.current = requestAnimationFrame(ease);
+    };
+    following.current = requestAnimationFrame(ease);
   }, [liveLength]);
+  useEffect(() => () => cancelAnimationFrame(following.current), []);
 
   // A file card, once per file.
   function addFile(url: string, name: string, caption: string | undefined, ts: number) {
@@ -1213,7 +1242,10 @@ function Chat({ id }: { id: string }) {
           ref={scrollRef}
           onScroll={(e) => {
             const el = e.currentTarget;
-            atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+            const up = el.scrollTop < lastTop.current - 2;
+            lastTop.current = el.scrollTop;
+            if (el.scrollHeight - el.scrollTop - el.clientHeight < 80) atBottom.current = true;
+            else if (up) atBottom.current = false;
             if (away === atBottom.current) setAway(!atBottom.current);
           }}
           className="relative flex-1 overflow-y-auto px-4 py-6 sm:px-8"
@@ -1352,7 +1384,10 @@ function Chat({ id }: { id: string }) {
               ),
             )}
             {pending && live.some((p) => p.thinking.trim() !== "") && (
-              <LiveThinking text={live.map((p) => p.thinking.trim()).filter(Boolean).join("\n\n")} />
+              <LiveThinking
+                text={live.map((p) => p.thinking.trim()).filter(Boolean).join("\n\n")}
+                active={!live.some((p) => p.text.trim() !== "")}
+              />
             )}
             {pending && live.some((p) => p.text.trim() !== "") && (
               <LiveBubble text={live.map((p) => p.text.trim()).filter(Boolean).join("\n\n")} />
@@ -2592,28 +2627,38 @@ function ChatModelMenus({
 }
 
 /** The reasoning of the reply being written, as it arrives. */
-function LiveThinking({ text }: { text: string }) {
+// Its head says what it is on now, its latest line, and while the model
+// still thinks, a highlight runs over it; a click folds the rest away.
+function LiveThinking({ text, active }: { text: string; active: boolean }) {
   const box = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const el = box.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [text]);
+  const lines = text.split("\n").filter((line) => line.trim() !== "");
+  const now = oneLine(lines[lines.length - 1] ?? "");
   return (
-    <div className="enter flex flex-col items-start">
-      <div
-        className="w-full py-1 text-xs"
-        style={{ color: "var(--color-body)" }}
-        aria-live="off"
+    <div className="enter w-full text-[13px]" style={{ color: "var(--color-body)" }} aria-live="off">
+      <Fold
+        opened
+        head={
+          <>
+            <Brain size={14} className="shrink-0" aria-hidden="true" style={{ color: "var(--color-stripe-purple-mid)" }} />
+            <span className={`min-w-0 truncate ${active ? "shimmer" : ""}`}>
+              <span className="font-medium">Thinking</span>
+              {now && <> · {now}</>}
+            </span>
+          </>
+        }
       >
-        <div className="mb-1 font-medium">thinking…</div>
         <div
           ref={box}
-          className="overflow-y-auto border-l-2 pl-3"
+          className="mb-1 ml-5 mt-1 overflow-y-auto border-l-2 pl-3"
           style={{ maxHeight: 160, whiteSpace: "pre-wrap", borderColor: "var(--color-border-default)" }}
         >
           {text}
         </div>
-      </div>
+      </Fold>
     </div>
   );
 }
@@ -2626,18 +2671,21 @@ function LiveThinking({ text }: { text: string }) {
 function Fold({
   head,
   onOpen,
+  opened = false,
   className,
   style,
   children,
 }: {
   head: React.ReactNode;
   onOpen?: () => void;
+  /** Open when it is first shown. */
+  opened?: boolean;
   className?: string;
   style?: React.CSSProperties;
   children: React.ReactNode;
 }) {
-  const [open, setOpen] = useState(false);
-  const [made, setMade] = useState(false);
+  const [open, setOpen] = useState(opened);
+  const [made, setMade] = useState(opened);
   const id = useId();
   return (
     <div className={className} style={style}>
@@ -3022,10 +3070,21 @@ function OwnerApproval({
 
 /** The reply as the model writes it, before the reply itself comes. */
 function LiveBubble({ text }: { text: string }) {
+  const inner = useRef<HTMLDivElement>(null);
+  const [height, setHeight] = useState<number | undefined>(undefined);
+  useEffect(() => {
+    const el = inner.current;
+    if (!el) return;
+    const watch = new ResizeObserver(() => setHeight(el.offsetHeight));
+    watch.observe(el);
+    return () => watch.disconnect();
+  }, []);
   return (
     <div className="enter flex flex-col items-start">
-      <div className="w-full" style={{ color: "var(--color-deep-navy)" }} aria-live="polite">
-        <Markdown>{text}</Markdown>
+      <div className="live-grow w-full" style={{ height }}>
+        <div ref={inner} style={{ color: "var(--color-deep-navy)" }} aria-live="polite">
+          <Markdown>{text}</Markdown>
+        </div>
       </div>
     </div>
   );
