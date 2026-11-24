@@ -83,7 +83,7 @@ fn map_proxy_error(e: ProxyError) -> ApiError {
         ProxyError::Transport(err) => ApiError::Upstream(format!("transport: {err}")),
         ProxyError::InvalidResponse(s) => ApiError::Upstream(format!("invalid response: {s}")),
         ProxyError::Db(err) => ApiError::Internal(err.to_string()),
-        ProxyError::UnknownProvider(p) => ApiError::BadRequest(format!("unknown provider: {p}")),
+        e @ ProxyError::UnknownProvider(_) => ApiError::BadRequest(e.to_string()),
         ProxyError::BudgetExhausted(reason) => {
             ApiError::Forbidden(format!("token budget exhausted: {reason}"))
         }

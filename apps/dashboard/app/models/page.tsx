@@ -6,6 +6,7 @@ import {
   ApiError,
   LLM_PROVIDERS as PROVIDERS,
   api,
+  endpointOf,
   modelName,
   thinkingChoices,
   type ModelCheck,
@@ -130,6 +131,7 @@ export default function ModelsPage() {
   }
 
   const editable = view?.editable ?? false;
+  const endpoints = view?.endpoints ?? [];
 
   return (
     <div className="mx-auto max-w-4xl px-4 py-8 sm:px-8 sm:py-12">
@@ -140,6 +142,9 @@ export default function ModelsPage() {
           of their own use the default: the one marked below, or the first.
           The list lives in <code className="font-mono">[[llm.models]]</code>{" "}
           of the gateway&apos;s config.toml; changes here are written there.
+          A local or other compatible server, set up in{" "}
+          <code className="font-mono">[llm.endpoints]</code> there, is a provider
+          too, and needs no key unless it asks for one.
           A model&apos;s price, in dollars per million tokens, gives what its
           calls cost on the usage page.
         </p>
@@ -214,11 +219,30 @@ export default function ModelsPage() {
                 onChange={(e) => setProvider(e.target.value)}
                 className="input"
               >
-                {PROVIDERS.map((p) => (
-                  <option key={p} value={p}>
-                    {p}
-                  </option>
-                ))}
+                {endpoints.length === 0 ? (
+                  PROVIDERS.map((p) => (
+                    <option key={p} value={p}>
+                      {p}
+                    </option>
+                  ))
+                ) : (
+                  <>
+                    <optgroup label="built-in">
+                      {PROVIDERS.map((p) => (
+                        <option key={p} value={p}>
+                          {p}
+                        </option>
+                      ))}
+                    </optgroup>
+                    <optgroup label="[llm.endpoints]">
+                      {endpoints.map((e) => (
+                        <option key={e.name} value={e.name}>
+                          {e.name} ({e.api} API)
+                        </option>
+                      ))}
+                    </optgroup>
+                  </>
+                )}
               </select>
             </div>
             <div className="md:col-span-3">
@@ -230,7 +254,9 @@ export default function ModelsPage() {
                 placeholder={
                   provider === "openrouter"
                     ? "deepseek/deepseek-v4.1-flash-1017"
-                    : "claude-sonnet-4-6"
+                    : endpointOf(view, provider)
+                      ? "the name the server gives it, e.g. qwen3:8b"
+                      : "claude-sonnet-4-6"
                 }
                 value={name}
                 onChange={(e) => setName(e.target.value)}
@@ -336,6 +362,7 @@ export default function ModelsPage() {
               </p>
               <ThinkingEditor
                 entry={m}
+                api={endpointOf(view, m.id.split(":")[0])?.api ?? m.id.split(":")[0]}
                 editable={editable && !busy}
                 onSave={(thinking) =>
                   save(
@@ -456,10 +483,13 @@ function MoreMenu({ label, children }: { label: string; children: React.ReactNod
  */
 function ThinkingEditor({
   entry,
+  api: speaks,
   editable,
   onSave,
 }: {
   entry: ModelEntry;
+  /** The built-in provider whose API the model's provider speaks. */
+  api: string;
   editable: boolean;
   onSave: (thinking: ThinkingSpec | undefined) => Promise<boolean>;
 }) {
@@ -499,7 +529,6 @@ function ThinkingEditor({
     }
   }
 
-  const provider = entry.id.split(":")[0];
   const muted = { color: "var(--color-body)" };
   if (!open) {
     return (
@@ -523,7 +552,7 @@ function ThinkingEditor({
           <option value="none">none: not asked to think</option>
           <option value="toggle">on or off</option>
           <option value="effort">by level</option>
-          {provider !== "openai" && <option value="budget">by token budget</option>}
+          {speaks !== "openai" && <option value="budget">by token budget</option>}
         </select>
       </label>
       {(style === "effort" || style === "budget") && (

@@ -39,6 +39,18 @@ pub struct ModelsView {
     #[serde(default)]
     pub title_model: Option<String>,
     pub models: Vec<ModelEntry>,
+    /// The gateway's `[llm.endpoints]` (issue #232); none from a gateway
+    /// from before them.
+    #[serde(default)]
+    pub endpoints: Vec<EndpointView>,
+}
+
+/// An `[llm.endpoints]` entry: models name it as their provider.
+#[derive(Debug, Deserialize)]
+pub struct EndpointView {
+    pub name: String,
+    /// `anthropic` or `openai`.
+    pub api: String,
 }
 
 // `version` is the one the list was read at: the gateway refuses the write
@@ -68,6 +80,7 @@ pub async fn list() -> anyhow::Result<()> {
             "no models — `havn model add <provider>:<model>` to add one, e.g. \
              `havn model add anthropic:claude-sonnet-4-6`"
         );
+        print_endpoints(&view.endpoints);
         return Ok(());
     }
     for m in &view.models {
@@ -97,7 +110,19 @@ pub async fn list() -> anyhow::Result<()> {
         };
         println!("{}{label}{limit}{vision}{default}{title}", m.id);
     }
+    print_endpoints(&view.endpoints);
     Ok(())
+}
+
+fn print_endpoints(endpoints: &[EndpointView]) {
+    if endpoints.is_empty() {
+        return;
+    }
+    let named: Vec<String> = endpoints
+        .iter()
+        .map(|e| format!("{} ({} API)", e.name, e.api))
+        .collect();
+    println!("endpoints of [llm.endpoints]: {}", named.join(", "));
 }
 
 pub async fn add(

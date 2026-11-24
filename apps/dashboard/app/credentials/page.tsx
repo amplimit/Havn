@@ -9,6 +9,7 @@ import {
   LLM_PROVIDERS,
   SEARCH_PROVIDERS,
   type CredentialView,
+  type ModelEndpoint,
   type SearchStatus,
 } from "@/lib/api";
 import { SkeletonList } from "@/components/SkeletonList";
@@ -17,6 +18,7 @@ export default function CredentialsPage() {
   const [creds, setCreds] = useState<CredentialView[] | null>(null);
   // Null until loaded, and when the gateway predates GET /search.
   const [search, setSearch] = useState<SearchStatus | null>(null);
+  const [endpoints, setEndpoints] = useState<ModelEndpoint[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -52,6 +54,12 @@ export default function CredentialsPage() {
     api.search.get().then(
       (s) => {
         if (!cancelled) setSearch(s);
+      },
+      () => {},
+    );
+    api.models.get().then(
+      (m) => {
+        if (!cancelled) setEndpoints(m.endpoints ?? []);
       },
       () => {},
     );
@@ -157,6 +165,16 @@ export default function CredentialsPage() {
                   </option>
                 ))}
               </optgroup>
+              {endpoints.length > 0 && (
+                <optgroup label="[llm.endpoints], if it asks for a key">
+                  {/* Stored as llm:<name>, the only name the gateway looks it up by. */}
+                  {endpoints.map((e) => (
+                    <option key={e.name} value={`llm:${e.name}`}>
+                      {e.name}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
               <optgroup label="web search">
                 {SEARCH_PROVIDERS.map((p) => (
                   <option key={p} value={`search:${p}`}>

@@ -820,6 +820,10 @@ fn models_verdict(
     let mut missing: Vec<&str> = Vec::new();
     for m in &view.models {
         let provider = m.id.split_once(':').map_or("", |(p, _)| p);
+        // An endpoint is called without a key when there is none.
+        if view.endpoints.iter().any(|e| e.name == provider) {
+            continue;
+        }
         let covered = creds.iter().any(|c| {
             c.enabled && c.provider.strip_prefix("llm:").unwrap_or(&c.provider) == provider
         });
@@ -893,6 +897,7 @@ mod tests {
                     price: None,
                 })
                 .collect(),
+            endpoints: Vec::new(),
         }
     }
 
@@ -929,6 +934,14 @@ mod tests {
             matches!(v, Verdict::Ok),
             "unreadable credentials are not missing: {msg}"
         );
+        // An endpoint's model needs no key.
+        let mut local = view(&["ollama:qwen3"]);
+        local.endpoints.push(crate::model::EndpointView {
+            name: "ollama".into(),
+            api: "openai".into(),
+        });
+        let (v, msg) = models_verdict(&local, Some(&[]));
+        assert!(matches!(v, Verdict::Ok), "{msg}");
     }
 
     #[test]

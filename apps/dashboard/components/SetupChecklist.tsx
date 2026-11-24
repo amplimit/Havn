@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 import { Circle, CircleCheck, TriangleAlert } from "lucide-react";
 import {
   api,
+  endpointOf,
   keyScopes,
   modelProvider,
   reachable,
@@ -48,11 +49,16 @@ export function SetupChecklist({
 
   const providers = setup?.providers;
   const models = setup?.models;
-  const anyKey = (providers?.size ?? 0) > 0;
+  const defaultProvider = modelProvider(models?.effective_default);
+  // A default model of an [llm.endpoints] server needs no key.
+  const keyless = endpointOf(models, defaultProvider) !== undefined;
+  const anyKey = (providers?.size ?? 0) > 0 || keyless;
   const hasModel = (models?.models.length ?? 0) > 0;
   const hasAgent = (agentCount ?? 0) > 0;
-  const defaultProvider = modelProvider(models?.effective_default);
-  const keyDone = hasModel && defaultProvider ? providers?.has(defaultProvider) === true : anyKey;
+  const keyDone =
+    hasModel && defaultProvider
+      ? keyless || providers?.has(defaultProvider) === true
+      : anyKey;
   const decided = agentCount !== null && (setup !== null || failed);
   const visible = setup !== null && agentCount !== null && !(anyKey && hasModel && hasAgent);
 

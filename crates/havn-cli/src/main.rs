@@ -395,7 +395,8 @@ enum ModelAction {
     /// List the models agents may use; the default is marked.
     List,
     /// Add a model as provider:model, e.g. `anthropic:claude-sonnet-4-6`
-    /// or `openrouter:deepseek/deepseek-v4.1-flash-1017`.
+    /// or `openrouter:deepseek/deepseek-v4.1-flash-1017`; an endpoint of
+    /// `[llm.endpoints]` is a provider too, as in `ollama:qwen3`.
     Add {
         id: String,
         /// Name shown in the dashboard.

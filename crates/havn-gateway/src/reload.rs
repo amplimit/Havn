@@ -89,6 +89,12 @@ pub const RULES: &[ReloadRule] = &[
         prefix: "llm.title_model",
         kind: ReloadKind::Hot,
     },
+    // The proxy calls the endpoints it started with (issue #232); a model
+    // list naming others is not taken until a restart.
+    ReloadRule {
+        prefix: "llm.endpoints",
+        kind: ReloadKind::Restart,
+    },
     ReloadRule {
         prefix: "workspace.browse",
         kind: ReloadKind::Hot,
@@ -220,6 +226,9 @@ pub struct ReloadHandles {
     pub attachments: Arc<ArcSwap<crate::config::AttachmentLimits>>,
     /// `[channels]`: the accounts and who may reach them.
     pub channels: Arc<ArcSwap<std::collections::BTreeMap<String, crate::config::ChannelEntry>>>,
+    /// `[llm.endpoints]` as the gateway started with them, which a reloaded
+    /// model list may name.
+    pub endpoints: Arc<crate::config::Endpoints>,
 }
 
 impl ReloadHandles {
@@ -232,6 +241,7 @@ impl ReloadHandles {
             transcription: Arc::new(ArcSwap::from_pointee(cfg.transcription.clone())),
             attachments: Arc::new(ArcSwap::from_pointee(cfg.attachments.clone())),
             channels: Arc::new(ArcSwap::from_pointee(cfg.channels.clone())),
+            endpoints: Arc::new(cfg.llm.endpoints.clone()),
         }
     }
 
@@ -251,6 +261,16 @@ impl ReloadHandles {
                 || path.starts_with("llm.title_model")
             {
                 let catalog = new.llm.catalog();
+                // Of the endpoints the proxy runs with: an endpoint added,
+                // removed or changed since takes a restart.
+                if let Err(e) = catalog.validate(&self.endpoints) {
+                    warn!(
+                        error = %e,
+                        "the model list was not reloaded: it needs [llm.endpoints] the gateway \
+                         does not run yet; run `havn gateway restart` to apply it"
+                    );
+                    continue;
+                }
                 info!(
                     models = catalog.models.len(),
                     default = ?catalog.default_entry().map(|m| m.id.as_str()),
@@ -601,6 +621,45 @@ mod tests {
         );
         let plan = ReloadPlan::build(&changed);
         assert!(plan.restart_paths.is_empty(), "{changed:?}");
+        handles.apply_hot(&new, &plan.hot_paths);
+        assert_eq!(*handles.models.load_full(), new.llm.catalog());
+    }
+
+    #[test]
+    fn endpoints_take_a_restart_and_a_list_of_others_waits_for_it() {
+        let old = GatewayConfig::default();
+        let handles = ReloadHandles::from_config(&old);
+        let mut new = old.clone();
+        new.llm.endpoints.0.insert(
+            "ollama".into(),
+            crate::config::Endpoint {
+                api: crate::config::EndpointApi::Openai,
+                base_url: "http://127.0.0.1:11434/v1".into(),
+            },
+        );
+        new.llm.models = vec![serde_json::from_value(json!({"id": "ollama:qwen3"})).unwrap()];
+        let changed = diff_paths(
+            &serde_json::to_value(&old).unwrap(),
+            &serde_json::to_value(&new).unwrap(),
+        );
+        let plan = ReloadPlan::build(&changed);
+        assert_eq!(
+            plan.restart_paths,
+            vec!["llm.endpoints.ollama"],
+            "{changed:?}"
+        );
+        assert_eq!(plan.hot_paths, vec!["llm.models"]);
+        handles.apply_hot(&new, &plan.hot_paths);
+        assert_eq!(
+            *handles.models.load_full(),
+            old.llm.catalog(),
+            "not taken before the restart"
+        );
+
+        // Started with the endpoint, the list is taken.
+        let mut running = old.clone();
+        running.llm.endpoints = new.llm.endpoints.clone();
+        let handles = ReloadHandles::from_config(&running);
         handles.apply_hot(&new, &plan.hot_paths);
         assert_eq!(*handles.models.load_full(), new.llm.catalog());
     }

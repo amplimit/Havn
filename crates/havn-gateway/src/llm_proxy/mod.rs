@@ -30,7 +30,7 @@ pub use provider::TextSink;
 
 use std::borrow::Cow;
 
-use havn_core::{AgentId, BudgetExhaustAction, BudgetPolicy, TeamId, UserId};
+use havn_core::{AgentId, BudgetExhaustAction, BudgetPolicy, CredentialId, TeamId, UserId};
 use havn_db::repo::credential_usage::{self, Caps, Reservation};
 use havn_db::repo::credentials::Credential;
 use serde::{Deserialize, Serialize};
@@ -273,7 +273,10 @@ pub enum ProxyError {
     Db(#[from] havn_db::DbError),
     #[error("invalid response body: {0}")]
     InvalidResponse(String),
-    #[error("unknown provider: {0:?}")]
+    #[error(
+        "unknown provider {0:?}: not built in, nor an endpoint of [llm.endpoints] the gateway \
+         runs (one added to config.toml takes `havn gateway restart`)"
+    )]
     UnknownProvider(String),
     #[error("token budget exhausted: {0}")]
     BudgetExhausted(String),
@@ -381,6 +384,17 @@ fn route<'a>(
     max_output_tokens: Option<u32>,
     llm: &'a LlmConfig,
 ) -> Result<Route<'a>, ProxyError> {
+    if let Some(endpoint) = llm.endpoints.get(provider_name)
+        && !is_provider(provider_name)
+    {
+        return Ok(Route {
+            provider: endpoint_provider(endpoint.api),
+            name: provider_name,
+            base_url: &endpoint.base_url,
+            max_output_tokens,
+            keyless: true,
+        });
+    }
     let provider = dispatch_provider(provider_name)?;
     Ok(Route {
         provider,
@@ -390,18 +404,32 @@ fn route<'a>(
             .get(provider_name)
             .map_or(provider.default_base_url(), |url| url.trim_end_matches('/')),
         max_output_tokens,
+        keyless: false,
     })
 }
 
+/// The implementation an `[llm.endpoints]` server of `api` is called with.
+fn endpoint_provider(api: crate::config::EndpointApi) -> &'static dyn LlmProvider {
+    static ANTHROPIC: anthropic::AnthropicProvider = anthropic::AnthropicProvider;
+    static COMPATIBLE: openai::OpenAiProvider = openai::OpenAiProvider::COMPATIBLE;
+    match api {
+        crate::config::EndpointApi::Anthropic => &ANTHROPIC,
+        crate::config::EndpointApi::Openai => &COMPATIBLE,
+    }
+}
+
 /// The provider implementation a call goes through, the provider name
-/// its credentials are stored under, the API base URL it calls, and the
-/// model's output limit from `[[llm.models]]`, if it sets one.
+/// its credentials are stored under, the API base URL it calls, the
+/// model's output limit from `[[llm.models]]`, if it sets one, and whether
+/// it is called without a key when there is none: an endpoint's is
+/// optional, as a local server takes none.
 #[derive(Clone, Copy)]
 struct Route<'a> {
     provider: &'a dyn LlmProvider,
     name: &'a str,
     base_url: &'a str,
     max_output_tokens: Option<u32>,
+    keyless: bool,
 }
 
 fn with_max_tokens(request: &AnthropicRequest, max_tokens: u32) -> Cow<'_, AnthropicRequest> {
@@ -440,10 +468,23 @@ async fn complete_through(
     let request = with_max_tokens(request, max_tokens);
     let request = request.as_ref();
 
-    let chain = resolve_for_user(db, billing.user_id, billing.agent_team, route.name).await?;
-    if chain.is_empty() {
+    // An endpoint's keys are `llm:<name>` only: a bare name may be any
+    // other kind of key's.
+    let lookup = if route.keyless {
+        format!("llm:{}", route.name)
+    } else {
+        route.name.to_string()
+    };
+    let chain = resolve_for_user(db, billing.user_id, billing.agent_team, &lookup).await?;
+    // An endpoint the caller has no key for is called without one (issue
+    // #232): a local server takes none.
+    let chain: Vec<Option<Credential>> = if !chain.is_empty() {
+        chain.into_iter().map(Some).collect()
+    } else if route.keyless {
+        vec![None]
+    } else {
         return Err(ProxyError::NoCredential(route.name.to_string()));
-    }
+    };
 
     // Each attempt first reserves the request's worst case (estimated
     // input plus `max_tokens`) against the credential's caps and the
@@ -458,17 +499,22 @@ async fn complete_through(
     let mut sent = false;
     // The last failure that passes, the calls made, and since when.
     let mut passing: Option<String> = None;
+    // An endpoint's last refusal that does not pass, with its status: said
+    // as it is, with how to add a key, rather than as no credential.
+    let mut refused: Option<(u16, String)> = None;
     let mut tries = 0_u32;
     let started = std::time::Instant::now();
     for cred in chain {
+        let cred_id = cred.as_ref().map(|c| c.id);
+        let shown = cred_id.map_or_else(|| "none".to_string(), |id| id.to_string());
         let caps = Caps {
             agent_tokens,
-            ..credential_caps(&cred)
+            ..cred.as_ref().map(credential_caps).unwrap_or_default()
         };
         let day_start = today_start_utc_rfc3339();
         let minute_start = minute_ago_utc_rfc3339();
         let reservation = Reservation {
-            credential_id: cred.id,
+            credential_id: cred_id,
             user_id: billing.user_id,
             agent_id: billing.agent_id,
             provider: route.name,
@@ -486,7 +532,7 @@ async fn complete_through(
                 db_failure = None;
                 let refusal = refusal(
                     db,
-                    &cred,
+                    cred_id,
                     billing,
                     caps,
                     tokens_in + min_tokens_out,
@@ -494,7 +540,7 @@ async fn complete_through(
                 )
                 .await;
                 warn!(
-                    credential_id = %cred.id,
+                    credential_id = %shown,
                     user_id = %billing.user_id,
                     reason = %refusal.reason,
                     "token caps leave no room for this request; skipping credential"
@@ -508,7 +554,7 @@ async fn complete_through(
             }
             Err(e) => {
                 warn!(
-                    credential_id = %cred.id,
+                    credential_id = %shown,
                     error = %e,
                     "token reservation failed; skipping credential"
                 );
@@ -533,7 +579,8 @@ async fn complete_through(
             }
             sent = true;
             tries += 1;
-            let attempt = try_one(http, keyring, route, &cred, &attempt_request, text).await;
+            let attempt =
+                try_one(http, keyring, route, cred.as_ref(), &attempt_request, text).await;
             if let Attempt::TryNext {
                 reason,
                 again: Some(asked),
@@ -547,7 +594,7 @@ async fn complete_through(
                 {
                     again += 1;
                     warn!(
-                        credential_id = %cred.id,
+                        credential_id = %shown,
                         %reason,
                         wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
                         "provider failed for now; trying again"
@@ -562,7 +609,7 @@ async fn complete_through(
             Attempt::Ok(resp) => {
                 if resp.usage.unreported {
                     warn!(
-                        credential_id = %cred.id,
+                        credential_id = %shown,
                         model = %resp.model,
                         "provider reported no token usage; keeping the reservation as usage"
                     );
@@ -571,30 +618,35 @@ async fn complete_through(
                     guard.settle(&resp).await;
                 }
                 info!(
-                    credential_id = %cred.id,
+                    credential_id = %shown,
                     provider = route.name,
                     model = %resp.model,
                     in = resp.usage.total_input_tokens(),
                     out = resp.usage.output_tokens,
                     "llm proxy ok"
                 );
-                warn_over_agent_budget(db, &cred, billing, (&day_start, &minute_start)).await;
+                warn_over_agent_budget(db, cred_id, billing, (&day_start, &minute_start)).await;
                 return Ok(resp);
             }
             Attempt::Disable { reason } => {
                 guard.release().await;
-                warn!(credential_id = %cred.id, %reason, "disabling credential");
-                let _ = havn_db::repo::credentials::set_enabled(db, cred.id, false)
-                    .await
-                    .map_err(|e| warn!(error = %e, "failed to disable credential"));
+                if let Some(id) = cred_id {
+                    warn!(credential_id = %shown, %reason, "disabling credential");
+                    let _ = havn_db::repo::credentials::set_enabled(db, id, false)
+                        .await
+                        .map_err(|e| warn!(error = %e, "failed to disable credential"));
+                }
+                refused = Some((401, reason));
             }
             Attempt::TryNext {
                 reason, transient, ..
             } => {
                 guard.release().await;
-                warn!(credential_id = %cred.id, %reason, "skipping credential, trying next");
+                warn!(credential_id = %shown, %reason, "skipping credential, trying next");
                 if transient {
                     passing = Some(reason);
+                } else {
+                    refused = Some((402, reason));
                 }
             }
             Attempt::Fatal(e) => {
@@ -618,6 +670,23 @@ async fn complete_through(
             provider: route.name.to_string(),
             reason: short_reason(&reason),
             tries,
+        });
+    }
+    if route.keyless
+        && let Some((status, reason)) = refused
+    {
+        let hint = if status == 401 {
+            format!(
+                "; the endpoint wants a key it takes: add one with `havn credential add llm:{} \
+                 <key>`",
+                route.name
+            )
+        } else {
+            String::new()
+        };
+        return Err(ProxyError::Upstream {
+            status,
+            message: format!("{reason}{hint}"),
         });
     }
     Err(exhausted.map_or_else(
@@ -766,7 +835,7 @@ struct Refusal {
 /// read of the totals (not atomic with the reservation; for messages only).
 async fn refusal(
     db: &SqlitePool,
-    cred: &Credential,
+    cred_id: Option<CredentialId>,
     billing: &Billing,
     caps: Caps,
     needed: i64,
@@ -774,7 +843,7 @@ async fn refusal(
 ) -> Refusal {
     let totals = credential_usage::totals(
         db,
-        cred.id,
+        cred_id,
         billing.user_id,
         billing.agent_id,
         day_start,
@@ -825,7 +894,7 @@ async fn refusal(
 /// once the agent has gone over.
 async fn warn_over_agent_budget(
     db: &SqlitePool,
-    cred: &Credential,
+    cred_id: Option<CredentialId>,
     billing: &Billing,
     (day_start, minute_start): (&str, &str),
 ) {
@@ -838,7 +907,7 @@ async fn warn_over_agent_budget(
     }
     if let Ok(totals) = credential_usage::totals(
         db,
-        cred.id,
+        cred_id,
         billing.user_id,
         billing.agent_id,
         day_start,
@@ -2190,6 +2259,8 @@ pub const PROVIDERS: &[&str] = &[
     gemini::GeminiProvider::NAME,
 ];
 
+/// Whether `name` is a built-in provider; an `[llm.endpoints]` one is
+/// not, and may not take a built-in one's name.
 #[must_use]
 pub fn is_provider(name: &str) -> bool {
     dispatch_provider(name).is_ok()
@@ -2218,7 +2289,7 @@ async fn try_one(
     http: &reqwest::Client,
     keyring: &KeyRing,
     route: Route<'_>,
-    cred: &Credential,
+    cred: Option<&Credential>,
     request: &AnthropicRequest,
     text: Option<&provider::TextSink>,
 ) -> Attempt {
@@ -2226,10 +2297,12 @@ async fn try_one(
     // before sending. Decrypt errors collapse to "credential malformed
     // / wrong key" without leaking which — the operator's recourse is
     // the same either way (fix the env, restart). Disable the credential
-    // so the resolver doesn't keep grinding on it.
-    let plaintext = match keyring.decrypt(&cred.api_key_ciphertext) {
-        Ok(p) => p,
-        Err(e) => {
+    // so the resolver doesn't keep grinding on it. Without a credential,
+    // the call goes without a key.
+    let plaintext = match cred.map(|c| keyring.decrypt(&c.api_key_ciphertext)) {
+        None => Vec::new(),
+        Some(Ok(p)) => p,
+        Some(Err(e)) => {
             return Attempt::Disable {
                 reason: format!(
                     "could not decrypt api_key — wrong HAVN_AGE_KEY or corrupted row ({e})"
@@ -3502,11 +3575,12 @@ mod tests {
         use super::super::provider::ProviderError;
         use super::super::*;
 
-        const PASSPHRASE: &str = "budget-tests";
+        pub(super) const PASSPHRASE: &str = "budget-tests";
         const CEILING: u32 = 128_000;
 
-        /// Encrypting calibrates scrypt to about a second; do it once.
-        fn ciphertext() -> &'static [u8] {
+        /// `sk-test`, encrypted with [`PASSPHRASE`]. Encrypting calibrates
+        /// scrypt to about a second; do it once.
+        pub(super) fn ciphertext() -> &'static [u8] {
             static CIPHERTEXT: OnceLock<Vec<u8>> = OnceLock::new();
             CIPHERTEXT.get_or_init(|| {
                 KeyRing::from_passphrase(PASSPHRASE)
@@ -3674,6 +3748,7 @@ mod tests {
                     name: "anthropic",
                     base_url: provider.default_base_url(),
                     max_output_tokens: None,
+                    keyless: false,
                 },
                 billing,
                 request,
@@ -3944,6 +4019,297 @@ mod tests {
             let tool_use = json!([{"type": "tool_use", "id": "t", "name": "n", "input":
                 {"type": "image", "source": {"data": "A".repeat(100_000)}}}]);
             assert!(estimate(tool_use) > 50_000);
+        }
+    }
+
+    mod endpoints {
+        #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+        use std::sync::{Arc, Mutex};
+
+        use axum::http::{HeaderMap, StatusCode, Uri};
+        use havn_db::repo::credentials::{CredentialScope, NewCredential, create as create_cred};
+        use havn_db::repo::users::{NewUser, create as create_user};
+        use serde_json::{Value, json};
+
+        use super::super::*;
+        use super::budgets::{PASSPHRASE, ciphertext};
+        use crate::config::{Endpoint, EndpointApi, Endpoints};
+
+        /// The path, headers and body of each call a server was sent.
+        type Seen = Arc<Mutex<Vec<(String, HeaderMap, Value)>>>;
+
+        /// A server of both APIs that answers every call with `status`.
+        async fn serve(status: StatusCode) -> (String, Seen) {
+            let seen: Seen = Arc::default();
+            let record = Arc::clone(&seen);
+            let app = axum::Router::new().fallback(
+                move |uri: Uri, headers: HeaderMap, body: axum::Json<Value>| {
+                    let record = Arc::clone(&record);
+                    async move {
+                        let path = uri.path().to_string();
+                        let reply = if path.ends_with("/chat/completions") {
+                            json!({"id": "c1", "model": "qwen3", "choices": [{"index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop"}],
+                                "usage": {"prompt_tokens": 3, "completion_tokens": 1}})
+                        } else {
+                            json!({"id": "msg_1", "model": "claude-x", "role": "assistant",
+                                "content": [{"type": "text", "text": "ok"}],
+                                "stop_reason": "end_turn",
+                                "usage": {"input_tokens": 3, "output_tokens": 1}})
+                        };
+                        record.lock().unwrap().push((path, headers, body.0));
+                        (status, axum::Json(reply))
+                    }
+                },
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(async move { axum::serve(listener, app).await });
+            (format!("http://{addr}"), seen)
+        }
+
+        /// `ollama` of the OpenAI API and `lan` of Anthropic's, at `base`.
+        fn llm(base: &str) -> LlmConfig {
+            let mut endpoints = Endpoints::default();
+            endpoints.0.insert(
+                "ollama".into(),
+                Endpoint {
+                    api: EndpointApi::Openai,
+                    base_url: format!("{base}/v1"),
+                },
+            );
+            endpoints.0.insert(
+                "lan".into(),
+                Endpoint {
+                    api: EndpointApi::Anthropic,
+                    base_url: format!("{base}/lan"),
+                },
+            );
+            LlmConfig {
+                endpoints,
+                ..LlmConfig::default()
+            }
+        }
+
+        fn hi() -> AnthropicRequest {
+            AnthropicRequest {
+                model: "qwen3".into(),
+                max_tokens: 64,
+                reasoning: None,
+                messages: vec![AnthropicMessage {
+                    role: "user".into(),
+                    content: json!("hi"),
+                }],
+                system: None,
+                temperature: None,
+                tools: None,
+                system_stable: 0,
+            }
+        }
+
+        async fn call(
+            db: &SqlitePool,
+            user: UserId,
+            provider: &str,
+            llm: &LlmConfig,
+            request: &AnthropicRequest,
+        ) -> Result<AnthropicResponse, ProxyError> {
+            complete_with_provider(
+                db,
+                &http_client().expect("client"),
+                &KeyRing::from_passphrase(PASSPHRASE),
+                &Billing::user(user),
+                provider,
+                None,
+                request,
+                llm,
+            )
+            .await
+        }
+
+        async fn rows(db: &SqlitePool) -> Vec<(Option<String>, String)> {
+            sqlx::query_as("SELECT credential_id, provider FROM credential_usages")
+                .fetch_all(db)
+                .await
+                .expect("rows")
+        }
+
+        #[test]
+        fn an_endpoint_is_called_at_its_url_as_its_api_is() {
+            let llm = llm("http://127.0.0.1:9");
+            let r = route("ollama", Some(100), &llm).expect("route");
+            assert_eq!(
+                (r.name, r.base_url, r.keyless, r.provider.name()),
+                ("ollama", "http://127.0.0.1:9/v1", true, "openai")
+            );
+            assert_eq!(r.max_output_tokens, Some(100));
+            let r = route("lan", None, &llm).expect("route");
+            assert_eq!(
+                (r.base_url, r.provider.name()),
+                ("http://127.0.0.1:9/lan", "anthropic")
+            );
+            let r = route("openai", None, &llm).expect("route");
+            assert_eq!(
+                (r.base_url, r.keyless),
+                ("https://api.openai.com/v1", false)
+            );
+            assert!(matches!(
+                route("nobody", None, &llm),
+                Err(ProxyError::UnknownProvider(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn an_endpoint_without_a_key_is_called_without_one() {
+            let (base, seen) = serve(StatusCode::OK).await;
+            let db = havn_db::connect_in_memory().await.expect("db");
+            let user = create_user(&db, NewUser { display_name: "u" })
+                .await
+                .expect("user")
+                .id;
+            let llm = llm(&base);
+            let mut request = hi();
+            request.reasoning = Some(Reasoning::Effort("high".into()));
+            call(&db, user, "ollama", &llm, &request)
+                .await
+                .expect("answer");
+            let (path, headers, body) = seen.lock().unwrap().pop().expect("a call");
+            assert_eq!(path, "/v1/chat/completions");
+            assert!(headers.get("authorization").is_none(), "{headers:?}");
+            assert!(headers.get("http-referer").is_none(), "{headers:?}");
+            // As local servers take them.
+            assert_eq!(body["max_tokens"], 64);
+            assert!(body.get("max_completion_tokens").is_none(), "{body}");
+            assert_eq!(body["reasoning_effort"], "high");
+            // Its use is recorded, without a credential.
+            assert_eq!(rows(&db).await, vec![(None, "ollama".to_string())]);
+
+            call(&db, user, "lan", &llm, &hi()).await.expect("answer");
+            let (path, headers, _) = seen.lock().unwrap().pop().expect("a call");
+            assert_eq!(path, "/lan/v1/messages");
+            assert!(headers.get("x-api-key").is_none(), "{headers:?}");
+            assert!(headers.get("anthropic-version").is_some());
+
+            // A built-in provider still needs a key.
+            let err = call(&db, user, "openai", &llm, &hi())
+                .await
+                .expect_err("no key");
+            assert!(matches!(err, ProxyError::NoCredential(_)), "{err}");
+        }
+
+        async fn key(db: &SqlitePool, user: UserId, provider: &str) {
+            create_cred(
+                db,
+                NewCredential {
+                    scope: CredentialScope::User,
+                    scope_id: &user.to_string(),
+                    provider,
+                    name: None,
+                    api_key_ciphertext: ciphertext(),
+                    priority: 1,
+                    limits: json!({}),
+                },
+            )
+            .await
+            .expect("credential");
+        }
+
+        #[tokio::test]
+        async fn an_endpoint_s_key_is_the_one_stored_as_llm_and_its_name() {
+            let (base, seen) = serve(StatusCode::OK).await;
+            let db = havn_db::connect_in_memory().await.expect("db");
+            let user = create_user(&db, NewUser { display_name: "u" })
+                .await
+                .expect("user")
+                .id;
+            key(&db, user, "llm:ollama").await;
+            // A bare name could be any other key's: not looked up.
+            key(&db, user, "lan").await;
+            let llm = llm(&base);
+            call(&db, user, "ollama", &llm, &hi())
+                .await
+                .expect("answer");
+            let (_, headers, _) = seen.lock().unwrap().pop().expect("a call");
+            assert_eq!(headers["authorization"], "Bearer sk-test");
+            call(&db, user, "lan", &llm, &hi()).await.expect("answer");
+            let (_, headers, _) = seen.lock().unwrap().pop().expect("a call");
+            assert!(headers.get("x-api-key").is_none(), "{headers:?}");
+            let creds: Vec<(bool, String)> = rows(&db)
+                .await
+                .into_iter()
+                .map(|(cred, provider)| (cred.is_some(), provider))
+                .collect();
+            assert_eq!(
+                creds,
+                vec![(true, "ollama".to_string()), (false, "lan".to_string())]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_streamed_call_without_a_key_sends_none() {
+            let (base, seen) = serve(StatusCode::OK).await;
+            let db = havn_db::connect_in_memory().await.expect("db");
+            let user = create_user(&db, NewUser { display_name: "u" })
+                .await
+                .expect("user")
+                .id;
+            let llm = llm(&base);
+            let streamed = Arc::new(Mutex::new(String::new()));
+            let into = Arc::clone(&streamed);
+            let sink = move |event: provider::TextEvent<'_>| {
+                if let provider::TextEvent::Text(piece) = event {
+                    into.lock().unwrap().push_str(piece);
+                }
+            };
+            for endpoint in ["ollama", "lan"] {
+                stream_with_provider(
+                    &db,
+                    &http_client().expect("client"),
+                    &KeyRing::from_passphrase(PASSPHRASE),
+                    &Billing::user(user),
+                    endpoint,
+                    None,
+                    &hi(),
+                    &llm,
+                    &sink,
+                )
+                .await
+                .expect("answer");
+                let (_, headers, body) = seen.lock().unwrap().pop().expect("a call");
+                assert_eq!(body["stream"], true, "{endpoint}");
+                assert!(headers.get("authorization").is_none(), "{headers:?}");
+                assert!(headers.get("x-api-key").is_none(), "{headers:?}");
+            }
+            assert_eq!(*streamed.lock().unwrap(), "okok");
+        }
+
+        #[tokio::test]
+        async fn an_endpoint_that_wants_a_key_says_how_to_add_one() {
+            let (base, _) = serve(StatusCode::UNAUTHORIZED).await;
+            let db = havn_db::connect_in_memory().await.expect("db");
+            let user = create_user(&db, NewUser { display_name: "u" })
+                .await
+                .expect("user")
+                .id;
+            let wants_a_key = |err: &ProxyError| {
+                matches!(err, ProxyError::Upstream { status: 401, message }
+                    if message.contains("havn credential add llm:ollama"))
+            };
+            let err = call(&db, user, "ollama", &llm(&base), &hi())
+                .await
+                .expect_err("401");
+            assert!(wants_a_key(&err), "{err}");
+            assert!(rows(&db).await.is_empty(), "the reservation is released");
+            // A key it refuses is disabled, and said the same way.
+            key(&db, user, "llm:ollama").await;
+            let err = call(&db, user, "ollama", &llm(&base), &hi())
+                .await
+                .expect_err("401");
+            assert!(wants_a_key(&err), "{err}");
         }
     }
 }
