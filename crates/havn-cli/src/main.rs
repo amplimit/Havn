@@ -75,14 +75,18 @@ enum Command {
     Doctor,
     /// Install the latest release of Havn (or `--version`) over this one,
     /// and restart the gateway on it; the old binaries are put back when it
-    /// does not start. Needs to write where these binaries are (root).
+    /// does not start. Then the same for each channel adapter on this
+    /// machine, from its own latest release. Needs root.
     Update {
-        /// The release to install, such as v0.2.9.
+        /// The gateway's release to install, such as v0.2.9.
         #[arg(long)]
         version: Option<String>,
-        /// Only say whether a newer release is out.
+        /// Only say which newer releases are out.
         #[arg(long)]
         check: bool,
+        /// Update only the gateway, not the channel adapters.
+        #[arg(long, value_name = "COMPONENT", value_parser = ["gateway"])]
+        only: Option<String>,
         /// Do not back up first (by default a backup is written to the home
         /// directory, as `havn backup` writes one).
         #[arg(long)]
@@ -494,9 +498,16 @@ fn main() -> anyhow::Result<()> {
         Command::Update {
             version,
             check,
+            only,
             no_backup,
             allow_downgrade,
-        } => async_runtime()?.block_on(run_update(version, check, !no_backup, allow_downgrade)),
+        } => async_runtime()?.block_on(run_update(
+            version,
+            check,
+            !no_backup,
+            allow_downgrade,
+            only.is_some(),
+        )),
         Command::Backup { output } => async_runtime()?.block_on(run_backup(output)),
         Command::Restore { archive, force } => run_restore(&archive, force),
         Command::Agent { action } => async_runtime()?.block_on(run_agent(action)),
@@ -648,8 +659,9 @@ async fn run_update(
     check: bool,
     backup: bool,
     downgrade: bool,
+    only_gateway: bool,
 ) -> anyhow::Result<()> {
-    update::run(version, check, backup, downgrade).await
+    update::run(version, check, backup, downgrade, only_gateway).await
 }
 
 #[cfg(not(unix))]
@@ -658,6 +670,7 @@ async fn run_update(
     _check: bool,
     _backup: bool,
     _downgrade: bool,
+    _only_gateway: bool,
 ) -> anyhow::Result<()> {
     anyhow::bail!("havn update runs on the gateway's host")
 }

@@ -101,7 +101,25 @@ Agent cgroups are `/sys/fs/cgroup/havn/agent-<id>`. The gateway creates that top
 
 ### Upgrading
 
-From v0.2.9, `sudo havn update` upgrades a gateway that runs as the systemd unit `havn` (as install.sh sets it up). It reads that gateway's `HAVN_CONFIG` and `HOME` to find its config, data and `listen` address. Then it: downloads the latest release (or `--version v0.2.10`) for this machine and checks the archive's sha256 against the release's checksum file (which shows the download is whole, not who made it: both come from the same release, as for install.sh); unpacks its binaries; backs up the installation (to `~/havn-backup-before-<version>-<time>.tar.gz`, root's home under `sudo`; `--no-backup` skips it); puts each binary in place of the one beside this `havn` (the previous ones kept as `<name>.old`, the gateway last); restarts the unit; and waits for the gateway to answer as the new release, for as long as systemd keeps it running (a large database takes a while to migrate), up to 10 minutes. A gateway that fails, or that systemd restarts, is given back its previous binaries and restarted; if it had migrated its databases by then, restore the backup with `havn restore`. A release older than the gateway's needs `--allow-downgrade`, as its gateway cannot open databases a newer one migrated. A gateway that runs otherwise (in a shell, another unit) is not touched: stop it, run `havn update`, which then only puts the binaries in place, and start it. `havn update --check` only says whether a newer release is out. Channel adapters (Telegram, Lark, Discord) are updated on their own, and the release's `havn.service` is not installed over yours. The gateway also looks for a newer release once a day (from GitHub's API, a minute after it starts) and the dashboard shows one beside its version to everyone who uses it; `update_check = false` in config.toml turns that off.
+From v0.2.9, `sudo havn update` upgrades a gateway that runs as the systemd unit `havn` (as install.sh sets it up). It reads that gateway's `HAVN_CONFIG` and `HOME` to find its config, data and `listen` address. Then it: downloads the latest release (or `--version v0.2.10`) for this machine and checks the archive's sha256 against the release's checksum file (which shows the download is whole, not who made it: both come from the same release, as for install.sh); unpacks its binaries; backs up the installation (to `~/havn-backup-before-<version>-<time>.tar.gz`, root's home under `sudo`; `--no-backup` skips it); puts each binary in place of the one beside this `havn` (the previous ones kept as `<name>.old`, the gateway last); restarts the unit; and waits for the gateway to answer as the new release, for as long as systemd keeps it running (a large database takes a while to migrate), up to 10 minutes. A gateway that fails, or that systemd restarts, is given back its previous binaries and restarted; if it had migrated its databases by then, restore the backup with `havn restore`. A release older than the gateway's needs `--allow-downgrade`, as its gateway cannot open databases a newer one migrated. A gateway that runs otherwise (in a shell, another unit) is not touched: stop it, run `havn update`, which then only puts the binaries in place, and start it. `havn update --check` only says which newer releases are out, installing nothing. The release's `havn.service` is not installed over yours. The gateway also looks for a newer release once a day (from GitHub's API, a minute after it starts) and the dashboard shows one beside its version to everyone who uses it; `update_check = false` in config.toml turns that off.
+
+From v0.2.13 (the `havn` that runs it: after updating from an earlier release, run `sudo havn update` once more), `havn update` then updates the channel adapters on the machine, each from its own repository's latest release; `--only gateway` updates the gateway alone, as before, and `--version` and `--allow-downgrade` are the gateway's only. It takes the adapters listed in `/etc/havn/components.toml` and those it finds by their systemd unit: a unit in `/etc/systemd/system`, `/usr/local/lib/systemd/system` or `/lib/systemd/system` whose `ExecStart=` runs a binary named `havn-channel-*` (template units such as `x@.service` are not looked at: list their instances in the file). For each adapter whose latest release is newer than the version its binary gives with `--version`, it downloads `<name>-<arch>-unknown-linux-musl.tar.gz` and checks it against its `.sha256`; puts the binary in place (the previous one kept as `<binary>.old`); checks that the new one says it is that release; and restarts each of its units that runs (a stopped one is not started), watching it: it must stay active without systemd restarting it and, if its previous run had logged `havn WS connected`, log it again within a minute. An adapter that does not is given back its previous binary and its units are restarted on it; the gateway and the other adapters are left as they are, and `havn update` exits with an error naming it. A release whose notes have a line `Requires Havn >= X.Y.Z` naming a newer gateway than the one that runs is skipped; notes without such a line mean any gateway will do. If the gateway's own update fails, no adapter is touched. Capability packs under `/opt/havn` (a directory with a `SKILL.md` or a `setup.sh`, or the browser pack's `/opt/havn/playwright-cli`) are listed but not updated: a pack is updated by running its newer `setup.sh`, which installs system packages and cannot be put back. At the end a table shows each component, the version it was, the release looked at, and what was done (with `--check`, what is installed and the latest).
+
+`/etc/havn/components.toml` lists what is installed besides the gateway; `havn update` writes it back, without comments, with the adapters and packs it found and the versions it installed. An adapter set up by hand under its own unit is found without it; list one whose unit runs it otherwise (a template's instances, a wrapper script) or whose repository is not one of amplimit's:
+
+```toml
+[[adapter]]
+name    = "havn-channel-telegram"
+repo    = "amplimit/havn-channel-telegram"   # where its releases are
+binary  = "/usr/local/bin/havn-channel-telegram"
+units   = ["havn-channel-telegram.service"]  # restarted after it is updated
+version = "0.2.11"                           # kept by havn update
+
+[[pack]]
+name = "havn-pack-browser"
+repo = "amplimit/havn-pack-browser"
+path = "/opt/havn/playwright-cli"
+```
 
 By hand, or up to v0.2.8:
 
@@ -672,6 +690,8 @@ Havn ships a stable HTTP + WebSocket protocol at `/api/v1/channel` for external 
 | Discord | [havn-channel-discord](https://github.com/amplimit/havn-channel-discord) | Available (gateway 0.2.11 or later) |
 | Slack | — | Planned |
 
+From v0.2.13, `sudo havn update` updates the adapters on the machine after the gateway, each from its own latest release (see "Upgrading").
+
 The Lark / Feishu adapter takes Lark's events on an HTTP webhook (`im.message.receive_v1`) and answers 1:1 chats only; see its README for setup and the message kinds it carries.
 
 The Discord adapter answers private messages and server channels: a mention of the bot in a channel, or a reply to one of its messages, opens a thread, a conversation of its own, and a server can be let in as a whole or a channel at a time (see "Group chats"). See its README for the bot's setup.
@@ -894,7 +914,7 @@ The reply to a link can be set like the other texts, with `{name}` for the accou
 
 ## Capability Packs
 
-Some agent workloads need capabilities havn doesn't build into core (browser, code interpreter, vendor CLI). Havn provides generic primitives — bind mounts, tmpfs mounts, seccomp allowances — and external capability packs wire them together. Packs live in separate repositories and install under `/opt/havn/<pack>/`.
+Some agent workloads need capabilities havn doesn't build into core (browser, code interpreter, vendor CLI). Havn provides generic primitives — bind mounts, tmpfs mounts, seccomp allowances — and external capability packs wire them together. Packs live in separate repositories and install under `/opt/havn/<pack>/`. `havn update` lists them but does not update them: run a pack's newer `setup.sh` (see "Upgrading").
 
 | Pack | Repository | Description |
 |------|-----------|-------------|
