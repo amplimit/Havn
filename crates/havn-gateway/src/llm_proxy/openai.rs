@@ -70,6 +70,35 @@ impl OpenAiProvider {
         max_tokens_field: "max_tokens",
         extra_headers: &[("HTTP-Referer", "https://havn.dev"), ("X-Title", "havn")],
     };
+
+    /// An `[llm.endpoints]` server of the OpenAI API (issue #232), always
+    /// at its own base URL: Ollama, llama.cpp, vLLM and LM Studio take
+    /// `max_tokens`, and thinking goes as OpenAI's `reasoning_effort`.
+    pub const COMPATIBLE: Self = Self {
+        name: Self::OPENAI_NAME,
+        base_url: OPENAI_URL,
+        max_tokens_field: "max_tokens",
+        extra_headers: &[],
+    };
+
+    /// A POST of `body` to the Chat Completions endpoint under `base_url`,
+    /// with the key, unless there is none, and the provider's headers.
+    fn post(
+        &self,
+        http: &reqwest::Client,
+        base_url: &str,
+        api_key: &str,
+        body: &Value,
+    ) -> reqwest::RequestBuilder {
+        let mut builder = http.post(format!("{base_url}/chat/completions")).json(body);
+        if !api_key.is_empty() {
+            builder = builder.bearer_auth(api_key);
+        }
+        for (k, v) in self.extra_headers {
+            builder = builder.header(*k, *v);
+        }
+        builder
+    }
 }
 
 #[async_trait]
@@ -92,15 +121,8 @@ impl LlmProvider for OpenAiProvider {
         let body = anthropic_to_openai(request, self.max_tokens_field, self.name)
             .map_err(|e| ProviderError::Translation(format!("request build: {e}")))?;
 
-        let mut builder = http
-            .post(format!("{base_url}/chat/completions"))
-            .bearer_auth(api_key)
-            .json(&body);
-        for (k, v) in self.extra_headers {
-            builder = builder.header(*k, *v);
-        }
-
-        let resp = builder
+        let resp = self
+            .post(http, base_url, api_key, &body)
             .send()
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
@@ -133,14 +155,8 @@ impl LlmProvider for OpenAiProvider {
         body["stream"] = Value::Bool(true);
         body["stream_options"] = json!({ "include_usage": true });
 
-        let mut builder = http
-            .post(format!("{base_url}/chat/completions"))
-            .bearer_auth(api_key)
-            .json(&body);
-        for (k, v) in self.extra_headers {
-            builder = builder.header(*k, *v);
-        }
-        let resp = builder
+        let resp = self
+            .post(http, base_url, api_key, &body)
             .send()
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;

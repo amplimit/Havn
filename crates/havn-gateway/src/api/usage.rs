@@ -153,9 +153,10 @@ pub async fn usage(
     let (mut calls, mut tokens, mut cost) = (0, 0, 0.0);
     let (mut unpriced_tokens, mut unsettled_calls, mut searches) = (0, 0, 0);
     for d in found {
-        // Calls of a provider the proxy does not dispatch to are of a web
-        // search backend (Brave, Tavily, Exa): counted as searches.
-        if crate::llm_proxy::dispatch_provider(&d.provider).is_err() {
+        // Calls of a web search backend (Brave, Tavily, Exa), recorded as
+        // `search:<backend>`, are counted as searches; the rest are model
+        // calls, of an endpoint (issue #232) too, or one removed since.
+        if d.provider.starts_with("search:") {
             searches += d.calls;
             continue;
         }
@@ -257,7 +258,7 @@ mod tests {
         let reserved = reserve(
             &state.db,
             Reservation {
-                credential_id: cred.id,
+                credential_id: Some(cred.id),
                 user_id: user,
                 agent_id: None,
                 provider,
@@ -340,13 +341,16 @@ mod tests {
         .await;
         spend(&state, owner, "anthropic", "free", (500, 50), true).await;
         spend(&state, owner, "anthropic", "free", (100, 900), false).await;
-        spend(&state, owner, "brave", "web_search", (1, 0), true).await;
+        spend(&state, owner, "search:brave", "web_search", (1, 0), true).await;
+        // An endpoint's calls are model calls (issue #232).
+        spend(&state, owner, "ollama", "qwen3", (10, 10), true).await;
         spend(&state, other, "anthropic", "priced", (10, 10), true).await;
 
         let mine = ask(&state, owner, None).await.expect("mine");
         assert!((mine.cost - 3.0).abs() < 1e-9, "{}", mine.cost);
-        assert_eq!(mine.unpriced_tokens, 1550);
-        assert_eq!((mine.calls, mine.unsettled_calls, mine.searches), (3, 1, 1));
+        assert_eq!(mine.unpriced_tokens, 1570);
+        assert_eq!((mine.calls, mine.unsettled_calls, mine.searches), (4, 1, 1));
+        assert!(mine.by_model.iter().any(|b| b.key == "ollama:qwen3"));
         assert!(
             mine.by_model
                 .iter()
@@ -358,14 +362,14 @@ mod tests {
                 .any(|b| b.key == "anthropic:free" && b.unpriced)
         );
         assert!(
-            !mine.by_model.iter().any(|b| b.key.starts_with("brave")),
+            !mine.by_model.iter().any(|b| b.key.starts_with("search:")),
             "a search is not a model"
         );
         assert_eq!(mine.by_day.len(), 1);
         assert!(mine.by_user.is_empty() && mine.everyone && mine.users.len() >= 2);
 
         let all = ask(&state, owner, Some("all")).await.expect("all");
-        assert_eq!(all.calls, 4);
+        assert_eq!(all.calls, 5);
         assert_eq!(all.by_user.len(), 2);
         assert_eq!(
             all.by_agent.len(),

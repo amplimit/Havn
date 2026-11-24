@@ -219,8 +219,13 @@ async fn by_model(
 ) -> Result<String, String> {
     let entry = call.models.resolve(model)?.clone();
     // What each API takes (issue #164): Anthropic no audio, OpenAI's own
-    // `input_audio` only WAV and MP3.
-    match entry.provider() {
+    // `input_audio` only WAV and MP3; an endpoint, what its API takes.
+    match call
+        .llm
+        .endpoints
+        .api_of(entry.provider())
+        .unwrap_or_default()
+    {
         "anthropic" => {
             return Err(format!(
                 "{} takes no audio: use an OpenRouter or Gemini model that does",

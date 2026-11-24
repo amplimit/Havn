@@ -188,8 +188,8 @@ impl ThinkingSpec {
         }
     }
 
-    fn validate(&self, id: &str) -> anyhow::Result<()> {
-        let provider = split_model_ref(id).map_or("", |(p, _)| p);
+    /// `api` is the API the model's provider speaks.
+    fn validate(&self, id: &str, api: Option<&str>) -> anyhow::Result<()> {
         match self.style {
             ThinkingStyle::Effort => {
                 if self.levels.is_empty() || self.levels.len() > MAX_CHOICES {
@@ -213,7 +213,7 @@ impl ThinkingSpec {
                 }
             }
             ThinkingStyle::Budget => {
-                if provider == "openai" {
+                if api == Some("openai") {
                     anyhow::bail!(
                         "[[llm.models]] {id:?}: an OpenAI-compatible endpoint takes thinking by effort or on/off, not by budget"
                     );
@@ -397,13 +397,18 @@ impl ModelEntry {
     }
 }
 
+/// `provider:model`, split at the first colon, with a provider that is a
+/// built-in one or has the shape of an `[llm.endpoints]` name: whether
+/// that endpoint is configured is [`ModelCatalog::validate`]'s to check.
 #[must_use]
 pub fn split_model_ref(id: &str) -> Option<(&str, &str)> {
     if id.len() > MAX_ID_LEN || id.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return None;
     }
     let (provider, model) = id.split_once(':')?;
-    (!model.is_empty() && crate::llm_proxy::is_provider(provider)).then_some((provider, model))
+    let named =
+        crate::llm_proxy::is_provider(provider) || crate::config::is_endpoint_name(provider);
+    (!model.is_empty() && named).then_some((provider, model))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -417,15 +422,22 @@ pub struct ModelCatalog {
 }
 
 impl ModelCatalog {
-    pub fn validate(&self) -> anyhow::Result<()> {
+    /// `endpoints` are the `[llm.endpoints]` its models may name.
+    pub fn validate(&self, endpoints: &crate::config::Endpoints) -> anyhow::Result<()> {
         let mut seen = HashSet::new();
         for entry in &self.models {
-            if split_model_ref(&entry.id).is_none() {
+            let api = split_model_ref(&entry.id).and_then(|(p, _)| endpoints.api_of(p));
+            if api.is_none() {
+                let providers: Vec<&str> = crate::llm_proxy::PROVIDERS
+                    .iter()
+                    .copied()
+                    .chain(endpoints.0.keys().map(String::as_str))
+                    .collect();
                 anyhow::bail!(
                     "[[llm.models]] id {:?} must be provider:model, without spaces, with a \
-                     provider of {}",
+                     provider of {} (an endpoint of [llm.endpoints] is a provider too)",
                     entry.id,
-                    crate::llm_proxy::PROVIDERS.join(", ")
+                    providers.join(", ")
                 );
             }
             if !seen.insert(entry.id.as_str()) {
@@ -446,7 +458,7 @@ impl ModelCatalog {
                 price.validate(&entry.id)?;
             }
             if let Some(thinking) = &entry.thinking {
-                thinking.validate(&entry.id)?;
+                thinking.validate(&entry.id, api)?;
             }
             if let Some(label) = &entry.label
                 && (label.len() > MAX_LABEL_LEN || label.chars().any(char::is_control))
@@ -573,9 +585,13 @@ fn entry_table(value: toml_edit::Value) -> anyhow::Result<Table> {
 // file a symlink points to), keeping the rest of the file, comments
 // included, and the comments of entries that stay. The entries go right
 // after the other `[llm]` tables, or before the first table when there are
-// none. A missing file is created.
-pub fn write_to_file(path: &Path, catalog: &ModelCatalog) -> anyhow::Result<()> {
-    write_checked(path, catalog, None).map(|_| ())
+// none. A missing file is created. Its models may name `endpoints`.
+pub fn write_to_file(
+    path: &Path,
+    catalog: &ModelCatalog,
+    endpoints: &crate::config::Endpoints,
+) -> anyhow::Result<()> {
+    write_checked(path, catalog, endpoints, None).map(|_| ())
 }
 
 // Like `write_to_file`, but only if the file's list still has `version`;
@@ -584,18 +600,20 @@ pub fn write_if_unchanged(
     path: &Path,
     version: &str,
     catalog: &ModelCatalog,
+    endpoints: &crate::config::Endpoints,
 ) -> anyhow::Result<bool> {
-    write_checked(path, catalog, Some(version))
+    write_checked(path, catalog, endpoints, Some(version))
 }
 
 fn write_checked(
     path: &Path,
     catalog: &ModelCatalog,
+    endpoints: &crate::config::Endpoints,
     expected: Option<&str>,
 ) -> anyhow::Result<bool> {
     use anyhow::Context as _;
 
-    catalog.validate()?;
+    catalog.validate(endpoints)?;
     let target: PathBuf = match std::fs::canonicalize(path) {
         Ok(p) => p,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
@@ -979,7 +997,9 @@ pub async fn upgrade(
             seeded.push(LEGACY_DEFAULT_MODEL.to_string());
         }
         for model in used {
-            if !seeded.contains(&model) && split_model_ref(&model).is_some() {
+            let builtin =
+                split_model_ref(&model).is_some_and(|(p, _)| crate::llm_proxy::is_provider(p));
+            if !seeded.contains(&model) && builtin {
                 seeded.push(model);
             }
         }
@@ -1002,7 +1022,8 @@ pub async fn upgrade(
                     .collect(),
             };
             let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
-            match write_to_file(config_path, &catalog) {
+            // Of the built-in providers only, as the agents named them.
+            match write_to_file(config_path, &catalog, &crate::config::Endpoints::default()) {
                 Ok(()) => {
                     info!(
                         path = %config_path.display(),
@@ -1039,6 +1060,9 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+    use crate::config::{Endpoint, EndpointApi, Endpoints};
+
+    const NO_ENDPOINTS: Endpoints = Endpoints(std::collections::BTreeMap::new());
 
     #[test]
     fn a_models_thinking_resolves_within_its_choices() {
@@ -1112,7 +1136,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "").expect("write");
-        write_to_file(&path, &c).expect("written");
+        write_to_file(&path, &c, &NO_ENDPOINTS).expect("written");
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(text.contains("vision = true"), "{text}");
         assert!(text.contains("vision = false"), "{text}");
@@ -1120,13 +1144,13 @@ mod tests {
         assert_eq!(read_from_file(&path).expect("read back"), c);
         // Unset again, the line goes.
         c.models[1].vision = None;
-        write_to_file(&path, &c).expect("written");
+        write_to_file(&path, &c, &NO_ENDPOINTS).expect("written");
         let text = std::fs::read_to_string(&path).expect("read");
         assert_eq!(text.matches("vision").count(), 1, "{text}");
         // A context window set is written and read back (issue #214).
         c.models[2].context_window = Some(20_000);
         c.models[2].fallback = vec!["openrouter:a/seeing".into()];
-        write_to_file(&path, &c).expect("written");
+        write_to_file(&path, &c, &NO_ENDPOINTS).expect("written");
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(text.contains("context_window = 20000"), "{text}");
         assert!(
@@ -1141,13 +1165,13 @@ mod tests {
         let mut c = ModelCatalog::default();
         c.models = vec![entry("openrouter:a/main"), entry("openrouter:a/spare")];
         c.models[0].fallback = vec!["openrouter:a/spare".into()];
-        assert!(c.validate().is_ok());
+        assert!(c.validate(&NO_ENDPOINTS).is_ok());
         // One removed since is passed over, not refused: the model it was
         // can be removed.
         c.models[0].fallback = vec!["openrouter:a/gone".into()];
-        assert!(c.validate().is_ok());
+        assert!(c.validate(&NO_ENDPOINTS).is_ok());
         c.models[0].fallback = vec!["openrouter:a/main".into()];
-        assert!(c.validate().is_err());
+        assert!(c.validate(&NO_ENDPOINTS).is_err());
     }
 
     #[test]
@@ -1169,18 +1193,21 @@ mod tests {
             fallback: Vec::new(),
             price: None,
         });
-        c.validate().expect("valid");
+        c.validate(&NO_ENDPOINTS).expect("valid");
         let dir = tempfile::tempdir().expect("dir");
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "").expect("write");
-        write_to_file(&path, &c).expect("written");
+        write_to_file(&path, &c, &NO_ENDPOINTS).expect("written");
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(text.contains("thinking = { style = \"effort\""), "{text}");
         assert_eq!(read_from_file(&path).expect("read back"), c);
 
         let mut bad = c.clone();
         bad.models[0].thinking.as_mut().expect("thinking").default = Some("max".into());
-        assert!(bad.validate().is_err(), "a default it does not offer");
+        assert!(
+            bad.validate(&NO_ENDPOINTS).is_err(),
+            "a default it does not offer"
+        );
         let mut bad = c.clone();
         bad.models[0].id = "openai:gpt-5".into();
         let spec = bad.models[0].thinking.as_mut().expect("thinking");
@@ -1188,7 +1215,7 @@ mod tests {
         spec.budgets = vec![1024];
         spec.default = None;
         assert!(
-            bad.validate().is_err(),
+            bad.validate(&NO_ENDPOINTS).is_err(),
             "an OpenAI endpoint takes no budget"
         );
     }
@@ -1226,31 +1253,87 @@ mod tests {
         );
         assert_eq!(split_model_ref("claude-opus-4-7"), None);
         assert_eq!(split_model_ref("deepseek/deepseek-r1:free"), None);
-        assert_eq!(split_model_ref("nobody:model"), None);
+        assert_eq!(split_model_ref("Nobody:model"), None);
         assert_eq!(split_model_ref("openai:"), None);
+        // An endpoint's name splits off; whether it is configured is
+        // checked by the catalog.
+        assert_eq!(
+            split_model_ref("ollama:qwen3:8b"),
+            Some(("ollama", "qwen3:8b"))
+        );
+    }
+
+    #[test]
+    fn a_model_may_name_an_endpoint_only_when_it_is_configured() {
+        let mut endpoints = Endpoints::default();
+        endpoints.0.insert(
+            "ollama".into(),
+            Endpoint {
+                api: EndpointApi::Openai,
+                base_url: "http://127.0.0.1:11434/v1".into(),
+            },
+        );
+        endpoints.0.insert(
+            "lan".into(),
+            Endpoint {
+                api: EndpointApi::Anthropic,
+                base_url: "http://10.0.0.5:8000".into(),
+            },
+        );
+        let c = catalog(&["ollama:qwen3", "anthropic:claude-opus-4-7"], None);
+        c.validate(&endpoints).expect("a configured endpoint");
+        let msg = format!(
+            "{}",
+            c.validate(&NO_ENDPOINTS).expect_err("no such endpoint")
+        );
+        assert!(msg.contains("ollama:qwen3"), "{msg}");
+        assert!(
+            catalog(&["nobody:model"], None)
+                .validate(&endpoints)
+                .is_err()
+        );
+        // The endpoint's API decides how it thinks: by budget on an
+        // Anthropic-compatible one, not on an OpenAI-compatible one.
+        let budget = |id: &str| {
+            let mut c = catalog(&[id], None);
+            c.models[0].thinking = Some(ThinkingSpec {
+                style: ThinkingStyle::Budget,
+                levels: Vec::new(),
+                budgets: vec![1024],
+                default: None,
+                mandatory: false,
+            });
+            c.validate(&endpoints)
+        };
+        assert!(budget("lan:claude-opus-4-7").is_ok());
+        assert!(budget("ollama:qwen3").is_err());
     }
 
     #[test]
     fn validation_rejects_bad_ids_duplicates_and_an_unlisted_default() {
         assert!(
             catalog(&["anthropic:claude-opus-4-7"], None)
-                .validate()
+                .validate(&NO_ENDPOINTS)
                 .is_ok()
         );
-        assert!(catalog(&["claude-opus-4-7"], None).validate().is_err());
+        assert!(
+            catalog(&["claude-opus-4-7"], None)
+                .validate(&NO_ENDPOINTS)
+                .is_err()
+        );
         assert!(
             catalog(&["openai:gpt-5", "openai:gpt-5"], None)
-                .validate()
+                .validate(&NO_ENDPOINTS)
                 .is_err()
         );
         assert!(
             catalog(&["openai:gpt-5"], Some("openai:gpt-4o"))
-                .validate()
+                .validate(&NO_ENDPOINTS)
                 .is_err()
         );
         let mut zero = catalog(&["openai:gpt-5"], None);
         zero.models[0].max_output_tokens = Some(0);
-        assert!(zero.validate().is_err());
+        assert!(zero.validate(&NO_ENDPOINTS).is_err());
     }
 
     #[test]
@@ -1311,7 +1394,7 @@ mod tests {
             Some("openai:gpt-5"),
         );
         c.models[0].label = Some("Opus".into());
-        write_to_file(&path, &c).unwrap();
+        write_to_file(&path, &c, &NO_ENDPOINTS).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         for kept in [
             "# operator notes",
@@ -1338,10 +1421,10 @@ mod tests {
         assert!(!cfg.trust_header.enabled);
         assert_eq!(read_from_file(&path).unwrap(), c);
 
-        write_to_file(&path, &catalog(&[], None)).unwrap();
+        write_to_file(&path, &catalog(&[], None), &NO_ENDPOINTS).unwrap();
         assert_eq!(parsed(&path).llm.catalog(), ModelCatalog::default());
         assert!(lists_models(&path).unwrap(), "an emptied list stays a list");
-        write_to_file(&path, &catalog(&["openai:gpt-5"], None)).unwrap();
+        write_to_file(&path, &catalog(&["openai:gpt-5"], None), &NO_ENDPOINTS).unwrap();
         assert_eq!(
             parsed(&path).llm.catalog(),
             catalog(&["openai:gpt-5"], None)
@@ -1358,7 +1441,7 @@ mod tests {
         )
         .unwrap();
         let c = catalog(&["openai:gpt-5"], Some("openai:gpt-5"));
-        write_to_file(&path, &c).unwrap();
+        write_to_file(&path, &c, &NO_ENDPOINTS).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("listen ="), "{text}");
         let reload = text.find("[reload]").unwrap();
@@ -1376,7 +1459,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "llm = { max_tokens_ceiling = 1000 }\n").unwrap();
         let c = catalog(&["openai:gpt-5"], None);
-        write_to_file(&path, &c).unwrap();
+        write_to_file(&path, &c, &NO_ENDPOINTS).unwrap();
         assert_eq!(parsed(&path).llm.catalog(), c);
         assert_eq!(parsed(&path).llm.max_tokens_ceiling, 1000);
 
@@ -1386,7 +1469,7 @@ mod tests {
         )
         .unwrap();
         let c = catalog(&["gemini:gemini-2.5-pro", "openai:gpt-5"], None);
-        write_to_file(&path, &c).unwrap();
+        write_to_file(&path, &c, &NO_ENDPOINTS).unwrap();
         assert_eq!(parsed(&path).llm.catalog(), c);
     }
 
@@ -1399,7 +1482,7 @@ mod tests {
         std::fs::write(&real, "listen = \"127.0.0.1:8080\"\n").unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let c = catalog(&["openai:gpt-5"], None);
-        write_to_file(&link, &c).unwrap();
+        write_to_file(&link, &c, &NO_ENDPOINTS).unwrap();
         assert!(
             std::fs::symlink_metadata(&link)
                 .unwrap()
@@ -1417,7 +1500,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-        write_to_file(&path, &catalog(&["openai:gpt-5"], None)).unwrap();
+        write_to_file(&path, &catalog(&["openai:gpt-5"], None), &NO_ENDPOINTS).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o640
@@ -1430,7 +1513,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub/config.toml");
         let c = catalog(&["openrouter:deepseek/deepseek-r1:free"], None);
-        write_to_file(&path, &c).unwrap();
+        write_to_file(&path, &c, &NO_ENDPOINTS).unwrap();
         assert_eq!(parsed(&path).llm.catalog(), c);
         assert_eq!(
             read_from_file(&dir.path().join("none.toml")).unwrap(),
@@ -1462,7 +1545,7 @@ mod tests {
         assert!(split_model_ref(&format!("openai:{}", "x".repeat(300))).is_none());
         let mut c = catalog(&["openai:gpt-5"], None);
         c.models[0].label = Some("bad\nlabel".into());
-        assert!(c.validate().is_err());
+        assert!(c.validate(&NO_ENDPOINTS).is_err());
     }
 
     async fn db() -> SqlitePool {
@@ -1607,11 +1690,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let first = catalog(&["openai:gpt-5"], None);
-        assert!(write_if_unchanged(&path, &ModelCatalog::default().version(), &first).unwrap());
+        assert!(
+            write_if_unchanged(
+                &path,
+                &ModelCatalog::default().version(),
+                &first,
+                &NO_ENDPOINTS
+            )
+            .unwrap()
+        );
         let other = catalog(&["gemini:gemini-2.5-pro"], None);
-        assert!(!write_if_unchanged(&path, &ModelCatalog::default().version(), &other).unwrap());
+        assert!(
+            !write_if_unchanged(
+                &path,
+                &ModelCatalog::default().version(),
+                &other,
+                &NO_ENDPOINTS
+            )
+            .unwrap()
+        );
         assert_eq!(read_from_file(&path).unwrap(), first);
-        assert!(write_if_unchanged(&path, &first.version(), &other).unwrap());
+        assert!(write_if_unchanged(&path, &first.version(), &other, &NO_ENDPOINTS).unwrap());
         assert_eq!(read_from_file(&path).unwrap(), other);
     }
 
@@ -1621,7 +1720,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        write_to_file(&path, &catalog(&["openai:gpt-5"], None)).unwrap();
+        write_to_file(&path, &catalog(&["openai:gpt-5"], None), &NO_ENDPOINTS).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o644
@@ -1635,7 +1734,7 @@ mod tests {
         mark_upgrade(&db).await;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        write_to_file(&path, &catalog(&[], None)).unwrap();
+        write_to_file(&path, &catalog(&[], None), &NO_ENDPOINTS).unwrap();
         let c = upgrade(&db, &path, ModelCatalog::default()).await.unwrap();
         assert_eq!(c, ModelCatalog::default());
         assert_eq!(parsed(&path).llm.catalog(), ModelCatalog::default());
@@ -1711,7 +1810,7 @@ mod tests {
             title_model: None,
             models: vec![negative],
         };
-        assert!(catalog.validate().is_err());
+        assert!(catalog.validate(&NO_ENDPOINTS).is_err());
         assert!(
             toml::from_str::<ModelEntry>("id = \"a:b\"\nprice = { input = 1.0 }").is_err(),
             "output is needed"
@@ -1745,7 +1844,7 @@ mod tests {
         ] {
             let expected = catalog.version();
             catalog.models[0].price = price;
-            assert!(write_if_unchanged(&path, &expected, &catalog).expect("write"));
+            assert!(write_if_unchanged(&path, &expected, &catalog, &NO_ENDPOINTS).expect("write"));
             assert_eq!(read().models[0].price, price);
             assert_eq!(read().version(), catalog.version(), "the file is what runs");
         }
@@ -1754,6 +1853,9 @@ mod tests {
             ..priced
         };
         catalog.models[0].price = Some(negative);
-        assert!(catalog.validate().is_err(), "-0 is refused too");
+        assert!(
+            catalog.validate(&NO_ENDPOINTS).is_err(),
+            "-0 is refused too"
+        );
     }
 }

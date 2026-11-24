@@ -524,6 +524,22 @@ async fn serve() -> anyhow::Result<()> {
             );
         }
     }
+    for (name, endpoint) in &cfg.llm.endpoints.0 {
+        info!(
+            endpoint = %name,
+            api = endpoint.api.as_str(),
+            url = %endpoint.base_url,
+            "[llm.endpoints] calls go there"
+        );
+        if config::is_plaintext_to_another_host(&endpoint.base_url) {
+            warn!(
+                endpoint = %name,
+                url = %endpoint.base_url,
+                "[llm.endpoints] is plain http to another host: prompts, replies and any key \
+                 cross the network unencrypted"
+            );
+        }
+    }
     for (backend, url) in cfg
         .search
         .base_url

@@ -20,6 +20,17 @@ pub struct ModelsView {
     pub title_model: Option<String>,
     pub models: Vec<ModelEntry>,
     pub editable: bool,
+    /// The `[llm.endpoints]` the gateway runs with, which models may name
+    /// as their provider (issue #232).
+    pub endpoints: Vec<EndpointView>,
+}
+
+/// An endpoint, without its URL.
+#[derive(Debug, Serialize)]
+pub struct EndpointView {
+    pub name: String,
+    /// The built-in provider whose API it speaks: `anthropic` or `openai`.
+    pub api: &'static str,
 }
 
 fn view(state: &AppState) -> ModelsView {
@@ -31,6 +42,16 @@ fn view(state: &AppState) -> ModelsView {
         title_model: catalog.title_model.clone(),
         models: catalog.models.clone(),
         editable: state.trusted_proxies.is_none(),
+        endpoints: state
+            .llm
+            .endpoints
+            .0
+            .iter()
+            .map(|(name, e)| EndpointView {
+                name: name.clone(),
+                api: e.api.as_str(),
+            })
+            .collect(),
     }
 }
 
@@ -85,18 +106,21 @@ pub async fn put(
         title_model,
         models: req.models,
     };
+    // Of the endpoints the gateway runs with: one added to config.toml
+    // since takes a restart to be called.
     catalog
-        .validate()
+        .validate(&state.llm.endpoints)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let _writing = state.models_write.lock().await;
     let path = state.config_path.clone();
     let written = catalog.clone();
     let expected = req.version;
+    let llm = Arc::clone(&state.llm);
     let applied = tokio::task::spawn_blocking(move || {
         // The file is compared, not the running list: a hand edit the
         // watcher has not applied yet must not be overwritten either.
-        if model_catalog::write_if_unchanged(&path, &expected, &written)? {
+        if model_catalog::write_if_unchanged(&path, &expected, &written, &llm.endpoints)? {
             return Ok(None);
         }
         // Retrying only helps if the gateway can load what is there now.
@@ -215,7 +239,7 @@ pub async fn check(
         title_model: None,
         models: vec![entry.clone()],
     }
-    .validate()
+    .validate(&state.llm.endpoints)
     .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let policy = crate::policy_resolver::for_user(&state.db, user.id).await;
     if !crate::llm_proxy::model_allowed(&policy.allowed_models, &entry.id) {
@@ -369,6 +393,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_model_may_name_an_endpoint_the_gateway_runs_with() {
+        let (mut state, user_id) = state_with(false).await;
+        let first = get(State(state.clone()), user(user_id)).await.0.version;
+        let err = put(
+            State(state.clone()),
+            user(user_id),
+            body(&first, &["ollama:qwen3"]),
+        )
+        .await
+        .expect_err("no such endpoint");
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+
+        let mut llm = crate::config::LlmConfig::default();
+        llm.endpoints.0.insert(
+            "ollama".into(),
+            crate::config::Endpoint {
+                api: crate::config::EndpointApi::Openai,
+                base_url: "http://127.0.0.1:11434/v1".into(),
+            },
+        );
+        state.llm = Arc::new(llm);
+        let view = put(
+            State(state.clone()),
+            user(user_id),
+            body(&first, &["ollama:qwen3"]),
+        )
+        .await
+        .unwrap()
+        .0;
+        let endpoints: Vec<(&str, &str)> = view
+            .endpoints
+            .iter()
+            .map(|e| (e.name.as_str(), e.api))
+            .collect();
+        assert_eq!(endpoints, vec![("ollama", "openai")]);
+        assert!(state.models.load().get("ollama:qwen3").is_some());
+        let _ = std::fs::remove_file(&state.config_path);
+    }
+
+    #[tokio::test]
     async fn a_client_that_leaves_out_the_title_model_keeps_it() {
         let (state, user_id) = state_with(false).await;
         let put_with = |version: String, ids: &[&str], title: Option<Option<&str>>| {
@@ -450,7 +514,7 @@ mod tests {
             title_model: None,
             models: vec![],
         };
-        model_catalog::write_to_file(&state.config_path, &edited).unwrap();
+        model_catalog::write_to_file(&state.config_path, &edited, &state.llm.endpoints).unwrap();
         let err = put(
             State(state.clone()),
             user(user_id),
