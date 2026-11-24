@@ -490,8 +490,9 @@ function BootstrapEditor({ agentId }: { agentId: string }) {
         SOUL.md and USER.md are in the agent&apos;s prompt in every chat: other people&apos;s
         it is open to, and groups&apos;, as well as yours. Write in them only what anyone who
         can talk to the bot may know. What should stay between you and the agent belongs in
-        its memory (ask it to remember, or add it on the memory page), which is used in your
-        own chats only.
+        its memory (ask it to remember in your own chat, or add it on the memory page): that
+        is put in the prompt of your own private chats only, and elsewhere the agent reaches it
+        only by searching memory, which waits for your review unless you allowed it.
       </p>
       {error && (
         <div
