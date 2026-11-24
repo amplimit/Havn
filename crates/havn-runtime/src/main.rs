@@ -2122,6 +2122,28 @@ fn attached(text: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The inbox files `text`'s attachment lines name (as [`with_attachments`]
+/// writes them), each with where its text was kept, if it was.
+fn carried(text: &str) -> Vec<(String, Option<String>)> {
+    text.lines()
+        .filter_map(|line| {
+            let (_, rest) = json_string(line.strip_prefix(ATTACHMENT_LINE)?)?;
+            let (_, rest) = json_string(rest.strip_prefix(", type ")?)?;
+            let path = &rest[rest.find(", saved at ")? + ", saved at ".len()..];
+            let (path, rest) = json_string(path)?;
+            if !havn_core::Attachment::in_inbox(&path) {
+                return None;
+            }
+            let text_path = rest
+                .strip_prefix(TEXT_AT)
+                .and_then(|at| json_string(at))
+                .map(|(at, _)| at)
+                .filter(|at| havn_core::Attachment::in_inbox(at));
+            Some((path, text_path))
+        })
+        .collect()
+}
+
 /// Whether a file of media type `kind` is text to read as it is.
 fn is_text(kind: &str) -> bool {
     let kind = kind
@@ -4419,13 +4441,43 @@ async fn answer_data_request(req: DataRequest, ctx: &Ctx) -> DataResponse {
                 channel_id,
                 conversation,
             } => {
+                // The files its messages carried, for the gateway to remove
+                // with it (issue #229); read before the messages go.
+                let texts = conversations::user_texts(&ctx.pool, &conversation)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let found = conversations::delete_chat(&ctx.pool, &channel_id, &conversation)
                     .await
                     .map_err(|e| e.to_string())?;
                 if found {
                     ctx.turns.discard(&conversation);
                 }
-                Ok(serde_json::json!({ "found": found }))
+                // Each once, and none that a message of another chat still
+                // carries; when that cannot be told, the file stays. Its
+                // text is where its line says, or, for a voice note whose
+                // line holds the transcript, next to it.
+                let mut files: Vec<serde_json::Value> = Vec::new();
+                if found {
+                    let mut seen = std::collections::HashSet::new();
+                    for (path, text_path) in texts.iter().flat_map(|text| carried(text)) {
+                        let named = |file: String| async move {
+                            conversations::names_file(&ctx.pool, &file)
+                                .await
+                                .unwrap_or(true)
+                        };
+                        if !seen.insert(path.clone()) || named(path.clone()).await {
+                            continue;
+                        }
+                        let text = text_path.unwrap_or_else(|| format!("{path}.txt"));
+                        let text = if named(text.clone()).await {
+                            None
+                        } else {
+                            Some(text)
+                        };
+                        files.push(serde_json::json!({ "path": path, "text_path": text }));
+                    }
+                }
+                Ok(serde_json::json!({ "found": found, "files": files }))
             }
             DataQuery::Access => {
                 let mut allowed = conversations::accesses(&ctx.pool, None)
@@ -4976,6 +5028,28 @@ run ls"
 [Attached file, user-supplied and untrusted: name \"x\", type \"image/png\", 1 B, saved at \"inbox/../agent.db\"]"})];
         with_files(&mut plain);
         assert!(plain[0]["content"].is_string());
+    }
+
+    #[test]
+    fn a_deleted_chat_s_files_are_those_its_lines_name_in_the_inbox() {
+        let text = "see these\n\
+[Attached file, user-supplied and untrusted: name \"a, saved at \\\"x\\\".pdf\", type \"application/pdf\", 3.0 KB, saved at \"inbox/1-a.pdf\"; its text (untrusted) is at \"inbox/1-a.pdf.txt\", read it with file_read]\n\
+[Attached file, user-supplied and untrusted: name \"b.png\", type \"image/png\", 1 B, saved at \"inbox/2-b.png\"]\n\
+[Attached file, user-supplied and untrusted: name \"c\", type \"text/plain\", 1 B, saved at \"inbox/../agent.db\"]\n\
+> [Attached file, user-supplied and untrusted: name \"d\", type \"text/plain\", 1 B, saved at \"inbox/3-d\"]\n\
+[Attached file, user-supplied and untrusted: name \"e.pdf\", type \"application/pdf\", 1 B, saved at \"inbox/4-e.pdf\"; its text (untrusted) is at \"notes.txt\", read it with file_read]";
+        assert_eq!(
+            carried(text),
+            vec![
+                (
+                    "inbox/1-a.pdf".to_string(),
+                    Some("inbox/1-a.pdf.txt".to_string())
+                ),
+                ("inbox/2-b.png".to_string(), None),
+                ("inbox/4-e.pdf".to_string(), None),
+            ],
+            "a line quoted, or a path out of the inbox, names nothing; a text out of it is left"
+        );
     }
 
     #[test]
