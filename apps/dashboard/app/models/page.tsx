@@ -1,10 +1,12 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { MoreHorizontal } from "lucide-react";
 import {
   ApiError,
   LLM_PROVIDERS as PROVIDERS,
   api,
+  modelName,
   thinkingChoices,
   type ModelCheck,
   type ModelEntry,
@@ -236,7 +238,7 @@ export default function ModelsPage() {
               />
             </div>
             <div className="md:col-span-2">
-              <label className="label" htmlFor="model-label">label (optional)</label>
+              <label className="label" htmlFor="model-label">label (optional, shown in place of the id)</label>
               <input
                 id="model-label"
                 value={label}
@@ -257,32 +259,28 @@ export default function ModelsPage() {
                 className="input tabular"
               />
             </div>
-            <div className="flex items-end">
-              <label className="flex items-center gap-2 text-sm">
+            <div title="Whether pictures sent in a chat are shown to this model. Tried, a model that refuses them is sent a note in their place.">
+              <label className="label" htmlFor="model-vision">images</label>
+              <select
+                id="model-vision"
+                className="input"
+                value={vision}
+                onChange={(e) => setVision(e.target.value as "" | "yes" | "no")}
+              >
+                <option value="">tried</option>
+                <option value="yes">shown</option>
+                <option value="no">never shown</option>
+              </select>
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-3 md:col-span-4">
+              <label className="flex items-center gap-2 text-sm" style={{ color: "var(--color-label)" }}>
                 <input
                   type="checkbox"
                   checked={makeDefault}
                   onChange={(e) => setMakeDefault(e.target.checked)}
                 />
-                make default
+                make it the default model
               </label>
-              <label
-                className="flex items-center gap-2 text-sm"
-                title="Whether pictures sent in a chat are shown to this model. Tried, a model that refuses them is sent a note in their place."
-              >
-                images
-                <select
-                  className="input"
-                  value={vision}
-                  onChange={(e) => setVision(e.target.value as "" | "yes" | "no")}
-                >
-                  <option value="">tried</option>
-                  <option value="yes">shown</option>
-                  <option value="no">never shown</option>
-                </select>
-              </label>
-            </div>
-            <div className="flex justify-end md:col-span-4">
               <button type="submit" className="btn-primary" disabled={busy || !name.trim()}>
                 {busy ? "saving…" : "add model"}
               </button>
@@ -308,7 +306,7 @@ export default function ModelsPage() {
           <li key={m.id} className="card flex flex-wrap items-center justify-between gap-3 px-5 py-4">
             <div className="min-w-[14rem] flex-1">
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                <span className="display-h3 wrap-anywhere">{m.label ?? m.id}</span>
+                <span className="display-h3 wrap-anywhere">{modelName(m.id, m.label)}</span>
                 {view.effective_default === m.id && (
                   <span className="pill pill-running">default</span>
                 )}
@@ -333,11 +331,9 @@ export default function ModelsPage() {
                   </span>
                 )}
               </div>
-              {m.label && (
-                <p className="mt-1 font-mono text-xs wrap-anywhere" style={{ color: "var(--color-body)" }}>
-                  {m.id}
-                </p>
-              )}
+              <p className="mt-1 font-mono text-xs wrap-anywhere" style={{ color: "var(--color-body)" }}>
+                {m.id}
+              </p>
               <ThinkingEditor
                 entry={m}
                 editable={editable && !busy}
@@ -361,47 +357,95 @@ export default function ModelsPage() {
               />
             </div>
             {editable && (
-              <div className="flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  className="btn-ghost"
-                  disabled={busy || i === 0}
-                  onClick={() => move(i, -1)}
-                >
-                  up
-                </button>
-                <button
-                  type="button"
-                  className="btn-ghost"
-                  disabled={busy || i === view.models.length - 1}
-                  onClick={() => move(i, 1)}
-                >
-                  down
-                </button>
+              <div className="flex items-center gap-1 self-start">
                 {view.effective_default !== m.id && (
                   <button
                     type="button"
-                    className="btn-ghost"
+                    className="tool-button text-sm"
                     disabled={busy}
                     onClick={() => save(m.id, view.models)}
                   >
                     make default
                   </button>
                 )}
-                <button
-                  type="button"
-                  className="btn-danger"
-                  disabled={busy}
-                  onClick={() => remove(m.id)}
-                >
-                  remove
-                </button>
+                <MoreMenu label={`more for ${m.id}`}>
+                  <button
+                    type="button"
+                    className="menu-item"
+                    disabled={busy || i === 0}
+                    onClick={() => move(i, -1)}
+                  >
+                    move up
+                  </button>
+                  <button
+                    type="button"
+                    className="menu-item"
+                    disabled={busy || i === view.models.length - 1}
+                    onClick={() => move(i, 1)}
+                  >
+                    move down
+                  </button>
+                  <button
+                    type="button"
+                    className="menu-item"
+                    style={{ color: "var(--color-ruby)" }}
+                    disabled={busy}
+                    onClick={() => remove(m.id)}
+                  >
+                    remove
+                  </button>
+                </MoreMenu>
               </div>
             )}
           </li>
         ))}
       </ul>
     </div>
+  );
+}
+
+/**
+ * Actions used now and then, behind a button: a menu that closes on a
+ * choice, on Escape, or on a click elsewhere.
+ */
+function MoreMenu({ label, children }: { label: string; children: React.ReactNode }) {
+  const menu = useRef<HTMLDetailsElement>(null);
+  useEffect(() => {
+    const close = (e: Event) => {
+      const el = menu.current;
+      if (!el?.open) return;
+      if (e instanceof KeyboardEvent) {
+        if (e.key !== "Escape") return;
+        el.open = false;
+        el.querySelector("summary")?.focus();
+      } else if (!el.contains(e.target as Node)) {
+        el.open = false;
+      }
+    };
+    document.addEventListener("click", close);
+    document.addEventListener("keydown", close);
+    return () => {
+      document.removeEventListener("click", close);
+      document.removeEventListener("keydown", close);
+    };
+  }, []);
+  return (
+    <details ref={menu} className="relative">
+      <summary className="tool-button list-none [&::-webkit-details-marker]:hidden" aria-label={label} title="more">
+        <MoreHorizontal size={18} aria-hidden="true" />
+      </summary>
+      <div
+        className="menu enter absolute right-0 z-20 mt-1 flex min-w-40 flex-col py-1"
+        onClick={(e) => {
+          if ((e.target as HTMLElement).closest("button")) {
+            menu.current?.removeAttribute("open");
+            menu.current?.querySelector("summary")?.focus();
+          }
+        }}
+      >
+        {children}
+      </div>
+    </details>
   );
 }
 
