@@ -284,9 +284,10 @@ struct Swapped {
 
 /// Put each of `names` from `from` in place of the one in `dir`, the old one
 /// kept as `<name>.old`: linked there first, then replaced in one rename, so
-/// it is never missing. A new binary keeps the old one's owner, mode and
-/// file capabilities (mode 755 when there was none). All or none.
-fn swap(dir: &Path, from: &Path, names: &[String]) -> anyhow::Result<Swapped> {
+/// it is never missing. A new binary is mode 755, or with `keep` (an
+/// adapter's) has the old one's owner, mode and file capabilities. All or
+/// none.
+fn swap(dir: &Path, from: &Path, names: &[String], keep: bool) -> anyhow::Result<Swapped> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
     let mut done = Swapped::default();
     let result = (|| -> anyhow::Result<()> {
@@ -303,7 +304,7 @@ fn swap(dir: &Path, from: &Path, names: &[String]) -> anyhow::Result<Swapped> {
                 .with_context(|| format!("writing {name} into {}", dir.display()))?;
             drop(out);
             let current = dir.join(name);
-            let was = std::fs::metadata(&current).ok();
+            let was = std::fs::metadata(&current).ok().filter(|_| keep);
             if let Some(was) = &was {
                 let made = std::fs::metadata(&fresh)?;
                 if (made.uid(), made.gid()) != (was.uid(), was.gid()) {
@@ -822,7 +823,7 @@ async fn gateway(
             .context("backing up first (--no-backup skips it)")?;
         println!("Backed up to {}.", output.display());
     }
-    let swapped = swap(&dir, stage.path(), &names)?;
+    let swapped = swap(&dir, stage.path(), &names, false)?;
     println!(
         "Installed {tag} in {} (the previous binaries are kept as *.old).",
         dir.display()
@@ -1030,12 +1031,12 @@ impl Components {
 
 /// The unit's name and the binaries it runs, from `systemctl show -p Id
 /// -p ExecStart` output `shown` (drop-ins applied; an alias shows the
-/// unit's own name).
+/// unit's own name). Each command is a `{ path=… ; argv[]=… ; … }`.
 fn parse_exec(shown: &str) -> (String, Vec<PathBuf>) {
     let paths = shown
         .lines()
         .filter_map(|line| line.strip_prefix("ExecStart="))
-        .flat_map(|value| value.split("path=").skip(1))
+        .flat_map(|value| value.split("{ path=").skip(1))
         .filter_map(|rest| rest.split([' ', ';']).next())
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -1170,8 +1171,23 @@ fn requires(notes: &str) -> Option<Result<String, String>> {
             .collect();
         let plain = plain.split_whitespace().collect::<Vec<_>>().join(" ");
         let at = plain.find(REQUIRES)?;
-        let rest = plain[at + REQUIRES.len()..].trim_start();
-        let rest = rest.strip_prefix(">=").unwrap_or(rest).trim_start();
+        let word = |c: char| c.is_alphanumeric() || c == '-';
+        let after = &plain[at + REQUIRES.len()..];
+        if plain[..at].ends_with(word) || after.starts_with(word) {
+            return None;
+        }
+        // Then a version: `>=` first, or its first digit.
+        let rest = after.trim_start();
+        let rest = match rest.strip_prefix(">=") {
+            Some(rest) => rest.trim_start(),
+            None if rest
+                .trim_start_matches('v')
+                .starts_with(|c: char| c.is_ascii_digit()) =>
+            {
+                rest
+            }
+            None => return None,
+        };
         let version = rest
             .split_whitespace()
             .next()
@@ -1358,13 +1374,20 @@ async fn restart_watched(
             invocation = Some(now.invocation.clone());
         }
         let active = now.state == "active";
-        let runs = if active && now.pid > 0 {
+        // Just after the restart the process may not have exec'd the binary
+        // yet (it is still systemd's): another binary fails only once it
+        // has had `watch.settle`. One replaced since it started reads
+        // `<path> (deleted)`, which is not the binary either.
+        let exe = if active && now.pid > 0 {
             host.exe(now.pid)
         } else {
             None
         };
-        if let Some(exe) = &runs
-            && exe != binary
+        let runs_it = exe.as_deref() == Some(binary);
+        let settled = started.elapsed() >= watch.settle;
+        if let Some(exe) = &exe
+            && !runs_it
+            && settled
         {
             return Err(format!(
                 "{unit} runs {}, not {}",
@@ -1373,13 +1396,13 @@ async fn restart_watched(
             ));
         }
         let connected = !connect || (active && host.logged(&now.invocation, CONNECTED));
-        if runs.is_some() && connected && started.elapsed() >= watch.settle {
+        if runs_it && connected && settled {
             return Ok(());
         }
         if started.elapsed() >= watch.within {
             return Err(if !active {
                 format!("{unit} did not start")
-            } else if runs.is_none() {
+            } else if exe.is_none() {
                 format!("cannot tell what {unit} runs")
             } else {
                 format!("{unit} did not connect to the gateway")
@@ -1443,7 +1466,7 @@ async fn install(
             running.push((unit.as_str(), connect));
         }
     }
-    let swapped = swap(dir, stage.path(), &[file.to_string()]).map_err(error)?;
+    let swapped = swap(dir, stage.path(), &[file.to_string()], true).map_err(error)?;
 
     let mut restarted = Vec::new();
     let mut failure = match host.version(&binary, false) {
@@ -1905,7 +1928,7 @@ mod tests {
         for name in &names {
             std::fs::write(from.path().join(name), format!("new {name}")).unwrap();
         }
-        let swapped = swap(dir.path(), from.path(), &names).unwrap();
+        let swapped = swap(dir.path(), from.path(), &names, false).unwrap();
         assert_eq!(swapped.added, vec!["havn-foo".to_string()]);
         for name in &names {
             assert_eq!(
@@ -1939,7 +1962,7 @@ mod tests {
 
         // One missing from what is installed: none is changed.
         std::fs::remove_file(from.path().join("havn-init")).unwrap();
-        assert!(swap(dir.path(), from.path(), &names).is_err());
+        assert!(swap(dir.path(), from.path(), &names, false).is_err());
         for name in BINARIES {
             assert_eq!(
                 std::fs::read_to_string(dir.path().join(name)).unwrap(),
@@ -1962,7 +1985,7 @@ mod tests {
             std::fs::write(from.path().join(name), "new").unwrap();
         }
         let names = vec!["havn-channel-x".to_string(), "havn-channel-y".to_string()];
-        swap(dir.path(), from.path(), &names).unwrap();
+        swap(dir.path(), from.path(), &names, true).unwrap();
         let mode = |name: &str| {
             std::fs::metadata(dir.path().join(name))
                 .unwrap()
@@ -1972,6 +1995,9 @@ mod tests {
         };
         assert_eq!(mode("havn-channel-x"), 0o750);
         assert_eq!(mode("havn-channel-y"), 0o755, "none before it");
+        // The gateway's binaries are 755, as before.
+        swap(dir.path(), from.path(), &names, false).unwrap();
+        assert_eq!(mode("havn-channel-x"), 0o755);
 
         let to = tempfile::tempdir().unwrap();
         let entries = files(&["tg-bridge", "README"]);
@@ -1998,6 +2024,9 @@ mod tests {
             )
         );
         assert_eq!(parse_exec(""), (String::new(), Vec::new()));
+        let argv = "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env x                     --state-path=/usr/local/bin/havn-channel-x ; ignore_errors=no }
+";
+        assert_eq!(parse_exec(argv).1, vec![PathBuf::from("/usr/bin/env")]);
 
         let etc = tempfile::tempdir().unwrap();
         let lib = tempfile::tempdir().unwrap();
@@ -2235,6 +2264,21 @@ mod tests {
         );
         assert_eq!(requires(""), None);
         assert_eq!(requires("Works with any Havn"), None);
+        for unrelated in [
+            "Logging in requires havn-gateway auth.",
+            "This requires Havn to restart.",
+            "Prerequires havn >= 0.2.12",
+        ] {
+            assert_eq!(requires(unrelated), None, "{unrelated}");
+        }
+        assert_eq!(
+            requires(
+                "Requires havn-gateway auth
+Requires Havn >= 0.2.12"
+            ),
+            Some(Ok("0.2.12".to_string())),
+            "a later line still says"
+        );
 
         assert_eq!(plan(Some("0.2.11"), "v0.2.11", "", "0.2.12"), Plan::Current);
         assert_eq!(plan(Some("0.2.12"), "v0.2.11", "", "0.2.12"), Plan::Current);
@@ -2294,7 +2338,9 @@ mod tests {
     /// systemd restarts them on its own with `flapping`, and they connect
     /// only with `connects`. They run `elsewhere` when it is set, ran
     /// before when `running`, and the old binary goes missing on the first
-    /// restart with `lose_old`. `execs` are the units' `ExecStart=`.
+    /// restart with `lose_old`. For the first `executor` looks after each
+    /// restart, the process is still systemd's. `execs` are the units'
+    /// `ExecStart=`.
     struct Fake {
         binary: PathBuf,
         old: &'static str,
@@ -2304,6 +2350,8 @@ mod tests {
         running: bool,
         elsewhere: Option<PathBuf>,
         lose_old: bool,
+        executor: u32,
+        looks: std::cell::Cell<u32>,
         execs: Vec<(&'static str, &'static str, &'static str)>,
         restarted: std::cell::RefCell<Vec<String>>,
     }
@@ -2319,6 +2367,8 @@ mod tests {
                 running: true,
                 elsewhere: None,
                 lose_old: false,
+                executor: 0,
+                looks: std::cell::Cell::new(0),
                 execs: Vec::new(),
                 restarted: std::cell::RefCell::new(Vec::new()),
             }
@@ -2372,6 +2422,7 @@ mod tests {
                 let _ = std::fs::remove_file(self.binary.with_file_name("havn-channel-test.old"));
             }
             self.restarted.borrow_mut().push(unit.to_string());
+            self.looks.set(0);
             Ok(0)
         }
 
@@ -2380,6 +2431,11 @@ mod tests {
         }
 
         fn exe(&self, _pid: u32) -> Option<PathBuf> {
+            let looks = self.looks.get();
+            self.looks.set(looks + 1);
+            if looks < self.executor {
+                return Some(EXECUTOR.into());
+            }
             Some(
                 self.elsewhere
                     .clone()
@@ -2387,6 +2443,8 @@ mod tests {
             )
         }
     }
+
+    const EXECUTOR: &str = "/usr/lib/systemd/systemd-executor";
 
     const QUICK: Watch = Watch {
         settle: Duration::ZERO,
@@ -2499,6 +2557,18 @@ mod tests {
             Ok("updated".into())
         );
 
+        // Still systemd's for a moment after each restart: not a failure.
+        let (adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        let fake = Fake {
+            executor: 3,
+            ..Fake::new(&adapter.binary)
+        };
+        assert_eq!(
+            install_on(&fake, &adapter, &archive, &sums, true, watch).await,
+            Ok("updated".into())
+        );
+        assert_eq!(fake.installed(), "0.2.11");
+
         // A unit under two names is restarted once.
         let (mut adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
         adapter.units.push("alias.service".into());
@@ -2574,6 +2644,28 @@ mod tests {
             failed.contains("runs /usr/bin/havn-channel-test, not"),
             "{failed}"
         );
+        assert_eq!(fake.installed(), "0.2.9");
+
+        // Still systemd's when it has had its time: not the binary.
+        let (adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        let fake = Fake {
+            executor: u32::MAX,
+            ..Fake::new(&adapter.binary)
+        };
+        let watch = Watch {
+            settle: Duration::from_millis(20),
+            within: Duration::from_millis(500),
+            poll: Duration::from_millis(1),
+        };
+        let started = Instant::now();
+        let failed = install_on(&fake, &adapter, &archive, &sums, true, watch)
+            .await
+            .unwrap_err();
+        assert!(
+            failed.contains(&format!("runs {EXECUTOR}, not")),
+            "{failed}"
+        );
+        assert!(started.elapsed() >= watch.settle, "not before the settle");
         assert_eq!(fake.installed(), "0.2.9");
 
         // The second unit fails after the first came up: both go back.
