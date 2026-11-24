@@ -33,7 +33,8 @@ pub struct Caps {
 
 #[derive(Debug, Clone)]
 pub struct Reservation<'a> {
-    pub credential_id: CredentialId,
+    /// `None` for a call made without a credential (issue #232).
+    pub credential_id: Option<CredentialId>,
     pub user_id: UserId,
     pub agent_id: Option<AgentId>,
     pub provider: &'a str,
@@ -96,7 +97,7 @@ pub async fn reserve(pool: &SqlitePool, r: Reservation<'_>) -> Result<Option<Res
          RETURNING tokens_out",
     )
     .bind(&id)
-    .bind(r.credential_id.to_string())
+    .bind(r.credential_id.map(|c| c.to_string()))
     .bind(r.user_id.to_string())
     .bind(r.agent_id.map(|a| a.to_string()))
     .bind(r.provider)
@@ -229,7 +230,7 @@ pub struct Totals {
 
 pub async fn totals(
     pool: &SqlitePool,
-    credential_id: CredentialId,
+    credential_id: Option<CredentialId>,
     user_id: UserId,
     agent_id: Option<AgentId>,
     day_start: &str,
@@ -247,7 +248,7 @@ pub async fn totals(
                (SELECT COALESCE(SUM(tokens_in + tokens_out), 0) FROM credential_usages \
                  WHERE agent_id = ?3 AND created_at >= ?4)",
         )
-        .bind(credential_id.to_string())
+        .bind(credential_id.map(|c| c.to_string()))
         .bind(user_id.to_string())
         .bind(agent_id.map(|a| a.to_string()))
         .bind(day_start)
@@ -434,7 +435,7 @@ mod tests {
 
     fn reservation(f: &Fixture, tokens_in: i64, max_out: i64, caps: Caps) -> Reservation<'static> {
         Reservation {
-            credential_id: f.credential_id,
+            credential_id: Some(f.credential_id),
             user_id: f.user_id,
             agent_id: Some(f.agent_id),
             provider: "anthropic",
@@ -451,7 +452,7 @@ mod tests {
     async fn total(pool: &SqlitePool, f: &Fixture) -> Totals {
         totals(
             pool,
-            f.credential_id,
+            Some(f.credential_id),
             f.user_id,
             Some(f.agent_id),
             DAY,
@@ -504,6 +505,144 @@ mod tests {
             .expect("granted");
         release(&pool, &r.id).await.expect("release");
         assert_eq!(total(&pool, &f).await.credential_tokens, 10);
+    }
+
+    #[tokio::test]
+    async fn a_call_without_a_credential_counts_against_the_agent_only() {
+        let pool = connect_in_memory().await.expect("connect");
+        let f = fixture(&pool).await;
+        let caps = Caps {
+            agent_tokens: 150,
+            ..Caps::default()
+        };
+        let keyless = Reservation {
+            credential_id: None,
+            ..reservation(&f, 10, 100, caps)
+        };
+        reserve(&pool, keyless.clone())
+            .await
+            .expect("reserve")
+            .expect("granted");
+        let t = total(&pool, &f).await;
+        assert_eq!((t.credential_tokens, t.agent_tokens), (0, 110));
+        // The agent's budget holds across calls with and without one.
+        let r = reserve(&pool, keyless)
+            .await
+            .expect("reserve")
+            .expect("what is left");
+        assert_eq!(r.tokens_out, 30);
+        let days = usage_by_day(&pool, None, DAY).await.expect("days");
+        assert_eq!(days.iter().map(|d| d.calls).sum::<i64>(), 2);
+    }
+
+    #[tokio::test]
+    async fn usage_rows_and_their_indexes_survive_migration_0025() {
+        use sqlx::migrate::Migrator;
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::borrow::Cow;
+
+        #[derive(Debug, PartialEq, sqlx::FromRow)]
+        struct Row {
+            id: String,
+            credential_id: Option<String>,
+            user_id: String,
+            agent_id: Option<String>,
+            provider: String,
+            model: String,
+            tokens_in: i64,
+            tokens_out: i64,
+            created_at: String,
+            cache_read_tokens: i64,
+            cache_write_tokens: i64,
+            asked_model: String,
+            settled: i64,
+        }
+        async fn all(pool: &SqlitePool) -> Vec<Row> {
+            sqlx::query_as(
+                "SELECT id, credential_id, user_id, agent_id, provider, model, tokens_in, \
+                 tokens_out, created_at, cache_read_tokens, cache_write_tokens, asked_model, \
+                 settled FROM credential_usages ORDER BY id",
+            )
+            .fetch_all(pool)
+            .await
+            .expect("rows")
+        }
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .in_memory(true)
+                    .foreign_keys(true),
+            )
+            .await
+            .expect("connect");
+        let before = Migrator {
+            migrations: Cow::Owned(
+                crate::MIGRATOR
+                    .iter()
+                    .filter(|m| m.version < 25)
+                    .cloned()
+                    .collect(),
+            ),
+            ..Migrator::DEFAULT
+        };
+        before.run(&pool).await.expect("migrate up to 0024");
+        let f = fixture(&pool).await;
+        let settled = reserve(&pool, reservation(&f, 10, 100, Caps::default()))
+            .await
+            .expect("reserve")
+            .expect("granted");
+        settle(
+            &pool,
+            &settled.id,
+            "m",
+            Used {
+                tokens_in: 40,
+                tokens_out: 60,
+                cache_read: 30,
+                cache_write: 5,
+            },
+        )
+        .await
+        .expect("settle");
+        reserve(&pool, reservation(&f, 1, 2, Caps::default()))
+            .await
+            .expect("reserve")
+            .expect("granted");
+        let rows = all(&pool).await;
+        assert_eq!(rows.len(), 2);
+
+        crate::MIGRATOR.run(&pool).await.expect("migrate to latest");
+        assert_eq!(all(&pool).await, rows);
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' \
+             AND tbl_name = 'credential_usages' AND name LIKE 'idx_%' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("indexes");
+        assert_eq!(
+            indexes,
+            [
+                "idx_credusage_agent_time",
+                "idx_credusage_credential_time",
+                "idx_credusage_time",
+                "idx_credusage_user_time",
+            ]
+        );
+        // And a call without a credential is recorded now.
+        reserve(
+            &pool,
+            Reservation {
+                credential_id: None,
+                ..reservation(&f, 1, 2, Caps::default())
+            },
+        )
+        .await
+        .expect("reserve")
+        .expect("granted");
+        assert_eq!(all(&pool).await.len(), 3);
     }
 
     #[tokio::test]

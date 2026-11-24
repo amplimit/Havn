@@ -116,6 +116,10 @@ pub struct GatewayConfig {
     ///
     /// [llm.base_url]
     /// anthropic = "https://llm-gateway.internal.example"
+    ///
+    /// [llm.endpoints.ollama]
+    /// api = "openai"
+    /// base_url = "http://127.0.0.1:11434/v1"
     /// ```
     #[serde(default)]
     pub llm: LlmConfig,
@@ -639,6 +643,11 @@ pub struct LlmConfig {
     /// are sent there. Operator config only; agents and API users cannot set
     /// it.
     pub base_url: std::collections::BTreeMap<String, String>,
+    /// Named endpoints that speak the API of a built-in provider (issue
+    /// #232), such as a local Ollama or vLLM server: models name them as
+    /// `<name>:<model>`, and their credentials are stored under the name.
+    /// Operator config only.
+    pub endpoints: Endpoints,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     /// The model that writes chats' titles (issue #179), unless a team's
@@ -660,6 +669,97 @@ impl LlmConfig {
 }
 
 pub const DEFAULT_MAX_TOKENS_CEILING: u32 = 128_000;
+
+/// An `[llm.endpoints]` entry: the API it speaks and where.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Endpoint {
+    pub api: EndpointApi,
+    pub base_url: String,
+}
+
+/// The APIs an endpoint may speak: those of the built-in providers of the
+/// same names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EndpointApi {
+    Anthropic,
+    Openai,
+}
+
+impl EndpointApi {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Openai => "openai",
+        }
+    }
+}
+
+/// `[llm.endpoints]`, by name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(transparent)]
+pub struct Endpoints(pub std::collections::BTreeMap<String, Endpoint>);
+
+impl Endpoints {
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&Endpoint> {
+        self.0.get(name)
+    }
+
+    /// The API a provider of `[[llm.models]]` speaks, as the name of the
+    /// built-in provider that speaks it: a built-in one's own, an
+    /// endpoint's, or `None` for neither.
+    #[must_use]
+    pub fn api_of(&self, provider: &str) -> Option<&'static str> {
+        crate::llm_proxy::PROVIDERS
+            .iter()
+            .find(|p| **p == provider)
+            .copied()
+            .or_else(|| self.get(provider).map(|e| e.api.as_str()))
+    }
+
+    /// Also stores each URL in normalized form, without a trailing slash.
+    fn validate(&mut self) -> anyhow::Result<()> {
+        for (name, endpoint) in &mut self.0 {
+            if crate::llm_proxy::is_provider(name) {
+                anyhow::bail!(
+                    "[llm.endpoints] {name:?} is a built-in provider: give the endpoint another \
+                     name, or move the provider itself with [llm.base_url]"
+                );
+            }
+            if !is_endpoint_name(name) {
+                anyhow::bail!(
+                    "[llm.endpoints] {name:?} must be a lowercase letter, then up to \
+                     {MAX_ENDPOINT_NAME} lowercase letters, digits, - or _"
+                );
+            }
+            let Some(normalized) = normalized_base_url(&endpoint.base_url) else {
+                anyhow::bail!(
+                    "[llm.endpoints] {name} base_url = {:?} must be an http(s) URL without \
+                     credentials, query or fragment",
+                    endpoint.base_url
+                );
+            };
+            endpoint.base_url = normalized;
+        }
+        Ok(())
+    }
+}
+
+/// Most characters of an endpoint's name after its first letter.
+const MAX_ENDPOINT_NAME: usize = 31;
+
+/// Whether `name` has the shape of an endpoint's name: a lowercase letter,
+/// then lowercase letters, digits, `-` or `_`.
+#[must_use]
+pub fn is_endpoint_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && name.len() <= MAX_ENDPOINT_NAME + 1
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
@@ -764,6 +864,7 @@ impl Default for LlmConfig {
         Self {
             max_tokens_ceiling: DEFAULT_MAX_TOKENS_CEILING,
             base_url: std::collections::BTreeMap::new(),
+            endpoints: Endpoints::default(),
             default_model: None,
             title_model: None,
             models: Vec::new(),
@@ -988,8 +1089,8 @@ impl GatewayConfig {
         Ok(parsed)
     }
 
-    /// Also stores each `[llm.base_url]` in normalized form, without a
-    /// trailing slash.
+    /// Also stores each `[llm.base_url]` and endpoint URL in normalized
+    /// form, without a trailing slash.
     fn validate_llm(&mut self) -> anyhow::Result<()> {
         if self.llm.max_tokens_ceiling == 0 {
             anyhow::bail!("[llm] max_tokens_ceiling must be at least 1");
@@ -1006,7 +1107,8 @@ impl GatewayConfig {
             };
             *url = normalized;
         }
-        self.llm.catalog().validate()
+        self.llm.endpoints.validate()?;
+        self.llm.catalog().validate(&self.llm.endpoints)
     }
 
     /// Also stores the search URLs in normalized form.
@@ -1537,6 +1639,64 @@ mod tests {
             "stored without the trailing slash"
         );
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn llm_endpoints_are_named_apart_from_the_providers_with_plain_urls() {
+        let p = write_tmp_config(
+            "[llm.endpoints.ollama]\napi = \"openai\"\nbase_url = \"http://127.0.0.1:11434/v1/\"\n\n\
+             [llm.endpoints.lan-claude_2]\napi = \"anthropic\"\nbase_url = \"https://llm.lan\"\n\n\
+             [[llm.models]]\nid = \"ollama:qwen3\"\n",
+        );
+        let cfg = GatewayConfig::load_from(&p).expect("load");
+        let ollama = cfg.llm.endpoints.get("ollama").expect("ollama");
+        assert_eq!(ollama.api, EndpointApi::Openai);
+        assert_eq!(
+            ollama.base_url, "http://127.0.0.1:11434/v1",
+            "stored without the trailing slash"
+        );
+        let api = |p: &str| cfg.llm.endpoints.api_of(p);
+        assert_eq!(api("lan-claude_2"), Some("anthropic"));
+        assert_eq!(api("ollama"), Some("openai"));
+        assert_eq!(api("openrouter"), Some("openrouter"));
+        assert_eq!(api("nobody"), None);
+        let _ = std::fs::remove_file(&p);
+
+        let endpoint = |name: &str, url: &str| {
+            format!("[llm.endpoints.{name}]\napi = \"openai\"\nbase_url = \"{url}\"\n")
+        };
+        for bad in [
+            endpoint("openai", "http://127.0.0.1:9000"),
+            endpoint("anthropic", "http://127.0.0.1:9000"),
+            endpoint("openrouter", "http://127.0.0.1:9000"),
+            endpoint("gemini", "http://127.0.0.1:9000"),
+            endpoint("Ollama", "http://127.0.0.1:9000"),
+            endpoint("9b", "http://127.0.0.1:9000"),
+            endpoint("\"a:b\"", "http://127.0.0.1:9000"),
+            endpoint("\"my endpoint\"", "http://127.0.0.1:9000"),
+            endpoint(&"x".repeat(33), "http://127.0.0.1:9000"),
+            endpoint("ollama", "ftp://127.0.0.1:9000"),
+            endpoint("ollama", "http://user:pw@127.0.0.1:9000"),
+            endpoint("ollama", "http://127.0.0.1:9000/v1?key=x"),
+            endpoint("ollama", "not a url"),
+        ] {
+            let p = write_tmp_config(&bad);
+            let msg = format!("{:#}", GatewayConfig::load_from(&p).expect_err(&bad));
+            assert!(msg.contains("[llm.endpoints]"), "{msg}");
+            let _ = std::fs::remove_file(&p);
+        }
+        assert!(is_endpoint_name(&"x".repeat(32)));
+        for bad in [
+            "[llm.endpoints.ollama]\napi = \"gemini\"\nbase_url = \"http://127.0.0.1:9000\"\n",
+            "[llm.endpoints.ollama]\napi = \"openai\"\n",
+            "[llm.endpoints.ollama]\napi = \"openai\"\nbase_url = \"http://127.0.0.1:9000\"\nkey = \"k\"\n",
+            // A model of an endpoint that is not there.
+            "[[llm.models]]\nid = \"ollama:qwen3\"\n",
+        ] {
+            let p = write_tmp_config(bad);
+            assert!(GatewayConfig::load_from(&p).is_err(), "{bad}");
+            let _ = std::fs::remove_file(&p);
+        }
     }
 
     #[test]

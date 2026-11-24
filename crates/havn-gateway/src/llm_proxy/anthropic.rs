@@ -18,6 +18,25 @@ impl AnthropicProvider {
     pub const NAME: &'static str = "anthropic";
 }
 
+/// A POST of `body` to the Messages endpoint under `base_url`, with the
+/// key, unless there is none.
+fn post(
+    http: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+) -> reqwest::RequestBuilder {
+    let builder = http
+        .post(format!("{base_url}/v1/messages"))
+        .header("anthropic-version", VERSION)
+        .json(body);
+    if api_key.is_empty() {
+        builder
+    } else {
+        builder.header("x-api-key", api_key)
+    }
+}
+
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
     fn name(&self) -> &'static str {
@@ -36,11 +55,7 @@ impl LlmProvider for AnthropicProvider {
         request: &AnthropicRequest,
     ) -> Result<AnthropicResponse, ProviderError> {
         let body = request_body(request)?;
-        let resp = http
-            .post(format!("{base_url}/v1/messages"))
-            .header("x-api-key", api_key)
-            .header("anthropic-version", VERSION)
-            .json(&body)
+        let resp = post(http, base_url, api_key, &body)
             .send()
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
@@ -68,11 +83,7 @@ impl LlmProvider for AnthropicProvider {
     ) -> Result<AnthropicResponse, ProviderError> {
         let mut body = request_body(request)?;
         body["stream"] = serde_json::Value::Bool(true);
-        let resp = http
-            .post(format!("{base_url}/v1/messages"))
-            .header("x-api-key", api_key)
-            .header("anthropic-version", VERSION)
-            .json(&body)
+        let resp = post(http, base_url, api_key, &body)
             .send()
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;

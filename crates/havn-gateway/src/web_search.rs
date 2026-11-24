@@ -475,7 +475,7 @@ impl WebSearch {
             let day_start = today_start_utc_rfc3339();
             let minute_start = minute_ago_utc_rfc3339();
             let reservation = Reservation {
-                credential_id: credential.id,
+                credential_id: Some(credential.id),
                 user_id: billing.user_id,
                 agent_id: billing.agent_id,
                 provider: candidate.backend.usage_provider(),

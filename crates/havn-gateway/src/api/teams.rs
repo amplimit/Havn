@@ -706,7 +706,7 @@ mod tests {
             let reserved = reserve(
                 db,
                 Reservation {
-                    credential_id: credential,
+                    credential_id: Some(credential),
                     user_id: user,
                     agent_id,
                     provider: "anthropic",

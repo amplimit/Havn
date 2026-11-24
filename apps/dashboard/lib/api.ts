@@ -406,6 +406,18 @@ export type ModelsView = {
   models: ModelEntry[];
   /** False with trust_header on: the list is then edited in config.toml only. */
   editable: boolean;
+  /**
+   * The gateway's [llm.endpoints]: models name them as their provider, and
+   * they are called without a key when there is none. Absent from a
+   * gateway from before them.
+   */
+  endpoints?: ModelEndpoint[];
+};
+
+/** A named endpoint that speaks the API of the built-in provider `api`. */
+export type ModelEndpoint = {
+  name: string;
+  api: "anthropic" | "openai";
 };
 
 export type EmbeddingStatus = {
@@ -1276,6 +1288,14 @@ export function llmProvider(credentialProvider: string): string | null {
 export function modelProvider(id: string | null | undefined): string | null {
   const provider = id?.split(":")[0];
   return provider ? provider : null;
+}
+
+/** The endpoint of [llm.endpoints] named `provider`, which needs no key. */
+export function endpointOf(
+  view: ModelsView | null | undefined,
+  provider: string | null,
+): ModelEndpoint | undefined {
+  return view?.endpoints?.find((e) => e.name === provider);
 }
 
 export type KeyScopes = { own: Set<string>; teams: Map<string, Set<string>> };

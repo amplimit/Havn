@@ -6,6 +6,7 @@ import { useEffect, useState } from "react";
 import { TriangleAlert } from "lucide-react";
 import {
   api,
+  endpointOf,
   keyScopes,
   modelProvider,
   reachable,
@@ -58,8 +59,12 @@ export default function NewAgentPage() {
   }, []);
 
   const provider = modelProvider(model || models?.effective_default);
+  // An endpoint of [llm.endpoints] is called without a key when there is none.
   const uncovered =
-    scopes !== null && provider !== null && !reachable(scopes, teamId || null).has(provider);
+    scopes !== null &&
+    provider !== null &&
+    !endpointOf(models, provider) &&
+    !reachable(scopes, teamId || null).has(provider);
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();

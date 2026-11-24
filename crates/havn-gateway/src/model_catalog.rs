@@ -188,8 +188,8 @@ impl ThinkingSpec {
         }
     }
 
-    fn validate(&self, id: &str) -> anyhow::Result<()> {
-        let provider = split_model_ref(id).map_or("", |(p, _)| p);
+    /// `api` is the API the model's provider speaks.
+    fn validate(&self, id: &str, api: Option<&str>) -> anyhow::Result<()> {
         match self.style {
             ThinkingStyle::Effort => {
                 if self.levels.is_empty() || self.levels.len() > MAX_CHOICES {
@@ -213,7 +213,7 @@ impl ThinkingSpec {
                 }
             }
             ThinkingStyle::Budget => {
-                if provider == "openai" {
+                if api == Some("openai") {
                     anyhow::bail!(
                         "[[llm.models]] {id:?}: an OpenAI-compatible endpoint takes thinking by effort or on/off, not by budget"
                     );
@@ -397,13 +397,18 @@ impl ModelEntry {
     }
 }
 
+/// `provider:model`, split at the first colon, with a provider that is a
+/// built-in one or has the shape of an `[llm.endpoints]` name: whether
+/// that endpoint is configured is [`ModelCatalog::validate`]'s to check.
 #[must_use]
 pub fn split_model_ref(id: &str) -> Option<(&str, &str)> {
     if id.len() > MAX_ID_LEN || id.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return None;
     }
     let (provider, model) = id.split_once(':')?;
-    (!model.is_empty() && crate::llm_proxy::is_provider(provider)).then_some((provider, model))
+    let named =
+        crate::llm_proxy::is_provider(provider) || crate::config::is_endpoint_name(provider);
+    (!model.is_empty() && named).then_some((provider, model))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -417,15 +422,33 @@ pub struct ModelCatalog {
 }
 
 impl ModelCatalog {
-    pub fn validate(&self) -> anyhow::Result<()> {
+    /// `endpoints` are the `[llm.endpoints]` its models may name.
+    pub fn validate(&self, endpoints: &crate::config::Endpoints) -> anyhow::Result<()> {
         let mut seen = HashSet::new();
         for entry in &self.models {
-            if split_model_ref(&entry.id).is_none() {
+            let split = split_model_ref(&entry.id);
+            let api = split.and_then(|(p, _)| endpoints.api_of(p));
+            if let Some((provider, _)) = split
+                && api.is_none()
+            {
+                anyhow::bail!(
+                    "[[llm.models]] {:?} names the endpoint {provider:?}, which is not one of \
+                     [llm.endpoints] (the gateway takes an endpoint added to config.toml, and \
+                     drops one removed, on `havn gateway restart`)",
+                    entry.id
+                );
+            }
+            if api.is_none() {
+                let providers: Vec<&str> = crate::llm_proxy::PROVIDERS
+                    .iter()
+                    .copied()
+                    .chain(endpoints.0.keys().map(String::as_str))
+                    .collect();
                 anyhow::bail!(
                     "[[llm.models]] id {:?} must be provider:model, without spaces, with a \
-                     provider of {}",
+                     provider of {} (an endpoint of [llm.endpoints] is a provider too)",
                     entry.id,
-                    crate::llm_proxy::PROVIDERS.join(", ")
+                    providers.join(", ")
                 );
             }
             if !seen.insert(entry.id.as_str()) {
@@ -446,7 +469,7 @@ impl ModelCatalog {
                 price.validate(&entry.id)?;
             }
             if let Some(thinking) = &entry.thinking {
-                thinking.validate(&entry.id)?;
+                thinking.validate(&entry.id, api)?;
             }
             if let Some(label) = &entry.label
                 && (label.len() > MAX_LABEL_LEN || label.chars().any(char::is_control))
@@ -573,7 +596,9 @@ fn entry_table(value: toml_edit::Value) -> anyhow::Result<Table> {
 // file a symlink points to), keeping the rest of the file, comments
 // included, and the comments of entries that stay. The entries go right
 // after the other `[llm]` tables, or before the first table when there are
-// none. A missing file is created.
+// none. A missing file is created. Nothing is written when the gateway
+// could not load the file with the list ([`Unloadable`]): its models must
+// name the file's own `[llm.endpoints]`.
 pub fn write_to_file(path: &Path, catalog: &ModelCatalog) -> anyhow::Result<()> {
     write_checked(path, catalog, None).map(|_| ())
 }
@@ -588,6 +613,12 @@ pub fn write_if_unchanged(
     write_checked(path, catalog, Some(version))
 }
 
+/// Why a model list was not written: config.toml with it is not one the
+/// gateway could load.
+#[derive(Debug, thiserror::Error)]
+#[error("config.toml would not load with this model list: {0}")]
+pub struct Unloadable(pub String);
+
 fn write_checked(
     path: &Path,
     catalog: &ModelCatalog,
@@ -595,7 +626,6 @@ fn write_checked(
 ) -> anyhow::Result<bool> {
     use anyhow::Context as _;
 
-    catalog.validate()?;
     let target: PathBuf = match std::fs::canonicalize(path) {
         Ok(p) => p,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
@@ -767,7 +797,12 @@ fn write_checked(
         llm.insert("models", Item::ArrayOfTables(models));
     }
 
-    replace_file(&target, doc.to_string().as_bytes())?;
+    // Checked as the gateway loads it at its next start.
+    let written = doc.to_string();
+    if let Err(e) = crate::config::GatewayConfig::from_toml(&written) {
+        return Err(Unloadable(format!("{e:#}")).into());
+    }
+    replace_file(&target, written.as_bytes())?;
     Ok(true)
 }
 
@@ -979,7 +1014,9 @@ pub async fn upgrade(
             seeded.push(LEGACY_DEFAULT_MODEL.to_string());
         }
         for model in used {
-            if !seeded.contains(&model) && split_model_ref(&model).is_some() {
+            let builtin =
+                split_model_ref(&model).is_some_and(|(p, _)| crate::llm_proxy::is_provider(p));
+            if !seeded.contains(&model) && builtin {
                 seeded.push(model);
             }
         }
@@ -1002,6 +1039,7 @@ pub async fn upgrade(
                     .collect(),
             };
             let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
+            // Of the built-in providers only, as the agents named them.
             match write_to_file(config_path, &catalog) {
                 Ok(()) => {
                     info!(
@@ -1039,6 +1077,9 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+    use crate::config::{Endpoint, EndpointApi, Endpoints};
+
+    const NO_ENDPOINTS: Endpoints = Endpoints(std::collections::BTreeMap::new());
 
     #[test]
     fn a_models_thinking_resolves_within_its_choices() {
@@ -1141,13 +1182,13 @@ mod tests {
         let mut c = ModelCatalog::default();
         c.models = vec![entry("openrouter:a/main"), entry("openrouter:a/spare")];
         c.models[0].fallback = vec!["openrouter:a/spare".into()];
-        assert!(c.validate().is_ok());
+        assert!(c.validate(&NO_ENDPOINTS).is_ok());
         // One removed since is passed over, not refused: the model it was
         // can be removed.
         c.models[0].fallback = vec!["openrouter:a/gone".into()];
-        assert!(c.validate().is_ok());
+        assert!(c.validate(&NO_ENDPOINTS).is_ok());
         c.models[0].fallback = vec!["openrouter:a/main".into()];
-        assert!(c.validate().is_err());
+        assert!(c.validate(&NO_ENDPOINTS).is_err());
     }
 
     #[test]
@@ -1169,7 +1210,7 @@ mod tests {
             fallback: Vec::new(),
             price: None,
         });
-        c.validate().expect("valid");
+        c.validate(&NO_ENDPOINTS).expect("valid");
         let dir = tempfile::tempdir().expect("dir");
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "").expect("write");
@@ -1180,7 +1221,10 @@ mod tests {
 
         let mut bad = c.clone();
         bad.models[0].thinking.as_mut().expect("thinking").default = Some("max".into());
-        assert!(bad.validate().is_err(), "a default it does not offer");
+        assert!(
+            bad.validate(&NO_ENDPOINTS).is_err(),
+            "a default it does not offer"
+        );
         let mut bad = c.clone();
         bad.models[0].id = "openai:gpt-5".into();
         let spec = bad.models[0].thinking.as_mut().expect("thinking");
@@ -1188,7 +1232,7 @@ mod tests {
         spec.budgets = vec![1024];
         spec.default = None;
         assert!(
-            bad.validate().is_err(),
+            bad.validate(&NO_ENDPOINTS).is_err(),
             "an OpenAI endpoint takes no budget"
         );
     }
@@ -1226,31 +1270,87 @@ mod tests {
         );
         assert_eq!(split_model_ref("claude-opus-4-7"), None);
         assert_eq!(split_model_ref("deepseek/deepseek-r1:free"), None);
-        assert_eq!(split_model_ref("nobody:model"), None);
+        assert_eq!(split_model_ref("Nobody:model"), None);
         assert_eq!(split_model_ref("openai:"), None);
+        // An endpoint's name splits off; whether it is configured is
+        // checked by the catalog.
+        assert_eq!(
+            split_model_ref("ollama:qwen3:8b"),
+            Some(("ollama", "qwen3:8b"))
+        );
+    }
+
+    #[test]
+    fn a_model_may_name_an_endpoint_only_when_it_is_configured() {
+        let mut endpoints = Endpoints::default();
+        endpoints.0.insert(
+            "ollama".into(),
+            Endpoint {
+                api: EndpointApi::Openai,
+                base_url: "http://127.0.0.1:11434/v1".into(),
+            },
+        );
+        endpoints.0.insert(
+            "lan".into(),
+            Endpoint {
+                api: EndpointApi::Anthropic,
+                base_url: "http://10.0.0.5:8000".into(),
+            },
+        );
+        let c = catalog(&["ollama:qwen3", "anthropic:claude-opus-4-7"], None);
+        c.validate(&endpoints).expect("a configured endpoint");
+        let msg = format!(
+            "{}",
+            c.validate(&NO_ENDPOINTS).expect_err("no such endpoint")
+        );
+        assert!(msg.contains("ollama:qwen3"), "{msg}");
+        assert!(
+            catalog(&["nobody:model"], None)
+                .validate(&endpoints)
+                .is_err()
+        );
+        // The endpoint's API decides how it thinks: by budget on an
+        // Anthropic-compatible one, not on an OpenAI-compatible one.
+        let budget = |id: &str| {
+            let mut c = catalog(&[id], None);
+            c.models[0].thinking = Some(ThinkingSpec {
+                style: ThinkingStyle::Budget,
+                levels: Vec::new(),
+                budgets: vec![1024],
+                default: None,
+                mandatory: false,
+            });
+            c.validate(&endpoints)
+        };
+        assert!(budget("lan:claude-opus-4-7").is_ok());
+        assert!(budget("ollama:qwen3").is_err());
     }
 
     #[test]
     fn validation_rejects_bad_ids_duplicates_and_an_unlisted_default() {
         assert!(
             catalog(&["anthropic:claude-opus-4-7"], None)
-                .validate()
+                .validate(&NO_ENDPOINTS)
                 .is_ok()
         );
-        assert!(catalog(&["claude-opus-4-7"], None).validate().is_err());
+        assert!(
+            catalog(&["claude-opus-4-7"], None)
+                .validate(&NO_ENDPOINTS)
+                .is_err()
+        );
         assert!(
             catalog(&["openai:gpt-5", "openai:gpt-5"], None)
-                .validate()
+                .validate(&NO_ENDPOINTS)
                 .is_err()
         );
         assert!(
             catalog(&["openai:gpt-5"], Some("openai:gpt-4o"))
-                .validate()
+                .validate(&NO_ENDPOINTS)
                 .is_err()
         );
         let mut zero = catalog(&["openai:gpt-5"], None);
         zero.models[0].max_output_tokens = Some(0);
-        assert!(zero.validate().is_err());
+        assert!(zero.validate(&NO_ENDPOINTS).is_err());
     }
 
     #[test]
@@ -1462,7 +1562,7 @@ mod tests {
         assert!(split_model_ref(&format!("openai:{}", "x".repeat(300))).is_none());
         let mut c = catalog(&["openai:gpt-5"], None);
         c.models[0].label = Some("bad\nlabel".into());
-        assert!(c.validate().is_err());
+        assert!(c.validate(&NO_ENDPOINTS).is_err());
     }
 
     async fn db() -> SqlitePool {
@@ -1615,6 +1715,32 @@ mod tests {
         assert_eq!(read_from_file(&path).unwrap(), other);
     }
 
+    #[test]
+    fn a_list_is_written_only_with_the_endpoints_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        let c = catalog(&["ollama:qwen3"], None);
+        let err = write_to_file(&path, &c).expect_err("no such endpoint in the file");
+        assert!(err.downcast_ref::<Unloadable>().is_some(), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("endpoint \"ollama\""),
+            "{err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "",
+            "nothing written"
+        );
+        std::fs::write(
+            &path,
+            "[llm.endpoints.ollama]\napi = \"openai\"\nbase_url = \"http://127.0.0.1:11434/v1\"\n",
+        )
+        .unwrap();
+        write_to_file(&path, &c).expect("written");
+        assert_eq!(read_from_file(&path).unwrap(), c);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_created_file_is_readable_by_others() {
@@ -1711,7 +1837,7 @@ mod tests {
             title_model: None,
             models: vec![negative],
         };
-        assert!(catalog.validate().is_err());
+        assert!(catalog.validate(&NO_ENDPOINTS).is_err());
         assert!(
             toml::from_str::<ModelEntry>("id = \"a:b\"\nprice = { input = 1.0 }").is_err(),
             "output is needed"
@@ -1754,6 +1880,9 @@ mod tests {
             ..priced
         };
         catalog.models[0].price = Some(negative);
-        assert!(catalog.validate().is_err(), "-0 is refused too");
+        assert!(
+            catalog.validate(&NO_ENDPOINTS).is_err(),
+            "-0 is refused too"
+        );
     }
 }

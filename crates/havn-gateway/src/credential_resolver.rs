@@ -50,8 +50,14 @@ pub async fn resolve_for_user(
     // form first (the canonical post-migration shape), fall through
     // to the bare form for v0.1 rows that haven't been migrated for
     // any reason. Two SELECTs maximum, both hitting the
-    // (scope, scope_id, provider, priority) index.
-    let candidates: [String; 2] = [format!("llm:{provider}"), provider.to_string()];
+    // (scope, scope_id, provider, priority) index. A name passed already
+    // namespaced, as an `[llm.endpoints]` one is (issue #232), is looked up
+    // as it is only: a bare one could be any other key's.
+    let candidates: Vec<String> = if provider.starts_with("llm:") {
+        vec![provider.to_string()]
+    } else {
+        vec![format!("llm:{provider}"), provider.to_string()]
+    };
 
     // Step 1: user scope, both forms.
     let mut chain = Vec::new();

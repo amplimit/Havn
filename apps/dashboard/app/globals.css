@@ -533,6 +533,11 @@
   animation: havn-fade 160ms ease-out both;
 }
 
+/* A group of settings: its first part close under the group's heading. */
+.settings-group > h2 + * {
+  margin-top: 1.25rem;
+}
+
 /* A part that opens and closes: its height and opacity move together,
  * the arrow beside its head turns. Closed, it keeps no height. */
 .fold {

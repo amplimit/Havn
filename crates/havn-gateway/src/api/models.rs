@@ -20,6 +20,17 @@ pub struct ModelsView {
     pub title_model: Option<String>,
     pub models: Vec<ModelEntry>,
     pub editable: bool,
+    /// The `[llm.endpoints]` the gateway runs with, which models may name
+    /// as their provider (issue #232).
+    pub endpoints: Vec<EndpointView>,
+}
+
+/// An endpoint, without its URL.
+#[derive(Debug, Serialize)]
+pub struct EndpointView {
+    pub name: String,
+    /// The built-in provider whose API it speaks: `anthropic` or `openai`.
+    pub api: &'static str,
 }
 
 fn view(state: &AppState) -> ModelsView {
@@ -31,6 +42,16 @@ fn view(state: &AppState) -> ModelsView {
         title_model: catalog.title_model.clone(),
         models: catalog.models.clone(),
         editable: state.trusted_proxies.is_none(),
+        endpoints: state
+            .llm
+            .endpoints
+            .0
+            .iter()
+            .map(|(name, e)| EndpointView {
+                name: name.clone(),
+                api: e.api.as_str(),
+            })
+            .collect(),
     }
 }
 
@@ -85,36 +106,52 @@ pub async fn put(
         title_model,
         models: req.models,
     };
+    // Of the endpoints the gateway runs with, so that it can call them; the
+    // write checks the file's own, so that it can start with them.
     catalog
-        .validate()
+        .validate(&state.llm.endpoints)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let _writing = state.models_write.lock().await;
     let path = state.config_path.clone();
     let written = catalog.clone();
     let expected = req.version;
+    let llm = Arc::clone(&state.llm);
     let applied = tokio::task::spawn_blocking(move || {
         // The file is compared, not the running list: a hand edit the
         // watcher has not applied yet must not be overwritten either.
-        if model_catalog::write_if_unchanged(&path, &expected, &written)? {
-            return Ok(None);
-        }
-        // Retrying only helps if the gateway can load what is there now.
-        Ok::<_, anyhow::Error>(Some(match crate::config::GatewayConfig::load_from(&path) {
-            Ok(_) => {
-                "the model list changed since it was read; load it again and retry".to_string()
+        match model_catalog::write_if_unchanged(&path, &expected, &written) {
+            Ok(true) => return Ok(None),
+            Ok(false) => {}
+            Err(e) if e.is::<model_catalog::Unloadable>() => {
+                return Ok(Some(ApiError::BadRequest(e.to_string())));
             }
-            Err(e) => format!(
-                "config.toml has changes the gateway could not load ({e:#}); fix the file, \
-                 then retry"
-            ),
-        }))
+            Err(e) => return Err(e),
+        }
+        // Retrying only helps if the gateway can load what is there now,
+        // and run its models.
+        Ok::<_, anyhow::Error>(Some(ApiError::Conflict(
+            match crate::config::GatewayConfig::load_from(&path) {
+                Ok(cfg) => match cfg.llm.catalog().validate(&llm.endpoints) {
+                    Ok(()) => "the model list changed since it was read; load it again and retry"
+                        .to_string(),
+                    Err(e) => format!(
+                        "config.toml lists models the running gateway cannot use yet ({e}); \
+                         run `havn gateway restart`, then retry"
+                    ),
+                },
+                Err(e) => format!(
+                    "config.toml has changes the gateway could not load ({e:#}); fix the file, \
+                     then retry"
+                ),
+            },
+        )))
     })
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?
     .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
-    if let Some(conflict) = applied {
-        return Err(ApiError::Conflict(conflict));
+    if let Some(refused) = applied {
+        return Err(refused);
     }
     let ids: Vec<String> = catalog.models.iter().map(|m| m.id.clone()).collect();
     let default_model = catalog.default_model.clone();
@@ -215,7 +252,7 @@ pub async fn check(
         title_model: None,
         models: vec![entry.clone()],
     }
-    .validate()
+    .validate(&state.llm.endpoints)
     .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let policy = crate::policy_resolver::for_user(&state.db, user.id).await;
     if !crate::llm_proxy::model_allowed(&policy.allowed_models, &entry.id) {
@@ -365,6 +402,70 @@ mod tests {
         let parsed: crate::config::GatewayConfig =
             toml::from_str(&std::fs::read_to_string(&state.config_path).unwrap()).unwrap();
         assert_eq!(parsed.llm.catalog(), *state.models.load_full());
+        let _ = std::fs::remove_file(&state.config_path);
+    }
+
+    #[tokio::test]
+    async fn a_model_may_name_an_endpoint_the_gateway_runs_with() {
+        let (mut state, user_id) = state_with(false).await;
+        let first = get(State(state.clone()), user(user_id)).await.0.version;
+        let err = put(
+            State(state.clone()),
+            user(user_id),
+            body(&first, &["ollama:qwen3"]),
+        )
+        .await
+        .expect_err("no such endpoint");
+        assert!(
+            matches!(&err, ApiError::BadRequest(m) if m.contains("havn gateway restart")),
+            "{err:?}"
+        );
+
+        let mut llm = crate::config::LlmConfig::default();
+        llm.endpoints.0.insert(
+            "ollama".into(),
+            crate::config::Endpoint {
+                api: crate::config::EndpointApi::Openai,
+                base_url: "http://127.0.0.1:11434/v1".into(),
+            },
+        );
+        state.llm = Arc::new(llm);
+        // Running, but gone from config.toml: the gateway could not start
+        // with the list, so it is not written.
+        let _ = std::fs::remove_file(&state.config_path);
+        let err = put(
+            State(state.clone()),
+            user(user_id),
+            body(&first, &["ollama:qwen3"]),
+        )
+        .await
+        .expect_err("not in the file");
+        assert!(
+            matches!(&err, ApiError::BadRequest(m) if m.contains("endpoint \"ollama\"")),
+            "{err:?}"
+        );
+        assert!(!state.config_path.exists(), "nothing written");
+
+        std::fs::write(
+            &state.config_path,
+            "[llm.endpoints.ollama]\napi = \"openai\"\nbase_url = \"http://127.0.0.1:11434/v1\"\n",
+        )
+        .unwrap();
+        let view = put(
+            State(state.clone()),
+            user(user_id),
+            body(&first, &["ollama:qwen3"]),
+        )
+        .await
+        .unwrap()
+        .0;
+        let endpoints: Vec<(&str, &str)> = view
+            .endpoints
+            .iter()
+            .map(|e| (e.name.as_str(), e.api))
+            .collect();
+        assert_eq!(endpoints, vec![("ollama", "openai")]);
+        assert!(state.models.load().get("ollama:qwen3").is_some());
         let _ = std::fs::remove_file(&state.config_path);
     }
 
