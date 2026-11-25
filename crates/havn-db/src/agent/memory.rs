@@ -336,7 +336,14 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
             .bind(&archived_id)
             .execute(&mut *tx)
             .await?;
-            insert_new(&mut *tx, &new, ttl, new_key(new.visibility), Some(&archived_id)).await?;
+            insert_new(
+                &mut *tx,
+                &new,
+                ttl,
+                new_key(new.visibility),
+                Some(&archived_id),
+            )
+            .await?;
         }
         None => {
             insert_new(&mut *tx, &new, ttl, new_key(new.visibility), None).await?;
@@ -1778,17 +1785,27 @@ mod tests {
 
         // An existing private entry is not made public by a save, repeated
         // or replaced: only the owner does that, on the dashboard.
-        remember(&pool, fact("k", "v1", PublicIfNew)).await.expect("repeat");
+        remember(&pool, fact("k", "v1", PublicIfNew))
+            .await
+            .expect("repeat");
         assert_eq!(shown(&pool, "k").await, Visibility::Private);
-        remember(&pool, fact("k", "v2", PublicIfNew)).await.expect("replace");
+        remember(&pool, fact("k", "v2", PublicIfNew))
+            .await
+            .expect("replace");
         assert_eq!(shown(&pool, "k").await, Visibility::Private);
 
         // A new key is.
-        remember(&pool, fact("p", "v1", PublicIfNew)).await.expect("public");
+        remember(&pool, fact("p", "v1", PublicIfNew))
+            .await
+            .expect("public");
         assert_eq!(shown(&pool, "p").await, Visibility::Public);
         // Repeated or replaced, it keeps it.
-        remember(&pool, fact("p", "v1", Keep)).await.expect("repeat");
-        remember(&pool, fact("p", "v2", Keep)).await.expect("replace");
+        remember(&pool, fact("p", "v1", Keep))
+            .await
+            .expect("repeat");
+        remember(&pool, fact("p", "v2", Keep))
+            .await
+            .expect("replace");
         let replaced = get(&pool, "p").await.unwrap().unwrap();
         assert_eq!(replaced.value, "v2");
         assert_eq!(replaced.visibility, Visibility::Public);
@@ -1808,13 +1825,19 @@ mod tests {
         assert_eq!(shown(&pool, "q").await, Visibility::Private);
 
         // Made private, even repeated.
-        remember(&pool, fact("r", "v1", PublicIfNew)).await.expect("public");
-        remember(&pool, fact("r", "v1", Private)).await.expect("private");
+        remember(&pool, fact("r", "v1", PublicIfNew))
+            .await
+            .expect("public");
+        remember(&pool, fact("r", "v1", Private))
+            .await
+            .expect("private");
         assert_eq!(shown(&pool, "r").await, Visibility::Private);
 
         // Forgotten and saved again: a new fact.
         forget(&pool, "k").await.expect("forget");
-        remember(&pool, fact("k", "v5", PublicIfNew)).await.expect("again");
+        remember(&pool, fact("k", "v5", PublicIfNew))
+            .await
+            .expect("again");
         assert_eq!(shown(&pool, "k").await, Visibility::Public);
         forget(&pool, "k").await.expect("forget");
         remember(&pool, fact("k", "v6", Keep)).await.expect("again");
@@ -1824,12 +1847,18 @@ mod tests {
     #[tokio::test]
     async fn public_facts_are_listed_most_recently_used_first_and_do_not_age_out() {
         let pool = connect_in_memory().await.expect("connect");
-        remember(&pool, fact("old", "used lately", VisibilityRule::PublicIfNew))
-            .await
-            .expect("old");
-        remember(&pool, fact("new", "saved last", VisibilityRule::PublicIfNew))
-            .await
-            .expect("new");
+        remember(
+            &pool,
+            fact("old", "used lately", VisibilityRule::PublicIfNew),
+        )
+        .await
+        .expect("old");
+        remember(
+            &pool,
+            fact("new", "saved last", VisibilityRule::PublicIfNew),
+        )
+        .await
+        .expect("new");
         remember(&pool, fact("hidden", "private", VisibilityRule::Keep))
             .await
             .expect("private");
@@ -1870,7 +1899,9 @@ mod tests {
     #[tokio::test]
     async fn visibility_is_switched_on_the_entry_shown_only() {
         let pool = connect_in_memory().await.expect("connect");
-        let first = remember(&pool, fact("k", "v1", VisibilityRule::Keep)).await.expect("v1");
+        let first = remember(&pool, fact("k", "v1", VisibilityRule::Keep))
+            .await
+            .expect("v1");
         let before = get(&pool, "k").await.unwrap().unwrap().updated_at;
         let (entry, was) = set_visibility(&pool, "k", Some(&first), Visibility::Public)
             .await
@@ -1881,7 +1912,9 @@ mod tests {
         assert_eq!(entry.updated_at, before, "when it was saved stays");
 
         // Replaced since: the switch under the old one changes nothing.
-        remember(&pool, fact("k", "v2", VisibilityRule::Keep)).await.expect("v2");
+        remember(&pool, fact("k", "v2", VisibilityRule::Keep))
+            .await
+            .expect("v2");
         assert!(
             set_visibility(&pool, "k", Some(&first), Visibility::Private)
                 .await

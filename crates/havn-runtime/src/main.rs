@@ -5565,7 +5565,11 @@ run ls"
             .expect("get")
             .expect("fact");
         assert_eq!(fact.visibility, memory::Visibility::Private);
-        assert!(!memory::import_pending(&pool, "USER.md").await.expect("pending"));
+        assert!(
+            !memory::import_pending(&pool, "USER.md")
+                .await
+                .expect("pending")
+        );
     }
 
     #[tokio::test]

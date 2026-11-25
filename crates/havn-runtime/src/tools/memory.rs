@@ -1219,14 +1219,15 @@ mod tests {
         turn: &std::sync::Arc<TurnMemory>,
         run: impl std::future::Future<Output = T>,
     ) -> T {
-
         match group {
             Some(group) => {
                 super::super::gateway::FROM_OWNER
                     .scope(
                         true,
-                        super::super::gateway::IN_GROUP
-                            .scope(group, MEMORY_CHANGES.scope(std::sync::Arc::clone(turn), run)),
+                        super::super::gateway::IN_GROUP.scope(
+                            group,
+                            MEMORY_CHANGES.scope(std::sync::Arc::clone(turn), run),
+                        ),
                     )
                     .await
             }
@@ -1300,7 +1301,11 @@ mod tests {
         // Repeated or replaced as public, even in the owner's own chat.
         for value in ["12 Rose Street", "14 Rose Street"] {
             let r = as_owner(Some(false), &turn, save_public(&ctx, "user.address", value)).await;
-            assert!(r.text().contains("an existing fact keeps its visibility"), "{}", r.text());
+            assert!(
+                r.text().contains("an existing fact keeps its visibility"),
+                "{}",
+                r.text()
+            );
             assert_eq!(
                 visibility_of(&ctx, "user.address").await,
                 Visibility::Private
@@ -1335,8 +1340,17 @@ mod tests {
 
         // Any other closes it for the rest of the turn.
         as_owner(Some(false), &turn, async { note_tool_call("web_fetch") }).await;
-        let r = as_owner(Some(false), &turn, save_public(&ctx, "user.lang", "Italian")).await;
-        assert!(r.text().contains("may not be your owner's words"), "{}", r.text());
+        let r = as_owner(
+            Some(false),
+            &turn,
+            save_public(&ctx, "user.lang", "Italian"),
+        )
+        .await;
+        assert!(
+            r.text().contains("may not be your owner's words"),
+            "{}",
+            r.text()
+        );
         assert_eq!(visibility_of(&ctx, "user.lang").await, Visibility::Private);
         // And a public fact it changes then is private.
         as_owner(Some(false), &turn, save_public(&ctx, "user.name", "Eve")).await;
