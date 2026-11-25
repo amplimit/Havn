@@ -1,13 +1,13 @@
 # Havn
 
 [![CI](https://github.com/amplimit/Havn/actions/workflows/ci.yml/badge.svg)](https://github.com/amplimit/Havn/actions/workflows/ci.yml)
-[![Smoke](https://github.com/amplimit/Havn/actions/workflows/smoke.yml/badge.svg)](https://github.com/amplimit/Havn/actions/workflows/smoke.yml)
-[![Audit](https://github.com/amplimit/Havn/actions/workflows/audit.yml/badge.svg)](https://github.com/amplimit/Havn/actions/workflows/audit.yml)
 [![Release](https://img.shields.io/github/v/release/amplimit/Havn?sort=semver)](https://github.com/amplimit/Havn/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg?logo=rust)](rust-toolchain.toml)
 [![Platform](https://img.shields.io/badge/platform-linux-lightgrey.svg?logo=linux&logoColor=white)](#key-features)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/amplimit/Havn)
+
+**English** | [简体中文](docs/README.zh-CN.md)
 
 Open infrastructure for running autonomous AI agents. Single binary, single SQLite file, Linux-native process isolation.
 
