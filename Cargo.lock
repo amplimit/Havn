@@ -1809,7 +1809,7 @@ dependencies = [
 
 [[package]]
 name = "havn-cli"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1832,7 +1832,7 @@ dependencies = [
 
 [[package]]
 name = "havn-core"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -1845,7 +1845,7 @@ dependencies = [
 
 [[package]]
 name = "havn-db"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "bytemuck",
  "chrono",
@@ -1864,7 +1864,7 @@ dependencies = [
 
 [[package]]
 name = "havn-gateway"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "age",
  "anyhow",
@@ -1913,7 +1913,7 @@ dependencies = [
 
 [[package]]
 name = "havn-init"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "havn-spawner",
  "libc",
@@ -1921,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "havn-proto"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "chrono",
  "havn-core",
@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "havn-runtime"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1968,7 +1968,7 @@ dependencies = [
 
 [[package]]
 name = "havn-spawner"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "async-trait",
  "havn-core",
