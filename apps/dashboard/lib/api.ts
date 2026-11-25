@@ -139,6 +139,9 @@ export type MemoryEntry = {
   archived_at: string | null;
   supersedes_id: string | null;
   visibility: MemoryVisibility;
+  /** The agent suggests making this private memory public; only the
+   * owner does, here. */
+  suggested_public: boolean;
 };
 
 /** A file the agent sent, kept by the gateway. */

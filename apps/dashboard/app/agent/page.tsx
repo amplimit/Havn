@@ -2473,8 +2473,13 @@ function MemoryChangeLine({ agentId, change }: { agentId: string; change: Memory
       )}
       {saved && change.visibility && change.after && state !== "undone" && (
         <>
-          {/* What it was when saved; the memory page shows what it is now. */}
-          <span>(saved as {change.visibility})</span>
+          {/* What it was when saved; the memory page shows what it is now.
+              The agent only suggests public: the owner makes it so. */}
+          <span>
+            {change.visibility === "private" && change.suggested_public
+              ? "(saved as private, suggested public)"
+              : `(saved as ${change.visibility})`}
+          </span>
           <button
             type="button"
             className="underline disabled:opacity-40"

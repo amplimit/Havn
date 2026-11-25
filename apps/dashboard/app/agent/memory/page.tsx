@@ -70,7 +70,9 @@ function Memory({ id }: { id: string }) {
   const [query, setQuery] = useState("");
   const [kindFilter, setKindFilter] = useState<MemoryKind | "all">("all");
   const [sourceFilter, setSourceFilter] = useState<MemoryEntry["source"] | "all">("all");
-  const [visibilityFilter, setVisibilityFilter] = useState<MemoryVisibility | "all">("all");
+  const [visibilityFilter, setVisibilityFilter] = useState<MemoryVisibility | "suggested" | "all">(
+    "all",
+  );
   const [pendingSwitch, setPendingSwitch] = useState<string | null>(null);
   const [editing, setEditing] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
@@ -203,7 +205,10 @@ function Memory({ id }: { id: string }) {
     (e) =>
       (kindFilter === "all" || e.kind === kindFilter) &&
       (sourceFilter === "all" || e.source === sourceFilter) &&
-      (visibilityFilter === "all" || e.visibility === visibilityFilter) &&
+      (visibilityFilter === "all" ||
+        (visibilityFilter === "suggested"
+          ? e.visibility === "private" && e.suggested_public
+          : e.visibility === visibilityFilter)) &&
       (!needle || e.key.toLowerCase().includes(needle) || e.value.toLowerCase().includes(needle)),
   );
   const grouped = groupByKind(shown);
@@ -235,10 +240,10 @@ function Memory({ id }: { id: string }) {
           A private memory is in the agent&apos;s prompt in your own private chats only;
           elsewhere the agent reaches it only by searching memory, which waits for your
           review. A public one is in its prompt in every chat, other people&apos;s and
-          groups&apos; too: your name, how to address you, your language. The agent may save
-          a new memory public in your own private chats, before any tool other than
-          memory&apos;s has returned anything there; every other memory it saves is private,
-          and it never makes an existing one public. Switch any of them here. Making one private again stops it being shown
+          groups&apos; too: your name, how to address you, your language. Everything the
+          agent saves is private; in your own private chats it may suggest that one be
+          public, and only you make it public, here. When the agent changes a public memory,
+          the new text is private again until you approve it. Making one private again stops it being shown
           from then on; what others already read cannot be taken back.
         </p>
       </header>
@@ -280,10 +285,13 @@ function Memory({ id }: { id: string }) {
             className="input w-auto"
             aria-label="visibility"
             value={visibilityFilter}
-            onChange={(e) => setVisibilityFilter(e.target.value as MemoryVisibility | "all")}
+            onChange={(e) =>
+              setVisibilityFilter(e.target.value as MemoryVisibility | "suggested" | "all")
+            }
           >
             <option value="all">private and public</option>
             <option value="private">private</option>
+            <option value="suggested">suggested public</option>
             <option value="public">public</option>
           </select>
           <button type="button" className="btn-primary" onClick={() => setAdding(true)} disabled={adding}>
@@ -435,7 +443,11 @@ function Memory({ id }: { id: string }) {
                                 : { background: "rgba(100, 116, 141, 0.1)", color: "var(--color-body)" }
                             }
                           >
-                            {pendingSwitch === e.key ? "switching…" : e.visibility}
+                            {pendingSwitch === e.key
+                              ? "switching…"
+                              : e.visibility === "private" && e.suggested_public
+                                ? "suggested public: make public"
+                                : e.visibility}
                           </button>
                           <p
                             className="mt-1 font-mono"
@@ -628,7 +640,8 @@ function asMarkdown(entries: MemoryEntry[]): string {
     out += `\n## ${KIND_LABEL[kind]}\n\n`;
     for (const e of grouped[kind]) {
       const who = e.source === "user_told" ? "you said" : "inferred";
-      out += `- **${e.key}**: ${e.value.replace(/\n/g, " ")} (${who}; ${e.visibility}; ${lifetime(e)})\n`;
+      const shown = e.visibility === "private" && e.suggested_public ? "private, suggested public" : e.visibility;
+      out += `- **${e.key}**: ${e.value.replace(/\n/g, " ")} (${who}; ${shown}; ${lifetime(e)})\n`;
     }
   }
   return out;

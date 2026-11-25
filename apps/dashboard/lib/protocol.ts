@@ -92,4 +92,6 @@ export type MemoryChange = {
   after?: string;
   /** Who the saved entry is put in front of. */
   visibility?: "private" | "public";
+  /** The agent suggests making it public; only the owner does. */
+  suggested_public?: boolean;
 };
