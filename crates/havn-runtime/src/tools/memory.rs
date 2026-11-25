@@ -83,6 +83,7 @@ pub fn changes(noted: Vec<Noted>) -> Vec<havn_proto::MemoryChange> {
                     .chars()
                     .take(havn_proto::MAX_MEMORY_CHANGE_CHARS)
                     .collect(),
+                value_cut: value.chars().count() > havn_proto::MAX_MEMORY_CHANGE_CHARS,
                 kind: kind.as_str().to_string(),
                 before: n.before.as_ref().map(|b| b.0.clone()),
                 after: n.after.as_ref().map(|a| a.0.clone()),
@@ -1247,6 +1248,23 @@ mod tests {
         assert_eq!(changed.value, "Ada Lovelace");
         assert_eq!(changed.visibility, Visibility::Private);
         assert!(changed.suggested_public);
+    }
+
+    #[test]
+    fn a_long_value_is_noted_cut_and_said_to_be() {
+        let noted = |value: String| Noted {
+            key: "k".into(),
+            before: None,
+            after: Some(("row".into(), value, Kind::Identity, Visibility::Private, true)),
+        };
+        let long = "字".repeat(havn_proto::MAX_MEMORY_CHANGE_CHARS + 1);
+        let shown = changes(vec![noted(long), noted("short".into())]);
+        assert!(shown[0].value_cut);
+        assert_eq!(
+            shown[0].value.chars().count(),
+            havn_proto::MAX_MEMORY_CHANGE_CHARS
+        );
+        assert!(!shown[1].value_cut);
     }
 
     #[test]

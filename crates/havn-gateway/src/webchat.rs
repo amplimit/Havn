@@ -540,6 +540,8 @@ impl WebChatRouter {
                     .chars()
                     .take(havn_proto::MAX_MEMORY_KEY_CHARS)
                     .collect();
+                change.value_cut |=
+                    change.value.chars().count() > havn_proto::MAX_MEMORY_CHANGE_CHARS;
                 change.value = change
                     .value
                     .chars()
@@ -1180,6 +1182,7 @@ mod tests {
             after: Some(format!("row{n}")),
             visibility: Some(if n == 0 { "public" } else { "secret" }.into()),
             suggested_public: n == 1,
+            value_cut: false,
         };
         let changed = havn_proto::MemoryChanged {
             channel_id: session_id.to_string(),
@@ -1202,6 +1205,7 @@ mod tests {
                 assert_eq!(changes[0].visibility.as_deref(), Some("public"));
                 assert!(changes[1].visibility.is_none(), "not a visibility");
                 assert!(changes[1].suggested_public && !changes[0].suggested_public);
+                assert!(changes[0].value_cut, "cut here, and said so");
                 assert!(conversation.is_none(), "an oversized chat id is dropped");
                 assert_eq!(changes.len(), havn_proto::MAX_MEMORY_CHANGES);
                 assert_eq!(

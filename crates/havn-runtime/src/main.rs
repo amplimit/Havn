@@ -266,7 +266,7 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("opening agent.db at {}", agent_db_path.display()))?;
     info!(db = %agent_db_path.display(), "agent db ready");
     if let Err(e) = fold_user_md(&args.workspace, &pool).await {
-        warn!(error = %e, "could not fold USER.md into memory; trying again on the next start");
+        warn!(error = %e, "could not fold USER.md into memory; it is not tried again");
     }
 
     // 2. Load bootstrap files — system prompt assembly is deferred to
@@ -3340,44 +3340,45 @@ fn fact_lines(
 
 /// Fold `USER.md` into memory, once (issue #309): its text, when it has
 /// any, becomes one public identity fact, kept until forgotten, and the
-/// file is kept as [`system_prompt::USER_BACKUP`]. Done once the fact is
-/// saved, so it is never saved again, nor a `USER.md` written later.
+/// file is kept as [`system_prompt::USER_BACKUP`]. Marked done before
+/// anything else: a fold that fails is lost rather than tried again, so
+/// it never makes public a `USER.md` written later, nor overrides the
+/// owner's switch.
 async fn fold_user_md(workspace: &std::path::Path, pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     use havn_db::agent::memory;
     if !memory::import_pending(pool, system_prompt::USER).await? {
         return Ok(());
     }
+    memory::import_done(pool, system_prompt::USER).await?;
     let path = workspace.join(system_prompt::USER);
     let text = match tokio::fs::read_to_string(&path).await {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
     };
     let text = text.trim();
-    if !text.is_empty() {
-        let (value, cut) = tools::memory::within_cap(text);
-        memory::remember_until_forgotten(
-            pool,
-            memory::NewEntry {
-                key: system_prompt::USER,
-                value: &value,
-                kind: memory::Kind::Identity,
-                source: memory::Source::UserTold,
-                ttl_days: None,
-                visibility: memory::VisibilityRule::Public,
-            },
-        )
-        .await?;
-        memory::import_done(pool, system_prompt::USER).await?;
-        info!(cut, "USER.md folded into memory as a public fact");
-        match keep_as_backup(workspace, &path).await {
-            Ok(Some(name)) => info!(%name, "USER.md kept as a backup"),
-            Ok(None) => warn!("USER.md left as it is: every backup name is taken"),
-            Err(e) => warn!(error = %e, "USER.md left as it is: could not keep it as a backup"),
-        }
+    if text.is_empty() {
         return Ok(());
     }
-    memory::import_done(pool, system_prompt::USER).await?;
+    let (value, cut) = tools::memory::within_cap(text);
+    memory::remember_until_forgotten(
+        pool,
+        memory::NewEntry {
+            key: system_prompt::USER,
+            value: &value,
+            kind: memory::Kind::Identity,
+            source: memory::Source::UserTold,
+            ttl_days: None,
+            visibility: memory::VisibilityRule::Public,
+        },
+    )
+    .await?;
+    info!(cut, "USER.md folded into memory as a public fact");
+    match keep_as_backup(workspace, &path).await {
+        Ok(Some(name)) => info!(%name, "USER.md kept as a backup"),
+        Ok(None) => warn!("USER.md left as it is: every backup name is taken"),
+        Err(e) => warn!(error = %e, "USER.md left as it is: could not keep it as a backup"),
+    }
     Ok(())
 }
 
@@ -5534,6 +5535,28 @@ run ls"
         fold_user_md(&workspace, &pool).await.expect("again");
         assert!(memory::get(&pool, "USER.md").await.expect("get").is_none());
         assert!(workspace.join("USER.md").exists());
+    }
+
+    #[tokio::test]
+    async fn a_fold_that_fails_is_not_tried_again() {
+        use havn_db::agent::memory;
+        let workspace = std::env::temp_dir().join(format!("havn-user-md-{}", uuid::Uuid::now_v7()));
+        // A USER.md that cannot be read: a directory.
+        tokio::fs::create_dir_all(workspace.join("USER.md"))
+            .await
+            .expect("ws");
+        let pool = havn_db::agent::connect_in_memory().await.expect("db");
+        assert!(fold_user_md(&workspace, &pool).await.is_err());
+        assert!(!memory::import_pending(&pool, "USER.md").await.expect("pending"));
+        // A readable one put there afterwards is not folded.
+        tokio::fs::remove_dir(workspace.join("USER.md"))
+            .await
+            .expect("rmdir");
+        tokio::fs::write(workspace.join("USER.md"), "Everyone may know my address")
+            .await
+            .expect("write");
+        fold_user_md(&workspace, &pool).await.expect("done already");
+        assert!(memory::get(&pool, "USER.md").await.expect("get").is_none());
     }
 
     #[tokio::test]

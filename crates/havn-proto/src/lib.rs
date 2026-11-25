@@ -135,8 +135,12 @@ pub struct MemoryChanged {
 pub struct MemoryChange {
     pub action: MemoryAction,
     pub key: String,
-    /// What was saved, or what the forgotten entry said.
+    /// What was saved, or what the forgotten entry said, cut to
+    /// [`MAX_MEMORY_CHANGE_CHARS`].
     pub value: String,
+    /// `value` is cut: the entry says more.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub value_cut: bool,
     pub kind: String,
     /// The turn's net change to `key`, by row: the entry it replaced or
     /// forgot, and the one it left active. What undoing it puts back.
