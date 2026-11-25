@@ -96,8 +96,15 @@ pub enum AgentToGateway {
     /// dashboard to show while the reply is being written (issue #162).
     Step(Step),
     /// The runtime no longer waits for this LLM call (its turn was
-    /// stopped): the gateway stops passing its text on.
-    LlmCancel { request_id: String },
+    /// stopped): the gateway stops passing its text on. With `keep`, sent
+    /// only to a gateway whose [`GatewayToAgent::Welcome`] says it
+    /// `cuts_calls` (issue #305), the gateway instead ends the call and
+    /// answers it with what it had written, which the runtime waits for.
+    LlmCancel {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        keep: bool,
+    },
 }
 
 /// See [`AgentToGateway::Step`].
@@ -373,6 +380,12 @@ pub enum GatewayToAgent {
         /// Absent from older gateways: English.
         #[serde(default)]
         language: havn_core::Language,
+        /// The gateway ends a call an [`AgentToGateway::LlmCancel`] asks
+        /// to `keep`, and answers it with what it had written (issue
+        /// #305). Absent from older gateways: a stopped turn drops its
+        /// call.
+        #[serde(default)]
+        cuts_calls: bool,
     },
     /// Inbound message from a channel adapter.
     InboundMessage(InboundMessage),
@@ -1141,6 +1154,7 @@ mod tests {
             egress_proxy: None,
             models: Vec::new(),
             language: havn_core::Language::English,
+            cuts_calls: true,
         };
         let line = serde_json::to_string(&frame).expect("serialize");
         assert!(line.contains("\"type\":\"welcome\""));
@@ -1181,6 +1195,7 @@ mod tests {
             egress_proxy: None,
             models: Vec::new(),
             language: havn_core::Language::English,
+            cuts_calls: true,
         };
         let line = serde_json::to_string(&frame).expect("serialize");
         let parsed: GatewayToAgent = serde_json::from_str(&line).expect("parse");
@@ -1223,5 +1238,54 @@ mod tests {
         assert!(policy.permissions.can_use_shell);
         assert!(policy.hooks.pre_tool_use.is_empty());
         assert_eq!(max_tokens, None);
+    }
+
+    #[test]
+    fn a_welcome_from_an_older_gateway_does_not_cut_calls() {
+        let line = r#"{"type":"welcome","session_token":"tok"}"#;
+        let parsed: GatewayToAgent = serde_json::from_str(line).expect("parse");
+        let GatewayToAgent::Welcome { cuts_calls, .. } = parsed else {
+            panic!("wrong variant");
+        };
+        assert!(!cuts_calls);
+    }
+
+    #[test]
+    fn a_cancel_that_drops_its_call_is_sent_as_before() {
+        let frame = AgentToGateway::LlmCancel {
+            request_id: "r1".into(),
+            keep: false,
+        };
+        let line = serde_json::to_string(&frame).expect("serialize");
+        assert_eq!(line, r#"{"type":"llm_cancel","request_id":"r1"}"#);
+        let parsed: AgentToGateway =
+            serde_json::from_str(r#"{"type":"llm_cancel","request_id":"r1"}"#).expect("parse");
+        assert!(matches!(
+            parsed,
+            AgentToGateway::LlmCancel { keep: false, .. }
+        ));
+    }
+
+    #[test]
+    fn a_cancel_that_keeps_its_call_reads_as_a_plain_one_where_keep_is_not_known() {
+        // The frame as a gateway before issue #305 reads it.
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum Older {
+            LlmCancel { request_id: String },
+        }
+        let frame = AgentToGateway::LlmCancel {
+            request_id: "r1".into(),
+            keep: true,
+        };
+        let line = serde_json::to_string(&frame).expect("serialize");
+        assert!(line.contains(r#""keep":true"#), "{line}");
+        let Older::LlmCancel { request_id } = serde_json::from_str(&line).expect("parse");
+        assert_eq!(request_id, "r1");
+        let parsed: AgentToGateway = serde_json::from_str(&line).expect("parse");
+        assert!(matches!(
+            parsed,
+            AgentToGateway::LlmCancel { keep: true, .. }
+        ));
     }
 }

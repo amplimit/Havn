@@ -183,6 +183,9 @@ struct Ctx {
     turns: Arc<turns::Turns>,
     /// Tool calls waiting for the user's approval.
     approvals: Arc<approvals::Approvals>,
+    /// The gateway answers a stopped call with what it had written (issue
+    /// #305).
+    cuts_calls: bool,
 }
 
 impl Ctx {
@@ -213,6 +216,7 @@ impl Ctx {
             billing_user_id: None,
             stop: None,
             segments: None,
+            cuts_calls: self.cuts_calls,
         }
     }
 }
@@ -318,6 +322,7 @@ async fn main() -> anyhow::Result<()> {
         timezone,
         egress_proxy,
         models,
+        cuts_calls,
     ): (
         Arc<Policy>,
         Option<String>,
@@ -331,6 +336,7 @@ async fn main() -> anyhow::Result<()> {
         Option<String>,
         Option<String>,
         Vec<havn_proto::ModelChoice>,
+        bool,
     ) = match first_frame {
         Some(GatewayToAgent::Welcome {
             session_token: _,
@@ -347,6 +353,7 @@ async fn main() -> anyhow::Result<()> {
             egress_proxy,
             models,
             language,
+            cuts_calls,
         }) => {
             // One agent per runtime: its language is the process's.
             let _ = LANGUAGE.set(language);
@@ -441,6 +448,7 @@ async fn main() -> anyhow::Result<()> {
                 timezone,
                 egress_proxy,
                 models,
+                cuts_calls,
             )
         }
         Some(other) => return Err(anyhow!("expected Welcome, got {other:?}")),
@@ -808,6 +816,7 @@ async fn main() -> anyhow::Result<()> {
             billing_user_id: None,
             stop: None,
             segments: None,
+            cuts_calls,
         },
         models: Arc::new(models),
         semaphore: Arc::new(Semaphore::new(subagent_tool::SUBAGENT_MAX_CONCURRENT)),
@@ -863,6 +872,7 @@ async fn main() -> anyhow::Result<()> {
         timezone: Arc::new(std::sync::RwLock::new(zone_or_utc(timezone.as_deref()))),
         turns: Arc::new(turns::Turns::default()),
         approvals,
+        cuts_calls,
     };
     let dispatch = run_reader_loop(&mut reader, ctx).await;
 
@@ -4843,6 +4853,7 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
         billing_user_id: Some(query.billing_user_id.clone()),
         stop: None,
         segments: None,
+        cuts_calls: ctx.cuts_calls,
     };
 
     // Use the typed runner so degraded outcomes (LLM error, iteration

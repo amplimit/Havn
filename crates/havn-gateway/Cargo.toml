@@ -20,6 +20,7 @@ havn-db.workspace = true
 sqlx.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 uuid.workspace = true
 futures-util.workspace = true
 notify.workspace = true

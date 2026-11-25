@@ -111,7 +111,7 @@ impl LlmProvider for GeminiProvider {
         base_url: &str,
         api_key: &str,
         request: &AnthropicRequest,
-        text: &TextSink,
+        text: &TextSink<'_>,
     ) -> Result<AnthropicResponse, ProviderError> {
         if !is_plain_model_name(&request.model) {
             return Err(ProviderError::BadRequest {
@@ -177,6 +177,9 @@ impl LlmProvider for GeminiProvider {
                     && !piece.is_empty()
                 {
                     text(TextEvent::Reasoning(piece));
+                }
+                if let Some(call) = part.get("functionCall") {
+                    text(TextEvent::ToolInput(&call.to_string()));
                 }
             }
             for piece in reply.add(&chunk) {

@@ -552,6 +552,7 @@ mod tests {
                 billing_user_id: None,
                 stop: None,
                 segments: None,
+                cuts_calls: false,
             },
             models: Arc::new(vec![
                 havn_proto::ModelChoice {
