@@ -178,6 +178,9 @@ impl LlmProvider for GeminiProvider {
                 {
                     text(TextEvent::Reasoning(piece));
                 }
+                if let Some(call) = part.get("functionCall") {
+                    text(TextEvent::ToolInput(&call.to_string()));
+                }
             }
             for piece in reply.add(&chunk) {
                 text(TextEvent::Text(&piece));

@@ -197,6 +197,18 @@ impl LlmProvider for OpenAiProvider {
             if let Some(piece) = reasoning_piece(&chunk) {
                 text(TextEvent::Reasoning(piece));
             }
+            for call in chunk
+                .pointer("/choices/0/delta/tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(piece) = call.pointer("/function/arguments").and_then(Value::as_str)
+                    && !piece.is_empty()
+                {
+                    text(TextEvent::ToolInput(piece));
+                }
+            }
             if let Some(piece) = reply.add(&chunk) {
                 text(TextEvent::Text(&piece));
             }

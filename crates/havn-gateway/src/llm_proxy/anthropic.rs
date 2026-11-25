@@ -127,6 +127,17 @@ impl LlmProvider for AnthropicProvider {
             {
                 text(TextEvent::Reasoning(piece));
             }
+            if event
+                .pointer("/delta/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("input_json_delta")
+                && let Some(piece) = event
+                    .pointer("/delta/partial_json")
+                    .and_then(serde_json::Value::as_str)
+                && !piece.is_empty()
+            {
+                text(TextEvent::ToolInput(piece));
+            }
             if let Some(piece) = message.add(&event) {
                 text(TextEvent::Text(&piece));
             }

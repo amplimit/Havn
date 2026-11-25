@@ -152,6 +152,9 @@ pub enum TextEvent<'a> {
     /// The next piece of the model's reasoning before it (issue #178):
     /// shown in the web chat, never part of the reply.
     Reasoning(&'a str),
+    /// The next piece of a tool call's input: not shown, only counted
+    /// for a call cut short (issue #305).
+    ToolInput(&'a str),
     /// The call starts over on another credential: what it passed so far
     /// is not the reply.
     Restart,

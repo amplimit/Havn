@@ -2473,6 +2473,8 @@ async fn handle_llm_request(
         Some(listed) => ReplyText::open(&ctx, agent_id, &req, &listed.asked).await,
         None => None,
     };
+    // The runtime was told its stopped call wrote nothing (issue #305).
+    let mut answered = false;
 
     // Caller-pays billing override (spec §4.4 v0.7 cross-agent query).
     // When the runtime is processing an `IncomingQuery` it stamps every
@@ -2707,15 +2709,15 @@ async fn handle_llm_request(
                 agent_team: agent.team_id,
                 budget: policy.budget.clone(),
             };
-            let reply_text = reply.as_ref();
             let cut = listed.as_ref().map(|listed| &listed.asked.cut);
+            let streamed = reply.as_ref().zip(cut);
             let ctx_ref = &ctx;
             let (billing_ref, entry_ref) = (&billing, &entry);
             let send = move |request: AnthropicRequest| async move {
-                match cut {
-                    // A turn answering someone: its stop may cut the call
-                    // short (issue #305).
-                    Some(cut) => {
+                match streamed {
+                    // Shown as it is written: the turn's stop cuts it short
+                    // (issue #305).
+                    Some((reply, cut)) => {
                         llm_proxy::stream_with_provider(
                             &ctx_ref.db,
                             &ctx_ref.http,
@@ -2725,7 +2727,7 @@ async fn handle_llm_request(
                             entry_ref.max_output_tokens,
                             &request,
                             &ctx_ref.llm,
-                            reply_text.map(|reply| reply.sink.as_ref()),
+                            reply.sink.as_ref(),
                             cut,
                         )
                         .await
@@ -2756,11 +2758,48 @@ async fn handle_llm_request(
                 ar.max_tokens,
                 ctx.llm.max_tokens_ceiling,
             );
-            let (result, trimmed) = match llm_proxy::send_seeing(
-                ar, workspace, limits, context, show, try_blind, send,
-            )
-            .await
-            {
+            let seeing =
+                llm_proxy::send_seeing(ar, workspace, limits, context, show, try_blind, send);
+            // A call shown to nobody is not cut short: it runs on and
+            // records what it used, as before issue #305, and the turn's
+            // stop is answered at once with nothing written.
+            let seen = match cut.filter(|_| streamed.is_none()) {
+                Some(cut) => {
+                    tokio::pin!(seeing);
+                    tokio::select! {
+                        biased;
+                        seen = &mut seeing => seen,
+                        () = cut.cancelled() => {
+                            answered = true;
+                            let stopped = serde_json::json!({
+                                "id": "",
+                                "model": entry.model(),
+                                "role": "assistant",
+                                "content": [],
+                                "stop_reason": llm_proxy::STOPPED,
+                                "usage": {"input_tokens": 0, "output_tokens": 0},
+                            });
+                            let _ = ctx
+                                .registry
+                                .send(
+                                    agent_id,
+                                    GatewayToAgent::LlmResponse(LlmResponse {
+                                        request_id: request_id.clone(),
+                                        outcome: LlmOutcome::Ok,
+                                        provider_response: stopped,
+                                        usage: None,
+                                        trimmed: false,
+                                        fallback: None,
+                                    }),
+                                )
+                                .await;
+                            seeing.await
+                        }
+                    }
+                }
+                None => seeing.await,
+            };
+            let (result, trimmed) = match seen {
                 Ok(seen) => {
                     if seen.model_takes_none
                         && ctx
@@ -2788,6 +2827,9 @@ async fn handle_llm_request(
                 }
                 Err(e) => {
                     warn!(%agent_id, error = %e, "could not read the files of an LLM request");
+                    if answered {
+                        return;
+                    }
                     let _ = ctx
                         .registry
                         .send(
@@ -2873,6 +2915,10 @@ async fn handle_llm_request(
     // The text shown arrives before the reply the runtime sends next.
     if let Some(reply) = reply {
         reply.finish().await;
+    }
+    // The runtime was answered when its turn stopped.
+    if answered {
+        return;
     }
     if let Err(e) = ctx
         .registry
@@ -2995,19 +3041,19 @@ impl ReplyText {
             if asked.dropped.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
+            let piece = match event {
+                llm_proxy::provider::TextEvent::Text(text) => ReplyPiece::Text(text.to_string()),
+                llm_proxy::provider::TextEvent::Reasoning(text) => {
+                    ReplyPiece::Reasoning(text.to_string())
+                }
+                llm_proxy::provider::TextEvent::Restart => ReplyPiece::Restart,
+                llm_proxy::provider::TextEvent::ToolInput(_) => return,
+            };
             let pieces = pieces
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(tx) = pieces.as_ref() {
-                let _ = tx.send(match event {
-                    llm_proxy::provider::TextEvent::Text(text) => {
-                        ReplyPiece::Text(text.to_string())
-                    }
-                    llm_proxy::provider::TextEvent::Reasoning(text) => {
-                        ReplyPiece::Reasoning(text.to_string())
-                    }
-                    llm_proxy::provider::TextEvent::Restart => ReplyPiece::Restart,
-                });
+                let _ = tx.send(piece);
             }
         });
         Some(Self {
@@ -4205,6 +4251,8 @@ mod tests {
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Which first?"}}"#,
             r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
             r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Half of"}}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t1","name":"shell","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"q\":\"x\"}"}}"#,
         ];
         let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
         let app = axum::Router::new().route(
@@ -4220,41 +4268,7 @@ mod tests {
                 )
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let base = format!("http://{}", listener.local_addr().expect("addr"));
-        let server = tokio::spawn(async move { axum::serve(listener, app).await });
-
-        let mut ctx = ctx_with(false, false).await;
-        let mut endpoints = crate::config::Endpoints::default();
-        endpoints.0.insert(
-            "lan".into(),
-            crate::config::Endpoint {
-                api: crate::config::EndpointApi::Anthropic,
-                base_url: base,
-            },
-        );
-        ctx.llm = Arc::new(crate::config::LlmConfig {
-            endpoints,
-            ..crate::config::LlmConfig::default()
-        });
-        ctx.keyring = Some(crate::keyring::KeyRing::from_passphrase("stop-tests"));
-        ctx.models
-            .store(Arc::new(crate::model_catalog::ModelCatalog {
-                default_model: None,
-                title_model: None,
-                models: vec![crate::model_catalog::ModelEntry {
-                    id: "lan:m".into(),
-                    label: None,
-                    max_output_tokens: None,
-                    vision: None,
-                    thinking: None,
-                    context_window: None,
-                    fallback: Vec::new(),
-                    price: None,
-                }],
-            }));
+        let (ctx, server) = ctx_calling(app).await;
         let owner = create_user(&ctx.db, NewUser { display_name: "o" })
             .await
             .expect("user")
@@ -4296,15 +4310,7 @@ mod tests {
             &ctx,
         )
         .await;
-        let answer = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Some(GatewayToAgent::LlmResponse(answer)) = rx.recv().await {
-                    break answer;
-                }
-            }
-        })
-        .await
-        .expect("answered at once");
+        let answer = next_llm_response(&mut rx).await;
         server.abort();
         assert_eq!(answer.request_id, "r1");
         assert!(
@@ -4320,6 +4326,110 @@ mod tests {
                 {"type": "text", "text": "Half of"}
             ])
         );
+        forgotten(&ctx).await;
+        // Its use as estimated: what it wrote, the tool call's input too.
+        let used: Vec<(i64,)> = sqlx::query_as("SELECT tokens_out FROM credential_usages")
+            .fetch_all(&ctx.db)
+            .await
+            .expect("rows");
+        assert_eq!(used, vec![(14,)]);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_call_shown_to_nobody_runs_on_and_records_what_it_used() {
+        // A provider that answers whole, once let.
+        let (asked, answer_now) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post({
+                let (asked, answer_now) = (Arc::clone(&asked), Arc::clone(&answer_now));
+                move || async move {
+                    asked.notify_one();
+                    answer_now.notified().await;
+                    axum::Json(serde_json::json!({
+                        "id": "m1",
+                        "model": "m",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "The whole answer."}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 5, "output_tokens": 7}
+                    }))
+                }
+            }),
+        );
+        let (ctx, server) = ctx_calling(app).await;
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (agent, mut rx) = connected_agent(&ctx, owner, "a", serde_json::json!({})).await;
+        // A chat app's conversation: its reply is not shown as it is written.
+        let req = LlmRequest {
+            model: "lan:m".into(),
+            reply: Some(havn_proto::ReplyStream {
+                channel_id: "telegram:123".into(),
+                conversation: None,
+            }),
+            ..llm_request("r1")
+        };
+        dispatch(agent, AgentToGateway::LlmRequest(req), &ctx).await;
+        tokio::time::timeout(Duration::from_secs(10), asked.notified())
+            .await
+            .expect("the provider is asked");
+        dispatch(
+            agent,
+            AgentToGateway::LlmCancel {
+                request_id: "r1".into(),
+                keep: true,
+            },
+            &ctx,
+        )
+        .await;
+        // Answered at once, with nothing written.
+        let answer = next_llm_response(&mut rx).await;
+        assert!(
+            matches!(answer.outcome, LlmOutcome::Ok),
+            "{:?}",
+            answer.outcome
+        );
+        assert_eq!(answer.provider_response["stop_reason"], llm_proxy::STOPPED);
+        assert_eq!(answer.provider_response["content"], serde_json::json!([]));
+        // The call runs on and records what it used, not its reservation.
+        answer_now.notify_one();
+        forgotten(&ctx).await;
+        server.abort();
+        let used: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT tokens_in, tokens_out FROM credential_usages")
+                .fetch_all(&ctx.db)
+                .await
+                .expect("rows");
+        assert_eq!(used, vec![(5, 7)]);
+        // The runtime is not answered twice.
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|frame| matches!(frame, GatewayToAgent::LlmResponse(_))),
+            "a second answer"
+        );
+    }
+
+    /// The next LLM answer the agent is sent, within 10 seconds.
+    async fn next_llm_response(rx: &mut mpsc::Receiver<GatewayToAgent>) -> LlmResponse {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(GatewayToAgent::LlmResponse(answer)) = rx.recv().await {
+                    break answer;
+                }
+            }
+        })
+        .await
+        .expect("answered at once")
+    }
+
+    /// Wait until no call is listed any more.
+    async fn forgotten(ctx: &AgentSocketCtx) {
         tokio::time::timeout(Duration::from_secs(5), async {
             while !ctx.reply_streams.lock().unwrap().is_empty() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4327,6 +4437,48 @@ mod tests {
         })
         .await
         .expect("the call is forgotten");
+    }
+
+    /// A context whose model `lan:m` is served by `app`, and its server.
+    async fn ctx_calling(
+        app: axum::Router,
+    ) -> (AgentSocketCtx, tokio::task::JoinHandle<std::io::Result<()>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let mut ctx = ctx_with(false, false).await;
+        let mut endpoints = crate::config::Endpoints::default();
+        endpoints.0.insert(
+            "lan".into(),
+            crate::config::Endpoint {
+                api: crate::config::EndpointApi::Anthropic,
+                base_url: base,
+            },
+        );
+        ctx.llm = Arc::new(crate::config::LlmConfig {
+            endpoints,
+            ..crate::config::LlmConfig::default()
+        });
+        ctx.keyring = Some(crate::keyring::KeyRing::from_passphrase("stop-tests"));
+        ctx.models
+            .store(Arc::new(crate::model_catalog::ModelCatalog {
+                default_model: None,
+                title_model: None,
+                models: vec![crate::model_catalog::ModelEntry {
+                    id: "lan:m".into(),
+                    label: None,
+                    max_output_tokens: None,
+                    vision: None,
+                    thinking: None,
+                    context_window: None,
+                    fallback: Vec::new(),
+                    price: None,
+                }],
+            }));
+        (ctx, server)
     }
 
     fn refused(outcome: &LlmOutcome) -> bool {
