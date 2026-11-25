@@ -5612,7 +5612,11 @@ run ls"
             .await
             .expect("chat");
         let png = sent("inbox/1-a.png", "image/png", None);
-        let pdf = sent("inbox/2-b.pdf", "application/pdf", Some("inbox/2-b.pdf.txt"));
+        let pdf = sent(
+            "inbox/2-b.pdf",
+            "application/pdf",
+            Some("inbox/2-b.pdf.txt"),
+        );
         conversations::record_in_chat(
             &pool,
             &deleted,
@@ -5648,7 +5652,10 @@ run ls"
         assert!(dir.join("2-b.pdf").exists(), "a message queued names it");
         assert!(dir.join("2-b.pdf.txt").exists(), "with its file");
         drop((started, own));
-        assert!(!inbox.unrecorded_names("inbox/1-a.png", ""), "let go once dropped");
+        assert!(
+            !inbox.unrecorded_names("inbox/1-a.png", ""),
+            "let go once dropped"
+        );
 
         // Neither now: the files go with the chat.
         let again = conversations::chat_for(&pool, "web", None, "again")
@@ -5676,8 +5683,15 @@ run ls"
 
     #[tokio::test]
     async fn a_line_cannot_take_another_chat_s_text_or_transcript() {
-        let (pool, workspace) =
-            inbox_with(&["1-b.pdf", "1-b.pdf.txt", "2-v.ogg", "2-v.ogg.txt", "9-x", "9-y"]).await;
+        let (pool, workspace) = inbox_with(&[
+            "1-b.pdf",
+            "1-b.pdf.txt",
+            "2-v.ogg",
+            "2-v.ogg.txt",
+            "9-x",
+            "9-y",
+        ])
+        .await;
         let inbox = Inbox::default();
         let theirs = conversations::chat_for(&pool, "dm", None, "theirs")
             .await
@@ -5691,7 +5705,11 @@ run ls"
             &with_attachments(
                 String::new(),
                 &[
-                    sent("inbox/1-b.pdf", "application/pdf", Some("inbox/1-b.pdf.txt")),
+                    sent(
+                        "inbox/1-b.pdf",
+                        "application/pdf",
+                        Some("inbox/1-b.pdf.txt"),
+                    ),
                     voice,
                 ],
             ),
