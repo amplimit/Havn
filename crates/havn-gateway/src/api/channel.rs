@@ -1890,6 +1890,26 @@ static KNOWN_PARENTS: std::sync::LazyLock<
     std::sync::Mutex<HashMap<(String, String, String), Noted>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
+/// What a message says of a place, `now`, with a title it leaves out taken
+/// from what was kept (`kept`): an adapter that names a place on some
+/// messages only does not change it on the others.
+fn as_kept(mut now: Noted, kept: Option<&Noted>) -> Noted {
+    let Some((kept_title, kept_parents)) = kept else {
+        return now;
+    };
+    if now.0.is_empty() {
+        now.0.clone_from(kept_title);
+    }
+    for (id, title) in &mut now.1 {
+        if title.is_empty()
+            && let Some((_, kept)) = kept_parents.iter().find(|(kept_id, _)| kept_id == id)
+        {
+            title.clone_from(kept);
+        }
+    }
+    now
+}
+
 /// Keep what `g`'s group and thread are part of (issue #285), so the agent
 /// can send to them later while one of these may use the bot; the thread
 /// only `with_thread`. Whether the message goes on: a thread kept as part
@@ -1948,10 +1968,15 @@ async fn note_parents(
                 .map(|p| (p.id.to_string(), p.title.to_string()))
                 .collect(),
         );
-        let known = KNOWN_PARENTS
-            .lock()
-            .map(|known| known.get(&place) == Some(&noted))
-            .unwrap_or(false);
+        let (noted, known) = match KNOWN_PARENTS.lock() {
+            Ok(known) => {
+                let kept = known.get(&place);
+                let noted = as_kept(noted, kept);
+                let same = kept == Some(&noted);
+                (noted, same)
+            }
+            Err(_) => (noted, false),
+        };
         if known {
             continue;
         }
@@ -3968,6 +3993,31 @@ pub async fn links_remove(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_left_out_counts_as_unchanged() {
+        let noted = |title: &str, space: &str| -> Noted {
+            (
+                title.into(),
+                vec![
+                    ("dc:c1".into(), String::new()),
+                    ("dc:s1".into(), space.into()),
+                ],
+            )
+        };
+        let kept = noted("plans", "Acme");
+        // Named, then not: the same as kept, so nothing is written.
+        assert_eq!(as_kept(noted("", ""), Some(&kept)), kept);
+        assert_eq!(as_kept(noted("plans", ""), Some(&kept)), kept);
+        // A new name is a change; with nothing kept, it is as it came.
+        assert_eq!(
+            as_kept(noted("ideas", ""), Some(&kept)),
+            noted("ideas", "Acme")
+        );
+        assert_eq!(as_kept(noted("", ""), None), noted("", ""));
+        // A parent kept under no title stays untitled.
+        assert_eq!(as_kept(noted("", ""), Some(&kept)).1[0].1, "");
+    }
 
     #[test]
     fn tokens_match_constant_time_basic() {
