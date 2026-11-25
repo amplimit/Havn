@@ -167,9 +167,25 @@ pub struct NewEntry<'a> {
     pub source: Source,
     /// `None` → use [`Kind::default_ttl_days`].
     pub ttl_days: Option<i64>,
-    /// `None` keeps the visibility of the entry it repeats or replaces;
-    /// a new key is private.
-    pub visibility: Option<Visibility>,
+    pub visibility: VisibilityRule,
+}
+
+/// What a save does to who the entry is shown to (issue #309). Only the
+/// owner, on the dashboard ([`set_visibility`]), makes an existing entry
+/// public.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VisibilityRule {
+    /// A new key is private; an entry repeated or replaced keeps its own.
+    #[default]
+    Keep,
+    /// Private, whatever it was.
+    Private,
+    /// Public when the key has no active entry (new, or forgotten);
+    /// otherwise as [`Self::Keep`].
+    PublicIfNew,
+    /// An entry repeated as it was keeps its own; anything else is
+    /// private.
+    PrivateIfChanged,
 }
 
 /// Insert a new entry, or replace the value for an existing key while
@@ -187,9 +203,8 @@ pub struct NewEntry<'a> {
 ///   archived row stays archived (audit) but the agent's view is
 ///   single-valued again.
 ///
-/// - **Visibility**: `new.visibility` when given; otherwise a repeated
-///   or replaced entry keeps its own, and a new or reactivated key is
-///   private.
+/// - **Visibility**: as `new.visibility` says ([`VisibilityRule`]),
+///   decided in the same transaction as the write.
 ///
 /// - **A `user_told` row repeated** (same value and kind) → it stays
 ///   `user_told`, and without an explicit `ttl_days` it keeps its
@@ -273,7 +288,7 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
             .bind(source.as_str())
             .bind(ttl)
             .bind(new.key)
-            .bind(new.visibility.map(Visibility::as_str))
+            .bind((new.visibility == VisibilityRule::Private).then_some("private"))
             .execute(&mut *tx)
             .await?;
         }
@@ -301,9 +316,12 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
             .bind(&old_id)
             .execute(&mut *tx)
             .await?;
-            let visibility = new
-                .visibility
-                .unwrap_or_else(|| Visibility::parse(was).unwrap_or_default());
+            let visibility = match new.visibility {
+                VisibilityRule::Keep | VisibilityRule::PublicIfNew => {
+                    Visibility::parse(was).unwrap_or_default()
+                }
+                VisibilityRule::Private | VisibilityRule::PrivateIfChanged => Visibility::Private,
+            };
             insert_new(&mut *tx, &new, ttl, visibility, Some(&old_id)).await?;
         }
         // Only archived rows for this key — suffix the archived row's
@@ -318,12 +336,10 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
             .bind(&archived_id)
             .execute(&mut *tx)
             .await?;
-            let visibility = new.visibility.unwrap_or_default();
-            insert_new(&mut *tx, &new, ttl, visibility, Some(&archived_id)).await?;
+            insert_new(&mut *tx, &new, ttl, new_key(new.visibility), Some(&archived_id)).await?;
         }
         None => {
-            let visibility = new.visibility.unwrap_or_default();
-            insert_new(&mut *tx, &new, ttl, visibility, None).await?;
+            insert_new(&mut *tx, &new, ttl, new_key(new.visibility), None).await?;
         }
     }
 
@@ -336,6 +352,15 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
             .await?;
     tx.commit().await?;
     Ok(id)
+}
+
+/// Who an entry under a key with no active entry is shown to.
+fn new_key(rule: VisibilityRule) -> Visibility {
+    if rule == VisibilityRule::PublicIfNew {
+        Visibility::Public
+    } else {
+        Visibility::Private
+    }
 }
 
 async fn insert_new(
@@ -562,7 +587,7 @@ pub async fn upsert(pool: &SqlitePool, key: &str, value: &str) -> Result<()> {
             kind: Kind::Preference,
             source: Source::AgentInferred,
             ttl_days: None,
-            visibility: None,
+            visibility: VisibilityRule::Keep,
         },
     )
     .await
@@ -868,11 +893,18 @@ pub async fn set_visibility(
     if id.is_some_and(|id| id != active) {
         return Ok(None);
     }
-    sqlx::query("UPDATE memory SET visibility = ?1 WHERE id = ?2")
-        .bind(visibility.as_str())
-        .bind(&active)
-        .execute(&mut *tx)
-        .await?;
+    // Public, it did not age; made private again, it gets its whole
+    // lifetime from now, not what is left of it.
+    sqlx::query(
+        "UPDATE memory SET visibility = ?1, \
+         last_recalled_at = CASE WHEN visibility = 'public' AND ?1 = 'private' \
+             THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE last_recalled_at END \
+         WHERE id = ?2",
+    )
+    .bind(visibility.as_str())
+    .bind(&active)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     let was = Visibility::parse(&was).unwrap_or_default();
     Ok(fetch_by_id(pool, &active).await?.map(|entry| (entry, was)))
@@ -1011,7 +1043,7 @@ mod tests {
             kind: Kind::Event,
             source: Source::AgentInferred,
             ttl_days: None,
-            visibility: None,
+            visibility: VisibilityRule::Keep,
         }
     }
 
@@ -1026,7 +1058,7 @@ mod tests {
                 kind: Kind::Identity,
                 source: Source::UserTold,
                 ttl_days: None,
-                visibility: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1117,7 +1149,7 @@ mod tests {
                 kind: Kind::Preference,
                 source: Source::UserTold,
                 ttl_days: None,
-                visibility: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1130,7 +1162,7 @@ mod tests {
                 kind: Kind::Event,
                 source: Source::AgentInferred,
                 ttl_days: None,
-                visibility: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1155,7 +1187,7 @@ mod tests {
                 kind: Kind::Preference,
                 source: Source::UserTold,
                 ttl_days: None,
-                visibility: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1179,7 +1211,7 @@ mod tests {
                 kind: Kind::Event,
                 source: Source::AgentInferred,
                 ttl_days: Some(1),
-                visibility: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1193,7 +1225,7 @@ mod tests {
                 kind: Kind::Preference,
                 source: Source::UserTold,
                 ttl_days: None,
-                visibility: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1289,7 +1321,7 @@ mod tests {
                 kind: Kind::Preference,
                 source: Source::AgentInferred,
                 ttl_days: None,
-                visibility: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1306,7 +1338,7 @@ mod tests {
                 kind: Kind::Preference,
                 source: Source::UserTold,
                 ttl_days: None,
-                visibility: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1336,7 +1368,7 @@ mod tests {
                     kind: Kind::Event,
                     source: Source::AgentInferred,
                     ttl_days: None,
-                    visibility: None,
+                    visibility: VisibilityRule::Keep,
                 },
             )
             .await
@@ -1373,7 +1405,7 @@ mod tests {
                 kind: Kind::Event,
                 source: Source::AgentInferred,
                 ttl_days: Some(1),
-                visibility: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1412,7 +1444,7 @@ mod tests {
                 kind: Kind::Event,
                 source: Source::AgentInferred,
                 ttl_days: Some(1),
-                visibility: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1444,7 +1476,7 @@ mod tests {
                 kind: Kind::Project,
                 source: Source::UserTold,
                 ttl_days: None,
-                visibility: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1459,7 +1491,7 @@ mod tests {
                 kind: Kind::Project,
                 source: Source::UserTold,
                 ttl_days: None,
-                visibility: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1492,7 +1524,7 @@ mod tests {
             kind: Kind::Preference,
             source: Source::UserTold,
             ttl_days: Some(400),
-            visibility: None,
+            visibility: VisibilityRule::Keep,
         };
         let long = "v".repeat(3000);
         let vim = remember(&pool, entry(&long)).await.expect("vim");
@@ -1585,7 +1617,7 @@ mod tests {
             NewEntry {
                 key: "pref.lang",
                 ttl_days: Some(1),
-                visibility: None,
+                visibility: VisibilityRule::Keep,
                 ..entry("Go")
             },
         )
@@ -1613,7 +1645,7 @@ mod tests {
             kind: Kind::Identity,
             source: Source::UserTold,
             ttl_days: None,
-            visibility: None,
+            visibility: VisibilityRule::Keep,
         };
         assert!(!key_known(&pool, "user.address").await.expect("known"));
         remember(&pool, entry).await.expect("save");
@@ -1633,7 +1665,7 @@ mod tests {
             kind: Kind::Event,
             source: Source::UserTold,
             ttl_days: None,
-            visibility: None,
+            visibility: VisibilityRule::Keep,
         };
         let id = remember_until_forgotten(&pool, told.clone())
             .await
@@ -1657,7 +1689,7 @@ mod tests {
             &pool,
             NewEntry {
                 ttl_days: Some(7),
-                visibility: None,
+                visibility: VisibilityRule::Keep,
                 ..told.clone()
             },
         )
@@ -1722,7 +1754,7 @@ mod tests {
 
     // ---- visibility (issue #309) ----------------------------------------
 
-    fn fact<'a>(key: &'a str, value: &'a str, visibility: Option<Visibility>) -> NewEntry<'a> {
+    fn fact<'a>(key: &'a str, value: &'a str, visibility: VisibilityRule) -> NewEntry<'a> {
         NewEntry {
             key,
             value,
@@ -1733,60 +1765,72 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_fact_is_private_unless_made_public_and_keeps_its_visibility_when_changed() {
-        let pool = connect_in_memory().await.expect("connect");
-        remember(&pool, fact("k", "v1", None)).await.expect("new");
-        let row = get(&pool, "k").await.expect("get").expect("row");
-        assert_eq!(row.visibility, Visibility::Private, "the default");
+    async fn shown(pool: &SqlitePool, key: &str) -> Visibility {
+        get(pool, key).await.unwrap().unwrap().visibility
+    }
 
-        remember(&pool, fact("k", "v1", Some(Visibility::Public)))
-            .await
-            .expect("made public");
-        assert_eq!(
-            get(&pool, "k").await.unwrap().unwrap().visibility,
-            Visibility::Public
-        );
-        // Repeated or replaced without one: it stays what it was.
-        remember(&pool, fact("k", "v1", None))
-            .await
-            .expect("repeat");
-        remember(&pool, fact("k", "v2", None))
-            .await
-            .expect("replace");
-        let replaced = get(&pool, "k").await.unwrap().unwrap();
+    #[tokio::test]
+    async fn a_save_makes_only_a_new_key_public_and_an_existing_entry_keeps_its_visibility() {
+        use VisibilityRule::{Keep, Private, PrivateIfChanged, PublicIfNew};
+        let pool = connect_in_memory().await.expect("connect");
+        remember(&pool, fact("k", "v1", Keep)).await.expect("new");
+        assert_eq!(shown(&pool, "k").await, Visibility::Private, "the default");
+
+        // An existing private entry is not made public by a save, repeated
+        // or replaced: only the owner does that, on the dashboard.
+        remember(&pool, fact("k", "v1", PublicIfNew)).await.expect("repeat");
+        assert_eq!(shown(&pool, "k").await, Visibility::Private);
+        remember(&pool, fact("k", "v2", PublicIfNew)).await.expect("replace");
+        assert_eq!(shown(&pool, "k").await, Visibility::Private);
+
+        // A new key is.
+        remember(&pool, fact("p", "v1", PublicIfNew)).await.expect("public");
+        assert_eq!(shown(&pool, "p").await, Visibility::Public);
+        // Repeated or replaced, it keeps it.
+        remember(&pool, fact("p", "v1", Keep)).await.expect("repeat");
+        remember(&pool, fact("p", "v2", Keep)).await.expect("replace");
+        let replaced = get(&pool, "p").await.unwrap().unwrap();
         assert_eq!(replaced.value, "v2");
         assert_eq!(replaced.visibility, Visibility::Public);
-        // Replaced as private: private.
-        remember(&pool, fact("k", "v3", Some(Visibility::Private)))
+        // Where it is saved private if changed: a repeat keeps it, a
+        // change does not.
+        remember(&pool, fact("p", "v2", PrivateIfChanged))
             .await
-            .expect("private");
-        assert_eq!(
-            get(&pool, "k").await.unwrap().unwrap().visibility,
-            Visibility::Private
-        );
-        // Forgotten and saved again: a new fact, private.
-        remember(&pool, fact("k", "v4", Some(Visibility::Public)))
+            .expect("repeat");
+        assert_eq!(shown(&pool, "p").await, Visibility::Public);
+        remember(&pool, fact("p", "v3", PrivateIfChanged))
             .await
-            .expect("public");
+            .expect("change");
+        assert_eq!(shown(&pool, "p").await, Visibility::Private);
+        remember(&pool, fact("q", "v1", PrivateIfChanged))
+            .await
+            .expect("new");
+        assert_eq!(shown(&pool, "q").await, Visibility::Private);
+
+        // Made private, even repeated.
+        remember(&pool, fact("r", "v1", PublicIfNew)).await.expect("public");
+        remember(&pool, fact("r", "v1", Private)).await.expect("private");
+        assert_eq!(shown(&pool, "r").await, Visibility::Private);
+
+        // Forgotten and saved again: a new fact.
         forget(&pool, "k").await.expect("forget");
-        remember(&pool, fact("k", "v5", None)).await.expect("again");
-        assert_eq!(
-            get(&pool, "k").await.unwrap().unwrap().visibility,
-            Visibility::Private
-        );
+        remember(&pool, fact("k", "v5", PublicIfNew)).await.expect("again");
+        assert_eq!(shown(&pool, "k").await, Visibility::Public);
+        forget(&pool, "k").await.expect("forget");
+        remember(&pool, fact("k", "v6", Keep)).await.expect("again");
+        assert_eq!(shown(&pool, "k").await, Visibility::Private);
     }
 
     #[tokio::test]
     async fn public_facts_are_listed_most_recently_used_first_and_do_not_age_out() {
         let pool = connect_in_memory().await.expect("connect");
-        remember(&pool, fact("old", "used lately", Some(Visibility::Public)))
+        remember(&pool, fact("old", "used lately", VisibilityRule::PublicIfNew))
             .await
             .expect("old");
-        remember(&pool, fact("new", "saved last", Some(Visibility::Public)))
+        remember(&pool, fact("new", "saved last", VisibilityRule::PublicIfNew))
             .await
             .expect("new");
-        remember(&pool, fact("hidden", "private", None))
+        remember(&pool, fact("hidden", "private", VisibilityRule::Keep))
             .await
             .expect("private");
         sqlx::query(
@@ -1826,7 +1870,7 @@ mod tests {
     #[tokio::test]
     async fn visibility_is_switched_on_the_entry_shown_only() {
         let pool = connect_in_memory().await.expect("connect");
-        let first = remember(&pool, fact("k", "v1", None)).await.expect("v1");
+        let first = remember(&pool, fact("k", "v1", VisibilityRule::Keep)).await.expect("v1");
         let before = get(&pool, "k").await.unwrap().unwrap().updated_at;
         let (entry, was) = set_visibility(&pool, "k", Some(&first), Visibility::Public)
             .await
@@ -1837,7 +1881,7 @@ mod tests {
         assert_eq!(entry.updated_at, before, "when it was saved stays");
 
         // Replaced since: the switch under the old one changes nothing.
-        remember(&pool, fact("k", "v2", None)).await.expect("v2");
+        remember(&pool, fact("k", "v2", VisibilityRule::Keep)).await.expect("v2");
         assert!(
             set_visibility(&pool, "k", Some(&first), Visibility::Private)
                 .await
@@ -1859,6 +1903,40 @@ mod tests {
                 .expect("set")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn a_fact_made_private_again_gets_its_whole_lifetime_from_then() {
+        let pool = connect_in_memory().await.expect("connect");
+        remember(&pool, fact("k", "public long", VisibilityRule::PublicIfNew))
+            .await
+            .expect("public");
+        remember(&pool, fact("p", "always private", VisibilityRule::Keep))
+            .await
+            .expect("private");
+        // Both saved long past their one day.
+        sqlx::query(
+            "UPDATE memory SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-30 days')",
+        )
+        .execute(&pool)
+        .await
+        .expect("backdate");
+        assert_eq!(age_expired(&pool).await.expect("age"), 1, "the private one");
+        set_visibility(&pool, "k", None, Visibility::Private)
+            .await
+            .expect("set")
+            .expect("found");
+        assert_eq!(age_expired(&pool).await.expect("age"), 0);
+        assert!(get(&pool, "k").await.unwrap().is_some());
+        // Its clock runs from the switch.
+        sqlx::query(
+            "UPDATE memory SET last_recalled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 days') \
+             WHERE key = 'k'",
+        )
+        .execute(&pool)
+        .await
+        .expect("later");
+        assert_eq!(age_expired(&pool).await.expect("age"), 1);
     }
 
     #[tokio::test]

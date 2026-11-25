@@ -72,7 +72,7 @@ mod tests {
                 kind: Kind::Event,
                 source: Source::AgentInferred,
                 ttl_days: Some(1),
-                visibility: None,
+                visibility: havn_db::agent::memory::VisibilityRule::Keep,
             },
         )
         .await

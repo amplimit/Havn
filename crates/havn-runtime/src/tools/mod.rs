@@ -392,6 +392,9 @@ impl ToolRegistry {
         input: serde_json::Value,
         ctx: &ToolCtx,
     ) -> ToolResult {
+        // Before it runs: what it gives, even an error, may be someone
+        // else's words (issue #309).
+        memory::note_tool_call(name);
         if self.disabled_in(context, name) {
             warn!(
                 name,

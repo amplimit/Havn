@@ -2935,7 +2935,12 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     )
     .await;
 
-    let memory_changes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let memory_changes = Arc::new(tools::memory::TurnMemory::default());
+    // What tools gave in the turns before, which the model reads again,
+    // counts as this turn's (issue #309).
+    if steps::calls_other_than(&messages, &tools::memory::MEMORY_TOOLS) {
+        memory_changes.saw_tool_output();
+    }
     let turn_trace = Arc::new(std::sync::Mutex::new(tool_loop::Trace::default()));
     let started = std::time::Instant::now();
     // A chat app gets what the model says before each tool call as it is
@@ -3173,11 +3178,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     if trimmed {
         compact_in_background(&ctx, &chat, &msg.channel_id, remembers);
     }
-    let changes = tools::memory::changes(std::mem::take(
-        &mut *memory_changes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    ));
+    let changes = tools::memory::changes(memory_changes.take());
     if !changes.is_empty() {
         let frame = AgentToGateway::MemoryChanged(havn_proto::MemoryChanged {
             channel_id: msg.channel_id,
@@ -3303,8 +3304,9 @@ async fn with_public_facts(pool: &sqlx::SqlitePool, base: &SystemPrompt) -> Syst
     }
 }
 
-/// `heading` and a line for each of `facts` in order, while they fit in
-/// `budget` characters, each value cut to `per_fact`.
+/// `heading` and a line for each of `facts` in order that fits in what is
+/// left of `budget` characters, each value cut to `per_fact`: one that
+/// does not is left out, and the next ones still tried.
 fn fact_lines(
     heading: &str,
     facts: &[havn_db::agent::memory::Entry],
@@ -3329,7 +3331,7 @@ fn fact_lines(
         );
         let size = line.chars().count();
         if size > left {
-            break;
+            continue;
         }
         left -= size;
         let _ = write!(section, "{line}");
@@ -3339,7 +3341,8 @@ fn fact_lines(
 
 /// Fold `USER.md` into memory, once (issue #309): its text, when it has
 /// any, becomes one public identity fact, kept until forgotten, and the
-/// file is renamed [`system_prompt::USER_BACKUP`]. It is not read again.
+/// file is kept as [`system_prompt::USER_BACKUP`]. Done once the fact is
+/// saved, so it is never saved again, nor a `USER.md` written later.
 async fn fold_user_md(workspace: &std::path::Path, pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     use havn_db::agent::memory;
     if !memory::import_pending(pool, system_prompt::USER).await? {
@@ -3362,15 +3365,47 @@ async fn fold_user_md(workspace: &std::path::Path, pool: &sqlx::SqlitePool) -> a
                 kind: memory::Kind::Identity,
                 source: memory::Source::UserTold,
                 ttl_days: None,
-                visibility: Some(memory::Visibility::Public),
+                visibility: memory::VisibilityRule::PublicIfNew,
             },
         )
         .await?;
-        tokio::fs::rename(&path, workspace.join(system_prompt::USER_BACKUP)).await?;
+        memory::import_done(pool, system_prompt::USER).await?;
         info!(cut, "USER.md folded into memory as a public fact");
+        match keep_as_backup(workspace, &path).await {
+            Ok(Some(name)) => info!(%name, "USER.md kept as a backup"),
+            Ok(None) => warn!("USER.md left as it is: every backup name is taken"),
+            Err(e) => warn!(error = %e, "USER.md left as it is: could not keep it as a backup"),
+        }
+        return Ok(());
     }
     memory::import_done(pool, system_prompt::USER).await?;
     Ok(())
+}
+
+/// Keep `path` as [`system_prompt::USER_BACKUP`] in `workspace`, or as
+/// `USER.md.bak.1`, `.2`, ... when that is taken: never over another file.
+/// The name it is kept under, or `None` when every one is taken.
+async fn keep_as_backup(
+    workspace: &std::path::Path,
+    path: &std::path::Path,
+) -> std::io::Result<Option<String>> {
+    for n in 0..100 {
+        let name = if n == 0 {
+            system_prompt::USER_BACKUP.to_string()
+        } else {
+            format!("{}.{n}", system_prompt::USER_BACKUP)
+        };
+        // A link fails where a file is; a rename would replace it.
+        match tokio::fs::hard_link(path, workspace.join(&name)).await {
+            Ok(()) => {
+                tokio::fs::remove_file(path).await?;
+                return Ok(Some(name));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
 }
 
 /// The prompt section that tells the model where it is talking and with
@@ -4258,7 +4293,7 @@ async fn summarize(
             kind,
             source: havn_db::agent::memory::Source::AgentInferred,
             ttl_days: None,
-            visibility: None,
+            visibility: havn_db::agent::memory::VisibilityRule::Keep,
         };
         if let Err(e) = tools::memory::save(false, &ctx.tool_env, entry).await {
             warn!(%key, error = %e, "could not save a fact from the chat summary");
@@ -4657,7 +4692,7 @@ async fn answer_data_request(req: DataRequest, ctx: &Ctx) -> DataResponse {
                         kind,
                         source: memory::Source::UserTold,
                         ttl_days,
-                        visibility: None,
+                        visibility: havn_db::agent::memory::VisibilityRule::Keep,
                     },
                 )
                 .await
@@ -5349,7 +5384,7 @@ run ls"
                     kind,
                     source: Source::UserTold,
                     ttl_days: None,
-                    visibility: None,
+                    visibility: havn_db::agent::memory::VisibilityRule::Keep,
                 },
             )
             .await
@@ -5376,7 +5411,7 @@ run ls"
 
     #[tokio::test]
     async fn public_facts_go_into_every_prompt_within_their_cap_and_private_ones_do_not() {
-        use havn_db::agent::memory::{self, Kind, NewEntry, Source, Visibility};
+        use havn_db::agent::memory::{self, Kind, NewEntry, Source, VisibilityRule};
         let pool = havn_db::agent::connect_in_memory().await.expect("db");
         let base = BootstrapFiles {
             system: Some("persona".into()),
@@ -5401,7 +5436,7 @@ run ls"
                         kind: Kind::Identity,
                         source: Source::UserTold,
                         ttl_days: None,
-                        visibility: Some(visibility),
+                        visibility,
                     },
                 )
                 .await
@@ -5411,14 +5446,16 @@ run ls"
         save(
             "user.secret",
             "lives on Elm Street".into(),
-            Visibility::Private,
+            VisibilityRule::Keep,
         )
         .await;
-        save("user.long", "x".repeat(3000), Visibility::Public).await;
+        save("user.old", "Milan".into(), VisibilityRule::PublicIfNew).await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        save("user.name", "Mira".into(), Visibility::Public).await;
+        save("user.long", "x".repeat(3000), VisibilityRule::PublicIfNew).await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        save("user.bio", "y".repeat(2000), Visibility::Public).await;
+        save("user.name", "Mira".into(), VisibilityRule::PublicIfNew).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        save("user.bio", "y".repeat(2000), VisibilityRule::PublicIfNew).await;
 
         let prompt = with_public_facts(&pool, &base).await;
         let text = prompt.as_text().expect("text");
@@ -5437,8 +5474,10 @@ run ls"
             text.find("user.bio") < text.find("user.name"),
             "the most recently used first"
         );
-        // The oldest does not fit what is left of the cap.
+        // One that does not fit what is left of the cap is left out, and
+        // older ones that do are still given.
         assert!(!text.contains("user.long"), "{text}");
+        assert!(text.contains("`user.old` (identity): Milan"), "{text}");
 
         // And the owner's private section has the private one only.
         let private = saved_facts(&pool).await.expect("facts").expect("some");
@@ -5482,6 +5521,51 @@ run ls"
         fold_user_md(&workspace, &pool).await.expect("again");
         assert!(memory::get(&pool, "USER.md").await.expect("get").is_none());
         assert!(workspace.join("USER.md").exists());
+    }
+
+    #[tokio::test]
+    async fn the_user_md_backup_never_replaces_another_file() {
+        use havn_db::agent::memory;
+        let workspace = std::env::temp_dir().join(format!("havn-user-md-{}", uuid::Uuid::now_v7()));
+        tokio::fs::create_dir_all(&workspace).await.expect("ws");
+        tokio::fs::write(workspace.join("USER.md.bak"), "the owner's own backup")
+            .await
+            .expect("write");
+        tokio::fs::write(workspace.join("USER.md"), "Call me Mira")
+            .await
+            .expect("write");
+        let pool = havn_db::agent::connect_in_memory().await.expect("db");
+        fold_user_md(&workspace, &pool).await.expect("fold");
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.join("USER.md.bak"))
+                .await
+                .expect("kept"),
+            "the owner's own backup"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.join("USER.md.bak.1"))
+                .await
+                .expect("backup"),
+            "Call me Mira"
+        );
+        assert!(!workspace.join("USER.md").exists());
+
+        // Done once the fact is saved: the owner's switch to private
+        // stays, whatever happens to the file.
+        memory::set_visibility(&pool, "USER.md", None, memory::Visibility::Private)
+            .await
+            .expect("set")
+            .expect("found");
+        tokio::fs::write(workspace.join("USER.md"), "Call me Mira")
+            .await
+            .expect("write");
+        fold_user_md(&workspace, &pool).await.expect("again");
+        let fact = memory::get(&pool, "USER.md")
+            .await
+            .expect("get")
+            .expect("fact");
+        assert_eq!(fact.visibility, memory::Visibility::Private);
+        assert!(!memory::import_pending(&pool, "USER.md").await.expect("pending"));
     }
 
     #[tokio::test]
