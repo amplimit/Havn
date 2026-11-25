@@ -37,6 +37,10 @@ pub enum ProviderError {
     /// region, a project). Try next; do NOT disable: the key may serve
     /// other requests (issue #323).
     Forbidden { body: String },
+    /// HTTP 403 for the key itself (Gemini: blocked, reported as leaked,
+    /// its API not enabled): disable it and try next, as for a 401, and
+    /// say it as the 403 it is.
+    KeyForbidden { body: String },
     /// HTTP 402 / 429 — quota exhausted or rate-limited. Try next; do NOT
     /// disable (the key may be fine again tomorrow / next minute). A 429 is
     /// tried again first, after `retry_after` when the provider said
@@ -67,7 +71,9 @@ impl std::fmt::Display for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unauthorized { body } => write!(f, "401 unauthorized: {body}"),
-            Self::Forbidden { body } => write!(f, "403 forbidden: {body}"),
+            Self::Forbidden { body } | Self::KeyForbidden { body } => {
+                write!(f, "403 forbidden: {body}")
+            }
             Self::QuotaOrRateLimit { status, body, .. } => write!(f, "{status}: {body}"),
             Self::Upstream { status, body, .. } => write!(f, "upstream {status}: {body}"),
             Self::BadRequest { status, body } => write!(f, "{status}: {body}"),
@@ -371,6 +377,10 @@ pub(super) fn classify(err: ProviderError) -> super::Attempt {
         ProviderError::Unauthorized { body } => super::Attempt::Disable {
             reason: format!("401 unauthorized: {body}"),
             said: Some((401, body)),
+        },
+        ProviderError::KeyForbidden { body } => super::Attempt::Disable {
+            reason: format!("403 forbidden: {body}"),
+            said: Some((403, body)),
         },
         ProviderError::Forbidden { body } => super::Attempt::TryNext {
             reason: format!("403 forbidden: {body}"),

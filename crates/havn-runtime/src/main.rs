@@ -4152,10 +4152,20 @@ fn failure_text(detail: &str) -> (String, bool) {
 }
 
 /// Whether failure `detail`, lowercased, is the provider's refusal with
-/// HTTP `status` (issue #323): the gateway's "upstream provider error:
-/// 402 — ...", or "unavailable (429: ...)" for one it tried again.
+/// HTTP `status` (issue #323), as the gateway starts it: "upstream
+/// provider error: 402 — ...", or, for one it tried again, "the provider
+/// "x" is unavailable (429: ...". What the provider said, after, does not
+/// count.
 fn refused_with(detail: &str, status: u16) -> bool {
-    detail.contains(&format!("error: {status} ")) || detail.contains(&format!("({status}: "))
+    if let Some(rest) = detail.strip_prefix("upstream provider error: ") {
+        return rest.starts_with(&format!("{status} "));
+    }
+    detail
+        .strip_prefix("the provider \"")
+        .and_then(|rest| rest.split_once("\" is unavailable ("))
+        .is_some_and(|(name, reason)| {
+            !name.contains('"') && reason.starts_with(&format!("{status}: "))
+        })
 }
 
 /// What a person is told when their chat was compacted because it had
@@ -5354,8 +5364,15 @@ run ls"
         assert!(payment.contains("payment") && !again, "{payment}");
         assert!(!payment.contains("no credit left"));
         let (forbidden, again) =
-            failure_text("LLM error: upstream provider error: 403 — not for this model");
+            failure_text("upstream provider error: 403 — not for this model");
         assert!(forbidden.contains("forbids") && !again, "{forbidden}");
+        // What the provider said does not pass for the status.
+        assert!(
+            told("upstream provider error: 400 — says \"upstream provider error: 403 — x\"")
+                .contains("refused")
+        );
+        assert!(told("the provider \"openai\" is unavailable (upstream 503: (429: x)) after 4 tries")
+            .contains("overloaded"));
         let (limited, again) = failure_text(
             "the provider \"openai\" is unavailable (429: insufficient_quota) after 4 tries",
         );

@@ -778,7 +778,12 @@ async fn complete_through(
                         .await
                         .map_err(|e| warn!(error = %e, "failed to disable credential"));
                 }
-                refused = Some(said.unwrap_or((401, reason)));
+                // A key refused (401) does not hide what another key was
+                // refused for (issue #323).
+                let said = said.unwrap_or((401, reason));
+                if said.0 != 401 || refused.as_ref().is_none_or(|(status, _)| *status == 401) {
+                    refused = Some(said);
+                }
             }
             Attempt::TryNext {
                 reason,
@@ -833,7 +838,7 @@ async fn complete_through(
         };
         return Err(ProxyError::Upstream {
             status,
-            message: format!("{message}{hint}"),
+            message: format!("{}{hint}", provider_words(&message)),
         });
     }
     Err(exhausted.map_or_else(
@@ -880,6 +885,27 @@ fn short_reason(reason: &str) -> String {
         short.push('…');
     }
     short
+}
+
+/// What a provider said as it refused a call (issue #323), for a person to
+/// read: the message of its JSON error when it sent one, else its body,
+/// cut as [`short_reason`] cuts; an HTML page is not shown, only said.
+fn provider_words(body: &str) -> String {
+    let start = body.trim_start().to_ascii_lowercase();
+    if start.starts_with("<!doctype html") || start.starts_with("<html") {
+        return "the server answered with an HTML page, not the API's error".into();
+    }
+    let said = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/error/message")
+                .or_else(|| v.get("message"))
+                .or_else(|| v.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.trim().to_string());
+    short_reason(&said)
 }
 
 /// Owns a reservation row until it is settled, released or kept. Dropped
@@ -4629,14 +4655,28 @@ mod tests {
         /// A server that refuses every call with `status` and `words`, and
         /// counts them.
         async fn refuse(status: u16, words: &'static str) -> (String, Arc<Mutex<usize>>) {
-            let status = StatusCode::from_u16(status).expect("status");
+            refuse_in_turn(vec![(status, json!({"error": {"message": words}}))]).await
+        }
+
+        /// A server that refuses its calls with `replies` in turn, the
+        /// last one for every call after, and counts them.
+        async fn refuse_in_turn(replies: Vec<(u16, Value)>) -> (String, Arc<Mutex<usize>>) {
             let calls: Arc<Mutex<usize>> = Arc::default();
             let count = Arc::clone(&calls);
+            let replies = Arc::new(replies);
             let app = axum::Router::new().fallback(move || {
-                let count = Arc::clone(&count);
+                let (count, replies) = (Arc::clone(&count), Arc::clone(&replies));
                 async move {
-                    *count.lock().unwrap() += 1;
-                    (status, axum::Json(json!({"error": {"message": words}})))
+                    let n = {
+                        let mut count = count.lock().unwrap();
+                        *count += 1;
+                        *count - 1
+                    };
+                    let (status, body) = replies[n.min(replies.len() - 1)].clone();
+                    (
+                        StatusCode::from_u16(status).expect("status"),
+                        axum::Json(body),
+                    )
                 }
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -4682,7 +4722,7 @@ mod tests {
                                 && reason.contains("the provider's own words")
                         }
                         ProxyError::Upstream { status: s, message } => {
-                            *s == status && message.contains("the provider's own words")
+                            *s == status && message == "the provider's own words"
                         }
                         _ => false,
                     };
@@ -4717,6 +4757,87 @@ mod tests {
             );
             assert_eq!(*calls.lock().unwrap(), 2, "each key is tried");
             assert!(rows(&db).await.is_empty(), "the reservations are released");
+        }
+
+        async fn enabled(db: &SqlitePool) -> Vec<bool> {
+            let mut enabled: Vec<bool> = sqlx::query_scalar("SELECT enabled FROM credentials")
+                .fetch_all(db)
+                .await
+                .expect("credentials");
+            enabled.sort_unstable();
+            enabled
+        }
+
+        #[tokio::test]
+        async fn a_key_refused_after_another_was_forbidden_does_not_hide_why() {
+            let (base, _) = refuse_in_turn(vec![
+                (403, json!({"error": {"message": "not for this model"}})),
+                (401, json!({"error": {"message": "bad key"}})),
+            ])
+            .await;
+            let db = havn_db::connect_in_memory().await.expect("db");
+            let user = create_user(&db, NewUser { display_name: "u" })
+                .await
+                .expect("user")
+                .id;
+            key(&db, user, "llm:ollama").await;
+            key(&db, user, "llm:ollama").await;
+            let err = call(&db, user, "ollama", &llm(&base), &hi())
+                .await
+                .expect_err("refused");
+            assert!(
+                matches!(&err, ProxyError::Upstream { status: 403, message } if message == "not for this model"),
+                "{err}"
+            );
+            assert_eq!(enabled(&db).await, [false, true], "the key refused is disabled");
+        }
+
+        #[tokio::test]
+        async fn a_gemini_key_refused_for_itself_is_disabled_and_said_as_a_403() {
+            let info = |reason: &str| {
+                json!({"error": {"code": 403, "message": "Permission denied", "status": "PERMISSION_DENIED",
+                    "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": reason}]}})
+            };
+            let leaked = json!({"error": {"code": 403, "status": "PERMISSION_DENIED",
+                "message": "Your API key was reported as leaked. Please use another API key."}});
+            for (body, disabled) in [
+                (info("API_KEY_SERVICE_BLOCKED"), true),
+                (info("SERVICE_DISABLED"), true),
+                (leaked, true),
+                (info("IAM_PERMISSION_DENIED"), false),
+            ] {
+                let (base, _) = refuse_in_turn(vec![(403, body.clone())]).await;
+                let db = havn_db::connect_in_memory().await.expect("db");
+                let user = create_user(&db, NewUser { display_name: "u" })
+                    .await
+                    .expect("user")
+                    .id;
+                key(&db, user, "gemini").await;
+                let mut llm = llm(&base);
+                llm.base_url.insert("gemini".into(), base.clone());
+                let err = call(&db, user, "gemini", &llm, &hi())
+                    .await
+                    .expect_err("refused");
+                assert!(
+                    matches!(&err, ProxyError::Upstream { status: 403, .. }),
+                    "{body}: {err}"
+                );
+                assert_eq!(enabled(&db).await, [!disabled], "{body}");
+            }
+        }
+
+        #[test]
+        fn a_refusal_is_said_in_the_provider_s_words_cut_short() {
+            assert_eq!(
+                provider_words(r#"{"error": {"message": "out of credit", "code": 402}}"#),
+                "out of credit"
+            );
+            assert_eq!(provider_words("plain words\nand more"), "plain words");
+            let long = "x".repeat(500);
+            assert_eq!(provider_words(&long).chars().count(), 121);
+            assert!(!provider_words("<!DOCTYPE html><html><body>Forbidden</body></html>")
+                .contains("Forbidden"));
+            assert!(provider_words("  <html><title>403</title>").contains("HTML page"));
         }
     }
 }
