@@ -157,6 +157,10 @@ pub struct Entry {
     pub supersedes_id: Option<String>,
     #[serde(default)]
     pub visibility: Visibility,
+    /// The agent suggests making this private entry public; only the owner
+    /// does, on the dashboard (issue #309).
+    #[serde(default)]
+    pub suggested_public: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -170,22 +174,38 @@ pub struct NewEntry<'a> {
     pub visibility: VisibilityRule,
 }
 
-/// What a save does to who the entry is shown to (issue #309). Only the
-/// owner, on the dashboard ([`set_visibility`]), makes an existing entry
-/// public.
+/// What a save does to who the entry is shown to (issue #309). The agent
+/// never makes a fact public: only the owner does, on the dashboard
+/// ([`set_visibility`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum VisibilityRule {
-    /// A new key is private; an entry repeated or replaced keeps its own.
+    /// The owner's save, from the dashboard: a new key is private; an
+    /// entry repeated or replaced keeps its own.
     #[default]
     Keep,
-    /// Private, whatever it was.
-    Private,
-    /// Public when the key has no active entry (new, or forgotten);
-    /// otherwise as [`Self::Keep`].
-    PublicIfNew,
-    /// An entry repeated as it was keeps its own; anything else is
-    /// private.
-    PrivateIfChanged,
+    /// The agent's save: private, though an entry repeated as it was keeps
+    /// its own. A public entry it changes becomes private and suggested
+    /// public, for the owner to approve the new text; `suggest_public`
+    /// suggests it of any other.
+    Agent { suggest_public: bool },
+    /// Public: what the owner wrote in `USER.md`.
+    Public,
+}
+
+/// Who an entry a save inserts is shown to, and whether it is suggested
+/// public, after the active entry it replaces, if any.
+fn inserted(rule: VisibilityRule, replaced: Option<(Visibility, bool)>) -> (Visibility, bool) {
+    match (rule, replaced) {
+        (VisibilityRule::Public, _) => (Visibility::Public, false),
+        (VisibilityRule::Keep, Some((was, suggested))) => {
+            (was, suggested && was == Visibility::Private)
+        }
+        (VisibilityRule::Keep, None) => (Visibility::Private, false),
+        (VisibilityRule::Agent { suggest_public }, replaced) => (
+            Visibility::Private,
+            suggest_public || replaced.is_some_and(|(was, _)| was == Visibility::Public),
+        ),
+    }
 }
 
 /// Insert a new entry, or replace the value for an existing key while
@@ -255,9 +275,10 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
         String,
         Option<i64>,
         String,
+        bool,
     )> = sqlx::query_as(
-        "SELECT id, value, kind, archived_at, source, ttl_days, visibility FROM memory \
-         WHERE key = ?1",
+        "SELECT id, value, kind, archived_at, source, ttl_days, visibility, suggested_public \
+         FROM memory WHERE key = ?1",
     )
     .bind(new.key)
     .fetch_optional(&mut *tx)
@@ -268,7 +289,7 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
         // explicit lifetime it follows the (possibly upgraded) source, so
         // promoting an agent_inferred row to user_told extends it per
         // §9.4; the agent repeating a user_told fact changes neither.
-        Some((_id, ref v, ref k, None, ref was, kept, _))
+        Some((_id, ref v, ref k, None, ref was, kept, _, _))
             if v == new.value && k == new.kind.as_str() =>
         {
             let told = was == Source::UserTold.as_str();
@@ -281,20 +302,29 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
                 "UPDATE memory \
                  SET source     = ?1, \
                      ttl_days   = ?2, \
-                     visibility = COALESCE(?4, visibility), \
+                     visibility = CASE WHEN ?4 THEN 'public' ELSE visibility END, \
+                     suggested_public = CASE WHEN ?4 THEN 0 \
+                         WHEN ?5 AND visibility = 'private' THEN 1 \
+                         ELSE suggested_public END, \
                      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
                  WHERE key = ?3",
             )
             .bind(source.as_str())
             .bind(ttl)
             .bind(new.key)
-            .bind((new.visibility == VisibilityRule::Private).then_some("private"))
+            .bind(new.visibility == VisibilityRule::Public)
+            .bind(matches!(
+                new.visibility,
+                VisibilityRule::Agent {
+                    suggest_public: true
+                }
+            ))
             .execute(&mut *tx)
             .await?;
         }
         // Active row whose content has changed → archive it, INSERT
         // replacement with supersedes link.
-        Some((old_id, _, _, None, _, _, ref was)) => {
+        Some((old_id, _, _, None, _, _, ref was, suggested)) => {
             sqlx::query(
                 "UPDATE memory \
                  SET archived_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
@@ -316,18 +346,14 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
             .bind(&old_id)
             .execute(&mut *tx)
             .await?;
-            let visibility = match new.visibility {
-                VisibilityRule::Keep | VisibilityRule::PublicIfNew => {
-                    Visibility::parse(was).unwrap_or_default()
-                }
-                VisibilityRule::Private | VisibilityRule::PrivateIfChanged => Visibility::Private,
-            };
-            insert_new(&mut *tx, &new, ttl, visibility, Some(&old_id)).await?;
+            let was = Visibility::parse(was).unwrap_or_default();
+            let shown = inserted(new.visibility, Some((was, suggested)));
+            insert_new(&mut *tx, &new, ttl, shown, Some(&old_id)).await?;
         }
         // Only archived rows for this key — suffix the archived row's
         // key so the UNIQUE(key) constraint stays satisfied, then INSERT
         // the new active row linked to it.
-        Some((archived_id, _, _, Some(_), _, _, _)) => {
+        Some((archived_id, _, _, Some(_), _, _, _, _)) => {
             sqlx::query(
                 "UPDATE memory \
                  SET key = key || '@reactivated:' || strftime('%Y-%m-%dT%H:%M:%fZ', 'now') || ':' || id \
@@ -336,17 +362,11 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
             .bind(&archived_id)
             .execute(&mut *tx)
             .await?;
-            insert_new(
-                &mut *tx,
-                &new,
-                ttl,
-                new_key(new.visibility),
-                Some(&archived_id),
-            )
-            .await?;
+            let shown = inserted(new.visibility, None);
+            insert_new(&mut *tx, &new, ttl, shown, Some(&archived_id)).await?;
         }
         None => {
-            insert_new(&mut *tx, &new, ttl, new_key(new.visibility), None).await?;
+            insert_new(&mut *tx, &new, ttl, inserted(new.visibility, None), None).await?;
         }
     }
 
@@ -361,25 +381,17 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
     Ok(id)
 }
 
-/// Who an entry under a key with no active entry is shown to.
-fn new_key(rule: VisibilityRule) -> Visibility {
-    if rule == VisibilityRule::PublicIfNew {
-        Visibility::Public
-    } else {
-        Visibility::Private
-    }
-}
-
 async fn insert_new(
     tx: &mut sqlx::SqliteConnection,
     new: &NewEntry<'_>,
     ttl: Option<i64>,
-    visibility: Visibility,
+    (visibility, suggested): (Visibility, bool),
     supersedes_id: Option<&str>,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO memory (id, key, value, kind, source, ttl_days, supersedes_id, visibility) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO memory \
+         (id, key, value, kind, source, ttl_days, supersedes_id, visibility, suggested_public) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )
     .bind(Uuid::now_v7().to_string())
     .bind(new.key)
@@ -389,6 +401,7 @@ async fn insert_new(
     .bind(ttl)
     .bind(supersedes_id)
     .bind(visibility.as_str())
+    .bind(suggested)
     .execute(tx)
     .await?;
     Ok(())
@@ -691,7 +704,7 @@ pub async fn list_archived_for_key(pool: &SqlitePool, key: &str) -> Result<Vec<E
     let prefix_pattern = format!("{key}@%");
     let rows: Vec<EntryRow> = sqlx::query_as::<_, EntryRow>(
         "SELECT id, key, value, kind, source, ttl_days, archived_at, created_at, updated_at, \
-                recall_count, last_recalled_at, supersedes_id, visibility \
+                recall_count, last_recalled_at, supersedes_id, visibility, suggested_public \
          FROM memory \
          WHERE archived_at IS NOT NULL AND (key = ?1 OR key LIKE ?2) \
          ORDER BY archived_at DESC",
@@ -757,7 +770,8 @@ pub async fn search(
     let rows: Vec<EntryRow> = if kinds.is_empty() {
         sqlx::query_as::<_, EntryRow>(
             "SELECT m.id, m.key, m.value, m.kind, m.source, m.ttl_days, m.archived_at, \
-                    m.created_at, m.updated_at, m.recall_count, m.last_recalled_at, m.supersedes_id, m.visibility \
+                    m.created_at, m.updated_at, m.recall_count, m.last_recalled_at, m.supersedes_id, m.visibility, \
+                    m.suggested_public \
              FROM memory_fts f JOIN memory m ON m.rowid = f.rowid \
              WHERE memory_fts MATCH ?1 AND m.archived_at IS NULL \
              ORDER BY rank LIMIT ?2",
@@ -773,7 +787,8 @@ pub async fn search(
             .join(", ");
         let sql = format!(
             "SELECT m.id, m.key, m.value, m.kind, m.source, m.ttl_days, m.archived_at, \
-                    m.created_at, m.updated_at, m.recall_count, m.last_recalled_at, m.supersedes_id, m.visibility \
+                    m.created_at, m.updated_at, m.recall_count, m.last_recalled_at, m.supersedes_id, m.visibility, \
+                    m.suggested_public \
              FROM memory_fts f JOIN memory m ON m.rowid = f.rowid \
              WHERE memory_fts MATCH ?1 AND m.archived_at IS NULL AND m.kind IN ({placeholders}) \
              ORDER BY rank LIMIT ?2"
@@ -812,7 +827,7 @@ pub async fn recent_events(
         .to_string();
     let rows: Vec<EntryRow> = sqlx::query_as::<_, EntryRow>(
         "SELECT id, key, value, kind, source, ttl_days, archived_at, created_at, updated_at, \
-                recall_count, last_recalled_at, supersedes_id, visibility \
+                recall_count, last_recalled_at, supersedes_id, visibility, suggested_public \
          FROM memory \
          WHERE archived_at IS NULL AND kind = 'event' AND updated_at >= ?1 \
          ORDER BY updated_at DESC LIMIT ?2",
@@ -833,7 +848,7 @@ pub async fn list_active_of_kind(pool: &SqlitePool, kind: Kind, limit: u32) -> R
     }
     let rows: Vec<EntryRow> = sqlx::query_as::<_, EntryRow>(
         "SELECT id, key, value, kind, source, ttl_days, archived_at, created_at, updated_at, \
-                recall_count, last_recalled_at, supersedes_id, visibility \
+                recall_count, last_recalled_at, supersedes_id, visibility, suggested_public \
          FROM memory \
          WHERE archived_at IS NULL AND kind = ?1 \
          ORDER BY updated_at DESC LIMIT ?2",
@@ -850,7 +865,7 @@ pub async fn list_active_of_kind(pool: &SqlitePool, kind: Kind, limit: u32) -> R
 pub async fn list_private_of_kind(pool: &SqlitePool, kind: Kind, limit: u32) -> Result<Vec<Entry>> {
     let rows: Vec<EntryRow> = sqlx::query_as::<_, EntryRow>(
         "SELECT id, key, value, kind, source, ttl_days, archived_at, created_at, updated_at, \
-                recall_count, last_recalled_at, supersedes_id, visibility \
+                recall_count, last_recalled_at, supersedes_id, visibility, suggested_public \
          FROM memory \
          WHERE archived_at IS NULL AND kind = ?1 AND visibility = 'private' \
          ORDER BY updated_at DESC LIMIT ?2",
@@ -867,7 +882,7 @@ pub async fn list_private_of_kind(pool: &SqlitePool, kind: Kind, limit: u32) -> 
 pub async fn list_public(pool: &SqlitePool, limit: u32) -> Result<Vec<Entry>> {
     let rows: Vec<EntryRow> = sqlx::query_as::<_, EntryRow>(
         "SELECT id, key, value, kind, source, ttl_days, archived_at, created_at, updated_at, \
-                recall_count, last_recalled_at, supersedes_id, visibility \
+                recall_count, last_recalled_at, supersedes_id, visibility, suggested_public \
          FROM memory \
          WHERE archived_at IS NULL AND visibility = 'public' \
          ORDER BY MAX(updated_at, COALESCE(last_recalled_at, updated_at)) DESC, id DESC \
@@ -880,8 +895,9 @@ pub async fn list_public(pool: &SqlitePool, limit: u32) -> Result<Vec<Entry>> {
 }
 
 /// Make the active entry under `key` private or public, keeping when it
-/// was saved: the entry and what it was before, or `None` when `key` has
-/// no active entry, or one other than `id` when given (it changed since).
+/// was saved, and drop any suggestion to make it public: the entry and
+/// what it was before, or `None` when `key` has no active entry, or one
+/// other than `id` when given (it changed since). The owner's alone.
 pub async fn set_visibility(
     pool: &SqlitePool,
     key: &str,
@@ -903,7 +919,7 @@ pub async fn set_visibility(
     // Public, it did not age; made private again, it gets its whole
     // lifetime from now, not what is left of it.
     sqlx::query(
-        "UPDATE memory SET visibility = ?1, \
+        "UPDATE memory SET visibility = ?1, suggested_public = 0, \
          last_recalled_at = CASE WHEN visibility = 'public' AND ?1 = 'private' \
              THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE last_recalled_at END \
          WHERE id = ?2",
@@ -939,7 +955,7 @@ pub async fn import_done(pool: &SqlitePool, file: &str) -> Result<()> {
 pub async fn list_active(pool: &SqlitePool, limit: u32) -> Result<Vec<Entry>> {
     let rows: Vec<EntryRow> = sqlx::query_as::<_, EntryRow>(
         "SELECT id, key, value, kind, source, ttl_days, archived_at, created_at, updated_at, \
-                recall_count, last_recalled_at, supersedes_id, visibility \
+                recall_count, last_recalled_at, supersedes_id, visibility, suggested_public \
          FROM memory WHERE archived_at IS NULL \
          ORDER BY updated_at DESC LIMIT ?1",
     )
@@ -975,7 +991,7 @@ pub async fn age_expired(pool: &SqlitePool) -> Result<u64> {
 async fn fetch_one(pool: &SqlitePool, where_clause: &str, args: &[&str]) -> Result<Option<Entry>> {
     let sql = format!(
         "SELECT id, key, value, kind, source, ttl_days, archived_at, created_at, updated_at, \
-                recall_count, last_recalled_at, supersedes_id, visibility \
+                recall_count, last_recalled_at, supersedes_id, visibility, suggested_public \
          FROM memory {where_clause}"
     );
     let mut q = sqlx::query_as::<_, EntryRow>(&sql);
@@ -1000,6 +1016,7 @@ struct EntryRow {
     last_recalled_at: Option<DateTime<Utc>>,
     supersedes_id: Option<String>,
     visibility: String,
+    suggested_public: bool,
 }
 
 impl From<EntryRow> for Entry {
@@ -1022,6 +1039,7 @@ impl From<EntryRow> for Entry {
             last_recalled_at: r.last_recalled_at,
             supersedes_id: r.supersedes_id,
             visibility: Visibility::parse(&r.visibility).unwrap_or_default(),
+            suggested_public: r.suggested_public,
         }
     }
 }
@@ -1776,72 +1794,76 @@ mod tests {
         get(pool, key).await.unwrap().unwrap().visibility
     }
 
+    async fn suggested(pool: &SqlitePool, key: &str) -> bool {
+        get(pool, key).await.unwrap().unwrap().suggested_public
+    }
+
     #[tokio::test]
-    async fn a_save_makes_only_a_new_key_public_and_an_existing_entry_keeps_its_visibility() {
-        use VisibilityRule::{Keep, Private, PrivateIfChanged, PublicIfNew};
+    async fn the_agent_never_makes_a_fact_public_and_its_change_to_a_public_one_is_suggested() {
+        const AGENT: VisibilityRule = VisibilityRule::Agent {
+            suggest_public: false,
+        };
+        const SUGGESTS: VisibilityRule = VisibilityRule::Agent {
+            suggest_public: true,
+        };
         let pool = connect_in_memory().await.expect("connect");
-        remember(&pool, fact("k", "v1", Keep)).await.expect("new");
-        assert_eq!(shown(&pool, "k").await, Visibility::Private, "the default");
-
-        // An existing private entry is not made public by a save, repeated
-        // or replaced: only the owner does that, on the dashboard.
-        remember(&pool, fact("k", "v1", PublicIfNew))
-            .await
-            .expect("repeat");
-        assert_eq!(shown(&pool, "k").await, Visibility::Private);
-        remember(&pool, fact("k", "v2", PublicIfNew))
-            .await
-            .expect("replace");
-        assert_eq!(shown(&pool, "k").await, Visibility::Private);
-
-        // A new key is.
-        remember(&pool, fact("p", "v1", PublicIfNew))
-            .await
-            .expect("public");
-        assert_eq!(shown(&pool, "p").await, Visibility::Public);
-        // Repeated or replaced, it keeps it.
-        remember(&pool, fact("p", "v1", Keep))
-            .await
-            .expect("repeat");
-        remember(&pool, fact("p", "v2", Keep))
-            .await
-            .expect("replace");
-        let replaced = get(&pool, "p").await.unwrap().unwrap();
-        assert_eq!(replaced.value, "v2");
-        assert_eq!(replaced.visibility, Visibility::Public);
-        // Where it is saved private if changed: a repeat keeps it, a
-        // change does not.
-        remember(&pool, fact("p", "v2", PrivateIfChanged))
-            .await
-            .expect("repeat");
-        assert_eq!(shown(&pool, "p").await, Visibility::Public);
-        remember(&pool, fact("p", "v3", PrivateIfChanged))
-            .await
-            .expect("change");
-        assert_eq!(shown(&pool, "p").await, Visibility::Private);
-        remember(&pool, fact("q", "v1", PrivateIfChanged))
+        remember(&pool, fact("k", "v1", VisibilityRule::Keep))
             .await
             .expect("new");
-        assert_eq!(shown(&pool, "q").await, Visibility::Private);
+        assert_eq!(shown(&pool, "k").await, Visibility::Private, "the default");
+        assert!(!suggested(&pool, "k").await);
 
-        // Made private, even repeated.
-        remember(&pool, fact("r", "v1", PublicIfNew))
-            .await
-            .expect("public");
-        remember(&pool, fact("r", "v1", Private))
-            .await
-            .expect("private");
-        assert_eq!(shown(&pool, "r").await, Visibility::Private);
-
-        // Forgotten and saved again: a new fact.
-        forget(&pool, "k").await.expect("forget");
-        remember(&pool, fact("k", "v5", PublicIfNew))
-            .await
-            .expect("again");
-        assert_eq!(shown(&pool, "k").await, Visibility::Public);
-        forget(&pool, "k").await.expect("forget");
-        remember(&pool, fact("k", "v6", Keep)).await.expect("again");
+        // The agent's own: private, suggested when it says so.
+        remember(&pool, fact("s", "Ada", SUGGESTS)).await.expect("new");
+        assert_eq!(shown(&pool, "s").await, Visibility::Private);
+        assert!(suggested(&pool, "s").await);
+        remember(&pool, fact("k", "v1", SUGGESTS)).await.expect("repeat");
         assert_eq!(shown(&pool, "k").await, Visibility::Private);
+        assert!(suggested(&pool, "k").await, "a repeat can suggest it");
+
+        // Made public by the owner: a repeat keeps it public.
+        set_visibility(&pool, "s", None, Visibility::Public)
+            .await
+            .expect("set")
+            .expect("found");
+        assert!(!suggested(&pool, "s").await, "the owner decided");
+        remember(&pool, fact("s", "Ada", AGENT)).await.expect("repeat");
+        assert_eq!(shown(&pool, "s").await, Visibility::Public);
+        // The owner editing it keeps it public too.
+        remember(&pool, fact("s", "Ada L.", VisibilityRule::Keep))
+            .await
+            .expect("edit");
+        assert_eq!(shown(&pool, "s").await, Visibility::Public);
+        // The agent changing it: private until the owner approves the text.
+        remember(&pool, fact("s", "Ada Lovelace", AGENT))
+            .await
+            .expect("change");
+        let changed = get(&pool, "s").await.unwrap().unwrap();
+        assert_eq!(changed.value, "Ada Lovelace");
+        assert_eq!(changed.visibility, Visibility::Private);
+        assert!(changed.suggested_public);
+        // Switching it private clears the suggestion as well.
+        set_visibility(&pool, "s", None, Visibility::Private)
+            .await
+            .expect("set")
+            .expect("found");
+        assert!(!suggested(&pool, "s").await);
+
+        // Forgotten and saved again by the agent: private.
+        set_visibility(&pool, "k", None, Visibility::Public)
+            .await
+            .expect("set")
+            .expect("found");
+        forget(&pool, "k").await.expect("forget");
+        remember(&pool, fact("k", "v1", AGENT)).await.expect("again");
+        assert_eq!(shown(&pool, "k").await, Visibility::Private);
+        assert!(!suggested(&pool, "k").await);
+
+        // What the owner wrote in USER.md is public.
+        remember(&pool, fact("USER.md", "Call me Ada", VisibilityRule::Public))
+            .await
+            .expect("fold");
+        assert_eq!(shown(&pool, "USER.md").await, Visibility::Public);
     }
 
     #[tokio::test]
@@ -1849,13 +1871,13 @@ mod tests {
         let pool = connect_in_memory().await.expect("connect");
         remember(
             &pool,
-            fact("old", "used lately", VisibilityRule::PublicIfNew),
+            fact("old", "used lately", VisibilityRule::Public),
         )
         .await
         .expect("old");
         remember(
             &pool,
-            fact("new", "saved last", VisibilityRule::PublicIfNew),
+            fact("new", "saved last", VisibilityRule::Public),
         )
         .await
         .expect("new");
@@ -1941,7 +1963,7 @@ mod tests {
     #[tokio::test]
     async fn a_fact_made_private_again_gets_its_whole_lifetime_from_then() {
         let pool = connect_in_memory().await.expect("connect");
-        remember(&pool, fact("k", "public long", VisibilityRule::PublicIfNew))
+        remember(&pool, fact("k", "public long", VisibilityRule::Public))
             .await
             .expect("public");
         remember(&pool, fact("p", "always private", VisibilityRule::Keep))

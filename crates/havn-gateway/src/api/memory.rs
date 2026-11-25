@@ -58,6 +58,7 @@ pub struct MemoryEntryView {
     pub archived_at: Option<DateTime<Utc>>,
     pub supersedes_id: Option<String>,
     pub visibility: &'static str,
+    pub suggested_public: bool,
 }
 
 impl From<memory::Entry> for MemoryEntryView {
@@ -76,6 +77,7 @@ impl From<memory::Entry> for MemoryEntryView {
             archived_at: e.archived_at,
             supersedes_id: e.supersedes_id,
             visibility: e.visibility.as_str(),
+            suggested_public: e.suggested_public,
         }
     }
 }
@@ -240,7 +242,9 @@ pub struct VisibilityRequest {
 /// `PUT /agents/:id/memory/:key/visibility` — make the entry under `key`
 /// private or public (issue #309): public facts are put in the prompt of
 /// every chat, other people's and groups' included. Only the agent's owner
-/// may (`resolve_agent`; anyone else gets 404). Answers with the entry;
+/// may (`resolve_agent`; anyone else gets 404): this is the only way a
+/// fact the agent saved becomes public, and it settles the agent's
+/// suggestion either way. Answers with the entry;
 /// 409 when the key changed since (or the agent is stopped). Audited as
 /// `memory.visibility`, with the entry and who changed it.
 pub async fn set_visibility(

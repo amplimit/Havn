@@ -102,23 +102,6 @@ pub fn calls_any(messages: &[Value], names: &[&str]) -> bool {
     })
 }
 
-/// Whether any of `messages` calls a tool other than `names`.
-pub fn calls_other_than(messages: &[Value], names: &[&str]) -> bool {
-    messages.iter().any(|m| {
-        m.get("content")
-            .and_then(Value::as_array)
-            .is_some_and(|blocks| {
-                blocks.iter().any(|b| {
-                    block_type(b) == Some("tool_use")
-                        && !b
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .is_some_and(|name| names.contains(&name))
-                })
-            })
-    })
-}
-
 /// The steps of a turn, from its `messages` (those the tool loop added
 /// after the history), as JSON to keep; `None` for a turn that called no
 /// tool, whose reply is all there is. `reply` is the reply kept, which can

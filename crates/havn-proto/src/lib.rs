@@ -148,6 +148,10 @@ pub struct MemoryChange {
     /// (issue #309); absent for one forgotten.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<String>,
+    /// The agent suggests making the saved entry public, which only the
+    /// owner does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub suggested_public: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

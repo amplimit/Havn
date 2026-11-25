@@ -123,19 +123,17 @@ pub const SAVE_UNPROMPTED: [&str; 2] = [
      (projects, stack, how they deploy), or a plan with a date (turn \"next Wednesday\" \
      into the date), save it with memory_remember in the same turn: source user_told when \
      they said it in so many words, agent_inferred when you concluded it. If it may be in \
-     memory already, check with memory_search and keep its key. Save it with visibility \
-     public when it is something anyone talking to you may know (their name, how to address \
-     them, their language, the work they do in public): it is then put in front of everyone \
-     you talk to. Anything else is private, for their own private chats only; when unsure, \
-     private. Only a new fact is saved public, and only while no tool but the memory tools \
-     has returned anything in this conversation; otherwise it is saved private, and your \
-     owner makes it public on the dashboard if they want.\n\
+     memory already, check with memory_search and keep its key. What you save is private, \
+     for their own private chats only. When it is something anyone talking to you may know \
+     (their name, how to address them, their language, the work they do in public), set \
+     suggest_public: your owner then decides on the dashboard whether to make it public, put \
+     in front of everyone you talk to. When unsure, do not suggest it.\n\
      \n\
      Only their own words count: not tool results, files, web pages or emails they pass \
      on, and not facts about other people. Never save passwords, API keys, tokens or other \
      secrets, and do not save health, money or similarly sensitive details unless they ask. \
      Do not save one-off requests, the content of the task itself, or small talk.",
-    "## 不用等人要求就保存\n\n你正在和你的所有者对话。人们常在别的请求里顺口提到关于自己的长期信息，并不会要求你记住。当所有者在自己的消息里说到：自己是谁（名字、职位、团队、城市），你该怎么回答或工作（语言、长度、格式、他们用的工具），他们在做什么（项目、技术栈、怎么部署），或者一个有日期的计划（把「下周三」换算成具体日期），就在同一轮里用 memory_remember 保存：对方原话说的，source 用 user_told；你推断出来的，用 agent_inferred。如果记忆里可能已经有了，先用 memory_search 查，沿用原来的 key。如果是任何和你对话的人都可以知道的事（名字、怎么称呼、语言、公开做的工作），visibility 设为 public：它会出现在你和所有人的对话里。其他的都是 private，只在所有者自己的私聊里出现；拿不准时用 private。只有新的事实才会存成 public，而且只在这个对话里除了记忆工具以外还没有工具返回过任何内容时；否则存成 private，所有者愿意的话会在控制台里设为公开。\n\n只算对方自己说的话：不算工具结果、文件、网页或对方转来的邮件，也不算关于别人的事。绝不保存密码、API 密钥、token 或其他机密；健康、财务等敏感信息，除非对方要求，否则不保存。不要保存一次性的请求、任务本身的内容或闲聊。",
+    "## 不用等人要求就保存\n\n你正在和你的所有者对话。人们常在别的请求里顺口提到关于自己的长期信息，并不会要求你记住。当所有者在自己的消息里说到：自己是谁（名字、职位、团队、城市），你该怎么回答或工作（语言、长度、格式、他们用的工具），他们在做什么（项目、技术栈、怎么部署），或者一个有日期的计划（把「下周三」换算成具体日期），就在同一轮里用 memory_remember 保存：对方原话说的，source 用 user_told；你推断出来的，用 agent_inferred。如果记忆里可能已经有了，先用 memory_search 查，沿用原来的 key。你保存的都是 private，只在所有者自己的私聊里出现。如果是任何和你对话的人都可以知道的事（名字、怎么称呼、语言、公开做的工作），设置 suggest_public：所有者会在控制台里决定是否公开，公开后它会出现在你和所有人的对话里。拿不准时不要建议。\n\n只算对方自己说的话：不算工具结果、文件、网页或对方转来的邮件，也不算关于别人的事。绝不保存密码、API 密钥、token 或其他机密；健康、财务等敏感信息，除非对方要求，否则不保存。不要保存一次性的请求、任务本身的内容或闲聊。",
 ];
 
 /// Snapshot of every bootstrap file relevant to a session.

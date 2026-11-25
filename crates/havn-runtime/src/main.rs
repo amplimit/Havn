@@ -2935,12 +2935,7 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     )
     .await;
 
-    let memory_changes = Arc::new(tools::memory::TurnMemory::default());
-    // What tools gave in the turns before, which the model reads again,
-    // counts as this turn's (issue #309).
-    if steps::calls_other_than(&messages, &tools::memory::MEMORY_TOOLS) {
-        memory_changes.saw_tool_output();
-    }
+    let memory_changes = Arc::new(std::sync::Mutex::new(Vec::new()));
     let turn_trace = Arc::new(std::sync::Mutex::new(tool_loop::Trace::default()));
     let started = std::time::Instant::now();
     // A chat app gets what the model says before each tool call as it is
@@ -3178,7 +3173,11 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     if trimmed {
         compact_in_background(&ctx, &chat, &msg.channel_id, remembers);
     }
-    let changes = tools::memory::changes(memory_changes.take());
+    let changes = tools::memory::changes(std::mem::take(
+        &mut *memory_changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    ));
     if !changes.is_empty() {
         let frame = AgentToGateway::MemoryChanged(havn_proto::MemoryChanged {
             channel_id: msg.channel_id,
@@ -3365,7 +3364,7 @@ async fn fold_user_md(workspace: &std::path::Path, pool: &sqlx::SqlitePool) -> a
                 kind: memory::Kind::Identity,
                 source: memory::Source::UserTold,
                 ttl_days: None,
-                visibility: memory::VisibilityRule::PublicIfNew,
+                visibility: memory::VisibilityRule::Public,
             },
         )
         .await?;
@@ -4277,29 +4276,43 @@ async fn summarize(
     // window is saved as they do. A key memory has or had is left alone:
     // what the summariser read is older than what may have replaced it.
     for (key, value, kind) in facts.into_iter().take(MAX_FLUSHED_FACTS) {
-        // Forgotten or expired keys too: the user may have removed it
-        // after the turns the summariser read.
-        match havn_db::agent::memory::key_known(&ctx.pool, &key).await {
-            Ok(false) => {}
-            Ok(true) => continue,
-            Err(e) => {
-                warn!(%key, error = %e, "could not look up a fact from the chat summary");
-                continue;
-            }
-        }
-        let entry = havn_db::agent::memory::NewEntry {
-            key: &key,
-            value: &value,
-            kind,
-            source: havn_db::agent::memory::Source::AgentInferred,
-            ttl_days: None,
-            visibility: havn_db::agent::memory::VisibilityRule::Keep,
-        };
-        if let Err(e) = tools::memory::save(false, &ctx.tool_env, entry).await {
-            warn!(%key, error = %e, "could not save a fact from the chat summary");
-        }
+        flush_fact(&ctx.tool_env, &key, &value, kind).await;
     }
     Ok(true)
+}
+
+/// Save a fact the summariser found, as the agent's (private), unless
+/// memory has or had its key.
+async fn flush_fact(
+    tool_env: &ToolCtx,
+    key: &str,
+    value: &str,
+    kind: havn_db::agent::memory::Kind,
+) {
+    use havn_db::agent::memory;
+    // Forgotten or expired keys too: the user may have removed it after
+    // the turns the summariser read.
+    match memory::key_known(&tool_env.agent_db, key).await {
+        Ok(false) => {}
+        Ok(true) => return,
+        Err(e) => {
+            warn!(%key, error = %e, "could not look up a fact from the chat summary");
+            return;
+        }
+    }
+    let entry = memory::NewEntry {
+        key,
+        value,
+        kind,
+        source: memory::Source::AgentInferred,
+        ttl_days: None,
+        visibility: memory::VisibilityRule::Agent {
+            suggest_public: false,
+        },
+    };
+    if let Err(e) = tools::memory::save(false, tool_env, entry).await {
+        warn!(%key, error = %e, "could not save a fact from the chat summary");
+    }
 }
 
 /// The summary and the facts to remember in what the summariser
@@ -5449,13 +5462,13 @@ run ls"
             VisibilityRule::Keep,
         )
         .await;
-        save("user.old", "Milan".into(), VisibilityRule::PublicIfNew).await;
+        save("user.old", "Milan".into(), VisibilityRule::Public).await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        save("user.long", "x".repeat(3000), VisibilityRule::PublicIfNew).await;
+        save("user.long", "x".repeat(3000), VisibilityRule::Public).await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        save("user.name", "Mira".into(), VisibilityRule::PublicIfNew).await;
+        save("user.name", "Mira".into(), VisibilityRule::Public).await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        save("user.bio", "y".repeat(2000), VisibilityRule::PublicIfNew).await;
+        save("user.bio", "y".repeat(2000), VisibilityRule::Public).await;
 
         let prompt = with_public_facts(&pool, &base).await;
         let text = prompt.as_text().expect("text");
@@ -5521,6 +5534,36 @@ run ls"
         fold_user_md(&workspace, &pool).await.expect("again");
         assert!(memory::get(&pool, "USER.md").await.expect("get").is_none());
         assert!(workspace.join("USER.md").exists());
+    }
+
+    #[tokio::test]
+    async fn a_fact_the_summary_flushes_is_never_public() {
+        use havn_db::agent::memory::{self, Kind, Visibility};
+        let tool_env = ToolCtx {
+            workspace_dir: std::env::temp_dir(),
+            agent_db: havn_db::agent::connect_in_memory().await.expect("db"),
+            policy: Arc::new(havn_core::Policy::default()),
+            embedder: None,
+        };
+        flush_fact(&tool_env, "user.name", "Mira", Kind::Identity).await;
+        let fact = memory::get(&tool_env.agent_db, "user.name")
+            .await
+            .expect("get")
+            .expect("saved");
+        assert_eq!(fact.visibility, Visibility::Private);
+        assert!(!fact.suggested_public);
+        // A key memory has is left alone, public or not.
+        memory::set_visibility(&tool_env.agent_db, "user.name", None, Visibility::Public)
+            .await
+            .expect("set")
+            .expect("found");
+        flush_fact(&tool_env, "user.name", "Mira Rossi", Kind::Identity).await;
+        let fact = memory::get(&tool_env.agent_db, "user.name")
+            .await
+            .expect("get")
+            .expect("kept");
+        assert_eq!(fact.value, "Mira");
+        assert_eq!(fact.visibility, Visibility::Public);
     }
 
     #[tokio::test]

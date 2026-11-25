@@ -5,6 +5,11 @@
 ALTER TABLE memory ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private'
     CHECK (visibility IN ('private', 'public'));
 
+-- The agent suggests making a private fact public; the owner decides on
+-- the dashboard, which clears it either way.
+ALTER TABLE memory ADD COLUMN suggested_public INTEGER NOT NULL DEFAULT 0
+    CHECK (suggested_public IN (0, 1));
+
 CREATE INDEX idx_memory_public ON memory(visibility)
     WHERE archived_at IS NULL AND visibility = 'public';
 

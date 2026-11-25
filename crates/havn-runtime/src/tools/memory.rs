@@ -21,48 +21,8 @@ use super::{Tool, ToolCtx, ToolResult};
 
 tokio::task_local! {
     /// What the memory tools change in a reply's turn, for the dashboard
-    /// to show under the reply (issue #105), and whether the turn saw tool
-    /// output. Set around a user turn.
-    pub static MEMORY_CHANGES: std::sync::Arc<TurnMemory>;
-}
-
-/// A chat turn's memory: what it changed, and whether a tool other than
-/// memory's gave the model output in it (issue #309), which may carry
-/// someone else's words: after that, nothing it saves is public.
-#[derive(Debug, Default)]
-pub struct TurnMemory {
-    pub noted: std::sync::Mutex<Vec<Noted>>,
-    tool_output: std::sync::atomic::AtomicBool,
-}
-
-impl TurnMemory {
-    /// Note that the model has read tool output in this turn.
-    pub fn saw_tool_output(&self) {
-        self.tool_output
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// What it noted, taken out.
-    pub fn take(&self) -> Vec<Noted> {
-        std::mem::take(
-            &mut *self
-                .noted
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-    }
-}
-
-/// The tools whose output leaves a fact free to be saved public: memory's
-/// own.
-pub const MEMORY_TOOLS: [&str; 3] = ["memory_remember", "memory_search", "memory_forget"];
-
-/// Note a call of tool `name` in the turn, before it runs: unless it is
-/// one of [`MEMORY_TOOLS`], what it gives may be someone else's words.
-pub fn note_tool_call(name: &str) {
-    if !MEMORY_TOOLS.contains(&name) {
-        let _ = MEMORY_CHANGES.try_with(|turn| turn.saw_tool_output());
-    }
+    /// to show under the reply (issue #105). Set around a user turn.
+    pub static MEMORY_CHANGES: std::sync::Arc<std::sync::Mutex<Vec<Noted>>>;
 }
 
 /// A turn's net change to one key: the entry before its first change
@@ -74,14 +34,13 @@ pub struct Noted {
     after: Option<Row>,
 }
 
-/// Row id, value, kind and visibility.
-type Row = (String, String, Kind, Visibility);
+/// Row id, value, kind, visibility, and whether it is suggested public.
+type Row = (String, String, Kind, Visibility, bool);
 
 /// Note a change to `key` from `before` to `after`.
 fn note_change(key: &str, before: Option<Row>, after: Option<Row>) {
-    let _ = MEMORY_CHANGES.try_with(|turn| {
-        let mut changes = turn
-            .noted
+    let _ = MEMORY_CHANGES.try_with(|changes| {
+        let mut changes = changes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(noted) = changes.iter_mut().find(|n| n.key == key) {
@@ -111,8 +70,10 @@ pub fn changes(noted: Vec<Noted>) -> Vec<havn_proto::MemoryChange> {
                 return None;
             }
             let (action, value, kind) = match (&n.after, &n.before) {
-                (Some((_, value, kind, _)), _) => (havn_proto::MemoryAction::Saved, value, kind),
-                (None, Some((_, value, kind, _))) => {
+                (Some((_, value, kind, _, _)), _) => {
+                    (havn_proto::MemoryAction::Saved, value, kind)
+                }
+                (None, Some((_, value, kind, _, _))) => {
                     (havn_proto::MemoryAction::Forgot, value, kind)
                 }
                 (None, None) => return None,
@@ -128,6 +89,7 @@ pub fn changes(noted: Vec<Noted>) -> Vec<havn_proto::MemoryChange> {
                 before: n.before.as_ref().map(|b| b.0.clone()),
                 after: n.after.as_ref().map(|a| a.0.clone()),
                 visibility: n.after.as_ref().map(|a| a.3.as_str().to_string()),
+                suggested_public: n.after.as_ref().is_some_and(|a| a.4),
             })
         })
         .collect()
@@ -152,24 +114,14 @@ fn may_change_memory() -> bool {
 }
 
 /// Whether the turn answers the owner in a private chat of theirs (issue
-/// #309): only there may a new fact be saved public, and anywhere else it
-/// is saved private. [`super::gateway::IN_GROUP`] and [`MEMORY_CHANGES`]
-/// are set around chat turns only, so heartbeats and scheduled tasks are
-/// not.
+/// #309): only there does a fact the agent saves carry its suggestion to
+/// make it public. [`super::gateway::IN_GROUP`] is set around chat turns
+/// only, so heartbeats and scheduled tasks are not.
 fn in_owner_private_chat() -> bool {
     may_change_memory()
         && super::gateway::IN_GROUP
             .try_with(|group| !*group)
             .unwrap_or(false)
-        && MEMORY_CHANGES.try_with(|_| ()).is_ok()
-}
-
-/// Whether the turn has read output of a tool other than memory's, or may
-/// have: so when it is not known.
-fn saw_tool_output() -> bool {
-    MEMORY_CHANGES
-        .try_with(|turn| turn.tool_output.load(std::sync::atomic::Ordering::SeqCst))
-        .unwrap_or(true)
 }
 
 const NOT_THE_OWNER: [&str; 2] = [
@@ -191,20 +143,19 @@ impl Tool for MemoryRememberTool {
          'project' for facts about current work that may go stale; \
          'event' for time-stamped incidents (default 30-day expiry). \
          Set `source: 'user_told'` when the user said it directly, \
-         'agent_inferred' when you guessed it. Set `visibility: 'public'` \
-         only for what anyone talking to you may know about your owner: \
-         their name, how to address them, their language, the work they \
-         do in public. Public facts are put in front of everyone you talk \
-         to, other people and groups included. Everything else is \
-         'private', seen in your owner's own private chats only; when \
-         unsure, private. A fact is saved public only when it is new, in \
-         your owner's own private chat, before any tool other than the \
-         memory tools has returned anything in the conversation you see; \
-         otherwise it is saved private, and an existing fact keeps its \
-         visibility unless you make it private. Only your owner makes an \
-         existing fact public, on the dashboard. Replaces any existing \
-         entry with the same key. The dashboard shows users exactly what \
-         you've remembered — keep entries short and specific."
+         'agent_inferred' when you guessed it. Everything you save is \
+         private: in your owner's own private chats only. Set \
+         `suggest_public: true` when it is something anyone talking to \
+         you may know about your owner (their name, how to address them, \
+         their language, the work they do in public); when unsure, don't. \
+         That only suggests it: your owner makes it public on the \
+         dashboard, and then it is put in front of everyone you talk to. \
+         The suggestion counts only in your owner's own private chats. A \
+         public fact you repeat as it is stays public; one you change goes \
+         back to private until your owner approves it again. Replaces any \
+         existing entry with the same key. The dashboard shows users \
+         exactly what you've remembered — keep entries short and \
+         specific."
     }
 
     fn input_schema(&self) -> Value {
@@ -233,10 +184,9 @@ impl Tool for MemoryRememberTool {
                     "type": "integer",
                     "description": "Override default TTL. Omit to use the kind's default (identity/preference: never expire; project: 90; event: 30)."
                 },
-                "visibility": {
-                    "type": "string",
-                    "enum": ["private", "public"],
-                    "description": "Who may be told it: 'public' for anyone talking to you, 'private' (the default for a new fact) for your owner in their own private chats only. When unsure, private."
+                "suggest_public": {
+                    "type": "boolean",
+                    "description": "Suggest to your owner that anyone talking to you may be told this. Only your owner makes a fact public. When unsure, false."
                 }
             },
             "required": ["key", "value", "kind"]
@@ -270,37 +220,23 @@ impl Tool for MemoryRememberTool {
                 Source::parse(s).unwrap_or(Source::AgentInferred)
             });
         let ttl_days = input.get("ttl_days").and_then(Value::as_i64);
-        let asked = match input.get("visibility").and_then(Value::as_str) {
-            None => None,
-            Some(raw) => match Visibility::parse(raw) {
-                Some(visibility) => Some(visibility),
-                None => {
-                    return ToolResult::Error(format!(
-                        "invalid visibility {raw:?}; expected private or public"
-                    ));
-                }
-            },
-        };
+        let suggest = input
+            .get("suggest_public")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         if let Err(why) = havn_proto::check_memory_key(key) {
             return ToolResult::Error(why);
         }
 
-        // Nobody but the owner steers a fact into every prompt (issue
-        // #309): outside the owner's own private chats, and once the turn
-        // read what a tool gave, which may be someone else's words, what is
-        // saved is private, though a fact only repeated keeps what it was.
-        // Even then the model makes only a new fact public.
+        // Only the owner makes a fact public (issue #309); the agent may
+        // suggest it, in the owner's own private chats.
         let owner_chat = in_owner_private_chat();
-        let tool_output = saw_tool_output();
-        let visibility = match asked {
-            Some(Visibility::Private) => VisibilityRule::Private,
-            _ if !owner_chat || tool_output => VisibilityRule::PrivateIfChanged,
-            Some(Visibility::Public) => VisibilityRule::PublicIfNew,
-            None => VisibilityRule::Keep,
+        let visibility = VisibilityRule::Agent {
+            suggest_public: suggest && owner_chat,
         };
 
-        let (_, truncated, saved_as) = match save(
+        let (_, truncated, (saved_as, suggested)) = match save(
             false,
             ctx,
             NewEntry {
@@ -323,25 +259,19 @@ impl Tool for MemoryRememberTool {
         } else {
             ""
         };
-        let refused = match (asked, saved_as) {
-            (Some(Visibility::Public), Visibility::Private) if !owner_chat => {
-                "; only in your owner's own private chats can a fact be saved public"
+        let shown = match (saved_as, suggested) {
+            (Visibility::Public, _) => "public",
+            (Visibility::Private, true) => {
+                "private, suggested public: your owner decides on the dashboard"
             }
-            (Some(Visibility::Public), Visibility::Private) if tool_output => {
-                "; a tool other than memory's returned output in this conversation, which may \
-                 not be your owner's words, so it was saved private: your owner can make it \
-                 public on the dashboard"
+            (Visibility::Private, false) if suggest => {
+                "private; a fact can be suggested public only in your owner's own private chats"
             }
-            (Some(Visibility::Public), Visibility::Private) => {
-                "; an existing fact keeps its visibility: only your owner makes it public, on \
-                 the dashboard"
-            }
-            _ => "",
+            (Visibility::Private, false) => "private",
         };
         ToolResult::Ok(format!(
-            "remembered {key:?} as {}, {}{refused}{suffix}",
-            kind.as_str(),
-            saved_as.as_str()
+            "remembered {key:?} as {}, {shown}{suffix}",
+            kind.as_str()
         ))
     }
 }
@@ -367,14 +297,15 @@ pub fn within_cap(value: &str) -> (String, bool) {
 
 /// Save `new` as the active entry for its key, cutting a value over
 /// [`MAX_VALUE_BYTES`] with a marker, and embed it when an embedder is
-/// wired: the row's id, whether the value was cut, and its visibility.
+/// wired: the row's id, whether the value was cut, and its visibility and
+/// whether it is suggested public.
 /// With `until_forgotten` it never expires (`new.ttl_days` is ignored).
 /// What the `memory_remember` tool and the dashboard save go through.
 pub async fn save(
     until_forgotten: bool,
     ctx: &ToolCtx,
     new: NewEntry<'_>,
-) -> havn_db::Result<(String, bool, Visibility)> {
+) -> havn_db::Result<(String, bool, (Visibility, bool))> {
     let (stored_value, truncated) = within_cap(new.value);
     let key = new.key;
     // The entry it replaces, if any, for the chat's note of the change.
@@ -382,7 +313,7 @@ pub async fn save(
         .await
         .ok()
         .flatten()
-        .map(|e| (e.id, e.value, e.kind, e.visibility));
+        .map(|e| (e.id, e.value, e.kind, e.visibility, e.suggested_public));
     let entry = NewEntry {
         key,
         value: &stored_value,
@@ -397,15 +328,23 @@ pub async fn save(
         memory::remember(&ctx.agent_db, entry).await?
     };
     // As the write decided it.
-    let visibility = memory::fetch_by_id(&ctx.agent_db, &row_id)
+    let (visibility, suggested) = memory::fetch_by_id(&ctx.agent_db, &row_id)
         .await?
-        .map_or(Visibility::Private, |e| e.visibility);
+        .map_or((Visibility::Private, false), |e| {
+            (e.visibility, e.suggested_public)
+        });
     // Noted as soon as it is written: a turn stopped while it embeds
     // keeps the entry, and shows it.
     note_change(
         key,
         before,
-        Some((row_id.clone(), stored_value.clone(), new.kind, visibility)),
+        Some((
+            row_id.clone(),
+            stored_value.clone(),
+            new.kind,
+            visibility,
+            suggested,
+        )),
     );
 
     // Hybrid retrieval (spec §9.4 v0.7): embed `"<key>: <value>"`, pinned
@@ -426,7 +365,7 @@ pub async fn save(
             }
         }
     }
-    Ok((row_id, truncated, visibility))
+    Ok((row_id, truncated, (visibility, suggested)))
 }
 
 pub struct MemorySearchTool;
@@ -757,7 +696,13 @@ impl Tool for MemoryForgetTool {
                 if let Some(entry) = before {
                     note_change(
                         key,
-                        Some((entry.id, entry.value, entry.kind, entry.visibility)),
+                        Some((
+                            entry.id,
+                            entry.value,
+                            entry.kind,
+                            entry.visibility,
+                            entry.suggested_public,
+                        )),
                         None,
                     );
                 }
@@ -1141,7 +1086,7 @@ mod tests {
         super::super::gateway::FROM_OWNER
             .scope(true, async {
                 let ctx = ctx().await;
-                let noted = std::sync::Arc::new(TurnMemory::default());
+                let noted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
                 let remember = |key: &'static str, value: &'static str| {
                     let ctx = &ctx;
                     async move {
@@ -1179,7 +1124,7 @@ mod tests {
                             .await;
                     })
                     .await;
-                let shown = changes(noted.take());
+                let shown = changes(std::mem::take(&mut *noted.lock().unwrap()));
                 let by_key = |k: &str| shown.iter().find(|c| c.key == k).cloned();
                 let editor = by_key("pref.editor").expect("editor");
                 assert_eq!(editor.action, havn_proto::MemoryAction::Saved);
@@ -1203,178 +1148,104 @@ mod tests {
             .await;
     }
 
-    async fn visibility_of(ctx: &ToolCtx, key: &str) -> Visibility {
-        memory::get(&ctx.agent_db, key)
-            .await
-            .expect("get")
-            .expect("row")
-            .visibility
-    }
 
-    /// Where a turn runs: in the owner's own private chat (`Some(false)`),
+    /// Run `run` as the owner: in a private chat of theirs (`Some(false)`),
     /// in a group (`Some(true)`), or outside a chat turn (`None`: the
     /// heartbeat, a scheduled task).
-    async fn as_owner<T>(
-        group: Option<bool>,
-        turn: &std::sync::Arc<TurnMemory>,
-        run: impl std::future::Future<Output = T>,
-    ) -> T {
+    async fn as_owner<T>(group: Option<bool>, run: impl std::future::Future<Output = T>) -> T {
         match group {
             Some(group) => {
                 super::super::gateway::FROM_OWNER
-                    .scope(
-                        true,
-                        super::super::gateway::IN_GROUP.scope(
-                            group,
-                            MEMORY_CHANGES.scope(std::sync::Arc::clone(turn), run),
-                        ),
-                    )
+                    .scope(true, super::super::gateway::IN_GROUP.scope(group, run))
                     .await
             }
             None => super::super::gateway::FROM_OWNER.scope(true, run).await,
         }
     }
 
-    async fn save_public(ctx: &ToolCtx, key: &str, value: &str) -> ToolResult {
+    async fn suggest(ctx: &ToolCtx, key: &str, value: &str) -> ToolResult {
         MemoryRememberTool
             .execute(
                 ctx,
-                json!({"key": key, "value": value, "kind": "identity", "visibility": "public"}),
+                json!({"key": key, "value": value, "kind": "identity", "suggest_public": true}),
             )
             .await
     }
 
-    #[tokio::test]
-    async fn a_fact_is_saved_public_only_in_the_owner_s_own_private_chat() {
-        let ctx = ctx().await;
-        let turn = std::sync::Arc::new(TurnMemory::default());
-
-        let r = as_owner(Some(false), &turn, save_public(&ctx, "user.name", "Ada")).await;
-        assert!(r.text().ends_with("as identity, public"), "{}", r.text());
-        assert_eq!(visibility_of(&ctx, "user.name").await, Visibility::Public);
-        let shown = changes(turn.take());
-        assert_eq!(shown[0].visibility.as_deref(), Some("public"));
-
-        let r = as_owner(Some(true), &turn, save_public(&ctx, "user.city", "Turin")).await;
-        assert!(
-            r.text().contains("only in your owner's own private chats"),
-            "{}",
-            r.text()
-        );
-        assert_eq!(visibility_of(&ctx, "user.city").await, Visibility::Private);
-        as_owner(None, &turn, save_public(&ctx, "user.team", "infra")).await;
-        assert_eq!(visibility_of(&ctx, "user.team").await, Visibility::Private);
-
-        // Repeated elsewhere, a public fact stays public, and says so;
-        // changed there, it is private.
-        let r = as_owner(Some(true), &turn, save_public(&ctx, "user.name", "Ada")).await;
-        assert!(r.text().ends_with("as identity, public"), "{}", r.text());
-        assert_eq!(visibility_of(&ctx, "user.name").await, Visibility::Public);
-        as_owner(None, &turn, save_public(&ctx, "user.name", "Ada Lovelace")).await;
-        assert_eq!(visibility_of(&ctx, "user.name").await, Visibility::Private);
-
-        let r = as_owner(
-            Some(false),
-            &turn,
-            MemoryRememberTool.execute(
-                &ctx,
-                json!({"key": "k", "value": "v", "kind": "identity", "visibility": "everyone"}),
-            ),
-        )
-        .await;
-        assert!(r.is_error(), "{}", r.text());
+    async fn entry_of(ctx: &ToolCtx, key: &str) -> memory::Entry {
+        memory::get(&ctx.agent_db, key)
+            .await
+            .expect("get")
+            .expect("row")
     }
 
     #[tokio::test]
-    async fn the_model_does_not_make_an_existing_fact_public() {
+    async fn the_agent_only_suggests_a_fact_be_public_and_only_in_the_owner_s_own_private_chat() {
         let ctx = ctx().await;
-        let turn = std::sync::Arc::new(TurnMemory::default());
-        as_owner(
+        let noted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let r = as_owner(
             Some(false),
-            &turn,
-            MemoryRememberTool.execute(
-                &ctx,
-                json!({"key": "user.address", "value": "12 Rose Street", "kind": "identity"}),
+            MEMORY_CHANGES.scope(
+                std::sync::Arc::clone(&noted),
+                suggest(&ctx, "user.name", "Ada"),
             ),
         )
         .await;
-        // Repeated or replaced as public, even in the owner's own chat.
-        for value in ["12 Rose Street", "14 Rose Street"] {
-            let r = as_owner(Some(false), &turn, save_public(&ctx, "user.address", value)).await;
+        assert!(r.text().contains("private, suggested public"), "{}", r.text());
+        let name = entry_of(&ctx, "user.name").await;
+        assert_eq!(name.visibility, Visibility::Private);
+        assert!(name.suggested_public);
+        let shown = changes(std::mem::take(&mut *noted.lock().unwrap()));
+        assert_eq!(shown[0].visibility.as_deref(), Some("private"));
+        assert!(shown[0].suggested_public);
+
+        // Elsewhere the suggestion is not taken.
+        for (key, group) in [("user.city", Some(true)), ("user.team", None)] {
+            let r = as_owner(group, suggest(&ctx, key, "x")).await;
             assert!(
-                r.text().contains("an existing fact keeps its visibility"),
+                r.text().contains("only in your owner's own private chats"),
                 "{}",
                 r.text()
             );
-            assert_eq!(
-                visibility_of(&ctx, "user.address").await,
-                Visibility::Private
-            );
+            let entry = entry_of(&ctx, key).await;
+            assert_eq!(entry.visibility, Visibility::Private);
+            assert!(!entry.suggested_public);
         }
-        // Made private by the model: it may.
-        as_owner(Some(false), &turn, save_public(&ctx, "user.name", "Ada")).await;
-        as_owner(
-            Some(false),
-            &turn,
-            MemoryRememberTool.execute(
-                &ctx,
-                json!({"key": "user.name", "value": "Ada", "kind": "identity", "visibility": "private"}),
-            ),
-        )
-        .await;
-        assert_eq!(visibility_of(&ctx, "user.name").await, Visibility::Private);
     }
 
     #[tokio::test]
-    async fn after_a_tool_returned_output_in_the_turn_a_fact_is_saved_private() {
+    async fn a_public_fact_the_agent_changes_goes_back_to_private_until_approved() {
         let ctx = ctx().await;
-        let turn = std::sync::Arc::new(TurnMemory::default());
-        // Memory's own tools leave it open.
-        as_owner(Some(false), &turn, async {
-            note_tool_call("memory_search");
-            note_tool_call("memory_remember");
-        })
-        .await;
-        let r = as_owner(Some(false), &turn, save_public(&ctx, "user.name", "Ada")).await;
-        assert!(r.text().ends_with("public"), "{}", r.text());
+        as_owner(Some(false), suggest(&ctx, "user.name", "Ada")).await;
+        // The owner approves it.
+        memory::set_visibility(&ctx.agent_db, "user.name", None, Visibility::Public)
+            .await
+            .expect("set")
+            .expect("found");
+        assert!(!entry_of(&ctx, "user.name").await.suggested_public);
 
-        // Any other closes it for the rest of the turn.
-        as_owner(Some(false), &turn, async { note_tool_call("web_fetch") }).await;
-        let r = as_owner(
-            Some(false),
-            &turn,
-            save_public(&ctx, "user.lang", "Italian"),
+        // Repeated as it is, anywhere: still public.
+        let r = as_owner(Some(true), suggest(&ctx, "user.name", "Ada")).await;
+        assert!(r.text().ends_with("as identity, public"), "{}", r.text());
+        assert_eq!(
+            entry_of(&ctx, "user.name").await.visibility,
+            Visibility::Public
+        );
+
+        // Changed by the agent, even without a suggestion: private, and
+        // suggested so the owner sees the new text to approve.
+        as_owner(
+            None,
+            MemoryRememberTool.execute(
+                &ctx,
+                json!({"key": "user.name", "value": "Ada Lovelace", "kind": "identity"}),
+            ),
         )
         .await;
-        assert!(
-            r.text().contains("may not be your owner's words"),
-            "{}",
-            r.text()
-        );
-        assert_eq!(visibility_of(&ctx, "user.lang").await, Visibility::Private);
-        // And a public fact it changes then is private.
-        as_owner(Some(false), &turn, save_public(&ctx, "user.name", "Eve")).await;
-        assert_eq!(visibility_of(&ctx, "user.name").await, Visibility::Private);
-
-        // A tool called in the turns the model is given counts too.
-        let history = [
-            json!({"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "memory_search", "input": {}}]}),
-        ];
-        assert!(!crate::steps::calls_other_than(&history, &MEMORY_TOOLS));
-        let history = [
-            json!({"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "file_read", "input": {}}]}),
-        ];
-        assert!(crate::steps::calls_other_than(&history, &MEMORY_TOOLS));
-
-        // Not knowing whether the turn read any, it may have.
-        let r = super::super::gateway::FROM_OWNER
-            .scope(
-                true,
-                super::super::gateway::IN_GROUP.scope(false, save_public(&ctx, "user.pet", "cat")),
-            )
-            .await;
-        assert!(!r.text().contains("as identity, public"), "{}", r.text());
-        assert_eq!(visibility_of(&ctx, "user.pet").await, Visibility::Private);
+        let changed = entry_of(&ctx, "user.name").await;
+        assert_eq!(changed.value, "Ada Lovelace");
+        assert_eq!(changed.visibility, Visibility::Private);
+        assert!(changed.suggested_public);
     }
 
     #[test]
