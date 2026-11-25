@@ -74,9 +74,30 @@ const KNOWN_PACKS: [(&str, &str); 1] = [("havn-pack-browser", "playwright-cli")]
 /// What an adapter logs when it has connected to the gateway.
 const CONNECTED: &str = "havn WS connected";
 
-/// The word with which a release's notes name the oldest gateway it works
-/// with: `Requires Havn >= 0.2.12` on a line, read in lower case.
-const REQUIRES: &str = "requires";
+/// The words with which a release's notes say what it needs, as in
+/// `Requires Havn >= 0.2.12` (the form the releases write), read in lower
+/// case; the Chinese ones are looked for in the text.
+const REQUIREMENT_WORDS: [&str; 9] = [
+    "require",
+    "requires",
+    "required",
+    "requirement",
+    "requirements",
+    "need",
+    "needs",
+    "needed",
+    "minimum",
+];
+const REQUIREMENT_WORDS_ZH: [&str; 2] = ["需要", "要求"];
+
+/// Words that, just before a requirement word, say it is not one (`longer`
+/// as in `no longer requires`).
+const NEGATIONS: [&str; 8] = [
+    "not", "no", "never", "longer", "doesn't", "don't", "isn't", "aren't",
+];
+
+/// Words that, before a version, make it an upper bound.
+const UPPER_BOUNDS: [&str; 6] = ["below", "before", "until", "under", "up to", "prior to"];
 
 /// Where the adapters' releases install their binary. One found elsewhere
 /// was put there otherwise (built from source, a package): it is updated
@@ -1014,7 +1035,10 @@ impl Components {
                     self.adapters.push(adapter);
                 }
                 None => {
-                    let why = format!("{} is not in {RELEASE_DIR}", adapter.binary.display());
+                    let why = format!(
+                        "{} is not in {RELEASE_DIR}; list it in {COMPONENTS} to update it",
+                        adapter.binary.display()
+                    );
                     unmanaged.push((adapter, why));
                 }
             }
@@ -1101,6 +1125,29 @@ fn candidate_units(unit_dirs: &[&Path]) -> Vec<String> {
         .collect()
 }
 
+/// What to do about a unit that runs an adapter inside `root` (its
+/// `RootDirectory=` or `RootImage=` line), when it is `listed` under an
+/// adapter whose binary it does not run, or is not listed.
+fn rooted_advice(root: &str, listed: bool) -> String {
+    match (root.starts_with("RootImage="), listed) {
+        (true, false) => format!(
+            "havn update cannot change a binary inside an image: list it in {COMPONENTS} with \
+             skip = true to leave it alone"
+        ),
+        (true, true) => format!(
+            "havn update cannot change a binary inside an image: take it out of those units and \
+             list it in {COMPONENTS} on its own with skip = true"
+        ),
+        (false, false) => {
+            format!("list it in {COMPONENTS}, with its binary as this machine has it, to update it")
+        }
+        (false, true) => format!(
+            "list it in {COMPONENTS} on its own, with its binary as this machine has it, to \
+             update it"
+        ),
+    }
+}
+
 /// The channel adapters that units in `unit_dirs` run, as systemd resolves
 /// the units (drop-ins applied, an alias once), and the packs under
 /// `packs`; apart, those a unit runs inside another root, with why.
@@ -1138,7 +1185,10 @@ fn discover(
                         version: None,
                         skip: false,
                     },
-                    format!("{unit} runs it under {root}"),
+                    format!(
+                        "{unit} runs it under {root}; {}",
+                        rooted_advice(root, false)
+                    ),
                 ));
                 continue;
             }
@@ -1194,69 +1244,178 @@ fn discover(
     (found, rooted)
 }
 
-/// What a release's `notes` say of the oldest gateway it works with:
-/// `None` when no line says, else that version, or the line when it names
-/// none that can be read. The line says `Requires Havn >= X.Y.Z`, `Requires
-/// Havn version X.Y.Z`, `Requires at least Havn vX.Y.Z+` and the like, in
-/// any case, with Markdown, `:`, brackets or `≥` about it.
-fn requires(notes: &str) -> Option<Result<String, String>> {
-    let word = |c: char| c.is_alphanumeric() || c == '-';
-    // `rest` without `lead`, a whole word when it is one.
-    let without = |rest: &str, lead: &str| -> Option<String> {
-        let after = rest.strip_prefix(lead)?;
-        (!lead.ends_with(word) || !after.starts_with(word)).then(|| after.trim_start().to_string())
-    };
-    notes.lines().find_map(|line| {
-        let plain: String = line
-            .to_lowercase()
-            .replace('≥', ">=")
-            .chars()
-            .map(|c| {
-                if matches!(c, '`' | '*' | '_' | ':' | '(' | ')' | '[' | ']') {
-                    ' '
-                } else {
-                    c
-                }
-            })
-            .collect();
-        let plain = plain.split_whitespace().collect::<Vec<_>>().join(" ");
-        plain.match_indices(REQUIRES).find_map(|(at, _)| {
-            let after = &plain[at + REQUIRES.len()..];
-            if plain[..at].ends_with(word) || after.starts_with(word) {
-                return None;
+/// `line` in lower case, without Markdown and brackets, `≥` as `>=`, its
+/// spaces one each.
+fn plainly(line: &str) -> String {
+    let plain: String = line
+        .to_lowercase()
+        .replace(['≥', '≧'], ">=")
+        .chars()
+        .map(|c| {
+            if matches!(c, '`' | '*' | '_' | ':' | '(' | ')' | '[' | ']') {
+                ' '
+            } else {
+                c
             }
-            let after = after.trim_start();
-            let after = without(after, "at least").unwrap_or_else(|| after.to_string());
-            let mut rest = without(&after, "havn")?;
-            // Then a version, after words that say one follows, or its
-            // first digit.
-            let mut said = false;
-            while let Some(next) = [">=", "version", "versions", "at least"]
-                .iter()
-                .find_map(|lead| without(&rest, lead))
-            {
-                rest = next;
-                said = true;
-            }
-            if !said
-                && !rest
-                    .trim_start_matches('v')
-                    .starts_with(|c: char| c.is_ascii_digit())
-            {
-                return None;
-            }
-            let version = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .trim_end_matches(['.', ',', ';', '!', '+'])
-                .trim_start_matches('v');
-            Some(match release::parse_version(version) {
-                Some(_) => Ok(version.to_string()),
-                None => Err(line.trim().to_string()),
-            })
         })
-    })
+        .collect();
+    plain.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether `plain` names Havn: `havn` as a word of its own.
+fn names_havn(plain: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '-';
+    plain
+        .match_indices("havn")
+        .any(|(at, _)| !plain[..at].ends_with(word) && !plain[at + 4..].starts_with(word))
+}
+
+/// Whether `plain` says something is required, other than that it is not.
+fn says_required(plain: &str) -> bool {
+    let words: Vec<String> = plain
+        .split(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '\'' | '’')))
+        .filter(|w| !w.is_empty())
+        .map(|w| w.replace('’', "'"))
+        .collect();
+    let english = words.iter().enumerate().any(|(i, w)| {
+        REQUIREMENT_WORDS.contains(&w.as_str())
+            && !(i > 0 && NEGATIONS.contains(&words[i - 1].as_str()))
+    });
+    english
+        || REQUIREMENT_WORDS_ZH.iter().any(|word| {
+            plain
+                .match_indices(word)
+                .any(|(at, _)| !plain[..at].ends_with('不') && !plain[..at].ends_with("不再"))
+        })
+}
+
+/// The oldest version each version in `plain` allows: `0.2.12` for
+/// `>= 0.2.12`, `v0.2.12+`, `~0.2.12` or `0.2.12`, `0.2.12` for `> 0.2.11`;
+/// one after `<` or `before` and the like is an upper bound, left out.
+fn versions_in(plain: &str) -> Vec<(u64, u64, u64)> {
+    let mut found = Vec::new();
+    for (at, c) in plain.char_indices() {
+        if !c.is_ascii_digit() {
+            continue;
+        }
+        let before = &plain[..at];
+        let before = before.strip_suffix('v').unwrap_or(before);
+        if before.ends_with(|c: char| c.is_alphanumeric() || c == '.') {
+            continue;
+        }
+        let text: String = plain[at..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let text = text.trim_end_matches('.');
+        if plain[at + text.len()..].starts_with(|c: char| c.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let Some((major, minor, patch)) = release::parse_version(text) else {
+            continue;
+        };
+        let operator = before.trim_end();
+        let upper = operator.ends_with(['<', '≤'])
+            || operator.ends_with("<=")
+            || UPPER_BOUNDS.iter().any(|bound| {
+                operator
+                    .strip_suffix(bound)
+                    .is_some_and(|rest| !rest.ends_with(|c: char| c.is_alphanumeric()))
+            });
+        if upper {
+            continue;
+        }
+        let after = operator.ends_with('>') && !operator.ends_with("=>");
+        found.push((major, minor, patch + u64::from(after)));
+    }
+    found
+}
+
+/// Whether `line`, trimmed, is an item of a Markdown list.
+fn list_item(line: &str) -> bool {
+    let numbered = line.split_once(['.', ')']).is_some_and(|(n, rest)| {
+        !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && rest.starts_with(' ')
+    });
+    numbered || ["- ", "* ", "+ "].iter().any(|mark| line.starts_with(mark))
+}
+
+/// What a release's `notes` say of the oldest gateway it works with:
+/// `None` when nothing does, else the highest version they ask for, or the
+/// first line that asks for one but names none that can be read. A line
+/// asks when it names Havn and says it is required (`Requires Havn >=
+/// X.Y.Z`, `Minimum Havn version: X.Y.Z`, `需要 Havn X.Y.Z`), or names
+/// Havn in a list under a heading or a line ending in `:` that says what is
+/// required; one naming Havn that ends in `:` takes its versions from its
+/// list.
+fn requires(notes: &str) -> Option<Result<String, String>> {
+    // The list a heading (until the next) or a line (until one that is not
+    // an item) opened: whether that named Havn, and it, while no version
+    // has been found for it.
+    struct Scope {
+        heading: bool,
+        named: bool,
+        waiting: Option<String>,
+    }
+    let mut highest = None;
+    let mut scope: Option<Scope> = None;
+    for line in notes.lines() {
+        let raw = line.trim();
+        let heading = raw.starts_with('#');
+        let item = list_item(raw);
+        if scope
+            .as_ref()
+            .is_some_and(|s| heading || (!s.heading && !item))
+            && let Some(waiting) = scope.take().and_then(|s| s.waiting)
+        {
+            return Some(Err(waiting));
+        }
+        if raw.is_empty() {
+            continue;
+        }
+        let plain = plainly(raw);
+        let required = says_required(&plain);
+        let havn = names_havn(&plain);
+        let versions = versions_in(&plain);
+        let opens = required
+            && (heading
+                || raw.trim_end_matches(['*', '_', '`']).ends_with(':')
+                || plain
+                    .split_whitespace()
+                    .all(|w| REQUIREMENT_WORDS.contains(&w)));
+        if opens {
+            if let Some(waiting) = scope.take().and_then(|s| s.waiting) {
+                return Some(Err(waiting));
+            }
+            if havn {
+                highest = highest.max(versions.iter().max().copied());
+            }
+            scope = Some(Scope {
+                heading,
+                named: havn,
+                waiting: (havn && versions.is_empty()).then(|| raw.to_string()),
+            });
+            continue;
+        }
+        let listed = item
+            && scope
+                .as_ref()
+                .is_some_and(|s| havn || (s.named && !versions.is_empty()));
+        let asks = (havn && required) || listed;
+        if !asks {
+            continue;
+        }
+        if versions.is_empty() {
+            return Some(Err(raw.to_string()));
+        }
+        highest = highest.max(versions.iter().max().copied());
+        if listed && let Some(s) = scope.as_mut() {
+            s.waiting = None;
+        }
+    }
+    if let Some(waiting) = scope.and_then(|s| s.waiting) {
+        return Some(Err(waiting));
+    }
+    highest.map(|(major, minor, patch)| Ok(format!("{major}.{minor}.{patch}")))
 }
 
 /// What to do with a component at `installed`, given its latest release
@@ -1307,7 +1466,8 @@ trait Host {
     /// Whether the unit's run `invocation` logged `line`.
     fn logged(&self, invocation: &str, line: &str) -> bool;
     /// The binary process `pid` runs, and whether it is the file at
-    /// `binary` (seen from another root, its path is not that).
+    /// `binary` (seen from another root, its path is not that); `None`
+    /// when the file it runs cannot be looked at.
     fn exe(&self, pid: u32, binary: &Path) -> Option<(PathBuf, bool)>;
 }
 
@@ -1411,10 +1571,9 @@ impl Host for System {
         let link = format!("/proc/{pid}/exe");
         let path = std::fs::read_link(&link).ok()?;
         // The link opens the file the process runs, whatever its root.
-        let same = match (std::fs::metadata(&link), std::fs::metadata(binary)) {
-            (Ok(runs), Ok(is)) => runs.dev() == is.dev() && runs.ino() == is.ino(),
-            _ => false,
-        };
+        let runs = std::fs::metadata(&link).ok()?;
+        let same = std::fs::metadata(binary)
+            .is_ok_and(|is| runs.dev() == is.dev() && runs.ino() == is.ino());
         Some((path, same))
     }
 }
@@ -1471,9 +1630,12 @@ async fn restart_watched(
             && !runs_it
             && settled
         {
-            return Err(if exe == binary {
+            return Err(if exe == binary && !binary.exists() {
+                format!("{unit} runs {}, which is gone", binary.display())
+            } else if exe == binary {
                 format!(
-                    "{unit} runs another {} than this one, in its own root",
+                    "{unit} runs another file at {} than this machine has there (it has a root or \
+                     mounts of its own)",
                     exe.display()
                 )
             } else {
@@ -1497,13 +1659,52 @@ async fn restart_watched(
     }
 }
 
+/// The units of `adapter` by their own name, an alias once; and apart, with
+/// why, those that run inside another root and, running, do not run the
+/// file at `binary` (the list names them under it, as v0.2.13 could write
+/// it, but they run a binary of their own), which are left alone.
+fn units_of(adapter: &Adapter, binary: &Path, host: &impl Host) -> (Vec<String>, Vec<String>) {
+    let mut units = Vec::new();
+    let mut apart = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for unit in &adapter.units {
+        let exec = host.exec(unit);
+        let unit = if exec.id.is_empty() {
+            unit.clone()
+        } else {
+            exec.id
+        };
+        if !seen.insert(unit.clone()) {
+            continue;
+        }
+        if let Some(root) = &exec.root {
+            let shown = host.show(&unit);
+            let other = shown.state == "active"
+                && shown.pid > 0
+                && host.exe(shown.pid, binary).is_some_and(|(_, same)| !same);
+            if other {
+                apart.push(format!(
+                    "{unit} runs another binary under {root}, though {COMPONENTS} lists it under \
+                     {}; {}",
+                    adapter.name,
+                    rooted_advice(root, true)
+                ));
+                continue;
+            }
+        }
+        units.push(unit);
+    }
+    (units, apart)
+}
+
 /// Put release `tag` of `adapter` in place from `archive` (checked against
-/// `sums`; its binary is `name`), and restart and watch each of its units
+/// `sums`; its binary is `name`), and restart and watch each of `units`
 /// that runs, once each: one whose run had connected to the gateway, when
 /// `gateway_up`, must connect again. On failure the old binary is put back
 /// and the units restarted on it. What was done, or what failed.
 async fn install(
     adapter: &Adapter,
+    units: &[String],
     name: &str,
     tag: &str,
     archive: &[u8],
@@ -1534,17 +1735,8 @@ async fn install(
             .context("unpacking")
             .map_err(error)?;
     }
-    // Each unit by its own name, so an alias is restarted once.
-    let mut units: Vec<String> = Vec::new();
-    for unit in &adapter.units {
-        let id = host.exec(unit).id;
-        let unit = if id.is_empty() { unit.clone() } else { id };
-        if !units.contains(&unit) {
-            units.push(unit);
-        }
-    }
     let mut running: Vec<(&str, bool)> = Vec::new();
-    for unit in &units {
+    for unit in units {
         let shown = host.show(unit);
         if unit_up(&shown.state) {
             let connect = gateway_up && host.logged(&shown.invocation, CONNECTED);
@@ -1634,13 +1826,14 @@ async fn exists(http: &reqwest::Client, api: &str) -> anyhow::Result<bool> {
 }
 
 /// The step of one channel adapter: look at its latest release and, unless
-/// `check`, install it. `adapter.version` is kept up to date. With `check`
-/// the version recorded is taken before asking the binary, which then runs
-/// as nobody.
+/// `check`, install it, restarting those of `units` that run.
+/// `adapter.version` is kept up to date. With `check` the version recorded
+/// is taken before asking the binary, which then runs as nobody.
 async fn adapter_step(
     http: &reqwest::Client,
     github: &Github,
     adapter: &mut Adapter,
+    units: &[String],
     gateway: &str,
     check: bool,
     gateway_up: bool,
@@ -1730,7 +1923,7 @@ async fn adapter_step(
     };
     let sums = String::from_utf8_lossy(&sums);
     match install(
-        adapter, name, &tag, &archive, &sums, gateway_up, host, watch,
+        adapter, units, name, &tag, &archive, &sums, gateway_up, host, watch,
     )
     .await
     {
@@ -1846,19 +2039,36 @@ async fn update_components(
         ));
     }
     for adapter in &mut gathered.list.adapters {
+        let (units, apart) = if adapter.skip || !adapter.binary.exists() {
+            (Vec::new(), Vec::new())
+        } else {
+            let binary = adapter
+                .binary
+                .canonicalize()
+                .unwrap_or_else(|_| adapter.binary.clone());
+            units_of(adapter, &binary, host)
+        };
         rows.push(
             adapter_step(
-                http, github, adapter, gateway, check, gateway_up, host, watch,
+                http, github, adapter, &units, gateway, check, gateway_up, host, watch,
             )
             .await,
         );
+        for why in apart {
+            rows.push(Row::new(
+                &adapter.name,
+                "-",
+                "-",
+                &format!("not managed: {why}"),
+            ));
+        }
     }
     for (adapter, why) in &gathered.unmanaged {
         rows.push(Row::new(
             &adapter.name,
             "-",
             "-",
-            &format!("not managed: {why}; list it in {COMPONENTS} to update it"),
+            &format!("not managed: {why}"),
         ));
     }
     for pack in &gathered.list.packs {
@@ -2274,7 +2484,8 @@ mod tests {
             vec![(
                 "havn-channel-telegram",
                 vec!["jail.service"],
-                "jail.service runs it under RootDirectory=/srv/jail"
+                "jail.service runs it under RootDirectory=/srv/jail; list it in \
+                 /etc/havn/components.toml, with its binary as this machine has it, to update it"
             )]
         );
 
@@ -2286,7 +2497,8 @@ mod tests {
         assert_eq!(unmanaged[0].0.binary, Path::new("/opt/havn-channel-odd"));
         assert_eq!(
             unmanaged[0].1,
-            "/opt/havn-channel-odd is not in /usr/local/bin"
+            "/opt/havn-channel-odd is not in /usr/local/bin; list it in \
+             /etc/havn/components.toml to update it"
         );
     }
 
@@ -2410,13 +2622,37 @@ mod tests {
                 "It requires a restart and requires Havn >= 0.2.21",
                 "0.2.21",
             ),
+            ("Requires Havn > 0.2.13", "0.2.14"),
+            ("Requires Havn gateway >= 0.2.14", "0.2.14"),
+            ("Requires the Havn gateway => 0.2.14", "0.2.14"),
+            ("Requires:\n- Havn >= 0.2.14\n- a bot token", "0.2.14"),
+            (
+                "## Requirements\n\n- Havn ~0.2.14\n- Rust\n\n## Changes\n- Havn 0.3.0 too",
+                "0.2.14",
+            ),
+            ("Requires Havn:\n1. 0.2.14 or later", "0.2.14"),
+            ("Minimum Havn version: 0.2.14", "0.2.14"),
+            ("Needs Havn ^0.2.14", "0.2.14"),
+            ("需要 Havn ≧ 0.2.14", "0.2.14"),
+            ("要求Havn版本 v0.2.14", "0.2.14"),
+            ("Requires Havn 0.2.12\nRequires Havn >= 0.2.14", "0.2.14"),
+            ("Requires Havn >= 0.2.12, < 0.3.0", "0.2.12"),
+            ("Requires Havn 0.2.12 up to 0.2.20", "0.2.12"),
+            (
+                "Requires Havn version checks to pass (from 0.2.12)",
+                "0.2.12",
+            ),
         ] {
             assert_eq!(requires(notes), Some(Ok(wanted.to_string())), "{notes}");
         }
+        // A line that asks but names no version skips the release, even
+        // when it did not mean to.
         for unreadable in [
             "Requires Havn >= soon",
             "Requires Havn version next",
             "Requires at least Havn v2",
+            "This requires Havn to restart.",
+            "Requires Havn version checks to pass",
         ] {
             assert_eq!(
                 requires(unreadable),
@@ -2424,23 +2660,32 @@ mod tests {
                 "{unreadable}"
             );
         }
+        assert_eq!(
+            requires("Requires Havn >= 0.2.12\n## Requirements\n- Havn, running"),
+            Some(Err("- Havn, running".to_string()))
+        );
+        assert_eq!(
+            requires("Requires Havn:\n- a bot token\n\nThanks"),
+            Some(Err("Requires Havn:".to_string())),
+            "its list names no version"
+        );
         assert_eq!(requires(""), None);
         assert_eq!(requires("Works with any Havn"), None);
         for unrelated in [
             "Logging in requires havn-gateway auth.",
-            "This requires Havn to restart.",
             "Prerequires havn >= 0.2.12",
             "Requireshavn >= 0.2.12",
-            "It requires at least one Havn agent.",
-            "Requires Havn versioned configs (see 0.2.12)",
+            "No longer requires Havn 0.3.0",
+            "Havn 0.2.12 is not required",
+            "不再需要 Havn 0.3.0",
+            "## Requirements\n- Rust 1.80",
+            "Requires:\n- a bot token\n\n- Havn 0.3.0 is out",
+            "## Changes\n- Works with Havn 0.3.0",
         ] {
             assert_eq!(requires(unrelated), None, "{unrelated}");
         }
         assert_eq!(
-            requires(
-                "Requires havn-gateway auth
-Requires Havn >= 0.2.12"
-            ),
+            requires("Requires havn-gateway auth\nRequires Havn >= 0.2.12"),
             Some(Ok("0.2.12".to_string())),
             "a later line still says"
         );
@@ -2505,7 +2750,8 @@ Requires Havn >= 0.2.12"
     /// before when `running`, and the old binary goes missing on the first
     /// restart with `lose_old`. For the first `executor` looks after each
     /// restart, the process is still systemd's. With `inside`, the binary
-    /// is seen at that path, as from a unit's own root. `execs` are the
+    /// is seen at that path, as from a unit's own root; the units in
+    /// `apart` run another file at the binary's path. `execs` are the
     /// units' `ExecStart=`, and `roots` their `RootDirectory=` or
     /// `RootImage=`.
     struct Fake {
@@ -2522,6 +2768,7 @@ Requires Havn >= 0.2.12"
         looks: std::cell::Cell<u32>,
         execs: Vec<(&'static str, &'static str, &'static str)>,
         roots: Vec<(&'static str, &'static str)>,
+        apart: Vec<&'static str>,
         restarted: std::cell::RefCell<Vec<String>>,
     }
 
@@ -2541,6 +2788,7 @@ Requires Havn >= 0.2.12"
                 looks: std::cell::Cell::new(0),
                 execs: Vec::new(),
                 roots: Vec::new(),
+                apart: Vec::new(),
                 restarted: std::cell::RefCell::new(Vec::new()),
             }
         }
@@ -2590,7 +2838,11 @@ Requires Havn >= 0.2.12"
                 state: state.into(),
                 restarts: u64::from(started && self.fresh() && self.flapping),
                 invocation: format!("{:032x}", self.restarted.borrow().len()),
-                pid: 42,
+                pid: if self.apart.contains(&unit) {
+                    APART
+                } else {
+                    42
+                },
             }
         }
 
@@ -2607,7 +2859,10 @@ Requires Havn >= 0.2.12"
             line == CONNECTED && (self.connects || !self.fresh())
         }
 
-        fn exe(&self, _pid: u32, binary: &Path) -> Option<(PathBuf, bool)> {
+        fn exe(&self, pid: u32, binary: &Path) -> Option<(PathBuf, bool)> {
+            if pid == APART {
+                return Some((self.binary.clone(), false));
+            }
             let looks = self.looks.get();
             self.looks.set(looks + 1);
             if looks < self.executor {
@@ -2624,6 +2879,9 @@ Requires Havn >= 0.2.12"
     }
 
     const EXECUTOR: &str = "/usr/lib/systemd/systemd-executor";
+
+    /// The process of a unit in [`Fake::apart`].
+    const APART: u32 = 43;
 
     const QUICK: Watch = Watch {
         settle: Duration::ZERO,
@@ -2675,8 +2933,10 @@ Requires Havn >= 0.2.12"
         gateway_up: bool,
         watch: Watch,
     ) -> Result<String, String> {
+        let (units, _) = units_of(adapter, &adapter.binary, fake);
         install(
             adapter,
+            &units,
             "havn-channel-test",
             "v0.2.11",
             archive,
@@ -2874,10 +3134,7 @@ Requires Havn >= 0.2.12"
             ..Fake::new(&adapter.binary)
         };
         let failed = fails(&fake, &adapter, &archive, &sums).await;
-        assert!(
-            failed.contains("than this one, in its own root"),
-            "{failed}"
-        );
+        assert!(failed.contains("than this machine has there"), "{failed}");
         assert_eq!(fake.installed(), "0.2.9");
 
         // Still systemd's when it has had its time: not the binary.
@@ -2901,6 +3158,27 @@ Requires Havn >= 0.2.12"
         );
         assert!(started.elapsed() >= watch.settle, "not before the settle");
         assert_eq!(fake.installed(), "0.2.9");
+
+        // A unit of its own root listed under it is left alone, going back
+        // too.
+        let (mut adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        adapter.units.push("jail.service".into());
+        let fake = Fake {
+            failing: vec!["test.service"],
+            execs: vec![("jail.service", "jail.service", "")],
+            roots: vec![("jail.service", "RootDirectory=/srv/jail")],
+            apart: vec!["jail.service"],
+            ..Fake::new(&adapter.binary)
+        };
+        let failed = fails(&fake, &adapter, &archive, &sums).await;
+        assert!(
+            failed.starts_with("test.service is failed") && failed.ends_with("old binary is back"),
+            "{failed}"
+        );
+        assert_eq!(
+            *fake.restarted.borrow(),
+            vec!["test.service", "test.service"]
+        );
 
         // The second unit fails after the first came up: both go back.
         let (mut adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
@@ -3040,7 +3318,7 @@ Requires Havn >= 0.2.12"
                 entry(
                     "test",
                     "amplimit/havn-channel-test",
-                    "units = [\"test.service\"]",
+                    "units = [\"test.service\", \"old.service\"]",
                 ),
                 entry("gone", "amplimit/gone", ""),
                 entry("empty", "amplimit/empty", ""),
@@ -3059,6 +3337,7 @@ Requires Havn >= 0.2.12"
             ("odd.service", "/opt/havn-channel-odd"),
             ("jail.service", "/usr/local/bin/havn-channel-test"),
             ("image.service", "/usr/local/bin/havn-channel-held"),
+            ("disk.service", "/usr/local/bin/havn-channel-disk"),
         ] {
             std::fs::write(units.path().join(unit), format!("ExecStart={binary}\n")).unwrap();
         }
@@ -3075,11 +3354,20 @@ Requires Havn >= 0.2.12"
                     "image.service",
                     "/usr/local/bin/havn-channel-held",
                 ),
+                (
+                    "disk.service",
+                    "disk.service",
+                    "/usr/local/bin/havn-channel-disk",
+                ),
+                ("old.service", "old.service", ""),
             ],
             roots: vec![
                 ("jail.service", "RootDirectory=/srv/jail"),
                 ("image.service", "RootImage=/srv/held.raw"),
+                ("disk.service", "RootImage=/srv/disk.raw"),
+                ("old.service", "RootDirectory=/srv/old"),
             ],
+            apart: vec!["old.service"],
             ..Fake::new(&adapter.binary)
         };
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -3106,6 +3394,16 @@ Requires Havn >= 0.2.12"
             got,
             vec![
                 ("test", "0.2.9", "v0.2.11", "updated", false),
+                (
+                    "test",
+                    "-",
+                    "-",
+                    "not managed: old.service runs another binary under RootDirectory=/srv/old, \
+                     though /etc/havn/components.toml lists it under test; list it in \
+                     /etc/havn/components.toml on its own, with its binary as this machine has \
+                     it, to update it",
+                    false
+                ),
                 (
                     "gone",
                     "0.2.9",
@@ -3137,14 +3435,29 @@ Requires Havn >= 0.2.12"
                     false
                 ),
                 (
+                    "havn-channel-disk",
+                    "-",
+                    "-",
+                    "not managed: disk.service runs it under RootImage=/srv/disk.raw; havn \
+                     update cannot change a binary inside an image: list it in \
+                     /etc/havn/components.toml with skip = true to leave it alone",
+                    false
+                ),
+                (
                     "havn-channel-test",
                     "-",
                     "-",
                     "not managed: jail.service runs it under RootDirectory=/srv/jail; list it \
-                     in /etc/havn/components.toml to update it",
+                     in /etc/havn/components.toml, with its binary as this machine has it, to \
+                     update it",
                     false
                 ),
             ]
+        );
+        assert_eq!(
+            *fake.restarted.borrow(),
+            vec!["test.service"],
+            "not the unit of its own root"
         );
         let kept = Components::read(&path).unwrap();
         let versions: Vec<Option<&str>> =
