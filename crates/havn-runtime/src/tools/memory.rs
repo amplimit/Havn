@@ -1255,7 +1255,13 @@ mod tests {
         let noted = |value: String| Noted {
             key: "k".into(),
             before: None,
-            after: Some(("row".into(), value, Kind::Identity, Visibility::Private, true)),
+            after: Some((
+                "row".into(),
+                value,
+                Kind::Identity,
+                Visibility::Private,
+                true,
+            )),
         };
         let long = "字".repeat(havn_proto::MAX_MEMORY_CHANGE_CHARS + 1);
         let shown = changes(vec![noted(long), noted("short".into())]);

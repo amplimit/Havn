@@ -5547,7 +5547,11 @@ run ls"
             .expect("ws");
         let pool = havn_db::agent::connect_in_memory().await.expect("db");
         assert!(fold_user_md(&workspace, &pool).await.is_err());
-        assert!(!memory::import_pending(&pool, "USER.md").await.expect("pending"));
+        assert!(
+            !memory::import_pending(&pool, "USER.md")
+                .await
+                .expect("pending")
+        );
         // A readable one put there afterwards is not folded.
         tokio::fs::remove_dir(workspace.join("USER.md"))
             .await
