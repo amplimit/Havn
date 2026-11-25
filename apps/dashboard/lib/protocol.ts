@@ -90,4 +90,6 @@ export type MemoryChange = {
    * active: what undoing it puts back and takes out. */
   before?: string;
   after?: string;
+  /** Who the saved entry is put in front of. */
+  visibility?: "private" | "public";
 };

@@ -2403,7 +2403,33 @@ function MemoryNote({ agentId, changes }: { agentId: string; changes: MemoryChan
 function MemoryChangeLine({ agentId, change }: { agentId: string; change: MemoryChange }) {
   const [state, setState] = useState<"shown" | "undoing" | "undone">("shown");
   const [error, setError] = useState<string | null>(null);
+  const [visibility, setVisibility] = useState(change.visibility);
+  const [switching, setSwitching] = useState(false);
   const saved = change.action === "saved";
+
+  // Only the entry this reply saved: nothing changes once the key holds
+  // another (issue #309).
+  async function switchVisibility() {
+    const next = visibility === "public" ? "private" : "public";
+    if (
+      next === "private" &&
+      !confirm(
+        "Make this private? From now on it is in your own private chats only. What others already read cannot be taken back.",
+      )
+    ) {
+      return;
+    }
+    setSwitching(true);
+    setError(null);
+    try {
+      const entry = await api.memory.setVisibility(agentId, change.key, next, change.after);
+      setVisibility(entry.visibility);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSwitching(false);
+    }
+  }
 
   async function undo() {
     setState("undoing");
@@ -2446,6 +2472,23 @@ function MemoryChangeLine({ agentId, change }: { agentId: string; change: Memory
           }
         >
           {state === "undoing" ? "undoing…" : "undo"}
+        </button>
+      )}
+      {saved && visibility && change.after && state !== "undone" && (
+        <button
+          type="button"
+          role="switch"
+          aria-checked={visibility === "public"}
+          className="underline disabled:opacity-40"
+          onClick={() => void switchVisibility()}
+          disabled={switching}
+          title={
+            visibility === "public"
+              ? "Public: in the prompt of every chat, other people's and groups' too. Make it private."
+              : "Private: in your own private chats only. Make it public, for anyone who talks to the agent."
+          }
+        >
+          {switching ? "switching…" : visibility}
         </button>
       )}
       {error && (

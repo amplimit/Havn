@@ -540,27 +540,26 @@ function SettingsNav() {
 }
 
 /**
- * Bootstrap-file editor: SOUL.md / USER.md / HEARTBEAT.md (spec
- * §5.3, §9.4 layer 2). Each file gets its own textarea + save button
- * because (a) the three have different effect timing and the user
+ * Bootstrap-file editor: SOUL.md / HEARTBEAT.md (spec §5.3, §9.4
+ * layer 2). Each file gets its own textarea + save button
+ * because (a) the two have different effect timing and the user
  * benefits from a clear "saved!" beat per file, (b) one big form
  * makes a typo in HEARTBEAT.md block a SOUL.md save the user really
  * wanted to land. Independent saves keep it simple.
  *
- * Effect timing on the hint lines mirrors spec §9.4: SOUL/USER are
+ * Effect timing on the hint lines mirrors spec §9.4: SOUL is
  * frozen into the system prompt at session start, so edits land on
  * the agent's next start. HEARTBEAT.md is the deliberate exception —
  * it's re-read on every tick (§9.6), so edits land on the next tick
- * (≤ 30 min by default).
+ * (≤ 30 min by default). What USER.md held is public memory now
+ * (issue #309): the memory page edits it.
  */
 function BootstrapEditor({ agentId }: { agentId: string }) {
   const [loaded, setLoaded] = useState<BootstrapView | null>(null);
   const [system, setSystem] = useState("");
-  const [user, setUser] = useState("");
   const [heartbeat, setHeartbeat] = useState("");
   const [saving, setSaving] = useState<string | null>(null);
   const [savedSystem, flashSystem] = useFlash();
-  const [savedUser, flashUser] = useFlash();
   const [savedHeartbeat, flashHeartbeat] = useFlash();
   const [error, setError] = useState<string | null>(null);
 
@@ -572,7 +571,6 @@ function BootstrapEditor({ agentId }: { agentId: string }) {
         if (cancelled) return;
         setLoaded(b);
         setSystem(b.system ?? "");
-        setUser(b.user ?? "");
         setHeartbeat(b.heartbeat ?? "");
       } catch (e) {
         if (!cancelled)
@@ -584,13 +582,13 @@ function BootstrapEditor({ agentId }: { agentId: string }) {
     };
   }, [agentId]);
 
-  async function save(field: "system" | "user" | "heartbeat", value: string) {
+  async function save(field: "system" | "heartbeat", value: string) {
     setSaving(field);
     setError(null);
     try {
       const next = await api.bootstrap.put(agentId, { [field]: value });
       setLoaded(next);
-      ({ system: flashSystem, user: flashUser, heartbeat: flashHeartbeat })[field]();
+      ({ system: flashSystem, heartbeat: flashHeartbeat })[field]();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -602,18 +600,15 @@ function BootstrapEditor({ agentId }: { agentId: string }) {
     <section className="mt-10 card px-4 py-4">
       <h3 className="display-h3 mb-2">bootstrap files</h3>
       <p className="mb-4 text-sm" style={{ color: "var(--color-body)" }}>
-        Three plain-text files in the agent&apos;s workspace that drive
-        persona, durable user-facing facts, and heartbeat behaviour.
+        Two plain-text files in the agent&apos;s workspace that drive
+        persona and heartbeat behaviour.
         Each saves independently. Empty
         body deletes the file.
       </p>
       <p className="mb-4 text-sm" role="note" style={{ color: "var(--color-warning-text)" }}>
-        SOUL.md and USER.md are in the agent&apos;s prompt in every chat: other people&apos;s
-        it is open to, and groups&apos;, as well as yours. Write in them only what anyone who
-        can talk to the bot may know. What should stay between you and the agent belongs in
-        its memory (ask it to remember in your own chat, or add it on the memory page): that
-        is put in the prompt of your own private chats only, and elsewhere the agent reaches it
-        only by searching memory, which waits for your review unless you allowed it.
+        SOUL.md is in the agent&apos;s prompt in every chat: other people&apos;s it is open
+        to, and groups&apos;, as well as yours. Write in it only what anyone who can talk to
+        the bot may know.
       </p>
       {error && (
         <div
@@ -638,16 +633,20 @@ function BootstrapEditor({ agentId }: { agentId: string }) {
         saving={saving === "system"}
         justSaved={savedSystem}
       />
-      <BootstrapFileEditor
-        title="USER.md — what anyone talking to the agent may know about you"
-        hint="Facts about you the agent has in scope in every chat, others' and groups' included: your name, how to address you, the language you like. Not private details; those go in memory. Edits take effect on the agent's next start."
-        value={user}
-        onChange={setUser}
-        loaded={loaded?.user ?? ""}
-        onSave={() => save("user", user)}
-        saving={saving === "user"}
-        justSaved={savedUser}
-      />
+      <div className="mb-5">
+        <div className="mb-1.5 text-sm" style={{ color: "var(--color-label)", fontWeight: 400 }}>
+          what the agent knows about you
+        </div>
+        <p className="text-xs" style={{ color: "var(--color-body)" }}>
+          Facts about you are in the agent&apos;s memory, each private (in your own private
+          chats only) or public (in every chat, other people&apos;s and groups&apos; too: your
+          name, how to address you, your language). USER.md became a public memory and is
+          kept as USER.md.bak.{" "}
+          <Link href={`/agent/memory?id=${agentId}`} className="underline" style={{ color: "var(--color-purple)" }}>
+            see and edit them on the memory page
+          </Link>
+        </p>
+      </div>
       <BootstrapFileEditor
         title="HEARTBEAT.md — periodic self-tick instructions"
         hint="Re-read on every heartbeat tick (unlike the system prompt, which is fixed while the agent runs). Edits take effect on the next tick."
