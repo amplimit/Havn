@@ -815,11 +815,7 @@ pub async fn list_active_of_kind(pool: &SqlitePool, kind: Kind, limit: u32) -> R
 
 /// Private entries of one kind, newest first: what the owner's own
 /// private chats are given (issue #309).
-pub async fn list_private_of_kind(
-    pool: &SqlitePool,
-    kind: Kind,
-    limit: u32,
-) -> Result<Vec<Entry>> {
+pub async fn list_private_of_kind(pool: &SqlitePool, kind: Kind, limit: u32) -> Result<Vec<Entry>> {
     let rows: Vec<EntryRow> = sqlx::query_as::<_, EntryRow>(
         "SELECT id, key, value, kind, source, ttl_days, archived_at, created_at, updated_at, \
                 recall_count, last_recalled_at, supersedes_id, visibility \
@@ -879,19 +875,16 @@ pub async fn set_visibility(
         .await?;
     tx.commit().await?;
     let was = Visibility::parse(&was).unwrap_or_default();
-    Ok(fetch_by_id(pool, &active)
-        .await?
-        .map(|entry| (entry, was)))
+    Ok(fetch_by_id(pool, &active).await?.map(|entry| (entry, was)))
 }
 
 /// Whether bootstrap file `file` is still to be folded into memory, once
 /// (issue #309).
 pub async fn import_pending(pool: &SqlitePool, file: &str) -> Result<bool> {
-    let found: Option<i64> =
-        sqlx::query_scalar("SELECT 1 FROM bootstrap_imports WHERE file = ?1")
-            .bind(file)
-            .fetch_optional(pool)
-            .await?;
+    let found: Option<i64> = sqlx::query_scalar("SELECT 1 FROM bootstrap_imports WHERE file = ?1")
+        .bind(file)
+        .fetch_optional(pool)
+        .await?;
     Ok(found.is_some())
 }
 
@@ -1755,8 +1748,12 @@ mod tests {
             Visibility::Public
         );
         // Repeated or replaced without one: it stays what it was.
-        remember(&pool, fact("k", "v1", None)).await.expect("repeat");
-        remember(&pool, fact("k", "v2", None)).await.expect("replace");
+        remember(&pool, fact("k", "v1", None))
+            .await
+            .expect("repeat");
+        remember(&pool, fact("k", "v2", None))
+            .await
+            .expect("replace");
         let replaced = get(&pool, "k").await.unwrap().unwrap();
         assert_eq!(replaced.value, "v2");
         assert_eq!(replaced.visibility, Visibility::Public);

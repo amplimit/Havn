@@ -5384,7 +5384,11 @@ run ls"
         }
         .system_prompt(None);
         let none = with_public_facts(&pool, &base).await;
-        assert_eq!(none.as_text(), base.as_text(), "no public facts, no section");
+        assert_eq!(
+            none.as_text(),
+            base.as_text(),
+            "no public facts, no section"
+        );
 
         let save = |key: &'static str, value: String, visibility| {
             let pool = &pool;
@@ -5404,7 +5408,12 @@ run ls"
                 .expect("saved");
             }
         };
-        save("user.secret", "lives on Elm Street".into(), Visibility::Private).await;
+        save(
+            "user.secret",
+            "lives on Elm Street".into(),
+            Visibility::Private,
+        )
+        .await;
         save("user.long", "x".repeat(3000), Visibility::Public).await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         save("user.name", "Mira".into(), Visibility::Public).await;
@@ -5413,8 +5422,15 @@ run ls"
 
         let prompt = with_public_facts(&pool, &base).await;
         let text = prompt.as_text().expect("text");
-        assert!(text.starts_with("# SOUL.md"), "after the frozen base: {text}");
-        assert_eq!(prompt.stable_len(), base.stable_len(), "the cached prefix stays");
+        assert!(
+            text.starts_with("# SOUL.md"),
+            "after the frozen base: {text}"
+        );
+        assert_eq!(
+            prompt.stable_len(),
+            base.stable_len(),
+            "the cached prefix stays"
+        );
         assert!(text.contains("`user.name` (identity): Mira"), "{text}");
         assert!(!text.contains("Elm Street"), "private: {text}");
         assert!(
@@ -5435,9 +5451,12 @@ run ls"
         use havn_db::agent::memory::{self, Kind, Visibility};
         let workspace = std::env::temp_dir().join(format!("havn-user-md-{}", uuid::Uuid::now_v7()));
         tokio::fs::create_dir_all(&workspace).await.expect("ws");
-        tokio::fs::write(workspace.join("USER.md"), "  Call me Mira. I write in English.\n")
-            .await
-            .expect("write");
+        tokio::fs::write(
+            workspace.join("USER.md"),
+            "  Call me Mira. I write in English.\n",
+        )
+        .await
+        .expect("write");
         let pool = havn_db::agent::connect_in_memory().await.expect("db");
         fold_user_md(&workspace, &pool).await.expect("fold");
         let fact = memory::get(&pool, "USER.md")

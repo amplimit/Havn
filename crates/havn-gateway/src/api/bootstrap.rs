@@ -103,10 +103,7 @@ pub async fn put(
             .map_err(|e| ApiError::Internal(format!("creating workspace: {e}")))?;
     }
     let mut touched: Vec<&'static str> = Vec::new();
-    for (name, body) in [
-        (SOUL_MD, &req.system),
-        (HEARTBEAT_MD, &req.heartbeat),
-    ] {
+    for (name, body) in [(SOUL_MD, &req.system), (HEARTBEAT_MD, &req.heartbeat)] {
         if body.is_some() {
             touched.push(name);
         }
@@ -114,10 +111,7 @@ pub async fn put(
     let ws_path = workspace.clone();
     let view = blocking(move || {
         let ws = open_workspace(&ws_path)?;
-        for (name, body) in [
-            (SOUL_MD, &req.system),
-            (HEARTBEAT_MD, &req.heartbeat),
-        ] {
+        for (name, body) in [(SOUL_MD, &req.system), (HEARTBEAT_MD, &req.heartbeat)] {
             if let Some(body) = body {
                 write_or_clear(&ws, name, body)?;
             }
