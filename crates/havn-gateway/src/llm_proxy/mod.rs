@@ -4657,12 +4657,20 @@ mod tests {
                     .expect("user")
                     .id;
                 let mut llm = llm(&base);
-                for provider in ["anthropic", "openai", "openrouter", "gemini"] {
+                // Each built-in API's own (OpenRouter's is OpenAI's); a key
+                // takes a while to decrypt, so a 429, tried again, is tried
+                // on one.
+                for provider in ["anthropic", "openai", "gemini"] {
                     llm.base_url
                         .insert(provider.into(), format!("{base}/{provider}"));
                     key(&db, user, provider).await;
                 }
-                for provider in ["ollama", "lan", "anthropic", "openai", "openrouter", "gemini"] {
+                let built_in: &[&str] = if status == 429 {
+                    &["gemini"]
+                } else {
+                    &["anthropic", "openai", "gemini"]
+                };
+                for provider in ["ollama", "lan"].iter().chain(built_in) {
                     let err = call(&db, user, provider, &llm, &hi())
                         .await
                         .expect_err("refused");
@@ -4685,7 +4693,7 @@ mod tests {
                     .fetch_all(&db)
                     .await
                     .expect("credentials");
-                assert_eq!(enabled, [true; 4], "{status}");
+                assert_eq!(enabled, [true; 3], "{status}");
             }
         }
 
