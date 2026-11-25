@@ -2876,12 +2876,14 @@ async fn delete_chat_with_files(
     };
     let dir = workspace.join(havn_core::INBOX_DIR);
     // Nothing through a link: the inbox is the workspace's own directory.
-    if !tokio::fs::symlink_metadata(&dir)
-        .await
-        .is_ok_and(|m| m.is_dir())
-    {
-        warn!("the inbox is not a directory; the files of a deleted chat stay");
-        return Ok(Some(0));
+    // None yet (no file was ever sent), nothing to remove.
+    match tokio::fs::symlink_metadata(&dir).await {
+        Ok(m) if m.is_dir() => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(0)),
+        _ => {
+            warn!("the inbox is not a directory; the files of a deleted chat stay");
+            return Ok(Some(0));
+        }
     }
     let name = |path: &str| {
         havn_core::Attachment::in_inbox(path)
@@ -2908,10 +2910,10 @@ async fn delete_chat_with_files(
             };
         let text = name(&text).filter(|_| !kept);
         let copy = havn_core::Attachment::shown_copy(&file);
-        for gone in std::iter::once(file)
+        let parts = std::iter::once(file)
             .chain(text)
-            .chain(std::iter::once(copy))
-        {
+            .chain(std::iter::once(copy));
+        for (i, gone) in parts.enumerate() {
             // A regular file only, not a link nor what one points to.
             let path = dir.join(&gone);
             if !tokio::fs::symlink_metadata(&path)
@@ -2920,13 +2922,16 @@ async fn delete_chat_with_files(
             {
                 continue;
             }
-            if let Err(e) = tokio::fs::remove_file(&path).await
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                warn!(file = %gone, error = %e, "could not remove a file of a deleted chat");
+            match tokio::fs::remove_file(&path).await {
+                // The file itself counts, not its text or copy.
+                Ok(()) if i == 0 => removed += 1,
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(file = %gone, error = %e, "could not remove a file of a deleted chat");
+                }
             }
         }
-        removed += 1;
     }
     Ok(Some(removed))
 }
@@ -5773,10 +5778,14 @@ run ls"
         )
         .await
         .expect("record");
-        // A link in the inbox stays, and what it points to.
-        delete_chat_with_files(&pool, &inbox, &workspace, "web", &chat, |_| false)
-            .await
-            .expect("delete");
+        // A link in the inbox stays, and what it points to; only the file
+        // removed counts.
+        assert_eq!(
+            delete_chat_with_files(&pool, &inbox, &workspace, "web", &chat, |_| false)
+                .await
+                .expect("delete"),
+            Some(1)
+        );
         assert!(!dir.join("1-a.png").exists());
         assert!(std::fs::symlink_metadata(dir.join("2-b.png")).is_ok());
         assert!(outside.join("2-b.png").exists());
@@ -5802,6 +5811,26 @@ run ls"
             Some(0)
         );
         assert!(outside.join("2-b.png").exists());
+
+        // No inbox at all: nothing to remove.
+        std::fs::remove_file(&dir).expect("unlink");
+        let chat = conversations::chat_for(&pool, "web", None, "none")
+            .await
+            .expect("chat");
+        conversations::record_in_chat(
+            &pool,
+            &chat,
+            Role::User,
+            &with_attachments(String::new(), &files[..1]),
+        )
+        .await
+        .expect("record");
+        assert_eq!(
+            delete_chat_with_files(&pool, &inbox, &workspace, "web", &chat, |_| false)
+                .await
+                .expect("delete"),
+            Some(0)
+        );
         std::fs::remove_dir_all(&workspace).expect("clean");
         std::fs::remove_dir_all(&outside).expect("clean");
     }
