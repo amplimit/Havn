@@ -186,6 +186,74 @@ struct Ctx {
     /// The gateway answers a stopped call with what it had written (issue
     /// #305).
     cuts_calls: bool,
+    /// What deleting a chat with its files must see (issue #322).
+    inbox: Arc<Inbox>,
+}
+
+/// What a chat deleted with the inbox files no other chat names must see
+/// (issue #322): `lock`, held to record a person's message, which may name
+/// inbox files, and alone to delete a chat; and the files named by the
+/// messages received and not yet recorded nor queued, by chat, with how
+/// many name each.
+#[derive(Debug, Default)]
+struct Inbox {
+    lock: tokio::sync::RwLock<()>,
+    unrecorded: std::sync::Mutex<HashMap<(String, String), usize>>,
+}
+
+/// The files of a message received and not yet recorded, named until it
+/// is dropped.
+struct Unrecorded {
+    inbox: Arc<Inbox>,
+    names: Vec<(String, String)>,
+}
+
+impl Inbox {
+    /// Hold that the files `msg` names are named, until what this returns
+    /// is dropped.
+    fn hold(self: &Arc<Self>, msg: &InboundMessage) -> Unrecorded {
+        let chat = turns::key(msg);
+        let names: Vec<(String, String)> = files_named_by(msg)
+            .into_iter()
+            .map(|path| (chat.clone(), path))
+            .collect();
+        let mut held = self.held();
+        for name in &names {
+            *held.entry(name.clone()).or_default() += 1;
+        }
+        Unrecorded {
+            inbox: Arc::clone(self),
+            names,
+        }
+    }
+
+    /// Whether a message received and not yet recorded, of a chat other
+    /// than `except`, names inbox file `path`.
+    fn unrecorded_names(&self, path: &str, except: &str) -> bool {
+        self.held()
+            .keys()
+            .any(|(chat, held)| chat != except && held == path)
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), usize>> {
+        self.unrecorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for Unrecorded {
+    fn drop(&mut self) {
+        let mut held = self.inbox.held();
+        for name in &self.names {
+            if let Some(count) = held.get_mut(name) {
+                *count -= 1;
+                if *count == 0 {
+                    held.remove(name);
+                }
+            }
+        }
+    }
 }
 
 impl Ctx {
@@ -873,6 +941,7 @@ async fn main() -> anyhow::Result<()> {
         turns: Arc::new(turns::Turns::default()),
         approvals,
         cuts_calls,
+        inbox: Arc::default(),
     };
     let dispatch = run_reader_loop(&mut reader, ctx).await;
 
@@ -1065,12 +1134,14 @@ where
                     }
                 }
                 // One turn at a time per chat; later messages wait their
-                // turn.
+                // turn. Its files are named until it is recorded: held
+                // before it is spawned, or in the queue (issue #322).
+                let unrecorded = ctx.inbox.hold(&msg);
                 match ctx.turns.admit(msg) {
                     turns::Admitted::Start(msg, stop) => {
                         let ctx = ctx.clone();
                         work.spawn(async move {
-                            run_conversation(*msg, stop, ctx).await;
+                            run_conversation(*msg, stop, unrecorded, ctx).await;
                         });
                     }
                     turns::Admitted::Queued {
@@ -1361,9 +1432,12 @@ async fn handle_heartbeat(tick: HeartbeatTick, ctx: Ctx) {
          {hb_text}"
     );
 
-    if let Err(e) =
+    // A person's turn, recorded as one is (issue #322).
+    let recorded = {
+        let _inbox = ctx.inbox.lock.read().await;
         conversations::record(&ctx.pool, HEARTBEAT_CHANNEL, Role::User, &synthesised).await
-    {
+    };
+    if let Err(e) = recorded {
         error!(error = %e, "could not persist heartbeat user turn");
         return;
     }
@@ -1838,7 +1912,12 @@ async fn handle_cron(tick: CronTick, ctx: Ctx) {
     let job_id = tick.job_id.clone();
     let channel_id = format!("{CRON_CHANNEL_PREFIX}{job_id}");
 
-    if let Err(e) = conversations::record(&ctx.pool, &channel_id, Role::User, &tick.prompt).await {
+    // A person's turn, recorded as one is (issue #322).
+    let recorded = {
+        let _inbox = ctx.inbox.lock.read().await;
+        conversations::record(&ctx.pool, &channel_id, Role::User, &tick.prompt).await
+    };
+    if let Err(e) = recorded {
         warn!(%job_id, error = %e, "could not persist cron user turn");
         // Continue anyway — the LLM call doesn't depend on persistence.
     }
@@ -2232,19 +2311,30 @@ fn json_escape(s: &str) -> String {
 }
 
 /// Run `msg`'s turn, then the messages queued behind it in the same
-/// conversation, one after another.
+/// conversation, one after another. Each one's files are held named
+/// (`unrecorded`) until it is recorded.
 async fn run_conversation(
     mut msg: InboundMessage,
     mut stop: tokio_util::sync::CancellationToken,
+    mut unrecorded: Unrecorded,
     ctx: Ctx,
 ) {
     loop {
         let chat = turns::key(&msg);
-        handle_inbound(msg, stop, ctx.clone()).await;
-        match ctx.turns.next(&chat) {
-            Some((queued, token)) => {
+        handle_inbound(msg, stop, unrecorded, ctx.clone()).await;
+        // Out of the queue and held at once, for a chat deleted with its
+        // files (issue #322).
+        let next = {
+            let _inbox = ctx.inbox.lock.read().await;
+            ctx.turns
+                .next(&chat)
+                .map(|(queued, token)| (ctx.inbox.hold(&queued), queued, token))
+        };
+        match next {
+            Some((held, queued, token)) => {
                 msg = queued;
                 stop = token;
+                unrecorded = held;
             }
             None => break,
         }
@@ -2734,16 +2824,157 @@ fn send_text(ctx: &Ctx, channel_id: String, conversation: Option<String>, text: 
     }
 }
 
-async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::CancellationToken, ctx: Ctx) {
-    let user_text = match render_content_for_llm(&msg.content) {
+/// Record `text`, a person's message, in chat `chat`, or branch the chat
+/// off as `branch` says: the user turn the reply answers, `None` when the
+/// chat or the turn is not there. Not while a chat is deleted with its
+/// files (`inbox`): one this message names stays (issue #322).
+async fn record_turn(
+    pool: &SqlitePool,
+    inbox: &Inbox,
+    chat: &str,
+    branch: Option<&Branch>,
+    text: &str,
+) -> havn_db::Result<Option<String>> {
+    let _inbox = inbox.lock.read().await;
+    match branch {
+        None => conversations::record_in_chat(pool, chat, Role::User, text).await,
+        Some(branch) => {
+            let rewind = match branch {
+                Branch::Edit { turn } => conversations::Rewind::Edit { turn, text },
+                Branch::Regenerate { turn } => conversations::Rewind::Regenerate(turn.as_deref()),
+            };
+            conversations::rewind(pool, chat, rewind).await
+        }
+    }
+}
+
+/// Delete chat `conversation` of `channel_id` and remove from the inbox of
+/// `workspace` the files its messages carried (issue #229): each with its
+/// text and the copy shown of it, and none that a message of another chat
+/// names, nor one a message received and not yet recorded names (in
+/// `inbox`, or `queued`), or when that cannot be told. Holding `inbox`
+/// alone, no message is recorded between telling which files to remove and
+/// removing them (issue #322). `None` when it is not a chat of
+/// `channel_id`, else how many files were removed.
+async fn delete_chat_with_files(
+    pool: &SqlitePool,
+    inbox: &Inbox,
+    workspace: &std::path::Path,
+    channel_id: &str,
+    conversation: &str,
+    queued: impl Fn(&str) -> bool,
+) -> havn_db::Result<Option<usize>> {
+    let _inbox = inbox.lock.write().await;
+    // Read before the messages go.
+    let texts = conversations::user_texts(pool, conversation).await?;
+    if !conversations::delete_chat(pool, channel_id, conversation).await? {
+        return Ok(None);
+    }
+    let named = |path: String| {
+        let unrecorded = inbox.unrecorded_names(&path, conversation) || queued(&path);
+        async move { unrecorded || conversations::names_file(pool, &path).await.unwrap_or(true) }
+    };
+    let dir = workspace.join(havn_core::INBOX_DIR);
+    // Nothing through a link: the inbox is the workspace's own directory.
+    // None yet (no file was ever sent), nothing to remove.
+    match tokio::fs::symlink_metadata(&dir).await {
+        Ok(m) if m.is_dir() => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(0)),
+        _ => {
+            warn!("the inbox is not a directory; the files of a deleted chat stay");
+            return Ok(Some(0));
+        }
+    }
+    let name = |path: &str| {
+        havn_core::Attachment::in_inbox(path)
+            .then(|| path[havn_core::INBOX_DIR.len() + 1..].to_string())
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut removed = 0;
+    // Its text is where its line says, or, for a voice note whose line
+    // holds the transcript, next to it.
+    for (path, text_path) in texts.iter().flat_map(|text| carried(text)) {
+        if !seen.insert(path.clone()) || named(path.clone()).await {
+            continue;
+        }
+        let Some(file) = name(&path) else {
+            continue;
+        };
+        // A text named as a file's, or as another file's text, or that of
+        // a file kept, as a voice note's transcript is, stays.
+        let text = text_path.unwrap_or_else(|| format!("{path}.txt"));
+        let kept = named(text.clone()).await
+            || match text.strip_suffix(".txt") {
+                Some(of) => named(of.to_string()).await,
+                None => false,
+            };
+        let text = name(&text).filter(|_| !kept);
+        let copy = havn_core::Attachment::shown_copy(&file);
+        let parts = std::iter::once(file)
+            .chain(text)
+            .chain(std::iter::once(copy));
+        for (i, gone) in parts.enumerate() {
+            // A regular file only, not a link nor what one points to.
+            let path = dir.join(&gone);
+            if !tokio::fs::symlink_metadata(&path)
+                .await
+                .is_ok_and(|m| m.is_file())
+            {
+                continue;
+            }
+            match tokio::fs::remove_file(&path).await {
+                // The file itself counts, not its text or copy.
+                Ok(()) if i == 0 => removed += 1,
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(file = %gone, error = %e, "could not remove a file of a deleted chat");
+                }
+            }
+        }
+    }
+    Ok(Some(removed))
+}
+
+/// What `msg` says as it is recorded: its text, and a line for each file
+/// sent with it; `None` for content that cannot be rendered.
+fn as_recorded(msg: &InboundMessage) -> Option<String> {
+    render_content_for_llm(&msg.content).map(|t| {
         // Only the dashboard's owner may name inbox images by writing the
         // lines: anyone else's is quoted, so it cannot show the owner's.
-        Some(t) if msg.channel == "webchat" => with_attachments(t, &msg.attachments),
-        Some(t) => with_attachments(quote_attachment_lines(&t), &msg.attachments),
-        None => {
-            warn!(content = ?msg.content, "skipping inbound with unrenderable content variant");
-            return;
+        if msg.channel == "webchat" {
+            with_attachments(t, &msg.attachments)
+        } else {
+            with_attachments(quote_attachment_lines(&t), &msg.attachments)
         }
+    })
+}
+
+/// The inbox files `msg` names as it will be recorded, and where their
+/// texts are said to be.
+fn files_named_by(msg: &InboundMessage) -> Vec<String> {
+    as_recorded(msg)
+        .iter()
+        .flat_map(|text| carried(text))
+        .flat_map(|(path, text_path)| std::iter::once(path).chain(text_path))
+        .collect()
+}
+
+/// Whether a message queued in a chat other than `except` names inbox file
+/// `path` (issue #322): the deleted chat's own queue goes with it.
+fn queued_names(turns: &turns::Turns, path: &str, except: &str) -> bool {
+    turns.any_queued(|chat, msg| chat != except && files_named_by(msg).iter().any(|p| p == path))
+}
+
+async fn handle_inbound(
+    msg: InboundMessage,
+    stop: tokio_util::sync::CancellationToken,
+    unrecorded: Unrecorded,
+    ctx: Ctx,
+) {
+    let Some(user_text) = as_recorded(&msg) else {
+        warn!(content = ?msg.content, "skipping inbound with unrenderable content variant");
+        return;
     };
 
     // The chat's history; replies go to `channel_id`.
@@ -2758,19 +2989,16 @@ async fn handle_inbound(msg: InboundMessage, stop: tokio_util::sync::Cancellatio
     // The user turn the reply answers: the message, recorded before the
     // LLM call so a crash doesn't lose it, or for an edit or a regenerated
     // reply the turn the chat branches off at.
-    let answered = match &msg.branch {
-        None => conversations::record_in_chat(&ctx.pool, &chat, Role::User, &user_text).await,
-        Some(branch) => {
-            let rewind = match branch {
-                Branch::Edit { turn } => conversations::Rewind::Edit {
-                    turn,
-                    text: &user_text,
-                },
-                Branch::Regenerate { turn } => conversations::Rewind::Regenerate(turn.as_deref()),
-            };
-            conversations::rewind(&ctx.pool, &chat, rewind).await
-        }
-    };
+    let answered = record_turn(
+        &ctx.pool,
+        &ctx.inbox,
+        &chat,
+        msg.branch.as_ref(),
+        &user_text,
+    )
+    .await;
+    // Recorded, or not to be: its files are named by it, or by nothing.
+    drop(unrecorded);
     let answered = match answered {
         Ok(Some(turn)) => turn,
         // Deleted while the message waited, or nothing there to branch off.
@@ -4659,43 +4887,24 @@ async fn answer_data_request(req: DataRequest, ctx: &Ctx) -> DataResponse {
                 channel_id,
                 conversation,
             } => {
-                // The files its messages carried, for the gateway to remove
-                // with it (issue #229); read before the messages go.
-                let texts = conversations::user_texts(&ctx.pool, &conversation)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let found = conversations::delete_chat(&ctx.pool, &channel_id, &conversation)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                if found {
+                let queued = |path: &str| queued_names(&ctx.turns, path, &conversation);
+                let removed = delete_chat_with_files(
+                    &ctx.pool,
+                    &ctx.inbox,
+                    &ctx.workspace_dir,
+                    &channel_id,
+                    &conversation,
+                    queued,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                if removed.is_some() {
                     ctx.turns.discard(&conversation);
                 }
-                // Each once, and none that a message of another chat still
-                // carries; when that cannot be told, the file stays. Its
-                // text is where its line says, or, for a voice note whose
-                // line holds the transcript, next to it.
-                let mut files: Vec<serde_json::Value> = Vec::new();
-                if found {
-                    let mut seen = std::collections::HashSet::new();
-                    for (path, text_path) in texts.iter().flat_map(|text| carried(text)) {
-                        let named = |file: String| async move {
-                            conversations::names_file(&ctx.pool, &file)
-                                .await
-                                .unwrap_or(true)
-                        };
-                        if !seen.insert(path.clone()) || named(path.clone()).await {
-                            continue;
-                        }
-                        let text = text_path.unwrap_or_else(|| format!("{path}.txt"));
-                        let text = if named(text.clone()).await {
-                            None
-                        } else {
-                            Some(text)
-                        };
-                        files.push(serde_json::json!({ "path": path, "text_path": text }));
-                    }
-                }
-                Ok(serde_json::json!({ "found": found, "files": files }))
+                Ok(serde_json::json!({
+                    "found": removed.is_some(),
+                    "removed": removed.unwrap_or(0),
+                }))
             }
             DataQuery::Access => {
                 let mut allowed = conversations::accesses(&ctx.pool, None)
@@ -5289,6 +5498,397 @@ run ls"
             ],
             "a line quoted, or a path out of the inbox, names nothing; a text out of it is left"
         );
+    }
+
+    async fn inbox_with(files: &[&str]) -> (SqlitePool, PathBuf) {
+        let pool = havn_db::agent::connect_in_memory().await.expect("db");
+        let workspace =
+            std::env::temp_dir().join(format!("havn-chat-files-{}", uuid::Uuid::now_v7()));
+        let dir = workspace.join(havn_core::INBOX_DIR);
+        tokio::fs::create_dir_all(&dir).await.expect("inbox");
+        for name in files {
+            tokio::fs::write(dir.join(name), name).await.expect("write");
+        }
+        (pool, workspace)
+    }
+
+    fn sent(path: &str, media_type: &str, text_path: Option<&str>) -> havn_core::Attachment {
+        havn_core::Attachment {
+            path: path.into(),
+            name: "x".into(),
+            media_type: media_type.into(),
+            size: 1,
+            text_path: text_path.map(Into::into),
+            transcript: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_chat_removes_the_files_only_it_names() {
+        let (pool, workspace) = inbox_with(&[
+            "1-a.pdf",
+            "1-a.pdf.txt",
+            ".1-a.pdf.shown",
+            "2-b.png",
+            "3-v.ogg",
+            "3-v.ogg.txt",
+        ])
+        .await;
+        let inbox = Inbox::default();
+        let deleted = conversations::chat_for(&pool, "web", None, "files")
+            .await
+            .expect("chat");
+        let other = conversations::chat_for(&pool, "dm", None, "other")
+            .await
+            .expect("chat");
+        let mut voice = sent("inbox/3-v.ogg", "audio/ogg", None);
+        voice.transcript = Some("hello".into());
+        let files = [
+            sent(
+                "inbox/1-a.pdf",
+                "application/pdf",
+                Some("inbox/1-a.pdf.txt"),
+            ),
+            sent("inbox/2-b.png", "image/png", None),
+            voice,
+        ];
+        record_turn(
+            &pool,
+            &inbox,
+            &deleted,
+            None,
+            &with_attachments("these".into(), &files),
+        )
+        .await
+        .expect("record");
+        record_turn(
+            &pool,
+            &inbox,
+            &other,
+            None,
+            &with_attachments(String::new(), &files[1..2]),
+        )
+        .await
+        .expect("record");
+        assert_eq!(
+            delete_chat_with_files(&pool, &inbox, &workspace, "dm", &deleted, |_| false)
+                .await
+                .expect("delete"),
+            None,
+            "not a chat of that scope"
+        );
+        assert_eq!(
+            delete_chat_with_files(&pool, &inbox, &workspace, "web", &deleted, |_| false)
+                .await
+                .expect("delete"),
+            Some(2)
+        );
+        let mut left: Vec<String> = std::fs::read_dir(workspace.join(havn_core::INBOX_DIR))
+            .expect("inbox")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["2-b.png"], "another chat names it");
+        std::fs::remove_dir_all(&workspace).expect("clean");
+    }
+
+    #[tokio::test]
+    async fn a_file_another_chat_names_as_its_chat_is_deleted_stays() {
+        let (pool, workspace) = inbox_with(&["1-a.png", "2-b.png"]).await;
+        let inbox = Arc::new(Inbox::default());
+        let deleted = conversations::chat_for(&pool, "web", None, "files")
+            .await
+            .expect("chat");
+        let other = conversations::chat_for(&pool, "dm", None, "other")
+            .await
+            .expect("chat");
+        let png = |path: &str| [sent(path, "image/png", None)];
+        let line = |path: &str| with_attachments(String::new(), &png(path));
+        conversations::record_in_chat(&pool, &deleted, Role::User, &line("inbox/1-a.png"))
+            .await
+            .expect("record");
+        conversations::record_in_chat(&pool, &deleted, Role::User, &line("inbox/2-b.png"))
+            .await
+            .expect("record");
+
+        // A message of another chat being recorded as the chat is deleted:
+        // the deletion waits for it, and keeps the file it names.
+        let recording = inbox.lock.read().await;
+        let deletion = {
+            let (pool, inbox, workspace) = (pool.clone(), inbox.clone(), workspace.clone());
+            tokio::spawn(async move {
+                delete_chat_with_files(&pool, &inbox, &workspace, "web", &deleted, |_| false)
+                    .await
+                    .expect("delete")
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!deletion.is_finished(), "it waits for the message");
+        conversations::record_in_chat(&pool, &other, Role::User, &line("inbox/1-a.png"))
+            .await
+            .expect("record");
+        drop(recording);
+        assert_eq!(deletion.await.expect("joined"), Some(1));
+        let dir = workspace.join(havn_core::INBOX_DIR);
+        assert!(dir.join("1-a.png").exists(), "another chat names it");
+        assert!(!dir.join("2-b.png").exists(), "no chat names it");
+
+        // A message sent while a chat is deleted with its files is recorded
+        // once the deletion is done, not between its two steps.
+        let deleting_files = inbox.lock.write().await;
+        let record = {
+            let (pool, inbox, other) = (pool.clone(), inbox.clone(), other.clone());
+            let text = line("inbox/1-a.png");
+            tokio::spawn(async move { record_turn(&pool, &inbox, &other, None, &text).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!record.is_finished(), "it waits for the deletion");
+        drop(deleting_files);
+        assert!(record.await.expect("joined").expect("record").is_some());
+        std::fs::remove_dir_all(&workspace).expect("clean");
+    }
+
+    fn sent_in(chat: &str, attachments: Vec<havn_core::Attachment>) -> InboundMessage {
+        InboundMessage {
+            conversation: Some(chat.into()),
+            branch: None,
+            channel_id: "web".into(),
+            sender_id: "owner".into(),
+            channel: "webchat".into(),
+            content: MessageContent::Text { text: "see".into() },
+            timestamp: chrono::Utc::now(),
+            attachments,
+            raw: serde_json::Value::Null,
+            from_owner: true,
+            group: false,
+            answers: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_a_message_received_and_not_yet_recorded_names_stays() {
+        let (pool, workspace) = inbox_with(&["1-a.png", "2-b.pdf", "2-b.pdf.txt"]).await;
+        let inbox = Arc::new(Inbox::default());
+        let deleted = conversations::chat_for(&pool, "web", None, "files")
+            .await
+            .expect("chat");
+        let png = sent("inbox/1-a.png", "image/png", None);
+        let pdf = sent(
+            "inbox/2-b.pdf",
+            "application/pdf",
+            Some("inbox/2-b.pdf.txt"),
+        );
+        conversations::record_in_chat(
+            &pool,
+            &deleted,
+            Role::User,
+            &with_attachments(String::new(), &[png.clone(), pdf.clone()]),
+        )
+        .await
+        .expect("record");
+        let dir = workspace.join(havn_core::INBOX_DIR);
+
+        // Started in another chat, not at its record yet: held, so kept;
+        // the deleted chat's own message names nothing.
+        let started = inbox.hold(&sent_in("other-chat", vec![png.clone()]));
+        let own = inbox.hold(&sent_in(&deleted, vec![pdf.clone()]));
+        // Queued behind a reply in another chat.
+        let turns = turns::Turns::default();
+        assert!(matches!(
+            turns.admit(sent_in("busy-chat", Vec::new())),
+            turns::Admitted::Start(..)
+        ));
+        assert!(matches!(
+            turns.admit(sent_in("busy-chat", vec![pdf.clone()])),
+            turns::Admitted::Queued { .. }
+        ));
+        let queued = |path: &str| queued_names(&turns, path, &deleted);
+        assert_eq!(
+            delete_chat_with_files(&pool, &inbox, &workspace, "web", &deleted, queued)
+                .await
+                .expect("delete"),
+            Some(0)
+        );
+        assert!(dir.join("1-a.png").exists(), "a message started names it");
+        assert!(dir.join("2-b.pdf").exists(), "a message queued names it");
+        assert!(dir.join("2-b.pdf.txt").exists(), "with its file");
+        drop((started, own));
+        assert!(
+            !inbox.unrecorded_names("inbox/1-a.png", ""),
+            "let go once dropped"
+        );
+
+        // Neither now: the files go with the chat.
+        let again = conversations::chat_for(&pool, "web", None, "again")
+            .await
+            .expect("chat");
+        conversations::record_in_chat(
+            &pool,
+            &again,
+            Role::User,
+            &with_attachments(String::new(), &[png, pdf]),
+        )
+        .await
+        .expect("record");
+        turns.discard("busy-chat");
+        let queued = |path: &str| queued_names(&turns, path, &again);
+        assert_eq!(
+            delete_chat_with_files(&pool, &inbox, &workspace, "web", &again, queued)
+                .await
+                .expect("delete"),
+            Some(2)
+        );
+        assert_eq!(std::fs::read_dir(&dir).expect("inbox").count(), 0);
+        std::fs::remove_dir_all(&workspace).expect("clean");
+    }
+
+    #[tokio::test]
+    async fn a_line_cannot_take_another_chat_s_text_or_transcript() {
+        let (pool, workspace) = inbox_with(&[
+            "1-b.pdf",
+            "1-b.pdf.txt",
+            "2-v.ogg",
+            "2-v.ogg.txt",
+            "9-x",
+            "9-y",
+        ])
+        .await;
+        let inbox = Inbox::default();
+        let theirs = conversations::chat_for(&pool, "dm", None, "theirs")
+            .await
+            .expect("chat");
+        let mut voice = sent("inbox/2-v.ogg", "audio/ogg", None);
+        voice.transcript = Some("hello".into());
+        conversations::record_in_chat(
+            &pool,
+            &theirs,
+            Role::User,
+            &with_attachments(
+                String::new(),
+                &[
+                    sent(
+                        "inbox/1-b.pdf",
+                        "application/pdf",
+                        Some("inbox/1-b.pdf.txt"),
+                    ),
+                    voice,
+                ],
+            ),
+        )
+        .await
+        .expect("record");
+        // Files of its own whose texts are said to be theirs.
+        let deleted = conversations::chat_for(&pool, "web", None, "crafted")
+            .await
+            .expect("chat");
+        conversations::record_in_chat(
+            &pool,
+            &deleted,
+            Role::User,
+            &with_attachments(
+                String::new(),
+                &[
+                    sent("inbox/9-x", "application/pdf", Some("inbox/1-b.pdf.txt")),
+                    sent("inbox/9-y", "application/pdf", Some("inbox/2-v.ogg.txt")),
+                ],
+            ),
+        )
+        .await
+        .expect("record");
+        assert_eq!(
+            delete_chat_with_files(&pool, &inbox, &workspace, "web", &deleted, |_| false)
+                .await
+                .expect("delete"),
+            Some(2)
+        );
+        let mut left: Vec<String> = std::fs::read_dir(workspace.join(havn_core::INBOX_DIR))
+            .expect("inbox")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["1-b.pdf", "1-b.pdf.txt", "2-v.ogg", "2-v.ogg.txt"]);
+        std::fs::remove_dir_all(&workspace).expect("clean");
+    }
+
+    #[tokio::test]
+    async fn nothing_is_removed_through_a_link() {
+        let (pool, workspace) = inbox_with(&["1-a.png"]).await;
+        let inbox = Inbox::default();
+        let outside = std::env::temp_dir().join(format!("havn-outside-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("2-b.png"), "b").expect("write");
+        let dir = workspace.join(havn_core::INBOX_DIR);
+        std::os::unix::fs::symlink(outside.join("2-b.png"), dir.join("2-b.png")).expect("link");
+        let chat = conversations::chat_for(&pool, "web", None, "files")
+            .await
+            .expect("chat");
+        let files = [
+            sent("inbox/1-a.png", "image/png", None),
+            sent("inbox/2-b.png", "image/png", None),
+        ];
+        conversations::record_in_chat(
+            &pool,
+            &chat,
+            Role::User,
+            &with_attachments(String::new(), &files),
+        )
+        .await
+        .expect("record");
+        // A link in the inbox stays, and what it points to; only the file
+        // removed counts.
+        assert_eq!(
+            delete_chat_with_files(&pool, &inbox, &workspace, "web", &chat, |_| false)
+                .await
+                .expect("delete"),
+            Some(1)
+        );
+        assert!(!dir.join("1-a.png").exists());
+        assert!(std::fs::symlink_metadata(dir.join("2-b.png")).is_ok());
+        assert!(outside.join("2-b.png").exists());
+
+        // An inbox that is a link: nothing in it is removed.
+        std::fs::remove_dir_all(&dir).expect("rm");
+        std::os::unix::fs::symlink(&outside, &dir).expect("link");
+        let chat = conversations::chat_for(&pool, "web", None, "again")
+            .await
+            .expect("chat");
+        conversations::record_in_chat(
+            &pool,
+            &chat,
+            Role::User,
+            &with_attachments(String::new(), &files[1..]),
+        )
+        .await
+        .expect("record");
+        assert_eq!(
+            delete_chat_with_files(&pool, &inbox, &workspace, "web", &chat, |_| false)
+                .await
+                .expect("delete"),
+            Some(0)
+        );
+        assert!(outside.join("2-b.png").exists());
+
+        // No inbox at all: nothing to remove.
+        std::fs::remove_file(&dir).expect("unlink");
+        let chat = conversations::chat_for(&pool, "web", None, "none")
+            .await
+            .expect("chat");
+        conversations::record_in_chat(
+            &pool,
+            &chat,
+            Role::User,
+            &with_attachments(String::new(), &files[..1]),
+        )
+        .await
+        .expect("record");
+        assert_eq!(
+            delete_chat_with_files(&pool, &inbox, &workspace, "web", &chat, |_| false)
+                .await
+                .expect("delete"),
+            Some(0)
+        );
+        std::fs::remove_dir_all(&workspace).expect("clean");
+        std::fs::remove_dir_all(&outside).expect("clean");
     }
 
     #[test]

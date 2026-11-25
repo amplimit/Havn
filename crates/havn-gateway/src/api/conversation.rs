@@ -230,20 +230,13 @@ struct Found {
     found: bool,
 }
 
-/// A deleted chat, and the inbox files its messages carried (issue #229);
-/// an older runtime names none.
+/// A deleted chat, and how many inbox files the runtime removed with it
+/// (issue #322); an older runtime removes none.
 #[derive(Deserialize)]
 struct Deleted {
     found: bool,
     #[serde(default)]
-    files: Vec<Carried>,
-}
-
-#[derive(Deserialize)]
-struct Carried {
-    path: String,
-    #[serde(default)]
-    text_path: Option<String>,
+    removed: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -735,24 +728,21 @@ pub async fn chat_delete(
     }
     // Its tasks report to the conversation, no longer to the chat.
     havn_db::repo::cron::forget_chat(&state.db, agent.id, &conversation).await?;
-    // The files it carried go with it: those sent in it, by the person and
-    // by the agent (issue #229).
-    let workspace = crate::api::agents::workspace_for(&state, agent.id);
+    // The files it carried go with it (issue #229): those the person sent,
+    // which the runtime removed as it told that no other chat names them
+    // (issue #322), and those the agent sent.
     let outbox = crate::outbox::dir(&state.workspace_root, agent.id);
     let chat = conversation.clone();
-    let files = deleted.files;
-    let named = tokio::task::spawn_blocking(move || {
-        for file in &files {
-            crate::api::files::discard_path(&workspace, &file.path, file.text_path.as_deref());
-        }
+    let sent = tokio::task::spawn_blocking(move || {
         let sent = crate::outbox::list(&outbox, Some(&chat), usize::MAX);
         for file in &sent {
             crate::outbox::remove(&outbox, &file.id);
         }
-        files.len() + sent.len()
+        sent.len()
     })
     .await
     .unwrap_or(0);
+    let named = deleted.removed + sent;
     crate::audit::record_agent_action(
         &state.db,
         user.id,

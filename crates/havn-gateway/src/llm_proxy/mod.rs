@@ -2096,11 +2096,10 @@ const JPEG_QUALITY: u8 = 85;
 const MAX_DECODED_PIXELS: u64 = 1 << 26;
 const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 
-/// The name, in the inbox, of the copy shown in place of file `name`
-/// (issue #225): hidden, and never the name of a file sent, as those start
-/// with the time they came.
+/// The name, in the inbox, of the copy shown in place of file `name`, as
+/// [`havn_core::Attachment::shown_copy`] names it.
 pub fn shown_copy(name: &str) -> String {
-    format!(".{name}.shown")
+    havn_core::Attachment::shown_copy(name)
 }
 
 /// Whether image `bytes` is shown as a copy: a HEIC image, or a PNG, JPEG,

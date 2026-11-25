@@ -631,7 +631,8 @@ pub enum DataQuery {
         to: String,
     },
     /// Delete chat `conversation` of `channel_id` and its history, stopping
-    /// its turn and dropping its queue: `{"found": bool}`.
+    /// its turn and dropping its queue, with the inbox files no other chat
+    /// names (issue #322): `{"found": bool, "removed": <files removed>}`.
     DeleteChat {
         channel_id: String,
         conversation: String,

@@ -1197,15 +1197,17 @@ pub async fn user_texts(pool: &SqlitePool, id: &str) -> Result<Vec<String>> {
 }
 
 /// Whether a message someone wrote in any chat still names inbox file
-/// `path`, as its attachment line does (issue #229): a file another chat
-/// carries is not removed with a deleted one.
+/// `path`, as its attachment line does (issue #229), as the file or as
+/// where its text is (issue #322): a file another chat carries is not
+/// removed with a deleted one.
 pub async fn names_file(pool: &SqlitePool, path: &str) -> Result<bool> {
     let quoted = serde_json::to_string(path).unwrap_or_default();
     let (found,): (bool,) = sqlx::query_as(
         "SELECT EXISTS (SELECT 1 FROM conversations \
-         WHERE role = 'user' AND instr(content, ?1) > 0)",
+         WHERE role = 'user' AND (instr(content, ?1) > 0 OR instr(content, ?2) > 0))",
     )
     .bind(format!("saved at {quoted}"))
+    .bind(format!("is at {quoted}"))
     .fetch_one(pool)
     .await?;
     Ok(found)
