@@ -363,7 +363,7 @@ pub async fn stream_with_provider(
     max_output_tokens: Option<u32>,
     request: &AnthropicRequest,
     llm: &LlmConfig,
-    text: Option<&provider::TextSink>,
+    text: Option<&provider::TextSink<'_>>,
     cut: &tokio_util::sync::CancellationToken,
 ) -> Result<AnthropicResponse, ProxyError> {
     let route = route(provider_name, max_output_tokens, llm)?;
@@ -559,7 +559,7 @@ async fn complete_through(
     billing: &Billing,
     request: &AnthropicRequest,
     max_tokens_ceiling: u32,
-    text: Option<&provider::TextSink>,
+    text: Option<&provider::TextSink<'_>>,
     cut: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<AnthropicResponse, ProxyError> {
     // What the call wrote so far, for an answer cut short.
@@ -573,7 +573,7 @@ async fn complete_through(
             text(event);
         }
     };
-    let text: Option<&provider::TextSink> = text.map(|_| &passing as &provider::TextSink);
+    let text: Option<&provider::TextSink<'_>> = text.map(|_| &passing as &provider::TextSink<'_>);
     let max_tokens = provider::clamp_max_tokens(
         &request.model,
         route.max_output_tokens,
@@ -2419,7 +2419,7 @@ async fn try_one(
     route: Route<'_>,
     cred: Option<&Credential>,
     request: &AnthropicRequest,
-    text: Option<&provider::TextSink>,
+    text: Option<&provider::TextSink<'_>>,
 ) -> Attempt {
     // Decrypt the at-rest ciphertext to bytes, then verify UTF-8 shape
     // before sending. Decrypt errors collapse to "credential malformed
@@ -3804,7 +3804,7 @@ mod tests {
                 base_url: &str,
                 api_key: &str,
                 request: &AnthropicRequest,
-                text: &provider::TextSink,
+                text: &provider::TextSink<'_>,
             ) -> Result<AnthropicResponse, ProviderError> {
                 text(provider::TextEvent::Reasoning("Which first?"));
                 text(provider::TextEvent::Text("Half of "));
@@ -4033,7 +4033,7 @@ mod tests {
                         &f.billing,
                         &ask(300),
                         CEILING,
-                        streamed.then_some(&sink as &provider::TextSink),
+                        streamed.then_some(&sink as &provider::TextSink<'_>),
                         Some(&cut),
                     )
                     .await

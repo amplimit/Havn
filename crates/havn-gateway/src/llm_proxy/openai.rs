@@ -148,7 +148,7 @@ impl LlmProvider for OpenAiProvider {
         base_url: &str,
         api_key: &str,
         request: &AnthropicRequest,
-        text: &TextSink,
+        text: &TextSink<'_>,
     ) -> Result<AnthropicResponse, ProviderError> {
         let mut body = anthropic_to_openai(request, self.max_tokens_field, self.name)
             .map_err(|e| ProviderError::Translation(format!("request build: {e}")))?;

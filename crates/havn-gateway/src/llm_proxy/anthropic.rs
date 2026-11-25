@@ -79,7 +79,7 @@ impl LlmProvider for AnthropicProvider {
         base_url: &str,
         api_key: &str,
         request: &AnthropicRequest,
-        text: &TextSink,
+        text: &TextSink<'_>,
     ) -> Result<AnthropicResponse, ProviderError> {
         let mut body = request_body(request)?;
         body["stream"] = serde_json::Value::Bool(true);

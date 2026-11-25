@@ -110,7 +110,7 @@ pub trait LlmProvider: Send + Sync {
         base_url: &str,
         api_key: &str,
         request: &AnthropicRequest,
-        text: &TextSink,
+        text: &TextSink<'_>,
     ) -> Result<AnthropicResponse, ProviderError> {
         let response = self.complete(http, base_url, api_key, request).await?;
         pass_text(&response, text);
@@ -119,7 +119,7 @@ pub trait LlmProvider: Send + Sync {
 }
 
 /// Pass the text of a whole `response` to `text` at once.
-pub fn pass_text(response: &AnthropicResponse, text: &TextSink) {
+pub fn pass_text(response: &AnthropicResponse, text: &TextSink<'_>) {
     for block in response.content.as_array().into_iter().flatten() {
         if block.get("type").and_then(serde_json::Value::as_str) == Some("text")
             && let Some(t) = block.get("text").and_then(serde_json::Value::as_str)
@@ -158,7 +158,7 @@ pub enum TextEvent<'a> {
 }
 
 /// Where a streamed call's text goes.
-pub type TextSink = dyn Fn(TextEvent<'_>) + Send + Sync;
+pub type TextSink<'a> = dyn Fn(TextEvent<'_>) + Send + Sync + 'a;
 
 /// The error an unsuccessful HTTP status stands for.
 #[must_use]

@@ -383,8 +383,7 @@ async fn rounds(
         {
             *mirror.write().await = messages.clone();
         }
-        let response = match call_unless_stopped(handle, context, messages, system_prompt).await
-        {
+        let response = match call_unless_stopped(handle, context, messages, system_prompt).await {
             Ok(response) => response.map_err(RunError::Infra)?,
             Err(cut) => {
                 said.extend(cut.as_ref().and_then(|cut| kept_text(context, cut)));
@@ -1053,12 +1052,10 @@ struct CancelOnDrop<'a> {
 impl Drop for CancelOnDrop<'_> {
     fn drop(&mut self) {
         if let Some(request_id) = self.request_id.take() {
-            let _ = self
-                .writer_tx
-                .try_send(AgentToGateway::LlmCancel {
-                    request_id,
-                    keep: false,
-                });
+            let _ = self.writer_tx.try_send(AgentToGateway::LlmCancel {
+                request_id,
+                keep: false,
+            });
         }
     }
 }
@@ -1861,7 +1858,10 @@ mod tests {
     }
 
     /// A turn answering a web chat, with its trace kept in `trace`.
-    async fn web_turn(handle: &LoopHandle, trace: &Arc<std::sync::Mutex<Trace>>) -> Result<String, RunError> {
+    async fn web_turn(
+        handle: &LoopHandle,
+        trace: &Arc<std::sync::Mutex<Trace>>,
+    ) -> Result<String, RunError> {
         let mut messages = vec![serde_json::json!({"role": "user", "content": "go"})];
         let prompt = crate::system_prompt::BootstrapFiles::default().system_prompt(None);
         crate::tools::gateway::CONVERSATION
@@ -1932,7 +1932,10 @@ mod tests {
         match ended {
             Err(RunError::Stopped { partial_text }) => {
                 assert_eq!(partial_text, "Looking.\n\nHalf of");
-                assert_eq!(stopped_reply(&partial_text), "Looking.\n\nHalf of\n\n(stopped)");
+                assert_eq!(
+                    stopped_reply(&partial_text),
+                    "Looking.\n\nHalf of\n\n(stopped)"
+                );
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -1987,7 +1990,10 @@ mod tests {
             Err(RunError::Stopped { partial_text }) => assert_eq!(partial_text, ""),
             other => panic!("unexpected {other:?}"),
         }
-        assert!(pending.lock().await.is_empty(), "nothing waits for the call");
+        assert!(
+            pending.lock().await.is_empty(),
+            "nothing waits for the call"
+        );
     }
 
     #[tokio::test]

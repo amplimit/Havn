@@ -2955,7 +2955,7 @@ type PieceSender = Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<ReplyPiece>
 /// A streamed call's text on its way to the tabs of the session its turn
 /// answers (issue #162). Dropping it, on any path, forgets the call.
 struct ReplyText {
-    sink: Box<llm_proxy::TextSink>,
+    sink: Box<llm_proxy::TextSink<'static>>,
     sender: PieceSender,
     forward: Option<tokio::task::JoinHandle<()>>,
 }
@@ -2991,7 +2991,7 @@ impl ReplyText {
         ));
         let pieces = Arc::clone(&sender);
         let asked = Arc::clone(asked);
-        let sink: Box<llm_proxy::TextSink> = Box::new(move |event| {
+        let sink: Box<llm_proxy::TextSink<'static>> = Box::new(move |event| {
             if asked.dropped.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
@@ -4194,6 +4194,139 @@ mod tests {
             Listed::open(&ctx.reply_streams, agent, &llm_request("r4")).is_none(),
             "a call of no turn cannot be stopped"
         );
+    }
+
+    #[tokio::test]
+    async fn a_stopped_call_answers_with_the_text_and_reasoning_the_tabs_were_shown() {
+        // A provider that writes some reasoning and text, then nothing more.
+        let events = [
+            r#"{"type":"message_start","message":{"id":"m1","type":"message","role":"assistant","model":"m","content":[],"stop_reason":null,"usage":{"input_tokens":5,"output_tokens":1}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Which first?"}}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Half of"}}"#,
+        ];
+        let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || async move {
+                let written = futures_util::stream::iter([Ok::<_, std::convert::Infallible>(body)]);
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    axum::body::Body::from_stream(futures_util::StreamExt::chain(
+                        written,
+                        futures_util::stream::pending(),
+                    )),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let mut ctx = ctx_with(false, false).await;
+        let mut endpoints = crate::config::Endpoints::default();
+        endpoints.0.insert(
+            "lan".into(),
+            crate::config::Endpoint {
+                api: crate::config::EndpointApi::Anthropic,
+                base_url: base,
+            },
+        );
+        ctx.llm = Arc::new(crate::config::LlmConfig {
+            endpoints,
+            ..crate::config::LlmConfig::default()
+        });
+        ctx.keyring = Some(crate::keyring::KeyRing::from_passphrase("stop-tests"));
+        ctx.models
+            .store(Arc::new(crate::model_catalog::ModelCatalog {
+                default_model: None,
+                title_model: None,
+                models: vec![crate::model_catalog::ModelEntry {
+                    id: "lan:m".into(),
+                    label: None,
+                    max_output_tokens: None,
+                    vision: None,
+                    thinking: None,
+                    context_window: None,
+                    fallback: Vec::new(),
+                    price: None,
+                }],
+            }));
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (agent, mut rx) = connected_agent(&ctx, owner, "a", serde_json::json!({})).await;
+        let session = Uuid::now_v7();
+        let (tab_tx, mut tab) = mpsc::channel(64);
+        let _tab = ctx.webchat_router.register(session, agent, tab_tx).await;
+
+        let req = LlmRequest {
+            model: "lan:m".into(),
+            reply: Some(havn_proto::ReplyStream {
+                channel_id: session.to_string(),
+                conversation: None,
+            }),
+            ..llm_request("r1")
+        };
+        dispatch(agent, AgentToGateway::LlmRequest(req), &ctx).await;
+        // The tab is shown what it wrote.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(crate::webchat::ServerMessage::ReplyText { text, thinking, .. }) =
+                    tab.recv().await
+                    && !thinking
+                    && text.contains("Half of")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the text is shown");
+        dispatch(
+            agent,
+            AgentToGateway::LlmCancel {
+                request_id: "r1".into(),
+                keep: true,
+            },
+            &ctx,
+        )
+        .await;
+        let answer = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(GatewayToAgent::LlmResponse(answer)) = rx.recv().await {
+                    break answer;
+                }
+            }
+        })
+        .await
+        .expect("answered at once");
+        server.abort();
+        assert_eq!(answer.request_id, "r1");
+        assert!(
+            matches!(answer.outcome, LlmOutcome::Ok),
+            "{:?}",
+            answer.outcome
+        );
+        assert_eq!(answer.provider_response["stop_reason"], llm_proxy::STOPPED);
+        assert_eq!(
+            answer.provider_response["content"],
+            serde_json::json!([
+                {"type": "thinking", "thinking": "Which first?"},
+                {"type": "text", "text": "Half of"}
+            ])
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ctx.reply_streams.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the call is forgotten");
     }
 
     fn refused(outcome: &LlmOutcome) -> bool {

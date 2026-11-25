@@ -111,7 +111,7 @@ impl LlmProvider for GeminiProvider {
         base_url: &str,
         api_key: &str,
         request: &AnthropicRequest,
-        text: &TextSink,
+        text: &TextSink<'_>,
     ) -> Result<AnthropicResponse, ProviderError> {
         if !is_plain_model_name(&request.model) {
             return Err(ProviderError::BadRequest {

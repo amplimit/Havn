@@ -1261,6 +1261,9 @@ mod tests {
         let Older::LlmCancel { request_id } = serde_json::from_str(&line).expect("parse");
         assert_eq!(request_id, "r1");
         let parsed: AgentToGateway = serde_json::from_str(&line).expect("parse");
-        assert!(matches!(parsed, AgentToGateway::LlmCancel { keep: true, .. }));
+        assert!(matches!(
+            parsed,
+            AgentToGateway::LlmCancel { keep: true, .. }
+        ));
     }
 }
