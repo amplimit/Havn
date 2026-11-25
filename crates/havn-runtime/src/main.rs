@@ -5363,16 +5363,17 @@ run ls"
         let (payment, again) = failure_text("upstream provider error: 402 — no credit left");
         assert!(payment.contains("payment") && !again, "{payment}");
         assert!(!payment.contains("no credit left"));
-        let (forbidden, again) =
-            failure_text("upstream provider error: 403 — not for this model");
+        let (forbidden, again) = failure_text("upstream provider error: 403 — not for this model");
         assert!(forbidden.contains("forbids") && !again, "{forbidden}");
         // What the provider said does not pass for the status.
         assert!(
             told("upstream provider error: 400 — says \"upstream provider error: 403 — x\"")
                 .contains("refused")
         );
-        assert!(told("the provider \"openai\" is unavailable (upstream 503: (429: x)) after 4 tries")
-            .contains("overloaded"));
+        assert!(
+            told("the provider \"openai\" is unavailable (upstream 503: (429: x)) after 4 tries")
+                .contains("overloaded")
+        );
         let (limited, again) = failure_text(
             "the provider \"openai\" is unavailable (429: insufficient_quota) after 4 tries",
         );

@@ -4789,7 +4789,11 @@ mod tests {
                 matches!(&err, ProxyError::Upstream { status: 403, message } if message == "not for this model"),
                 "{err}"
             );
-            assert_eq!(enabled(&db).await, [false, true], "the key refused is disabled");
+            assert_eq!(
+                enabled(&db).await,
+                [false, true],
+                "the key refused is disabled"
+            );
         }
 
         #[tokio::test]
@@ -4835,8 +4839,10 @@ mod tests {
             assert_eq!(provider_words("plain words\nand more"), "plain words");
             let long = "x".repeat(500);
             assert_eq!(provider_words(&long).chars().count(), 121);
-            assert!(!provider_words("<!DOCTYPE html><html><body>Forbidden</body></html>")
-                .contains("Forbidden"));
+            assert!(
+                !provider_words("<!DOCTYPE html><html><body>Forbidden</body></html>")
+                    .contains("Forbidden")
+            );
             assert!(provider_words("  <html><title>403</title>").contains("HTML page"));
         }
     }
