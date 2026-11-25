@@ -1879,10 +1879,36 @@ fn place_title(g: &havn_proto::channel::ChannelGroup) -> String {
     .join(" / ")
 }
 
-/// Places whose parents were kept since the gateway started, so each is
-/// written once, not on every message.
-static KNOWN_PARENTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+/// What was last kept of a place: its title and its parents' ids and
+/// titles.
+type Noted = (String, Vec<(String, String)>);
+
+/// What was last kept of each place since the gateway started, by
+/// `(channel, account, place)`, so it is written when it changes (issue
+/// #321), not on every message.
+static KNOWN_PARENTS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<(String, String, String), Noted>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// What a message says of a place, `now`, with a title it leaves out taken
+/// from what was kept (`kept`): an adapter that names a place on some
+/// messages only does not change it on the others.
+fn as_kept(mut now: Noted, kept: Option<&Noted>) -> Noted {
+    let Some((kept_title, kept_parents)) = kept else {
+        return now;
+    };
+    if now.0.is_empty() {
+        now.0.clone_from(kept_title);
+    }
+    for (id, title) in &mut now.1 {
+        if title.is_empty()
+            && let Some((_, kept)) = kept_parents.iter().find(|(kept_id, _)| kept_id == id)
+        {
+            title.clone_from(kept);
+        }
+    }
+    now
+}
 
 /// Keep what `g`'s group and thread are part of (issue #285), so the agent
 /// can send to them later while one of these may use the bot; the thread
@@ -1907,6 +1933,7 @@ async fn note_parents(
     };
     let space_title = cut(g.space.as_ref().and_then(|p| p.title.as_deref()));
     let group_title = cut(g.title.as_deref());
+    let thread_title = cut(g.thread.as_ref().and_then(|p| p.title.as_deref()));
     let space = g.space.as_ref().map(|p| Parent {
         id: &p.id,
         kind: PARENT_SPACE,
@@ -1917,30 +1944,39 @@ async fn note_parents(
         kind: PARENT_GROUP,
         title: &group_title,
     };
-    let mut links: Vec<(&str, Vec<Parent<'_>>)> = Vec::new();
+    let mut links: Vec<(&str, &str, Vec<Parent<'_>>)> = Vec::new();
     if let Some(space) = space {
-        links.push((g.id.as_str(), vec![space]));
+        links.push((g.id.as_str(), &group_title, vec![space]));
     }
     if let Some(thread) = g.thread.as_ref().filter(|_| with_thread) {
         links.push((
             thread.id.as_str(),
+            &thread_title,
             std::iter::once(group).chain(space).collect(),
         ));
     }
-    for (child, parents) in links {
-        let key = format!(
-            "{}|{}",
-            channel_id_codec::encode(channel, account_id, child),
+    for (child, child_title, parents) in links {
+        let place = (
+            channel.to_string(),
+            account_id.to_string(),
+            child.to_string(),
+        );
+        let noted: Noted = (
+            child_title.to_string(),
             parents
                 .iter()
-                .map(|p| format!("{}={}", p.id, p.title))
-                .collect::<Vec<_>>()
-                .join(",")
+                .map(|p| (p.id.to_string(), p.title.to_string()))
+                .collect(),
         );
-        let known = KNOWN_PARENTS
-            .lock()
-            .map(|known| known.contains(&key))
-            .unwrap_or(false);
+        let (noted, known) = match KNOWN_PARENTS.lock() {
+            Ok(known) => {
+                let kept = known.get(&place);
+                let noted = as_kept(noted, kept);
+                let same = kept == Some(&noted);
+                (noted, same)
+            }
+            Err(_) => (noted, false),
+        };
         if known {
             continue;
         }
@@ -1978,13 +2014,22 @@ async fn note_parents(
                 return false;
             }
         }
-        match channel_access::note_parents(&state.db, channel, account_id, child, &parents).await {
+        match channel_access::note_parents(
+            &state.db,
+            channel,
+            account_id,
+            child,
+            child_title,
+            &parents,
+        )
+        .await
+        {
             Ok(_) => {
                 if let Ok(mut known) = KNOWN_PARENTS.lock() {
-                    if known.len() >= GROUP_CONTEXT_GROUPS * 50 {
+                    if known.len() >= GROUP_CONTEXT_GROUPS * 50 && !known.contains_key(&place) {
                         known.clear();
                     }
-                    known.insert(key);
+                    known.insert(place, noted);
                 }
             }
             Err(e) => warn!(channel, error = %e, "could not keep what a group is part of"),
@@ -3500,10 +3545,15 @@ async fn channel_access_view(
                     .await
                     .map_err(internal)?
             };
+            // As it was last seen, renamed since it was let in or not
+            // (issue #321).
+            let title = channel_access::place_title(&state.db, channel, &account.id, &g.group_id)
+                .await
+                .map_err(internal)?;
             groups.push(GroupView {
                 sees_all: seeing.get(&g.group_id).copied(),
                 group_id: g.group_id,
-                title: own_title(g.title, in_space.as_ref()),
+                title: own_title(title, in_space.as_ref()),
                 source: g.source,
                 since: g.registered_at,
                 space,
@@ -3943,6 +3993,31 @@ pub async fn links_remove(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_left_out_counts_as_unchanged() {
+        let noted = |title: &str, space: &str| -> Noted {
+            (
+                title.into(),
+                vec![
+                    ("dc:c1".into(), String::new()),
+                    ("dc:s1".into(), space.into()),
+                ],
+            )
+        };
+        let kept = noted("plans", "Acme");
+        // Named, then not: the same as kept, so nothing is written.
+        assert_eq!(as_kept(noted("", ""), Some(&kept)), kept);
+        assert_eq!(as_kept(noted("plans", ""), Some(&kept)), kept);
+        // A new name is a change; with nothing kept, it is as it came.
+        assert_eq!(
+            as_kept(noted("ideas", ""), Some(&kept)),
+            noted("ideas", "Acme")
+        );
+        assert_eq!(as_kept(noted("", ""), None), noted("", ""));
+        // A parent kept under no title stays untitled.
+        assert_eq!(as_kept(noted("", ""), Some(&kept)).1[0].1, "");
+    }
 
     #[test]
     fn tokens_match_constant_time_basic() {
@@ -5563,12 +5638,117 @@ mod tests {
                 .iter()
                 .find(|g| g.group_id == "dc:c287")
                 .unwrap_or_else(|| panic!("{groups:?}"));
-            // Its name went with its refusal when the server was let in.
             assert!(!channel.space, "{channel:?}");
             assert_eq!(
                 channel.in_space.as_ref().map(|s| s.id.as_str()),
                 Some("dc:s287")
             );
+            while f.adapter.try_recv().is_ok() {}
+        }
+
+        #[tokio::test]
+        async fn a_channel_keeps_its_name_whichever_of_it_and_its_server_is_let_in_first() {
+            use crate::config::GroupPolicy;
+            use axum::extract::{Json, Path};
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            f.groups(GroupPolicy::Allowlist, &[]);
+            let place = |id: &str, title: &str| havn_proto::channel::ChannelPlace {
+                id: id.into(),
+                title: Some(title.into()),
+            };
+            let said_in = |space: &str, channel: &str, title: &str| {
+                let mut inb = text_from("dc:ann", "hi");
+                inb.group = Some(havn_proto::channel::ChannelGroup {
+                    id: channel.into(),
+                    title: Some(title.into()),
+                    sender_name: Some("Ann".into()),
+                    addressed: true,
+                    sees_all: Some(true),
+                    space: Some(place(space, "Acme")),
+                    thread: None,
+                });
+                inb
+            };
+            for (space, channel) in [("dc:s321", "dc:c321"), ("dc:s322", "dc:c322")] {
+                handle_inbound(&f.state, "telegram", said_in(space, channel, "general")).await;
+            }
+            let agent = agent_repo::list_for_owner(&f.state.db, f.owner)
+                .await
+                .expect("agents")
+                .remove(0);
+            let (owner, state) = (f.owner, f.state.clone());
+            let allow = |sender: &'static str| {
+                let state = state.clone();
+                let id = agent.id.to_string();
+                async move {
+                    channel_sender_allow(
+                        State(state),
+                        crate::auth::AuthedUser {
+                            id: owner,
+                            display_name: "owner".into(),
+                        },
+                        Path(id),
+                        Json(SenderChange {
+                            channel: "telegram".into(),
+                            account_id: "bot".into(),
+                            sender_id: sender.into(),
+                            group: true,
+                        }),
+                    )
+                    .await
+                    .expect("allow")
+                    .0
+                }
+            };
+            let named = |view: &ChannelAccessView, id: &str| {
+                let groups = &view.accounts[0].groups;
+                let g = groups
+                    .iter()
+                    .find(|g| g.group_id == id)
+                    .unwrap_or_else(|| panic!("{groups:?}"));
+                (
+                    g.title.clone(),
+                    g.in_space.as_ref().map(|s| s.title.clone()),
+                )
+            };
+            let general = ("general".to_string(), Some("Acme".to_string()));
+
+            // The channel first, then its server.
+            allow("dc:c321").await;
+            let view = allow("dc:s321").await;
+            assert_eq!(named(&view, "dc:c321"), general);
+            // The server first, which forgets the channel's refusal, then
+            // the channel: named as the adapter reported it.
+            allow("dc:s322").await;
+            let view = allow("dc:c322").await;
+            assert_eq!(named(&view, "dc:c322"), general);
+            assert_eq!(named(&view, "dc:s322").0, "Acme");
+
+            // Renamed once let in, it is named as it was last seen; renamed
+            // back, too.
+            let view = || {
+                let (state, id) = (state.clone(), agent.id.to_string());
+                async move {
+                    channel_access_get(
+                        State(state),
+                        crate::auth::AuthedUser {
+                            id: owner,
+                            display_name: "owner".into(),
+                        },
+                        Path(id),
+                    )
+                    .await
+                    .expect("view")
+                    .0
+                }
+            };
+            for title in ["chat", "general"] {
+                handle_inbound(&f.state, "telegram", said_in("dc:s322", "dc:c322", title)).await;
+                assert_eq!(
+                    named(&view().await, "dc:c322"),
+                    (title.to_string(), Some("Acme".to_string()))
+                );
+            }
             while f.adapter.try_recv().is_ok() {}
         }
 
