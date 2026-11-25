@@ -1814,10 +1814,14 @@ mod tests {
         assert!(!suggested(&pool, "k").await);
 
         // The agent's own: private, suggested when it says so.
-        remember(&pool, fact("s", "Ada", SUGGESTS)).await.expect("new");
+        remember(&pool, fact("s", "Ada", SUGGESTS))
+            .await
+            .expect("new");
         assert_eq!(shown(&pool, "s").await, Visibility::Private);
         assert!(suggested(&pool, "s").await);
-        remember(&pool, fact("k", "v1", SUGGESTS)).await.expect("repeat");
+        remember(&pool, fact("k", "v1", SUGGESTS))
+            .await
+            .expect("repeat");
         assert_eq!(shown(&pool, "k").await, Visibility::Private);
         assert!(suggested(&pool, "k").await, "a repeat can suggest it");
 
@@ -1827,7 +1831,9 @@ mod tests {
             .expect("set")
             .expect("found");
         assert!(!suggested(&pool, "s").await, "the owner decided");
-        remember(&pool, fact("s", "Ada", AGENT)).await.expect("repeat");
+        remember(&pool, fact("s", "Ada", AGENT))
+            .await
+            .expect("repeat");
         assert_eq!(shown(&pool, "s").await, Visibility::Public);
         // The owner editing it keeps it public too.
         remember(&pool, fact("s", "Ada L.", VisibilityRule::Keep))
@@ -1855,32 +1861,31 @@ mod tests {
             .expect("set")
             .expect("found");
         forget(&pool, "k").await.expect("forget");
-        remember(&pool, fact("k", "v1", AGENT)).await.expect("again");
+        remember(&pool, fact("k", "v1", AGENT))
+            .await
+            .expect("again");
         assert_eq!(shown(&pool, "k").await, Visibility::Private);
         assert!(!suggested(&pool, "k").await);
 
         // What the owner wrote in USER.md is public.
-        remember(&pool, fact("USER.md", "Call me Ada", VisibilityRule::Public))
-            .await
-            .expect("fold");
+        remember(
+            &pool,
+            fact("USER.md", "Call me Ada", VisibilityRule::Public),
+        )
+        .await
+        .expect("fold");
         assert_eq!(shown(&pool, "USER.md").await, Visibility::Public);
     }
 
     #[tokio::test]
     async fn public_facts_are_listed_most_recently_used_first_and_do_not_age_out() {
         let pool = connect_in_memory().await.expect("connect");
-        remember(
-            &pool,
-            fact("old", "used lately", VisibilityRule::Public),
-        )
-        .await
-        .expect("old");
-        remember(
-            &pool,
-            fact("new", "saved last", VisibilityRule::Public),
-        )
-        .await
-        .expect("new");
+        remember(&pool, fact("old", "used lately", VisibilityRule::Public))
+            .await
+            .expect("old");
+        remember(&pool, fact("new", "saved last", VisibilityRule::Public))
+            .await
+            .expect("new");
         remember(&pool, fact("hidden", "private", VisibilityRule::Keep))
             .await
             .expect("private");

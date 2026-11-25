@@ -70,9 +70,7 @@ pub fn changes(noted: Vec<Noted>) -> Vec<havn_proto::MemoryChange> {
                 return None;
             }
             let (action, value, kind) = match (&n.after, &n.before) {
-                (Some((_, value, kind, _, _)), _) => {
-                    (havn_proto::MemoryAction::Saved, value, kind)
-                }
+                (Some((_, value, kind, _, _)), _) => (havn_proto::MemoryAction::Saved, value, kind),
                 (None, Some((_, value, kind, _, _))) => {
                     (havn_proto::MemoryAction::Forgot, value, kind)
                 }
@@ -1148,7 +1146,6 @@ mod tests {
             .await;
     }
 
-
     /// Run `run` as the owner: in a private chat of theirs (`Some(false)`),
     /// in a group (`Some(true)`), or outside a chat turn (`None`: the
     /// heartbeat, a scheduled task).
@@ -1191,7 +1188,11 @@ mod tests {
             ),
         )
         .await;
-        assert!(r.text().contains("private, suggested public"), "{}", r.text());
+        assert!(
+            r.text().contains("private, suggested public"),
+            "{}",
+            r.text()
+        );
         let name = entry_of(&ctx, "user.name").await;
         assert_eq!(name.visibility, Visibility::Private);
         assert!(name.suggested_public);
