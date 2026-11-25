@@ -96,8 +96,12 @@ const NEGATIONS: [&str; 8] = [
     "not", "no", "never", "longer", "doesn't", "don't", "isn't", "aren't",
 ];
 
-/// Words that, before a version, make it an upper bound.
-const UPPER_BOUNDS: [&str; 6] = ["below", "before", "until", "under", "up to", "prior to"];
+/// What may stand between `Havn` and the version it asks for; `>` asks for
+/// a newer one than that.
+const BEFORE_VERSION: [&str; 13] = [
+    "gateway", "versions", "version", "版本", "at least", "between", ">=", "=>", "==", ">", "=",
+    "~", "^",
+];
 
 /// Where the adapters' releases install their binary. One found elsewhere
 /// was put there otherwise (built from source, a package): it is updated
@@ -1262,97 +1266,115 @@ fn plainly(line: &str) -> String {
     plain.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Whether `plain` names Havn: `havn` as a word of its own.
-fn names_havn(plain: &str) -> bool {
+/// Where `plain` names Havn: `havn` as a word of its own.
+fn havn_words(plain: &str) -> Vec<usize> {
     let word = |c: char| c.is_ascii_alphanumeric() || c == '-';
     plain
         .match_indices("havn")
-        .any(|(at, _)| !plain[..at].ends_with(word) && !plain[at + 4..].starts_with(word))
+        .map(|(at, _)| at)
+        .filter(|at| !plain[..*at].ends_with(word) && !plain[at + 4..].starts_with(word))
+        .collect()
 }
 
-/// Whether `plain` says something is required, other than that it is not.
-fn says_required(plain: &str) -> bool {
-    let words: Vec<String> = plain
-        .split(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '\'' | '’')))
-        .filter(|w| !w.is_empty())
-        .map(|w| w.replace('’', "'"))
-        .collect();
-    let english = words.iter().enumerate().any(|(i, w)| {
-        REQUIREMENT_WORDS.contains(&w.as_str())
-            && !(i > 0 && NEGATIONS.contains(&words[i - 1].as_str()))
-    });
-    english
-        || REQUIREMENT_WORDS_ZH.iter().any(|word| {
-            plain
-                .match_indices(word)
-                .any(|(at, _)| !plain[..at].ends_with('不') && !plain[..at].ends_with("不再"))
-        })
-}
-
-/// The oldest version each version in `plain` allows: `0.2.12` for
-/// `>= 0.2.12`, `v0.2.12+`, `~0.2.12` or `0.2.12`, `0.2.12` for `> 0.2.11`;
-/// one after `<` or `before` and the like is an upper bound, left out.
-fn versions_in(plain: &str) -> Vec<(u64, u64, u64)> {
-    let mut found = Vec::new();
-    for (at, c) in plain.char_indices() {
-        if !c.is_ascii_digit() {
-            continue;
+/// Where `plain` first says something is required, other than that it is
+/// not.
+fn required_at(plain: &str) -> Option<usize> {
+    let mut words: Vec<(usize, String)> = Vec::new();
+    let mut start = None;
+    for (at, c) in plain.char_indices().chain([(plain.len(), ' ')]) {
+        let inside = c.is_alphanumeric() || matches!(c, '-' | '\'' | '’');
+        match (inside, start) {
+            (true, None) => start = Some(at),
+            (false, Some(from)) => {
+                words.push((from, plain[from..at].replace('’', "'")));
+                start = None;
+            }
+            _ => {}
         }
-        let before = &plain[..at];
-        let before = before.strip_suffix('v').unwrap_or(before);
-        if before.ends_with(|c: char| c.is_alphanumeric() || c == '.') {
-            continue;
-        }
-        let text: String = plain[at..]
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '.')
-            .collect();
-        let text = text.trim_end_matches('.');
-        if plain[at + text.len()..].starts_with(|c: char| c.is_ascii_alphanumeric()) {
-            continue;
-        }
-        let Some((major, minor, patch)) = release::parse_version(text) else {
-            continue;
-        };
-        let operator = before.trim_end();
-        let upper = operator.ends_with(['<', '≤'])
-            || operator.ends_with("<=")
-            || UPPER_BOUNDS.iter().any(|bound| {
-                operator
-                    .strip_suffix(bound)
-                    .is_some_and(|rest| !rest.ends_with(|c: char| c.is_alphanumeric()))
-            });
-        if upper {
-            continue;
-        }
-        let after = operator.ends_with('>') && !operator.ends_with("=>");
-        found.push((major, minor, patch + u64::from(after)));
     }
-    found
+    let english = words.iter().enumerate().find_map(|(i, (at, w))| {
+        (REQUIREMENT_WORDS.contains(&w.as_str())
+            && !(i > 0 && NEGATIONS.contains(&words[i - 1].1.as_str())))
+        .then_some(*at)
+    });
+    let chinese = REQUIREMENT_WORDS_ZH
+        .iter()
+        .flat_map(|word| plain.match_indices(word))
+        .map(|(at, _)| at)
+        .filter(|at| !plain[..*at].ends_with('不') && !plain[..*at].ends_with("不再"))
+        .min();
+    english.into_iter().chain(chinese).min()
 }
 
-/// Whether `line`, trimmed, is an item of a Markdown list.
-fn list_item(line: &str) -> bool {
-    let numbered = line.split_once(['.', ')']).is_some_and(|(n, rest)| {
-        !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && rest.starts_with(' ')
-    });
-    numbered || ["- ", "* ", "+ "].iter().any(|mark| line.starts_with(mark))
+/// The oldest version `rest`, what follows `Havn`, asks for: `0.2.12` for
+/// `0.2.12`, `v0.2.12+`, `>= 0.2.12`, `version 0.2.12` or `> 0.2.11`. `None`
+/// when none can be read there, as for a pre-release or build such as
+/// `0.3.0-beta`.
+fn version_after(rest: &str) -> Option<(u64, u64, u64)> {
+    let mut rest = rest.trim_start();
+    let mut newer = false;
+    while let Some((lead, after)) = BEFORE_VERSION.iter().find_map(|lead| {
+        let after = rest.strip_prefix(lead)?;
+        let whole = !lead.ends_with(|c: char| c.is_ascii_alphabetic())
+            || !after.starts_with(|c: char| c.is_alphanumeric());
+        whole.then_some((*lead, after))
+    }) {
+        newer |= lead == ">";
+        rest = after.trim_start();
+    }
+    let rest = rest.strip_prefix('v').unwrap_or(rest);
+    let taken = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(rest.len());
+    let suffix = &rest[taken..];
+    let suffix = suffix.strip_prefix(['+', '-']).unwrap_or(suffix);
+    if suffix.starts_with(|c: char| c.is_alphanumeric()) {
+        return None;
+    }
+    let (major, minor, patch) = release::parse_version(rest[..taken].trim_end_matches('.'))?;
+    Some((major, minor, patch + u64::from(newer)))
+}
+
+/// What each mention of Havn in `plain` from `from` on asks for.
+fn asked(plain: &str, from: usize) -> Vec<Option<(u64, u64, u64)>> {
+    havn_words(plain)
+        .into_iter()
+        .filter(|at| *at >= from)
+        .map(|at| version_after(&plain[at + 4..]))
+        .collect()
+}
+
+/// The text of `line`, trimmed, when it is an item of a Markdown list.
+fn list_item(line: &str) -> Option<&str> {
+    if let Some((n, rest)) = line.split_once(['.', ')'])
+        && !n.is_empty()
+        && n.bytes().all(|b| b.is_ascii_digit())
+        && rest.starts_with(' ')
+    {
+        return Some(rest.trim_start());
+    }
+    ["- ", "* ", "+ "]
+        .iter()
+        .find_map(|mark| line.strip_prefix(mark))
+        .map(str::trim_start)
 }
 
 /// What a release's `notes` say of the oldest gateway it works with:
 /// `None` when nothing does, else the highest version they ask for, or the
 /// first line that asks for one but names none that can be read. A line
-/// asks when it names Havn and says it is required (`Requires Havn >=
-/// X.Y.Z`, `Minimum Havn version: X.Y.Z`, `需要 Havn X.Y.Z`), or names
-/// Havn in a list under a heading or a line ending in `:` that says what is
-/// required; one naming Havn that ends in `:` takes its versions from its
-/// list.
+/// asks when it says something is required and then names Havn (`Requires
+/// Havn >= X.Y.Z`, `Minimum Havn version: X.Y.Z`, `需要 Havn X.Y.Z`), or
+/// is an item naming Havn in a list under a heading or a line ending in
+/// `:` that says what is required; one naming Havn that ends in `:` takes
+/// its version from the items. What a line asks for is the version right
+/// after `Havn`; others on it are not looked at.
 fn requires(notes: &str) -> Option<Result<String, String>> {
-    // The list a heading (until the next) or a line (until one that is not
-    // an item) opened: whether that named Havn, and it, while no version
-    // has been found for it.
+    // The list a heading (until the next) or a line (until a blank or other
+    // line after its items) opened: whether it had items yet, whether it
+    // named Havn, and it, while no version has been found for it.
     struct Scope {
         heading: bool,
+        items: bool,
         named: bool,
         waiting: Option<String>,
     }
@@ -1362,21 +1384,24 @@ fn requires(notes: &str) -> Option<Result<String, String>> {
         let raw = line.trim();
         let heading = raw.starts_with('#');
         let item = list_item(raw);
-        if scope
-            .as_ref()
-            .is_some_and(|s| heading || (!s.heading && !item))
-            && let Some(waiting) = scope.take().and_then(|s| s.waiting)
-        {
+        let ends = scope.as_ref().is_some_and(|s| {
+            heading
+                || (!s.heading
+                    && if raw.is_empty() {
+                        s.items
+                    } else {
+                        item.is_none()
+                    })
+        });
+        if ends && let Some(waiting) = scope.take().and_then(|s| s.waiting) {
             return Some(Err(waiting));
         }
         if raw.is_empty() {
             continue;
         }
         let plain = plainly(raw);
-        let required = says_required(&plain);
-        let havn = names_havn(&plain);
-        let versions = versions_in(&plain);
-        let opens = required
+        let required = required_at(&plain);
+        let opens = required.is_some()
             && (heading
                 || raw.trim_end_matches(['*', '_', '`']).ends_with(':')
                 || plain
@@ -1386,29 +1411,43 @@ fn requires(notes: &str) -> Option<Result<String, String>> {
             if let Some(waiting) = scope.take().and_then(|s| s.waiting) {
                 return Some(Err(waiting));
             }
-            if havn {
-                highest = highest.max(versions.iter().max().copied());
-            }
+            let mentions = required.map_or_else(Vec::new, |at| asked(&plain, at));
+            let found = mentions.iter().flatten().max().copied();
+            highest = highest.max(found);
             scope = Some(Scope {
                 heading,
-                named: havn,
-                waiting: (havn && versions.is_empty()).then(|| raw.to_string()),
+                items: false,
+                named: !mentions.is_empty(),
+                waiting: (!mentions.is_empty() && found.is_none()).then(|| raw.to_string()),
             });
             continue;
         }
-        let listed = item
-            && scope
-                .as_ref()
-                .is_some_and(|s| havn || (s.named && !versions.is_empty()));
-        let asks = (havn && required) || listed;
-        if !asks {
+        let mentions = match (scope.as_mut(), item) {
+            (Some(s), Some(text)) => {
+                s.items = true;
+                let mentions = asked(&plain, 0);
+                // Under a line that named Havn, the item is its version.
+                if mentions.is_empty() && s.named {
+                    version_after(&plainly(text))
+                        .map(Some)
+                        .into_iter()
+                        .collect()
+                } else {
+                    mentions
+                }
+            }
+            _ => required.map_or_else(Vec::new, |at| asked(&plain, at)),
+        };
+        if mentions.is_empty() {
             continue;
         }
-        if versions.is_empty() {
+        let Some(found) = mentions.iter().flatten().max().copied() else {
             return Some(Err(raw.to_string()));
-        }
-        highest = highest.max(versions.iter().max().copied());
-        if listed && let Some(s) = scope.as_mut() {
+        };
+        highest = highest.max(Some(found));
+        if item.is_some()
+            && let Some(s) = scope.as_mut()
+        {
             s.waiting = None;
         }
     }
@@ -1660,10 +1699,19 @@ async fn restart_watched(
 }
 
 /// The units of `adapter` by their own name, an alias once; and apart, with
-/// why, those that run inside another root and, running, do not run the
-/// file at `binary` (the list names them under it, as v0.2.13 could write
-/// it, but they run a binary of their own), which are left alone.
+/// what the table says of them, those that run inside another root and do
+/// not run the file at `binary` or an older copy of it (the list names them
+/// under it, as v0.2.13 could write it, but they run a binary of their
+/// own), or that could not be looked at, not running: they are left alone.
 fn units_of(adapter: &Adapter, binary: &Path, host: &impl Host) -> (Vec<String>, Vec<String>) {
+    let old = binary.with_file_name(format!(
+        "{}.old",
+        binary
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+    ));
+    let deleted = format!("{} (deleted)", binary.display());
     let mut units = Vec::new();
     let mut apart = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -1679,17 +1727,42 @@ fn units_of(adapter: &Adapter, binary: &Path, host: &impl Host) -> (Vec<String>,
         }
         if let Some(root) = &exec.root {
             let shown = host.show(&unit);
-            let other = shown.state == "active"
-                && shown.pid > 0
-                && host.exe(shown.pid, binary).is_some_and(|(_, same)| !same);
-            if other {
+            if shown.state != "active" || shown.pid == 0 {
+                let state = if shown.state.is_empty() {
+                    "not running"
+                } else {
+                    shown.state.as_str()
+                };
                 apart.push(format!(
-                    "{unit} runs another binary under {root}, though {COMPONENTS} lists it under \
-                     {}; {}",
-                    adapter.name,
-                    rooted_advice(root, true)
+                    "not checked: {unit} runs under {root} and is {state}, so what it runs cannot \
+                     be told; it is left as it is"
                 ));
                 continue;
+            }
+            // One not restarted since the binary was last replaced runs the
+            // one before, now `<binary>.old` or deleted.
+            let runs = host.exe(shown.pid, binary).map(|(path, same)| {
+                same || path.as_os_str() == deleted.as_str()
+                    || host.exe(shown.pid, &old).is_some_and(|(_, same)| same)
+            });
+            match runs {
+                Some(true) => {}
+                Some(false) => {
+                    apart.push(format!(
+                        "not managed: {unit} runs another binary under {root}, though \
+                         {COMPONENTS} lists it under {}; {}",
+                        adapter.name,
+                        rooted_advice(root, true)
+                    ));
+                    continue;
+                }
+                None => {
+                    apart.push(format!(
+                        "not checked: cannot tell what {unit} runs under {root}; it is left as \
+                         it is"
+                    ));
+                    continue;
+                }
             }
         }
         units.push(unit);
@@ -2054,13 +2127,8 @@ async fn update_components(
             )
             .await,
         );
-        for why in apart {
-            rows.push(Row::new(
-                &adapter.name,
-                "-",
-                "-",
-                &format!("not managed: {why}"),
-            ));
+        for result in apart {
+            rows.push(Row::new(&adapter.name, "-", "-", &result));
         }
     }
     for (adapter, why) in &gathered.unmanaged {
@@ -2638,10 +2706,23 @@ mod tests {
             ("Requires Havn 0.2.12\nRequires Havn >= 0.2.14", "0.2.14"),
             ("Requires Havn >= 0.2.12, < 0.3.0", "0.2.12"),
             ("Requires Havn 0.2.12 up to 0.2.20", "0.2.12"),
+            // Only the version right after Havn is what it asks for.
             (
-                "Requires Havn version checks to pass (from 0.2.12)",
-                "0.2.12",
+                "Needs Rust 1.85.0 to build; works with Havn 0.2.10",
+                "0.2.10",
             ),
+            ("Requires Havn 0.2.14, tested on 0.2.30", "0.2.14"),
+            (
+                "Requires Havn 0.2.14 or later (0.2.16 recommended)",
+                "0.2.14",
+            ),
+            ("Requires Havn 0.2.14 to 0.2.99", "0.2.14"),
+            ("Requires Havn 0.2.14 - 0.2.99", "0.2.14"),
+            ("Requires Havn between 0.2.14 and 0.3.0", "0.2.14"),
+            ("Requires Havn 0.2.14 or 0.3.0", "0.2.14"),
+            ("Requires Havn >= 0.2.14 (Havn's new API)", "0.2.14"),
+            ("Requires:\n\n- Havn >= 0.2.14", "0.2.14"),
+            ("Requires Havn 0.2.14+", "0.2.14"),
         ] {
             assert_eq!(requires(notes), Some(Ok(wanted.to_string())), "{notes}");
         }
@@ -2653,6 +2734,10 @@ mod tests {
             "Requires at least Havn v2",
             "This requires Havn to restart.",
             "Requires Havn version checks to pass",
+            "Requires Havn version checks to pass (from 0.2.12)",
+            "requires Havn 1.0.0-beta",
+            "Requires Havn 0.2.14+build.5",
+            "Requires Havn 0.2.14-0.2.99",
         ] {
             assert_eq!(
                 requires(unreadable),
@@ -2681,6 +2766,8 @@ mod tests {
             "## Requirements\n- Rust 1.80",
             "Requires:\n- a bot token\n\n- Havn 0.3.0 is out",
             "## Changes\n- Works with Havn 0.3.0",
+            "Havn 0.2.13 requires a restart",
+            "Requires:\n\nThanks to all\n- Havn 0.3.0 is out",
         ] {
             assert_eq!(requires(unrelated), None, "{unrelated}");
         }
@@ -2751,9 +2838,10 @@ mod tests {
     /// restart with `lose_old`. For the first `executor` looks after each
     /// restart, the process is still systemd's. With `inside`, the binary
     /// is seen at that path, as from a unit's own root; the units in
-    /// `apart` run another file at the binary's path. `execs` are the
-    /// units' `ExecStart=`, and `roots` their `RootDirectory=` or
-    /// `RootImage=`.
+    /// `apart` run another file at the binary's path, and until a restart
+    /// those in `pids` run as that process (none, stopped, for 0).
+    /// `execs` are the units' `ExecStart=`, and `roots` their
+    /// `RootDirectory=` or `RootImage=`.
     struct Fake {
         binary: PathBuf,
         old: &'static str,
@@ -2769,6 +2857,7 @@ mod tests {
         execs: Vec<(&'static str, &'static str, &'static str)>,
         roots: Vec<(&'static str, &'static str)>,
         apart: Vec<&'static str>,
+        pids: Vec<(&'static str, u32)>,
         restarted: std::cell::RefCell<Vec<String>>,
     }
 
@@ -2789,6 +2878,7 @@ mod tests {
                 execs: Vec::new(),
                 roots: Vec::new(),
                 apart: Vec::new(),
+                pids: Vec::new(),
                 restarted: std::cell::RefCell::new(Vec::new()),
             }
         }
@@ -2827,8 +2917,17 @@ mod tests {
 
         fn show(&self, unit: &str) -> Shown {
             let started = !self.restarted.borrow().is_empty();
+            let before = self
+                .pids
+                .iter()
+                .find(|(u, _)| !started && *u == unit)
+                .map(|(_, pid)| *pid);
             let state = if !started {
-                if self.running { "active" } else { "inactive" }
+                if self.running && before != Some(0) {
+                    "active"
+                } else {
+                    "inactive"
+                }
             } else if self.fresh() && self.failing.contains(&unit) {
                 "failed"
             } else {
@@ -2841,7 +2940,7 @@ mod tests {
                 pid: if self.apart.contains(&unit) {
                     APART
                 } else {
-                    42
+                    before.unwrap_or(42)
                 },
             }
         }
@@ -2860,8 +2959,14 @@ mod tests {
         }
 
         fn exe(&self, pid: u32, binary: &Path) -> Option<(PathBuf, bool)> {
-            if pid == APART {
-                return Some((self.binary.clone(), false));
+            let old = self.binary.with_file_name("havn-channel-test.old");
+            match pid {
+                APART => return Some((self.binary.clone(), false)),
+                DELETED => {
+                    return Some((format!("{} (deleted)", self.binary.display()).into(), false));
+                }
+                OLDER => return Some(("/srv/bind/havn-channel-test".into(), binary == old)),
+                _ => {}
             }
             let looks = self.looks.get();
             self.looks.set(looks + 1);
@@ -2882,6 +2987,11 @@ mod tests {
 
     /// The process of a unit in [`Fake::apart`].
     const APART: u32 = 43;
+
+    /// A process that runs the binary before it was replaced, read as
+    /// deleted, and one that runs it as `<binary>.old`, seen from its root.
+    const DELETED: u32 = 44;
+    const OLDER: u32 = 45;
 
     const QUICK: Watch = Watch {
         settle: Duration::ZERO,
@@ -3061,6 +3171,75 @@ mod tests {
                 (runs.clone(), false),
                 (runs, false)
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_unit_of_its_own_root_is_restarted_only_when_it_runs_this_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let rooted = |adapter: &Adapter, pids: Vec<(&'static str, u32)>| Fake {
+            execs: vec![("bind.service", "bind.service", "")],
+            roots: vec![("bind.service", "RootDirectory=/srv/bind")],
+            pids,
+            ..Fake::new(&adapter.binary)
+        };
+
+        // It runs the binary as it was before the last update: deleted, or
+        // kept as `.old`. It is restarted on this one.
+        for pid in [DELETED, OLDER] {
+            let (mut adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+            adapter.units.push("bind.service".into());
+            let fake = rooted(&adapter, vec![("bind.service", pid)]);
+            assert_eq!(
+                units_of(&adapter, &adapter.binary, &fake),
+                (vec!["test.service".into(), "bind.service".into()], vec![]),
+                "{pid}"
+            );
+            assert_eq!(
+                install_on(&fake, &adapter, &archive, &sums, true, QUICK).await,
+                Ok("updated".into())
+            );
+            assert_eq!(
+                *fake.restarted.borrow(),
+                vec!["test.service", "bind.service"]
+            );
+        }
+
+        // Stopped, so what it runs cannot be told: left as it is.
+        let (mut adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        adapter.units.push("bind.service".into());
+        let fake = rooted(&adapter, vec![("bind.service", 0)]);
+        assert_eq!(
+            units_of(&adapter, &adapter.binary, &fake),
+            (
+                vec!["test.service".into()],
+                vec![
+                    "not checked: bind.service runs under RootDirectory=/srv/bind and is \
+                     inactive, so what it runs cannot be told; it is left as it is"
+                        .into()
+                ]
+            )
+        );
+        assert_eq!(
+            install_on(&fake, &adapter, &archive, &sums, true, QUICK).await,
+            Ok("updated".into())
+        );
+        assert_eq!(*fake.restarted.borrow(), vec!["test.service"]);
+
+        // A binary of its own: left alone, its adapter's other units not.
+        let (mut adapter, _, _) = adapter_at(dir.path(), "0.2.11");
+        adapter.units.push("bind.service".into());
+        let fake = Fake {
+            apart: vec!["bind.service"],
+            ..rooted(&adapter, Vec::new())
+        };
+        let (units, apart) = units_of(&adapter, &adapter.binary, &fake);
+        assert_eq!(units, vec!["test.service"]);
+        assert!(
+            apart[0].starts_with(
+                "not managed: bind.service runs another binary under RootDirectory=/srv/bind"
+            ),
+            "{apart:?}"
         );
     }
 
