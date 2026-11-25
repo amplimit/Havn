@@ -1,6 +1,5 @@
 # Havn
 
-[![CI](https://github.com/amplimit/Havn/actions/workflows/ci.yml/badge.svg)](https://github.com/amplimit/Havn/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/amplimit/Havn?sort=semver)](https://github.com/amplimit/Havn/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg?logo=rust)](rust-toolchain.toml)
