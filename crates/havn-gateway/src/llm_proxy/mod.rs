@@ -335,6 +335,7 @@ pub async fn complete_with_provider(
         request,
         llm.max_tokens_ceiling,
         None,
+        None,
     )
     .await;
     if billing.agent_id.is_some() {
@@ -343,9 +344,12 @@ pub async fn complete_with_provider(
     result
 }
 
-/// [`complete_with_provider`], streaming: the reply's text goes to `text`
-/// as the provider writes it (issue #162), and a retry on another
-/// credential first sends [`provider::TextEvent::Restart`].
+/// [`complete_with_provider`] for a turn answering someone: streaming when
+/// given `text`, where the reply's text goes as the provider writes it
+/// (issue #162), and a retry on another credential first sends
+/// [`provider::TextEvent::Restart`]. Once `cut` is cancelled the provider
+/// is no longer read, and the call answers with what it had written,
+/// marked [`STOPPED`] (issue #305).
 #[allow(
     clippy::too_many_arguments,
     reason = "one call site per caller; a parameter struct would only rename them"
@@ -359,7 +363,8 @@ pub async fn stream_with_provider(
     max_output_tokens: Option<u32>,
     request: &AnthropicRequest,
     llm: &LlmConfig,
-    text: &provider::TextSink,
+    text: Option<&provider::TextSink>,
+    cut: &tokio_util::sync::CancellationToken,
 ) -> Result<AnthropicResponse, ProxyError> {
     let route = route(provider_name, max_output_tokens, llm)?;
     let result = complete_through(
@@ -370,7 +375,8 @@ pub async fn stream_with_provider(
         billing,
         request,
         llm.max_tokens_ceiling,
-        Some(text),
+        text,
+        Some(cut),
     )
     .await;
     if billing.agent_id.is_some() {
@@ -443,6 +449,102 @@ fn with_max_tokens(request: &AnthropicRequest, max_tokens: u32) -> Cow<'_, Anthr
     }
 }
 
+/// The `stop_reason` of a call cut short (issue #305).
+pub const STOPPED: &str = "stopped";
+
+/// What a streamed call wrote: its reply's text and its reasoning.
+#[derive(Default)]
+struct Written {
+    text: String,
+    reasoning: String,
+}
+
+impl Written {
+    fn add(&mut self, event: provider::TextEvent<'_>) {
+        match event {
+            provider::TextEvent::Text(piece) => self.text.push_str(piece),
+            provider::TextEvent::Reasoning(piece) => self.reasoning.push_str(piece),
+            provider::TextEvent::Restart => *self = Self::default(),
+        }
+    }
+
+    /// The tokens it took, as estimated for a request.
+    fn tokens(&self) -> i64 {
+        let mut count = Count::default();
+        count.text(&self.text);
+        count.text(&self.reasoning);
+        i64::try_from(count.tokens()).unwrap_or(i64::MAX)
+    }
+
+    /// The answer of a call cut short: what it wrote, its reasoning
+    /// first, and no tool call.
+    fn response(&self, model: &str, usage: AnthropicUsage) -> AnthropicResponse {
+        let mut content = Vec::new();
+        if !self.reasoning.is_empty() {
+            content.push(serde_json::json!({"type": "thinking", "thinking": self.reasoning}));
+        }
+        if !self.text.is_empty() {
+            content.push(serde_json::json!({"type": "text", "text": self.text}));
+        }
+        AnthropicResponse {
+            id: String::new(),
+            model: model.to_string(),
+            role: "assistant".into(),
+            content: serde_json::Value::Array(content),
+            stop_reason: Some(STOPPED.into()),
+            usage,
+        }
+    }
+}
+
+/// The answer of a call cut short, with its use recorded: estimated from
+/// what it wrote when it streamed; otherwise what it wrote is not known,
+/// and its reservation stands.
+async fn cut_answer(
+    guard: ReservationGuard,
+    streamed: bool,
+    model: &str,
+    tokens_in: i64,
+    written: &std::sync::Mutex<Written>,
+) -> AnthropicResponse {
+    let written = std::mem::take(
+        &mut *written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    let tokens_out = if streamed {
+        let tokens_out = written.tokens();
+        guard.settle_tokens(model, tokens_in, tokens_out).await;
+        tokens_out
+    } else {
+        guard.keep();
+        0
+    };
+    info!(model, out = tokens_out, "llm call cut short");
+    let usage = AnthropicUsage {
+        input_tokens: u64::try_from(tokens_in).unwrap_or(0),
+        output_tokens: u64::try_from(tokens_out).unwrap_or(0),
+        ..AnthropicUsage::default()
+    };
+    written.response(model, usage)
+}
+
+/// `work`, unless `cut` is cancelled first: then `None`, and `work` is
+/// dropped, which stops reading from the provider.
+async fn until_cut<T>(
+    cut: Option<&tokio_util::sync::CancellationToken>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    match cut {
+        Some(cut) => tokio::select! {
+            biased;
+            () = cut.cancelled() => None,
+            out = work => Some(out),
+        },
+        None => Some(work.await),
+    }
+}
+
 /// `max_tokens` is clamped to the model's known output limit and to
 /// `max_tokens_ceiling` before anything is reserved or sent.
 #[allow(
@@ -458,7 +560,20 @@ async fn complete_through(
     request: &AnthropicRequest,
     max_tokens_ceiling: u32,
     text: Option<&provider::TextSink>,
+    cut: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<AnthropicResponse, ProxyError> {
+    // What the call wrote so far, for an answer cut short.
+    let written = std::sync::Mutex::new(Written::default());
+    let passing = |event: provider::TextEvent<'_>| {
+        written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .add(event);
+        if let Some(text) = text {
+            text(event);
+        }
+    };
+    let text: Option<&provider::TextSink> = text.map(|_| &passing as &provider::TextSink);
     let max_tokens = provider::clamp_max_tokens(
         &request.model,
         route.max_output_tokens,
@@ -467,6 +582,9 @@ async fn complete_through(
     );
     let request = with_max_tokens(request, max_tokens);
     let request = request.as_ref();
+    if cut.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return Ok(Written::default().response(&request.model, AnthropicUsage::default()));
+    }
 
     // An endpoint's keys are `llm:<name>` only: a bare name may be any
     // other kind of key's.
@@ -579,8 +697,14 @@ async fn complete_through(
             }
             sent = true;
             tries += 1;
-            let attempt =
-                try_one(http, keyring, route, cred.as_ref(), &attempt_request, text).await;
+            let Some(attempt) = until_cut(
+                cut,
+                try_one(http, keyring, route, cred.as_ref(), &attempt_request, text),
+            )
+            .await
+            else {
+                return Ok(cut_answer(guard, text.is_some(), &request.model, tokens_in, &written).await);
+            };
             if let Attempt::TryNext {
                 reason,
                 again: Some(asked),
@@ -599,7 +723,11 @@ async fn complete_through(
                         wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
                         "provider failed for now; trying again"
                     );
-                    tokio::time::sleep(wait).await;
+                    if until_cut(cut, tokio::time::sleep(wait)).await.is_none() {
+                        return Ok(
+                            cut_answer(guard, text.is_some(), &request.model, tokens_in, &written).await,
+                        );
+                    }
                     continue;
                 }
             }
@@ -3667,6 +3795,22 @@ mod tests {
                     usage,
                 })
             }
+
+            /// Writes some reasoning and text first, then answers as
+            /// `complete`.
+            async fn stream(
+                &self,
+                http: &reqwest::Client,
+                base_url: &str,
+                api_key: &str,
+                request: &AnthropicRequest,
+                text: &provider::TextSink,
+            ) -> Result<AnthropicResponse, ProviderError> {
+                text(provider::TextEvent::Reasoning("Which first?"));
+                text(provider::TextEvent::Text("Half of "));
+                text(provider::TextEvent::Text("it"));
+                self.complete(http, base_url, api_key, request).await
+            }
         }
 
         struct Fixture {
@@ -3753,6 +3897,7 @@ mod tests {
                 billing,
                 request,
                 ceiling,
+                None,
                 None,
             )
             .await
@@ -3860,6 +4005,111 @@ mod tests {
             })
             .await
             .expect("reservation released");
+        }
+
+        /// A call of `provider` that takes a minute, cut once it started;
+        /// whether it streamed decides what it answers.
+        async fn cut_call(
+            f: &Arc<Fixture>,
+            provider: &Arc<FakeProvider>,
+            streamed: bool,
+        ) -> AnthropicResponse {
+            let cut = tokio_util::sync::CancellationToken::new();
+            let task = {
+                let (f, provider, cut) = (Arc::clone(f), Arc::clone(provider), cut.clone());
+                tokio::spawn(async move {
+                    let sink = |_: provider::TextEvent<'_>| {};
+                    complete_through(
+                        &f.db,
+                        &reqwest::Client::new(),
+                        &KeyRing::from_passphrase(PASSPHRASE),
+                        Route {
+                            provider: provider.as_ref(),
+                            name: "anthropic",
+                            base_url: provider.default_base_url(),
+                            max_output_tokens: None,
+                            keyless: false,
+                        },
+                        &f.billing,
+                        &ask(300),
+                        CEILING,
+                        streamed.then_some(&sink as &provider::TextSink),
+                        Some(&cut),
+                    )
+                    .await
+                })
+            };
+            while provider.seen().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            cut.cancel();
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("answered at once")
+                .expect("join")
+                .expect("an answer")
+        }
+
+        #[tokio::test]
+        async fn a_cut_call_answers_with_what_it_wrote_and_records_that_use() {
+            let db = havn_db::connect_in_memory().await.expect("db");
+            let f = Arc::new(fixture(db, json!({})).await);
+            let provider = FakeProvider::new(Reply::Ok, Duration::from_secs(60));
+            let answer = cut_call(&f, &provider, true).await;
+            assert_eq!(answer.stop_reason.as_deref(), Some(STOPPED));
+            assert_eq!(
+                answer.content,
+                json!([
+                    {"type": "thinking", "thinking": "Which first?"},
+                    {"type": "text", "text": "Half of it"}
+                ])
+            );
+            // As estimated, not the 300 tokens reserved.
+            let row = rows(&f.db).await.pop().expect("row");
+            assert_eq!((row.2, row.3), (input_token_estimate(&ask(300)), 11));
+        }
+
+        #[tokio::test]
+        async fn a_cut_call_that_did_not_stream_keeps_its_reservation() {
+            let db = havn_db::connect_in_memory().await.expect("db");
+            let f = Arc::new(fixture(db, json!({})).await);
+            let provider = FakeProvider::new(Reply::Ok, Duration::from_secs(60));
+            let answer = cut_call(&f, &provider, false).await;
+            assert_eq!(answer.stop_reason.as_deref(), Some(STOPPED));
+            assert_eq!(answer.content, json!([]));
+            let row = rows(&f.db).await.pop().expect("row");
+            assert_eq!((row.2, row.3), (input_token_estimate(&ask(300)), 300));
+        }
+
+        #[tokio::test]
+        async fn a_call_cut_before_it_starts_is_not_made() {
+            let db = havn_db::connect_in_memory().await.expect("db");
+            let f = fixture(db, json!({})).await;
+            let provider = FakeProvider::new(Reply::Ok, Duration::ZERO);
+            let cut = tokio_util::sync::CancellationToken::new();
+            cut.cancel();
+            let answer = complete_through(
+                &f.db,
+                &reqwest::Client::new(),
+                &KeyRing::from_passphrase(PASSPHRASE),
+                Route {
+                    provider: provider.as_ref(),
+                    name: "anthropic",
+                    base_url: provider.default_base_url(),
+                    max_output_tokens: None,
+                    keyless: false,
+                },
+                &f.billing,
+                &ask(300),
+                CEILING,
+                None,
+                Some(&cut),
+            )
+            .await
+            .expect("an answer");
+            assert_eq!(answer.stop_reason.as_deref(), Some(STOPPED));
+            assert!(provider.seen().is_empty());
+            assert!(rows(&f.db).await.is_empty());
         }
 
         #[tokio::test]
@@ -4275,7 +4525,8 @@ mod tests {
                     None,
                     &hi(),
                     &llm,
-                    &sink,
+                    Some(&sink),
+                    &tokio_util::sync::CancellationToken::new(),
                 )
                 .await
                 .expect("answer");

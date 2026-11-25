@@ -177,12 +177,17 @@ pub struct LoopHandle {
     /// recursively).
     pub billing_user_id: Option<String>,
     /// Cancelled when the user stops the turn: the loop ends at once,
-    /// dropping the model call or tool call in flight.
+    /// dropping the tool call in flight, and the model call unless the
+    /// gateway cuts it short.
     pub stop: Option<tokio_util::sync::CancellationToken>,
     /// Where the text the model writes before calling a tool goes at once
     /// (issue #212): a chat app's conversation, which gets it as a message
     /// while the tools run. `None` keeps it for the reply alone.
     pub segments: Option<Segments>,
+    /// The gateway ends a model call the turn's stop cuts short and
+    /// answers it with what the call had written (issue #305): the loop
+    /// waits for that answer and keeps it, rather than dropping the call.
+    pub cuts_calls: bool,
 }
 
 /// A chat app's conversation, which gets each part of a reply as it is
@@ -260,6 +265,11 @@ pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 /// gateway's provider calls time out long before this (120 s per
 /// credential), so it only fires when an answer is lost.
 pub const LLM_RESPONSE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Upper bound on waiting for the gateway's answer to a call the turn's
+/// stop cut short: it answers at once, so this only fires when the answer
+/// is lost.
+const CUT_ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Stands in for a tool result removed to keep a request within
 /// [`MAX_FRAME_BYTES`].
@@ -373,13 +383,14 @@ async fn rounds(
         {
             *mirror.write().await = messages.clone();
         }
-        let response = unless_stopped(
-            handle.stop.as_ref(),
-            call_llm(handle, context, messages, system_prompt),
-        )
-        .await
-        .ok_or_else(|| stopped(&said))?
-        .map_err(RunError::Infra)?;
+        let response = match call_unless_stopped(handle, context, messages, system_prompt).await
+        {
+            Ok(response) => response.map_err(RunError::Infra)?,
+            Err(cut) => {
+                said.extend(cut.as_ref().and_then(|cut| kept_text(context, cut)));
+                return Err(stopped(&said));
+            }
+        };
         if response.trimmed {
             let _ = TRACE.try_with(|trace| {
                 trace
@@ -406,21 +417,7 @@ async fn rounds(
         // turn's messages, as Anthropic's thinking with tools needs; the
         // adapters of other providers leave it out, and later turns are
         // built from the stored replies, which never hold it.
-        if traced(context) {
-            for block in content.as_array().into_iter().flatten() {
-                if block.get("type").and_then(Value::as_str) == Some("thinking")
-                    && let Some(text) = block.get("thinking").and_then(Value::as_str)
-                    && !text.trim().is_empty()
-                {
-                    let text = clip(text.trim(), TRACE_THINKING_CHARS);
-                    let chars = text.chars().count();
-                    trace(
-                        serde_json::json!({ "kind": "thinking", "text": text }),
-                        chars,
-                    );
-                }
-            }
-        }
+        trace_thinking(context, &content);
 
         // Only this turn keeps its thinking: its tool calls need it back,
         // and older turns' only fill the frame.
@@ -482,18 +479,20 @@ async fn rounds(
         })
         .is_some();
     if asked {
-        let summed = unless_stopped(
-            handle.stop.as_ref(),
-            call_llm(handle, context, messages, system_prompt),
-        )
-        .await;
+        let summed = call_unless_stopped(handle, context, messages, system_prompt).await;
         if let Some(blocks) = messages
             .last_mut()
             .and_then(|m| m["content"].as_array_mut())
         {
             blocks.pop();
         }
-        let summed = summed.ok_or_else(|| stopped(&said))?;
+        let summed = match summed {
+            Ok(summed) => summed,
+            Err(cut) => {
+                said.extend(cut.as_ref().and_then(|cut| kept_text(context, cut)));
+                return Err(stopped(&said));
+            }
+        };
         match summed {
             Ok(response) => {
                 if response.trimmed {
@@ -595,6 +594,71 @@ pub fn stopped_reply(partial_text: &str) -> String {
     } else {
         format!("{partial}\n\n(stopped)")
     }
+}
+
+/// Add the reasoning in `content`, a model's answer, to the running turn's
+/// trace, when its loop keeps one.
+fn trace_thinking(context: &'static str, content: &Value) {
+    if !traced(context) {
+        return;
+    }
+    for block in content.as_array().into_iter().flatten() {
+        if block.get("type").and_then(Value::as_str) == Some("thinking")
+            && let Some(text) = block.get("thinking").and_then(Value::as_str)
+            && !text.trim().is_empty()
+        {
+            let text = clip(text.trim(), TRACE_THINKING_CHARS);
+            let chars = text.chars().count();
+            trace(
+                serde_json::json!({ "kind": "thinking", "text": text }),
+                chars,
+            );
+        }
+    }
+}
+
+/// What a call the turn's stop cut short had written (issue #305): its
+/// text, for the reply, and its reasoning, added to the trace. A tool call
+/// it names is not run.
+fn kept_text(context: &'static str, cut: &LlmResponse) -> Option<String> {
+    if !matches!(cut.outcome, LlmOutcome::Ok) {
+        return None;
+    }
+    let content = cut.provider_response.get("content")?;
+    trace_thinking(context, content);
+    let text = extract_text(content)?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// One model call, unless the turn is stopped while it runs: then `Err`,
+/// with what the call had written when the gateway cuts it short (issue
+/// #305), or nothing when the call is dropped.
+async fn call_unless_stopped(
+    handle: &LoopHandle,
+    context: &'static str,
+    messages: &mut [Value],
+    system_prompt: &SystemPrompt,
+) -> Result<anyhow::Result<LlmResponse>, Option<LlmResponse>> {
+    let Some(stop) = &handle.stop else {
+        return Ok(call_llm(handle, context, messages, system_prompt).await);
+    };
+    if stop.is_cancelled() {
+        return Err(None);
+    }
+    if !(handle.cuts_calls && reply_stream(context).is_some()) {
+        return unless_stopped(
+            Some(stop),
+            call_llm(handle, context, messages, system_prompt),
+        )
+        .await
+        .ok_or(None);
+    }
+    let response = call_llm(handle, context, messages, system_prompt).await;
+    if stop.is_cancelled() {
+        return Err(response.ok());
+    }
+    Ok(response)
 }
 
 /// `work`, unless `stop` is cancelled first: then `None`, and `work` is
@@ -806,18 +870,7 @@ async fn call_llm(
         options["tools"] = handle.registry.schemas_for(context);
     }
 
-    // A turn answering someone shows its text as the model writes it.
-    let reply = (context == crate::tools::context::WEBCHAT)
-        .then(|| {
-            crate::tools::gateway::CONVERSATION
-                .try_with(Clone::clone)
-                .ok()
-        })
-        .flatten()
-        .map(|channel_id| havn_proto::ReplyStream {
-            channel_id,
-            conversation: crate::tools::gateway::CHAT.try_with(Clone::clone).ok(),
-        });
+    let reply = reply_stream(context);
     // A model that answers in place of the turn's goes on for the turn
     // (issue #216), without thinking: it may not take the turn's reasoning
     // so far, nor its own replies of this turn without any.
@@ -877,7 +930,13 @@ async fn call_llm(
         writer_tx: &handle.writer_tx,
         request_id: llm_req.reply.is_some().then(|| request_id.clone()),
     };
-    let mut response = request_llm(&handle.writer_tx, &handle.pending, llm_req).await;
+    let mut response = request_until_stopped(handle, llm_req, &mut cancel).await;
+    let stopped = || {
+        handle
+            .stop
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+    };
     // The model was down: its fallback answers, a few in turn at most.
     let mut asked = vec![model.clone()];
     while let Ok(answer) = &response
@@ -885,6 +944,7 @@ async fn call_llm(
         && let Some(next) = answer.fallback.clone()
         && !asked.contains(&next)
         && asked.len() <= MAX_FALLBACKS
+        && !stopped()
     {
         warn!(from = %model, to = %next, "the model is unavailable; asking its fallback");
         model.clone_from(&next);
@@ -896,7 +956,7 @@ async fn call_llm(
         // assistant turn): it answers without thinking.
         retry.options["thinking"] = Value::String("off".into());
         cancel.request_id = retry.reply.is_some().then(|| retry.request_id.clone());
-        response = request_llm(&handle.writer_tx, &handle.pending, retry).await;
+        response = request_until_stopped(handle, retry, &mut cancel).await;
         // It answered: the turn's later calls go to it, and the person is
         // told.
         if matches!(&response, Ok(answer) if matches!(answer.outcome, LlmOutcome::Ok)) {
@@ -915,6 +975,74 @@ async fn call_llm(
 /// Fallback models one call goes through at most (issue #216).
 const MAX_FALLBACKS: usize = 3;
 
+/// Where a call of a loop in `context` shows its text as the model writes
+/// it: a turn answering someone, in their conversation.
+fn reply_stream(context: &'static str) -> Option<havn_proto::ReplyStream> {
+    (context == crate::tools::context::WEBCHAT)
+        .then(|| {
+            crate::tools::gateway::CONVERSATION
+                .try_with(Clone::clone)
+                .ok()
+        })
+        .flatten()
+        .map(|channel_id| havn_proto::ReplyStream {
+            channel_id,
+            conversation: crate::tools::gateway::CHAT.try_with(Clone::clone).ok(),
+        })
+}
+
+/// [`request_llm`], cut short by the turn's stop when the gateway
+/// `cuts_calls` and `cancel` names the call (issue #305): the gateway is
+/// asked to end it, and its answer, with what the call had written, is
+/// waited for, at most [`CUT_ANSWER_TIMEOUT`]. A request not sent yet when
+/// the turn stops is not sent.
+async fn request_until_stopped(
+    handle: &LoopHandle,
+    req: LlmRequest,
+    cancel: &mut CancelOnDrop<'_>,
+) -> anyhow::Result<LlmResponse> {
+    let Some(stop) = handle
+        .stop
+        .as_ref()
+        .filter(|_| handle.cuts_calls && cancel.request_id.is_some())
+    else {
+        return request_llm(&handle.writer_tx, &handle.pending, req).await;
+    };
+    // Sent first: a request handed over is one the gateway may be running.
+    let sent = tokio::select! {
+        biased;
+        sent = send_llm(&handle.writer_tx, &handle.pending, req) => sent?,
+        () = stop.cancelled() => {
+            return Err(anyhow!("the turn was stopped before its LLM request was sent"));
+        }
+    };
+    let request_id = sent.request_id.clone();
+    let answer = sent.answer();
+    tokio::pin!(answer);
+    tokio::select! {
+        biased;
+        answered = &mut answer => return answered,
+        () = stop.cancelled() => {}
+    }
+    cancel.request_id = None;
+    handle
+        .writer_tx
+        .send(AgentToGateway::LlmCancel {
+            request_id: request_id.clone(),
+            keep: true,
+        })
+        .await
+        .map_err(|e| anyhow!("failed to enqueue LlmCancel: {e}"))?;
+    tokio::time::timeout(CUT_ANSWER_TIMEOUT, answer)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "no answer to the stopped LLM call {request_id} within {}s",
+                CUT_ANSWER_TIMEOUT.as_secs()
+            )
+        })?
+}
+
 /// Sends [`AgentToGateway::LlmCancel`] for its call when dropped before
 /// the call's answer came.
 struct CancelOnDrop<'a> {
@@ -927,7 +1055,10 @@ impl Drop for CancelOnDrop<'_> {
         if let Some(request_id) = self.request_id.take() {
             let _ = self
                 .writer_tx
-                .try_send(AgentToGateway::LlmCancel { request_id });
+                .try_send(AgentToGateway::LlmCancel {
+                    request_id,
+                    keep: false,
+                });
         }
     }
 }
@@ -972,14 +1103,46 @@ pub async fn request_llm(
     pending: &Pending,
     req: LlmRequest,
 ) -> anyhow::Result<LlmResponse> {
-    let _slot = LLM_SLOTS
+    send_llm(writer_tx, pending, req).await?.answer().await
+}
+
+/// An LLM request handed to the gateway, waiting for its answer.
+struct Sent<'a> {
+    _slot: tokio::sync::SemaphorePermit<'static>,
+    _entry: PendingEntry<'a, LlmResponse>,
+    request_id: String,
+    answer: oneshot::Receiver<LlmResponse>,
+}
+
+impl Sent<'_> {
+    /// Its `LlmResponse`, at most [`LLM_RESPONSE_TIMEOUT`] from now.
+    async fn answer(self) -> anyhow::Result<LlmResponse> {
+        let request_id = &self.request_id;
+        match tokio::time::timeout(LLM_RESPONSE_TIMEOUT, self.answer).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => Err(anyhow!("LlmResponse channel closed for {request_id}")),
+            Err(_) => Err(anyhow!(
+                "no LlmResponse for {request_id} within {}s",
+                LLM_RESPONSE_TIMEOUT.as_secs()
+            )),
+        }
+    }
+}
+
+/// Hand `req` to the gateway, once one of [`LLM_SLOTS`] is free.
+async fn send_llm<'a>(
+    writer_tx: &mpsc::Sender<AgentToGateway>,
+    pending: &'a Pending,
+    req: LlmRequest,
+) -> anyhow::Result<Sent<'a>> {
+    let slot = LLM_SLOTS
         .acquire()
         .await
         .map_err(|e| anyhow!("LLM request slots closed: {e}"))?;
     let request_id = req.request_id.clone();
     let (resp_tx, resp_rx) = oneshot::channel();
     pending.lock().await.insert(request_id.clone(), resp_tx);
-    let _entry = PendingEntry {
+    let entry = PendingEntry {
         pending,
         request_id: request_id.clone(),
     };
@@ -988,15 +1151,12 @@ pub async fn request_llm(
         .send(AgentToGateway::LlmRequest(req))
         .await
         .map_err(|e| anyhow!("failed to enqueue LlmRequest: {e}"))?;
-
-    match tokio::time::timeout(LLM_RESPONSE_TIMEOUT, resp_rx).await {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) => Err(anyhow!("LlmResponse channel closed for {request_id}")),
-        Err(_) => Err(anyhow!(
-            "no LlmResponse for {request_id} within {}s",
-            LLM_RESPONSE_TIMEOUT.as_secs()
-        )),
-    }
+    Ok(Sent {
+        _slot: slot,
+        _entry: entry,
+        request_id,
+        answer: resp_rx,
+    })
 }
 
 /// Removes a request's pending entry however its call ends, including when
@@ -1351,6 +1511,7 @@ mod tests {
             billing_user_id: None,
             stop: None,
             segments: None,
+            cuts_calls: false,
         };
         // A gateway that answers a tool call first, then the summing up.
         let gateway = tokio::spawn({
@@ -1464,6 +1625,7 @@ mod tests {
             billing_user_id: None,
             stop: None,
             segments: None,
+            cuts_calls: false,
         };
         let gateway = tokio::spawn({
             let pending = Arc::clone(&pending);
@@ -1634,5 +1796,212 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    async fn stoppable_handle(
+        tx: mpsc::Sender<AgentToGateway>,
+        pending: &Pending,
+        stop: &tokio_util::sync::CancellationToken,
+        cuts_calls: bool,
+    ) -> LoopHandle {
+        use crate::tools::{ToolCtx, ToolRegistry};
+        let policy = Arc::new(havn_core::Policy::default());
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite");
+        LoopHandle {
+            writer_tx: tx,
+            pending: Arc::clone(pending),
+            registry: ToolRegistry::standard(&policy),
+            tool_env: ToolCtx {
+                workspace_dir: std::path::PathBuf::from("/tmp"),
+                agent_db: pool,
+                policy: Arc::clone(&policy),
+                embedder: None,
+            },
+            max_iterations: 5,
+            messages_mirror: false,
+            model: Arc::new(String::new()),
+            max_tokens: DEFAULT_MAX_TOKENS,
+            billing_user_id: None,
+            stop: Some(stop.clone()),
+            segments: None,
+            cuts_calls,
+        }
+    }
+
+    /// The next frame to the gateway that is not a step shown.
+    async fn next_frame(rx: &mut mpsc::Receiver<AgentToGateway>) -> AgentToGateway {
+        loop {
+            match rx.recv().await.expect("a frame") {
+                AgentToGateway::Step(_) => {}
+                frame => return frame,
+            }
+        }
+    }
+
+    async fn answer(pending: &Pending, request_id: &str, provider_response: Value) {
+        let reply = LlmResponse {
+            request_id: request_id.into(),
+            outcome: LlmOutcome::Ok,
+            provider_response,
+            usage: None,
+            trimmed: false,
+            fallback: None,
+        };
+        loop {
+            if let Some(answer) = pending.lock().await.remove(request_id) {
+                let _ = answer.send(reply);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A turn answering a web chat, with its trace kept in `trace`.
+    async fn web_turn(handle: &LoopHandle, trace: &Arc<std::sync::Mutex<Trace>>) -> Result<String, RunError> {
+        let mut messages = vec![serde_json::json!({"role": "user", "content": "go"})];
+        let prompt = crate::system_prompt::BootstrapFiles::default().system_prompt(None);
+        crate::tools::gateway::CONVERSATION
+            .scope(
+                "web-session".into(),
+                TRACE.scope(
+                    Arc::clone(trace),
+                    run_typed(
+                        handle,
+                        crate::tools::context::WEBCHAT,
+                        &mut messages,
+                        &prompt,
+                    ),
+                ),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_stopped_call_keeps_what_it_had_written_and_its_reasoning_but_runs_no_tool() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (pending, _) = maps();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let handle = stoppable_handle(tx, &pending, &stop, true).await;
+        let gateway = tokio::spawn({
+            let pending = Arc::clone(&pending);
+            let stop = stop.clone();
+            async move {
+                let AgentToGateway::LlmRequest(first) = next_frame(&mut rx).await else {
+                    panic!("no request");
+                };
+                answer(
+                    &pending,
+                    &first.request_id,
+                    serde_json::json!({"stop_reason": "tool_use", "content": [
+                        {"type": "text", "text": "Looking."},
+                        {"type": "tool_use", "id": "t1", "name": "no_such_tool", "input": {}}
+                    ]}),
+                )
+                .await;
+                let AgentToGateway::LlmRequest(second) = next_frame(&mut rx).await else {
+                    panic!("no second request");
+                };
+                stop.cancel();
+                let AgentToGateway::LlmCancel { request_id, keep } = next_frame(&mut rx).await
+                else {
+                    panic!("the call is not cut short");
+                };
+                assert_eq!(request_id, second.request_id);
+                assert!(keep, "the call is asked to keep what it wrote");
+                // What the call had written, with a tool call it named.
+                answer(
+                    &pending,
+                    &second.request_id,
+                    serde_json::json!({"stop_reason": "stopped", "content": [
+                        {"type": "thinking", "thinking": "Which one first?"},
+                        {"type": "text", "text": "Half of"},
+                        {"type": "tool_use", "id": "t2", "name": "no_such_tool", "input": {}}
+                    ]}),
+                )
+                .await;
+                rx
+            }
+        });
+        let trace = Arc::new(std::sync::Mutex::new(Trace::default()));
+        let ended = web_turn(&handle, &trace).await;
+        let mut rx = gateway.await.expect("gateway");
+        match ended {
+            Err(RunError::Stopped { partial_text }) => {
+                assert_eq!(partial_text, "Looking.\n\nHalf of");
+                assert_eq!(stopped_reply(&partial_text), "Looking.\n\nHalf of\n\n(stopped)");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let items = trace.lock().unwrap().items.clone();
+        assert_eq!(
+            items.iter().filter(|i| i["kind"] == "step").count(),
+            1,
+            "only the first call's tool ran: {items:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| i["kind"] == "thinking" && i["text"] == "Which one first?"),
+            "{items:?}"
+        );
+        while let Ok(frame) = rx.try_recv() {
+            assert!(
+                matches!(frame, AgentToGateway::Step(_)),
+                "nothing more is asked: {frame:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gateway_that_does_not_cut_calls_has_the_stopped_call_dropped() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (pending, _) = maps();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let handle = stoppable_handle(tx, &pending, &stop, false).await;
+        let gateway = tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                let AgentToGateway::LlmRequest(asked) = next_frame(&mut rx).await else {
+                    panic!("no request");
+                };
+                stop.cancel();
+                // Never answered: an older gateway runs the call on.
+                let AgentToGateway::LlmCancel { request_id, keep } = next_frame(&mut rx).await
+                else {
+                    panic!("the gateway is not told");
+                };
+                assert_eq!(request_id, asked.request_id);
+                assert!(!keep, "sent as an older gateway reads it");
+            }
+        });
+        let trace = Arc::new(std::sync::Mutex::new(Trace::default()));
+        let ended = tokio::time::timeout(Duration::from_secs(5), web_turn(&handle, &trace))
+            .await
+            .expect("the turn ends at once");
+        gateway.await.expect("gateway");
+        match ended {
+            Err(RunError::Stopped { partial_text }) => assert_eq!(partial_text, ""),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(pending.lock().await.is_empty(), "nothing waits for the call");
+    }
+
+    #[tokio::test]
+    async fn a_call_stopped_before_it_is_sent_is_not_sent() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (pending, _) = maps();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let handle = stoppable_handle(tx, &pending, &stop, true).await;
+        stop.cancel();
+        let trace = Arc::new(std::sync::Mutex::new(Trace::default()));
+        match web_turn(&handle, &trace).await {
+            Err(RunError::Stopped { partial_text }) => assert_eq!(partial_text, ""),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "nothing is sent");
     }
 }
