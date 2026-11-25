@@ -128,7 +128,8 @@ pub struct AgentSocketCtx {
     /// without a side-channel.
     pub embedding_config: Arc<arc_swap::ArcSwap<serde_json::Value>>,
     pub multi_user: bool,
-    /// The streamed LLM calls in flight (issue #162).
+    /// The LLM calls in flight of turns answering someone (issues #162
+    /// and #305).
     pub reply_streams: ReplyStreams,
     /// `[llm]` settings: the `max_tokens` ceiling for every proxied LLM
     /// call, whatever the agent's config asks for, and provider base URLs.
@@ -750,6 +751,7 @@ async fn handle_connection(
         timezone: Some(crate::timezone::for_agent(&ctx.db, agent_id).await),
         models,
         language,
+        cuts_calls: true,
     };
     let write_welcome = write_frame(&mut write, &welcome);
     let sent = match tokio::time::timeout(AGENT_WRITE_TIMEOUT, write_welcome).await {
@@ -1075,13 +1077,19 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
                 debug!(%agent_id, error = %e, "memory changes not shown");
             }
         }
-        AgentToGateway::LlmCancel { request_id } => {
+        AgentToGateway::LlmCancel { request_id, keep } => {
             let streams = ctx
                 .reply_streams
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(cancelled) = streams.get(&(agent_id, request_id)) {
-                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(asked) = streams.get(&(agent_id, request_id)) {
+                if keep {
+                    asked.cut.cancel();
+                } else {
+                    asked
+                        .dropped
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         AgentToGateway::Step(step) => {
@@ -1123,9 +1131,12 @@ async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx
                 refuse(ctx, agent_id, refusal).await;
                 return;
             };
+            // Listed before the next frame is read: a cancel that follows
+            // finds it.
+            let listed = Listed::open(&ctx.reply_streams, agent_id, &req);
             let ctx_cloned = ctx.clone();
             tokio::spawn(async move {
-                handle_llm_request(agent_id, req, ctx_cloned).await;
+                handle_llm_request(agent_id, req, ctx_cloned, listed).await;
                 drop(permit);
             });
         }
@@ -2451,9 +2462,19 @@ async fn run_web_search(
     result.map(|report| crate::web_search::render(&report, chrono::Utc::now()))
 }
 
-async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocketCtx) {
+async fn handle_llm_request(
+    agent_id: AgentId,
+    req: LlmRequest,
+    ctx: AgentSocketCtx,
+    listed: Option<Listed>,
+) {
     let request_id = req.request_id.clone();
-    let reply = ReplyText::open(&ctx, agent_id, &req).await;
+    let reply = match &listed {
+        Some(listed) => ReplyText::open(&ctx, agent_id, &req, &listed.asked).await,
+        None => None,
+    };
+    // The runtime was told its stopped call wrote nothing (issue #305).
+    let mut answered = false;
 
     // Caller-pays billing override (spec §4.4 v0.7 cross-agent query).
     // When the runtime is processing an `IncomingQuery` it stamps every
@@ -2688,12 +2709,15 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                 agent_team: agent.team_id,
                 budget: policy.budget.clone(),
             };
-            let reply_text = reply.as_ref();
+            let cut = listed.as_ref().map(|listed| &listed.asked.cut);
+            let streamed = reply.as_ref().zip(cut);
             let ctx_ref = &ctx;
             let (billing_ref, entry_ref) = (&billing, &entry);
             let send = move |request: AnthropicRequest| async move {
-                match reply_text {
-                    Some(reply) => {
+                match streamed {
+                    // Shown as it is written: the turn's stop cuts it short
+                    // (issue #305).
+                    Some((reply, cut)) => {
                         llm_proxy::stream_with_provider(
                             &ctx_ref.db,
                             &ctx_ref.http,
@@ -2704,6 +2728,7 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                             &request,
                             &ctx_ref.llm,
                             reply.sink.as_ref(),
+                            cut,
                         )
                         .await
                     }
@@ -2733,11 +2758,48 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                 ar.max_tokens,
                 ctx.llm.max_tokens_ceiling,
             );
-            let (result, trimmed) = match llm_proxy::send_seeing(
-                ar, workspace, limits, context, show, try_blind, send,
-            )
-            .await
-            {
+            let seeing =
+                llm_proxy::send_seeing(ar, workspace, limits, context, show, try_blind, send);
+            // A call shown to nobody is not cut short: it runs on and
+            // records what it used, as before issue #305, and the turn's
+            // stop is answered at once with nothing written.
+            let seen = match cut.filter(|_| streamed.is_none()) {
+                Some(cut) => {
+                    tokio::pin!(seeing);
+                    tokio::select! {
+                        biased;
+                        seen = &mut seeing => seen,
+                        () = cut.cancelled() => {
+                            answered = true;
+                            let stopped = serde_json::json!({
+                                "id": "",
+                                "model": entry.model(),
+                                "role": "assistant",
+                                "content": [],
+                                "stop_reason": llm_proxy::STOPPED,
+                                "usage": {"input_tokens": 0, "output_tokens": 0},
+                            });
+                            let _ = ctx
+                                .registry
+                                .send(
+                                    agent_id,
+                                    GatewayToAgent::LlmResponse(LlmResponse {
+                                        request_id: request_id.clone(),
+                                        outcome: LlmOutcome::Ok,
+                                        provider_response: stopped,
+                                        usage: None,
+                                        trimmed: false,
+                                        fallback: None,
+                                    }),
+                                )
+                                .await;
+                            seeing.await
+                        }
+                    }
+                }
+                None => seeing.await,
+            };
+            let (result, trimmed) = match seen {
                 Ok(seen) => {
                     if seen.model_takes_none
                         && ctx
@@ -2765,6 +2827,9 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
                 }
                 Err(e) => {
                     warn!(%agent_id, error = %e, "could not read the files of an LLM request");
+                    if answered {
+                        return;
+                    }
                     let _ = ctx
                         .registry
                         .send(
@@ -2851,6 +2916,10 @@ async fn handle_llm_request(agent_id: AgentId, req: LlmRequest, ctx: AgentSocket
     if let Some(reply) = reply {
         reply.finish().await;
     }
+    // The runtime was answered when its turn stopped.
+    if answered {
+        return;
+    }
     if let Err(e) = ctx
         .registry
         .send(agent_id, GatewayToAgent::LlmResponse(response))
@@ -2866,13 +2935,60 @@ const REPLY_TEXT_EVERY: std::time::Duration = std::time::Duration::from_millis(8
 /// tab that missed a piece, or opened during the call, catches up.
 const REPLY_TEXT_WHOLE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// The LLM calls of each agent whose text is shown as it arrives, by
-/// request id, and whether the runtime has given up on them.
-pub type ReplyStreams = Arc<
-    std::sync::Mutex<
-        std::collections::HashMap<(AgentId, String), Arc<std::sync::atomic::AtomicBool>>,
-    >,
->;
+/// The LLM calls of each agent's turns answering someone, by request id,
+/// and what the runtime asked of them.
+pub type ReplyStreams =
+    Arc<std::sync::Mutex<std::collections::HashMap<(AgentId, String), Arc<Asked>>>>;
+
+/// What the runtime asked of an LLM call of a turn answering someone.
+#[derive(Debug, Default)]
+pub struct Asked {
+    /// Stop passing its text on: the runtime no longer waits for it.
+    dropped: std::sync::atomic::AtomicBool,
+    /// End it and answer with what it had written (issue #305).
+    cut: tokio_util::sync::CancellationToken,
+}
+
+/// A call's entry in [`ReplyStreams`], removed when dropped.
+struct Listed {
+    asked: Arc<Asked>,
+    key: (AgentId, String),
+    streams: ReplyStreams,
+}
+
+impl Listed {
+    /// For a request of a turn answering someone; `None` for any other.
+    fn open(streams: &ReplyStreams, agent_id: AgentId, req: &LlmRequest) -> Option<Self> {
+        req.reply.as_ref()?;
+        let asked = Arc::new(Asked::default());
+        let key = (agent_id, req.request_id.clone());
+        streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.clone(), Arc::clone(&asked));
+        Some(Self {
+            asked,
+            key,
+            streams: Arc::clone(streams),
+        })
+    }
+}
+
+impl Drop for Listed {
+    fn drop(&mut self) {
+        let mut streams = self
+            .streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A request id used again is another call's.
+        if streams
+            .get(&self.key)
+            .is_some_and(|asked| Arc::ptr_eq(asked, &self.asked))
+        {
+            streams.remove(&self.key);
+        }
+    }
+}
 
 enum ReplyPiece {
     Text(String),
@@ -2885,17 +3001,20 @@ type PieceSender = Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<ReplyPiece>
 /// A streamed call's text on its way to the tabs of the session its turn
 /// answers (issue #162). Dropping it, on any path, forgets the call.
 struct ReplyText {
-    sink: Box<llm_proxy::TextSink>,
+    sink: Box<llm_proxy::TextSink<'static>>,
     sender: PieceSender,
     forward: Option<tokio::task::JoinHandle<()>>,
-    key: (AgentId, String),
-    streams: ReplyStreams,
 }
 
 impl ReplyText {
     /// For a request whose turn answers a dashboard session of this agent;
     /// `None` for any other.
-    async fn open(ctx: &AgentSocketCtx, agent_id: AgentId, req: &LlmRequest) -> Option<Self> {
+    async fn open(
+        ctx: &AgentSocketCtx,
+        agent_id: AgentId,
+        req: &LlmRequest,
+        asked: &Arc<Asked>,
+    ) -> Option<Self> {
         let target = req.reply.as_ref()?;
         let session: crate::webchat::SessionId = target.channel_id.parse().ok()?;
         if ctx.webchat_router.agent_for_session(session).await != Some(agent_id) {
@@ -2905,12 +3024,6 @@ impl ReplyText {
             .conversation
             .clone()
             .filter(|c| c.len() <= crate::webchat::MAX_CONVERSATION_ID);
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let key = (agent_id, req.request_id.clone());
-        ctx.reply_streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key.clone(), Arc::clone(&cancelled));
         let (tx, rx) = mpsc::unbounded_channel();
         let sender: PieceSender = Arc::new(std::sync::Mutex::new(Some(tx)));
         let forward = tokio::spawn(forward_reply_text(
@@ -2920,34 +3033,33 @@ impl ReplyText {
             conversation,
             req.request_id.clone(),
             rx,
-            Arc::clone(&cancelled),
+            Arc::clone(asked),
         ));
         let pieces = Arc::clone(&sender);
-        let sink: Box<llm_proxy::TextSink> = Box::new(move |event| {
-            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        let asked = Arc::clone(asked);
+        let sink: Box<llm_proxy::TextSink<'static>> = Box::new(move |event| {
+            if asked.dropped.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
+            let piece = match event {
+                llm_proxy::provider::TextEvent::Text(text) => ReplyPiece::Text(text.to_string()),
+                llm_proxy::provider::TextEvent::Reasoning(text) => {
+                    ReplyPiece::Reasoning(text.to_string())
+                }
+                llm_proxy::provider::TextEvent::Restart => ReplyPiece::Restart,
+                llm_proxy::provider::TextEvent::ToolInput(_) => return,
+            };
             let pieces = pieces
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(tx) = pieces.as_ref() {
-                let _ = tx.send(match event {
-                    llm_proxy::provider::TextEvent::Text(text) => {
-                        ReplyPiece::Text(text.to_string())
-                    }
-                    llm_proxy::provider::TextEvent::Reasoning(text) => {
-                        ReplyPiece::Reasoning(text.to_string())
-                    }
-                    llm_proxy::provider::TextEvent::Restart => ReplyPiece::Restart,
-                });
+                let _ = tx.send(piece);
             }
         });
         Some(Self {
             sink,
             sender,
             forward: Some(forward),
-            key,
-            streams: Arc::clone(&ctx.reply_streams),
         })
     }
 
@@ -2971,10 +3083,6 @@ impl ReplyText {
 impl Drop for ReplyText {
     fn drop(&mut self) {
         self.close();
-        self.streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.key);
     }
 }
 
@@ -3022,7 +3130,7 @@ async fn forward_reply_text(
     conversation: Option<String>,
     call: String,
     mut rx: mpsc::UnboundedReceiver<ReplyPiece>,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    asked: Arc<Asked>,
 ) {
     let mut text = Streamed::default();
     let mut reasoning = Streamed::default();
@@ -3057,7 +3165,7 @@ async fn forward_reply_text(
                 },
             }
         }
-        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        if asked.dropped.load(std::sync::atomic::Ordering::Relaxed) {
             continue;
         }
         let whole_due = last_whole.elapsed() >= REPLY_TEXT_WHOLE_EVERY;
@@ -4005,7 +4113,7 @@ mod tests {
         let (agent, mut rx) = connected_agent(&ctx, owner, "a", agent_config).await;
         let mut req = llm_request("r1");
         req.model = model.into();
-        handle_llm_request(agent, req, ctx.clone()).await;
+        handle_llm_request(agent, req, ctx.clone(), None).await;
         match rx.try_recv().expect("a reply") {
             GatewayToAgent::LlmResponse(LlmResponse {
                 outcome: LlmOutcome::Error { message },
@@ -4075,6 +4183,302 @@ mod tests {
             billing_user_id: None,
             reply: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_cancel_that_keeps_its_call_cuts_it_and_one_that_does_not_only_hides_its_text() {
+        let ctx = ctx_with(false, false).await;
+        let agent = AgentId::new();
+        let of_a_turn = |request_id: &str| LlmRequest {
+            reply: Some(havn_proto::ReplyStream {
+                channel_id: "session".into(),
+                conversation: None,
+            }),
+            ..llm_request(request_id)
+        };
+        let dropped = Listed::open(&ctx.reply_streams, agent, &of_a_turn("r1")).expect("listed");
+        let cut = Listed::open(&ctx.reply_streams, agent, &of_a_turn("r2")).expect("listed");
+        // As a runtime before issue #305 sends it.
+        dispatch(
+            agent,
+            serde_json::from_str(r#"{"type":"llm_cancel","request_id":"r1"}"#).expect("frame"),
+            &ctx,
+        )
+        .await;
+        dispatch(
+            agent,
+            AgentToGateway::LlmCancel {
+                request_id: "r2".into(),
+                keep: true,
+            },
+            &ctx,
+        )
+        .await;
+        let hidden = |listed: &Listed| {
+            listed
+                .asked
+                .dropped
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        assert!(hidden(&dropped) && !dropped.asked.cut.is_cancelled());
+        assert!(!hidden(&cut) && cut.asked.cut.is_cancelled());
+        // Another agent's cancel does not reach them.
+        let other = Listed::open(&ctx.reply_streams, agent, &of_a_turn("r3")).expect("listed");
+        dispatch(
+            AgentId::new(),
+            AgentToGateway::LlmCancel {
+                request_id: "r3".into(),
+                keep: true,
+            },
+            &ctx,
+        )
+        .await;
+        assert!(!other.asked.cut.is_cancelled());
+        drop((dropped, cut, other));
+        assert!(ctx.reply_streams.lock().unwrap().is_empty(), "forgotten");
+        assert!(
+            Listed::open(&ctx.reply_streams, agent, &llm_request("r4")).is_none(),
+            "a call of no turn cannot be stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stopped_call_answers_with_the_text_and_reasoning_the_tabs_were_shown() {
+        // A provider that writes some reasoning and text, then nothing more.
+        let events = [
+            r#"{"type":"message_start","message":{"id":"m1","type":"message","role":"assistant","model":"m","content":[],"stop_reason":null,"usage":{"input_tokens":5,"output_tokens":1}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Which first?"}}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Half of"}}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t1","name":"shell","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"q\":\"x\"}"}}"#,
+        ];
+        let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || async move {
+                let written = futures_util::stream::iter([Ok::<_, std::convert::Infallible>(body)]);
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    axum::body::Body::from_stream(futures_util::StreamExt::chain(
+                        written,
+                        futures_util::stream::pending(),
+                    )),
+                )
+            }),
+        );
+        let (ctx, server) = ctx_calling(app).await;
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (agent, mut rx) = connected_agent(&ctx, owner, "a", serde_json::json!({})).await;
+        let session = Uuid::now_v7();
+        let (tab_tx, mut tab) = mpsc::channel(64);
+        let _tab = ctx.webchat_router.register(session, agent, tab_tx).await;
+
+        let req = LlmRequest {
+            model: "lan:m".into(),
+            reply: Some(havn_proto::ReplyStream {
+                channel_id: session.to_string(),
+                conversation: None,
+            }),
+            ..llm_request("r1")
+        };
+        dispatch(agent, AgentToGateway::LlmRequest(req), &ctx).await;
+        // The tab is shown what it wrote.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(crate::webchat::ServerMessage::ReplyText { text, thinking, .. }) =
+                    tab.recv().await
+                    && !thinking
+                    && text.contains("Half of")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the text is shown");
+        dispatch(
+            agent,
+            AgentToGateway::LlmCancel {
+                request_id: "r1".into(),
+                keep: true,
+            },
+            &ctx,
+        )
+        .await;
+        let answer = next_llm_response(&mut rx).await;
+        server.abort();
+        assert_eq!(answer.request_id, "r1");
+        assert!(
+            matches!(answer.outcome, LlmOutcome::Ok),
+            "{:?}",
+            answer.outcome
+        );
+        assert_eq!(answer.provider_response["stop_reason"], llm_proxy::STOPPED);
+        assert_eq!(
+            answer.provider_response["content"],
+            serde_json::json!([
+                {"type": "thinking", "thinking": "Which first?"},
+                {"type": "text", "text": "Half of"}
+            ])
+        );
+        forgotten(&ctx).await;
+        // Its use as estimated: what it wrote, the tool call's input too.
+        let used: Vec<(i64,)> = sqlx::query_as("SELECT tokens_out FROM credential_usages")
+            .fetch_all(&ctx.db)
+            .await
+            .expect("rows");
+        assert_eq!(used, vec![(14,)]);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_call_shown_to_nobody_runs_on_and_records_what_it_used() {
+        // A provider that answers whole, once let.
+        let (asked, answer_now) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post({
+                let (asked, answer_now) = (Arc::clone(&asked), Arc::clone(&answer_now));
+                move || async move {
+                    asked.notify_one();
+                    answer_now.notified().await;
+                    axum::Json(serde_json::json!({
+                        "id": "m1",
+                        "model": "m",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "The whole answer."}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 5, "output_tokens": 7}
+                    }))
+                }
+            }),
+        );
+        let (ctx, server) = ctx_calling(app).await;
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (agent, mut rx) = connected_agent(&ctx, owner, "a", serde_json::json!({})).await;
+        // A chat app's conversation: its reply is not shown as it is written.
+        let req = LlmRequest {
+            model: "lan:m".into(),
+            reply: Some(havn_proto::ReplyStream {
+                channel_id: "telegram:123".into(),
+                conversation: None,
+            }),
+            ..llm_request("r1")
+        };
+        dispatch(agent, AgentToGateway::LlmRequest(req), &ctx).await;
+        tokio::time::timeout(Duration::from_secs(10), asked.notified())
+            .await
+            .expect("the provider is asked");
+        dispatch(
+            agent,
+            AgentToGateway::LlmCancel {
+                request_id: "r1".into(),
+                keep: true,
+            },
+            &ctx,
+        )
+        .await;
+        // Answered at once, with nothing written.
+        let answer = next_llm_response(&mut rx).await;
+        assert!(
+            matches!(answer.outcome, LlmOutcome::Ok),
+            "{:?}",
+            answer.outcome
+        );
+        assert_eq!(answer.provider_response["stop_reason"], llm_proxy::STOPPED);
+        assert_eq!(answer.provider_response["content"], serde_json::json!([]));
+        // The call runs on and records what it used, not its reservation.
+        answer_now.notify_one();
+        forgotten(&ctx).await;
+        server.abort();
+        let used: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT tokens_in, tokens_out FROM credential_usages")
+                .fetch_all(&ctx.db)
+                .await
+                .expect("rows");
+        assert_eq!(used, vec![(5, 7)]);
+        // The runtime is not answered twice.
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|frame| matches!(frame, GatewayToAgent::LlmResponse(_))),
+            "a second answer"
+        );
+    }
+
+    /// The next LLM answer the agent is sent, within 10 seconds.
+    async fn next_llm_response(rx: &mut mpsc::Receiver<GatewayToAgent>) -> LlmResponse {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(GatewayToAgent::LlmResponse(answer)) = rx.recv().await {
+                    break answer;
+                }
+            }
+        })
+        .await
+        .expect("answered at once")
+    }
+
+    /// Wait until no call is listed any more.
+    async fn forgotten(ctx: &AgentSocketCtx) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ctx.reply_streams.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the call is forgotten");
+    }
+
+    /// A context whose model `lan:m` is served by `app`, and its server.
+    async fn ctx_calling(
+        app: axum::Router,
+    ) -> (AgentSocketCtx, tokio::task::JoinHandle<std::io::Result<()>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let mut ctx = ctx_with(false, false).await;
+        let mut endpoints = crate::config::Endpoints::default();
+        endpoints.0.insert(
+            "lan".into(),
+            crate::config::Endpoint {
+                api: crate::config::EndpointApi::Anthropic,
+                base_url: base,
+            },
+        );
+        ctx.llm = Arc::new(crate::config::LlmConfig {
+            endpoints,
+            ..crate::config::LlmConfig::default()
+        });
+        ctx.keyring = Some(crate::keyring::KeyRing::from_passphrase("stop-tests"));
+        ctx.models
+            .store(Arc::new(crate::model_catalog::ModelCatalog {
+                default_model: None,
+                title_model: None,
+                models: vec![crate::model_catalog::ModelEntry {
+                    id: "lan:m".into(),
+                    label: None,
+                    max_output_tokens: None,
+                    vision: None,
+                    thinking: None,
+                    context_window: None,
+                    fallback: Vec::new(),
+                    price: None,
+                }],
+            }));
+        (ctx, server)
     }
 
     fn refused(outcome: &LlmOutcome) -> bool {

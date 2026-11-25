@@ -79,7 +79,7 @@ impl LlmProvider for AnthropicProvider {
         base_url: &str,
         api_key: &str,
         request: &AnthropicRequest,
-        text: &TextSink,
+        text: &TextSink<'_>,
     ) -> Result<AnthropicResponse, ProviderError> {
         let mut body = request_body(request)?;
         body["stream"] = serde_json::Value::Bool(true);
@@ -126,6 +126,17 @@ impl LlmProvider for AnthropicProvider {
                 && !piece.is_empty()
             {
                 text(TextEvent::Reasoning(piece));
+            }
+            if event
+                .pointer("/delta/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("input_json_delta")
+                && let Some(piece) = event
+                    .pointer("/delta/partial_json")
+                    .and_then(serde_json::Value::as_str)
+                && !piece.is_empty()
+            {
+                text(TextEvent::ToolInput(piece));
             }
             if let Some(piece) = message.add(&event) {
                 text(TextEvent::Text(&piece));
