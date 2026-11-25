@@ -4803,12 +4803,12 @@ async fn handle_incoming_query(query: IncomingQuery, ctx: Ctx) {
     // arrives with `is_error: true` and the caller's LLM can decide
     // to retry / give up rather than treating an error-shaped string
     // as a normal answer.
-    let prompt = with_public_facts(&ctx.pool, &ctx.system_prompt).await;
+    let system_prompt = with_public_facts(&ctx.pool, &ctx.system_prompt).await;
     let (outcome, text) = match tool_loop::run_typed(
         &handle,
         tool_ctx::AGENT_QUERY,
         &mut messages,
-        &prompt,
+        &system_prompt,
     )
     .await
     {
