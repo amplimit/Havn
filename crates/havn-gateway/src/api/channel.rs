@@ -1936,7 +1936,11 @@ async fn note_parents(
         ));
     }
     for (child, child_title, parents) in links {
-        let place = (channel.to_string(), account_id.to_string(), child.to_string());
+        let place = (
+            channel.to_string(),
+            account_id.to_string(),
+            child.to_string(),
+        );
         let noted: Noted = (
             child_title.to_string(),
             parents
