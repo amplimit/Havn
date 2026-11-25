@@ -703,7 +703,9 @@ async fn complete_through(
             )
             .await
             else {
-                return Ok(cut_answer(guard, text.is_some(), &request.model, tokens_in, &written).await);
+                return Ok(
+                    cut_answer(guard, text.is_some(), &request.model, tokens_in, &written).await,
+                );
             };
             if let Attempt::TryNext {
                 reason,
@@ -724,9 +726,14 @@ async fn complete_through(
                         "provider failed for now; trying again"
                     );
                     if until_cut(cut, tokio::time::sleep(wait)).await.is_none() {
-                        return Ok(
-                            cut_answer(guard, text.is_some(), &request.model, tokens_in, &written).await,
-                        );
+                        return Ok(cut_answer(
+                            guard,
+                            text.is_some(),
+                            &request.model,
+                            tokens_in,
+                            &written,
+                        )
+                        .await);
                     }
                     continue;
                 }
