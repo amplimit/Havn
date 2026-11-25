@@ -1266,13 +1266,21 @@ fn plainly(line: &str) -> String {
     plain.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Where `plain` names Havn: `havn` as a word of its own.
+/// Where `plain` names Havn: `havn` as a word of its own, or with a
+/// version after a `-`.
 fn havn_words(plain: &str) -> Vec<usize> {
     let word = |c: char| c.is_ascii_alphanumeric() || c == '-';
     plain
         .match_indices("havn")
         .map(|(at, _)| at)
-        .filter(|at| !plain[..*at].ends_with(word) && !plain[at + 4..].starts_with(word))
+        .filter(|at| {
+            let after = &plain[at + 4..];
+            let versioned = after.strip_prefix('-').is_some_and(|rest| {
+                rest.trim_start_matches('v')
+                    .starts_with(|c: char| c.is_ascii_digit())
+            });
+            !plain[..*at].ends_with(word) && (versioned || !after.starts_with(word))
+        })
         .collect()
 }
 
@@ -1340,7 +1348,7 @@ fn asked(plain: &str, from: usize) -> Vec<Option<(u64, u64, u64)>> {
     havn_words(plain)
         .into_iter()
         .filter(|at| *at >= from)
-        .map(|at| version_after(&plain[at + 4..]))
+        .map(|at| version_after(plain[at + 4..].trim_start_matches('-')))
         .collect()
 }
 
@@ -1384,14 +1392,9 @@ fn requires(notes: &str) -> Option<Result<String, String>> {
         let raw = line.trim();
         let heading = raw.starts_with('#');
         let item = list_item(raw);
+        // A line's list may begin after other lines.
         let ends = scope.as_ref().is_some_and(|s| {
-            heading
-                || (!s.heading
-                    && if raw.is_empty() {
-                        s.items
-                    } else {
-                        item.is_none()
-                    })
+            heading || (!s.heading && s.items && (raw.is_empty() || item.is_none()))
         });
         if ends && let Some(waiting) = scope.take().and_then(|s| s.waiting) {
             return Some(Err(waiting));
@@ -1624,6 +1627,23 @@ fn version_in(out: &str) -> Option<String> {
     Some(version.trim_start_matches('v').to_string())
 }
 
+/// Why a restarted unit is not taken as up; `another` when it runs another
+/// file of the binary's name (one of its own root's).
+#[derive(Debug)]
+struct Down {
+    why: String,
+    another: bool,
+}
+
+impl From<String> for Down {
+    fn from(why: String) -> Self {
+        Self {
+            why,
+            another: false,
+        }
+    }
+}
+
 /// Restart `unit` and watch it: after `watch.settle` it must be active,
 /// running `binary`, without systemd having restarted it, and with
 /// `connect`, have logged that it connected to the gateway, within
@@ -1634,20 +1654,20 @@ async fn restart_watched(
     binary: &Path,
     connect: bool,
     watch: Watch,
-) -> Result<(), String> {
+) -> Result<(), Down> {
     let before = host.restart(unit).map_err(|e| format!("{e:#}"))?;
     let started = Instant::now();
     let mut invocation: Option<String> = None;
     loop {
         let now = host.show(unit);
         if !now.state.is_empty() && !unit_up(&now.state) {
-            return Err(format!("{unit} is {}", now.state));
+            return Err(format!("{unit} is {}", now.state).into());
         }
         let rerun = invocation
             .as_ref()
             .is_some_and(|first| !now.invocation.is_empty() && *first != now.invocation);
         if now.restarts > before || rerun {
-            return Err(format!("{unit} exited and systemd restarted it"));
+            return Err(format!("{unit} exited and systemd restarted it").into());
         }
         if invocation.is_none() && !now.invocation.is_empty() {
             invocation = Some(now.invocation.clone());
@@ -1669,7 +1689,7 @@ async fn restart_watched(
             && !runs_it
             && settled
         {
-            return Err(if exe == binary && !binary.exists() {
+            let why = if exe == binary && !binary.exists() {
                 format!("{unit} runs {}, which is gone", binary.display())
             } else if exe == binary {
                 format!(
@@ -1679,6 +1699,10 @@ async fn restart_watched(
                 )
             } else {
                 format!("{unit} runs {}, not {}", exe.display(), binary.display())
+            };
+            return Err(Down {
+                why,
+                another: binary.exists() && exe.file_name() == binary.file_name(),
             });
         }
         let connected = !connect || (active && host.logged(&now.invocation, CONNECTED));
@@ -1692,7 +1716,8 @@ async fn restart_watched(
                 format!("cannot tell what {unit} runs")
             } else {
                 format!("{unit} did not connect to the gateway")
-            });
+            }
+            .into());
         }
         tokio::time::sleep(watch.poll).await;
     }
@@ -1774,7 +1799,9 @@ fn units_of(adapter: &Adapter, binary: &Path, host: &impl Host) -> (Vec<String>,
 /// `sums`; its binary is `name`), and restart and watch each of `units`
 /// that runs, once each: one whose run had connected to the gateway, when
 /// `gateway_up`, must connect again. On failure the old binary is put back
-/// and the units restarted on it. What was done, or what failed.
+/// and the units restarted on it. A unit with its own root that, restarted,
+/// runs a binary of its own is not a failure: it is left as it is. What was
+/// done, with what the table says of such units, or what failed.
 async fn install(
     adapter: &Adapter,
     units: &[String],
@@ -1785,7 +1812,7 @@ async fn install(
     gateway_up: bool,
     host: &impl Host,
     watch: Watch,
-) -> Result<String, String> {
+) -> Result<(String, Vec<String>), String> {
     let error = |e: anyhow::Error| format!("{e:#}");
     verify(archive, sums).map_err(error)?;
     let binary = adapter
@@ -1819,6 +1846,7 @@ async fn install(
     let swapped = swap(dir, stage.path(), &[file.to_string()], true).map_err(error)?;
 
     let mut restarted = Vec::new();
+    let mut apart = Vec::new();
     let mut failure = match host.version(&binary, false) {
         Some(v) if release::parse_version(&v) == release::parse_version(tag) => None,
         Some(v) => Some(format!("the new binary says it is {v}")),
@@ -1826,11 +1854,27 @@ async fn install(
     };
     if failure.is_none() {
         for (unit, connect) in &running {
-            restarted.push(*unit);
-            if let Err(e) = restart_watched(host, unit, &binary, *connect, watch).await {
-                failure = Some(e);
-                break;
+            let Err(down) = restart_watched(host, unit, &binary, *connect, watch).await else {
+                restarted.push(*unit);
+                continue;
+            };
+            let root = if down.another {
+                host.exec(unit).root
+            } else {
+                None
+            };
+            if let Some(root) = root {
+                apart.push(format!(
+                    "not managed: {unit} runs another binary under {root} once restarted, though \
+                     {COMPONENTS} lists it under {}; {}",
+                    adapter.name,
+                    rooted_advice(&root, true)
+                ));
+                continue;
             }
+            restarted.push(*unit);
+            failure = Some(down.why);
+            break;
         }
     }
     let Some(failure) = failure else {
@@ -1839,13 +1883,14 @@ async fn install(
             .map(String::as_str)
             .filter(|u| !running.iter().any(|(r, _)| r == u))
             .collect();
-        return Ok(if running.is_empty() {
+        let done = if running.is_empty() {
             "installed; no unit of it runs".to_string()
         } else if stopped.is_empty() {
             "updated".to_string()
         } else {
             format!("updated; not started: {}", stopped.join(", "))
-        });
+        };
+        return Ok((done, apart));
     };
     if let Err(e) = restore(dir, &swapped) {
         return Err(format!(
@@ -1899,7 +1944,8 @@ async fn exists(http: &reqwest::Client, api: &str) -> anyhow::Result<bool> {
 }
 
 /// The step of one channel adapter: look at its latest release and, unless
-/// `check`, install it, restarting those of `units` that run.
+/// `check`, install it, restarting those of `units` that run; what the
+/// table says of units left as they are goes to `apart`.
 /// `adapter.version` is kept up to date. With `check` the version recorded
 /// is taken before asking the binary, which then runs as nobody.
 async fn adapter_step(
@@ -1907,6 +1953,7 @@ async fn adapter_step(
     github: &Github,
     adapter: &mut Adapter,
     units: &[String],
+    apart: &mut Vec<String>,
     gateway: &str,
     check: bool,
     gateway_up: bool,
@@ -2000,9 +2047,10 @@ async fn adapter_step(
     )
     .await
     {
-        Ok(result) => {
+        Ok((result, left)) => {
             adapter.version = Some(tag.trim_start_matches('v').to_string());
             row.result = result;
+            apart.extend(left);
             row
         }
         Err(e) => failed(row, e),
@@ -2112,7 +2160,7 @@ async fn update_components(
         ));
     }
     for adapter in &mut gathered.list.adapters {
-        let (units, apart) = if adapter.skip || !adapter.binary.exists() {
+        let (units, mut apart) = if adapter.skip || !adapter.binary.exists() {
             (Vec::new(), Vec::new())
         } else {
             let binary = adapter
@@ -2123,7 +2171,7 @@ async fn update_components(
         };
         rows.push(
             adapter_step(
-                http, github, adapter, &units, gateway, check, gateway_up, host, watch,
+                http, github, adapter, &units, &mut apart, gateway, check, gateway_up, host, watch,
             )
             .await,
         );
@@ -2722,6 +2770,9 @@ mod tests {
             ("Requires Havn 0.2.14 or 0.3.0", "0.2.14"),
             ("Requires Havn >= 0.2.14 (Havn's new API)", "0.2.14"),
             ("Requires:\n\n- Havn >= 0.2.14", "0.2.14"),
+            ("Requires:\nSee below\n- Havn >= 0.2.14", "0.2.14"),
+            ("Requires Havn-0.2.14", "0.2.14"),
+            ("Requires Havn-v0.2.14+", "0.2.14"),
             ("Requires Havn 0.2.14+", "0.2.14"),
         ] {
             assert_eq!(requires(notes), Some(Ok(wanted.to_string())), "{notes}");
@@ -2767,7 +2818,6 @@ mod tests {
             "Requires:\n- a bot token\n\n- Havn 0.3.0 is out",
             "## Changes\n- Works with Havn 0.3.0",
             "Havn 0.2.13 requires a restart",
-            "Requires:\n\nThanks to all\n- Havn 0.3.0 is out",
         ] {
             assert_eq!(requires(unrelated), None, "{unrelated}");
         }
@@ -2838,8 +2888,9 @@ mod tests {
     /// restart with `lose_old`. For the first `executor` looks after each
     /// restart, the process is still systemd's. With `inside`, the binary
     /// is seen at that path, as from a unit's own root; the units in
-    /// `apart` run another file at the binary's path, and until a restart
-    /// those in `pids` run as that process (none, stopped, for 0).
+    /// `apart` run another file at the binary's path (those in `after` once
+    /// restarted), and until a restart those in `pids` run as that process
+    /// (none, stopped, for 0).
     /// `execs` are the units' `ExecStart=`, and `roots` their
     /// `RootDirectory=` or `RootImage=`.
     struct Fake {
@@ -2858,6 +2909,7 @@ mod tests {
         roots: Vec<(&'static str, &'static str)>,
         apart: Vec<&'static str>,
         pids: Vec<(&'static str, u32)>,
+        after: Vec<&'static str>,
         restarted: std::cell::RefCell<Vec<String>>,
     }
 
@@ -2879,6 +2931,7 @@ mod tests {
                 roots: Vec::new(),
                 apart: Vec::new(),
                 pids: Vec::new(),
+                after: Vec::new(),
                 restarted: std::cell::RefCell::new(Vec::new()),
             }
         }
@@ -2937,7 +2990,7 @@ mod tests {
                 state: state.into(),
                 restarts: u64::from(started && self.fresh() && self.flapping),
                 invocation: format!("{:032x}", self.restarted.borrow().len()),
-                pid: if self.apart.contains(&unit) {
+                pid: if self.apart.contains(&unit) || (started && self.after.contains(&unit)) {
                     APART
                 } else {
                     before.unwrap_or(42)
@@ -3056,6 +3109,12 @@ mod tests {
             watch,
         )
         .await
+        .map(|(done, apart)| {
+            std::iter::once(done)
+                .chain(apart)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
     }
 
     #[tokio::test]
@@ -3204,6 +3263,49 @@ mod tests {
                 vec!["test.service", "bind.service"]
             );
         }
+
+        // Taken as on the binary before, but once restarted it runs one of
+        // its own root's: left as it is, the host's unit updated.
+        let (mut adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        adapter.units.push("bind.service".into());
+        let fake = Fake {
+            after: vec!["bind.service"],
+            ..rooted(&adapter, vec![("bind.service", DELETED)])
+        };
+        assert_eq!(
+            install_on(&fake, &adapter, &archive, &sums, true, QUICK).await,
+            Ok(
+                "updated\nnot managed: bind.service runs another binary under \
+                RootDirectory=/srv/bind once restarted, though /etc/havn/components.toml lists \
+                it under havn-channel-test; list it in /etc/havn/components.toml on its own, \
+                with its binary as this machine has it, to update it"
+                    .into()
+            )
+        );
+        assert_eq!(fake.installed(), "0.2.11");
+        assert_eq!(
+            *fake.restarted.borrow(),
+            vec!["test.service", "bind.service"]
+        );
+
+        // So when the host's unit then fails, only it goes back.
+        let (mut adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        adapter.units.insert(0, "bind.service".into());
+        let fake = Fake {
+            after: vec!["bind.service"],
+            failing: vec!["test.service"],
+            ..rooted(&adapter, vec![("bind.service", DELETED)])
+        };
+        let failed = fails(&fake, &adapter, &archive, &sums).await;
+        assert!(
+            failed.starts_with("test.service is failed") && failed.ends_with("old binary is back"),
+            "{failed}"
+        );
+        assert_eq!(fake.installed(), "0.2.9");
+        assert_eq!(
+            *fake.restarted.borrow(),
+            vec!["bind.service", "test.service", "test.service"]
+        );
 
         // Stopped, so what it runs cannot be told: left as it is.
         let (mut adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
