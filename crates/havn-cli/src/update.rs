@@ -74,9 +74,9 @@ const KNOWN_PACKS: [(&str, &str); 1] = [("havn-pack-browser", "playwright-cli")]
 /// What an adapter logs when it has connected to the gateway.
 const CONNECTED: &str = "havn WS connected";
 
-/// How a release's notes name the oldest gateway it works with:
-/// `Requires Havn >= 0.2.12` on a line, read in lower case.
-const REQUIRES: &str = "requires havn";
+/// The word with which a release's notes name the oldest gateway it works
+/// with: `Requires Havn >= 0.2.12` on a line, read in lower case.
+const REQUIRES: &str = "requires";
 
 /// Where the adapters' releases install their binary. One found elsewhere
 /// was put there otherwise (built from source, a package): it is updated
@@ -991,8 +991,8 @@ impl Components {
     /// Add what was `found` and is not listed: an adapter by its binary (a
     /// listed one gains the units found running it), a pack by its name or
     /// path. A found adapter whose binary is not in [`RELEASE_DIR`] is not
-    /// added but returned.
-    fn add(&mut self, found: Self) -> Vec<Adapter> {
+    /// added but returned, with why.
+    fn add(&mut self, found: Self) -> Vec<(Adapter, String)> {
         let mut unmanaged = Vec::new();
         for adapter in found.adapters {
             match self
@@ -1013,7 +1013,10 @@ impl Components {
                 None if adapter.binary.parent() == Some(Path::new(RELEASE_DIR)) => {
                     self.adapters.push(adapter);
                 }
-                None => unmanaged.push(adapter),
+                None => {
+                    let why = format!("{} is not in {RELEASE_DIR}", adapter.binary.display());
+                    unmanaged.push((adapter, why));
+                }
             }
         }
         for pack in found.packs {
@@ -1029,11 +1032,21 @@ impl Components {
     }
 }
 
-/// The unit's name and the binaries it runs, from `systemctl show -p Id
-/// -p ExecStart` output `shown` (drop-ins applied; an alias shows the
-/// unit's own name). Each command is a `{ path=… ; argv[]=… ; … }`.
-fn parse_exec(shown: &str) -> (String, Vec<PathBuf>) {
-    let paths = shown
+/// What systemd says a unit runs: its own name (an alias shows the unit's),
+/// the binaries of its `ExecStart=` and, when it runs them inside another
+/// root, its `RootDirectory=` or `RootImage=` line.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Exec {
+    id: String,
+    binaries: Vec<PathBuf>,
+    root: Option<String>,
+}
+
+/// What a unit runs, from `systemctl show -p Id -p ExecStart -p
+/// RootDirectory -p RootImage` output `shown` (drop-ins applied). Each
+/// command is a `{ path=… ; argv[]=… ; … }`.
+fn parse_exec(shown: &str) -> Exec {
+    let binaries = shown
         .lines()
         .filter_map(|line| line.strip_prefix("ExecStart="))
         .flat_map(|value| value.split("{ path=").skip(1))
@@ -1041,7 +1054,15 @@ fn parse_exec(shown: &str) -> (String, Vec<PathBuf>) {
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .collect();
-    (field(shown, "Id"), paths)
+    let root = ["RootDirectory", "RootImage"].iter().find_map(|key| {
+        let value = field(shown, key);
+        (!value.is_empty() && value != "/").then(|| format!("{key}={value}"))
+    });
+    Exec {
+        id: field(shown, "Id"),
+        binaries,
+        root,
+    }
 }
 
 /// Whether the file at `path` names a channel adapter's binary.
@@ -1082,21 +1103,43 @@ fn candidate_units(unit_dirs: &[&Path]) -> Vec<String> {
 
 /// The channel adapters that units in `unit_dirs` run, as systemd resolves
 /// the units (drop-ins applied, an alias once), and the packs under
-/// `packs`.
-fn discover(unit_dirs: &[&Path], packs: &Path, host: &impl Host) -> Components {
+/// `packs`; apart, those a unit runs inside another root, with why.
+fn discover(
+    unit_dirs: &[&Path],
+    packs: &Path,
+    host: &impl Host,
+) -> (Components, Vec<(Adapter, String)>) {
     let mut found = Components::default();
+    let mut rooted = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for unit in candidate_units(unit_dirs) {
-        let (id, binaries) = host.exec(&unit);
-        let unit = if id.is_empty() { unit } else { id };
+        let exec = host.exec(&unit);
+        let unit = if exec.id.is_empty() { unit } else { exec.id };
         if !seen.insert(unit.clone()) {
             continue;
         }
-        for binary in binaries {
+        for binary in exec.binaries {
             let Some(name) = binary.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
             if !name.starts_with("havn-channel-") || !a_binary(name) {
+                continue;
+            }
+            // Its binary is not the one at that path here, and what this
+            // machine has of it (a directory, an image) cannot be told
+            // reliably from the unit: it is left to the list.
+            if let Some(root) = &exec.root {
+                rooted.push((
+                    Adapter {
+                        name: name.to_string(),
+                        repo: String::new(),
+                        binary,
+                        units: vec![unit.clone()],
+                        version: None,
+                        skip: false,
+                    },
+                    format!("{unit} runs it under {root}"),
+                ));
                 continue;
             }
             match found.adapters.iter_mut().find(|a| a.binary == binary) {
@@ -1148,21 +1191,28 @@ fn discover(unit_dirs: &[&Path], packs: &Path, host: &impl Host) -> Components {
             });
         }
     }
-    found
+    (found, rooted)
 }
 
 /// What a release's `notes` say of the oldest gateway it works with:
 /// `None` when no line says, else that version, or the line when it names
-/// none that can be read. The line holds `Requires Havn >= X.Y.Z` in any
-/// case, with Markdown, `:` or `≥` about it.
+/// none that can be read. The line says `Requires Havn >= X.Y.Z`, `Requires
+/// Havn version X.Y.Z`, `Requires at least Havn vX.Y.Z+` and the like, in
+/// any case, with Markdown, `:`, brackets or `≥` about it.
 fn requires(notes: &str) -> Option<Result<String, String>> {
+    let word = |c: char| c.is_alphanumeric() || c == '-';
+    // `rest` without `lead`, a whole word when it is one.
+    let without = |rest: &str, lead: &str| -> Option<String> {
+        let after = rest.strip_prefix(lead)?;
+        (!lead.ends_with(word) || !after.starts_with(word)).then(|| after.trim_start().to_string())
+    };
     notes.lines().find_map(|line| {
         let plain: String = line
             .to_lowercase()
             .replace('≥', ">=")
             .chars()
             .map(|c| {
-                if matches!(c, '`' | '*' | '_' | ':') {
+                if matches!(c, '`' | '*' | '_' | ':' | '(' | ')' | '[' | ']') {
                     ' '
                 } else {
                     c
@@ -1170,33 +1220,41 @@ fn requires(notes: &str) -> Option<Result<String, String>> {
             })
             .collect();
         let plain = plain.split_whitespace().collect::<Vec<_>>().join(" ");
-        let at = plain.find(REQUIRES)?;
-        let word = |c: char| c.is_alphanumeric() || c == '-';
-        let after = &plain[at + REQUIRES.len()..];
-        if plain[..at].ends_with(word) || after.starts_with(word) {
-            return None;
-        }
-        // Then a version: `>=` first, or its first digit.
-        let rest = after.trim_start();
-        let rest = match rest.strip_prefix(">=") {
-            Some(rest) => rest.trim_start(),
-            None if rest
-                .trim_start_matches('v')
-                .starts_with(|c: char| c.is_ascii_digit()) =>
-            {
-                rest
+        plain.match_indices(REQUIRES).find_map(|(at, _)| {
+            let after = &plain[at + REQUIRES.len()..];
+            if plain[..at].ends_with(word) || after.starts_with(word) {
+                return None;
             }
-            None => return None,
-        };
-        let version = rest
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .trim_end_matches(['.', ',', ';', ')', '!'])
-            .trim_start_matches('v');
-        Some(match release::parse_version(version) {
-            Some(_) => Ok(version.to_string()),
-            None => Err(line.trim().to_string()),
+            let after = after.trim_start();
+            let after = without(after, "at least").unwrap_or_else(|| after.to_string());
+            let mut rest = without(&after, "havn")?;
+            // Then a version, after words that say one follows, or its
+            // first digit.
+            let mut said = false;
+            while let Some(next) = [">=", "version", "versions", "at least"]
+                .iter()
+                .find_map(|lead| without(&rest, lead))
+            {
+                rest = next;
+                said = true;
+            }
+            if !said
+                && !rest
+                    .trim_start_matches('v')
+                    .starts_with(|c: char| c.is_ascii_digit())
+            {
+                return None;
+            }
+            let version = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches(['.', ',', ';', '!', '+'])
+                .trim_start_matches('v');
+            Some(match release::parse_version(version) {
+                Some(_) => Ok(version.to_string()),
+                None => Err(line.trim().to_string()),
+            })
         })
     })
 }
@@ -1240,16 +1298,17 @@ trait Host {
     /// The version `binary --version` says it is; as nobody, when
     /// `unprivileged`.
     fn version(&self, binary: &Path, unprivileged: bool) -> Option<String>;
-    /// The unit's own name and the binaries it runs.
-    fn exec(&self, unit: &str) -> (String, Vec<PathBuf>);
+    /// What the unit runs.
+    fn exec(&self, unit: &str) -> Exec;
     /// The unit as it is now.
     fn show(&self, unit: &str) -> Shown;
     /// Restart the unit; how many times systemd had restarted it before.
     fn restart(&self, unit: &str) -> anyhow::Result<u64>;
     /// Whether the unit's run `invocation` logged `line`.
     fn logged(&self, invocation: &str, line: &str) -> bool;
-    /// The binary process `pid` runs.
-    fn exe(&self, pid: u32) -> Option<PathBuf>;
+    /// The binary process `pid` runs, and whether it is the file at
+    /// `binary` (seen from another root, its path is not that).
+    fn exe(&self, pid: u32, binary: &Path) -> Option<(PathBuf, bool)>;
 }
 
 /// The user `--version` runs as, unprivileged.
@@ -1291,8 +1350,22 @@ impl Host for System {
         version_in(&out)
     }
 
-    fn exec(&self, unit: &str) -> (String, Vec<PathBuf>) {
-        parse_exec(&systemctl(&["show", "-p", "Id", "-p", "ExecStart", unit]).unwrap_or_default())
+    fn exec(&self, unit: &str) -> Exec {
+        parse_exec(
+            &systemctl(&[
+                "show",
+                "-p",
+                "Id",
+                "-p",
+                "ExecStart",
+                "-p",
+                "RootDirectory",
+                "-p",
+                "RootImage",
+                unit,
+            ])
+            .unwrap_or_default(),
+        )
     }
 
     fn show(&self, unit: &str) -> Shown {
@@ -1333,8 +1406,16 @@ impl Host for System {
             .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains(line))
     }
 
-    fn exe(&self, pid: u32) -> Option<PathBuf> {
-        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    fn exe(&self, pid: u32, binary: &Path) -> Option<(PathBuf, bool)> {
+        use std::os::unix::fs::MetadataExt as _;
+        let link = format!("/proc/{pid}/exe");
+        let path = std::fs::read_link(&link).ok()?;
+        // The link opens the file the process runs, whatever its root.
+        let same = match (std::fs::metadata(&link), std::fs::metadata(binary)) {
+            (Ok(runs), Ok(is)) => runs.dev() == is.dev() && runs.ino() == is.ino(),
+            _ => false,
+        };
+        Some((path, same))
     }
 }
 
@@ -1376,24 +1457,28 @@ async fn restart_watched(
         let active = now.state == "active";
         // Just after the restart the process may not have exec'd the binary
         // yet (it is still systemd's): another binary fails only once it
-        // has had `watch.settle`. One replaced since it started reads
-        // `<path> (deleted)`, which is not the binary either.
+        // has had `watch.settle`. It is the same file, not the same path:
+        // a unit with its own root sees the binary at another, and another
+        // binary at this one.
         let exe = if active && now.pid > 0 {
-            host.exe(now.pid)
+            host.exe(now.pid, binary)
         } else {
             None
         };
-        let runs_it = exe.as_deref() == Some(binary);
+        let runs_it = exe.as_ref().is_some_and(|(_, same)| *same);
         let settled = started.elapsed() >= watch.settle;
-        if let Some(exe) = &exe
+        if let Some((exe, _)) = &exe
             && !runs_it
             && settled
         {
-            return Err(format!(
-                "{unit} runs {}, not {}",
-                exe.display(),
-                binary.display()
-            ));
+            return Err(if exe == binary {
+                format!(
+                    "{unit} runs another {} than this one, in its own root",
+                    exe.display()
+                )
+            } else {
+                format!("{unit} runs {}, not {}", exe.display(), binary.display())
+            });
         }
         let connected = !connect || (active && host.logged(&now.invocation, CONNECTED));
         if runs_it && connected && settled {
@@ -1452,7 +1537,7 @@ async fn install(
     // Each unit by its own name, so an alias is restarted once.
     let mut units: Vec<String> = Vec::new();
     for unit in &adapter.units {
-        let (id, _) = host.exec(unit);
+        let id = host.exec(unit).id;
         let unit = if id.is_empty() { unit.clone() } else { id };
         if !units.contains(&unit) {
             units.push(unit);
@@ -1689,13 +1774,14 @@ fn table(head: [&str; 4], rows: &[Row]) -> String {
 
 /// What the adapters' step works on, gathered before the gateway's: the
 /// list as read from `path`, the list with what was found added, the
-/// adapters found but not managed, and why the list could not be read.
+/// adapters found but not managed with why, and why the list could not be
+/// read.
 #[derive(Debug)]
 struct Gathered {
     path: PathBuf,
     read: Components,
     list: Components,
-    unmanaged: Vec<Adapter>,
+    unmanaged: Vec<(Adapter, String)>,
     unread: Option<String>,
 }
 
@@ -1714,7 +1800,20 @@ fn gather(
         Err(e) => return Err(e.context("--only gateway updates the gateway without it")),
     };
     let mut list = read.clone();
-    let unmanaged = list.add(discover(unit_dirs, packs, host));
+    let (found, rooted) = discover(unit_dirs, packs, host);
+    let mut unmanaged = list.add(found);
+    // A unit with its own root is said only when the list does not name it.
+    let listed = |unit: &str| {
+        list.adapters
+            .iter()
+            .flat_map(|a| &a.units)
+            .any(|u| u == unit || host.exec(u).id == unit)
+    };
+    unmanaged.extend(
+        rooted
+            .into_iter()
+            .filter(|(adapter, _)| !adapter.units.iter().any(|u| listed(u))),
+    );
     Ok(Gathered {
         path: path.to_path_buf(),
         read,
@@ -1754,15 +1853,12 @@ async fn update_components(
             .await,
         );
     }
-    for adapter in &gathered.unmanaged {
+    for (adapter, why) in &gathered.unmanaged {
         rows.push(Row::new(
             &adapter.name,
             "-",
             "-",
-            &format!(
-                "not managed: {} is not in {RELEASE_DIR}; list it in {COMPONENTS} to update it",
-                adapter.binary.display()
-            ),
+            &format!("not managed: {why}; list it in {COMPONENTS} to update it"),
         ));
     }
     for pack in &gathered.list.packs {
@@ -2014,19 +2110,32 @@ mod tests {
                      argv[]=/usr/local/bin/havn-channel-telegram --config /etc/c.toml ; \
                      ignore_errors=no ; pid=0 }\nExecStart={ path=/opt/y ; argv[]=/opt/y }\n";
         assert_eq!(
-            parse_exec(shown),
-            (
-                "tg.service".to_string(),
-                vec![
+            parse_exec(&format!("{shown}RootDirectory=\nRootImage=\n")),
+            Exec {
+                id: "tg.service".to_string(),
+                binaries: vec![
                     PathBuf::from("/usr/local/bin/havn-channel-telegram"),
                     PathBuf::from("/opt/y")
-                ]
-            )
+                ],
+                root: None,
+            }
         );
-        assert_eq!(parse_exec(""), (String::new(), Vec::new()));
+        assert_eq!(parse_exec(""), Exec::default());
         let argv = "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env x                     --state-path=/usr/local/bin/havn-channel-x ; ignore_errors=no }
 ";
-        assert_eq!(parse_exec(argv).1, vec![PathBuf::from("/usr/bin/env")]);
+        assert_eq!(
+            parse_exec(argv).binaries,
+            vec![PathBuf::from("/usr/bin/env")]
+        );
+        assert_eq!(
+            parse_exec(&format!("{shown}RootDirectory=/srv/jail\nRootImage=\n")).root,
+            Some("RootDirectory=/srv/jail".to_string())
+        );
+        assert_eq!(
+            parse_exec(&format!("{shown}RootDirectory=\nRootImage=/srv/tg.raw\n")).root,
+            Some("RootImage=/srv/tg.raw".to_string())
+        );
+        assert_eq!(parse_exec("RootDirectory=/\n").root, None, "the host's own");
 
         let etc = tempfile::tempdir().unwrap();
         let lib = tempfile::tempdir().unwrap();
@@ -2051,6 +2160,7 @@ mod tests {
             ),
             (etc.path(), "tpl@.service", mentions),
             (etc.path(), "dc.timer", mentions),
+            (etc.path(), "jail.service", mentions),
             (
                 lib.path(),
                 "dc.service",
@@ -2071,6 +2181,7 @@ mod tests {
             vec![
                 "alias.service",
                 "dc.service",
+                "jail.service",
                 "odd.service",
                 "tg.service",
                 "tg2.service"
@@ -2101,10 +2212,12 @@ mod tests {
                     "dc.service",
                     "/usr/local/bin/havn-channel-discord",
                 ),
+                ("jail.service", "jail.service", telegram),
             ],
+            roots: vec![("jail.service", "RootDirectory=/srv/jail")],
             ..Fake::new(Path::new("/nonexistent"))
         };
-        let found = discover(&[etc.path(), lib.path()], packs.path(), &fake);
+        let (found, rooted) = discover(&[etc.path(), lib.path()], packs.path(), &fake);
         let adapters: Vec<(&str, &str, Vec<&str>)> = found
             .adapters
             .iter()
@@ -2145,12 +2258,36 @@ mod tests {
             ]
         );
 
+        // A unit that runs it inside another root is not one of telegram's.
+        let rooted: Vec<(&str, Vec<&str>, &str)> = rooted
+            .iter()
+            .map(|(a, why)| {
+                (
+                    a.name.as_str(),
+                    a.units.iter().map(String::as_str).collect(),
+                    why.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rooted,
+            vec![(
+                "havn-channel-telegram",
+                vec!["jail.service"],
+                "jail.service runs it under RootDirectory=/srv/jail"
+            )]
+        );
+
         // Only one in the releases' directory is taken without being listed.
         let mut list = Components::default();
         let unmanaged = list.add(found);
         assert_eq!(list.adapters.len(), 2);
         assert_eq!(unmanaged.len(), 1);
-        assert_eq!(unmanaged[0].binary, Path::new("/opt/havn-channel-odd"));
+        assert_eq!(unmanaged[0].0.binary, Path::new("/opt/havn-channel-odd"));
+        assert_eq!(
+            unmanaged[0].1,
+            "/opt/havn-channel-odd is not in /usr/local/bin"
+        );
     }
 
     fn listed(name: &str, binary: &str, units: &[&str]) -> Adapter {
@@ -2255,19 +2392,47 @@ mod tests {
             ),
             ("requires havn>=0.2.14", "0.2.14"),
             ("- Requires _Havn_ 0.2.15 or later", "0.2.15"),
+            ("Requires Havn version 0.2.13", "0.2.13"),
+            ("requires havn 0.2.13", "0.2.13"),
+            ("Requires Havn v0.2.13+", "0.2.13"),
+            ("Requires at least Havn 0.2.16.", "0.2.16"),
+            ("Requires Havn version >= v0.2.17", "0.2.17"),
+            ("Requires Havn (>= 0.2.18)", "0.2.18"),
+            (
+                "This release requires Havn at least version 0.2.19.",
+                "0.2.19",
+            ),
+            (
+                "Requires Havn [v0.2.20](https://x/releases/v0.2.20)",
+                "0.2.20",
+            ),
+            (
+                "It requires a restart and requires Havn >= 0.2.21",
+                "0.2.21",
+            ),
         ] {
             assert_eq!(requires(notes), Some(Ok(wanted.to_string())), "{notes}");
         }
-        assert_eq!(
-            requires("Requires Havn >= soon"),
-            Some(Err("Requires Havn >= soon".to_string()))
-        );
+        for unreadable in [
+            "Requires Havn >= soon",
+            "Requires Havn version next",
+            "Requires at least Havn v2",
+        ] {
+            assert_eq!(
+                requires(unreadable),
+                Some(Err(unreadable.to_string())),
+                "{unreadable}"
+            );
+        }
         assert_eq!(requires(""), None);
         assert_eq!(requires("Works with any Havn"), None);
         for unrelated in [
             "Logging in requires havn-gateway auth.",
             "This requires Havn to restart.",
             "Prerequires havn >= 0.2.12",
+            "Requireshavn >= 0.2.12",
+            "It requires at least one Havn agent.",
+            "Requires Havn versioned configs (see 0.2.12)",
         ] {
             assert_eq!(requires(unrelated), None, "{unrelated}");
         }
@@ -2339,8 +2504,10 @@ Requires Havn >= 0.2.12"
     /// only with `connects`. They run `elsewhere` when it is set, ran
     /// before when `running`, and the old binary goes missing on the first
     /// restart with `lose_old`. For the first `executor` looks after each
-    /// restart, the process is still systemd's. `execs` are the units'
-    /// `ExecStart=`.
+    /// restart, the process is still systemd's. With `inside`, the binary
+    /// is seen at that path, as from a unit's own root. `execs` are the
+    /// units' `ExecStart=`, and `roots` their `RootDirectory=` or
+    /// `RootImage=`.
     struct Fake {
         binary: PathBuf,
         old: &'static str,
@@ -2349,10 +2516,12 @@ Requires Havn >= 0.2.12"
         connects: bool,
         running: bool,
         elsewhere: Option<PathBuf>,
+        inside: Option<PathBuf>,
         lose_old: bool,
         executor: u32,
         looks: std::cell::Cell<u32>,
         execs: Vec<(&'static str, &'static str, &'static str)>,
+        roots: Vec<(&'static str, &'static str)>,
         restarted: std::cell::RefCell<Vec<String>>,
     }
 
@@ -2366,10 +2535,12 @@ Requires Havn >= 0.2.12"
                 connects: true,
                 running: true,
                 elsewhere: None,
+                inside: None,
                 lose_old: false,
                 executor: 0,
                 looks: std::cell::Cell::new(0),
                 execs: Vec::new(),
+                roots: Vec::new(),
                 restarted: std::cell::RefCell::new(Vec::new()),
             }
         }
@@ -2391,13 +2562,19 @@ Requires Havn >= 0.2.12"
             version_in(&std::fs::read_to_string(binary).ok()?)
         }
 
-        fn exec(&self, unit: &str) -> (String, Vec<PathBuf>) {
-            self.execs
-                .iter()
-                .find(|(u, ..)| *u == unit)
-                .map_or((String::new(), Vec::new()), |(_, id, binary)| {
-                    ((*id).to_string(), vec![PathBuf::from(binary)])
-                })
+        fn exec(&self, unit: &str) -> Exec {
+            self.execs.iter().find(|(u, ..)| *u == unit).map_or_else(
+                Exec::default,
+                |(_, id, binary)| Exec {
+                    id: (*id).to_string(),
+                    binaries: vec![PathBuf::from(binary)],
+                    root: self
+                        .roots
+                        .iter()
+                        .find(|(u, _)| *u == unit)
+                        .map(|(_, root)| (*root).to_string()),
+                },
+            )
         }
 
         fn show(&self, unit: &str) -> Shown {
@@ -2430,17 +2607,19 @@ Requires Havn >= 0.2.12"
             line == CONNECTED && (self.connects || !self.fresh())
         }
 
-        fn exe(&self, _pid: u32) -> Option<PathBuf> {
+        fn exe(&self, _pid: u32, binary: &Path) -> Option<(PathBuf, bool)> {
             let looks = self.looks.get();
             self.looks.set(looks + 1);
             if looks < self.executor {
-                return Some(EXECUTOR.into());
+                return Some((EXECUTOR.into(), false));
             }
-            Some(
-                self.elsewhere
-                    .clone()
-                    .unwrap_or_else(|| self.binary.clone()),
-            )
+            Some(match &self.elsewhere {
+                Some(path) => (path.clone(), false),
+                None => (
+                    self.inside.clone().unwrap_or_else(|| self.binary.clone()),
+                    binary == self.binary,
+                ),
+            })
         }
     }
 
@@ -2569,6 +2748,18 @@ Requires Havn >= 0.2.12"
         );
         assert_eq!(fake.installed(), "0.2.11");
 
+        // A unit with its own root runs the file at another path.
+        let (adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        let fake = Fake {
+            inside: Some("/usr/local/bin/havn-channel-test".into()),
+            ..Fake::new(&adapter.binary)
+        };
+        assert_eq!(
+            install_on(&fake, &adapter, &archive, &sums, true, QUICK).await,
+            Ok("updated".into())
+        );
+        assert_eq!(fake.installed(), "0.2.11");
+
         // A unit under two names is restarted once.
         let (mut adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
         adapter.units.push("alias.service".into());
@@ -2581,6 +2772,36 @@ Requires Havn >= 0.2.12"
             Ok("updated".into())
         );
         assert_eq!(*fake.restarted.borrow(), vec!["test.service"]);
+    }
+
+    #[test]
+    fn what_a_process_runs_is_told_by_its_file_not_its_path() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (runs, _) = System.exe(child.id(), Path::new("/nonexistent")).unwrap();
+        // The same file at another path, as a unit's own root would show it.
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("sleep");
+        std::os::unix::fs::symlink(&runs, &elsewhere).unwrap();
+        let seen = [
+            System.exe(child.id(), &runs),
+            System.exe(child.id(), &elsewhere),
+            System.exe(child.id(), &std::env::current_exe().unwrap()),
+            System.exe(child.id(), Path::new("/nonexistent")),
+        ];
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            seen.map(|s| s.unwrap()),
+            [
+                (runs.clone(), true),
+                (runs.clone(), true),
+                (runs.clone(), false),
+                (runs, false)
+            ]
+        );
     }
 
     async fn fails(fake: &Fake, adapter: &Adapter, archive: &[u8], sums: &str) -> String {
@@ -2642,6 +2863,19 @@ Requires Havn >= 0.2.12"
         let failed = fails(&fake, &adapter, &archive, &sums).await;
         assert!(
             failed.contains("runs /usr/bin/havn-channel-test, not"),
+            "{failed}"
+        );
+        assert_eq!(fake.installed(), "0.2.9");
+
+        // Another file at the same path: the one in the unit's own root.
+        let (adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        let fake = Fake {
+            elsewhere: Some(adapter.binary.clone()),
+            ..Fake::new(&adapter.binary)
+        };
+        let failed = fails(&fake, &adapter, &archive, &sums).await;
+        assert!(
+            failed.contains("than this one, in its own root"),
             "{failed}"
         );
         assert_eq!(fake.installed(), "0.2.9");
@@ -2811,19 +3045,41 @@ Requires Havn >= 0.2.12"
                 entry("gone", "amplimit/gone", ""),
                 entry("empty", "amplimit/empty", ""),
                 entry("later", "amplimit/later", ""),
-                entry("held", "amplimit/held", "skip = true"),
+                entry(
+                    "held",
+                    "amplimit/held",
+                    "units = [\"image.service\"]\nskip = true",
+                ),
             ]
             .concat(),
         )
         .unwrap();
         let units = tempfile::tempdir().unwrap();
-        std::fs::write(
-            units.path().join("odd.service"),
-            "ExecStart=/opt/havn-channel-odd\n",
-        )
-        .unwrap();
+        for (unit, binary) in [
+            ("odd.service", "/opt/havn-channel-odd"),
+            ("jail.service", "/usr/local/bin/havn-channel-test"),
+            ("image.service", "/usr/local/bin/havn-channel-held"),
+        ] {
+            std::fs::write(units.path().join(unit), format!("ExecStart={binary}\n")).unwrap();
+        }
         let fake = Fake {
-            execs: vec![("odd.service", "odd.service", "/opt/havn-channel-odd")],
+            execs: vec![
+                ("odd.service", "odd.service", "/opt/havn-channel-odd"),
+                (
+                    "jail.service",
+                    "jail.service",
+                    "/usr/local/bin/havn-channel-test",
+                ),
+                (
+                    "image.service",
+                    "image.service",
+                    "/usr/local/bin/havn-channel-held",
+                ),
+            ],
+            roots: vec![
+                ("jail.service", "RootDirectory=/srv/jail"),
+                ("image.service", "RootImage=/srv/held.raw"),
+            ],
             ..Fake::new(&adapter.binary)
         };
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -2878,6 +3134,14 @@ Requires Havn >= 0.2.12"
                     "-",
                     "not managed: /opt/havn-channel-odd is not in /usr/local/bin; list it in \
                      /etc/havn/components.toml to update it",
+                    false
+                ),
+                (
+                    "havn-channel-test",
+                    "-",
+                    "-",
+                    "not managed: jail.service runs it under RootDirectory=/srv/jail; list it \
+                     in /etc/havn/components.toml to update it",
                     false
                 ),
             ]
