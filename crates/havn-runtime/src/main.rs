@@ -4281,7 +4281,44 @@ fn failure_text(detail: &str) -> (String, bool) {
             ),
             false,
         )
-    } else if d.contains("is unavailable") || d.contains("overloaded") || d.contains(" 429") {
+    } else if refused_with(&d, 402) {
+        (
+            lang().pick(
+                "its provider asks for payment: the account its API key bills is out of credit. The agent's owner can check it.",
+                "模型服务商要求付款：API 密钥所属的账户余额不足。agent 的所有者可以检查一下。",
+            ),
+            false,
+        )
+    } else if refused_with(&d, 403)
+        && d.starts_with(&format!(
+            "upstream provider error: 403 — {}",
+            havn_proto::KEY_TURNED_OFF
+        ))
+    {
+        (
+            lang().pick(
+                "its provider refused the API key itself (revoked, leaked or blocked), so it was turned off. The agent's owner can check it.",
+                "模型服务商拒绝了这个 API 密钥本身（已吊销、泄露或被封禁），所以它已被停用。agent 的所有者可以检查一下。",
+            ),
+            false,
+        )
+    } else if refused_with(&d, 403) {
+        (
+            lang().pick(
+                "its provider forbids it: the API key may not be allowed this model. The agent's owner can check it.",
+                "模型服务商拒绝了它：这个 API 密钥可能不能使用这个模型。agent 的所有者可以检查一下。",
+            ),
+            false,
+        )
+    } else if refused_with(&d, 429) {
+        (
+            lang().pick(
+                "its provider limits how often it is called, or its quota is used up. Try again later.",
+                "模型服务商限制了调用频率，或者额度已经用完。请稍后再试。",
+            ),
+            true,
+        )
+    } else if d.contains("is unavailable") || d.contains("overloaded") {
         (
             lang().pick(
                 "its provider is overloaded or cannot be reached right now. Try again in a minute.",
@@ -4353,6 +4390,25 @@ fn failure_text(detail: &str) -> (String, bool) {
         ),
         again,
     )
+}
+
+/// Whether failure `detail`, lowercased, is the provider's refusal with
+/// HTTP `status` (issue #323), as the gateway starts it: "upstream
+/// provider error: 402 — ...", or, for one it tried again, "the provider
+/// "x" is unavailable (429: ...". What the provider said, after, does not
+/// count.
+fn refused_with(detail: &str, status: u16) -> bool {
+    if let Some(rest) = detail.strip_prefix("upstream provider error: ") {
+        return rest
+            .strip_prefix(&status.to_string())
+            .is_some_and(|after| after.is_empty() || after.starts_with(' '));
+    }
+    detail
+        .strip_prefix("the provider \"")
+        .and_then(|rest| rest.split_once("\" is unavailable ("))
+        .is_some_and(|(name, reason)| {
+            !name.contains('"') && reason.starts_with(&format!("{status}: "))
+        })
 }
 
 /// What a person is told when their chat was compacted because it had
@@ -5918,6 +5974,34 @@ run ls"
         );
         assert!(told("internal error: the context budget is wrong").contains("agent's side"));
         assert!(told("upstream provider error: 400 — Budget 0 is invalid").contains("refused"));
+        // A provider's refusal is told as what it is (issue #323).
+        let (payment, again) = failure_text("upstream provider error: 402 — no credit left");
+        assert!(payment.contains("payment") && !again, "{payment}");
+        assert!(!payment.contains("no credit left"));
+        let (forbidden, again) = failure_text("upstream provider error: 403 — not for this model");
+        assert!(forbidden.contains("forbids") && !again, "{forbidden}");
+        let (turned_off, again) = failure_text(&format!(
+            "upstream provider error: 403 — {} — Your API key was reported as leaked.",
+            havn_proto::KEY_TURNED_OFF
+        ));
+        assert!(
+            turned_off.contains("refused the API key itself") && !again,
+            "{turned_off}"
+        );
+        assert!(told("upstream provider error: 403").contains("forbids"));
+        // What the provider said does not pass for the status.
+        assert!(
+            told("upstream provider error: 400 — says \"upstream provider error: 403 — x\"")
+                .contains("refused")
+        );
+        assert!(
+            told("the provider \"openai\" is unavailable (upstream 503: (429: x)) after 4 tries")
+                .contains("overloaded")
+        );
+        let (limited, again) = failure_text(
+            "the provider \"openai\" is unavailable (429: insufficient_quota) after 4 tries",
+        );
+        assert!(limited.contains("quota") && again, "{limited}");
         assert!(
             told(
                 "the conversation is 9 bytes over the 4194304-byte limit for one LLM request, \

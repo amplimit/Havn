@@ -33,6 +33,14 @@ use super::{AnthropicRequest, AnthropicResponse};
 pub enum ProviderError {
     /// HTTP 401 — key revoked. Disable the credential and try next.
     Unauthorized { body: String },
+    /// HTTP 403 — the provider forbids this key the request (a model, a
+    /// region, a project). Try next; do NOT disable: the key may serve
+    /// other requests (issue #323).
+    Forbidden { body: String },
+    /// HTTP 403 for the key itself (Gemini: blocked, reported as leaked,
+    /// its API not enabled): disable it and try next, as for a 401, and
+    /// say it as the 403 it is.
+    KeyForbidden { body: String },
     /// HTTP 402 / 429 — quota exhausted or rate-limited. Try next; do NOT
     /// disable (the key may be fine again tomorrow / next minute). A 429 is
     /// tried again first, after `retry_after` when the provider said
@@ -48,7 +56,7 @@ pub enum ProviderError {
         body: String,
         retry_after: Option<std::time::Duration>,
     },
-    /// HTTP 4xx other than 401/402/429 — caller's request is malformed.
+    /// HTTP 4xx other than 401/402/403/429 — caller's request is malformed.
     /// Fatal; do not iterate.
     BadRequest { status: u16, body: String },
     /// Network / TLS / DNS failure. Try next (the next credential may be
@@ -63,6 +71,9 @@ impl std::fmt::Display for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unauthorized { body } => write!(f, "401 unauthorized: {body}"),
+            Self::Forbidden { body } | Self::KeyForbidden { body } => {
+                write!(f, "403 forbidden: {body}")
+            }
             Self::QuotaOrRateLimit { status, body, .. } => write!(f, "{status}: {body}"),
             Self::Upstream { status, body, .. } => write!(f, "upstream {status}: {body}"),
             Self::BadRequest { status, body } => write!(f, "{status}: {body}"),
@@ -172,6 +183,7 @@ pub fn status_error(
 ) -> ProviderError {
     match status {
         401 => ProviderError::Unauthorized { body },
+        403 => ProviderError::Forbidden { body },
         402 | 429 => ProviderError::QuotaOrRateLimit {
             status,
             body,
@@ -364,6 +376,17 @@ pub(super) fn classify(err: ProviderError) -> super::Attempt {
     match err {
         ProviderError::Unauthorized { body } => super::Attempt::Disable {
             reason: format!("401 unauthorized: {body}"),
+            said: Some((401, body)),
+        },
+        ProviderError::KeyForbidden { body } => super::Attempt::Disable {
+            reason: format!("403 forbidden: {body}"),
+            said: Some((403, body)),
+        },
+        ProviderError::Forbidden { body } => super::Attempt::TryNext {
+            reason: format!("403 forbidden: {body}"),
+            again: None,
+            transient: false,
+            said: Some((403, body)),
         },
         // A rate limit or an overload passes: tried again (issue #216). A
         // quota (402) does not.
@@ -375,6 +398,7 @@ pub(super) fn classify(err: ProviderError) -> super::Attempt {
             reason: format!("{status}: {body}"),
             again: (status == 429).then(|| retry_after.unwrap_or_default()),
             transient: status == 429,
+            said: Some((status, body)),
         },
         ProviderError::Upstream {
             status,
@@ -384,11 +408,13 @@ pub(super) fn classify(err: ProviderError) -> super::Attempt {
             reason: format!("upstream {status}: {body}"),
             again: Some(retry_after.unwrap_or_default()),
             transient: true,
+            said: Some((status, body)),
         },
         ProviderError::Transport(s) => super::Attempt::TryNext {
             reason: format!("transport: {s}"),
             again: Some(std::time::Duration::ZERO),
             transient: true,
+            said: None,
         },
         ProviderError::BadRequest { status, body } => {
             super::Attempt::Fatal(super::ProxyError::Upstream {

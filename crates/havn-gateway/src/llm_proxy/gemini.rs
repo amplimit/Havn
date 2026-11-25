@@ -28,6 +28,48 @@ use super::{AnthropicMessage, AnthropicRequest, AnthropicResponse, AnthropicUsag
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
+/// The `ErrorInfo` reasons Google gives a 403 for the key itself rather
+/// than for one request (issue #323): its key stops working until its
+/// owner fixes it. Not `SERVICE_DISABLED`, given for minutes after the API
+/// is enabled, nor `API_KEY_IP_ADDRESS_BLOCKED`, which a gateway whose
+/// address changes may get with a good key: those try the next key.
+const KEY_REASONS: &[&str] = &[
+    "API_KEY_INVALID",
+    "API_KEY_SERVICE_BLOCKED",
+    "API_KEY_HTTP_REFERRER_BLOCKED",
+    "API_KEY_ANDROID_APP_BLOCKED",
+    "API_KEY_IOS_APP_BLOCKED",
+    "CONSUMER_SUSPENDED",
+];
+
+/// The error a Gemini status and body stand for: a 403 for the key itself
+/// (one of [`KEY_REASONS`], or a key reported as leaked, which Google says
+/// only in words) disables the key; any other as every provider's.
+fn gemini_error(status: u16, body: String, wait: Option<std::time::Duration>) -> ProviderError {
+    if status == 403 && refuses_the_key(&body) {
+        return ProviderError::KeyForbidden { body };
+    }
+    status_error(status, body, wait)
+}
+
+fn refuses_the_key(body: &str) -> bool {
+    let Ok(error) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let error = &error["error"];
+    let by_reason = error["details"].as_array().is_some_and(|details| {
+        details.iter().any(|d| {
+            d["reason"]
+                .as_str()
+                .is_some_and(|reason| KEY_REASONS.contains(&reason))
+        })
+    });
+    by_reason
+        || error["message"]
+            .as_str()
+            .is_some_and(|m| m.to_ascii_lowercase().contains("reported as leaked"))
+}
+
 #[derive(Debug, Default)]
 pub struct GeminiProvider;
 
@@ -78,23 +120,7 @@ impl LlmProvider for GeminiProvider {
         if !status.is_success() {
             let wait = super::provider::retry_after(resp.headers());
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                401 | 403 => ProviderError::Unauthorized { body: body_text },
-                402 | 429 => ProviderError::QuotaOrRateLimit {
-                    status: status.as_u16(),
-                    body: body_text,
-                    retry_after: wait,
-                },
-                500..=599 => ProviderError::Upstream {
-                    status: status.as_u16(),
-                    body: body_text,
-                    retry_after: wait,
-                },
-                other => ProviderError::BadRequest {
-                    status: other,
-                    body: body_text,
-                },
-            });
+            return Err(gemini_error(status.as_u16(), body_text, wait));
         }
 
         let raw: Value = resp
@@ -136,10 +162,7 @@ impl LlmProvider for GeminiProvider {
         if !status.is_success() {
             let wait = super::provider::retry_after(resp.headers());
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                403 => ProviderError::Unauthorized { body: body_text },
-                code => status_error(code, body_text, wait),
-            });
+            return Err(gemini_error(status.as_u16(), body_text, wait));
         }
         if !is_event_stream(&resp) {
             let raw: Value = resp

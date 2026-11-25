@@ -2,7 +2,7 @@
 //!
 //! Phase 1 shipped Anthropic-only. Phase 3 adds OpenAI, OpenRouter, and
 //! Gemini behind a [`provider::LlmProvider`] trait. The fallback policy
-//! (401 → disable + try next, 429/402 → try next, 5xx → try next, all
+//! (401 → disable + try next, 429/403/402 → try next, 5xx → try next, all
 //! exhausted → error) is defined once here and reused by every provider.
 //!
 //! ## Canonical shape
@@ -265,7 +265,7 @@ pub enum ProxyError {
         reason: String,
         tries: u32,
     },
-    #[error("upstream provider error: {status} — {message}")]
+    #[error("upstream provider error: {status}{}", dash(.message))]
     Upstream { status: u16, message: String },
     #[error("transport: {0}")]
     Transport(#[from] reqwest::Error),
@@ -293,10 +293,14 @@ pub(crate) enum Attempt {
         reason: String,
         again: Option<std::time::Duration>,
         transient: bool,
+        /// The provider's status and message, when it answered (issue
+        /// #323).
+        said: Option<(u16, String)>,
     },
     /// Try next credential, and disable this one (401 unauthorized — key revoked).
     Disable {
         reason: String,
+        said: Option<(u16, String)>,
     },
     /// Hard upstream error — surface to caller, do not try other credentials.
     Fatal(ProxyError),
@@ -308,7 +312,7 @@ pub(crate) enum Attempt {
 /// - token caps leave no room for the request → try next.
 /// - 200 → settle usage, return canonical response.
 /// - 401 → disable credential, try next.
-/// - 402 / 429 → try next; do not disable (transient / quota).
+/// - 402 / 403 / 429 → try next; do not disable (quota / forbidden / transient).
 /// - 5xx / network → try next.
 /// - 4xx (other) → fatal — caller's request is malformed; do not iterate.
 #[allow(
@@ -625,9 +629,10 @@ async fn complete_through(
     let mut sent = false;
     // The last failure that passes, the calls made, and since when.
     let mut passing: Option<String> = None;
-    // An endpoint's last refusal that does not pass, with its status: said
-    // as it is, with how to add a key, rather than as no credential.
-    let mut refused: Option<(u16, String)> = None;
+    // The last refusal that does not pass, with its status: said as it is,
+    // an endpoint's with how to add a key, rather than as no credential.
+    // And whether its key was turned off for it.
+    let mut refused: Option<(u16, String, bool)> = None;
     let mut tries = 0_u32;
     let started = std::time::Instant::now();
     for cred in chain {
@@ -721,6 +726,7 @@ async fn complete_through(
                 reason,
                 again: Some(asked),
                 transient: true,
+                ..
             } = &attempt
             {
                 let wait = backoff(again, *asked);
@@ -765,7 +771,7 @@ async fn complete_through(
                 warn_over_agent_budget(db, cred_id, billing, (&day_start, &minute_start)).await;
                 return Ok(resp);
             }
-            Attempt::Disable { reason } => {
+            Attempt::Disable { reason, said } => {
                 guard.release().await;
                 if let Some(id) = cred_id {
                     warn!(credential_id = %shown, %reason, "disabling credential");
@@ -773,17 +779,25 @@ async fn complete_through(
                         .await
                         .map_err(|e| warn!(error = %e, "failed to disable credential"));
                 }
-                refused = Some((401, reason));
+                // A key refused (401) does not hide what another key was
+                // refused for (issue #323).
+                let (status, message) = said.unwrap_or((401, reason));
+                if status != 401 || refused.as_ref().is_none_or(|(was, ..)| *was == 401) {
+                    refused = Some((status, message, true));
+                }
             }
             Attempt::TryNext {
-                reason, transient, ..
+                reason,
+                transient,
+                said,
+                ..
             } => {
                 guard.release().await;
                 warn!(credential_id = %shown, %reason, "skipping credential, trying next");
                 if transient {
                     passing = Some(reason);
-                } else {
-                    refused = Some((402, reason));
+                } else if let Some((status, message)) = said {
+                    refused = Some((status, message, false));
                 }
             }
             Attempt::Fatal(e) => {
@@ -809,8 +823,10 @@ async fn complete_through(
             tries,
         });
     }
-    if route.keyless
-        && let Some((status, reason)) = refused
+    // The provider's last refusal, as it said it (issue #323); a key a
+    // built-in provider refused (401) was disabled, and none is left.
+    if let Some((status, message, turned_off)) = refused
+        && (route.keyless || status != 401)
     {
         let hint = if status == 401 {
             format!(
@@ -821,10 +837,15 @@ async fn complete_through(
         } else {
             String::new()
         };
-        return Err(ProxyError::Upstream {
-            status,
-            message: format!("{reason}{hint}"),
-        });
+        let words = provider_words(&message);
+        // A key refused for itself (a 403 for a revoked, leaked or blocked
+        // key) is said so, first, as the runtime tells it.
+        let message = if turned_off && status != 401 {
+            format!("{}{}", havn_proto::KEY_TURNED_OFF, dash(&words))
+        } else {
+            format!("{words}{hint}")
+        };
+        return Err(ProxyError::Upstream { status, message });
     }
     Err(exhausted.map_or_else(
         || ProxyError::NoCredential(route.name.to_string()),
@@ -870,6 +891,36 @@ fn short_reason(reason: &str) -> String {
         short.push('…');
     }
     short
+}
+
+/// ` — message`, or nothing when there is no message.
+fn dash(message: &str) -> String {
+    if message.is_empty() {
+        String::new()
+    } else {
+        format!(" — {message}")
+    }
+}
+
+/// What a provider said as it refused a call (issue #323), for a person to
+/// read: the message of its JSON error when it sent one, else its body,
+/// cut as [`short_reason`] cuts; an HTML page is not shown, only said.
+fn provider_words(body: &str) -> String {
+    let start = body.trim_start().to_ascii_lowercase();
+    if start.starts_with("<!doctype html") || start.starts_with("<html") {
+        return "the server answered with an HTML page, not the API's error".into();
+    }
+    let said = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/error/message")
+                .or_else(|| v.get("message"))
+                .or_else(|| v.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.trim().to_string());
+    short_reason(&said)
 }
 
 /// Owns a reservation row until it is settled, released or kept. Dropped
@@ -2443,12 +2494,14 @@ async fn try_one(
                 reason: format!(
                     "could not decrypt api_key — wrong HAVN_AGE_KEY or corrupted row ({e})"
                 ),
+                said: None,
             };
         }
     };
     let Ok(api_key) = std::str::from_utf8(&plaintext) else {
         return Attempt::Disable {
             reason: "decrypted api_key bytes are not valid UTF-8 — credential is malformed".into(),
+            said: None,
         };
     };
 
@@ -4611,6 +4664,210 @@ mod tests {
                 .await
                 .expect_err("401");
             assert!(wants_a_key(&err), "{err}");
+        }
+
+        /// A server that refuses every call with `status` and `words`, and
+        /// counts them.
+        async fn refuse(status: u16, words: &'static str) -> (String, Arc<Mutex<usize>>) {
+            refuse_in_turn(vec![(status, json!({"error": {"message": words}}))]).await
+        }
+
+        /// A server that refuses its calls with `replies` in turn, the
+        /// last one for every call after, and counts them.
+        async fn refuse_in_turn(replies: Vec<(u16, Value)>) -> (String, Arc<Mutex<usize>>) {
+            let calls: Arc<Mutex<usize>> = Arc::default();
+            let count = Arc::clone(&calls);
+            let replies = Arc::new(replies);
+            let app = axum::Router::new().fallback(move || {
+                let (count, replies) = (Arc::clone(&count), Arc::clone(&replies));
+                async move {
+                    let n = {
+                        let mut count = count.lock().unwrap();
+                        *count += 1;
+                        *count - 1
+                    };
+                    let (status, body) = replies[n.min(replies.len() - 1)].clone();
+                    (
+                        StatusCode::from_u16(status).expect("status"),
+                        axum::Json(body),
+                    )
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(async move { axum::serve(listener, app).await });
+            (format!("http://{addr}"), calls)
+        }
+
+        #[tokio::test]
+        async fn a_refusal_is_reported_as_the_provider_said_it_for_every_provider() {
+            for status in [402, 403, 429] {
+                let (base, _) = refuse(status, "the provider's own words").await;
+                let db = havn_db::connect_in_memory().await.expect("db");
+                let user = create_user(&db, NewUser { display_name: "u" })
+                    .await
+                    .expect("user")
+                    .id;
+                let mut llm = llm(&base);
+                // Each built-in API's own (OpenRouter's is OpenAI's); a key
+                // takes a while to decrypt, so a 429, tried again, is tried
+                // on one.
+                for provider in ["anthropic", "openai", "gemini"] {
+                    llm.base_url
+                        .insert(provider.into(), format!("{base}/{provider}"));
+                    key(&db, user, provider).await;
+                }
+                let built_in: &[&str] = if status == 429 {
+                    &["gemini"]
+                } else {
+                    &["anthropic", "openai", "gemini"]
+                };
+                for provider in ["ollama", "lan"].iter().chain(built_in) {
+                    let err = call(&db, user, provider, &llm, &hi())
+                        .await
+                        .expect_err("refused");
+                    let told = match &err {
+                        // A rate limit, or a quota used up, may pass: tried
+                        // again, then said as unavailable, with its status.
+                        ProxyError::Unavailable { reason, .. } if status == 429 => {
+                            reason.starts_with("429: ")
+                                && reason.contains("the provider's own words")
+                        }
+                        ProxyError::Upstream { status: s, message } => {
+                            *s == status && message == "the provider's own words"
+                        }
+                        _ => false,
+                    };
+                    assert!(told, "{status} from {provider}: {err:?}");
+                }
+                // A key refused this way is not disabled.
+                let enabled: Vec<bool> = sqlx::query_scalar("SELECT enabled FROM credentials")
+                    .fetch_all(&db)
+                    .await
+                    .expect("credentials");
+                assert_eq!(enabled, [true; 3], "{status}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_key_forbidden_a_request_is_kept_and_the_next_is_tried() {
+            let (base, calls) = refuse(403, "not for this model").await;
+            let db = havn_db::connect_in_memory().await.expect("db");
+            let user = create_user(&db, NewUser { display_name: "u" })
+                .await
+                .expect("user")
+                .id;
+            key(&db, user, "llm:ollama").await;
+            key(&db, user, "llm:ollama").await;
+            let err = call(&db, user, "ollama", &llm(&base), &hi())
+                .await
+                .expect_err("403");
+            assert!(
+                matches!(&err, ProxyError::Upstream { status: 403, message }
+                    if message.contains("not for this model") && !message.contains("havn credential")),
+                "{err}"
+            );
+            assert_eq!(*calls.lock().unwrap(), 2, "each key is tried");
+            assert!(rows(&db).await.is_empty(), "the reservations are released");
+        }
+
+        async fn enabled(db: &SqlitePool) -> Vec<bool> {
+            let mut enabled: Vec<bool> = sqlx::query_scalar("SELECT enabled FROM credentials")
+                .fetch_all(db)
+                .await
+                .expect("credentials");
+            enabled.sort_unstable();
+            enabled
+        }
+
+        #[tokio::test]
+        async fn a_key_refused_after_another_was_forbidden_does_not_hide_why() {
+            let (base, _) = refuse_in_turn(vec![
+                (403, json!({"error": {"message": "not for this model"}})),
+                (401, json!({"error": {"message": "bad key"}})),
+            ])
+            .await;
+            let db = havn_db::connect_in_memory().await.expect("db");
+            let user = create_user(&db, NewUser { display_name: "u" })
+                .await
+                .expect("user")
+                .id;
+            key(&db, user, "llm:ollama").await;
+            key(&db, user, "llm:ollama").await;
+            let err = call(&db, user, "ollama", &llm(&base), &hi())
+                .await
+                .expect_err("refused");
+            assert!(
+                matches!(&err, ProxyError::Upstream { status: 403, message } if message == "not for this model"),
+                "{err}"
+            );
+            assert_eq!(
+                enabled(&db).await,
+                [false, true],
+                "the key refused is disabled"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_gemini_key_refused_for_itself_is_disabled_and_said_as_a_403() {
+            let info = |reason: &str| {
+                json!({"error": {"code": 403, "message": "Permission denied", "status": "PERMISSION_DENIED",
+                    "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": reason}]}})
+            };
+            let leaked = json!({"error": {"code": 403, "status": "PERMISSION_DENIED",
+                "message": "Your API key was reported as leaked. Please use another API key."}});
+            for (body, disabled) in [
+                (info("API_KEY_SERVICE_BLOCKED"), true),
+                (leaked, true),
+                // Passing, or the gateway's own address: the key stays.
+                (info("SERVICE_DISABLED"), false),
+                (info("API_KEY_IP_ADDRESS_BLOCKED"), false),
+                (info("IAM_PERMISSION_DENIED"), false),
+            ] {
+                let (base, _) = refuse_in_turn(vec![(403, body.clone())]).await;
+                let db = havn_db::connect_in_memory().await.expect("db");
+                let user = create_user(&db, NewUser { display_name: "u" })
+                    .await
+                    .expect("user")
+                    .id;
+                key(&db, user, "gemini").await;
+                let mut llm = llm(&base);
+                llm.base_url.insert("gemini".into(), base.clone());
+                let err = call(&db, user, "gemini", &llm, &hi())
+                    .await
+                    .expect_err("refused");
+                assert!(
+                    matches!(&err, ProxyError::Upstream { status: 403, message }
+                        if message.starts_with(havn_proto::KEY_TURNED_OFF) == disabled),
+                    "{body}: {err}"
+                );
+                assert_eq!(enabled(&db).await, [!disabled], "{body}");
+            }
+        }
+
+        #[test]
+        fn a_refusal_is_said_in_the_provider_s_words_cut_short() {
+            // Without words, no dash.
+            let bare = ProxyError::Upstream {
+                status: 403,
+                message: String::new(),
+            };
+            assert_eq!(bare.to_string(), "upstream provider error: 403");
+            assert_eq!(provider_words(""), "");
+            assert_eq!(
+                provider_words(r#"{"error": {"message": "out of credit", "code": 402}}"#),
+                "out of credit"
+            );
+            assert_eq!(provider_words("plain words\nand more"), "plain words");
+            let long = "x".repeat(500);
+            assert_eq!(provider_words(&long).chars().count(), 121);
+            assert!(
+                !provider_words("<!DOCTYPE html><html><body>Forbidden</body></html>")
+                    .contains("Forbidden")
+            );
+            assert!(provider_words("  <html><title>403</title>").contains("HTML page"));
         }
     }
 }
