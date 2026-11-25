@@ -1820,14 +1820,15 @@ mod tests {
             kind: PARENT_SPACE,
             title,
         };
-        let note = |child: &'static str, child_title: &'static str, parents: Vec<Parent<'static>>| {
-            let pool = pool.clone();
-            async move {
-                note_parents(&pool, "discord", "bot", child, child_title, &parents)
-                    .await
-                    .expect("note")
-            }
-        };
+        let note =
+            |child: &'static str, child_title: &'static str, parents: Vec<Parent<'static>>| {
+                let pool = pool.clone();
+                async move {
+                    note_parents(&pool, "discord", "bot", child, child_title, &parents)
+                        .await
+                        .expect("note")
+                }
+            };
         record_group_refusal(
             &pool,
             "discord",
