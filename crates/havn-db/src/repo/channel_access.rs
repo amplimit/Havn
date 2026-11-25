@@ -1006,31 +1006,39 @@ pub struct Parent<'a> {
     pub title: &'a str,
 }
 
-/// Keep what group `child_id` is part of (issue #285): each of
-/// `parents`, with its title (kept when one is given, the newest last).
-/// Whether any of it was not kept before.
+/// Keep what group `child_id`, called `child_title`, is part of (issue
+/// #285): each of `parents`, with its title (kept when one is given, the
+/// newest last). Whether any of it was not kept before.
 pub async fn note_parents(
     pool: &SqlitePool,
     channel: &str,
     account_id: &str,
     child_id: &str,
+    child_title: &str,
     parents: &[Parent<'_>],
 ) -> Result<bool> {
+    let cut = |title: &str| -> String { title.trim().chars().take(REFUSAL_SAID_CHARS).collect() };
+    let child_title = cut(child_title);
     let mut new = false;
     for parent in parents {
-        let title: String = parent
-            .title
-            .trim()
-            .chars()
-            .take(REFUSAL_SAID_CHARS)
-            .collect();
+        let title = cut(parent.title);
+        // A newer title of the parent moves `noted_at`; one of the child
+        // only replaces the one kept (issue #321).
         let res = sqlx::query(
             "INSERT INTO channel_group_parents \
-               (channel, account_id, child_id, parent_id, parent_kind, parent_title, noted_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+               (channel, account_id, child_id, parent_id, parent_kind, parent_title, noted_at, \
+                child_title) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
              ON CONFLICT (channel, account_id, child_id, parent_id) DO UPDATE SET \
-                 parent_title = excluded.parent_title, noted_at = excluded.noted_at \
-             WHERE excluded.parent_title != '' AND excluded.parent_title != parent_title",
+                 parent_title = CASE WHEN excluded.parent_title != '' \
+                                     THEN excluded.parent_title ELSE parent_title END, \
+                 noted_at = CASE WHEN excluded.parent_title != '' \
+                                  AND excluded.parent_title != parent_title \
+                                 THEN excluded.noted_at ELSE noted_at END, \
+                 child_title = CASE WHEN excluded.child_title != '' \
+                                    THEN excluded.child_title ELSE child_title END \
+             WHERE (excluded.parent_title != '' AND excluded.parent_title != parent_title) \
+                OR (excluded.child_title != '' AND excluded.child_title != child_title)",
         )
         .bind(channel)
         .bind(account_id)
@@ -1039,6 +1047,7 @@ pub async fn note_parents(
         .bind(parent.kind)
         .bind(&title)
         .bind(timestamp(Utc::now()))
+        .bind(&child_title)
         .execute(pool)
         .await?;
         new |= res.rows_affected() > 0;
@@ -1195,8 +1204,11 @@ pub async fn parent_title(
 }
 
 /// What place `id` is called (issue #293): the title it was turned away
-/// with, the newest, while it is; else the one it was let in with; else
-/// the one a group part of it named it by; empty when none was kept.
+/// with, the newest, while it is; else, a server's channel, the one it was
+/// last seen with, as "Server / channel" (issue #321), kept from the
+/// messages it was let in or turned away by, so never older than the one
+/// it was let in with; else that one; else the one a group part of it
+/// named it by; empty when none was kept.
 pub async fn place_title(
     pool: &SqlitePool,
     channel: &str,
@@ -1207,6 +1219,15 @@ pub async fn place_title(
         "SELECT COALESCE( \
            (SELECT NULLIF(title, '') FROM channel_refusals \
             WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 AND is_group = 1), \
+           (SELECT CASE WHEN parent_title != '' THEN parent_title || ' / ' || child_title \
+                        ELSE child_title END \
+            FROM channel_group_parents \
+            WHERE channel = ?1 AND account_id = ?2 AND child_id = ?3 AND parent_kind = 'space' \
+              AND child_title != '' \
+              AND NOT EXISTS (SELECT 1 FROM channel_group_parents t \
+                              WHERE t.channel = ?1 AND t.account_id = ?2 AND t.child_id = ?3 \
+                                AND t.parent_kind = 'group') \
+            ORDER BY noted_at DESC LIMIT 1), \
            (SELECT NULLIF(title, '') FROM channel_groups \
             WHERE channel = ?1 AND account_id = ?2 AND group_id = ?3), \
            (SELECT parent_title FROM channel_group_parents \
@@ -1547,7 +1568,7 @@ mod tests {
         let note = |child: &'static str, parents: Vec<Parent<'static>>| {
             let pool = pool.clone();
             async move {
-                note_parents(&pool, "discord", "bot", child, &parents)
+                note_parents(&pool, "discord", "bot", child, "", &parents)
                     .await
                     .expect("note")
             }
@@ -1665,6 +1686,7 @@ mod tests {
             "discord",
             "bot",
             "discord:c1",
+            "",
             &[Parent {
                 id: "discord:s1",
                 kind: PARENT_SPACE,
@@ -1766,6 +1788,7 @@ mod tests {
             "discord",
             "bot",
             "discord:c1",
+            "",
             &[Parent {
                 id: "discord:s1",
                 kind: PARENT_SPACE,
@@ -1780,6 +1803,85 @@ mod tests {
             .await
             .expect("refused");
         assert_eq!(title("discord:9").await, "");
+    }
+
+    #[tokio::test]
+    async fn a_server_s_channel_is_called_by_the_name_it_was_last_seen_with() {
+        let pool = crate::connect_in_memory().await.expect("db");
+        let title = |id: &'static str| {
+            let pool = pool.clone();
+            async move {
+                place_title(&pool, "discord", "bot", id)
+                    .await
+                    .expect("title")
+            }
+        };
+        let acme = |title| Parent {
+            id: "discord:s1",
+            kind: PARENT_SPACE,
+            title,
+        };
+        let note =
+            |child: &'static str, child_title: &'static str, parents: Vec<Parent<'static>>| {
+                let pool = pool.clone();
+                async move {
+                    note_parents(&pool, "discord", "bot", child, child_title, &parents)
+                        .await
+                        .expect("note")
+                }
+            };
+        record_group_refusal(
+            &pool,
+            "discord",
+            "bot",
+            "discord:c1",
+            "Acme / general",
+            "hi",
+            Utc::now(),
+        )
+        .await
+        .expect("refused");
+        assert!(note("discord:c1", "general", vec![acme("Acme")]).await);
+        // Its refusal forgotten, as when its server is let in, it keeps the
+        // name it was seen with.
+        forget_group_refusal(&pool, "discord", "bot", "discord:c1")
+            .await
+            .expect("forget");
+        assert_eq!(title("discord:c1").await, "Acme / general");
+        // Renamed, it is called by the new name; not lost to none given.
+        assert!(note("discord:c1", "chat", vec![acme("")]).await);
+        assert!(!note("discord:c1", "", vec![acme("")]).await, "nothing new");
+        assert_eq!(title("discord:c1").await, "Acme / chat");
+        // Let in, then renamed: called by the name it was seen with since.
+        admit_group(
+            &pool,
+            "discord",
+            "bot",
+            "discord:c1",
+            "Acme / chat",
+            GROUP_BY_OWNER,
+        )
+        .await
+        .expect("admit");
+        assert!(note("discord:c1", "general", vec![acme("Acme")]).await);
+        assert_eq!(title("discord:c1").await, "Acme / general");
+        assert!(note("discord:c1", "chat", vec![acme("Acme")]).await);
+        assert_eq!(
+            space_of(&pool, "discord", "bot", "discord:c1")
+                .await
+                .expect("space"),
+            Some(("discord:s1".into(), "Acme".into())),
+            "the server's title is kept"
+        );
+        // A thread is not named as a server's channel.
+        let chat = Parent {
+            id: "discord:c1",
+            kind: PARENT_GROUP,
+            title: "chat",
+        };
+        note("discord:t1", "plans", vec![chat, acme("Acme")]).await;
+        assert_eq!(title("discord:t1").await, "");
+        assert_eq!(title("discord:c1").await, "Acme / chat");
     }
 
     #[tokio::test]
