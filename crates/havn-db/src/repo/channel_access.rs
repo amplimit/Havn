@@ -1204,10 +1204,11 @@ pub async fn parent_title(
 }
 
 /// What place `id` is called (issue #293): the title it was turned away
-/// with, the newest, while it is; else the one it was let in with; else,
-/// a server's channel, the one it was last seen with, as "Server /
-/// channel" (issue #321); else the one a group part of it named it by;
-/// empty when none was kept.
+/// with, the newest, while it is; else, a server's channel, the one it was
+/// last seen with, as "Server / channel" (issue #321), kept from the
+/// messages it was let in or turned away by, so never older than the one
+/// it was let in with; else that one; else the one a group part of it
+/// named it by; empty when none was kept.
 pub async fn place_title(
     pool: &SqlitePool,
     channel: &str,
@@ -1218,8 +1219,6 @@ pub async fn place_title(
         "SELECT COALESCE( \
            (SELECT NULLIF(title, '') FROM channel_refusals \
             WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 AND is_group = 1), \
-           (SELECT NULLIF(title, '') FROM channel_groups \
-            WHERE channel = ?1 AND account_id = ?2 AND group_id = ?3), \
            (SELECT CASE WHEN parent_title != '' THEN parent_title || ' / ' || child_title \
                         ELSE child_title END \
             FROM channel_group_parents \
@@ -1229,6 +1228,8 @@ pub async fn place_title(
                               WHERE t.channel = ?1 AND t.account_id = ?2 AND t.child_id = ?3 \
                                 AND t.parent_kind = 'group') \
             ORDER BY noted_at DESC LIMIT 1), \
+           (SELECT NULLIF(title, '') FROM channel_groups \
+            WHERE channel = ?1 AND account_id = ?2 AND group_id = ?3), \
            (SELECT parent_title FROM channel_group_parents \
             WHERE channel = ?1 AND account_id = ?2 AND parent_id = ?3 AND parent_title != '' \
             ORDER BY noted_at DESC LIMIT 1), \
@@ -1851,6 +1852,20 @@ mod tests {
         assert!(note("discord:c1", "chat", vec![acme("")]).await);
         assert!(!note("discord:c1", "", vec![acme("")]).await, "nothing new");
         assert_eq!(title("discord:c1").await, "Acme / chat");
+        // Let in, then renamed: called by the name it was seen with since.
+        admit_group(
+            &pool,
+            "discord",
+            "bot",
+            "discord:c1",
+            "Acme / chat",
+            GROUP_BY_OWNER,
+        )
+        .await
+        .expect("admit");
+        assert!(note("discord:c1", "general", vec![acme("Acme")]).await);
+        assert_eq!(title("discord:c1").await, "Acme / general");
+        assert!(note("discord:c1", "chat", vec![acme("Acme")]).await);
         assert_eq!(
             space_of(&pool, "discord", "bot", "discord:c1")
                 .await
