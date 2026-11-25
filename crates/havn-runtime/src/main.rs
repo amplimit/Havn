@@ -2783,11 +2783,8 @@ async fn delete_chat_with_files(
     if !conversations::delete_chat(pool, channel_id, conversation).await? {
         return Ok(None);
     }
-    let named = |file: String| async move {
-        conversations::names_file(pool, &file)
-            .await
-            .unwrap_or(true)
-    };
+    let named =
+        |file: String| async move { conversations::names_file(pool, &file).await.unwrap_or(true) };
     let dir = workspace.join(havn_core::INBOX_DIR);
     let name = |path: &str| {
         havn_core::Attachment::in_inbox(path)
@@ -2810,7 +2807,10 @@ async fn delete_chat_with_files(
             _ => None,
         };
         let copy = havn_core::Attachment::shown_copy(&file);
-        for gone in std::iter::once(file).chain(text).chain(std::iter::once(copy)) {
+        for gone in std::iter::once(file)
+            .chain(text)
+            .chain(std::iter::once(copy))
+        {
             if let Err(e) = tokio::fs::remove_file(dir.join(&gone)).await
                 && e.kind() != std::io::ErrorKind::NotFound
             {
@@ -5299,7 +5299,8 @@ run ls"
 
     async fn inbox_with(files: &[&str]) -> (SqlitePool, PathBuf) {
         let pool = havn_db::agent::connect_in_memory().await.expect("db");
-        let workspace = std::env::temp_dir().join(format!("havn-chat-files-{}", uuid::Uuid::now_v7()));
+        let workspace =
+            std::env::temp_dir().join(format!("havn-chat-files-{}", uuid::Uuid::now_v7()));
         let dir = workspace.join(havn_core::INBOX_DIR);
         tokio::fs::create_dir_all(&dir).await.expect("inbox");
         for name in files {
@@ -5340,7 +5341,11 @@ run ls"
         let mut voice = sent("inbox/3-v.ogg", "audio/ogg", None);
         voice.transcript = Some("hello".into());
         let files = [
-            sent("inbox/1-a.pdf", "application/pdf", Some("inbox/1-a.pdf.txt")),
+            sent(
+                "inbox/1-a.pdf",
+                "application/pdf",
+                Some("inbox/1-a.pdf.txt"),
+            ),
             sent("inbox/2-b.png", "image/png", None),
             voice,
         ];
