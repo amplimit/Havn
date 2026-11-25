@@ -144,6 +144,10 @@ pub struct MemoryChange {
     pub before: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<String>,
+    /// Who the saved entry is put in front of, `private` or `public`
+    /// (issue #309); absent for one forgotten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -630,6 +634,16 @@ pub enum DataQuery {
         before: Option<String>,
         #[serde(default)]
         after: Option<String>,
+    },
+    /// Make the active entry under `key` `private` or `public` (issue
+    /// #309), only while it is entry `entry` when given (a row id from
+    /// its [`MemoryChange`]): `{"entry": entry | null, "was": string}`,
+    /// `null` when the key has no such entry.
+    SetMemoryVisibility {
+        key: String,
+        #[serde(default)]
+        entry: Option<String>,
+        visibility: String,
     },
     /// What the owner always allows in conversations not theirs (issue
     /// #255): `{"allowed": [{"scope", "tool", "input", "rule",

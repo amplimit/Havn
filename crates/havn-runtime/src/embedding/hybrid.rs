@@ -487,6 +487,7 @@ mod tests {
                     kind: *kind,
                     source: *source,
                     ttl_days: None,
+                    visibility: None,
                 },
             )
             .await

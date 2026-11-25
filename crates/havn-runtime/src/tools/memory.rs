@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 
 use async_trait::async_trait;
 use havn_db::agent::conversations::{self, ChatTurn};
-use havn_db::agent::memory::{self, Kind, NewEntry, Source};
+use havn_db::agent::memory::{self, Kind, NewEntry, Source, Visibility};
 use serde_json::{Value, json};
 
 use super::{Tool, ToolCtx, ToolResult};
@@ -30,17 +30,15 @@ tokio::task_local! {
 #[derive(Debug, Clone)]
 pub struct Noted {
     key: String,
-    /// Row id, value and kind.
-    before: Option<(String, String, Kind)>,
-    after: Option<(String, String, Kind)>,
+    before: Option<Row>,
+    after: Option<Row>,
 }
 
-/// Note a change to `key` from `before` to `after` (row id, value, kind).
-fn note_change(
-    key: &str,
-    before: Option<(String, String, Kind)>,
-    after: Option<(String, String, Kind)>,
-) {
+/// Row id, value, kind and visibility.
+type Row = (String, String, Kind, Visibility);
+
+/// Note a change to `key` from `before` to `after`.
+fn note_change(key: &str, before: Option<Row>, after: Option<Row>) {
     let _ = MEMORY_CHANGES.try_with(|changes| {
         let mut changes = changes
             .lock()
@@ -72,8 +70,10 @@ pub fn changes(noted: Vec<Noted>) -> Vec<havn_proto::MemoryChange> {
                 return None;
             }
             let (action, value, kind) = match (&n.after, &n.before) {
-                (Some((_, value, kind)), _) => (havn_proto::MemoryAction::Saved, value, kind),
-                (None, Some((_, value, kind))) => (havn_proto::MemoryAction::Forgot, value, kind),
+                (Some((_, value, kind, _)), _) => (havn_proto::MemoryAction::Saved, value, kind),
+                (None, Some((_, value, kind, _))) => {
+                    (havn_proto::MemoryAction::Forgot, value, kind)
+                }
                 (None, None) => return None,
             };
             Some(havn_proto::MemoryChange {
@@ -86,6 +86,7 @@ pub fn changes(noted: Vec<Noted>) -> Vec<havn_proto::MemoryChange> {
                 kind: kind.as_str().to_string(),
                 before: n.before.as_ref().map(|b| b.0.clone()),
                 after: n.after.as_ref().map(|a| a.0.clone()),
+                visibility: n.after.as_ref().map(|a| a.3.as_str().to_string()),
             })
         })
         .collect()
@@ -109,6 +110,17 @@ fn may_change_memory() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the turn answers the owner in a private chat of theirs (issue
+/// #309): only there is a fact saved public when the model asks, and
+/// anywhere else it is saved private. [`super::gateway::IN_GROUP`] is set
+/// around chat turns only, so heartbeats and scheduled tasks are not.
+fn in_owner_private_chat() -> bool {
+    may_change_memory()
+        && super::gateway::IN_GROUP
+            .try_with(|group| !*group)
+            .unwrap_or(false)
+}
+
 const NOT_THE_OWNER: [&str; 2] = [
     "only your owner's conversations change your memory, and this one is with someone else: \
      nothing was saved or forgotten",
@@ -128,9 +140,18 @@ impl Tool for MemoryRememberTool {
          'project' for facts about current work that may go stale; \
          'event' for time-stamped incidents (default 30-day expiry). \
          Set `source: 'user_told'` when the user said it directly, \
-         'agent_inferred' when you guessed it. Replaces any existing \
-         entry with the same key. The dashboard shows users exactly \
-         what you've remembered — keep entries short and specific."
+         'agent_inferred' when you guessed it. Set `visibility: 'public'` \
+         only for what anyone talking to you may know about your owner: \
+         their name, how to address them, their language, the work they \
+         do in public. Public facts are put in front of everyone you talk \
+         to, other people and groups included. Everything else is \
+         'private', seen in your owner's own private chats only; when \
+         unsure, private. Visibility is taken only in your owner's own \
+         private chats: anywhere else every fact is saved private, and \
+         without it a fact keeps the visibility it had. Your owner can \
+         switch it on the dashboard. Replaces any existing entry with \
+         the same key. The dashboard shows users exactly what you've \
+         remembered — keep entries short and specific."
     }
 
     fn input_schema(&self) -> Value {
@@ -158,6 +179,11 @@ impl Tool for MemoryRememberTool {
                 "ttl_days": {
                     "type": "integer",
                     "description": "Override default TTL. Omit to use the kind's default (identity/preference: never expire; project: 90; event: 30)."
+                },
+                "visibility": {
+                    "type": "string",
+                    "enum": ["private", "public"],
+                    "description": "Who may be told it: 'public' for anyone talking to you, 'private' (the default for a new fact) for your owner in their own private chats only. When unsure, private."
                 }
             },
             "required": ["key", "value", "kind"]
@@ -191,12 +217,38 @@ impl Tool for MemoryRememberTool {
                 Source::parse(s).unwrap_or(Source::AgentInferred)
             });
         let ttl_days = input.get("ttl_days").and_then(Value::as_i64);
+        let asked = match input.get("visibility").and_then(Value::as_str) {
+            None => None,
+            Some(raw) => match Visibility::parse(raw) {
+                Some(visibility) => Some(visibility),
+                None => {
+                    return ToolResult::Error(format!(
+                        "invalid visibility {raw:?}; expected private or public"
+                    ));
+                }
+            },
+        };
 
         if let Err(why) = havn_proto::check_memory_key(key) {
             return ToolResult::Error(why);
         }
 
-        let (_, truncated) = match save(
+        // Outside the owner's own private chats, nobody steers a fact into
+        // every prompt (issue #309): what is saved there is private, but a
+        // fact only repeated keeps what the owner made it.
+        let owner_chat = in_owner_private_chat();
+        let visibility = if owner_chat {
+            asked
+        } else {
+            let repeated = memory::get(&ctx.agent_db, key)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|e| e.value == value && e.kind == kind);
+            (!repeated).then_some(Visibility::Private)
+        };
+
+        let (_, truncated, saved_as) = match save(
             false,
             ctx,
             NewEntry {
@@ -205,6 +257,7 @@ impl Tool for MemoryRememberTool {
                 kind,
                 source,
                 ttl_days,
+                visibility,
             },
         )
         .await
@@ -218,49 +271,68 @@ impl Tool for MemoryRememberTool {
         } else {
             ""
         };
-        ToolResult::Ok(format!("remembered {key:?} as {}{suffix}", kind.as_str()))
+        let refused = if !owner_chat && asked == Some(Visibility::Public) {
+            "; only in your owner's own private chats can a fact be saved public"
+        } else {
+            ""
+        };
+        ToolResult::Ok(format!(
+            "remembered {key:?} as {}, {}{refused}{suffix}",
+            kind.as_str(),
+            saved_as.as_str()
+        ))
     }
+}
+
+/// `value`, cut to [`MAX_VALUE_BYTES`] with a marker when over it, and
+/// whether it was cut.
+pub fn within_cap(value: &str) -> (String, bool) {
+    // Truncate-with-marker rather than reject: the agent can still write
+    // the important prefix and sees in the result that it was cut.
+    if value.len() <= MAX_VALUE_BYTES {
+        return (value.to_string(), false);
+    }
+    const MARKER: &str = "\n…(truncated to fit memory entry size cap)";
+    let room = MAX_VALUE_BYTES - MARKER.len();
+    let end = value
+        .char_indices()
+        .map(|(i, c)| i + c.len_utf8())
+        .take_while(|&end| end <= room)
+        .last()
+        .unwrap_or(0);
+    (format!("{}{MARKER}", &value[..end]), true)
 }
 
 /// Save `new` as the active entry for its key, cutting a value over
 /// [`MAX_VALUE_BYTES`] with a marker, and embed it when an embedder is
-/// wired: the row's id, and whether the value was cut. With
-/// `until_forgotten` it never expires (`new.ttl_days` is ignored). What
-/// the `memory_remember` tool and the dashboard save go through.
+/// wired: the row's id, whether the value was cut, and its visibility.
+/// With `until_forgotten` it never expires (`new.ttl_days` is ignored).
+/// What the `memory_remember` tool and the dashboard save go through.
 pub async fn save(
     until_forgotten: bool,
     ctx: &ToolCtx,
     new: NewEntry<'_>,
-) -> havn_db::Result<(String, bool)> {
-    // Truncate-with-marker rather than reject: the agent can still write
-    // the important prefix and sees in the result that it was cut.
-    let (stored_value, truncated) = if new.value.len() > MAX_VALUE_BYTES {
-        const MARKER: &str = "\n…(truncated to fit memory entry size cap)";
-        let room = MAX_VALUE_BYTES - MARKER.len();
-        let end = new
-            .value
-            .char_indices()
-            .map(|(i, c)| i + c.len_utf8())
-            .take_while(|&end| end <= room)
-            .last()
-            .unwrap_or(0);
-        (format!("{}{MARKER}", &new.value[..end]), true)
-    } else {
-        (new.value.to_string(), false)
-    };
+) -> havn_db::Result<(String, bool, Visibility)> {
+    let (stored_value, truncated) = within_cap(new.value);
     let key = new.key;
     // The entry it replaces, if any, for the chat's note of the change.
     let before = memory::get(&ctx.agent_db, key)
         .await
         .ok()
         .flatten()
-        .map(|e| (e.id, e.value, e.kind));
+        .map(|e| (e.id, e.value, e.kind, e.visibility));
+    // As `memory::remember` decides it.
+    let visibility = new
+        .visibility
+        .or(before.as_ref().map(|b| b.3))
+        .unwrap_or_default();
     let entry = NewEntry {
         key,
         value: &stored_value,
         kind: new.kind,
         source: new.source,
         ttl_days: new.ttl_days,
+        visibility: new.visibility,
     };
     let row_id = if until_forgotten {
         memory::remember_until_forgotten(&ctx.agent_db, entry).await?
@@ -272,7 +344,7 @@ pub async fn save(
     note_change(
         key,
         before,
-        Some((row_id.clone(), stored_value.clone(), new.kind)),
+        Some((row_id.clone(), stored_value.clone(), new.kind, visibility)),
     );
 
     // Hybrid retrieval (spec §9.4 v0.7): embed `"<key>: <value>"`, pinned
@@ -293,7 +365,7 @@ pub async fn save(
             }
         }
     }
-    Ok((row_id, truncated))
+    Ok((row_id, truncated, visibility))
 }
 
 pub struct MemorySearchTool;
@@ -622,7 +694,11 @@ impl Tool for MemoryForgetTool {
         match memory::forget(&ctx.agent_db, key).await {
             Ok(true) => {
                 if let Some(entry) = before {
-                    note_change(key, Some((entry.id, entry.value, entry.kind)), None);
+                    note_change(
+                        key,
+                        Some((entry.id, entry.value, entry.kind, entry.visibility)),
+                        None,
+                    );
                 }
                 ToolResult::Ok(format!("forgot {key:?}"))
             }
@@ -972,10 +1048,11 @@ mod tests {
                     kind: Kind::Preference,
                     source: Source::UserTold,
                     ttl_days: None,
+                    visibility: None,
                 };
                 // 1500 three-byte characters: 4500 bytes, over the cap.
                 let long = "字".repeat(1500);
-                let (_, cut) = save(false, &ctx, new(&long)).await.expect("save");
+                let (_, cut, _) = save(false, &ctx, new(&long)).await.expect("save");
                 assert!(cut);
                 let row = memory::get(&ctx.agent_db, "k")
                     .await
@@ -985,7 +1062,7 @@ mod tests {
                 assert!(row.value.ends_with("size cap)"));
                 // 1300 of them fit: kept whole, without a marker.
                 let fits = "字".repeat(1300);
-                let (_, cut) = save(true, &ctx, new(&fits)).await.expect("save");
+                let (_, cut, _) = save(true, &ctx, new(&fits)).await.expect("save");
                 assert!(!cut);
                 let row = memory::get(&ctx.agent_db, "k")
                     .await
@@ -1063,6 +1140,81 @@ mod tests {
                 assert!(remember("..", "x").await.is_error());
             })
             .await;
+    }
+
+    async fn visibility_of(ctx: &ToolCtx, key: &str) -> Visibility {
+        memory::get(&ctx.agent_db, key)
+            .await
+            .expect("get")
+            .expect("row")
+            .visibility
+    }
+
+    #[tokio::test]
+    async fn a_fact_is_saved_public_only_in_the_owner_s_own_private_chat() {
+        let ctx = ctx().await;
+        let remember = |key: &'static str, value: &'static str, group: Option<bool>| {
+            let ctx = &ctx;
+            let run = async move {
+                MemoryRememberTool
+                    .execute(
+                        ctx,
+                        json!({"key": key, "value": value, "kind": "identity", "visibility": "public"}),
+                    )
+                    .await
+            };
+            async move {
+                match group {
+                    Some(group) => {
+                        super::super::gateway::FROM_OWNER
+                            .scope(true, super::super::gateway::IN_GROUP.scope(group, run))
+                            .await
+                    }
+                    // A heartbeat or the owner's scheduled task.
+                    None => super::super::gateway::FROM_OWNER.scope(true, run).await,
+                }
+            }
+        };
+
+        let r = remember("user.name", "Ada", Some(false)).await;
+        assert!(r.text().contains("public"), "{}", r.text());
+        assert_eq!(visibility_of(&ctx, "user.name").await, Visibility::Public);
+
+        let r = remember("user.city", "Turin", Some(true)).await;
+        assert!(
+            r.text().contains("only in your owner's own private chats"),
+            "{}",
+            r.text()
+        );
+        assert_eq!(visibility_of(&ctx, "user.city").await, Visibility::Private);
+        remember("user.team", "infra", None).await;
+        assert_eq!(visibility_of(&ctx, "user.team").await, Visibility::Private);
+
+        // Repeated elsewhere, a public fact stays public; changed there,
+        // it is private.
+        remember("user.name", "Ada", Some(true)).await;
+        assert_eq!(visibility_of(&ctx, "user.name").await, Visibility::Public);
+        let noted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        MEMORY_CHANGES
+            .scope(
+                std::sync::Arc::clone(&noted),
+                remember("user.name", "Ada Lovelace", None),
+            )
+            .await;
+        assert_eq!(visibility_of(&ctx, "user.name").await, Visibility::Private);
+        let shown = changes(std::mem::take(&mut *noted.lock().unwrap()));
+        assert_eq!(shown[0].visibility.as_deref(), Some("private"));
+
+        let r = super::super::gateway::FROM_OWNER
+            .scope(
+                true,
+                MemoryRememberTool.execute(
+                    &ctx,
+                    json!({"key": "k", "value": "v", "kind": "identity", "visibility": "everyone"}),
+                ),
+            )
+            .await;
+        assert!(r.is_error(), "{}", r.text());
     }
 
     #[test]

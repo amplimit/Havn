@@ -871,6 +871,10 @@ async fn serve() -> anyhow::Result<()> {
             "/agents/{id}/memory/{key}/undo",
             axum::routing::post(api::memory::undo),
         )
+        .route(
+            "/agents/{id}/memory/{key}/visibility",
+            axum::routing::put(api::memory::set_visibility),
+        )
         .route("/agents/{id}/skills", get(api::skills::list))
         .route("/agents/{id}/skills/{name}/pin", post(api::skills::pin))
         .route("/agents/{id}/skills/{name}/unpin", post(api::skills::unpin))

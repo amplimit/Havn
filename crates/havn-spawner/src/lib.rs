@@ -39,7 +39,7 @@ pub mod subprocess;
 pub struct AgentSpawnConfig {
     pub agent_id: AgentId,
     /// Workspace dir on the host. The spawner ensures this exists with the
-    /// expected layout (`SOUL.md`, `USER.md`, `HEARTBEAT.md`, `IDENTITY.md`,
+    /// expected layout (`SOUL.md`, `HEARTBEAT.md`, `IDENTITY.md`,
     /// `skills/`, `agent.db`) before launching the runtime — see spec §5.3.
     pub workspace_dir: PathBuf,
     /// Path to the `havn-runtime` binary the spawner exec()s.

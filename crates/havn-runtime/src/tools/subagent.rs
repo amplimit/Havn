@@ -383,7 +383,12 @@ impl Tool for SubagentSpawnTool {
         );
         let mut handle = self.bridge.child_handle.clone();
         handle.model = Arc::clone(&model);
-        let prompt = Arc::clone(&self.bridge.parent_system_prompt);
+        // With the public facts, as the parent's chats have them (issue #309).
+        let prompt = crate::with_public_facts(
+            &handle.tool_env.agent_db,
+            &self.bridge.parent_system_prompt,
+        )
+        .await;
         let run = tool_loop::TURN_MODEL.scope(
             model,
             tool_loop::TURN_THINKING.scope(

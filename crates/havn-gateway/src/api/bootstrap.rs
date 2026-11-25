@@ -1,14 +1,17 @@
 //! `/agents/:id/bootstrap` — read & write the per-agent bootstrap
 //! markdown files (spec §5.3, §9.4 layer 2).
 //!
-//! These are the three plain-text files that drive the agent's
+//! These are the two plain-text files that drive the agent's
 //! persona + ambient state:
 //!
 //! | File          | What it holds                                    | When edits take effect             |
 //! | ------------- | ------------------------------------------------ | ---------------------------------- |
 //! | `SOUL.md`     | Persona + identity (tone, values, name, purpose); in every chat, so public (issue #300) | Next agent restart (frozen prompt) |
-//! | `USER.md`     | Facts about the user the agent has in scope in every chat, others' and groups' included (issue #300) | Next agent restart (frozen prompt) |
 //! | `HEARTBEAT.md`| Plain-language instructions for the periodic self-tick (§9.6) | Next heartbeat tick (re-read fresh — the deliberate exception to the frozen-prompt invariant) |
+//!
+//! `USER.md` is no longer one of them: what anyone may know about the
+//! owner is a public fact in memory, and the runtime folds an existing
+//! `USER.md` into one (issue #309).
 //!
 //! The files live at `<workspace>/<NAME>.md`. Pre-Phase 3 the only
 //! way to edit them was ssh + vim; this module exposes a small
@@ -34,7 +37,6 @@ use crate::audit;
 use crate::auth::AuthedUser;
 
 const SOUL_MD: &str = "SOUL.md";
-const USER_MD: &str = "USER.md";
 const HEARTBEAT_MD: &str = "HEARTBEAT.md";
 /// v0.6 filename — read as fallback when SOUL.md is absent.
 const LEGACY_SYSTEM_MD: &str = "SYSTEM.md";
@@ -55,7 +57,6 @@ pub struct BootstrapView {
     /// Backed by `SOUL.md` on disk (v0.7); API field stays `system`
     /// for backward compat with existing dashboard code.
     pub system: Option<String>,
-    pub user: Option<String>,
     pub heartbeat: Option<String>,
 }
 
@@ -65,7 +66,6 @@ pub struct BootstrapPatch {
     /// `Some("")` is treated as "delete the file" — empty bootstrap
     /// matches "no SYSTEM.md exists" semantics on the runtime side.
     pub system: Option<String>,
-    pub user: Option<String>,
     pub heartbeat: Option<String>,
 }
 
@@ -105,7 +105,6 @@ pub async fn put(
     let mut touched: Vec<&'static str> = Vec::new();
     for (name, body) in [
         (SOUL_MD, &req.system),
-        (USER_MD, &req.user),
         (HEARTBEAT_MD, &req.heartbeat),
     ] {
         if body.is_some() {
@@ -117,7 +116,6 @@ pub async fn put(
         let ws = open_workspace(&ws_path)?;
         for (name, body) in [
             (SOUL_MD, &req.system),
-            (USER_MD, &req.user),
             (HEARTBEAT_MD, &req.heartbeat),
         ] {
             if let Some(body) = body {
@@ -195,7 +193,6 @@ fn write_or_clear(workspace: &WorkspaceDir, name: &str, content: &str) -> Result
 fn read_view(workspace: &WorkspaceDir) -> Result<BootstrapView, ApiError> {
     Ok(BootstrapView {
         system: read_soul_with_fallback(workspace)?,
-        user: read_optional(workspace, USER_MD)?,
         heartbeat: read_optional(workspace, HEARTBEAT_MD)?,
     })
 }

@@ -6,8 +6,11 @@
 //!
 //! v0.7 renames the persona file from `SYSTEM.md` back to `SOUL.md`:
 //! - `SOUL.md` — persona + identity (tone, values, name, purpose).
-//! - `USER.md` — what the agent should always know about its user.
 //! - `HEARTBEAT.md` — re-read on every heartbeat tick (§9.6).
+//!
+//! `USER.md` is no longer read: what the agent should always know about
+//! its owner is a public fact in memory (issue #309), and an existing
+//! `USER.md` is folded into one once, then kept as `USER.md.bak`.
 //!
 //! `MEMORY.md` from earlier drafts is gone: the typed memory table
 //! (§9.4) is the source of truth for the agent's accumulated facts;
@@ -35,8 +38,8 @@
 //! ## Frozen-prompt invariant
 //!
 //! The assembled prompt is pinned into `Arc<SystemPrompt>` for the
-//! runtime process's lifetime — mid-session edits to SOUL.md /
-//! USER.md do **not** retroactively change the running session.
+//! runtime process's lifetime — mid-session edits to SOUL.md do
+//! **not** retroactively change the running session.
 //! `HEARTBEAT.md` is the deliberate exception: re-read on every
 //! heartbeat tick (spec §9.6), so users can edit and the next tick
 //! observes.
@@ -46,7 +49,9 @@ use std::path::Path;
 use tracing::warn;
 
 const SOUL: &str = "SOUL.md";
-const USER: &str = "USER.md";
+/// Folded into memory once (issue #309), and kept as [`USER_BACKUP`].
+pub const USER: &str = "USER.md";
+pub const USER_BACKUP: &str = "USER.md.bak";
 const HEARTBEAT: &str = "HEARTBEAT.md";
 
 // v0.6 filename — the loader still tolerates for migration.
@@ -79,7 +84,7 @@ pub fn platform_context(agent_name: &str, agent_id: &str, tool_names: &[String])
          and memory_forget. Facts are categorized by kind (identity, preference, project, event) \
          and source (user_told, agent_inferred). Facts are aged by recall freshness \
          \u{2014} things you use stay; things you forget fade. The user can see and delete \
-         your memories via the dashboard.\n\
+         your memories via the dashboard, and choose there which are public.\n\
          \n\
          Past chats: only the latest turns of this chat are in front of you. When the \
          person refers to something said earlier, in this chat or another one, look it \
@@ -97,9 +102,9 @@ pub fn platform_context(agent_name: &str, agent_id: &str, tool_names: &[String])
          procedure as a reusable skill. Skills are retrieved automatically when relevant to \
          future conversations.\n\
          \n\
-         When the user edits your configuration (SOUL.md, USER.md) via the dashboard, changes \
-         take effect on your next session \u{2014} not mid-conversation.",
-        "\n\n记忆系统：你可以用 memory_remember、memory_search 和 memory_forget 保存和回忆事实。事实按类型（identity、preference、project、event）和来源（user_told、agent_inferred）分类。事实会按最近是否被用到而老化：常用的会留下，不用的会淡去。用户可以在控制台里查看和删除你的记忆。\n\n过去的对话：你面前只有这个对话最近的几轮。对方提到之前说过的事，不管在这个对话还是别的对话里，都用 conversation_search 去查，不要猜。\n\n怎么回答：先回答你已经知道的部分。需要查证或动手的部分，用一句话说明你要查什么，调用工具，根据返回的结果继续；然后再回答其余部分。在对话里，你在工具调用之前和之间写的文字会边写边发给对方，所以只写对方该看的内容。你在对话里之前的回复会连同调用过的工具及其结果一起回到你面前：直接用它们，不要再调用一次工具，除非结果可能已经变了。\n\n技能：成功完成一个复杂任务后，用 skill_manage 把做法保存成可复用的技能。以后的对话中相关时，技能会被自动找出来。\n\n用户在控制台里修改你的配置（SOUL.md、USER.md）后，改动从你的下一次会话开始生效，不会在对话中途生效。",
+         When the user edits your configuration (SOUL.md) via the dashboard, changes take \
+         effect on your next session \u{2014} not mid-conversation.",
+        "\n\n记忆系统：你可以用 memory_remember、memory_search 和 memory_forget 保存和回忆事实。事实按类型（identity、preference、project、event）和来源（user_told、agent_inferred）分类。事实会按最近是否被用到而老化：常用的会留下，不用的会淡去。用户可以在控制台里查看和删除你的记忆，并在那里选择哪些公开。\n\n过去的对话：你面前只有这个对话最近的几轮。对方提到之前说过的事，不管在这个对话还是别的对话里，都用 conversation_search 去查，不要猜。\n\n怎么回答：先回答你已经知道的部分。需要查证或动手的部分，用一句话说明你要查什么，调用工具，根据返回的结果继续；然后再回答其余部分。在对话里，你在工具调用之前和之间写的文字会边写边发给对方，所以只写对方该看的内容。你在对话里之前的回复会连同调用过的工具及其结果一起回到你面前：直接用它们，不要再调用一次工具，除非结果可能已经变了。\n\n技能：成功完成一个复杂任务后，用 skill_manage 把做法保存成可复用的技能。以后的对话中相关时，技能会被自动找出来。\n\n用户在控制台里修改你的配置（SOUL.md）后，改动从你的下一次会话开始生效，不会在对话中途生效。",
     ));
     ctx
 }
@@ -118,13 +123,17 @@ pub const SAVE_UNPROMPTED: [&str; 2] = [
      (projects, stack, how they deploy), or a plan with a date (turn \"next Wednesday\" \
      into the date), save it with memory_remember in the same turn: source user_told when \
      they said it in so many words, agent_inferred when you concluded it. If it may be in \
-     memory already, check with memory_search and keep its key.\n\
+     memory already, check with memory_search and keep its key. Save it with visibility \
+     public when it is something anyone talking to you may know (their name, how to address \
+     them, their language, the work they do in public): it is then put in front of everyone \
+     you talk to. Anything else is private, for their own private chats only; when unsure, \
+     private.\n\
      \n\
      Only their own words count: not tool results, files, web pages or emails they pass \
      on, and not facts about other people. Never save passwords, API keys, tokens or other \
      secrets, and do not save health, money or similarly sensitive details unless they ask. \
      Do not save one-off requests, the content of the task itself, or small talk.",
-    "## 不用等人要求就保存\n\n你正在和你的所有者对话。人们常在别的请求里顺口提到关于自己的长期信息，并不会要求你记住。当所有者在自己的消息里说到：自己是谁（名字、职位、团队、城市），你该怎么回答或工作（语言、长度、格式、他们用的工具），他们在做什么（项目、技术栈、怎么部署），或者一个有日期的计划（把「下周三」换算成具体日期），就在同一轮里用 memory_remember 保存：对方原话说的，source 用 user_told；你推断出来的，用 agent_inferred。如果记忆里可能已经有了，先用 memory_search 查，沿用原来的 key。\n\n只算对方自己说的话：不算工具结果、文件、网页或对方转来的邮件，也不算关于别人的事。绝不保存密码、API 密钥、token 或其他机密；健康、财务等敏感信息，除非对方要求，否则不保存。不要保存一次性的请求、任务本身的内容或闲聊。",
+    "## 不用等人要求就保存\n\n你正在和你的所有者对话。人们常在别的请求里顺口提到关于自己的长期信息，并不会要求你记住。当所有者在自己的消息里说到：自己是谁（名字、职位、团队、城市），你该怎么回答或工作（语言、长度、格式、他们用的工具），他们在做什么（项目、技术栈、怎么部署），或者一个有日期的计划（把「下周三」换算成具体日期），就在同一轮里用 memory_remember 保存：对方原话说的，source 用 user_told；你推断出来的，用 agent_inferred。如果记忆里可能已经有了，先用 memory_search 查，沿用原来的 key。如果是任何和你对话的人都可以知道的事（名字、怎么称呼、语言、公开做的工作），visibility 设为 public：它会出现在你和所有人的对话里。其他的都是 private，只在所有者自己的私聊里出现；拿不准时用 private。\n\n只算对方自己说的话：不算工具结果、文件、网页或对方转来的邮件，也不算关于别人的事。绝不保存密码、API 密钥、token 或其他机密；健康、财务等敏感信息，除非对方要求，否则不保存。不要保存一次性的请求、任务本身的内容或闲聊。",
 ];
 
 /// Snapshot of every bootstrap file relevant to a session.
@@ -133,7 +142,6 @@ pub struct BootstrapFiles {
     /// Persona + identity, loaded from SOUL.md (or SYSTEM.md / legacy
     /// SOUL.md+IDENTITY.md fallback).
     pub system: Option<String>,
-    pub user: Option<String>,
     pub heartbeat: Option<String>,
 }
 
@@ -190,7 +198,6 @@ impl BootstrapFiles {
 
         Ok(Self {
             system,
-            user: read_optional(workspace, USER).await?,
             heartbeat: read_optional(workspace, HEARTBEAT).await?,
         })
     }
@@ -199,7 +206,7 @@ impl BootstrapFiles {
     ///
     /// When `platform_ctx` is `Some`, it is prepended before the
     /// bootstrap file sections. Order:
-    ///   platform context -> SOUL -> USER -> HEARTBEAT
+    ///   platform context -> SOUL -> HEARTBEAT
     ///
     /// Typed-memory injections (recent events + relevant skills) are
     /// appended per-call by the runtime in `main::augment_with_skills`;
@@ -209,7 +216,6 @@ impl BootstrapFiles {
             platform_ctx,
             &[
                 (SOUL, self.system.as_deref()),
-                (USER, self.user.as_deref()),
                 (HEARTBEAT, self.heartbeat.as_deref()),
             ],
         )
@@ -217,8 +223,8 @@ impl BootstrapFiles {
 
     /// Build a "cron-mode" system prompt — `skip_memory: true` per
     /// spec §8.5. Cron contexts inherit the agent's persona/identity
-    /// (SOUL) but skip USER.md and HEARTBEAT.md (those are for
-    /// interactive use; cron is fresh-context).
+    /// (SOUL) but skip HEARTBEAT.md (that is for interactive use; cron
+    /// is fresh-context).
     pub fn cron_system_prompt(&self, platform_ctx: Option<&str>) -> SystemPrompt {
         SystemPrompt::from_sections_with_preamble(platform_ctx, &[(SOUL, self.system.as_deref())])
     }
@@ -321,7 +327,6 @@ mod tests {
         let dir = tempdir();
         let bf = BootstrapFiles::load(&dir).await.expect("load");
         assert!(bf.system.is_none());
-        assert!(bf.user.is_none());
         assert!(bf.heartbeat.is_none());
         assert!(bf.system_prompt(None).as_text().is_none());
     }
@@ -332,16 +337,16 @@ mod tests {
         tokio::fs::write(dir.join(SOUL), "   \n\n\t\n")
             .await
             .expect("write");
-        tokio::fs::write(dir.join(USER), "real")
+        tokio::fs::write(dir.join(HEARTBEAT), "real")
             .await
             .expect("write");
         let bf = BootstrapFiles::load(&dir).await.expect("load");
         assert!(bf.system.is_none());
-        assert_eq!(bf.user.as_deref(), Some("real"));
+        assert_eq!(bf.heartbeat.as_deref(), Some("real"));
     }
 
     #[tokio::test]
-    async fn order_is_soul_user_heartbeat() {
+    async fn order_is_soul_heartbeat_and_user_md_is_not_read() {
         let dir = tempdir();
         tokio::fs::write(dir.join(SOUL), "soul-content")
             .await
@@ -357,10 +362,9 @@ mod tests {
         let prompt = bf.system_prompt(None);
         let text = prompt.as_text().expect("some");
         let soul_pos = text.find("soul-content").unwrap();
-        let user_pos = text.find("user-content").unwrap();
         let heartbeat_pos = text.find("heartbeat-content").unwrap();
-        assert!(soul_pos < user_pos);
-        assert!(user_pos < heartbeat_pos);
+        assert!(soul_pos < heartbeat_pos);
+        assert!(!text.contains("user-content"), "USER.md is memory now");
     }
 
     #[tokio::test]
@@ -466,24 +470,18 @@ mod tests {
     }
 
     #[test]
-    fn assembly_order_is_platform_then_soul_then_user_then_heartbeat() {
+    fn assembly_order_is_platform_then_soul_then_heartbeat() {
         let preamble = platform_context("test", "id-1", &["shell".into()]);
         let prompt = SystemPrompt::from_sections_with_preamble(
             Some(&preamble),
-            &[
-                (SOUL, Some("soul-body")),
-                (USER, Some("user-body")),
-                (HEARTBEAT, Some("hb-body")),
-            ],
+            &[(SOUL, Some("soul-body")), (HEARTBEAT, Some("hb-body"))],
         );
         let text = prompt.as_text().expect("some");
         let plat_pos = text.find("havn, a self-hosted").unwrap();
         let soul_pos = text.find("soul-body").unwrap();
-        let user_pos = text.find("user-body").unwrap();
         let hb_pos = text.find("hb-body").unwrap();
         assert!(plat_pos < soul_pos, "platform context must precede SOUL");
-        assert!(soul_pos < user_pos, "SOUL must precede USER");
-        assert!(user_pos < hb_pos, "USER must precede HEARTBEAT");
+        assert!(soul_pos < hb_pos, "SOUL must precede HEARTBEAT");
     }
 
     #[test]
