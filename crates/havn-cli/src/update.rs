@@ -1378,11 +1378,13 @@ fn list_item(line: &str) -> Option<&str> {
 /// after `Havn`; others on it are not looked at.
 fn requires(notes: &str) -> Option<Result<String, String>> {
     // The list a heading (until the next) or a line (until a blank or other
-    // line after its items) opened: whether it had items yet, whether it
-    // named Havn, and it, while no version has been found for it.
+    // line after its items) opened: whether it had items yet, or other
+    // lines before them, whether it named Havn, and it, while no version
+    // has been found for it.
     struct Scope {
         heading: bool,
         items: bool,
+        text: bool,
         named: bool,
         waiting: Option<String>,
     }
@@ -1391,10 +1393,21 @@ fn requires(notes: &str) -> Option<Result<String, String>> {
     for line in notes.lines() {
         let raw = line.trim();
         let heading = raw.starts_with('#');
+        // A line that begins in bold, such as `**Full Changelog**: …`, is a
+        // heading too, as far as a list goes.
+        let bold = raw.starts_with("**") || raw.starts_with("__");
         let item = list_item(raw);
-        // A line's list may begin after other lines.
+        // A line's list may begin after other lines, but not after a blank
+        // one that follows them.
         let ends = scope.as_ref().is_some_and(|s| {
-            heading || (!s.heading && s.items && (raw.is_empty() || item.is_none()))
+            heading
+                || bold
+                || (!s.heading
+                    && if s.items {
+                        raw.is_empty() || item.is_none()
+                    } else {
+                        raw.is_empty() && s.text
+                    })
         });
         if ends && let Some(waiting) = scope.take().and_then(|s| s.waiting) {
             return Some(Err(waiting));
@@ -1420,10 +1433,16 @@ fn requires(notes: &str) -> Option<Result<String, String>> {
             scope = Some(Scope {
                 heading,
                 items: false,
+                text: false,
                 named: !mentions.is_empty(),
                 waiting: (!mentions.is_empty() && found.is_none()).then(|| raw.to_string()),
             });
             continue;
+        }
+        if item.is_none()
+            && let Some(s) = scope.as_mut()
+        {
+            s.text = true;
         }
         let mentions = match (scope.as_mut(), item) {
             (Some(s), Some(text)) => {
@@ -1885,6 +1904,8 @@ async fn install(
             .collect();
         let done = if running.is_empty() {
             "installed; no unit of it runs".to_string()
+        } else if restarted.is_empty() {
+            "installed; no unit of it runs it".to_string()
         } else if stopped.is_empty() {
             "updated".to_string()
         } else {
@@ -2771,6 +2792,7 @@ mod tests {
             ("Requires Havn >= 0.2.14 (Havn's new API)", "0.2.14"),
             ("Requires:\n\n- Havn >= 0.2.14", "0.2.14"),
             ("Requires:\nSee below\n- Havn >= 0.2.14", "0.2.14"),
+            ("Requires:\n\nSee below\n- Havn >= 0.2.14", "0.2.14"),
             ("Requires Havn-0.2.14", "0.2.14"),
             ("Requires Havn-v0.2.14+", "0.2.14"),
             ("Requires Havn 0.2.14+", "0.2.14"),
@@ -2818,6 +2840,12 @@ mod tests {
             "Requires:\n- a bot token\n\n- Havn 0.3.0 is out",
             "## Changes\n- Works with Havn 0.3.0",
             "Havn 0.2.13 requires a restart",
+            // A list closed by a blank line after its text, or by bold.
+            "Requirements:\nNone beyond the last release.\n\nWhat changed\n- Havn 0.2.99 support for \
+             threads",
+            "Requires:\n**What changed**\n- Havn 0.2.99 support for threads",
+            "Requires:\n\n**Full Changelog**: https://x/compare/v0.2.13...v0.2.14\n- Havn 0.2.99 \
+             support for threads",
         ] {
             assert_eq!(requires(unrelated), None, "{unrelated}");
         }
@@ -3287,6 +3315,22 @@ mod tests {
             *fake.restarted.borrow(),
             vec!["test.service", "bind.service"]
         );
+
+        // When it is the only one, no unit runs the binary put in place.
+        let (mut adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
+        adapter.units = vec!["bind.service".into()];
+        let fake = Fake {
+            after: vec!["bind.service"],
+            ..rooted(&adapter, vec![("bind.service", DELETED)])
+        };
+        let done = install_on(&fake, &adapter, &archive, &sums, true, QUICK)
+            .await
+            .unwrap();
+        assert!(
+            done.starts_with("installed; no unit of it runs it\nnot managed: bind.service"),
+            "{done}"
+        );
+        assert_eq!(fake.installed(), "0.2.11");
 
         // So when the host's unit then fails, only it goes back.
         let (mut adapter, archive, sums) = adapter_at(dir.path(), "0.2.11");
