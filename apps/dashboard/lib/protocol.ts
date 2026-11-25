@@ -83,8 +83,10 @@ export type Attachment = {
 export type MemoryChange = {
   action: "saved" | "forgot";
   key: string;
-  /** What was saved, or what the forgotten entry said. */
+  /** What was saved, or what the forgotten entry said, cut short. */
   value: string;
+  /** `value` is cut: the entry says more. */
+  value_cut?: boolean;
   kind: string;
   /** The entry the change replaced or forgot, and the one it left
    * active: what undoing it puts back and takes out. */
