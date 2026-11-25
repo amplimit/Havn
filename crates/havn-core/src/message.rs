@@ -86,6 +86,14 @@ impl Attachment {
             && !name.contains(['/', '\\'])
             && !name.chars().any(char::is_control)
     }
+
+    /// The name, in the inbox, of the copy shown in place of file `name`
+    /// (issue #225): hidden, and never the name of a file sent, as those
+    /// start with the time they came.
+    #[must_use]
+    pub fn shown_copy(name: &str) -> String {
+        format!(".{name}.shown")
+    }
 }
 
 /// Where a message branches off its chat (issue #129).

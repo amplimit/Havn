@@ -384,8 +384,8 @@ pub fn discard(workspace: &std::path::Path, attachment: &Attachment) {
 }
 
 /// Remove inbox file `path` of `workspace`, its text at `text_path` and
-/// the copy shown of it: a file sent unused, or one of a deleted chat
-/// (issue #229). Nothing outside the inbox is touched.
+/// the copy shown of it: a file sent unused. Nothing outside the inbox is
+/// touched.
 pub fn discard_path(workspace: &std::path::Path, path: &str, text_path: Option<&str>) {
     let Ok(inbox) = inbox(workspace) else {
         return;

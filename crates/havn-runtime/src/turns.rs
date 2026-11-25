@@ -167,6 +167,14 @@ impl Turns {
         }
     }
 
+    /// Whether `found` holds for a message queued in a chat, given the
+    /// chat (issue #322).
+    pub fn any_queued(&self, found: impl Fn(&str, &InboundMessage) -> bool) -> bool {
+        self.lock()
+            .iter()
+            .any(|(chat, turn)| turn.queue.iter().any(|msg| found(chat, msg)))
+    }
+
     /// Take every queued message out, leaving running turns to finish; for
     /// a runtime that is about to stop.
     pub fn take_queued(&self) -> Vec<InboundMessage> {
