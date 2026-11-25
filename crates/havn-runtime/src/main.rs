@@ -4061,6 +4061,19 @@ fn failure_text(detail: &str) -> (String, bool) {
             ),
             false,
         )
+    } else if refused_with(&d, 403)
+        && d.starts_with(&format!(
+            "upstream provider error: 403 — {}",
+            havn_proto::KEY_TURNED_OFF
+        ))
+    {
+        (
+            lang().pick(
+                "its provider refused the API key itself (revoked, leaked or blocked), so it was turned off. The agent's owner can check it.",
+                "模型服务商拒绝了这个 API 密钥本身（已吊销、泄露或被封禁），所以它已被停用。agent 的所有者可以检查一下。",
+            ),
+            false,
+        )
     } else if refused_with(&d, 403) {
         (
             lang().pick(
@@ -4158,7 +4171,9 @@ fn failure_text(detail: &str) -> (String, bool) {
 /// count.
 fn refused_with(detail: &str, status: u16) -> bool {
     if let Some(rest) = detail.strip_prefix("upstream provider error: ") {
-        return rest.starts_with(&format!("{status} "));
+        return rest
+            .strip_prefix(&status.to_string())
+            .is_some_and(|after| after.is_empty() || after.starts_with(' '));
     }
     detail
         .strip_prefix("the provider \"")
@@ -5365,6 +5380,15 @@ run ls"
         assert!(!payment.contains("no credit left"));
         let (forbidden, again) = failure_text("upstream provider error: 403 — not for this model");
         assert!(forbidden.contains("forbids") && !again, "{forbidden}");
+        let (turned_off, again) = failure_text(&format!(
+            "upstream provider error: 403 — {} — Your API key was reported as leaked.",
+            havn_proto::KEY_TURNED_OFF
+        ));
+        assert!(
+            turned_off.contains("refused the API key itself") && !again,
+            "{turned_off}"
+        );
+        assert!(told("upstream provider error: 403").contains("forbids"));
         // What the provider said does not pass for the status.
         assert!(
             told("upstream provider error: 400 — says \"upstream provider error: 403 — x\"")

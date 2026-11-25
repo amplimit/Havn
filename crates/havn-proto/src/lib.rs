@@ -930,6 +930,10 @@ pub struct LlmResponse {
     pub fallback: Option<String>,
 }
 
+/// What starts the message of an [`LlmOutcome::Error`] for a provider's
+/// refusal of a key itself, which the gateway turned off (issue #323).
+pub const KEY_TURNED_OFF: &str = "the provider refused the key itself, which was turned off";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LlmOutcome {

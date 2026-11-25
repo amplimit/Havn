@@ -265,7 +265,7 @@ pub enum ProxyError {
         reason: String,
         tries: u32,
     },
-    #[error("upstream provider error: {status} — {message}")]
+    #[error("upstream provider error: {status}{}", dash(.message))]
     Upstream { status: u16, message: String },
     #[error("transport: {0}")]
     Transport(#[from] reqwest::Error),
@@ -631,7 +631,8 @@ async fn complete_through(
     let mut passing: Option<String> = None;
     // The last refusal that does not pass, with its status: said as it is,
     // an endpoint's with how to add a key, rather than as no credential.
-    let mut refused: Option<(u16, String)> = None;
+    // And whether its key was turned off for it.
+    let mut refused: Option<(u16, String, bool)> = None;
     let mut tries = 0_u32;
     let started = std::time::Instant::now();
     for cred in chain {
@@ -780,9 +781,9 @@ async fn complete_through(
                 }
                 // A key refused (401) does not hide what another key was
                 // refused for (issue #323).
-                let said = said.unwrap_or((401, reason));
-                if said.0 != 401 || refused.as_ref().is_none_or(|(status, _)| *status == 401) {
-                    refused = Some(said);
+                let (status, message) = said.unwrap_or((401, reason));
+                if status != 401 || refused.as_ref().is_none_or(|(was, ..)| *was == 401) {
+                    refused = Some((status, message, true));
                 }
             }
             Attempt::TryNext {
@@ -795,8 +796,8 @@ async fn complete_through(
                 warn!(credential_id = %shown, %reason, "skipping credential, trying next");
                 if transient {
                     passing = Some(reason);
-                } else if said.is_some() {
-                    refused = said;
+                } else if let Some((status, message)) = said {
+                    refused = Some((status, message, false));
                 }
             }
             Attempt::Fatal(e) => {
@@ -824,7 +825,7 @@ async fn complete_through(
     }
     // The provider's last refusal, as it said it (issue #323); a key a
     // built-in provider refused (401) was disabled, and none is left.
-    if let Some((status, message)) = refused
+    if let Some((status, message, turned_off)) = refused
         && (route.keyless || status != 401)
     {
         let hint = if status == 401 {
@@ -836,10 +837,15 @@ async fn complete_through(
         } else {
             String::new()
         };
-        return Err(ProxyError::Upstream {
-            status,
-            message: format!("{}{hint}", provider_words(&message)),
-        });
+        let words = provider_words(&message);
+        // A key refused for itself (a 403 for a revoked, leaked or blocked
+        // key) is said so, first, as the runtime tells it.
+        let message = if turned_off && status != 401 {
+            format!("{}{}", havn_proto::KEY_TURNED_OFF, dash(&words))
+        } else {
+            format!("{words}{hint}")
+        };
+        return Err(ProxyError::Upstream { status, message });
     }
     Err(exhausted.map_or_else(
         || ProxyError::NoCredential(route.name.to_string()),
@@ -885,6 +891,15 @@ fn short_reason(reason: &str) -> String {
         short.push('…');
     }
     short
+}
+
+/// ` — message`, or nothing when there is no message.
+fn dash(message: &str) -> String {
+    if message.is_empty() {
+        String::new()
+    } else {
+        format!(" — {message}")
+    }
 }
 
 /// What a provider said as it refused a call (issue #323), for a person to
@@ -4806,8 +4821,10 @@ mod tests {
                 "message": "Your API key was reported as leaked. Please use another API key."}});
             for (body, disabled) in [
                 (info("API_KEY_SERVICE_BLOCKED"), true),
-                (info("SERVICE_DISABLED"), true),
                 (leaked, true),
+                // Passing, or the gateway's own address: the key stays.
+                (info("SERVICE_DISABLED"), false),
+                (info("API_KEY_IP_ADDRESS_BLOCKED"), false),
                 (info("IAM_PERMISSION_DENIED"), false),
             ] {
                 let (base, _) = refuse_in_turn(vec![(403, body.clone())]).await;
@@ -4823,7 +4840,8 @@ mod tests {
                     .await
                     .expect_err("refused");
                 assert!(
-                    matches!(&err, ProxyError::Upstream { status: 403, .. }),
+                    matches!(&err, ProxyError::Upstream { status: 403, message }
+                        if message.starts_with(havn_proto::KEY_TURNED_OFF) == disabled),
                     "{body}: {err}"
                 );
                 assert_eq!(enabled(&db).await, [!disabled], "{body}");
@@ -4832,6 +4850,13 @@ mod tests {
 
         #[test]
         fn a_refusal_is_said_in_the_provider_s_words_cut_short() {
+            // Without words, no dash.
+            let bare = ProxyError::Upstream {
+                status: 403,
+                message: String::new(),
+            };
+            assert_eq!(bare.to_string(), "upstream provider error: 403");
+            assert_eq!(provider_words(""), "");
             assert_eq!(
                 provider_words(r#"{"error": {"message": "out of credit", "code": 402}}"#),
                 "out of credit"

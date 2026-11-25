@@ -30,15 +30,15 @@ const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
 /// The `ErrorInfo` reasons Google gives a 403 for the key itself rather
 /// than for one request (issue #323): its key stops working until its
-/// owner fixes it.
+/// owner fixes it. Not `SERVICE_DISABLED`, given for minutes after the API
+/// is enabled, nor `API_KEY_IP_ADDRESS_BLOCKED`, which a gateway whose
+/// address changes may get with a good key: those try the next key.
 const KEY_REASONS: &[&str] = &[
     "API_KEY_INVALID",
     "API_KEY_SERVICE_BLOCKED",
     "API_KEY_HTTP_REFERRER_BLOCKED",
-    "API_KEY_IP_ADDRESS_BLOCKED",
     "API_KEY_ANDROID_APP_BLOCKED",
     "API_KEY_IOS_APP_BLOCKED",
-    "SERVICE_DISABLED",
     "CONSUMER_SUSPENDED",
 ];
 
