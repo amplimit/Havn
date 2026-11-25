@@ -487,6 +487,7 @@ mod tests {
                     kind: *kind,
                     source: *source,
                     ttl_days: None,
+                    visibility: havn_db::agent::memory::VisibilityRule::Keep,
                 },
             )
             .await

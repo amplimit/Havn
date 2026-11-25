@@ -2403,7 +2403,30 @@ function MemoryNote({ agentId, changes }: { agentId: string; changes: MemoryChan
 function MemoryChangeLine({ agentId, change }: { agentId: string; change: MemoryChange }) {
   const [state, setState] = useState<"shown" | "undoing" | "undone">("shown");
   const [error, setError] = useState<string | null>(null);
+  const [visibility, setVisibility] = useState(change.visibility);
+  const [switching, setSwitching] = useState(false);
   const saved = change.action === "saved";
+
+  // Only the entry this reply saved: nothing changes once the key holds
+  // another (issue #309).
+  async function switchVisibility() {
+    const next = visibility === "public" ? "private" : "public";
+    const ask =
+      next === "public"
+        ? `Make "${change.key}" public? It is then in the agent's prompt in every chat, other people's and groups' too, as it says:\n\n${change.value}`
+        : `Make "${change.key}" private? From now on it is in your own private chats only. What others already read cannot be taken back.`;
+    if (!confirm(ask)) return;
+    setSwitching(true);
+    setError(null);
+    try {
+      const entry = await api.memory.setVisibility(agentId, change.key, next, change.after);
+      setVisibility(entry.visibility);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSwitching(false);
+    }
+  }
 
   async function undo() {
     setState("undoing");
@@ -2427,6 +2450,7 @@ function MemoryChangeLine({ agentId, change }: { agentId: string; change: Memory
         {": "}
         <span style={{ textDecoration: state === "undone" ? "line-through" : undefined }}>
           {change.value}
+          {change.value_cut && "…"}
         </span>
       </span>
       {state === "undone" ? (
@@ -2447,6 +2471,43 @@ function MemoryChangeLine({ agentId, change }: { agentId: string; change: Memory
         >
           {state === "undoing" ? "undoing…" : "undo"}
         </button>
+      )}
+      {saved && change.visibility && change.after && state !== "undone" && (
+        <>
+          {/* What it was when saved; the memory page shows what it is now.
+              The agent only suggests public: the owner makes it so. */}
+          <span>
+            {change.visibility === "private" && change.suggested_public
+              ? "(saved as private, suggested public)"
+              : `(saved as ${change.visibility})`}
+          </span>
+          {visibility !== "public" && change.value_cut ? (
+            // Only what the owner read in full is made public: the memory
+            // page shows all of it.
+            <Link
+              href={`/agent/memory?id=${agentId}`}
+              className="underline"
+              title="It says more than is shown here: read it all on the memory page and make it public there."
+            >
+              make public on the memory page
+            </Link>
+          ) : (
+            <button
+              type="button"
+              className="underline disabled:opacity-40"
+              onClick={() => void switchVisibility()}
+              disabled={switching}
+              title={
+                visibility === "public"
+                  ? "Make it private: in your own private chats only."
+                  : "Make it public: in the prompt of every chat, other people's and groups' too."
+              }
+            >
+              {switching ? "switching…" : visibility === "public" ? "make private" : "make public"}
+            </button>
+          )}
+          {visibility !== change.visibility && <span>(now {visibility})</span>}
+        </>
       )}
       {error && (
         <span role="alert" style={{ color: "var(--color-ruby)" }}>

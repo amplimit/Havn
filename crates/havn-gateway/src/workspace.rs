@@ -14,10 +14,12 @@ const README: &str = "# This agent's workspace
 This directory contains files the agent reads at every session start:
 
 - `SOUL.md` — Persona + identity (tone, values, communication style, name, purpose).
-- `USER.md` — What the agent should always know about you.
 - `HEARTBEAT.md` — Periodic self-tick instructions (spec §9.6).
 
-All three are optional and user-editable. Empty files are silently skipped.
+Both are optional and user-editable. Empty files are silently skipped.
+What the agent should know about you is in its memory (the dashboard's
+memory page), each fact private or public; an earlier `USER.md` became a
+public fact there and is kept as `USER.md.bak`.
 Mid-session edits do not retroactively change a running session — see the
 frozen-prompt invariant in spec §9.4. (`HEARTBEAT.md` is the deliberate
 exception: re-read on every heartbeat tick.)
@@ -32,7 +34,7 @@ MEMORY, HEARTBEAT). v0.6 collapsed them into SYSTEM.md; v0.7 renamed it to
 SOUL.md. The runtime still tolerates the old filenames for existing workspaces.
 ";
 
-const BOOTSTRAP_FILES: &[&str] = &["SOUL.md", "USER.md", "HEARTBEAT.md"];
+const BOOTSTRAP_FILES: &[&str] = &["SOUL.md", "HEARTBEAT.md"];
 
 /// Create the workspace directory and all bootstrap files if they don't already exist.
 /// Idempotent — safe to call on an existing workspace.

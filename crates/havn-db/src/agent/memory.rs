@@ -103,6 +103,37 @@ impl Source {
     }
 }
 
+/// Who a fact is put in front of (issue #309). Only the owner makes one
+/// public.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Visibility {
+    /// In the prompt of the owner's own private chats only; elsewhere
+    /// `memory_search` reaches it, with the owner's review.
+    #[default]
+    Private,
+    /// In the prompt of every chat, other people's and groups' included.
+    /// Never ages out.
+    Public,
+}
+
+impl Visibility {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Public => "public",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "private" => Self::Private,
+            "public" => Self::Public,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
     pub id: String,
@@ -124,6 +155,12 @@ pub struct Entry {
     /// points at the (now archived) old row. Forms a soft-delete chain
     /// the dashboard renders as "agent used to think X, now thinks Y".
     pub supersedes_id: Option<String>,
+    #[serde(default)]
+    pub visibility: Visibility,
+    /// The agent suggests making this private entry public; only the owner
+    /// does, on the dashboard (issue #309).
+    #[serde(default)]
+    pub suggested_public: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +171,41 @@ pub struct NewEntry<'a> {
     pub source: Source,
     /// `None` → use [`Kind::default_ttl_days`].
     pub ttl_days: Option<i64>,
+    pub visibility: VisibilityRule,
+}
+
+/// What a save does to who the entry is shown to (issue #309). The agent
+/// never makes a fact public: only the owner does, on the dashboard
+/// ([`set_visibility`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VisibilityRule {
+    /// The owner's save, from the dashboard: a new key is private; an
+    /// entry repeated or replaced keeps its own.
+    #[default]
+    Keep,
+    /// The agent's save: private, though an entry repeated as it was keeps
+    /// its own. A public entry it changes becomes private and suggested
+    /// public, for the owner to approve the new text; `suggest_public`
+    /// suggests it of any other.
+    Agent { suggest_public: bool },
+    /// Public: what the owner wrote in `USER.md`.
+    Public,
+}
+
+/// Who an entry a save inserts is shown to, and whether it is suggested
+/// public, after the active entry it replaces, if any.
+fn inserted(rule: VisibilityRule, replaced: Option<(Visibility, bool)>) -> (Visibility, bool) {
+    match (rule, replaced) {
+        (VisibilityRule::Public, _) => (Visibility::Public, false),
+        (VisibilityRule::Keep, Some((was, suggested))) => {
+            (was, suggested && was == Visibility::Private)
+        }
+        (VisibilityRule::Keep, None) => (Visibility::Private, false),
+        (VisibilityRule::Agent { suggest_public }, replaced) => (
+            Visibility::Private,
+            suggest_public || replaced.is_some_and(|(was, _)| was == Visibility::Public),
+        ),
+    }
 }
 
 /// Insert a new entry, or replace the value for an existing key while
@@ -150,6 +222,9 @@ pub struct NewEntry<'a> {
 ///   `supersedes_id` pointing at the most-recent archived row. The
 ///   archived row stays archived (audit) but the agent's view is
 ///   single-valued again.
+///
+/// - **Visibility**: as `new.visibility` says ([`VisibilityRule`]),
+///   decided in the same transaction as the write.
 ///
 /// - **A `user_told` row repeated** (same value and kind) → it stays
 ///   `user_told`, and without an explicit `ttl_days` it keeps its
@@ -199,8 +274,11 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
         Option<DateTime<Utc>>,
         String,
         Option<i64>,
+        String,
+        bool,
     )> = sqlx::query_as(
-        "SELECT id, value, kind, archived_at, source, ttl_days FROM memory WHERE key = ?1",
+        "SELECT id, value, kind, archived_at, source, ttl_days, visibility, suggested_public \
+         FROM memory WHERE key = ?1",
     )
     .bind(new.key)
     .fetch_optional(&mut *tx)
@@ -211,7 +289,7 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
         // explicit lifetime it follows the (possibly upgraded) source, so
         // promoting an agent_inferred row to user_told extends it per
         // §9.4; the agent repeating a user_told fact changes neither.
-        Some((_id, ref v, ref k, None, ref was, kept))
+        Some((_id, ref v, ref k, None, ref was, kept, _, _))
             if v == new.value && k == new.kind.as_str() =>
         {
             let told = was == Source::UserTold.as_str();
@@ -224,18 +302,29 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
                 "UPDATE memory \
                  SET source     = ?1, \
                      ttl_days   = ?2, \
+                     visibility = CASE WHEN ?4 THEN 'public' ELSE visibility END, \
+                     suggested_public = CASE WHEN ?4 THEN 0 \
+                         WHEN ?5 AND visibility = 'private' THEN 1 \
+                         ELSE suggested_public END, \
                      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
                  WHERE key = ?3",
             )
             .bind(source.as_str())
             .bind(ttl)
             .bind(new.key)
+            .bind(new.visibility == VisibilityRule::Public)
+            .bind(matches!(
+                new.visibility,
+                VisibilityRule::Agent {
+                    suggest_public: true
+                }
+            ))
             .execute(&mut *tx)
             .await?;
         }
         // Active row whose content has changed → archive it, INSERT
         // replacement with supersedes link.
-        Some((old_id, _, _, None, _, _)) => {
+        Some((old_id, _, _, None, _, _, ref was, suggested)) => {
             sqlx::query(
                 "UPDATE memory \
                  SET archived_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
@@ -257,12 +346,14 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
             .bind(&old_id)
             .execute(&mut *tx)
             .await?;
-            insert_new(&mut *tx, &new, ttl, Some(&old_id)).await?;
+            let was = Visibility::parse(was).unwrap_or_default();
+            let shown = inserted(new.visibility, Some((was, suggested)));
+            insert_new(&mut *tx, &new, ttl, shown, Some(&old_id)).await?;
         }
         // Only archived rows for this key — suffix the archived row's
         // key so the UNIQUE(key) constraint stays satisfied, then INSERT
         // the new active row linked to it.
-        Some((archived_id, _, _, Some(_), _, _)) => {
+        Some((archived_id, _, _, Some(_), _, _, _, _)) => {
             sqlx::query(
                 "UPDATE memory \
                  SET key = key || '@reactivated:' || strftime('%Y-%m-%dT%H:%M:%fZ', 'now') || ':' || id \
@@ -271,10 +362,11 @@ async fn write(pool: &SqlitePool, new: NewEntry<'_>, ttl_choice: Ttl) -> Result<
             .bind(&archived_id)
             .execute(&mut *tx)
             .await?;
-            insert_new(&mut *tx, &new, ttl, Some(&archived_id)).await?;
+            let shown = inserted(new.visibility, None);
+            insert_new(&mut *tx, &new, ttl, shown, Some(&archived_id)).await?;
         }
         None => {
-            insert_new(&mut *tx, &new, ttl, None).await?;
+            insert_new(&mut *tx, &new, ttl, inserted(new.visibility, None), None).await?;
         }
     }
 
@@ -293,11 +385,13 @@ async fn insert_new(
     tx: &mut sqlx::SqliteConnection,
     new: &NewEntry<'_>,
     ttl: Option<i64>,
+    (visibility, suggested): (Visibility, bool),
     supersedes_id: Option<&str>,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO memory (id, key, value, kind, source, ttl_days, supersedes_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO memory \
+         (id, key, value, kind, source, ttl_days, supersedes_id, visibility, suggested_public) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )
     .bind(Uuid::now_v7().to_string())
     .bind(new.key)
@@ -306,6 +400,8 @@ async fn insert_new(
     .bind(new.source.as_str())
     .bind(ttl)
     .bind(supersedes_id)
+    .bind(visibility.as_str())
+    .bind(suggested)
     .execute(tx)
     .await?;
     Ok(())
@@ -511,6 +607,7 @@ pub async fn upsert(pool: &SqlitePool, key: &str, value: &str) -> Result<()> {
             kind: Kind::Preference,
             source: Source::AgentInferred,
             ttl_days: None,
+            visibility: VisibilityRule::Keep,
         },
     )
     .await
@@ -607,7 +704,7 @@ pub async fn list_archived_for_key(pool: &SqlitePool, key: &str) -> Result<Vec<E
     let prefix_pattern = format!("{key}@%");
     let rows: Vec<EntryRow> = sqlx::query_as::<_, EntryRow>(
         "SELECT id, key, value, kind, source, ttl_days, archived_at, created_at, updated_at, \
-                recall_count, last_recalled_at, supersedes_id \
+                recall_count, last_recalled_at, supersedes_id, visibility, suggested_public \
          FROM memory \
          WHERE archived_at IS NOT NULL AND (key = ?1 OR key LIKE ?2) \
          ORDER BY archived_at DESC",
@@ -673,7 +770,8 @@ pub async fn search(
     let rows: Vec<EntryRow> = if kinds.is_empty() {
         sqlx::query_as::<_, EntryRow>(
             "SELECT m.id, m.key, m.value, m.kind, m.source, m.ttl_days, m.archived_at, \
-                    m.created_at, m.updated_at, m.recall_count, m.last_recalled_at, m.supersedes_id \
+                    m.created_at, m.updated_at, m.recall_count, m.last_recalled_at, m.supersedes_id, m.visibility, \
+                    m.suggested_public \
              FROM memory_fts f JOIN memory m ON m.rowid = f.rowid \
              WHERE memory_fts MATCH ?1 AND m.archived_at IS NULL \
              ORDER BY rank LIMIT ?2",
@@ -689,7 +787,8 @@ pub async fn search(
             .join(", ");
         let sql = format!(
             "SELECT m.id, m.key, m.value, m.kind, m.source, m.ttl_days, m.archived_at, \
-                    m.created_at, m.updated_at, m.recall_count, m.last_recalled_at, m.supersedes_id \
+                    m.created_at, m.updated_at, m.recall_count, m.last_recalled_at, m.supersedes_id, m.visibility, \
+                    m.suggested_public \
              FROM memory_fts f JOIN memory m ON m.rowid = f.rowid \
              WHERE memory_fts MATCH ?1 AND m.archived_at IS NULL AND m.kind IN ({placeholders}) \
              ORDER BY rank LIMIT ?2"
@@ -728,7 +827,7 @@ pub async fn recent_events(
         .to_string();
     let rows: Vec<EntryRow> = sqlx::query_as::<_, EntryRow>(
         "SELECT id, key, value, kind, source, ttl_days, archived_at, created_at, updated_at, \
-                recall_count, last_recalled_at, supersedes_id \
+                recall_count, last_recalled_at, supersedes_id, visibility, suggested_public \
          FROM memory \
          WHERE archived_at IS NULL AND kind = 'event' AND updated_at >= ?1 \
          ORDER BY updated_at DESC LIMIT ?2",
@@ -749,7 +848,7 @@ pub async fn list_active_of_kind(pool: &SqlitePool, kind: Kind, limit: u32) -> R
     }
     let rows: Vec<EntryRow> = sqlx::query_as::<_, EntryRow>(
         "SELECT id, key, value, kind, source, ttl_days, archived_at, created_at, updated_at, \
-                recall_count, last_recalled_at, supersedes_id \
+                recall_count, last_recalled_at, supersedes_id, visibility, suggested_public \
          FROM memory \
          WHERE archived_at IS NULL AND kind = ?1 \
          ORDER BY updated_at DESC LIMIT ?2",
@@ -761,10 +860,102 @@ pub async fn list_active_of_kind(pool: &SqlitePool, kind: Kind, limit: u32) -> R
     Ok(rows.into_iter().map(Entry::from).collect())
 }
 
+/// Private entries of one kind, newest first: what the owner's own
+/// private chats are given (issue #309).
+pub async fn list_private_of_kind(pool: &SqlitePool, kind: Kind, limit: u32) -> Result<Vec<Entry>> {
+    let rows: Vec<EntryRow> = sqlx::query_as::<_, EntryRow>(
+        "SELECT id, key, value, kind, source, ttl_days, archived_at, created_at, updated_at, \
+                recall_count, last_recalled_at, supersedes_id, visibility, suggested_public \
+         FROM memory \
+         WHERE archived_at IS NULL AND kind = ?1 AND visibility = 'private' \
+         ORDER BY updated_at DESC LIMIT ?2",
+    )
+    .bind(kind.as_str())
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(Entry::from).collect())
+}
+
+/// Active public entries of every kind, the most recently used (saved or
+/// found by `memory_search`) first (issue #309).
+pub async fn list_public(pool: &SqlitePool, limit: u32) -> Result<Vec<Entry>> {
+    let rows: Vec<EntryRow> = sqlx::query_as::<_, EntryRow>(
+        "SELECT id, key, value, kind, source, ttl_days, archived_at, created_at, updated_at, \
+                recall_count, last_recalled_at, supersedes_id, visibility, suggested_public \
+         FROM memory \
+         WHERE archived_at IS NULL AND visibility = 'public' \
+         ORDER BY MAX(updated_at, COALESCE(last_recalled_at, updated_at)) DESC, id DESC \
+         LIMIT ?1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(Entry::from).collect())
+}
+
+/// Make the active entry under `key` private or public, keeping when it
+/// was saved, and drop any suggestion to make it public: the entry and
+/// what it was before, or `None` when `key` has no active entry, or one
+/// other than `id` when given (it changed since). The owner's alone.
+pub async fn set_visibility(
+    pool: &SqlitePool,
+    key: &str,
+    id: Option<&str>,
+    visibility: Visibility,
+) -> Result<Option<(Entry, Visibility)>> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let active: Option<(String, String)> =
+        sqlx::query_as("SELECT id, visibility FROM memory WHERE key = ?1 AND archived_at IS NULL")
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((active, was)) = active else {
+        return Ok(None);
+    };
+    if id.is_some_and(|id| id != active) {
+        return Ok(None);
+    }
+    // Public, it did not age; made private again, it gets its whole
+    // lifetime from now, not what is left of it.
+    sqlx::query(
+        "UPDATE memory SET visibility = ?1, suggested_public = 0, \
+         last_recalled_at = CASE WHEN visibility = 'public' AND ?1 = 'private' \
+             THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE last_recalled_at END \
+         WHERE id = ?2",
+    )
+    .bind(visibility.as_str())
+    .bind(&active)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let was = Visibility::parse(&was).unwrap_or_default();
+    Ok(fetch_by_id(pool, &active).await?.map(|entry| (entry, was)))
+}
+
+/// Whether bootstrap file `file` is still to be folded into memory, once
+/// (issue #309).
+pub async fn import_pending(pool: &SqlitePool, file: &str) -> Result<bool> {
+    let found: Option<i64> = sqlx::query_scalar("SELECT 1 FROM bootstrap_imports WHERE file = ?1")
+        .bind(file)
+        .fetch_optional(pool)
+        .await?;
+    Ok(found.is_some())
+}
+
+/// Note bootstrap file `file` as folded into memory: it is not again.
+pub async fn import_done(pool: &SqlitePool, file: &str) -> Result<()> {
+    sqlx::query("DELETE FROM bootstrap_imports WHERE file = ?1")
+        .bind(file)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn list_active(pool: &SqlitePool, limit: u32) -> Result<Vec<Entry>> {
     let rows: Vec<EntryRow> = sqlx::query_as::<_, EntryRow>(
         "SELECT id, key, value, kind, source, ttl_days, archived_at, created_at, updated_at, \
-                recall_count, last_recalled_at, supersedes_id \
+                recall_count, last_recalled_at, supersedes_id, visibility, suggested_public \
          FROM memory WHERE archived_at IS NULL \
          ORDER BY updated_at DESC LIMIT ?1",
     )
@@ -781,13 +972,15 @@ pub async fn list_active(pool: &SqlitePool, limit: u32) -> Result<Vec<Entry>> {
 /// `memory_search` in the last week is *not* stale, it's load-bearing.
 ///
 /// Identity / preference / user-told-preference rows have `ttl_days IS NULL`
-/// and are never touched. Returns the row count archived.
+/// and are never touched, nor are public rows, which stay until the owner
+/// changes them (issue #309). Returns the row count archived.
 pub async fn age_expired(pool: &SqlitePool) -> Result<u64> {
     let res = sqlx::query(
         "UPDATE memory \
          SET archived_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
          WHERE archived_at IS NULL \
            AND ttl_days IS NOT NULL \
+           AND visibility = 'private' \
            AND julianday('now') - julianday(COALESCE(last_recalled_at, updated_at)) >= ttl_days",
     )
     .execute(pool)
@@ -798,7 +991,7 @@ pub async fn age_expired(pool: &SqlitePool) -> Result<u64> {
 async fn fetch_one(pool: &SqlitePool, where_clause: &str, args: &[&str]) -> Result<Option<Entry>> {
     let sql = format!(
         "SELECT id, key, value, kind, source, ttl_days, archived_at, created_at, updated_at, \
-                recall_count, last_recalled_at, supersedes_id \
+                recall_count, last_recalled_at, supersedes_id, visibility, suggested_public \
          FROM memory {where_clause}"
     );
     let mut q = sqlx::query_as::<_, EntryRow>(&sql);
@@ -822,6 +1015,8 @@ struct EntryRow {
     recall_count: i64,
     last_recalled_at: Option<DateTime<Utc>>,
     supersedes_id: Option<String>,
+    visibility: String,
+    suggested_public: bool,
 }
 
 impl From<EntryRow> for Entry {
@@ -843,6 +1038,8 @@ impl From<EntryRow> for Entry {
             recall_count: r.recall_count,
             last_recalled_at: r.last_recalled_at,
             supersedes_id: r.supersedes_id,
+            visibility: Visibility::parse(&r.visibility).unwrap_or_default(),
+            suggested_public: r.suggested_public,
         }
     }
 }
@@ -871,6 +1068,7 @@ mod tests {
             kind: Kind::Event,
             source: Source::AgentInferred,
             ttl_days: None,
+            visibility: VisibilityRule::Keep,
         }
     }
 
@@ -885,6 +1083,7 @@ mod tests {
                 kind: Kind::Identity,
                 source: Source::UserTold,
                 ttl_days: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -895,6 +1094,7 @@ mod tests {
         assert_eq!(entry.source, Source::UserTold);
         assert!(entry.ttl_days.is_none());
         assert!(entry.archived_at.is_none());
+        assert_eq!(entry.visibility, Visibility::Private);
     }
 
     #[tokio::test]
@@ -974,6 +1174,7 @@ mod tests {
                 kind: Kind::Preference,
                 source: Source::UserTold,
                 ttl_days: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -986,6 +1187,7 @@ mod tests {
                 kind: Kind::Event,
                 source: Source::AgentInferred,
                 ttl_days: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1010,6 +1212,7 @@ mod tests {
                 kind: Kind::Preference,
                 source: Source::UserTold,
                 ttl_days: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1033,6 +1236,7 @@ mod tests {
                 kind: Kind::Event,
                 source: Source::AgentInferred,
                 ttl_days: Some(1),
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1046,6 +1250,7 @@ mod tests {
                 kind: Kind::Preference,
                 source: Source::UserTold,
                 ttl_days: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1141,6 +1346,7 @@ mod tests {
                 kind: Kind::Preference,
                 source: Source::AgentInferred,
                 ttl_days: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1157,6 +1363,7 @@ mod tests {
                 kind: Kind::Preference,
                 source: Source::UserTold,
                 ttl_days: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1186,6 +1393,7 @@ mod tests {
                     kind: Kind::Event,
                     source: Source::AgentInferred,
                     ttl_days: None,
+                    visibility: VisibilityRule::Keep,
                 },
             )
             .await
@@ -1222,6 +1430,7 @@ mod tests {
                 kind: Kind::Event,
                 source: Source::AgentInferred,
                 ttl_days: Some(1),
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1260,6 +1469,7 @@ mod tests {
                 kind: Kind::Event,
                 source: Source::AgentInferred,
                 ttl_days: Some(1),
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1291,6 +1501,7 @@ mod tests {
                 kind: Kind::Project,
                 source: Source::UserTold,
                 ttl_days: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1305,6 +1516,7 @@ mod tests {
                 kind: Kind::Project,
                 source: Source::UserTold,
                 ttl_days: None,
+                visibility: VisibilityRule::Keep,
             },
         )
         .await
@@ -1337,6 +1549,7 @@ mod tests {
             kind: Kind::Preference,
             source: Source::UserTold,
             ttl_days: Some(400),
+            visibility: VisibilityRule::Keep,
         };
         let long = "v".repeat(3000);
         let vim = remember(&pool, entry(&long)).await.expect("vim");
@@ -1429,6 +1642,7 @@ mod tests {
             NewEntry {
                 key: "pref.lang",
                 ttl_days: Some(1),
+                visibility: VisibilityRule::Keep,
                 ..entry("Go")
             },
         )
@@ -1456,6 +1670,7 @@ mod tests {
             kind: Kind::Identity,
             source: Source::UserTold,
             ttl_days: None,
+            visibility: VisibilityRule::Keep,
         };
         assert!(!key_known(&pool, "user.address").await.expect("known"));
         remember(&pool, entry).await.expect("save");
@@ -1475,6 +1690,7 @@ mod tests {
             kind: Kind::Event,
             source: Source::UserTold,
             ttl_days: None,
+            visibility: VisibilityRule::Keep,
         };
         let id = remember_until_forgotten(&pool, told.clone())
             .await
@@ -1498,6 +1714,7 @@ mod tests {
             &pool,
             NewEntry {
                 ttl_days: Some(7),
+                visibility: VisibilityRule::Keep,
                 ..told.clone()
             },
         )
@@ -1558,5 +1775,236 @@ mod tests {
             active.supersedes_id.is_none()
                 || active.supersedes_id.as_deref() == Some(first_id.as_str())
         );
+    }
+
+    // ---- visibility (issue #309) ----------------------------------------
+
+    fn fact<'a>(key: &'a str, value: &'a str, visibility: VisibilityRule) -> NewEntry<'a> {
+        NewEntry {
+            key,
+            value,
+            kind: Kind::Project,
+            source: Source::AgentInferred,
+            ttl_days: Some(1),
+            visibility,
+        }
+    }
+
+    async fn shown(pool: &SqlitePool, key: &str) -> Visibility {
+        get(pool, key).await.unwrap().unwrap().visibility
+    }
+
+    async fn suggested(pool: &SqlitePool, key: &str) -> bool {
+        get(pool, key).await.unwrap().unwrap().suggested_public
+    }
+
+    #[tokio::test]
+    async fn the_agent_never_makes_a_fact_public_and_its_change_to_a_public_one_is_suggested() {
+        const AGENT: VisibilityRule = VisibilityRule::Agent {
+            suggest_public: false,
+        };
+        const SUGGESTS: VisibilityRule = VisibilityRule::Agent {
+            suggest_public: true,
+        };
+        let pool = connect_in_memory().await.expect("connect");
+        remember(&pool, fact("k", "v1", VisibilityRule::Keep))
+            .await
+            .expect("new");
+        assert_eq!(shown(&pool, "k").await, Visibility::Private, "the default");
+        assert!(!suggested(&pool, "k").await);
+
+        // The agent's own: private, suggested when it says so.
+        remember(&pool, fact("s", "Ada", SUGGESTS))
+            .await
+            .expect("new");
+        assert_eq!(shown(&pool, "s").await, Visibility::Private);
+        assert!(suggested(&pool, "s").await);
+        remember(&pool, fact("k", "v1", SUGGESTS))
+            .await
+            .expect("repeat");
+        assert_eq!(shown(&pool, "k").await, Visibility::Private);
+        assert!(suggested(&pool, "k").await, "a repeat can suggest it");
+
+        // Made public by the owner: a repeat keeps it public.
+        set_visibility(&pool, "s", None, Visibility::Public)
+            .await
+            .expect("set")
+            .expect("found");
+        assert!(!suggested(&pool, "s").await, "the owner decided");
+        remember(&pool, fact("s", "Ada", AGENT))
+            .await
+            .expect("repeat");
+        assert_eq!(shown(&pool, "s").await, Visibility::Public);
+        // The owner editing it keeps it public too.
+        remember(&pool, fact("s", "Ada L.", VisibilityRule::Keep))
+            .await
+            .expect("edit");
+        assert_eq!(shown(&pool, "s").await, Visibility::Public);
+        // The agent changing it: private until the owner approves the text.
+        remember(&pool, fact("s", "Ada Lovelace", AGENT))
+            .await
+            .expect("change");
+        let changed = get(&pool, "s").await.unwrap().unwrap();
+        assert_eq!(changed.value, "Ada Lovelace");
+        assert_eq!(changed.visibility, Visibility::Private);
+        assert!(changed.suggested_public);
+        // Switching it private clears the suggestion as well.
+        set_visibility(&pool, "s", None, Visibility::Private)
+            .await
+            .expect("set")
+            .expect("found");
+        assert!(!suggested(&pool, "s").await);
+
+        // Forgotten and saved again by the agent: private.
+        set_visibility(&pool, "k", None, Visibility::Public)
+            .await
+            .expect("set")
+            .expect("found");
+        forget(&pool, "k").await.expect("forget");
+        remember(&pool, fact("k", "v1", AGENT))
+            .await
+            .expect("again");
+        assert_eq!(shown(&pool, "k").await, Visibility::Private);
+        assert!(!suggested(&pool, "k").await);
+
+        // What the owner wrote in USER.md is public.
+        remember(
+            &pool,
+            fact("USER.md", "Call me Ada", VisibilityRule::Public),
+        )
+        .await
+        .expect("fold");
+        assert_eq!(shown(&pool, "USER.md").await, Visibility::Public);
+    }
+
+    #[tokio::test]
+    async fn public_facts_are_listed_most_recently_used_first_and_do_not_age_out() {
+        let pool = connect_in_memory().await.expect("connect");
+        remember(&pool, fact("old", "used lately", VisibilityRule::Public))
+            .await
+            .expect("old");
+        remember(&pool, fact("new", "saved last", VisibilityRule::Public))
+            .await
+            .expect("new");
+        remember(&pool, fact("hidden", "private", VisibilityRule::Keep))
+            .await
+            .expect("private");
+        sqlx::query(
+            "UPDATE memory SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3 days')",
+        )
+        .execute(&pool)
+        .await
+        .expect("backdate");
+        sqlx::query(
+            "UPDATE memory SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 days') \
+             WHERE key = 'new'",
+        )
+        .execute(&pool)
+        .await
+        .expect("backdate");
+        sqlx::query(
+            "UPDATE memory SET last_recalled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 days') \
+             WHERE key = 'old'",
+        )
+        .execute(&pool)
+        .await
+        .expect("recalled");
+        let public = list_public(&pool, 10).await.expect("public");
+        let keys: Vec<&str> = public.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, ["old", "new"]);
+
+        // All three are past their one day; only the private one goes.
+        assert_eq!(age_expired(&pool).await.expect("age"), 1);
+        assert!(get(&pool, "hidden").await.unwrap().is_none());
+        assert_eq!(list_public(&pool, 10).await.unwrap().len(), 2);
+        let private = list_private_of_kind(&pool, Kind::Project, 10)
+            .await
+            .expect("private");
+        assert!(private.is_empty(), "{private:?}");
+    }
+
+    #[tokio::test]
+    async fn visibility_is_switched_on_the_entry_shown_only() {
+        let pool = connect_in_memory().await.expect("connect");
+        let first = remember(&pool, fact("k", "v1", VisibilityRule::Keep))
+            .await
+            .expect("v1");
+        let before = get(&pool, "k").await.unwrap().unwrap().updated_at;
+        let (entry, was) = set_visibility(&pool, "k", Some(&first), Visibility::Public)
+            .await
+            .expect("set")
+            .expect("found");
+        assert_eq!(entry.visibility, Visibility::Public);
+        assert_eq!(was, Visibility::Private);
+        assert_eq!(entry.updated_at, before, "when it was saved stays");
+
+        // Replaced since: the switch under the old one changes nothing.
+        remember(&pool, fact("k", "v2", VisibilityRule::Keep))
+            .await
+            .expect("v2");
+        assert!(
+            set_visibility(&pool, "k", Some(&first), Visibility::Private)
+                .await
+                .expect("set")
+                .is_none()
+        );
+        assert_eq!(
+            get(&pool, "k").await.unwrap().unwrap().visibility,
+            Visibility::Public
+        );
+        let (entry, _) = set_visibility(&pool, "k", None, Visibility::Private)
+            .await
+            .expect("set")
+            .expect("found");
+        assert_eq!(entry.value, "v2");
+        assert!(
+            set_visibility(&pool, "none", None, Visibility::Public)
+                .await
+                .expect("set")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fact_made_private_again_gets_its_whole_lifetime_from_then() {
+        let pool = connect_in_memory().await.expect("connect");
+        remember(&pool, fact("k", "public long", VisibilityRule::Public))
+            .await
+            .expect("public");
+        remember(&pool, fact("p", "always private", VisibilityRule::Keep))
+            .await
+            .expect("private");
+        // Both saved long past their one day.
+        sqlx::query(
+            "UPDATE memory SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-30 days')",
+        )
+        .execute(&pool)
+        .await
+        .expect("backdate");
+        assert_eq!(age_expired(&pool).await.expect("age"), 1, "the private one");
+        set_visibility(&pool, "k", None, Visibility::Private)
+            .await
+            .expect("set")
+            .expect("found");
+        assert_eq!(age_expired(&pool).await.expect("age"), 0);
+        assert!(get(&pool, "k").await.unwrap().is_some());
+        // Its clock runs from the switch.
+        sqlx::query(
+            "UPDATE memory SET last_recalled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 days') \
+             WHERE key = 'k'",
+        )
+        .execute(&pool)
+        .await
+        .expect("later");
+        assert_eq!(age_expired(&pool).await.expect("age"), 1);
+    }
+
+    #[tokio::test]
+    async fn user_md_is_folded_into_memory_once() {
+        let pool = connect_in_memory().await.expect("connect");
+        assert!(import_pending(&pool, "USER.md").await.expect("pending"));
+        assert!(!import_pending(&pool, "SOUL.md").await.expect("pending"));
+        import_done(&pool, "USER.md").await.expect("done");
+        assert!(!import_pending(&pool, "USER.md").await.expect("pending"));
     }
 }

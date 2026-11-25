@@ -11,7 +11,8 @@
 //! agent socket as a [`havn_proto::MemoryForgetRequest`] frame —
 //! agent.db remains single-writer (spec §5.2). Requires the agent to
 //! be running; offline deletes return 409. `PUT` saves an entry the
-//! user added or edited the same way, as a data request.
+//! user added or edited the same way, as a data request, and `PUT
+//! .../visibility` makes one private or public (issue #309).
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -44,6 +45,7 @@ pub struct ListQuery {
 
 #[derive(Debug, Serialize)]
 pub struct MemoryEntryView {
+    pub id: String,
     pub key: String,
     pub value: String,
     pub kind: String,
@@ -55,11 +57,14 @@ pub struct MemoryEntryView {
     pub last_recalled_at: Option<DateTime<Utc>>,
     pub archived_at: Option<DateTime<Utc>>,
     pub supersedes_id: Option<String>,
+    pub visibility: &'static str,
+    pub suggested_public: bool,
 }
 
 impl From<memory::Entry> for MemoryEntryView {
     fn from(e: memory::Entry) -> Self {
         Self {
+            id: e.id,
             key: e.key,
             value: e.value,
             kind: e.kind.as_str().into(),
@@ -71,6 +76,8 @@ impl From<memory::Entry> for MemoryEntryView {
             last_recalled_at: e.last_recalled_at,
             archived_at: e.archived_at,
             supersedes_id: e.supersedes_id,
+            visibility: e.visibility.as_str(),
+            suggested_public: e.suggested_public,
         }
     }
 }
@@ -223,6 +230,76 @@ pub async fn undo(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct VisibilityRequest {
+    pub visibility: String,
+    /// The entry the switch was shown for (a row id); when given, nothing
+    /// changes once the key holds another.
+    #[serde(default)]
+    pub entry: Option<String>,
+}
+
+/// `PUT /agents/:id/memory/:key/visibility` — make the entry under `key`
+/// private or public (issue #309): public facts are put in the prompt of
+/// every chat, other people's and groups' included. Only the agent's owner
+/// may (`resolve_agent`; anyone else gets 404): this is the only way a
+/// fact the agent saved becomes public, and it settles the agent's
+/// suggestion either way. Answers with the entry;
+/// 409 when the key changed since (or the agent is stopped). Audited as
+/// `memory.visibility`, with the entry and who changed it.
+pub async fn set_visibility(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path((id, key)): Path<(String, String)>,
+    Json(body): Json<VisibilityRequest>,
+) -> Result<Json<MemoryEntryView>, ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let agent_id = agent.id;
+    let Some(visibility) = memory::Visibility::parse(&body.visibility) else {
+        return Err(ApiError::BadRequest(format!(
+            "visibility is private or public, not {:?}",
+            body.visibility
+        )));
+    };
+    #[derive(Deserialize)]
+    struct Set {
+        entry: Option<memory::Entry>,
+        #[serde(default)]
+        was: Option<String>,
+    }
+    let reply: Set = crate::api::agents::agent_data(
+        &state,
+        user.id,
+        agent_id,
+        havn_proto::DataQuery::SetMemoryVisibility {
+            key: key.clone(),
+            entry: body.entry.clone(),
+            visibility: visibility.as_str().into(),
+        },
+        false,
+    )
+    .await?;
+    let Some(entry) = reply.entry else {
+        return Err(ApiError::Conflict(
+            "this memory changed since; see the memory page".into(),
+        ));
+    };
+    audit::record_agent_action(
+        &state.db,
+        user.id,
+        agent_id,
+        "memory.visibility",
+        serde_json::json!({
+            "key": entry.key,
+            "entry": entry.id,
+            "visibility": visibility.as_str(),
+            "was": reply.was,
+        }),
+    )
+    .await;
+    Ok(Json(MemoryEntryView::from(entry)))
+}
+
 /// `DELETE /agents/:id/memory/:key` — soft-delete a memory row via
 /// the agent socket (spec §5.2 single-writer invariant). The runtime's
 /// `memory::forget` archives the row and suffixes the key with
@@ -295,5 +372,183 @@ pub async fn forget(
         Err(AdminRpcCallError::Rpc(RpcError::ChannelClosed)) => Err(ApiError::Conflict(
             "agent disconnected before reply arrived; retry once the agent reconnects".into(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use havn_db::repo::audit::{self, ListFilter};
+    use havn_spawner::AgentHandle;
+
+    /// An agent of `owner`'s, connected, whose runtime answers each data
+    /// request with `answer` until the test ends.
+    async fn answering_agent(
+        state: &AppState,
+        owner: havn_core::UserId,
+        answer: serde_json::Value,
+    ) -> havn_core::AgentId {
+        let agent = havn_db::repo::agents::create(
+            &state.db,
+            havn_db::repo::agents::NewAgent {
+                owner_id: owner,
+                team_id: None,
+                name: "remembers",
+                config: serde_json::json!({}),
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        state.registry.register(AgentHandle::new(agent, 1)).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        state.registry.attach(agent, tx).await.expect("attach");
+        let rpc = state.admin_rpc.clone();
+        tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                if let GatewayToAgent::DataRequest(req) = frame {
+                    rpc.resolve(
+                        agent,
+                        &req.request_id,
+                        AdminOutcome::Ok {
+                            details: answer.clone(),
+                        },
+                    )
+                    .await;
+                }
+            }
+        });
+        agent
+    }
+
+    fn entry(visibility: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "row-1",
+            "key": "user.name",
+            "value": "Mira",
+            "kind": "Identity",
+            "source": "UserTold",
+            "ttl_days": null,
+            "archived_at": null,
+            "created_at": "2026-11-24T08:00:00Z",
+            "updated_at": "2026-11-24T08:00:00Z",
+            "recall_count": 0,
+            "last_recalled_at": null,
+            "supersedes_id": null,
+            "visibility": visibility,
+        })
+    }
+
+    fn request(visibility: &str) -> Json<VisibilityRequest> {
+        Json(VisibilityRequest {
+            visibility: visibility.into(),
+            entry: Some("row-1".into()),
+        })
+    }
+
+    #[tokio::test]
+    async fn only_the_owner_switches_a_fact_and_the_switch_is_audited() {
+        let (state, owner) = crate::auth::tests::state_with(false).await;
+        let agent = answering_agent(
+            &state,
+            owner,
+            serde_json::json!({"entry": entry("public"), "was": "private"}),
+        )
+        .await;
+        let someone = havn_db::repo::users::create(
+            &state.db,
+            havn_db::repo::users::NewUser {
+                display_name: "someone",
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        let path = || Path((agent.to_string(), "user.name".to_string()));
+
+        let refused = set_visibility(
+            State(state.clone()),
+            AuthedUser {
+                id: someone,
+                display_name: "someone".into(),
+            },
+            path(),
+            request("public"),
+        )
+        .await;
+        assert!(matches!(refused, Err(ApiError::NotFound)), "{refused:?}");
+        let odd = set_visibility(
+            State(state.clone()),
+            AuthedUser {
+                id: owner,
+                display_name: "owner".into(),
+            },
+            path(),
+            request("everyone"),
+        )
+        .await;
+        assert!(matches!(odd, Err(ApiError::BadRequest(_))), "{odd:?}");
+
+        let Json(view) = set_visibility(
+            State(state.clone()),
+            AuthedUser {
+                id: owner,
+                display_name: "owner".into(),
+            },
+            path(),
+            request("public"),
+        )
+        .await
+        .expect("switched");
+        assert_eq!(view.visibility, "public");
+        assert_eq!(view.id, "row-1");
+
+        let rows = audit::list(
+            &state.db,
+            ListFilter {
+                action_prefix: Some("memory.visibility".into()),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("audit");
+        assert_eq!(rows.len(), 1, "the refused ones are not recorded");
+        assert_eq!(rows[0].user_id, owner);
+        assert_eq!(rows[0].agent_id, Some(agent));
+        assert_eq!(rows[0].details["entry"], "row-1");
+        assert_eq!(rows[0].details["key"], "user.name");
+        assert_eq!(rows[0].details["visibility"], "public");
+        assert_eq!(rows[0].details["was"], "private");
+    }
+
+    #[tokio::test]
+    async fn a_switch_for_an_entry_replaced_since_is_a_conflict() {
+        let (state, owner) = crate::auth::tests::state_with(false).await;
+        let agent = answering_agent(&state, owner, serde_json::json!({"entry": null})).await;
+        let changed = set_visibility(
+            State(state.clone()),
+            AuthedUser {
+                id: owner,
+                display_name: "owner".into(),
+            },
+            Path((agent.to_string(), "user.name".to_string())),
+            request("private"),
+        )
+        .await;
+        assert!(matches!(changed, Err(ApiError::Conflict(_))), "{changed:?}");
+        let rows = audit::list(
+            &state.db,
+            ListFilter {
+                action_prefix: Some("memory.visibility".into()),
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("audit");
+        assert!(rows.is_empty());
     }
 }

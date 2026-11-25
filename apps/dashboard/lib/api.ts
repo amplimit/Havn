@@ -121,7 +121,12 @@ export type AgentWebPatch = {
 
 export type MemoryKind = "identity" | "preference" | "project" | "event";
 
+/** Who a memory is put in front of: `private`, the owner's own private
+ * chats only; `public`, every chat, other people's and groups' too. */
+export type MemoryVisibility = "private" | "public";
+
 export type MemoryEntry = {
+  id: string;
   key: string;
   value: string;
   kind: MemoryKind;
@@ -133,6 +138,10 @@ export type MemoryEntry = {
   last_recalled_at: string | null;
   archived_at: string | null;
   supersedes_id: string | null;
+  visibility: MemoryVisibility;
+  /** The agent suggests making this private memory public; only the
+   * owner does, here. */
+  suggested_public: boolean;
 };
 
 /** A file the agent sent, kept by the gateway. */
@@ -456,8 +465,6 @@ export type BootstrapView = {
    * absent or empty. Edits take effect on the agent's next start
    * (frozen system prompt — spec §9.4). */
   system: string | null;
-  /** Durable facts about the user. null = absent. Frozen-prompt rules. */
-  user: string | null;
   /** Periodic-self-tick instructions. Re-read fresh on every tick
    * (spec §9.4 / §9.6 — the deliberate exception to the frozen-prompt
    * invariant), so edits take effect at the next heartbeat. */
@@ -1033,7 +1040,7 @@ export const api = {
   },
 
   bootstrap: {
-    /** Read SOUL.md / USER.md / HEARTBEAT.md from the agent's
+    /** Read SOUL.md / HEARTBEAT.md from the agent's
      * workspace (spec §5.3, §9.4 layer 2). Each field is `null` when
      * the file doesn't exist or is empty. (The `system` field name is
      * kept for backward compat; it maps to SOUL.md on disk.) */
@@ -1041,8 +1048,8 @@ export const api = {
       request<BootstrapView>(`/agents/${agentId}/bootstrap`),
     /** Write any non-null field. Empty string is treated as "delete
      * the file" — same semantics as the runtime ("absent or empty =
-     * skip this section"). SOUL.md and USER.md changes take effect
-     * on the agent's next start (frozen-prompt invariant);
+     * skip this section"). SOUL.md changes take effect on the
+     * agent's next start (frozen-prompt invariant);
      * HEARTBEAT.md is re-read on every tick. */
     put: (agentId: string, patch: Partial<BootstrapView>) =>
       request<BootstrapView>(`/agents/${agentId}/bootstrap`, {
@@ -1136,6 +1143,13 @@ export const api = {
       request<MemoryEntry>(`/agents/${agentId}/memory/${encodeURIComponent(key)}`, {
         method: "PUT",
         body: JSON.stringify(entry),
+      }),
+    /** Make the memory under `key` private or public; only while it is
+     * entry `entry` when given. Owner only; 409 when it changed since. */
+    setVisibility: (agentId: string, key: string, visibility: MemoryVisibility, entry?: string) =>
+      request<MemoryEntry>(`/agents/${agentId}/memory/${encodeURIComponent(key)}/visibility`, {
+        method: "PUT",
+        body: JSON.stringify({ visibility, entry: entry ?? null }),
       }),
   },
 

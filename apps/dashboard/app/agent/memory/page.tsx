@@ -11,6 +11,7 @@ import {
   type MemoryEntry,
   type MemoryExpiry,
   type MemoryKind,
+  type MemoryVisibility,
 } from "@/lib/api";
 
 const KIND_ORDER: MemoryKind[] = ["identity", "preference", "project", "event"];
@@ -69,6 +70,10 @@ function Memory({ id }: { id: string }) {
   const [query, setQuery] = useState("");
   const [kindFilter, setKindFilter] = useState<MemoryKind | "all">("all");
   const [sourceFilter, setSourceFilter] = useState<MemoryEntry["source"] | "all">("all");
+  const [visibilityFilter, setVisibilityFilter] = useState<MemoryVisibility | "suggested" | "all">(
+    "all",
+  );
+  const [pendingSwitch, setPendingSwitch] = useState<string | null>(null);
   const [editing, setEditing] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
 
@@ -148,6 +153,32 @@ function Memory({ id }: { id: string }) {
     }
   }
 
+  // Only the owner can; making one private does not take back what others
+  // already read (issue #309).
+  async function onSwitch(e: MemoryEntry) {
+    const next: MemoryVisibility = e.visibility === "public" ? "private" : "public";
+    const ask =
+      next === "public"
+        ? `Make "${e.key}" public? It is then in the agent's prompt in every chat, other people's and groups' too.`
+        : `Make "${e.key}" private? From now on it is in your own private chats only. What others already read cannot be taken back.`;
+    if (!confirm(ask)) return;
+    setPendingSwitch(e.key);
+    setForgetError(null);
+    try {
+      await api.memory.setVisibility(id, e.key, next, e.id);
+      await load();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) {
+        setForgetError("This memory changed since, or the agent is stopped; reload and try again.");
+        await load();
+      } else {
+        setForgetError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      setPendingSwitch(null);
+    }
+  }
+
   // Save an added or edited memory; the error, if any, for the form.
   // Only the form that saved closes.
   async function onSave(
@@ -174,6 +205,10 @@ function Memory({ id }: { id: string }) {
     (e) =>
       (kindFilter === "all" || e.kind === kindFilter) &&
       (sourceFilter === "all" || e.source === sourceFilter) &&
+      (visibilityFilter === "all" ||
+        (visibilityFilter === "suggested"
+          ? e.visibility === "private" && e.suggested_public
+          : e.visibility === visibilityFilter)) &&
       (!needle || e.key.toLowerCase().includes(needle) || e.value.toLowerCase().includes(needle)),
   );
   const grouped = groupByKind(shown);
@@ -200,6 +235,16 @@ function Memory({ id }: { id: string }) {
           Values are exactly what the agent sees on its next turn — no
           summary, no transformation. What you add or edit here counts as
           something you said.
+        </p>
+        <p className="mt-2 max-w-2xl text-sm" role="note" style={{ color: "var(--color-body)" }}>
+          A private memory is in the agent&apos;s prompt in your own private chats only;
+          elsewhere the agent reaches it only by searching memory, which waits for your
+          review. A public one is in its prompt in every chat, other people&apos;s and
+          groups&apos; too: your name, how to address you, your language. Everything the
+          agent saves is private; in your own private chats it may suggest that one be
+          public, and only you make it public, here. When the agent changes a public memory,
+          the new text is private again until you approve it. Making one private again stops it being shown
+          from then on; what others already read cannot be taken back.
         </p>
       </header>
 
@@ -235,6 +280,19 @@ function Memory({ id }: { id: string }) {
             <option value="all">anyone</option>
             <option value="user_told">you said</option>
             <option value="agent_inferred">inferred</option>
+          </select>
+          <select
+            className="input w-auto"
+            aria-label="visibility"
+            value={visibilityFilter}
+            onChange={(e) =>
+              setVisibilityFilter(e.target.value as MemoryVisibility | "suggested" | "all")
+            }
+          >
+            <option value="all">private and public</option>
+            <option value="private">private</option>
+            <option value="suggested">suggested public</option>
+            <option value="public">public</option>
           </select>
           <button type="button" className="btn-primary" onClick={() => setAdding(true)} disabled={adding}>
             add memory
@@ -366,6 +424,31 @@ function Memory({ id }: { id: string }) {
                         </div>
                         <div className="shrink-0 text-right text-xs">
                           <SourcePill source={e.source} />
+                          <button
+                            type="button"
+                            role="switch"
+                            aria-checked={e.visibility === "public"}
+                            aria-label={`public: ${e.key}`}
+                            onClick={() => onSwitch(e)}
+                            disabled={pendingSwitch === e.key}
+                            className="pill ml-1 disabled:opacity-40"
+                            title={
+                              e.visibility === "public"
+                                ? "Public: in the prompt of every chat, other people's and groups' too. Click to make it private."
+                                : "Private: in your own private chats only. Click to make it public, for anyone who talks to the agent."
+                            }
+                            style={
+                              e.visibility === "public"
+                                ? { background: "rgba(234, 179, 8, 0.15)", color: "var(--color-warning-text)" }
+                                : { background: "rgba(100, 116, 141, 0.1)", color: "var(--color-body)" }
+                            }
+                          >
+                            {pendingSwitch === e.key
+                              ? "switching…"
+                              : e.visibility === "private" && e.suggested_public
+                                ? "suggested public: make public"
+                                : e.visibility}
+                          </button>
                           <p
                             className="mt-1 font-mono"
                             style={{ color: "var(--color-body)" }}
@@ -409,6 +492,7 @@ function Memory({ id }: { id: string }) {
 /** How long `e` is kept, in words. */
 function lifetime(e: MemoryEntry): string {
   if (e.ttl_days === null) return "kept until forgotten";
+  if (e.visibility === "public") return "kept until forgotten while public";
   return `forgotten after ${e.ttl_days} day${e.ttl_days === 1 ? "" : "s"} unused`;
 }
 
@@ -556,7 +640,8 @@ function asMarkdown(entries: MemoryEntry[]): string {
     out += `\n## ${KIND_LABEL[kind]}\n\n`;
     for (const e of grouped[kind]) {
       const who = e.source === "user_told" ? "you said" : "inferred";
-      out += `- **${e.key}**: ${e.value.replace(/\n/g, " ")} (${who}; ${lifetime(e)})\n`;
+      const shown = e.visibility === "private" && e.suggested_public ? "private, suggested public" : e.visibility;
+      out += `- **${e.key}**: ${e.value.replace(/\n/g, " ")} (${who}; ${shown}; ${lifetime(e)})\n`;
     }
   }
   return out;
