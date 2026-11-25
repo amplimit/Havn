@@ -881,8 +881,7 @@ async fn answer(
                 ProxyError::NoCredential(_)
                 | ProxyError::Unavailable { .. }
                 | ProxyError::Upstream {
-                    status: 402 | 403,
-                    ..
+                    status: 402 | 403, ..
                 },
             ) if i + 1 < call.models.len() => {}
             Err(e) => return Err(format!("answering from {url} failed: {e}")),
