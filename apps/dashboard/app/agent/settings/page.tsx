@@ -640,8 +640,10 @@ function BootstrapEditor({ agentId }: { agentId: string }) {
         <p className="text-xs" style={{ color: "var(--color-body)" }}>
           Facts about you are in the agent&apos;s memory, each private (in your own private
           chats only) or public (in every chat, other people&apos;s and groups&apos; too: your
-          name, how to address you, your language). USER.md became a public memory and is
-          kept as USER.md.bak.{" "}
+          name, how to address you, your language). If the agent had a USER.md, it became
+          a public memory under the key USER.md, and the old file is kept in its workspace as
+          USER.md.bak, where the agent&apos;s file tools can still read it in any chat: delete it
+          if what it says should not stay there.{" "}
           <Link href={`/agent/memory?id=${agentId}`} className="underline" style={{ color: "var(--color-purple)" }}>
             see and edit them on the memory page
           </Link>

@@ -235,9 +235,10 @@ function Memory({ id }: { id: string }) {
           A private memory is in the agent&apos;s prompt in your own private chats only;
           elsewhere the agent reaches it only by searching memory, which waits for your
           review. A public one is in its prompt in every chat, other people&apos;s and
-          groups&apos; too: your name, how to address you, your language. The agent picks
-          one when it saves a memory in your own private chats, and saves every other one
-          private; switch any of them here. Making one private again stops it being shown
+          groups&apos; too: your name, how to address you, your language. The agent may save
+          a new memory public in your own private chats, before any tool other than
+          memory&apos;s has returned anything there; every other memory it saves is private,
+          and it never makes an existing one public. Switch any of them here. Making one private again stops it being shown
           from then on; what others already read cannot be taken back.
         </p>
       </header>

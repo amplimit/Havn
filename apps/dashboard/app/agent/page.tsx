@@ -2411,14 +2411,11 @@ function MemoryChangeLine({ agentId, change }: { agentId: string; change: Memory
   // another (issue #309).
   async function switchVisibility() {
     const next = visibility === "public" ? "private" : "public";
-    if (
-      next === "private" &&
-      !confirm(
-        "Make this private? From now on it is in your own private chats only. What others already read cannot be taken back.",
-      )
-    ) {
-      return;
-    }
+    const ask =
+      next === "public"
+        ? `Make "${change.key}" public? It is then in the agent's prompt in every chat, other people's and groups' too.`
+        : `Make "${change.key}" private? From now on it is in your own private chats only. What others already read cannot be taken back.`;
+    if (!confirm(ask)) return;
     setSwitching(true);
     setError(null);
     try {
@@ -2474,22 +2471,25 @@ function MemoryChangeLine({ agentId, change }: { agentId: string; change: Memory
           {state === "undoing" ? "undoing…" : "undo"}
         </button>
       )}
-      {saved && visibility && change.after && state !== "undone" && (
-        <button
-          type="button"
-          role="switch"
-          aria-checked={visibility === "public"}
-          className="underline disabled:opacity-40"
-          onClick={() => void switchVisibility()}
-          disabled={switching}
-          title={
-            visibility === "public"
-              ? "Public: in the prompt of every chat, other people's and groups' too. Make it private."
-              : "Private: in your own private chats only. Make it public, for anyone who talks to the agent."
-          }
-        >
-          {switching ? "switching…" : visibility}
-        </button>
+      {saved && change.visibility && change.after && state !== "undone" && (
+        <>
+          {/* What it was when saved; the memory page shows what it is now. */}
+          <span>(saved as {change.visibility})</span>
+          <button
+            type="button"
+            className="underline disabled:opacity-40"
+            onClick={() => void switchVisibility()}
+            disabled={switching}
+            title={
+              visibility === "public"
+                ? "Make it private: in your own private chats only."
+                : "Make it public: in the prompt of every chat, other people's and groups' too."
+            }
+          >
+            {switching ? "switching…" : visibility === "public" ? "make private" : "make public"}
+          </button>
+          {visibility !== change.visibility && <span>(now {visibility})</span>}
+        </>
       )}
       {error && (
         <span role="alert" style={{ color: "var(--color-ruby)" }}>
