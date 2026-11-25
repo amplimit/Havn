@@ -2,7 +2,7 @@
 //!
 //! Phase 1 shipped Anthropic-only. Phase 3 adds OpenAI, OpenRouter, and
 //! Gemini behind a [`provider::LlmProvider`] trait. The fallback policy
-//! (401 → disable + try next, 429/402 → try next, 5xx → try next, all
+//! (401 → disable + try next, 429/403/402 → try next, 5xx → try next, all
 //! exhausted → error) is defined once here and reused by every provider.
 //!
 //! ## Canonical shape
@@ -293,10 +293,14 @@ pub(crate) enum Attempt {
         reason: String,
         again: Option<std::time::Duration>,
         transient: bool,
+        /// The provider's status and message, when it answered (issue
+        /// #323).
+        said: Option<(u16, String)>,
     },
     /// Try next credential, and disable this one (401 unauthorized — key revoked).
     Disable {
         reason: String,
+        said: Option<(u16, String)>,
     },
     /// Hard upstream error — surface to caller, do not try other credentials.
     Fatal(ProxyError),
@@ -308,7 +312,7 @@ pub(crate) enum Attempt {
 /// - token caps leave no room for the request → try next.
 /// - 200 → settle usage, return canonical response.
 /// - 401 → disable credential, try next.
-/// - 402 / 429 → try next; do not disable (transient / quota).
+/// - 402 / 403 / 429 → try next; do not disable (quota / forbidden / transient).
 /// - 5xx / network → try next.
 /// - 4xx (other) → fatal — caller's request is malformed; do not iterate.
 #[allow(
@@ -625,8 +629,8 @@ async fn complete_through(
     let mut sent = false;
     // The last failure that passes, the calls made, and since when.
     let mut passing: Option<String> = None;
-    // An endpoint's last refusal that does not pass, with its status: said
-    // as it is, with how to add a key, rather than as no credential.
+    // The last refusal that does not pass, with its status: said as it is,
+    // an endpoint's with how to add a key, rather than as no credential.
     let mut refused: Option<(u16, String)> = None;
     let mut tries = 0_u32;
     let started = std::time::Instant::now();
@@ -721,6 +725,7 @@ async fn complete_through(
                 reason,
                 again: Some(asked),
                 transient: true,
+                ..
             } = &attempt
             {
                 let wait = backoff(again, *asked);
@@ -765,7 +770,7 @@ async fn complete_through(
                 warn_over_agent_budget(db, cred_id, billing, (&day_start, &minute_start)).await;
                 return Ok(resp);
             }
-            Attempt::Disable { reason } => {
+            Attempt::Disable { reason, said } => {
                 guard.release().await;
                 if let Some(id) = cred_id {
                     warn!(credential_id = %shown, %reason, "disabling credential");
@@ -773,17 +778,20 @@ async fn complete_through(
                         .await
                         .map_err(|e| warn!(error = %e, "failed to disable credential"));
                 }
-                refused = Some((401, reason));
+                refused = Some(said.unwrap_or((401, reason)));
             }
             Attempt::TryNext {
-                reason, transient, ..
+                reason,
+                transient,
+                said,
+                ..
             } => {
                 guard.release().await;
                 warn!(credential_id = %shown, %reason, "skipping credential, trying next");
                 if transient {
                     passing = Some(reason);
-                } else {
-                    refused = Some((402, reason));
+                } else if said.is_some() {
+                    refused = said;
                 }
             }
             Attempt::Fatal(e) => {
@@ -809,8 +817,10 @@ async fn complete_through(
             tries,
         });
     }
-    if route.keyless
-        && let Some((status, reason)) = refused
+    // The provider's last refusal, as it said it (issue #323); a key a
+    // built-in provider refused (401) was disabled, and none is left.
+    if let Some((status, message)) = refused
+        && (route.keyless || status != 401)
     {
         let hint = if status == 401 {
             format!(
@@ -823,7 +833,7 @@ async fn complete_through(
         };
         return Err(ProxyError::Upstream {
             status,
-            message: format!("{reason}{hint}"),
+            message: format!("{message}{hint}"),
         });
     }
     Err(exhausted.map_or_else(
@@ -2444,12 +2454,14 @@ async fn try_one(
                 reason: format!(
                     "could not decrypt api_key — wrong HAVN_AGE_KEY or corrupted row ({e})"
                 ),
+                said: None,
             };
         }
     };
     let Ok(api_key) = std::str::from_utf8(&plaintext) else {
         return Attempt::Disable {
             reason: "decrypted api_key bytes are not valid UTF-8 — credential is malformed".into(),
+            said: None,
         };
     };
 
@@ -4612,6 +4624,91 @@ mod tests {
                 .await
                 .expect_err("401");
             assert!(wants_a_key(&err), "{err}");
+        }
+
+        /// A server that refuses every call with `status` and `words`, and
+        /// counts them.
+        async fn refuse(status: u16, words: &'static str) -> (String, Arc<Mutex<usize>>) {
+            let status = StatusCode::from_u16(status).expect("status");
+            let calls: Arc<Mutex<usize>> = Arc::default();
+            let count = Arc::clone(&calls);
+            let app = axum::Router::new().fallback(move || {
+                let count = Arc::clone(&count);
+                async move {
+                    *count.lock().unwrap() += 1;
+                    (status, axum::Json(json!({"error": {"message": words}})))
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(async move { axum::serve(listener, app).await });
+            (format!("http://{addr}"), calls)
+        }
+
+        #[tokio::test]
+        async fn a_refusal_is_reported_as_the_provider_said_it_for_every_provider() {
+            for status in [402, 403, 429] {
+                let (base, _) = refuse(status, "the provider's own words").await;
+                let db = havn_db::connect_in_memory().await.expect("db");
+                let user = create_user(&db, NewUser { display_name: "u" })
+                    .await
+                    .expect("user")
+                    .id;
+                let mut llm = llm(&base);
+                for provider in ["anthropic", "openai", "openrouter", "gemini"] {
+                    llm.base_url
+                        .insert(provider.into(), format!("{base}/{provider}"));
+                    key(&db, user, provider).await;
+                }
+                for provider in ["ollama", "lan", "anthropic", "openai", "openrouter", "gemini"] {
+                    let err = call(&db, user, provider, &llm, &hi())
+                        .await
+                        .expect_err("refused");
+                    let told = match &err {
+                        // A rate limit, or a quota used up, may pass: tried
+                        // again, then said as unavailable, with its status.
+                        ProxyError::Unavailable { reason, .. } if status == 429 => {
+                            reason.starts_with("429: ")
+                                && reason.contains("the provider's own words")
+                        }
+                        ProxyError::Upstream { status: s, message } => {
+                            *s == status && message.contains("the provider's own words")
+                        }
+                        _ => false,
+                    };
+                    assert!(told, "{status} from {provider}: {err:?}");
+                }
+                // A key refused this way is not disabled.
+                let enabled: Vec<bool> = sqlx::query_scalar("SELECT enabled FROM credentials")
+                    .fetch_all(&db)
+                    .await
+                    .expect("credentials");
+                assert_eq!(enabled, [true; 4], "{status}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_key_forbidden_a_request_is_kept_and_the_next_is_tried() {
+            let (base, calls) = refuse(403, "not for this model").await;
+            let db = havn_db::connect_in_memory().await.expect("db");
+            let user = create_user(&db, NewUser { display_name: "u" })
+                .await
+                .expect("user")
+                .id;
+            key(&db, user, "llm:ollama").await;
+            key(&db, user, "llm:ollama").await;
+            let err = call(&db, user, "ollama", &llm(&base), &hi())
+                .await
+                .expect_err("403");
+            assert!(
+                matches!(&err, ProxyError::Upstream { status: 403, message }
+                    if message.contains("not for this model") && !message.contains("havn credential")),
+                "{err}"
+            );
+            assert_eq!(*calls.lock().unwrap(), 2, "each key is tried");
+            assert!(rows(&db).await.is_empty(), "the reservations are released");
         }
     }
 }

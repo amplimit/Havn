@@ -4053,7 +4053,31 @@ fn failure_text(detail: &str) -> (String, bool) {
             ),
             false,
         )
-    } else if d.contains("is unavailable") || d.contains("overloaded") || d.contains(" 429") {
+    } else if refused_with(&d, 402) {
+        (
+            lang().pick(
+                "its provider asks for payment: the account its API key bills is out of credit. The agent's owner can check it.",
+                "模型服务商要求付款：API 密钥所属的账户余额不足。agent 的所有者可以检查一下。",
+            ),
+            false,
+        )
+    } else if refused_with(&d, 403) {
+        (
+            lang().pick(
+                "its provider forbids it: the API key may not be allowed this model. The agent's owner can check it.",
+                "模型服务商拒绝了它：这个 API 密钥可能不能使用这个模型。agent 的所有者可以检查一下。",
+            ),
+            false,
+        )
+    } else if refused_with(&d, 429) {
+        (
+            lang().pick(
+                "its provider limits how often it is called, or its quota is used up. Try again later.",
+                "模型服务商限制了调用频率，或者额度已经用完。请稍后再试。",
+            ),
+            true,
+        )
+    } else if d.contains("is unavailable") || d.contains("overloaded") {
         (
             lang().pick(
                 "its provider is overloaded or cannot be reached right now. Try again in a minute.",
@@ -4125,6 +4149,13 @@ fn failure_text(detail: &str) -> (String, bool) {
         ),
         again,
     )
+}
+
+/// Whether failure `detail`, lowercased, is the provider's refusal with
+/// HTTP `status` (issue #323): the gateway's "upstream provider error:
+/// 402 — ...", or "unavailable (429: ...)" for one it tried again.
+fn refused_with(detail: &str, status: u16) -> bool {
+    detail.contains(&format!("error: {status} ")) || detail.contains(&format!("({status}: "))
 }
 
 /// What a person is told when their chat was compacted because it had
@@ -5318,6 +5349,17 @@ run ls"
         );
         assert!(told("internal error: the context budget is wrong").contains("agent's side"));
         assert!(told("upstream provider error: 400 — Budget 0 is invalid").contains("refused"));
+        // A provider's refusal is told as what it is (issue #323).
+        let (payment, again) = failure_text("upstream provider error: 402 — no credit left");
+        assert!(payment.contains("payment") && !again, "{payment}");
+        assert!(!payment.contains("no credit left"));
+        let (forbidden, again) =
+            failure_text("LLM error: upstream provider error: 403 — not for this model");
+        assert!(forbidden.contains("forbids") && !again, "{forbidden}");
+        let (limited, again) = failure_text(
+            "the provider \"openai\" is unavailable (429: insufficient_quota) after 4 tries",
+        );
+        assert!(limited.contains("quota") && again, "{limited}");
         assert!(
             told(
                 "the conversation is 9 bytes over the 4194304-byte limit for one LLM request, \

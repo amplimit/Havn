@@ -78,23 +78,7 @@ impl LlmProvider for GeminiProvider {
         if !status.is_success() {
             let wait = super::provider::retry_after(resp.headers());
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                401 | 403 => ProviderError::Unauthorized { body: body_text },
-                402 | 429 => ProviderError::QuotaOrRateLimit {
-                    status: status.as_u16(),
-                    body: body_text,
-                    retry_after: wait,
-                },
-                500..=599 => ProviderError::Upstream {
-                    status: status.as_u16(),
-                    body: body_text,
-                    retry_after: wait,
-                },
-                other => ProviderError::BadRequest {
-                    status: other,
-                    body: body_text,
-                },
-            });
+            return Err(status_error(status.as_u16(), body_text, wait));
         }
 
         let raw: Value = resp
@@ -136,10 +120,7 @@ impl LlmProvider for GeminiProvider {
         if !status.is_success() {
             let wait = super::provider::retry_after(resp.headers());
             let body_text = resp.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                403 => ProviderError::Unauthorized { body: body_text },
-                code => status_error(code, body_text, wait),
-            });
+            return Err(status_error(status.as_u16(), body_text, wait));
         }
         if !is_event_stream(&resp) {
             let raw: Value = resp

@@ -695,6 +695,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removing_a_credential_keeps_the_usage_made_with_it() {
+        let pool = connect_in_memory().await.expect("connect");
+        let f = fixture(&pool).await;
+        let r = reserve(&pool, reservation(&f, 10, 100, Caps::default()))
+            .await
+            .expect("reserve")
+            .expect("granted");
+        settle(
+            &pool,
+            &r.id,
+            "m",
+            Used {
+                tokens_in: 40,
+                tokens_out: 60,
+                cache_read: 0,
+                cache_write: 0,
+            },
+        )
+        .await
+        .expect("settle");
+        crate::repo::credentials::delete(&pool, f.credential_id)
+            .await
+            .expect("remove credential");
+        // The call stays, with no credential, in the history and in the
+        // agent's budget.
+        let credential: Option<String> =
+            sqlx::query_scalar("SELECT credential_id FROM credential_usages WHERE id = ?1")
+                .bind(&r.id)
+                .fetch_one(&pool)
+                .await
+                .expect("the row is kept");
+        assert_eq!(credential, None);
+        let days = usage_by_day(&pool, Some(f.user_id), DAY)
+            .await
+            .expect("days");
+        assert_eq!(
+            days.iter()
+                .map(|d| (d.calls, d.tokens_in, d.tokens_out))
+                .collect::<Vec<_>>(),
+            [(1, 40, 60)]
+        );
+        let t = totals(&pool, None, f.user_id, Some(f.agent_id), DAY, MINUTE)
+            .await
+            .expect("totals");
+        assert_eq!(t.agent_tokens, 100);
+    }
+
+    #[tokio::test]
     async fn each_cap_limits_the_grant() {
         let pool = connect_in_memory().await.expect("connect");
         let f = fixture(&pool).await;

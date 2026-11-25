@@ -876,8 +876,15 @@ async fn answer(
         .await;
         match result {
             Ok(response) => return Ok((response_text(&response.content), model.id.clone())),
-            Err(ProxyError::NoCredential(_) | ProxyError::Unavailable { .. })
-                if i + 1 < call.models.len() => {}
+            // Its provider refused every key (issue #323): another's may not.
+            Err(
+                ProxyError::NoCredential(_)
+                | ProxyError::Unavailable { .. }
+                | ProxyError::Upstream {
+                    status: 402 | 403,
+                    ..
+                },
+            ) if i + 1 < call.models.len() => {}
             Err(e) => return Err(format!("answering from {url} failed: {e}")),
         }
     }
