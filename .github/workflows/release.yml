@@ -146,10 +146,12 @@ jobs:
       - name: third-party notices
         # THIRD-PARTY-NOTICES.txt: the licences of the crates these binaries
         # are built from, by cargo-about (contrib/notices/about.toml, whose
-        # list is deny.toml's: a crate under another licence fails the
-        # build), then those of the npm packages of the dashboard
-        # havn-gateway embeds (production packages of the lockfile, checked
-        # against the same list). Offline, from the locked sources.
+        # list must be deny.toml's: a crate under another licence fails the
+        # build), with data some crates bundle; then, by notices.mjs, what
+        # is linked in from outside the crates (the Rust standard library as
+        # the toolchain lists it, musl, libunwind and compiler_rt from zig)
+        # and the npm packages of the dashboard havn-gateway embeds, checked
+        # against the same list. Offline, from the locked sources.
         env:
           CARGO_ABOUT: "0.9.3"
           CARGO_ABOUT_SHA256: 3ad1e94ea1e63d69d1961f4fb15ccbbe9575d906111f96d2cb4dce6df48f71b4
@@ -165,7 +167,9 @@ jobs:
             --target ${{ matrix.target }} \
             -c contrib/notices/about.toml -o target/notices/THIRD-PARTY-NOTICES.txt \
             contrib/notices/notices.hbs
-          ( cd apps/dashboard && node ../../contrib/notices/npm-notices.mjs ../../contrib/notices/about.toml ) \
+          zig="$(dirname "$(command -v zig)")"
+          rust="$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html"
+          ( cd apps/dashboard && node ../../contrib/notices/notices.mjs ../.. "$rust" "$zig" ) \
             >> target/notices/THIRD-PARTY-NOTICES.txt
           ls -l target/notices
 

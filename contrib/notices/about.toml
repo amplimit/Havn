@@ -1,7 +1,7 @@
 # cargo-about: the licences of the crates Havn's release binaries are built
 # from, for THIRD-PARTY-NOTICES.txt in each release tarball. `accepted` is
-# deny.toml's [licenses] allow list; keep the two the same. A crate under
-# any other licence fails the release build.
+# deny.toml's [licenses] allow list: notices.mjs fails the release build
+# when they differ. A crate under any other licence fails it too.
 accepted = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",

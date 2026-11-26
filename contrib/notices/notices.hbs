@@ -1,8 +1,9 @@
 THIRD-PARTY NOTICES
 
-Havn's binaries are built from the Rust crates below, and havn-gateway also
+Havn's binaries are built from the Rust crates below and linked with the
+Rust standard library, musl libc and LLVM's libunwind; havn-gateway also
 embeds the dashboard, built from the npm packages listed after them. Each
-licence is given once, with the packages under it.
+licence of the crates is given once, with the crates under it.
 
 =============================================================================
 Rust crates
@@ -17,3 +18,79 @@ Rust crates
 
 {{{text}}}
 {{/each}}
+
+=============================================================================
+Data bundled in crates above, under notices their licences do not carry
+=============================================================================
+
+-----------------------------------------------------------------------------
+hayro-font: glyph names from the Adobe Glyph List and the ITC Zapf Dingbats
+glyph list
+
+Copyright 1997, 1998, 2002, 2007, 2010 Adobe Systems Incorporated.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+Redistributions of source code must retain the above copyright notice, this
+list of conditions and the following disclaimer.
+
+Redistributions in binary form must reproduce the above copyright notice,
+this list of conditions and the following disclaimer in the documentation
+and/or other materials provided with the distribution.
+
+Neither the name of Adobe Systems Incorporated nor the names of its
+contributors may be used to endorse or promote products derived from this
+software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+-----------------------------------------------------------------------------
+hayro-font: further glyph names, from Apache PDFBox
+
+Apache PDFBox
+Copyright The Apache Software Foundation
+
+This product includes software developed at The Apache Software Foundation
+(http://www.apache.org/), licensed under the Apache License, Version 2.0,
+whose text is given above.
+
+-----------------------------------------------------------------------------
+hayro-font: glyph widths of the 14 standard PDF fonts, from Adobe's Core 14
+AFM files
+
+Courier: Copyright (c) 1989, 1990, 1991, 1992, 1993, 1997 Adobe Systems
+Incorporated. All Rights Reserved.
+Helvetica: Copyright (c) 1985, 1987, 1989, 1990, 1997 Adobe Systems
+Incorporated. All Rights Reserved. Helvetica is a trademark of Linotype-Hell
+AG and/or its subsidiaries.
+Times: Copyright (c) 1985, 1987, 1989, 1990, 1993, 1997 Adobe Systems
+Incorporated. All Rights Reserved. Times is a trademark of Linotype-Hell AG
+and/or its subsidiaries.
+Symbol: Copyright (c) 1985, 1987, 1989, 1990, 1997 Adobe Systems
+Incorporated. All rights reserved.
+ZapfDingbats: Copyright (c) 1985, 1987, 1988, 1989, 1997 Adobe Systems
+Incorporated. All Rights Reserved. ITC Zapf Dingbats is a registered
+trademark of International Typeface Corporation.
+
+This file and the 14 PostScript(R) AFM files it accompanies may be used,
+copied, and distributed for any purpose and without charge, with or without
+modification, provided that all copyright notices are retained; that the AFM
+files are not distributed without this file; that all modifications to this
+file or any of the AFM files are prominently noted in the modified file(s);
+and that this paragraph is not modified. Adobe Systems has no responsibility
+or obligation to support the use of the AFM files.
+
+(Havn ships the widths these files give, read into hayro-font's tables, not
+the AFM files themselves.)
