@@ -317,7 +317,7 @@ havn 是**基础设施，而不是 SaaS**。判断标准：这件事是否需要
 - 如果 Landlock 不可用（需要内核 5.13+，且 `lsm=` 列表中包含 `landlock`；`havn doctor` 会检查），Agent 不会启动。若仍要在这类内核上运行不受文件系统限制的 Agent，请以 `HAVN_ALLOW_NO_LANDLOCK=1` 启动网关
 - Agent 无法创建 user 命名空间（带 `CLONE_NEWUSER` 的 `unshare`/`clone` 会以 `EPERM` 失败；`clone3` 返回 `ENOSYS`，调用方因而回退到 `clone`），这样 user 命名空间向非特权进程开放的那部分内核代码就不在其可及范围内。工作负载需要嵌套 user 命名空间的能力包（如 Chromium 的沙箱）需要设置 `[seccomp] allow_extra = ["user_namespaces"]`
 - 工具启动的每个进程（Shell 命令，以及用于自动提交的 git）都运行在嵌套于运行时之下的 Landlock 域中，因此无法读取 MCP 服务器（它们留在运行时的域中）的环境变量或内存，也无法读取其 `/proc/<pid>/fd` 和 `cwd`。但它仍能看到这些进程的命令行（通过 `env` 而不是 `args` 向 MCP 服务器传递密钥，最好写成 `secret:<name>`；参见[工具密钥](#secrets-for-tools)），并且可以读写任一 MCP 服务器 `extra_paths_rw`/`extra_paths_ro` 下的文件——Agent 的每个进程都能使用这些路径。MCP 服务器代表 Agent 运行的代码（例如运行 Agent 仓库中钩子的 git 服务器、执行命令的服务器）留在运行时的域中，因此不要把这类服务器与持有密钥的服务器同时分配给同一个 Agent。每次工具调用都有独立的域：命令无法读取先前调用遗留运行的进程的上述 `/proc` 条目，不过 `ps`、`kill` 和 `pkill` 仍然可用
-- Agent 的网络访问有三种设置（`network_policy.egress_allowed` 和 `egress_proxy`，位于 Agent 设置页）：关闭；仅允许的域名，经由网关的出站代理；或所有公网地址。走代理时，Agent 的命名空间没有越过网关主机的路由，发往非本主机地址的流量一律丢弃，其工具会获得指向 `http://<其链路的主机地址>:<[network] egress_proxy_port>`（913）的 `HTTP_PROXY`/`HTTPS_PROXY`。网关在启动 Agent 前绑定该端口，绑定失败则不会启动；过滤入站流量的主机防火墙（ufw、firewalld）必须允许 Agent 地址池访问它。代理会隧道转发 HTTPS（`CONNECT`，端口 443），并将普通 HTTP（端口 80，仅支持带 `Content-Length` 的请求体）转发到允许域名的公网地址；被阻止的域名会被拒绝；对于既不在允许列表也不在阻止列表中的域名，会在 Dashboard 聊天中询问所有者：允许 10 分钟、始终允许（加入 Agent 的允许域名）或拒绝。拒绝的结果保持 10 分钟，且一个 Agent 每分钟最多发起 5 个新询问。常见软件包源（PyPI、npm、crates.io、Go proxy、GitHub、Debian 和 Ubuntu 软件源）的列出主机会合并在一起询问，并注明来源名称。无人回答的询问在 5 分钟后被拒绝；所有回答以 `egress.domain` 记入审计。代理检查的是工具请求的主机名，而不是 TLS 隧道中实际承载的内容：按内部 `Host` 路由请求的服务（共享 CDN 上的域前置）可以访问其背后的其他站点，因此只允许那些你愿意放行其背后一切的域名。今后新建的 Agent 默认采用 `[network] default_egress`（除非设为 `off` 或 `all`，否则为 `allowlist`），除非其配置另有指定；已有 Agent 保持原设置，修改在 Agent 下次启动时生效。走代理时，不遵循代理变量的工具（例如 Node 内置的 `fetch`）或使用其他协议的工具（基于 SSH 的 git）没有网络。
+- Agent 的网络访问有三种设置（`network_policy.egress_allowed` 和 `egress_proxy`，位于 Agent 设置页）：关闭；仅允许的域名，经由网关的出站代理；或所有公网地址。走代理时，Agent 的命名空间没有越过网关主机的路由，发往非本主机地址的流量一律丢弃，其工具会获得指向 `http://<其链路的主机地址>:<[network] egress_proxy_port>`（913）的 `HTTP_PROXY`/`HTTPS_PROXY`。网关在启动 Agent 前绑定该端口，绑定失败则不会启动；过滤入站流量的主机防火墙（ufw、firewalld）必须允许 Agent 地址池访问它。代理会隧道转发 HTTPS（`CONNECT`，端口 443），并将普通 HTTP（端口 80，仅支持带 `Content-Length` 的请求体）转发到允许域名的公网地址；被阻止的域名会被拒绝；对于既不在允许列表也不在阻止列表中的域名，会在 Dashboard 聊天中询问所有者：允许 10 分钟、始终允许（加入 Agent 的允许域名）或拒绝。拒绝的结果保持 10 分钟，且一个 Agent 每分钟最多发起 5 个新询问。常见软件包源（PyPI、npm、crates.io、Go proxy、GitHub、Debian 和 Ubuntu 软件源）的列出主机会合并在一起询问，并注明来源名称。无人回答的询问在 5 分钟后被拒绝；所有回答以 `egress.domain` 记入审计。代理检查的是工具请求的主机名，而不是 TLS 隧道中实际承载的内容：按内部 `Host` 路由请求的服务（共享 CDN 上的域前置）可以访问其背后的其他站点，因此只允许那些你愿意放行其背后一切的域名。今后新建的 Agent 默认采用 `[network] default_egress`（除非设为 `off` 或 `all`，否则为 `allowlist`），除非其配置另有指定；已有 Agent 保持原设置，修改在 Agent 下次启动时生效。走代理时，不遵循代理变量的工具（例如 Node 内置的 `fetch`）或使用其他协议的工具（基于 SSH 的 git）没有网络。运行时自身与远程 MCP 服务器的连接同样经由代理（参见[远程服务器](#remote-servers)）。远程服务器的 OAuth 则不经由代理：为了连接和刷新，网关自己向该服务器及其授权服务器发送 https 请求，只发往公网地址，且只针对 Agent 网络可达的服务器。启用 `trust_header` 时，除非运维者设置 `[mcp] remote = "on"`，否则远程服务器处于关闭状态，因为每个成员都能选择这些主机。
 - 有出站网络的 Agent 只能访问公网：发往网关主机（包括 Docker 发布的端口）、其他 Agent、私有地址、链路本地地址（包括云元数据服务）、CGNAT 和保留地址的流量，会在 `mangle PREROUTING` 中先于任何其他防火墙规则被丢弃，且 Agent 链路的主机端没有 IPv6。配置的 `agent_dns` 服务器仍可通过 53 端口访问，即使它们运行在网关主机上；Agent 可以访问的其他内网地址请列在 `[network] agent_private_access = ["10.0.5.20", "192.168.1.0/24"]` 中。如果这些规则无法安装（没有 `iptables`），Agent 将完全没有网络。`firewall-cmd --reload` 或类似的清空操作会移除这些规则；此后启动的 Agent 在网关重启前都没有网络。将 53 端口重定向到本地解析器的全局规则也会破坏 Agent 的 DNS，因为重定向后的目标已不再是 `agent_dns` 服务器
 - 即使对没有出站网络的 Agent，搜索查询也会离开主机：`web_search` 会将其发送到搜索后端，因此 Agent 可能把工作区中的数据放进查询里。对数据不得外泄的 Agent，请关闭 `can_search_web`
 - `web_fetch` 请求同样会离开主机。Agent 只能读取用户发给它的 URL、搜索结果和已读页面上的链接，或其允许域名下的地址，因此无法把工作区数据塞进自己编造的 URL。但被访问的页面仍能看到请求，恶意页面也能诱导 Agent：一个提供大量链接页面的站点，可以通过 Agent 每次选择哪个链接，在每用户速率限制之内逐步套取其数据。只允许那些你信任不会回显 URL 或任意重定向的域名。对完全不应访问网络的 Agent，请关闭 `can_fetch_web`。没有出站网络时，沙箱本身仍然没有网络：`web_fetch` 不是 Shell 命令下载文件的途径
@@ -336,7 +336,7 @@ Agent 能做什么由一份 JSON 策略（`havn_core::Policy`）决定。其顶�
 - `allowed_models`：Agent 可使用的 `provider:model` id，或用 `*` 表示 `[[llm.models]]` 中的任意模型（`["*"]`）；参见[配置](#configuration)。
 - `resource_limits`：Agent 的 cgroup 限制，`memory_mb`（512）、`cpu_cores`（1.0）和 `pids_max`（64）。
 - `budget`：`max_tokens_per_day`（0，不设上限）和 `on_exhaust`（`warn_only`、`warn_and_pause` 或 `fail`；默认 `warn_and_pause`）；参见[安全模型](#security-model)。
-- `permissions`：工具和功能开关：`can_use_shell`、`can_access_network`、`can_install_skills`、`can_schedule_cron`、`can_search_web` 和 `can_fetch_web`（默认开），`can_use_mcp`、`can_spawn_subagents` 和 `can_query_other_agents`（默认关）。`can_view_own_logs`、`can_export_memory` 和 `can_bind_channels` 属于 schema 的一部分，但 Havn 中没有任何地方检查它们。
+- `permissions`：工具和功能开关：`can_use_shell`、`can_access_network`、`can_install_skills`、`can_schedule_cron`、`can_search_web`、`can_fetch_web` 和 `can_transcribe`（默认开），`can_use_mcp`、`can_spawn_subagents` 和 `can_query_other_agents`（默认关）。`can_view_own_logs`、`can_export_memory` 和 `can_bind_channels` 属于 schema 的一部分，但 Havn 中没有任何地方检查它们。
 - `network_policy`：`egress_allowed`、`egress_proxy`、`allowed_domains` 和 `blocked_domains`；参见[安全模型](#security-model)和[读取网页](#reading-web-pages)。
 - `context_toolsets`：在某个上下文中关闭的工具名，形如 `{"cron": {"disabled": ["shell"]}}`。上下文包括 `webchat`（来自 Dashboard 或聊天应用的消息）、`heartbeat`、`cron`、`subagent` 和 `agent_query`。
 - `admin_visibility`：`can_view_audit_log` 允许持有该角色的团队管理员读取团队审计日志；`can_view_agent_status`、`can_view_agent_config` 和 `can_view_conversations` 属于 schema 的一部分，但 Havn 中没有任何地方检查它们。
@@ -394,7 +394,7 @@ Agent 设置页维护一个每次调用都需要审批的工具列表（`GET` �
 <a id="mcp-servers"></a>
 ## MCP 服务器
 
-Agent 可以使用运维者安装的 MCP（Model Context Protocol）服务器提供的工具。服务器是宿主机上 `/usr/share/havn/mcp-servers/` 中的二进制文件，Agent 通过其 `/usr` 以只读方式看到它们；Agent 和用户都无法自行添加。只有开启 `policy.permissions.can_use_mcp`（默认关闭）时，Agent 才会运行服务器，并且只运行 `policy.mcp_servers` 中以运维者自定名称列出的服务器：
+Agent 可以使用 MCP（Model Context Protocol）服务器提供的工具：运维者安装的二进制文件（在 Agent 的沙箱中运行），以及位于某个 URL 的远程服务器（参见[远程服务器](#remote-servers)）。本地服务器是宿主机上 `/usr/share/havn/mcp-servers/` 中的二进制文件，Agent 通过其 `/usr` 以只读方式看到它们；Agent 和用户都无法自行添加。只有开启 `policy.permissions.can_use_mcp`（默认关闭）时，Agent 才会运行服务器，并且只运行 `policy.mcp_servers` 中以运维者自定名称列出的服务器：
 
 ```json
 "permissions": { "can_use_mcp": true },
@@ -419,7 +419,54 @@ Agent 可以使用运维者安装的 MCP（Model Context Protocol）服务器提
 
 运行时在 Agent 启动时、其 Landlock 和 seccomp 规则就位后，启动每个已启用的服务器，作为通过 stdin 和 stdout 使用 MCP 通信的子进程；除非 `env` 另行设置，其 `HOME=/nonexistent`，并在 Agent 网络经由出站代理时设置代理变量。运行时列出服务器的工具，并以 `mcp__<server>__<tool>` 注册每一个，附带服务器提供的描述和输入 schema；子 Agent 也会获得这些工具。只使用工具，不使用资源或提示词，且只使用结果中的文本：其中的图片、音频和资源会变成一行占位文字。启动失败或无法列出工具的服务器会被跳过，并在 Agent 日志中记录警告，Agent 照常启动；服务器写到 stderr 的内容也会进入该日志，其中 Agent 的密钥会被替换掉。钩子规则可以用前缀指代某个服务器的工具，例如 `mcp__github__*`（参见[工具钩子](#tool-hooks)）。
 
-Agent 的设置页有一个 **MCP servers** 区域：`can_use_mcp`、带开关和删除按钮的服务器列表，以及添加服务器的表单（名称、从已安装中选择的二进制文件、以空格分隔的参数、读写和只读路径）。`env` 和 `timeout_seconds` 需通过 API 设置：`GET /agents/{id}/mcp` 返回 `can_use_mcp`、`servers` 和 `available_binaries`，`PATCH /agents/{id}/mcp` 接受 `can_use_mcp` 和 `servers`，后者整体替换 Agent 的服务器列表。两者都写入 Agent 的策略覆盖配置，每次修改都以 `agent.mcp.updated` 记入审计。修改在 Agent 下次启动时生效。在多用户模式下，Agent 只运行其所有者角色中以相同名称列出的服务器，并使用角色中的设置，因此团队管理员通过角色的 `mcp_servers` 授予服务器（参见[策略](#policy)）。
+<a id="remote-servers"></a>
+### 远程服务器
+
+以 `url` 代替 `binary` 的服务器是远程服务器：运行时通过 [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#streamable-http) 或较旧的 HTTP+SSE 传输连接它，并像使用本地服务器一样使用其工具：
+
+```json
+"mcp_servers": {
+  "notion": {
+    "url": "https://mcp.notion.com/mcp",
+    "auth": { "type": "oauth" }
+  },
+  "linear": {
+    "url": "https://mcp.linear.app/sse",
+    "transport": "sse",
+    "headers": { "X-Workspace": "core" },
+    "auth": { "type": "bearer", "token": "secret:linear" }
+  }
+}
+```
+
+- `url` 为 `http` 或 `https`，不含用户名、密码或 `#fragment`。远程服务器不接受 `binary`、`args`、`env` 或路径；`timeout_seconds` 和 `enabled` 与本地服务器相同。
+- `transport` 为 `auto`（默认：先用 Streamable HTTP，失败时改用 HTTP+SSE，这正是 MCP 的向后兼容机制要求客户端采取的做法）、`streamable_http` 或 `sse`。使用 HTTP+SSE 时，服务器的 `endpoint` 事件为消息指定的地址必须与该 URL 同源；重定向也是如此，且最多跟随 5 次。
+- `headers` 随每个请求发送，最多 32 个。值为 `secret:<name>` 的就是 Agent 名为该名称的密钥。`Authorization`、`Accept`、`Content-Type`、`Host`、连接相关的请求头，以及以 `Mcp-` 或 `Proxy-` 开头的请求头由 Havn 管理。
+- `auth` 为 `{"type": "none"}`（默认）、`{"type": "bearer", "token": "..."}`（以 `Authorization: Bearer <token>` 发送），或 `{"type": "oauth"}`（见下文）。令牌、请求头的值和客户端密钥最好写成 `secret:<name>`：直接以文本填写的值会原样保存在 Agent 的设置中，其设置页面和 API 都会显示它；当某个值看起来像密钥时，Dashboard 会给出警告。使用普通 `http` 时，它们以未加密的形式在网络上传输，Dashboard 同样会提示。
+- `headers` 和 `auth` 中的引用在 Agent 启动时解析，与 `env` 相同，并且只对 Agent 自身设置中按其实际运行方式定义的服务器（相同的 URL、传输方式、请求头和 `auth`）解析：由所有者角色提供的服务器，或者在角色中的设置与 Agent 自身设置不同的服务器，既拿不到所有者的密钥，也拿不到其 OAuth 令牌，且不会启动。团队管理员无法让所有者的令牌发往其他 URL：那需要所有者的条目也随之改成一致。
+
+运行时在 Agent 启动时连接，与其他请求一样经由 Agent 的网络访问：出站经由网关的出站代理时，若服务器主机在 Agent 的允许域名中，代理放行；若被阻止，则拒绝；否则在聊天中询问所有者（设置页面会提供允许该主机的选项）；代理只隧道转发 443 端口，并且只转发 80 端口上的普通 http。出站允许所有公网地址时，主机仍不得被阻止；没有网络访问的 Agent 无法使用远程服务器。主机被拒绝或询问无人回答时，该服务器会被跳过，与启动失败的服务器一样。远程服务器在 Agent 启动时同时连接，每个限时 90 秒。运行超过 `timeout_seconds` 的工具调用会在服务器端被取消（`notifications/cancelled`）。
+
+**OAuth。** 对于设置了 `"auth": {"type": "oauth"}` 的服务器（其 URL 为 `https`），所有者在 Agent 的设置页面上点击 **connect**。网关按 MCP 规范发现服务器的授权服务器（先是服务器的 `WWW-Authenticate` 质询和受保护资源元数据，然后是授权服务器的元数据），在授权服务器提供动态注册时把自己注册为客户端，并将浏览器引导去授权，附带 PKCE 质询、一次性的 `state`，并以该服务器作为令牌的 `resource`。提供方把浏览器送回打开 Dashboard 时所在源上的 `/api/mcp/oauth/callback`（网关自身的源、`allowed_origins` 之一，或在未启用 `trust_header` 时的某个回环源）；网关在那里检查该 `state` 是否属于同一用户在过去 10 分钟内发起的连接，用 PKCE verifier 交换授权码，并保存令牌，连同授权服务器的元数据和客户端信息（若注册时给了客户端密钥，也一并保存），与 Agent 密钥一样用 `HAVN_AGE_KEY` 加密，并绑定到签发令牌时的服务器 URL。对于不支持动态注册的授权服务器，请设置在那里注册、并以该回调作为重定向 URL 的应用的 `client_id`（以及 `client_secret`，最好写成 `secret:<name>`，它在每次使用时解析，不与令牌一起保存）；`scopes` 设置请求的 scope，未设置时使用服务器指定的 scope。每个用户同时最多有 8 个等待中的连接。
+
+网关自己发出这些请求，不经过 Agent 的出站代理，且只针对 Agent 自身设置中按实际运行方式定义、主机为 Agent 网络可达且未被阻止的服务器：只通过 https 发往公网地址，每个响应最多 1 MB，每个请求最多 30 秒。授权服务器元数据中列出的每个端点（authorization、token、registration、revocation）都必须是公网地址上的 https，并且 authorization 端点自身不得携带 `state`；否则连接会被拒绝，因此元数据无法把浏览器引向 https 页面以外的任何地方。暂不支持位于私有网络上的授权服务器（例如位于 10.x 地址的公司单点登录）；这类服务器仍可使用 bearer 令牌或请求头，只需将其地址加入 `[network] agent_private_access`，并让 Agent 的出站允许所有地址。
+
+运行时只获得访问令牌，且仅用于该 URL 上的该服务器；它会像密钥一样从工具输出和日志中被替换掉（替换为 `[secret:mcp:<server>]`，当前令牌和上一个令牌都会替换）。Agent 运行期间，网关会在令牌到期前 5 分钟刷新它，若令牌有效期的一半更短，则在一半时刷新（最多同时为 8 个 Agent 刷新，每次失败后等待更久，最长一小时）；Agent 启动时也会刷新（最多等待 10 秒，以免缓慢的提供方拖住启动；届时未完成的刷新会继续进行）。刷新前的发现过程限时 30 秒，超时后使用连接时保存的元数据；令牌请求不会被中断，因此轮换后的刷新令牌绝不会丢失，期间被重新连接或断开的授权也不会被覆盖；刷新后，网关把新令牌发给运行时，下一个请求即使用它。只有 Agent 会用到的令牌才会被刷新：属于其自身的服务器、位于签发时的 URL、被运维者允许、主机为其网络可达。提供方拒绝刷新时，令牌会被丢弃，设置页面会提示重新连接；提供方没有给出刷新令牌时，令牌一直使用到过期。从 Agent 设置中移除的服务器，或其 URL、授权方式或客户端发生变化的服务器，会失去其令牌。**disconnect** 会丢弃令牌，并在授权服务器列出了 revocation 端点时，在后台到那里撤销刷新令牌（RFC 7009）；否则请到提供方处撤销授权。删除 Agent 会删除这些令牌。连接和断开以 `agent.mcp.oauth.connected` 和 `agent.mcp.oauth.disconnected` 记入审计。已连接的服务器从 Agent 下次启动时开始使用。
+
+**运维者的控制。** config.toml 中的 `[mcp]`，重启后生效：
+
+```toml
+[mcp]
+remote = "on"                                   # "off"：任何 Agent 都不使用远程服务器
+remote_hosts = ["mcp.notion.com", "linear.app"] # 非空时，仅允许这些主机及其子域名
+```
+
+未设置时，单用户网关上 `remote` 为 `on`，启用 `trust_header` 时为 `off`：在后一种情况下，每个成员都可能让网关自己在出站代理之外，向其选择的公网主机发送 https 请求（OAuth 发现、注册、令牌），因此由运维者开启远程服务器，最好同时设置 `remote_hosts`。开启后，除非 `remote_hosts` 列出了部分主机，否则任何主机都被允许，但仍受每个 Agent 的网络策略约束，而让 Agent 无法访问某个主机的正是网络策略：以默认 `[network] default_egress` 创建的 Agent 会就每个新域名询问其所有者。运维者不允许的远程服务器会被排除在每个 Agent 的策略之外，无论由谁设置，也无法添加到 Agent 的 MCP 设置中或在那里修改；已存在的条目保持原样，但不会运行。在多用户模式下，Agent 的服务器还仅限于其所有者角色所列出的那些（如上所述），因此由团队管理员决定成员可以使用哪些远程服务器。
+
+<a id="settings-page"></a>
+### 设置页面
+
+Agent 的设置页有一个 **MCP servers** 区域：`can_use_mcp`、带开关、编辑和删除按钮的服务器列表，以及添加服务器的表单：本地服务器（名称、从已安装中选择的二进制文件、以空格分隔的参数、读写和只读路径），或远程服务器（名称、URL、传输方式、请求头、bearer 令牌或 OAuth，以及可选的 client id、client secret 和 scope）。Agent 运行时，每个服务器会显示它是否已启动、它的工具，以及未能启动的原因或此后发生的错误；远程服务器还会显示 Agent 的网络能否访问其主机，OAuth 服务器则显示是否已连接，并提供 **connect** 和 **disconnect**。本地服务器的 `env` 需通过 API 设置：`GET /agents/{id}/mcp` 返回 `can_use_mcp`、`servers`、`available_binaries`、运维者允许的内容（`remote`）、各服务器的启动情况（`status`）、每个已连接服务器的 OAuth 状态（`oauth`：其 URL、连接时间、令牌到期时间，以及失败的刷新）、未按设置运行的服务器及其原因（`refused`），以及 Agent 能否访问每个远程主机（`reach`）；`PATCH /agents/{id}/mcp` 接受 `can_use_mcp` 和 `servers`，后者整体替换 Agent 的服务器列表。`POST /agents/{id}/mcp/{server}/oauth` 开始连接（它返回要将浏览器引向的 `authorization_url`，并且需要请求带有 `Origin`），对同一路径发送 `DELETE` 则断开连接。修改写入 Agent 的策略覆盖配置，每次修改都以 `agent.mcp.updated` 记入审计。修改在 Agent 下次启动时生效。在多用户模式下，Agent 只运行其所有者角色中以相同名称列出的服务器，并使用角色中的设置，因此团队管理员通过角色的 `mcp_servers` 授予服务器（参见[策略](#policy)）。
 
 <a id="secrets-for-tools"></a>
 ## 工具密钥
@@ -427,7 +474,7 @@ Agent 的设置页有一个 **MCP servers** 区域：`can_use_mcp`、带开关�
 Agent 的工具可以获得令牌和密钥，而无需把它们放进聊天或文件中。由 Agent 的所有者在其设置页面（**Secrets**）中设置，且只有所有者可以：其他人都看不到也改不了，团队管理员也不例外；角色提供的 MCP 服务器也拿不到（见下文）。密钥有一个名称（1 到 64 个字母、数字、`_`、`-` 和 `.`）和一个值（最多 16 KB，不含 NUL；值两端的空格和换行会被去掉，因此使用的值与被替换的值一致）；一个 Agent 的密钥合计最多 512 KB，按传给其运行时时的大小计算，即按 JSON 转义后计。值保存在网关的数据库中，与凭据一样用 `HAVN_AGE_KEY` 加密，因此没有该密钥的网关无法设置它们，已设置密钥的网关没有该密钥则无法启动；Agent 被删除时密钥随之删除，在备份中保持加密。任何页面或 API 响应都不会再显示值，审计日志以 `secret.set` 和 `secret.removed` 记录，只含名称。
 
 - **Shell 命令**获得 Agent 的 **shell environment**，在同一区域中编辑（每行一个 `NAME=value`，也就是 `config.shell_env`，最多 64 个变量）。值为 `secret:<name>` 的就是该密钥；其密钥尚未设置的变量会被省略。`HOME`、`XDG_CACHE_HOME` 和代理变量由 Havn 管理，不能设置。设置密钥时也可以同时给它一个变量（例如 `github` 对应 `GH_TOKEN`）。改动在正在运行的 Agent 的下一条命令时生效。
-- **MCP 服务器**在其 `env` 中用 `secret:<name>` 引用密钥（参见[MCP 服务器](#mcp-servers)）。服务器在启动时获得值，因此修改或删除的密钥要到 Agent 下次启动时才对它生效。只有 Agent 自己的 MCP 设置中按实际运行方式定义的服务器才能获得密钥：按所有者角色的设置运行的服务器（由团队管理员编写，可能把值发往任何地方），如果其 `env` 引用了密钥则不会启动，**Secrets** 区域会列出它。
+- **MCP 服务器**在其 `env` 中用 `secret:<name>` 引用密钥，远程服务器还可以在其请求头和 bearer 令牌中引用（参见[MCP 服务器](#mcp-servers)）。服务器在启动时获得值，因此修改或删除的密钥要到 Agent 下次启动时才对它生效。只有 Agent 自己的 MCP 设置中按实际运行方式定义的服务器才能获得密钥：按所有者角色的设置运行的服务器（由团队管理员编写，可能把值发往任何地方），如果引用了密钥或使用 OAuth，则不会启动，**Secrets** 区域会列出它。远程服务器的 OAuth 令牌以同样的方式保存：加密存储、从不显示，也不列在密钥之中（参见[远程服务器](#remote-servers)）。
 - **渠道适配器**仍然用 `secret:<provider>:<name>`（如 `secret:channel:telegram:bot`）指定其令牌对应的凭据，由同一段代码解析。适配器属于网关而非某个 Agent，因此在适配器中使用 `secret:<name>` 会被拒绝。
 - **申请密钥。** 允许运行 shell 命令或 MCP 服务器的 Agent 拥有 `secret_request` 工具：它给出名称、需要的理由，以及可选的希望使用的变量名。申请会列在设置页面上，附带理由，以及 Agent 申请时正在回复谁：所有者（在其网页聊天、聊天应用或群聊中）、其他人（其聊天应用上的发送者 id，以及关联到的 Havn 用户名）、Webhook 或定时任务。正在回复所有者并不意味着是所有者提出的：Agent 在那一轮读到的内容（网页、文件、工具输出）也可能引导它申请。所有者在页面上填写值或驳回申请；值不会经过任何聊天，也不会经过 Agent 的模型。Agent 申请的变量只有在所有者勾选后才会设置。任何能与 Agent 对话的人，或它读到的内容，都可能引导它申请，因此页面提示只为你预期中的申请填写值。对仍在等待的密钥再次申请，会保留第一次的理由和变量，只计数重复次数。同时最多有 20 个申请在等待；每个申请只审计一次，记为 `secret.requested`，附带申请者。
 - **替换。** Agent 每个密钥的值在所有工具的输出中（shell、后台进程、文件、MCP 服务器、网关工具）都会被替换为 `[secret:<name>]`，然后才交给模型、审核调用的所有者或聊天；Dashboard 显示的步骤中、运行时日志中（包括 MCP 服务器的 stderr）也是如此。匹配时既按原样，也按日志字段和 JSON 的转义形式（`\n`、`\"`、`\\`），因此跨多行的密钥也会被替换；相互重叠的值会一起替换。被替换或删除的值在 Agent 的运行时重启之前仍会被替换。分段读取的输出（运行中读取的后台进程，或被截成首尾两部分的输出）不会以某个值的开头结束一段：要么等待其余部分，要么在截断处略去。短于 8 个字符的值不会被替换：替换工具输出中每一个 `1234` 造成的破坏会大于它所隐藏的。经过编码（base64、URL 转义）的值能绕过替换。
@@ -530,6 +577,8 @@ thinking = { style = "effort", levels = ["low", "medium", "high"], default = "me
 
 聊天中发送的图片（Agent 收件箱中的 PNG、JPEG、GIF、WebP 或 HEIC）会根据当前轮次模型的 `vision` 设置展示给模型。超过 3.75 MB 或单边超过 8000 像素的图片，以及 HEIC 照片，会以网关在收到时生成的副本展示：单边最多 2048 像素，按照片方向旋转，sRGB，JPEG 格式（透明图片则为 PNG），与原图一起保存为 `.<file>.shown`。原图保留在收件箱中供 Agent 的工具使用。无法生成副本时（文件损坏、超过 6700 万像素、非 HEVC 编码的 HEIC、AVIF），模型会收到一行说明图片未展示。`vision = true` 时始终展示，`vision = false` 时从不展示：模型会收到一行说明它看不到该图片，Agent 会如实告知用户。未设置时则会尝试展示。当提供方直接拒绝包含图片的请求（4xx，但不包括认证、付费或限流类拒绝）时，请求会以说明文字替代每张图片再发送一次；若仍被拒绝，Agent 收到第一次的拒绝结果。若第二次请求成功，且拒绝信息表明该模型不接受图片（如 OpenRouter 返回 404 "No endpoints found that support image input"，或 OpenAI 返回 "image_url is only supported by certain models"），则此后该模型直接收到说明文字，直到其条目变更或网关重启，网关还会记录一条警告，建议设置 `vision = false`。其他原因的拒绝（图片损坏、上下文过长）不会被记住。可用 `havn model add <id> --vision` 或 `--no-vision`，或在模型页面设置。
 
+聊天中发送的文档（PDF、Word `.docx`、电子表格 `.xlsx`、`.xlsm`、`.xls` 和 `.ods`、演示文稿 `.pptx`、`.pptm` 和 `.ppsx`）会把其文本保存在旁边，即 `<file>.txt`，Agent 会连同消息一起收到它。演示文稿的文本按幻灯片放映顺序逐张给出：每张幻灯片的编号和标题（以及是否隐藏）、其文本框和项目符号、表格和图片描述，然后是演讲者备注；日期、页脚和幻灯片编号会被略去。PDF 的文本逐页读取。其中几乎没有可读文本的页面（除空格外少于 32 个字符：扫描页、图片页，或使用文本读取器无法映射的字体的文本）会被绘制为图片，最多 20 张，单边最多 1600 像素，按页码保存在旁边，即 `.<file>.page-<n>.jpg`；几乎全白的页面（空白背面、分隔页：每 10,000 个像素中有墨迹的少于 5 个）不保存图片，也不计入其中，Agent 收到的说明行会注明这类页面有多少。说明行会列出每张图片的名称，供 Agent 用 `view_image` 查看（模型需具备 `vision`），并说明其中有多少页文本很少：当所有页面都没有文本时，会说明它很可能是扫描件。已读出的文本与其他 PDF 一样保存。页面在另一个转换子进程中绘制（参见“读取网页”），且仅针对含有此类页面的 PDF，使用 [hayro](https://github.com/LaurenzV/hayro)（一个用 Rust 编写的 PDF 渲染器）：每页生成后立即传出，因此在子进程超时之前生成的页面都会保留（10 秒后，或会使图片超过 24 MB 时，它不再开始新的页面），并且只从中取所请求的页面。页面无法绘制时，Agent 会被告知。文本无法读取的 PDF 从第一页开始绘制。完全无法读取的文档，会告知 Agent 它已加密、已损坏（读取器处理失败），或过大、过慢而无法读取（读取器被某项限制终止）。Agent 自己的文件不会被转换：`file_read` 只读取文本文件。
+
 从没有模型列表的旧版网关升级后首次启动时，Agent 和策略中的模型名会被改写为 `provider:model`，provider 按旧版网关从名称推断的方式确定；若 `config.toml` 中还没有 `[llm] models`，现有 Agent 使用的模型会被加入其中（若存在未指定模型的 Agent，则以旧版网关为其分配的 `anthropic:claude-opus-4-6` 打头）。全新安装或没有 Agent 的升级安装以空列表启动：首次聊天前请用 `havn model add` 添加模型。
 
 无论 Agent 请求多少，每次 LLM 调用的 `max_tokens` 都受 `[llm] max_tokens_ceiling` 限制（默认 128000，即已知模型中最大的输出上限；在 `havn gateway restart` 时生效）。进行中的调用会在其计费的各上限中预留至多这么多输出 token，因此在共享凭据设置了较小上限时，请调低该值，以免某个用户的大 `max_tokens` 占用其他所有人的剩余预算：
@@ -590,7 +639,7 @@ brave = "https://search-proxy.internal.example"
 Agent 还可使用由网关代为执行的 `web_fetch` 工具：Agent 提供 URL 和想了解的内容，网关读取页面并通过一次模型调用基于页面作答，Agent 得到的是答案而非页面本身。没有网络出口的 Agent 也能使用，长页面也只占用 Agent 上下文中答案的篇幅。
 
 - 网关会把 `http` 升级为 `https`，拒绝包含用户名或密码的 URL，并只连接公网地址（在 DNS 解析后及每次重定向时检查，范围与 Agent 防火墙相同，另加网关主机自身的地址）。同一主机内的重定向会被跟随；跳转到其他主机的重定向会返回给 Agent，由它再发起一次调用读取。
-- HTML 转换为 Markdown 并将链接改为绝对地址，PDF 转换为文本，文本和 JSON 按原样读取；GBK 等旧字符集会被解码。页面最多读取 10 MB，答案每次覆盖页面的 100,000 个字符；结果会告知 Agent 继续读取的偏移量。转换后的页面按 Agent 缓存 15 分钟。
+- HTML 转换为 Markdown 并将链接改为绝对地址，PDF 转换为文本，Word 文档、电子表格和演示文稿（连同演讲者备注）按与在聊天中发送时相同的方式转换为 Markdown，文本和 JSON 按原样读取；没有文本层的 PDF（扫描件）会被告知是扫描件，因为 `web_fetch` 只读取文本；GBK 等旧字符集会被解码。页面最多读取 10 MB，答案每次覆盖页面的 100,000 个字符；结果会告知 Agent 继续读取的偏移量。转换后的页面按 Agent 缓存 15 分钟。
 - 页面在网关二进制的一个子进程中解析，该子进程在异步运行时启动之前创建，没有网络（独立的网络命名空间）、不能获取新权限、地址空间为 1 GB、CPU 时间 20 秒、不能写文件，30 秒后被终止；网关以 root 运行时，子进程以 `nobody` 身份运行。以其他用户运行的网关需要非特权用户命名空间来创建子进程，否则 `web_fetch` 会失败；网关在启动时检查这一点并记录警告。子进程仍可读取其用户有权读取的文件，因此请保持网关文件的私密性。页面 URL 通过 stdin 传给子进程，而不是放在参数中。导致解析器崩溃或卡住的页面只会让该次调用失败。转换后的文本每页最多保留 8 MB，15 分钟缓存最多占用 128 MB。
 - 若 Agent 的 `allowed_models` 允许且其所有者拥有该提供方的凭据，答案由 `[fetch] model` 生成，否则使用 Agent 自身的模型，并像 Agent 自身的调用一样计费：计入 Agent 所有者的凭据和 Agent 的 token 预算。整次调用限时 75 秒。
 - Agent 只能读取网关看到来自其模型之外的 URL：用户发给它的消息中（WebChat 和渠道）、`web_search` 结果中、以这种方式读取的页面上的链接，或重定向目标，有效期为网关启动后的 24 小时内。模型自身的文本和其他工具的输出（shell 命令、文件、MCP 服务器）都不会新增可读 URL，因此模型无法把 Agent 中的数据塞进它自选的 URL。策略 `network_policy.allowed_domains` 中的域名（一个域名同时匹配其子域名）无需满足上述条件即可读取，路径和查询不限；仅因域名被允许而读取的页面上的链接和重定向不会被记录，因为这类页面可能回显模型放进 URL 的内容。`blocked_domains` 中的域名永远不会被读取。被拒绝的 URL 不会被回显。
@@ -786,7 +835,7 @@ Agent 只能通过 `[[bindings]]` 绑定给它的渠道账号发送消息。若�
 
 在每个对话中，Agent 一次只回复一条消息。在它回复期间发来的消息会排队，在这次回复之后按顺序回复（最多排队 20 条；渠道用户会被告知消息已排队）。回复进行中时，Dashboard 聊天里有一个停止按钮；在渠道对话中，`/stop`（或 `/stop@botname`）可以停止回复：Agent 会结束正在进行的模型调用或工具调用，并终止正在运行的 shell 命令所启动的进程。保留下来的回复是模型已经写出的文本，后跟一个空行和 `(stopped)`；如果模型还没写出任何内容，则只有 `(stopped)`。这包括进行中的模型调用已经写出的内容：网关停止从提供商读取并保留这些内容，该调用的推理过程与回复的其他步骤放在一起（在 Dashboard 聊天中显示），而它已经指定的工具调用不会执行。在聊天应用中，这需要能边写边显示回复的适配器（从 v0.2.15 起，Telegram 和 Discord）：回复以一条消息（“Replying…”）出现，并随着文本到来而编辑（大约每秒一次，在应用限制机器人编辑次数的地方更少，例如 Telegram 群组），下方有一个 **Stop** 按钮，作用与 `/stop` 相同，能使用它的人也相同；完整的回复取代它，按钮随之消失。超过一条消息长度的回复在下一条中继续；模型在工具调用之前写出的文本单独保留为一条消息，回复在其下方继续。如果模型调用的文本当前没有展示给任何人（没有打开标签页的 Dashboard 聊天、适配器不能边写边显示回复的聊天应用，或在 v0.2.15 之前启动的 Agent），则不会被中途截断：它会执行完毕，其文本被丢弃，与 v0.2.13 之前的网关或 Agent 的行为相同。排队的消息会在之后得到回复。
 
-每个用户可以与一个 Agent 进行多个聊天。Dashboard 聊天会在对话旁按最近时间顺序列出这些聊天：“new chat”会开启一个新聊天；聊天可以重命名或删除：删除时会一并删除其中的消息和在其中发送的文件（用户上传到 Agent 收件箱的文件，连同其文本、转写和为显示而生成的副本，除非删除时其他聊天的某条消息引用了它们或它们所属的文件，包括 Agent 已收到、尚未记录的消息；以及 Agent 发送的文件；不会通过链接删除任何文件），但不会删除 Agent 保存到记忆中或写入其工作区其他位置的内容。**export** 会把当前屏幕上的聊天导出为 Markdown，或导出为 JSON（包含每条消息及其携带的文件名），导出内容来自屏幕上显示的分支，最多为最新的 500 条消息。在渠道对话中，`/new`（或 `/new@botname`）会开启一个新聊天，之前的聊天会被保留。每个聊天有各自的历史、队列、停止按钮和“approve for this conversation”批准记录；Agent 在某个聊天中安排的任务会在该聊天中报告，结果也保存在该聊天的历史中；在渠道中发送 `/stop` 会停止该发送者任一聊天中正在进行的回复。删除聊天会停止其回复并丢弃其排队的消息；Agent 的记忆由所有聊天共享。`conversation_search` 用于查找过去的消息：对 Agent 的所有者，范围是他发过消息的所有聊天（Dashboard，以及关联到他的聊天应用账号）；对其他人，仅限其本人的聊天；在群中，仅限该对话的聊天（若帖子是独立对话，则为该帖子自己的聊天），所有者也是如此。Agent 保存的每条事实要么是私有的，要么是公开的。关于其所有者的私有事实（他是谁、喜欢什么、在做什么）会出现在所有者在任何渠道上的每个私聊中，但绝不会出现在群聊中；在其他地方，Agent 只能通过 `memory_search` 获取它们，而该工具需要等待所有者审核，除非所有者已允许（见“他人对话中的工具”）。公开事实是任何能与机器人对话的人都可以知道的信息（名字、称呼方式、语言、公开的工作），它们会出现在每个聊天的提示词中，包括他人的聊天和群聊，`SOUL.md` 也是如此——即 Agent 设置页面在“bootstrap files”下编辑的文件（定时任务和 Webhook 只有 `SOUL.md`）：最多 100 条，最近使用的排在前面，每条截断为 2,000 个字符，在 4,000 个字符的总量内能放多少放多少（放不下的一条会被略过，后面的仍然会给出），且它们不会过期。Agent 保存的一切都是私有的。在所有者自己的私聊中，Agent 可以建议将某条事实设为公开（`suggest_public`）；只有所有者能在 Dashboard 上把事实设为公开：在保存该事实的那条回复下方，或在记忆页面（可按私有、建议公开和公开筛选）。Agent 只是重复一遍的事实保持原有可见性；Agent 对公开事实的修改会使其退回私有、建议公开的状态，直到所有者批准新文本；Agent 遗忘的事实不再显示。所有者无论朝哪个方向切换，都会以 `memory.visibility` 记入审计日志；而在事实公开期间别人读到的内容无法收回。以上规则针对的是 Agent 的记忆工具：它的文件工具可以修改它自己的文件（包括 `SOUL.md`），允许运行 shell 命令的 Agent 还能修改其数据库，因此在包含不可信内容的聊天中，文件和 shell 访问权限才是真正的边界。重新设为私有的事实，其完整的生命周期从那时起重新计算。`USER.md` 已不再读取：升级时，非空的 `USER.md` 会变成一条公开的 `identity` 事实（键为 `USER.md`），文件被重命名为 `USER.md.bak`（该名称已被占用时为 `USER.md.bak.1` 等）；如果读取或保存失败（会记录日志），则不会再次尝试，文件保持为 `USER.md` 且不被读取；Agent 的文件工具在任何聊天中仍可读取该文件，因此如果其中的内容不应留在工作区，请删除它。所有者在已关联的聊天应用账号上（群聊之外）发送的消息，会像 Dashboard 中的消息一样被记住。聊天功能出现之前的历史记录，成为了各个对话的第一个聊天。
+每个用户可以与一个 Agent 进行多个聊天。Dashboard 聊天会在对话旁按最近时间顺序列出这些聊天：“new chat”会开启一个新聊天；聊天可以重命名或删除：删除时会一并删除其中的消息和在其中发送的文件（用户上传到 Agent 收件箱的文件，连同其文本、转写、为显示而生成的副本以及扫描件的页面图片，除非删除时其他聊天的某条消息引用了它们或它们所属的文件，包括 Agent 已收到、尚未记录的消息；以及 Agent 发送的文件；不会通过链接删除任何文件），但不会删除 Agent 保存到记忆中或写入其工作区其他位置的内容。**export** 会把当前屏幕上的聊天导出为 Markdown，或导出为 JSON（包含每条消息及其携带的文件名），导出内容来自屏幕上显示的分支，最多为最新的 500 条消息。在渠道对话中，`/new`（或 `/new@botname`）会开启一个新聊天，之前的聊天会被保留。每个聊天有各自的历史、队列、停止按钮和“approve for this conversation”批准记录；Agent 在某个聊天中安排的任务会在该聊天中报告，结果也保存在该聊天的历史中；在渠道中发送 `/stop` 会停止该发送者任一聊天中正在进行的回复。删除聊天会停止其回复并丢弃其排队的消息；Agent 的记忆由所有聊天共享。`conversation_search` 用于查找过去的消息：对 Agent 的所有者，范围是他发过消息的所有聊天（Dashboard，以及关联到他的聊天应用账号）；对其他人，仅限其本人的聊天；在群中，仅限该对话的聊天（若帖子是独立对话，则为该帖子自己的聊天），所有者也是如此。Agent 保存的每条事实要么是私有的，要么是公开的。关于其所有者的私有事实（他是谁、喜欢什么、在做什么）会出现在所有者在任何渠道上的每个私聊中，但绝不会出现在群聊中；在其他地方，Agent 只能通过 `memory_search` 获取它们，而该工具需要等待所有者审核，除非所有者已允许（见“他人对话中的工具”）。公开事实是任何能与机器人对话的人都可以知道的信息（名字、称呼方式、语言、公开的工作），它们会出现在每个聊天的提示词中，包括他人的聊天和群聊，`SOUL.md` 也是如此——即 Agent 设置页面在“bootstrap files”下编辑的文件（定时任务和 Webhook 只有 `SOUL.md`）：最多 100 条，最近使用的排在前面，每条截断为 2,000 个字符，在 4,000 个字符的总量内能放多少放多少（放不下的一条会被略过，后面的仍然会给出），且它们不会过期。Agent 保存的一切都是私有的。在所有者自己的私聊中，Agent 可以建议将某条事实设为公开（`suggest_public`）；只有所有者能在 Dashboard 上把事实设为公开：在保存该事实的那条回复下方，或在记忆页面（可按私有、建议公开和公开筛选）。Agent 只是重复一遍的事实保持原有可见性；Agent 对公开事实的修改会使其退回私有、建议公开的状态，直到所有者批准新文本；Agent 遗忘的事实不再显示。所有者无论朝哪个方向切换，都会以 `memory.visibility` 记入审计日志；而在事实公开期间别人读到的内容无法收回。以上规则针对的是 Agent 的记忆工具：它的文件工具可以修改它自己的文件（包括 `SOUL.md`），允许运行 shell 命令的 Agent 还能修改其数据库，因此在包含不可信内容的聊天中，文件和 shell 访问权限才是真正的边界。重新设为私有的事实，其完整的生命周期从那时起重新计算。`USER.md` 已不再读取：升级时，非空的 `USER.md` 会变成一条公开的 `identity` 事实（键为 `USER.md`），文件被重命名为 `USER.md.bak`（该名称已被占用时为 `USER.md.bak.1` 等）；如果读取或保存失败（会记录日志），则不会再次尝试，文件保持为 `USER.md` 且不被读取；Agent 的文件工具在任何聊天中仍可读取该文件，因此如果其中的内容不应留在工作区，请删除它。所有者在已关联的聊天应用账号上（群聊之外）发送的消息，会像 Dashboard 中的消息一样被记住。聊天功能出现之前的历史记录，成为了各个对话的第一个聊天。
 
 在 Dashboard 聊天中，可以编辑消息，也可以重新生成回复。两者都会开启一个分支：该点之后的消息仍保存在它们自己的分支上，消息下方的 `‹ 2/3 ›` 用于在不同版本之间切换，Agent 只能看到屏幕上显示的分支。在渠道对话中，`/retry`（或 `/retry@botname`）会重新回复最后一条消息。分支不会撤销工具已经做过的事：已写入的文件、已发送的消息和已保存的记忆都会保留。
 
@@ -802,12 +851,12 @@ Agent 的记忆、工作区和机器都属于其所有者。在与其他人的�
 
 | 工具 | 何时询问所有者 |
 |---|---|
-| `shell`、`process`、`file_write`、`file_edit`、`view_image`、`skill_manage`、`send_file`、`set_timezone`、MCP 工具 | 调用运行**之前**，展示其完整输入 |
+| `shell`、`process`、`file_write`、`file_edit`、`view_image`、`transcribe`、`skill_manage`、`send_file`、`set_timezone`、MCP 工具 | 调用运行**之前**，展示其完整输入 |
 | `memory_search`、`file_read`、`file_find`、`file_search` | 运行**之后**，展示它返回的全部内容（与模型将得到的内容完全一致；总计超过 4000 个字符时，其余部分在两边都会被略去，且两边都会被告知） |
 
 对方会被告知 Agent 正在征询其所有者。所有者会在 Web 聊天中看到是谁提出的请求、对方写了什么以及具体的调用；如果所有者关联了该聊天应用的账号，还会在他与同一机器人的私聊中看到，并可在那里作答：
 
-- **allow once** / **use**：仅此一次，执行该调用，或让模型得到它返回的内容；读取类工具或子 Agent 返回的内容不会保存在回复的步骤中，因此那里之后的轮次不会拥有这些内容；
+- **allow once** / **use**：仅此一次，执行该调用，或让模型得到它返回的内容；读取类工具、`transcribe` 或子 Agent 返回的内容不会保存在回复的步骤中，因此那里之后的轮次不会拥有这些内容；
 - **always allow there**：对读取类工具，此后在该对话中直接回答，不再询问；对执行或修改类工具，只有完全相同的那个调用如此（在群中总是允许 `shell` 会让群里的任何人都能运行任何命令）；
 - **deny**，或 10 分钟内未作答：模型会被告知不允许，且不得透露它本会得到什么；该回复中对该工具的后续调用会被直接拒绝，不再询问。
 
@@ -837,6 +886,10 @@ Agent 可以用 `ask_choice` 工具让正在对话的人在 2 到 10 个选项�
 
 当设置了 `[transcription]` 时，送达 Agent 收件箱的语音消息和音频文件（Ogg/Opus、MP3、M4A、WAV、WebM、FLAC；最大 20 MB），无论来自聊天应用还是在 Web 聊天中上传，都会由网关转写。转写保存在文件旁边（`<file>.txt`），Agent 会连同文件一起收到它，并标注为用户提供的音频的转写；如果没有设置 `[transcription]`，或转写失败，Agent 会收到文件和一行说明未转写的文字。转写永远不会被当作命令：命令必须打字输入。此配置节无需重启即可生效。
 
+设置了 `[transcription]` 时，Agent 还会获得一个由网关代为运行的 `transcribe` 工具：Agent 指定其工作区中的一个音频文件（录音、工具下载的音频，或从视频中截取的音频），得到其转写，标注为机器生成，生成方式和计量方式都与上文相同。网关自己读取该文件，最大 20 MB，必须是不经过任何链接即可到达的普通文件，并按扩展名、否则按文件开头的字节判断其类型。Agent 可以通过这种方式发送自己的任意文件，因此其工作区中的任何内容都可能到达转写提供方；不是音频的文件不会得到有用的结果。使用端点时，MP4 或 WebM 视频按原样发送（OpenAI 的端点会接收两者的声音）；使用模型时遇到视频（WebM 视频也包括在内），以及无论使用哪种方式遇到其他任何视频（`.mov`、`.mkv`、`.avi` 等），Agent 都会被告知先提取声音。音频时长没有单独的限制：一次调用（包括等待时间）超过 80 秒就会被放弃，并告诉 Agent 把音频切成几段；超过 20,000 个字符的转写会被截断，Agent 会被告知。在所有 Agent 之间，除发来的语音消息外，最多同时进行两次调用，同一用户的各 Agent 一次只进行一次；文件在轮到该调用时才读取。同一用户的各 Agent 合计每分钟最多调用 10 次，每次调用都以 `audio.transcribe` 连同路径记入审计日志。策略权限 `can_transcribe`（Agent 设置页面上的 "transcribe audio"）可移除该工具，在多用户模式下角色也可以禁止它。未设置它的策略（包括在它出现之前写的策略）沿用 `can_fetch_web` 的值，而后者默认开启：被禁止读取网页的角色或 Agent，在设置 `can_transcribe` 之前同样被禁止转写。针对 `file_read`（或 `file_*`）的规则也适用于它，在某个上下文中禁用 `file_read` 也会禁用它。在他人的对话中，它在运行前等待所有者，展示路径，且其返回的内容不会保留给那里之后的轮次（见“他人对话中的工具”）；在所有者自己的聊天、定时任务和心跳中，它与 Agent 的其他工具一样运行。未设置 `[transcription]` 时不提供该工具，在该配置节被删除后发起的调用会得到网关不转写音频的说明；在添加该配置节之前启动的 Agent，会在下次启动时获得该工具。
+
+转写的用量计入 Agent 的每日 token 预算，发给它的语音消息也是如此：模型的 token 使用 Agent 所有者的凭据，端点的用量使用运维者的密钥。端点调用在发送前按声音可能的时长预订用量，宁可估长（WAV 按其采样率、声道数和采样大小计算，其他文件按其格式的低码率由文件大小估算，Ogg 和 WebM 按每秒 1.5 KB），每秒声音计 10 个 token，另加每秒 5 个 token 用于文本，预算不足时拒绝调用。之后按端点报告的用量结算（token，或按每秒 10 个 token 计的秒数），否则保持该估算值；已发送但失败或超时的调用也保持估算值，因为端点可能已经完成了处理，只有未能发送的调用不计入。它在用量页面上显示在提供方 `transcription` 和该端点的模型之下。
+
 ```toml
 [transcription]
 kind        = "endpoint"                   # 兼容 OpenAI 的 /audio/transcriptions 接口
@@ -850,7 +903,7 @@ api_key_env = "OPENAI_API_KEY"             # 默认值：存放密钥的环境�
 # model = "openrouter:google/gemini-3.8-flash"
 ```
 
-端点的密钥从环境变量读取，绝不从 config.toml 读取；当该变量未设置或为空时（本地服务器），不发送密钥。使用 `kind = "model"` 时，请选择接受音频的 OpenRouter 或 Gemini 模型（Anthropic 模型不接受音频，OpenAI 自己的 API 只接受 WAV 和 MP3，而 Telegram 语音消息是 Ogg/Opus）；该模型必须已列出并允许该 Agent 使用，其 token 计入 Agent 的预算。转写耗时超过 90 秒会被放弃；最多同时进行四个转写。
+端点的密钥从环境变量读取，绝不从 config.toml 读取；当该变量未设置或为空时（本地服务器），不发送密钥。使用 `kind = "model"` 时，请选择接受音频的 OpenRouter 或 Gemini 模型（Anthropic 模型不接受音频，OpenAI 自己的 API 只接受 WAV 和 MP3，而 Telegram 语音消息是 Ogg/Opus）；该模型必须已列出并允许该 Agent 使用，其 token 计入 Agent 的预算。对发来的文件的转写耗时超过 90 秒会被放弃；最多同时进行四个转写。
 
 <a id="chat-commands"></a>
 ### 聊天命令
@@ -1017,4 +1070,6 @@ bot_username = "acme_bot"    # Telegram 机器人的用户名，用于 https://t
 Copyright 2025-2026 Amplimit
 
 基于 Apache License 2.0 授权。详情见 [LICENSE](../LICENSE)。
+
+每个发布版 tarball 都附带 `LICENSE` 和 `THIRD-PARTY-NOTICES.txt`：其中包括构建其二进制文件所用的 Rust crate 的许可证（以及其中部分 crate 打包的文件和数据，例如 hayro 的 PDF 字体、CMap、字形名称和字体度量），与之静态链接的组件的许可证（Rust 标准库，以及按 zig 的构建方式得到的 musl libc 和 LLVM 的 libunwind），以及 `havn-gateway` 内嵌的 Dashboard 所用 npm 包的许可证，连同 Next.js 内置（vendor）的那些包和随之发布的 Tailwind CSS。发布构建使用 [cargo-about](https://github.com/EmbarkStudios/cargo-about) 和 `contrib/notices/` 生成这些声明；当某个依赖采用 `deny.toml` 不允许的许可证，或 `contrib/notices/about.toml` 中的列表与之不一致时，构建失败。`install.sh` 会把这两个文件放到 `/usr/local/share/doc/havn`（与二进制文件所在的前缀相邻）；`havn update` 只替换二进制文件。
 
