@@ -255,6 +255,15 @@ pub fn served<'a>(policy: &'a Policy, own: &[String]) -> Vec<(&'a String, &'a Mc
         .collect()
 }
 
+/// Whether `now` is the grant `was`: not connected again, refreshed or ended
+/// since.
+fn same_grant(now: &Grant, was: &Grant) -> bool {
+    now.url == was.url
+        && now.client_id == was.client_id
+        && now.refresh_token() == was.refresh_token()
+        && now.access_token() == was.access_token()
+}
+
 /// Whether `grant` is still for `cfg`: its URL, and its client when the
 /// owner configured one.
 fn grant_fits(grant: &Grant, cfg: &McpServerConfig) -> bool {
@@ -382,19 +391,28 @@ impl OAuthGrants {
         let slot = self.slot(agent_id).await;
         let mut held = slot.lock().await;
         let mut grants = self.loaded(agent_id, &mut held).await;
-        let unchanged = grants.get(server).is_some_and(|now| {
-            now.url == was.url
-                && now.client_id == was.client_id
-                && now.refresh_token() == was.refresh_token()
-                && now.access_token() == was.access_token()
-        });
-        if !unchanged {
+        if !grants.get(server).is_some_and(|now| same_grant(now, was)) {
             return Ok(false);
         }
         self.store(agent_id, server, &next, &ciphertext).await?;
         grants.insert(server.to_string(), next);
         *held = Some(grants);
         Ok(true)
+    }
+
+    /// Note why refreshing `server` failed, when its grant is still `was`;
+    /// whether it was.
+    async fn note_failure(&self, agent_id: AgentId, server: &str, was: &Grant, why: &str) -> bool {
+        let slot = self.slot(agent_id).await;
+        let mut held = slot.lock().await;
+        let grants = self.loaded(agent_id, &mut held).await;
+        if !grants.get(server).is_some_and(|now| same_grant(now, was)) {
+            return false;
+        }
+        if let Err(db) = agent_secrets::oauth_error(&self.db, agent_id, server, why).await {
+            warn!(%agent_id, server, error = %db, "could not note a failed refresh");
+        }
+        true
     }
 
     /// The lock one refresh of `server` holds.
@@ -623,17 +641,48 @@ impl OAuthGrants {
         server: &str,
         owner_secret: Option<String>,
     ) -> Result<bool, OAuthError> {
-        let slot = self.slot(agent_id).await;
-        let mut held = slot.lock().await;
-        let mut grants = self.loaded(agent_id, &mut held).await;
-        let was = agent_secrets::oauth_remove(&self.db, agent_id, server)
+        self.remove_unless(agent_id, server, owner_secret, |_| false)
             .await
-            .map_err(|e| OAuthError::Internal(e.to_string()))?;
-        if let Some(grant) = grants.remove(server) {
-            self.revoke(grant, owner_secret);
-        }
-        *held = Some(grants);
-        Ok(was)
+    }
+
+    /// Remove `server`'s grant, unless `keep` says otherwise of it as it is
+    /// under the agent's lock, and revoke it; whether one was removed.
+    async fn remove_unless(
+        &self,
+        agent_id: AgentId,
+        server: &str,
+        owner_secret: Option<String>,
+        keep: impl Fn(&Grant) -> bool,
+    ) -> Result<bool, OAuthError> {
+        let removed = {
+            let slot = self.slot(agent_id).await;
+            let mut held = slot.lock().await;
+            let mut grants = self.loaded(agent_id, &mut held).await;
+            if grants.get(server).is_some_and(&keep) {
+                return Ok(false);
+            }
+            let was = agent_secrets::oauth_remove(&self.db, agent_id, server)
+                .await
+                .map_err(|e| OAuthError::Internal(e.to_string()))?;
+            let grant = grants.remove(server);
+            *held = Some(grants);
+            if let Some(grant) = grant {
+                self.revoke(grant, owner_secret);
+            }
+            was
+        };
+        self.clear_server(agent_id, server).await;
+        Ok(removed)
+    }
+
+    /// Forget the refresh state of `server`, whose grant is gone.
+    async fn clear_server(&self, agent_id: AgentId, server: &str) {
+        let key = (agent_id, server.to_string());
+        self.failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key);
+        self.refreshing.lock().await.remove(&key);
     }
 
     /// Forget the grants of the agent's servers that are gone from `servers`
@@ -665,8 +714,16 @@ impl OAuthGrants {
                 .get(&server)
                 .and_then(|cfg| owner_secret(cfg, secrets).ok())
                 .flatten();
-            match self.disconnect(agent_id, &server, secret).await {
-                Ok(_) => {
+            // A connect that finished meanwhile, for the server as it is
+            // now, stays.
+            let fits = |grant: &Grant| {
+                servers
+                    .get(&server)
+                    .is_some_and(|cfg| grant_fits(grant, cfg))
+            };
+            match self.remove_unless(agent_id, &server, secret, fits).await {
+                Ok(false) => {}
+                Ok(true) => {
                     info!(%agent_id, server, "an MCP server's OAuth is forgotten: the server changed")
                 }
                 Err(e) => {
@@ -726,6 +783,14 @@ impl OAuthGrants {
     /// Forget what was read of a deleted agent.
     pub async fn forget(&self, agent_id: AgentId) {
         self.slots.lock().await.remove(&agent_id);
+        self.failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(agent, _), _| *agent != agent_id);
+        self.refreshing
+            .lock()
+            .await
+            .retain(|(agent, _), _| *agent != agent_id);
     }
 
     /// The access tokens of the agent's [`served`] servers, each for the URL
@@ -872,10 +937,19 @@ impl OAuthGrants {
                     // tried again until the owner connects the server again.
                     let mut ended = grant.clone();
                     ended.credentials.token_response = None;
-                    if !self.replace(agent_id, server, &grant, ended).await? {
+                    if !self
+                        .replace(agent_id, server, &grant, ended.clone())
+                        .await?
+                        || !self.note_failure(agent_id, server, &ended, &why).await
+                    {
                         return Ok(());
                     }
                 } else {
+                    // A grant connected again meanwhile is not the one that
+                    // failed.
+                    if !self.note_failure(agent_id, server, &grant, &why).await {
+                        return Ok(());
+                    }
                     let mut failures = self
                         .failures
                         .lock()
@@ -893,10 +967,6 @@ impl OAuthGrants {
                         _ => wait,
                     };
                     failures.insert(key, (count, Instant::now() + wait));
-                }
-                if let Err(db) = agent_secrets::oauth_error(&self.db, agent_id, server, &why).await
-                {
-                    warn!(%agent_id, server, error = %db, "could not note a failed refresh");
                 }
                 Err(e)
             }
@@ -1360,6 +1430,75 @@ mod tests {
         assert_eq!(due.len(), 1);
         assert!(!refreshing.is_finished());
         refreshing.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failure_of_a_grant_since_replaced_is_not_noted() {
+        use havn_db::repo::agents::{NewAgent, create as create_agent};
+        use havn_db::repo::users::{NewUser, create as create_user};
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let owner = create_user(&db, NewUser { display_name: "o" })
+            .await
+            .expect("user");
+        let agent = create_agent(
+            &db,
+            NewAgent {
+                owner_id: owner.id,
+                team_id: None,
+                name: "a",
+                config: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("agent");
+        let oauth = OAuthGrants::new(db.clone(), Some(KeyRing::from_passphrase("test-key")));
+        let url = "https://mcp.example.com/mcp";
+        oauth
+            .keep_for_test(agent.id, "s", url, "old-access", 0)
+            .await;
+        let old = oauth.grant(agent.id, "s").await.expect("grant");
+        // Connected again while the old grant's refresh ran.
+        oauth
+            .keep_for_test(agent.id, "s", url, "new-access", 0)
+            .await;
+        assert!(!oauth.note_failure(agent.id, "s", &old, "refused").await);
+        let rows = agent_secrets::oauth_list(&db, agent.id)
+            .await
+            .expect("rows");
+        assert_eq!(rows[0].error, None);
+        let now = oauth.grant(agent.id, "s").await.expect("grant");
+        assert!(oauth.note_failure(agent.id, "s", &now, "refused").await);
+        // Its refresh state goes with the grant.
+        oauth
+            .failures
+            .lock()
+            .unwrap()
+            .insert((agent.id, "s".to_string()), (1, Instant::now()));
+        let _gate = oauth.refresh_gate(agent.id, "s").await;
+        assert!(
+            oauth
+                .disconnect(agent.id, "s", None)
+                .await
+                .expect("disconnect")
+        );
+        assert!(oauth.failures.lock().unwrap().is_empty());
+        assert!(oauth.refreshing.lock().await.is_empty());
+        // A grant that fits the server as it is now is not pruned.
+        oauth.keep_for_test(agent.id, "s", url, "kept", 0).await;
+        let servers = HashMap::from([(
+            "s".to_string(),
+            McpServerConfig {
+                url: url.into(),
+                auth: McpAuth::Oauth(havn_core::McpOAuthConfig::default()),
+                ..Default::default()
+            },
+        )]);
+        oauth
+            .prune(agent.id, &servers, &HashMap::new(), &BTreeMap::new())
+            .await;
+        assert!(oauth.grant(agent.id, "s").await.is_some());
+        oauth.forget(agent.id).await;
+        assert!(oauth.refreshing.lock().await.is_empty());
     }
 
     #[test]
