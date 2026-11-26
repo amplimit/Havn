@@ -831,6 +831,17 @@ impl OAuthGrants {
         let Some(grant) = self.grant(agent_id, server).await else {
             return Ok(());
         };
+        // A refresh that waited for another finds it done, or failed and
+        // waiting.
+        let waiting = self
+            .failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(agent_id, server.to_string()))
+            .is_some_and(|(_, next)| *next > Instant::now());
+        if waiting || grant.refresh_at().is_none_or(|at| at > Utc::now()) {
+            return Ok(());
+        }
         let secret = grant.client_secret(owner_secret.as_deref());
         let outcome = self.refreshed(&grant, secret).await;
         let key = (agent_id, server.to_string());
@@ -1170,13 +1181,13 @@ impl OAuthHttpClient for Http {
     }
 }
 
-/// Every minute, refresh the due tokens of running agents, at most
+/// Every 15 seconds, refresh the due tokens of running agents, at most
 /// [`PARALLEL_REFRESHES`] agents at once, and send each its new ones.
 pub async fn refresh_loop(
     secrets: crate::secrets::SecretStore,
     registry: crate::agent_registry::AgentRegistry,
 ) {
-    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    let mut tick = tokio::time::interval(Duration::from_secs(15));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
