@@ -1053,8 +1053,20 @@ impl GatewayConfig {
         ) {
             cfg.trust_header.enabled = true;
         }
+        let multi_user = cfg.trust_header.enabled;
+        cfg.settle_defaults(multi_user);
 
         Ok(cfg)
+    }
+
+    /// Defaults that depend on the config as it is in the end, environment
+    /// included: `[mcp] remote` left out is `off` with `trust_header`, `on`
+    /// without.
+    pub fn settle_defaults(&mut self, multi_user: bool) {
+        if self.mcp.remote.is_none() {
+            let default = if multi_user { "off" } else { "on" };
+            self.mcp.remote = Some(default.into());
+        }
     }
 
     /// Load and parse a config file at an explicit path. Used by the hot-reload
@@ -1135,15 +1147,7 @@ impl GatewayConfig {
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
         match parsed.mcp.remote.as_deref() {
-            Some("on" | "off") => {}
-            None => {
-                let default = if parsed.trust_header.enabled {
-                    "off"
-                } else {
-                    "on"
-                };
-                parsed.mcp.remote = Some(default.into());
-            }
+            None | Some("on" | "off") => {}
             Some(other) => anyhow::bail!("[mcp] remote = {other:?} must be \"on\" or \"off\""),
         }
         havn_core::policy::validate_domains("[mcp] remote_hosts", &parsed.mcp.remote_hosts)
@@ -1951,8 +1955,18 @@ metrics_listen = \"{value}\"
         assert!(any.mcp.allows("mcp.notion.com"));
         // With trust_header every member could send the gateway's own OAuth
         // requests anywhere: off unless the operator turns it on.
-        let multi = GatewayConfig::from_toml("[trust_header]\nenabled = true\n").expect("multi");
+        let mut multi =
+            GatewayConfig::from_toml("[trust_header]\nenabled = true\n").expect("multi");
+        multi.settle_defaults(multi.trust_header.enabled);
         assert!(!multi.mcp.allows("mcp.notion.com"));
+        // HAVN_TRUST_HEADER turns it on after the file, or without one.
+        let mut env = GatewayConfig::default();
+        env.trust_header.enabled = true;
+        env.settle_defaults(true);
+        assert!(!env.mcp.allows("mcp.notion.com"));
+        let mut single = GatewayConfig::default();
+        single.settle_defaults(false);
+        assert!(single.mcp.allows("mcp.notion.com"));
         let multi_on =
             GatewayConfig::from_toml("[trust_header]\nenabled = true\n[mcp]\nremote = \"on\"\n")
                 .expect("multi on");

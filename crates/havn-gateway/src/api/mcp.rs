@@ -248,7 +248,13 @@ pub async fn patch(
     // changed, are for something else now.
     if req.servers.is_some() {
         let (_, servers) = read_mcp_from_config(&updated.config);
-        state.secrets.oauth().prune(id, &servers).await;
+        let (_, before) = read_mcp_from_config(&agent.config);
+        let secrets = state.secrets.values(id).await.unwrap_or_default();
+        state
+            .secrets
+            .oauth()
+            .prune(id, &servers, &before, &secrets)
+            .await;
         state.secrets.push(&state.registry, id).await;
     }
     Ok(Json(view(&state, &updated).await))

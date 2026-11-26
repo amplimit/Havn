@@ -99,6 +99,16 @@ impl SecretStore {
         &self.oauth
     }
 
+    /// OAuth requests made through `http`.
+    #[cfg(test)]
+    pub fn with_oauth_http(
+        mut self,
+        http: Arc<dyn rmcp::transport::auth::OAuthHttpClient>,
+    ) -> Self {
+        self.oauth = self.oauth.with_http(http);
+        self
+    }
+
     /// Whether secrets can be set: `HAVN_AGE_KEY` is.
     pub fn encrypts(&self) -> bool {
         self.keyring.is_some()
@@ -226,32 +236,33 @@ impl SecretStore {
         agent_id: AgentId,
         deadline: std::time::Duration,
     ) -> bool {
-        let agent = match havn_db::repo::agents::find_by_id(&self.db, agent_id).await {
-            Ok(Some(agent)) => agent,
-            _ => return true,
-        };
-        let policy = crate::policy_resolver::for_session(&self.db, &agent, self.multi_user).await;
-        let own = own_mcp_servers(&agent.config, &policy);
-        let served = crate::mcp_oauth::served(&policy, &own);
-        let due = self.oauth.due(agent_id, &served).await;
-        if due.is_empty() {
-            return true;
-        }
-        let values = self.values(agent_id).await.unwrap_or_default();
-        let work: Vec<(String, Option<String>)> = due
-            .into_iter()
-            .map(|server| {
-                let secret = served
-                    .iter()
-                    .find(|(name, _)| **name == server)
-                    .and_then(|(_, cfg)| crate::mcp_oauth::owner_secret(cfg, &values).ok())
-                    .flatten();
-                (server, secret)
-            })
-            .collect();
         let store = self.clone();
         let registry = registry.clone();
         let task = tokio::spawn(async move {
+            let agent = match havn_db::repo::agents::find_by_id(&store.db, agent_id).await {
+                Ok(Some(agent)) => agent,
+                _ => return,
+            };
+            let policy =
+                crate::policy_resolver::for_session(&store.db, &agent, store.multi_user).await;
+            let own = own_mcp_servers(&agent.config, &policy);
+            let served = crate::mcp_oauth::served(&policy, &own);
+            let due = store.oauth.due(agent_id, &served).await;
+            if due.is_empty() {
+                return;
+            }
+            let values = store.values(agent_id).await.unwrap_or_default();
+            let work: Vec<(String, Option<String>)> = due
+                .into_iter()
+                .map(|server| {
+                    let secret = served
+                        .iter()
+                        .find(|(name, _)| **name == server)
+                        .and_then(|(_, cfg)| crate::mcp_oauth::owner_secret(cfg, &values).ok())
+                        .flatten();
+                    (server, secret)
+                })
+                .collect();
             let refreshes = work.into_iter().map(|(server, secret)| {
                 let oauth = store.oauth.clone();
                 async move {
@@ -932,6 +943,60 @@ mod tests {
         );
     }
 
+    /// A provider that takes half a minute to answer anything.
+    struct Slow;
+
+    impl rmcp::transport::auth::OAuthHttpClient for Slow {
+        fn execute(
+            &self,
+            _request: rmcp::transport::auth::OAuthHttpRequest,
+        ) -> rmcp::transport::auth::OAuthHttpClientFuture<'_> {
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                Err("too slow".into())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_provider_does_not_delay_an_agents_start() {
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let url = "https://mcp.example.com/mcp";
+        let server = json!({"url": url, "auth": {"type": "oauth"}});
+        let a = agent(
+            &db,
+            json!({"policy": {
+                "permissions": {"can_use_mcp": true, "can_access_network": true},
+                "network_policy": {"egress_allowed": true, "egress_proxy": false},
+                "mcp_servers": {"slow": server},
+            }}),
+        )
+        .await;
+        let store = SecretStore::new(db.clone(), Some(KeyRing::from_passphrase("test-key")))
+            .with_oauth_http(Arc::new(Slow));
+        // Due: an hour's token issued 3500 s ago.
+        store
+            .oauth()
+            .keep_for_test(a.id, "slow", url, "oauth-access-slow", 3500)
+            .await;
+        let registry = AgentRegistry::new();
+        // As before Welcome: the refresh is waited for 300 ms, then the
+        // runtime's secrets are read, with the token there is.
+        let started = std::time::Instant::now();
+        let done = store
+            .refresh_oauth(&registry, a.id, std::time::Duration::from_millis(300))
+            .await;
+        assert!(!done, "the slow refresh was still running");
+        let policy = crate::policy_resolver::for_session(&db, &a, false).await;
+        let secrets = store.for_runtime(&a, &policy).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(secrets.mcp_tokens["slow"].access_token, "oauth-access-slow");
+    }
+
     #[tokio::test]
     async fn the_runtime_gets_oauth_tokens_of_its_own_servers_at_their_url_only() {
         let db = havn_db::connect_in_memory().await.expect("db");
@@ -959,6 +1024,7 @@ mod tests {
                 "notion",
                 "https://mcp.notion.com/mcp",
                 "oauth-access-1",
+                0,
             )
             .await;
         store
@@ -968,6 +1034,7 @@ mod tests {
                 "moved",
                 "https://mcp.example.com/v1",
                 "oauth-access-2",
+                0,
             )
             .await;
         let tokens = store.oauth().tokens(a.id, &policy, &own).await;
@@ -1001,7 +1068,10 @@ mod tests {
         assert!(fresh.oauth().tokens(a.id, &offline, &own).await.is_empty());
         // A server whose URL changed, or that is gone, loses its grant.
         let now = HashMap::from([("notion".to_string(), server("https://mcp.notion.com/v2"))]);
-        fresh.oauth().prune(a.id, &now).await;
+        fresh
+            .oauth()
+            .prune(a.id, &now, &HashMap::new(), &BTreeMap::new())
+            .await;
         assert!(
             agent_secrets::oauth_list(&db, a.id)
                 .await
@@ -1015,6 +1085,7 @@ mod tests {
                 "notion",
                 "https://mcp.notion.com/mcp",
                 "oauth-access-3",
+                0,
             )
             .await;
         assert!(

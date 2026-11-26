@@ -60,8 +60,12 @@ const MAX_PENDING: usize = 1024;
 pub const REFRESH_AHEAD: chrono::Duration = chrono::Duration::minutes(5);
 /// How long one OAuth request may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long one refresh may take, discovery included.
-pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the background loop waits for one agent's refreshes; they go on
+/// past it.
+pub const REFRESH_WAIT: Duration = Duration::from_secs(60);
+/// How long the discovery before a refresh may take; past it the metadata
+/// kept from the connect is used.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// After a failed refresh, the next try waits this, doubling up to
 /// [`MAX_BACKOFF`].
 const FIRST_BACKOFF: Duration = Duration::from_secs(60);
@@ -171,11 +175,16 @@ type Grants = BTreeMap<String, Grant>;
 pub struct OAuthGrants {
     db: SqlitePool,
     keyring: Option<KeyRing>,
-    http: Arc<Http>,
+    http: Arc<dyn OAuthHttpClient>,
+    /// The client revocations are sent with.
+    revoker: reqwest::Client,
     pending: Arc<std::sync::Mutex<HashMap<String, Pending>>>,
     /// Per agent, its grants once decrypted; each slot's lock serializes
-    /// the agent's reads and changes.
+    /// the agent's reads and changes, and is never held across a request.
     slots: Arc<Mutex<HashMap<AgentId, Arc<Mutex<Option<Grants>>>>>>,
+    /// Per agent and server, held while its token is refreshed: one refresh
+    /// of a server at a time, apart from the reads.
+    refreshing: Arc<Mutex<HashMap<(AgentId, String), Arc<Mutex<()>>>>>,
     /// Refreshes that failed, by agent and server: how many in a row, and
     /// when the next may be tried.
     failures: Arc<std::sync::Mutex<HashMap<(AgentId, String), (u32, Instant)>>>,
@@ -262,14 +271,24 @@ fn grant_fits(grant: &Grant, cfg: &McpServerConfig) -> bool {
 
 impl OAuthGrants {
     pub fn new(db: SqlitePool, keyring: Option<KeyRing>) -> Self {
+        let http = Http::new();
         Self {
             db,
             keyring,
-            http: Arc::new(Http::new()),
+            revoker: http.stop.clone(),
+            http: Arc::new(http),
             pending: Arc::default(),
             slots: Arc::default(),
+            refreshing: Arc::default(),
             failures: Arc::default(),
         }
+    }
+
+    /// OAuth requests made through `http`.
+    #[cfg(test)]
+    pub fn with_http(mut self, http: Arc<dyn OAuthHttpClient>) -> Self {
+        self.http = http;
+        self
     }
 
     async fn slot(&self, agent_id: AgentId) -> Arc<Mutex<Option<Grants>>> {
@@ -309,23 +328,84 @@ impl OAuthGrants {
         grants
     }
 
-    async fn save(&self, agent_id: AgentId, server: &str, grant: &Grant) -> Result<(), OAuthError> {
+    async fn encrypt(&self, grant: &Grant) -> Result<Vec<u8>, OAuthError> {
         let ring = self.keyring.clone().ok_or(OAuthError::NoKey)?;
         let plain = serde_json::to_vec(grant).map_err(|e| OAuthError::Internal(e.to_string()))?;
-        let ciphertext = tokio::task::spawn_blocking(move || ring.encrypt(&plain))
+        tokio::task::spawn_blocking(move || ring.encrypt(&plain))
             .await
             .map_err(|e| OAuthError::Internal(e.to_string()))?
-            .map_err(|e| OAuthError::Internal(e.to_string()))?;
+            .map_err(|e| OAuthError::Internal(e.to_string()))
+    }
+
+    async fn store(
+        &self,
+        agent_id: AgentId,
+        server: &str,
+        grant: &Grant,
+        ciphertext: &[u8],
+    ) -> Result<(), OAuthError> {
         agent_secrets::oauth_set(
             &self.db,
             agent_id,
             server,
             &grant.url,
-            &ciphertext,
+            ciphertext,
             grant.expires_at(),
         )
         .await
         .map_err(|e| OAuthError::Internal(e.to_string()))
+    }
+
+    async fn save(&self, agent_id: AgentId, server: &str, grant: &Grant) -> Result<(), OAuthError> {
+        let ciphertext = self.encrypt(grant).await?;
+        self.store(agent_id, server, grant, &ciphertext).await
+    }
+
+    /// `server`'s grant as it is now.
+    async fn grant(&self, agent_id: AgentId, server: &str) -> Option<Grant> {
+        let slot = self.slot(agent_id).await;
+        let mut held = slot.lock().await;
+        self.loaded(agent_id, &mut held).await.get(server).cloned()
+    }
+
+    /// Put `next` in place of `server`'s grant when that is still `was`: not
+    /// connected again, disconnected or pruned meanwhile. Whether it was.
+    /// Encrypted before the agent's lock is taken.
+    async fn replace(
+        &self,
+        agent_id: AgentId,
+        server: &str,
+        was: &Grant,
+        next: Grant,
+    ) -> Result<bool, OAuthError> {
+        let ciphertext = self.encrypt(&next).await?;
+        let slot = self.slot(agent_id).await;
+        let mut held = slot.lock().await;
+        let mut grants = self.loaded(agent_id, &mut held).await;
+        let unchanged = grants.get(server).is_some_and(|now| {
+            now.url == was.url
+                && now.client_id == was.client_id
+                && now.refresh_token() == was.refresh_token()
+                && now.access_token() == was.access_token()
+        });
+        if !unchanged {
+            return Ok(false);
+        }
+        self.store(agent_id, server, &next, &ciphertext).await?;
+        grants.insert(server.to_string(), next);
+        *held = Some(grants);
+        Ok(true)
+    }
+
+    /// The lock one refresh of `server` holds.
+    async fn refresh_gate(&self, agent_id: AgentId, server: &str) -> Arc<Mutex<()>> {
+        Arc::clone(
+            self.refreshing
+                .lock()
+                .await
+                .entry((agent_id, server.to_string()))
+                .or_default(),
+        )
     }
 
     /// Start connecting `server` of `agent` for its owner `user_id`: the URL
@@ -558,8 +638,16 @@ impl OAuthGrants {
 
     /// Forget the grants of the agent's servers that are gone from `servers`
     /// (its own settings), or whose URL, authorization or client changed:
-    /// their tokens are for something else now.
-    pub async fn prune(&self, agent_id: AgentId, servers: &HashMap<String, McpServerConfig>) {
+    /// their tokens are for something else now. They are revoked with the
+    /// client secret of the server as it was (`before`), resolved from the
+    /// agent's `secrets`.
+    pub async fn prune(
+        &self,
+        agent_id: AgentId,
+        servers: &HashMap<String, McpServerConfig>,
+        before: &HashMap<String, McpServerConfig>,
+        secrets: &BTreeMap<String, String>,
+    ) {
         let stale: Vec<String> = {
             let slot = self.slot(agent_id).await;
             let mut held = slot.lock().await;
@@ -573,7 +661,11 @@ impl OAuthGrants {
                 .collect()
         };
         for server in stale {
-            match self.disconnect(agent_id, &server, None).await {
+            let secret = before
+                .get(&server)
+                .and_then(|cfg| owner_secret(cfg, secrets).ok())
+                .flatten();
+            match self.disconnect(agent_id, &server, secret).await {
                 Ok(_) => {
                     info!(%agent_id, server, "an MCP server's OAuth is forgotten: the server changed")
                 }
@@ -611,7 +703,7 @@ impl OAuthGrants {
             form.append_pair("client_secret", &secret);
         }
         let body = form.finish();
-        let client = self.http.stop.clone();
+        let client = self.revoker.clone();
         tokio::spawn(async move {
             let sent = client
                 .post(endpoint)
@@ -723,45 +815,40 @@ impl OAuthGrants {
             .collect()
     }
 
-    /// Refresh the access token of `server`, within [`REFRESH_TIMEOUT`].
-    /// `owner_secret` is the owner's client secret, resolved now. A refusal
-    /// ends the grant; other failures wait longer each time.
+    /// Refresh the access token of `server`. `owner_secret` is the owner's
+    /// client secret, resolved now. The agent's grants stay readable while
+    /// the request runs; what it returns is kept unless the grant changed
+    /// meanwhile (connected again, disconnected). A refusal ends the grant;
+    /// other failures wait longer each time.
     pub async fn refresh(
         &self,
         agent_id: AgentId,
         server: &str,
         owner_secret: Option<String>,
     ) -> Result<(), OAuthError> {
-        let slot = self.slot(agent_id).await;
-        let mut held = slot.lock().await;
-        let mut grants = self.loaded(agent_id, &mut held).await;
-        let Some(grant) = grants.get(server).cloned() else {
+        let gate = self.refresh_gate(agent_id, server).await;
+        let _one = gate.lock().await;
+        let Some(grant) = self.grant(agent_id, server).await else {
             return Ok(());
         };
         let secret = grant.client_secret(owner_secret.as_deref());
-        let outcome = tokio::time::timeout(REFRESH_TIMEOUT, self.refreshed(&grant, secret))
-            .await
-            .unwrap_or_else(|_| {
-                Err(OAuthError::Provider(format!(
-                    "no answer in {}s",
-                    REFRESH_TIMEOUT.as_secs()
-                )))
-            });
+        let outcome = self.refreshed(&grant, secret).await;
         let key = (agent_id, server.to_string());
         match outcome {
             Ok(credentials) => {
-                let grant = Grant {
+                let next = Grant {
                     credentials,
-                    ..grant
+                    ..grant.clone()
                 };
-                self.save(agent_id, server, &grant).await?;
-                grants.insert(server.to_string(), grant);
-                *held = Some(grants);
-                self.failures
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&key);
-                info!(%agent_id, server, "MCP server's OAuth token refreshed");
+                if self.replace(agent_id, server, &grant, next).await? {
+                    self.failures
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&key);
+                    info!(%agent_id, server, "MCP server's OAuth token refreshed");
+                } else {
+                    info!(%agent_id, server, "an MCP server's refreshed OAuth token is not kept: its grant changed meanwhile");
+                }
                 Ok(())
             }
             Err(e) => {
@@ -772,11 +859,11 @@ impl OAuthGrants {
                 if matches!(e, OAuthError::Rejected(_)) {
                     // The grant ended: its token is dropped, and it is not
                     // tried again until the owner connects the server again.
-                    let mut ended = grant;
+                    let mut ended = grant.clone();
                     ended.credentials.token_response = None;
-                    self.save(agent_id, server, &ended).await?;
-                    grants.insert(server.to_string(), ended);
-                    *held = Some(grants);
+                    if !self.replace(agent_id, server, &grant, ended).await? {
+                        return Ok(());
+                    }
                 } else {
                     let mut failures = self
                         .failures
@@ -818,18 +905,21 @@ impl OAuthGrants {
                 .await?;
         // Discovery again, for the resource the server names itself as and
         // the authorization server it uses now, which must be the one that
-        // issued the tokens.
-        let metadata = match manager.resolve_metadata().await {
-            Ok(resolution) if resolution.metadata.issuer == grant.metadata.issuer => {
-                resolution.metadata
-            }
-            Ok(_) => {
-                return Err(OAuthError::Rejected(
-                    "the server's authorization server changed; connect it again".into(),
-                ));
-            }
-            Err(_) => grant.metadata.clone(),
-        };
+        // issued the tokens. It has a deadline; the token request after it
+        // has none but its request timeout, so what a provider returns, a
+        // rotated refresh token with it, is never dropped half-way.
+        let metadata =
+            match tokio::time::timeout(DISCOVERY_TIMEOUT, manager.resolve_metadata()).await {
+                Ok(Ok(resolution)) if resolution.metadata.issuer == grant.metadata.issuer => {
+                    resolution.metadata
+                }
+                Ok(Ok(_)) => {
+                    return Err(OAuthError::Rejected(
+                        "the server's authorization server changed; connect it again".into(),
+                    ));
+                }
+                Ok(Err(_)) | Err(_) => grant.metadata.clone(),
+            };
         check_metadata(&metadata)?;
         manager.set_metadata(metadata);
         let mut client =
@@ -865,6 +955,7 @@ impl OAuthGrants {
         server: &str,
         url: &str,
         access_token: &str,
+        age_secs: u64,
     ) {
         let token = serde_json::from_value(serde_json::json!({
             "access_token": access_token,
@@ -873,7 +964,9 @@ impl OAuthGrants {
             "refresh_token": "refresh-0123",
         }))
         .expect("token");
-        let received = u64::try_from(Utc::now().timestamp()).unwrap_or_default();
+        let received = u64::try_from(Utc::now().timestamp())
+            .unwrap_or_default()
+            .saturating_sub(age_secs);
         let grant = Grant {
             url: url.to_string(),
             client_id: "havn".into(),
@@ -1097,7 +1190,7 @@ pub async fn refresh_loop(
                         return;
                     }
                     secrets
-                        .refresh_oauth(&registry, agent_id, REFRESH_TIMEOUT)
+                        .refresh_oauth(&registry, agent_id, REFRESH_WAIT)
                         .await;
                 }
             })
@@ -1183,6 +1276,79 @@ mod tests {
                 .await,
             Err(OAuthError::UnknownState)
         ));
+    }
+
+    /// A provider that takes half a minute to answer anything.
+    struct Slow;
+
+    impl OAuthHttpClient for Slow {
+        fn execute(&self, _request: OAuthHttpRequest) -> OAuthHttpClientFuture<'_> {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Err("too slow".into())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_refresh_does_not_hold_the_agents_tokens() {
+        use havn_db::repo::agents::{NewAgent, create as create_agent};
+        use havn_db::repo::users::{NewUser, create as create_user};
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let owner = create_user(&db, NewUser { display_name: "o" })
+            .await
+            .expect("user");
+        let agent = create_agent(
+            &db,
+            NewAgent {
+                owner_id: owner.id,
+                team_id: None,
+                name: "a",
+                config: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("agent");
+        let oauth = OAuthGrants::new(db, Some(KeyRing::from_passphrase("test-key")))
+            .with_http(Arc::new(Slow));
+        let url = "https://mcp.example.com/mcp";
+        // Issued 3500 s ago with an hour's lifetime: due.
+        oauth
+            .keep_for_test(agent.id, "slow", url, "oauth-access-slow", 3500)
+            .await;
+        let mut policy = Policy::default();
+        policy.permissions.can_access_network = true;
+        policy.network_policy.egress_allowed = true;
+        policy.mcp_servers = HashMap::from([(
+            "slow".to_string(),
+            McpServerConfig {
+                url: url.into(),
+                auth: McpAuth::Oauth(havn_core::McpOAuthConfig::default()),
+                ..Default::default()
+            },
+        )]);
+        let own = vec!["slow".to_string()];
+        let served = served(&policy, &own);
+        assert_eq!(oauth.due(agent.id, &served).await, vec!["slow".to_string()]);
+        let refreshing = tokio::spawn({
+            let oauth = oauth.clone();
+            async move { oauth.refresh(agent.id, "slow", None).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // What a starting agent reads, while the provider has not answered.
+        let tokens = tokio::time::timeout(
+            Duration::from_secs(2),
+            oauth.tokens(agent.id, &policy, &own),
+        )
+        .await
+        .expect("tokens wait for the refresh");
+        assert_eq!(tokens["slow"].access_token, "oauth-access-slow");
+        let due = tokio::time::timeout(Duration::from_secs(2), oauth.due(agent.id, &served))
+            .await
+            .expect("due waits for the refresh");
+        assert_eq!(due.len(), 1);
+        assert!(!refreshing.is_finished());
+        refreshing.abort();
     }
 
     #[test]
