@@ -18,7 +18,7 @@ on:
         default: ''
 
 permissions:
-  contents: write   # create releases + upload assets
+  contents: read   # only the release job writes (creates the release)
 
 env:
   CARGO_TERM_COLOR: always
@@ -164,17 +164,36 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-      - name: publish to release
-        # Only when a tag is in play: a `v*` tag push, or a manual run that
-        # supplied a tag input.
-        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != ''
+  release:
+    # One job, after every build, creates the release and uploads all the
+    # assets, so a tag gets exactly one release. Only when a tag is in play:
+    # a `v*` tag push, or a manual run that supplied a tag input.
+    name: publish to release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: create the release, or upload to the one that exists
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
         run: |
-          # Create the release if it doesn't exist yet; ignore the "already
-          # exists" error so parallel matrix jobs don't fight. --clobber lets
-          # re-runs replace assets.
-          gh release create "$TAG" --title "$TAG" --generate-notes \
-            || echo "release $TAG already exists; uploading assets"
-          gh release upload "$TAG" dist/* --clobber
+          ls -lh dist
+          # A rerun, or a manual run for a tag whose release exists, uploads
+          # to that release; --clobber replaces its assets.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes
+          fi
