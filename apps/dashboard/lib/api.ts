@@ -438,7 +438,16 @@ export type EmbeddingStatus = {
   config: Record<string, unknown>;
 };
 
+/** How a remote MCP server is authorized. Token and client secret are best `secret:<name>`. */
+export type McpAuth =
+  | { type: "none" }
+  | { type: "bearer"; token: string }
+  | { type: "oauth"; client_id?: string; client_secret?: string; scopes?: string[] };
+
+export type McpTransport = "auto" | "streamable_http" | "sse";
+
 export type McpServerConfig = {
+  /** A stdio server's binary; empty for a remote one. */
   binary: string;
   args: string[];
   env: Record<string, string>;
@@ -446,6 +455,30 @@ export type McpServerConfig = {
   extra_paths_ro: string[];
   timeout_seconds: number;
   enabled: boolean;
+  /** A remote server's URL (issue #234). */
+  url?: string;
+  transport?: McpTransport;
+  /** Values are text or `secret:<name>`. */
+  headers?: Record<string, string>;
+  auth?: McpAuth;
+};
+
+/** How one MCP server started, while the agent runs. */
+export type McpServerStatus = {
+  name: string;
+  connected: boolean;
+  tools?: string[];
+  error?: string;
+};
+
+/** A remote MCP server connected with OAuth: never its tokens. */
+export type McpOAuthStatus = {
+  /** The server URL the tokens were issued for. */
+  url: string;
+  connected_at: string;
+  expires_at?: string;
+  /** Why the last refresh failed. */
+  error?: string;
 };
 
 export type McpView = {
@@ -458,6 +491,16 @@ export type McpView = {
   /** Binaries currently installed at /usr/share/havn/mcp-servers/.
    * Empty when the dir is missing. */
   available_binaries: string[];
+  /** What the gateway's operator allows of remote servers (`[mcp]`). */
+  remote: { allowed: boolean; hosts: string[] };
+  /** How the servers started; absent while the agent is not running. */
+  status?: McpServerStatus[];
+  /** Servers connected with OAuth, by name. */
+  oauth: Record<string, McpOAuthStatus>;
+  /** Servers that do not run as set here, and why. */
+  refused: Record<string, string>;
+  /** Per remote server: `allowed`, `ask` (the owner is asked when the agent connects), `blocked` or `none`. */
+  reach: Record<string, string>;
 };
 
 /** One of an agent's secrets (issue #233): never its value. */
@@ -1128,6 +1171,17 @@ export const api = {
       request<McpView>(`/agents/${agentId}/mcp`, {
         method: "PATCH",
         body: JSON.stringify(patch),
+      }),
+    /** Start connecting a server whose auth is OAuth: where to send the browser. */
+    connect: (agentId: string, server: string) =>
+      request<{ authorization_url: string }>(
+        `/agents/${agentId}/mcp/${encodeURIComponent(server)}/oauth`,
+        { method: "POST" },
+      ),
+    /** Forget the server's OAuth tokens. */
+    disconnect: (agentId: string, server: string) =>
+      request<void>(`/agents/${agentId}/mcp/${encodeURIComponent(server)}/oauth`, {
+        method: "DELETE",
       }),
   },
 

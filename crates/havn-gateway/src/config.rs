@@ -158,6 +158,16 @@ pub struct GatewayConfig {
     /// ```
     #[serde(default)]
     pub fetch: FetchConfig,
+    /// Remote MCP servers (issue #234), applied on restart.
+    ///
+    /// TOML form:
+    /// ```toml
+    /// [mcp]
+    /// remote = "on"                       # or "off"
+    /// remote_hosts = ["mcp.notion.com"]   # empty: any host
+    /// ```
+    #[serde(default)]
+    pub mcp: McpConfig,
     /// Channel-adapter account configuration (spec §3.4). Keyed by
     /// channel id ("telegram", "slack", …); each value lists the
     /// operator-controlled accounts (bot identities) on that channel.
@@ -405,6 +415,50 @@ pub struct NetworkConfig {
     /// sets one: `off`, `allowlist` (through the egress proxy, asking the
     /// owner about each new domain) or `all` (every public address).
     pub default_egress: String,
+}
+
+/// `[mcp]`: whether agents may use remote MCP servers, and at which hosts.
+/// Within that, each agent reaches a server only as its network policy
+/// lets it reach the host.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpConfig {
+    /// `on` or `off`.
+    pub remote: String,
+    /// When not empty, the only hosts remote servers may be at; an entry
+    /// covers its subdomains, as `allowed_domains` do.
+    pub remote_hosts: Vec<String>,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            remote: "on".into(),
+            remote_hosts: Vec::new(),
+        }
+    }
+}
+
+impl McpConfig {
+    /// Whether a remote server at `host` may be used.
+    pub fn allows(&self, host: &str) -> bool {
+        self.remote == "on"
+            && (self.remote_hosts.is_empty()
+                || havn_core::policy::domain_listed(&self.remote_hosts, host))
+    }
+
+    /// Why a remote server at `host` may not be used, when it may not.
+    pub fn refusal(&self, host: &str) -> Option<String> {
+        if self.remote != "on" {
+            Some("this gateway's operator does not allow remote MCP servers ([mcp] remote)".into())
+        } else if !self.allows(host) {
+            Some(format!(
+                "this gateway's operator does not allow MCP servers at {host} ([mcp] remote_hosts)"
+            ))
+        } else {
+            None
+        }
+    }
 }
 
 /// `[channel_texts.<channel>.<account>]`: what an `allowlist` bot tells a
@@ -914,6 +968,7 @@ impl Default for GatewayConfig {
             attachments: AttachmentLimits::default(),
             search: SearchConfig::default(),
             fetch: FetchConfig::default(),
+            mcp: McpConfig::default(),
             channels: std::collections::BTreeMap::new(),
             bindings: Vec::new(),
         }
@@ -1081,6 +1136,14 @@ impl GatewayConfig {
             &parsed.network.blocked_domains,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if !matches!(parsed.mcp.remote.as_str(), "on" | "off") {
+            anyhow::bail!(
+                "[mcp] remote = {:?} must be \"on\" or \"off\"",
+                parsed.mcp.remote
+            );
+        }
+        havn_core::policy::validate_domains("[mcp] remote_hosts", &parsed.mcp.remote_hosts)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         if let Some(model) = &parsed.fetch.model
             && parsed.llm.catalog().get(model).is_none()
         {
@@ -1876,5 +1939,25 @@ metrics_listen = \"{value}\"
         assert!(with("127.0.0.1:8080").is_err(), "listen's port");
         assert!(with("127.0.0.1:3000").is_err(), "dashboard_listen's port");
         assert!(with("not an address").is_err());
+    }
+
+    #[test]
+    fn the_operator_allows_remote_mcp_servers_or_some_hosts() {
+        let any = GatewayConfig::from_toml("").expect("default");
+        assert!(any.mcp.allows("mcp.notion.com"));
+        let off = GatewayConfig::from_toml("[mcp]\nremote = \"off\"\n").expect("off");
+        assert!(!off.mcp.allows("mcp.notion.com"));
+        assert!(off.mcp.refusal("mcp.notion.com").is_some());
+        let some =
+            GatewayConfig::from_toml("[mcp]\nremote_hosts = [\"notion.com\"]\n").expect("hosts");
+        assert!(some.mcp.allows("mcp.notion.com"));
+        assert!(!some.mcp.allows("mcp.linear.app"));
+        assert!(
+            some.mcp
+                .refusal("mcp.linear.app")
+                .is_some_and(|w| w.contains("remote_hosts"))
+        );
+        assert!(GatewayConfig::from_toml("[mcp]\nremote = \"yes\"\n").is_err());
+        assert!(GatewayConfig::from_toml("[mcp]\nremote_hosts = [\"com\"]\n").is_err());
     }
 }

@@ -192,7 +192,7 @@ impl Policy {
             &self.network_policy.blocked_domains,
         )?;
         for (server, config) in &self.mcp_servers {
-            config.validate_env(server)?;
+            config.validate(server)?;
         }
         self.hooks.validate()
     }
@@ -526,38 +526,224 @@ pub struct McpServerConfig {
     /// Disable a server without removing the entry — useful when an
     /// operator is debugging.
     pub enabled: bool,
+    /// A remote server's URL (issue #234), in place of `binary`: the
+    /// runtime connects to it through the agent's network egress.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    /// How a remote server is spoken to.
+    #[serde(skip_serializing_if = "McpTransport::is_auto")]
+    pub transport: McpTransport,
+    /// Headers sent to a remote server. A value `secret:<name>` is the
+    /// agent's secret of that name.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, String>,
+    /// How a remote server is authorized.
+    #[serde(skip_serializing_if = "McpAuth::is_none")]
+    pub auth: McpAuth,
+}
+
+/// How a remote MCP server is spoken to: Streamable HTTP, the older
+/// HTTP+SSE transport, or Streamable HTTP falling back to HTTP+SSE.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransport {
+    #[default]
+    Auto,
+    StreamableHttp,
+    Sse,
+}
+
+impl McpTransport {
+    #[must_use]
+    pub fn is_auto(&self) -> bool {
+        *self == Self::Auto
+    }
+}
+
+/// How a remote MCP server is authorized.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum McpAuth {
+    #[default]
+    None,
+    /// `Authorization: Bearer <token>`; the token is best `secret:<name>`.
+    Bearer { token: String },
+    /// OAuth 2.1 as MCP specifies it: the owner connects the server on the
+    /// dashboard, and the gateway keeps and refreshes its tokens.
+    Oauth(McpOAuth),
+}
+
+impl McpAuth {
+    #[must_use]
+    pub fn is_none(&self) -> bool {
+        *self == Self::None
+    }
+}
+
+/// A remote MCP server's OAuth settings. Without a `client_id` the gateway
+/// registers itself with the authorization server.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpOAuth {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub client_id: String,
+    /// The client's secret, best `secret:<name>`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub client_secret: String,
+    /// The scopes asked for; without them, those the server names.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+}
+
+/// Headers of a remote MCP server, at most.
+pub const MAX_MCP_HEADERS: usize = 32;
+/// Bytes of a remote MCP server's URL, or of one of its header values.
+pub const MAX_MCP_VALUE_BYTES: usize = 4096;
+
+/// Headers the runtime sets itself for a remote MCP server.
+const RESERVED_MCP_HEADERS: [&str; 10] = [
+    "accept",
+    "authorization",
+    "connection",
+    "content-length",
+    "content-type",
+    "host",
+    "keep-alive",
+    "last-event-id",
+    "te",
+    "transfer-encoding",
+];
+
+/// Checks a value that may be `secret:<name>`: then it must name one of the
+/// agent's own secrets, as the runtime resolves it.
+fn check_secret_value(what: &str, value: &str) -> crate::Result<()> {
+    use crate::secret_ref::{self, SecretRef};
+    if !value.starts_with(secret_ref::PREFIX) {
+        return Ok(());
+    }
+    match secret_ref::parse(value) {
+        Ok(SecretRef::Agent { .. }) => Ok(()),
+        Ok(SecretRef::Credential { .. }) => Err(crate::Error::InvalidPolicy(format!(
+            "{what}: {value:?} names a gateway credential; \
+             an MCP server gets only the agent's own secrets, as `secret:<name>`"
+        ))),
+        Err(e) => Err(crate::Error::InvalidPolicy(format!("{what}: {e}"))),
+    }
 }
 
 impl McpServerConfig {
-    /// Checks that each `env` value starting with `secret:` names one of the
-    /// agent's own secrets (`secret:<name>`), as the runtime resolves it.
-    pub fn validate_env(&self, server: &str) -> crate::Result<()> {
-        use crate::secret_ref::{self, SecretRef};
+    /// Checks the entry: a stdio server (`binary`) or a remote one (`url`),
+    /// not both, and that each value starting with `secret:` names one of
+    /// the agent's own secrets (`secret:<name>`), as the runtime resolves it.
+    pub fn validate(&self, server: &str) -> crate::Result<()> {
+        let invalid = |why: String| {
+            Err(crate::Error::InvalidPolicy(format!(
+                "mcp_servers.{server}: {why}"
+            )))
+        };
         for (var, value) in &self.env {
-            if !value.starts_with(secret_ref::PREFIX) {
-                continue;
+            check_secret_value(&format!("mcp_servers.{server}.env.{var}"), value)?;
+        }
+        if !self.is_remote() {
+            if self.transport != McpTransport::Auto
+                || !self.headers.is_empty()
+                || !self.auth.is_none()
+            {
+                return invalid("transport, headers and auth are for a server with a `url`".into());
             }
-            match secret_ref::parse(value) {
-                Ok(SecretRef::Agent { .. }) => {}
-                Ok(SecretRef::Credential { .. }) => {
-                    return Err(crate::Error::InvalidPolicy(format!(
-                        "mcp_servers.{server}.env.{var}: {value:?} names a gateway credential; \
-                         an MCP server gets only the agent's own secrets, as `secret:<name>`"
-                    )));
+            return Ok(());
+        }
+        if !self.binary.is_empty()
+            || !self.args.is_empty()
+            || !self.env.is_empty()
+            || !self.extra_paths_rw.is_empty()
+            || !self.extra_paths_ro.is_empty()
+        {
+            return invalid(
+                "a server with a `url` is remote: it takes no binary, args, env or paths".into(),
+            );
+        }
+        if let Err(why) = remote_url(&self.url) {
+            return invalid(why);
+        }
+        if self.headers.len() > MAX_MCP_HEADERS {
+            return invalid(format!("more than {MAX_MCP_HEADERS} headers"));
+        }
+        for (name, value) in &self.headers {
+            let lower = name.to_ascii_lowercase();
+            let token = !name.is_empty()
+                && name.len() <= 128
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
+            if !token {
+                return invalid(format!("{name:?} is not a header name"));
+            }
+            if RESERVED_MCP_HEADERS.contains(&lower.as_str())
+                || lower.starts_with("mcp-")
+                || lower.starts_with("proxy-")
+            {
+                return invalid(format!(
+                    "header {name} is set by Havn (use `auth` for Authorization)"
+                ));
+            }
+            check_header_value(&format!("mcp_servers.{server}.headers.{name}"), value)?;
+        }
+        match &self.auth {
+            McpAuth::None => {}
+            McpAuth::Bearer { token } => {
+                if token.trim().is_empty() {
+                    return invalid("auth.token is empty".into());
                 }
-                Err(e) => {
-                    return Err(crate::Error::InvalidPolicy(format!(
-                        "mcp_servers.{server}.env.{var}: {e}"
-                    )));
+                check_header_value(&format!("mcp_servers.{server}.auth.token"), token)?;
+            }
+            McpAuth::Oauth(oauth) => {
+                if !self.url.starts_with("https://") {
+                    return invalid("OAuth needs an https URL".into());
+                }
+                if !oauth.client_secret.is_empty() && oauth.client_id.is_empty() {
+                    return invalid("auth.client_secret needs a client_id".into());
+                }
+                check_header_value(
+                    &format!("mcp_servers.{server}.auth.client_id"),
+                    &oauth.client_id,
+                )?;
+                check_header_value(
+                    &format!("mcp_servers.{server}.auth.client_secret"),
+                    &oauth.client_secret,
+                )?;
+                if oauth.scopes.len() > 64
+                    || oauth.scopes.iter().any(|s| {
+                        s.is_empty()
+                            || s.len() > 256
+                            || s.bytes()
+                                .any(|b| !b.is_ascii_graphic() || b == b'"' || b == b'\\')
+                    })
+                {
+                    return invalid(
+                        "auth.scopes: each a word of printable ASCII, at most 64".into(),
+                    );
                 }
             }
         }
         Ok(())
     }
 
+    /// A remote server: one with a `url`.
+    #[must_use]
+    pub fn is_remote(&self) -> bool {
+        !self.url.is_empty()
+    }
+
+    /// The host of a remote server's URL, in lowercase.
+    #[must_use]
+    pub fn remote_host(&self) -> Option<String> {
+        remote_url(&self.url).ok().map(|(_, host)| host)
+    }
+
     /// Whether `self` runs as `other`: the same binary, arguments,
-    /// environment and paths (whether each is enabled, and its timeout,
-    /// aside).
+    /// environment and paths, or the same URL, transport, headers and
+    /// authorization (whether each is enabled, and its timeout, aside).
     #[must_use]
     pub fn runs_as(&self, other: &McpServerConfig) -> bool {
         self.binary == other.binary
@@ -565,15 +751,65 @@ impl McpServerConfig {
             && self.env == other.env
             && self.extra_paths_rw == other.extra_paths_rw
             && self.extra_paths_ro == other.extra_paths_ro
+            && self.url == other.url
+            && self.transport == other.transport
+            && self.headers == other.headers
+            && self.auth == other.auth
     }
 
-    /// Whether its `env` refers to a secret.
+    /// Whether it is given any of the agent's secrets: a `secret:` reference
+    /// in its `env`, headers or authorization, or OAuth tokens.
     #[must_use]
     pub fn uses_secrets(&self) -> bool {
-        self.env
-            .values()
-            .any(|v| v.starts_with(crate::secret_ref::PREFIX))
+        let reference = |v: &String| v.starts_with(crate::secret_ref::PREFIX);
+        self.env.values().any(reference)
+            || self.headers.values().any(reference)
+            || match &self.auth {
+                McpAuth::None => false,
+                McpAuth::Bearer { token } => reference(token),
+                McpAuth::Oauth(_) => true,
+            }
     }
+}
+
+/// Checks a header value of a remote server: printable, bounded, and a
+/// reference of the agent's own when it is `secret:`.
+fn check_header_value(what: &str, value: &str) -> crate::Result<()> {
+    if value.len() > MAX_MCP_VALUE_BYTES || value.bytes().any(|b| b.is_ascii_control()) {
+        return Err(crate::Error::InvalidPolicy(format!(
+            "{what}: at most {MAX_MCP_VALUE_BYTES} bytes, without control characters"
+        )));
+    }
+    check_secret_value(what, value)
+}
+
+/// The scheme and lowercase host of a remote MCP server's URL: http or
+/// https, with a host name or address, without user name, password or
+/// fragment.
+pub fn remote_url(url: &str) -> Result<(String, String), String> {
+    if url.len() > MAX_MCP_VALUE_BYTES {
+        return Err(format!("url: at most {MAX_MCP_VALUE_BYTES} bytes"));
+    }
+    let parsed = url::Url::parse(url).map_err(|e| format!("url {url:?}: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("url {url:?}: http or https only"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "url {url:?}: no user name or password in it (use headers or auth)"
+        ));
+    }
+    if parsed.fragment().is_some() {
+        return Err(format!("url {url:?}: no #fragment"));
+    }
+    let host = parsed
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| format!("url {url:?}: no host"))?;
+    Ok((
+        parsed.scheme().to_string(),
+        host.trim_end_matches('.').to_ascii_lowercase(),
+    ))
 }
 
 impl Default for McpServerConfig {
@@ -586,6 +822,10 @@ impl Default for McpServerConfig {
             extra_paths_ro: Vec::new(),
             timeout_seconds: 60,
             enabled: true,
+            url: String::new(),
+            transport: McpTransport::Auto,
+            headers: HashMap::new(),
+            auth: McpAuth::None,
         }
     }
 }
@@ -1476,5 +1716,108 @@ mod tests {
         assert!(server("secret:github").uses_secrets());
         assert!(server("secret:github").runs_as(&server("secret:github")));
         assert!(!server("secret:github").runs_as(&server("secret:gitlab")));
+    }
+
+    #[test]
+    fn remote_mcp_servers_parse_and_are_checked() {
+        let raw = serde_json::json!({
+            "notion": {
+                "url": "https://mcp.notion.com/mcp",
+                "auth": {"type": "oauth"},
+            },
+            "linear": {
+                "url": "https://mcp.linear.app/sse",
+                "transport": "sse",
+                "headers": {"X-Team": "core"},
+                "auth": {"type": "bearer", "token": "secret:linear"},
+            }
+        });
+        let parsed: HashMap<String, McpServerConfig> = serde_json::from_value(raw).expect("parse");
+        let notion = &parsed["notion"];
+        assert!(notion.is_remote());
+        assert_eq!(notion.remote_host().as_deref(), Some("mcp.notion.com"));
+        assert_eq!(notion.auth, McpAuth::Oauth(McpOAuth::default()));
+        assert!(notion.uses_secrets(), "OAuth tokens are the owner's");
+        let linear = &parsed["linear"];
+        assert_eq!(linear.transport, McpTransport::Sse);
+        assert!(linear.uses_secrets());
+        for (name, server) in &parsed {
+            assert!(server.validate(name).is_ok(), "{name}");
+        }
+        // A stdio entry serializes without the remote keys.
+        let stdio = serde_json::to_value(McpServerConfig {
+            binary: "fs".into(),
+            ..Default::default()
+        })
+        .expect("json");
+        for key in ["url", "transport", "headers", "auth"] {
+            assert!(stdio.get(key).is_none(), "{key}");
+        }
+
+        let remote = |edit: fn(&mut McpServerConfig)| {
+            let mut server = McpServerConfig {
+                url: "https://mcp.example.com/mcp".into(),
+                ..Default::default()
+            };
+            edit(&mut server);
+            server.validate("x")
+        };
+        assert!(remote(|_| {}).is_ok());
+        assert!(remote(|s| s.url = "http://mcp.example.com/mcp".into()).is_ok());
+        for bad in [
+            (|s: &mut McpServerConfig| s.binary = "fs".into()) as fn(&mut McpServerConfig),
+            |s| s.env = HashMap::from([("A".into(), "b".into())]),
+            |s| s.url = "ftp://mcp.example.com".into(),
+            |s| s.url = "https://user:pw@mcp.example.com".into(),
+            |s| s.url = "https://mcp.example.com/#x".into(),
+            |s| s.url = "not a url".into(),
+            |s| s.headers = HashMap::from([("Authorization".into(), "Bearer x".into())]),
+            |s| s.headers = HashMap::from([("Mcp-Session-Id".into(), "x".into())]),
+            |s| s.headers = HashMap::from([("Bad Name".into(), "x".into())]),
+            |s| s.headers = HashMap::from([("X-Key".into(), "a\nb".into())]),
+            |s| s.headers = HashMap::from([("X-Key".into(), "secret:channel:x:y".into())]),
+            |s| {
+                s.auth = McpAuth::Bearer {
+                    token: String::new(),
+                }
+            },
+            |s| {
+                s.url = "http://mcp.example.com/mcp".into();
+                s.auth = McpAuth::Oauth(McpOAuth::default());
+            },
+            |s| {
+                s.auth = McpAuth::Oauth(McpOAuth {
+                    client_secret: "secret:x".into(),
+                    ..Default::default()
+                })
+            },
+        ] {
+            assert!(remote(bad).is_err());
+        }
+        // Remote keys on a stdio entry.
+        let stdio = McpServerConfig {
+            binary: "fs".into(),
+            headers: HashMap::from([("X-Key".into(), "v".into())]),
+            ..Default::default()
+        };
+        assert!(stdio.validate("fs").is_err());
+    }
+
+    #[test]
+    fn a_remote_server_runs_as_another_only_at_the_same_url_and_auth() {
+        let server = |url: &str, token: &str| McpServerConfig {
+            url: url.into(),
+            auth: McpAuth::Bearer {
+                token: token.into(),
+            },
+            ..Default::default()
+        };
+        let own = server("https://mcp.example.com/mcp", "secret:t");
+        assert!(own.runs_as(&server("https://mcp.example.com/mcp", "secret:t")));
+        assert!(!own.runs_as(&server("https://evil.example/mcp", "secret:t")));
+        assert!(!own.runs_as(&server("https://mcp.example.com/mcp", "secret:u")));
+        let mut headers = own.clone();
+        headers.headers = HashMap::from([("X-Forward".into(), "evil".into())]);
+        assert!(!own.runs_as(&headers));
     }
 }

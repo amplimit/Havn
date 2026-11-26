@@ -27,7 +27,8 @@ pub use codec::{FrameError, read_frame, write_frame};
 /// 0.7.0: `ChatTitled`.
 /// 0.8.0: `HeartbeatTick` names where its result goes.
 /// 0.10.0: `Welcome.secrets` and `Secrets` (issue #233).
-pub const PROTOCOL_VERSION: &str = "0.10.0";
+/// 0.11.0: `McpStatus` and `Secrets.mcp_tokens` (issue #234).
+pub const PROTOCOL_VERSION: &str = "0.11.0";
 
 /// How often a runtime sends [`AgentToGateway::LivenessPing`] once it is
 /// up. The gateway restarts an agent that stays connected but silent for
@@ -108,6 +109,9 @@ pub enum AgentToGateway {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         keep: bool,
     },
+    /// How the agent's MCP servers started, sent once they have, and
+    /// again when one fails after (issue #234), for its settings page.
+    McpStatus(McpStatus),
 }
 
 /// See [`AgentToGateway::Step`].
@@ -198,6 +202,26 @@ pub struct Secrets {
     /// Variables shell commands get: a value, or `secret:<name>`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub shell_env: BTreeMap<String, String>,
+    /// By MCP server name, the OAuth access token the owner connected it
+    /// with (issue #234), for the agent's own servers only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp_tokens: BTreeMap<String, McpToken>,
+}
+
+/// An OAuth access token of a remote MCP server, and the server URL it was
+/// issued for: it is sent there only.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpToken {
+    pub url: String,
+    pub access_token: String,
+}
+
+impl std::fmt::Debug for McpToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpToken")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Debug for Secrets {
@@ -205,9 +229,34 @@ impl std::fmt::Debug for Secrets {
         f.debug_struct("Secrets")
             .field("values", &self.values.keys().collect::<Vec<_>>())
             .field("shell_env", &self.shell_env.keys().collect::<Vec<_>>())
+            .field("mcp_tokens", &self.mcp_tokens.keys().collect::<Vec<_>>())
             .finish()
     }
 }
+
+/// See [`AgentToGateway::McpStatus`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpStatus {
+    pub servers: Vec<McpServerStatus>,
+}
+
+/// How one of the agent's MCP servers started.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerStatus {
+    pub name: String,
+    /// It is up and its tools are the agent's.
+    pub connected: bool,
+    /// The names of its tools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// Why it is not up, or what failed since, with the agent's secrets
+    /// redacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Characters of an [`McpServerStatus`] error kept.
+pub const MAX_MCP_ERROR_CHARS: usize = 500;
 
 /// See [`GatewayToAgent::StopTurn`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1313,6 +1362,13 @@ mod tests {
         let secrets = Secrets {
             values: BTreeMap::from([("github".to_string(), "ghp_value_1234".to_string())]),
             shell_env: BTreeMap::from([("GH_TOKEN".to_string(), "secret:github".to_string())]),
+            mcp_tokens: BTreeMap::from([(
+                "notion".to_string(),
+                McpToken {
+                    url: "https://mcp.notion.com/mcp".into(),
+                    access_token: "oauth_access_5678".into(),
+                },
+            )]),
         };
         let line = serde_json::to_string(&GatewayToAgent::Secrets(secrets.clone())).expect("ser");
         let GatewayToAgent::Secrets(parsed) = serde_json::from_str(&line).expect("parse") else {
@@ -1322,6 +1378,7 @@ mod tests {
         let debug = format!("{:?}", GatewayToAgent::Secrets(secrets));
         assert!(debug.contains("github") && debug.contains("GH_TOKEN"));
         assert!(!debug.contains("ghp_value_1234"));
+        assert!(debug.contains("notion") && !debug.contains("oauth_access_5678"));
     }
 
     #[test]

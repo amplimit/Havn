@@ -23,9 +23,9 @@ pub use message::{
 pub use policy::{
     AGENT_CGROUP_PARENT, AGENT_CGROUP_PREFIX, AdminVisibility, BudgetExhaustAction, BudgetPolicy,
     ChannelAllowance, ChatTitles, ContextToolsetEntry, ContextToolsets, HOOK_REGEX_SIZE_LIMIT,
-    HookPolicy, MAX_HOOK_PATTERN_LEN, MAX_HOOK_PATTERNS, MAX_HOOK_RULES, McpServerConfig,
-    NetworkPolicy, Permissions, Policy, ResourceLimits, ToolHookRule, agent_cgroup,
-    compile_hook_pattern,
+    HookPolicy, MAX_HOOK_PATTERN_LEN, MAX_HOOK_PATTERNS, MAX_HOOK_RULES, McpAuth, McpOAuth,
+    McpServerConfig, McpTransport, NetworkPolicy, Permissions, Policy, ResourceLimits,
+    ToolHookRule, agent_cgroup, compile_hook_pattern,
 };
 
 /// The language of what Havn writes for an agent (issue #250): the parts of

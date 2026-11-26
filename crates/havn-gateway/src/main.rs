@@ -20,6 +20,7 @@ mod egress_proxy;
 mod heartbeat;
 mod keyring;
 mod llm_proxy;
+mod mcp_oauth;
 mod metrics;
 mod model_catalog;
 mod office;
@@ -254,6 +255,7 @@ async fn serve() -> anyhow::Result<()> {
 
     let mut cfg = GatewayConfig::load().context("loading gateway config")?;
     policy_resolver::set_operator_blocked_domains(cfg.network.blocked_domains.clone());
+    policy_resolver::set_operator_mcp(cfg.mcp.clone());
     policy_resolver::set_default_egress(cfg.network.default_egress.clone());
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -566,7 +568,8 @@ async fn serve() -> anyhow::Result<()> {
     }
     let search = Arc::new(web_search::WebSearch::new(cfg.search.clone(), &cfg.llm));
     let llm = Arc::new(cfg.llm.clone());
-    let secret_store = secrets::SecretStore::new(db.clone(), keyring.clone());
+    let secret_store = secrets::SecretStore::new(db.clone(), keyring.clone())
+        .with_multi_user(cfg.trust_header.enabled);
     let state = AppState {
         db: db.clone(),
         bootstrap_user_id: user.id,
@@ -703,6 +706,12 @@ async fn serve() -> anyhow::Result<()> {
         heartbeat.run().await;
     });
 
+    // Background task: refreshing remote MCP servers' OAuth tokens (issue #234).
+    let oauth_task = tokio::spawn(mcp_oauth::refresh_loop(
+        state.secrets.clone(),
+        state.registry.clone(),
+    ));
+
     // Background task: cron scheduler (spec §8.5).
     let cron_task = tokio::spawn(async move {
         cron_scheduler.run().await;
@@ -802,6 +811,11 @@ async fn serve() -> anyhow::Result<()> {
             "/agents/{id}/mcp",
             get(api::mcp::get).patch(api::mcp::patch),
         )
+        .route(
+            "/agents/{id}/mcp/{server}/oauth",
+            post(api::mcp::connect).delete(api::mcp::disconnect),
+        )
+        .route(mcp_oauth::CALLBACK_PATH, get(api::mcp::callback))
         .route("/agents/{id}/secrets", get(api::secrets::list))
         .route(
             "/agents/{id}/secrets/{name}",
@@ -1064,7 +1078,7 @@ async fn serve() -> anyhow::Result<()> {
         }
     }
     // No new ticks, and no liveness verdicts on agents that are leaving.
-    for task in [liveness_task, heartbeat_task, cron_task] {
+    for task in [liveness_task, heartbeat_task, cron_task, oauth_task] {
         task.abort();
         let _ = task.await;
     }

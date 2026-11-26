@@ -44,6 +44,7 @@ chrono-tz.workspace = true
 arc-swap.workspace = true
 bytemuck.workspace = true
 rmcp.workspace = true
+sse-stream.workspace = true
 
 # Optional: local fastembed-rs provider for hybrid retrieval. See
 # `features.local-embed` above + `embedding/local.rs`.

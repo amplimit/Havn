@@ -19,11 +19,12 @@ use std::io::Write as _;
 use std::sync::{RwLock, RwLockReadGuard};
 
 use havn_core::secret_ref::{self, SecretRef};
-use havn_proto::Secrets;
+use havn_proto::{McpToken, Secrets};
 
 struct Current {
     values: BTreeMap<String, String>,
     shell_env: BTreeMap<String, String>,
+    mcp_tokens: BTreeMap<String, McpToken>,
     /// Every `(name, value)` this process was given, the current ones and
     /// those replaced or removed since.
     seen: Vec<(String, String)>,
@@ -34,6 +35,7 @@ struct Current {
 static CURRENT: RwLock<Current> = RwLock::new(Current {
     values: BTreeMap::new(),
     shell_env: BTreeMap::new(),
+    mcp_tokens: BTreeMap::new(),
     seen: Vec::new(),
     redaction: Vec::new(),
 });
@@ -48,15 +50,20 @@ fn read() -> RwLockReadGuard<'static, Current> {
 /// before stay redacted.
 pub fn set(secrets: Secrets) {
     let mut seen = read().seen.clone();
-    for (name, value) in &secrets.values {
-        if !seen.iter().any(|(n, v)| n == name && v == value) {
-            seen.push((name.clone(), value.clone()));
+    let tokens = secrets
+        .mcp_tokens
+        .iter()
+        .map(|(server, token)| (token_name(server), token.access_token.clone()));
+    for (name, value) in secrets.values.clone().into_iter().chain(tokens) {
+        if !seen.iter().any(|(n, v)| *n == name && *v == value) {
+            seen.push((name, value));
         }
     }
     let redaction = secret_ref::redaction_list(seen.iter().map(|(n, v)| (n, v)));
     let next = Current {
         values: secrets.values,
         shell_env: secrets.shell_env,
+        mcp_tokens: secrets.mcp_tokens,
         seen,
         redaction,
     };
@@ -68,6 +75,22 @@ pub fn set(secrets: Secrets) {
         next,
     );
     drop(previous);
+}
+
+/// The name an MCP server's OAuth token is redacted as: not one an owner can
+/// give a secret, or refer to.
+fn token_name(server: &str) -> String {
+    format!("mcp:{server}")
+}
+
+/// The OAuth access token MCP server `server` was connected with, when it
+/// was issued for `url`.
+pub fn mcp_token(server: &str, url: &str) -> Option<String> {
+    read()
+        .mcp_tokens
+        .get(server)
+        .filter(|token| token.url == url)
+        .map(|token| token.access_token.clone())
 }
 
 /// `text` with every secret's value replaced with `[secret:<name>]`.
@@ -295,7 +318,7 @@ pub(crate) mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         set(Secrets {
             values: BTreeMap::from([("api".to_string(), "sk-live-123456".to_string())]),
-            shell_env: BTreeMap::new(),
+            ..Default::default()
         });
         assert_eq!(redact("key=sk-live-123456"), "key=[secret:api]");
         assert_eq!(resolve("secret:api").as_deref(), Ok("sk-live-123456"));
@@ -307,7 +330,7 @@ pub(crate) mod tests {
                     "-----BEGIN KEY-----\nAAAA\n-----END KEY-----".to_string(),
                 ),
             ]),
-            shell_env: BTreeMap::new(),
+            ..Default::default()
         });
         assert_eq!(resolve("secret:api").as_deref(), Ok("sk-live-654321"));
         assert_eq!(
@@ -355,6 +378,7 @@ pub(crate) mod tests {
             seen: Vec::new(),
             values,
             shell_env,
+            mcp_tokens: BTreeMap::new(),
         };
         apply_in(&current, &mut command);
         let envs: BTreeMap<String, Option<String>> = command
@@ -374,5 +398,35 @@ pub(crate) mod tests {
             secret_ref::redact("token ghp_abcdefgh", &current.redaction),
             "token [secret:github]"
         );
+    }
+
+    #[test]
+    fn an_mcp_token_goes_to_its_url_only_and_is_redacted() {
+        let _one = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set(Secrets {
+            mcp_tokens: BTreeMap::from([(
+                "notion".to_string(),
+                McpToken {
+                    url: "https://mcp.notion.com/mcp".into(),
+                    access_token: "oauth-access-0123".into(),
+                },
+            )]),
+            ..Default::default()
+        });
+        assert_eq!(
+            mcp_token("notion", "https://mcp.notion.com/mcp").as_deref(),
+            Some("oauth-access-0123")
+        );
+        assert_eq!(mcp_token("notion", "https://evil.example/mcp"), None);
+        assert_eq!(mcp_token("linear", "https://mcp.notion.com/mcp"), None);
+        assert_eq!(
+            redact("Bearer oauth-access-0123"),
+            "Bearer [secret:mcp:notion]"
+        );
+        assert!(resolve("secret:mcp:notion").is_err());
+        set(Secrets::default());
+        assert_eq!(mcp_token("notion", "https://mcp.notion.com/mcp"), None);
     }
 }
