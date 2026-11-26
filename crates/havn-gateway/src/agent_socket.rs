@@ -3578,7 +3578,16 @@ async fn keep_chat_reply_alive(shown: ChatWriting) {
     };
     loop {
         tokio::time::sleep(CHAT_REPLY_ALIVE_EVERY).await;
-        if !shown.send(alive.clone()).await {
+        // Asked each time, whether or not the frame can go: a reply that
+        // ended while its adapter was away, or did not take such frames,
+        // ends this too.
+        let open = shown.replies.is_open(
+            shown.agent_id,
+            &shown.channel_id,
+            &shown.chat,
+            &shown.frame.reply,
+        );
+        if !open || !shown.send(alive.clone()).await {
             return;
         }
     }
@@ -5180,6 +5189,49 @@ mod tests {
         tokio::time::sleep(CHAT_REPLY_ALIVE_EVERY + Duration::from_secs(1)).await;
         assert!(adapter.try_recv().is_err());
         assert!(alive.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_ending_while_no_adapter_takes_its_frames_stops_being_kept_alive() {
+        // No adapter connected for the account, then one that does not show
+        // replies as they are written: no frame can go.
+        let router = crate::channel_router::ChannelRouter::new();
+        let replies = ChatReplies::default();
+        let agent = AgentId::new();
+        let (reply, _) = replies.open(agent, 1, "ch", "c1", "t1");
+        let shown = ChatWriting {
+            router: router.clone(),
+            replies: replies.clone(),
+            agent_id: agent,
+            channel: "telegram".into(),
+            channel_id: "ch".into(),
+            chat: "c1".into(),
+            frame: havn_proto::channel::ChannelWriting {
+                account_id: "bot".into(),
+                to: "tg:1".into(),
+                in_reply_to: None,
+                reply: reply.expect("open"),
+                text: String::new(),
+                buttons: Vec::new(),
+                waiting: true,
+                alive: false,
+            },
+            waiting: "Replying…".into(),
+        };
+        let alive = tokio::spawn(keep_chat_reply_alive(shown));
+        tokio::time::sleep(CHAT_REPLY_ALIVE_EVERY + Duration::from_secs(1)).await;
+        assert!(!alive.is_finished(), "kept while it is written");
+        let (older, mut older_rx) = mpsc::channel(8);
+        router
+            .register(
+                crate::channel_router::AccountKey::new("telegram", "bot"),
+                older,
+            )
+            .await;
+        replies.of(agent, "ch", "c1", true);
+        tokio::time::sleep(CHAT_REPLY_ALIVE_EVERY + Duration::from_secs(1)).await;
+        assert!(alive.is_finished(), "ended with its reply");
+        assert!(older_rx.try_recv().is_err());
     }
 
     #[tokio::test]
