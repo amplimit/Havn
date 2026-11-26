@@ -3296,6 +3296,12 @@ const MAX_CHAT_REPLIES: usize = 32;
 /// #325): a call of its turn that comes after it is not shown.
 const CHAT_REPLY_ENDED_KEPT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// How often a chat app is told a reply is still being written while
+/// nothing new is shown (issue #325): its turn thinks, writes a tool's
+/// input, runs a tool or waits for an approval. The adapter keeps it,
+/// with its Stop button, as long as these come.
+const CHAT_REPLY_ALIVE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// A reply a chat app is shown as it is written (issue #325).
 #[derive(Debug, Clone)]
 struct ChatReply {
@@ -3307,19 +3313,29 @@ struct ChatReply {
     connection: u64,
     /// When it ended; `None` while it is written.
     ended: Option<std::time::Instant>,
+    /// Whether the adapter is told it is still being written.
+    kept_alive: bool,
 }
 
 /// An agent, a conversation and one of its chats.
 type ChatKey = (AgentId, String, String);
 
+/// What [`ChatReplies`] holds.
+#[derive(Debug, Default)]
+struct ChatRepliesHeld {
+    replies: HashMap<ChatKey, ChatReply>,
+    /// The agents that write [`MAX_CHAT_REPLIES`], said once.
+    full: std::collections::HashSet<AgentId>,
+}
+
 /// The replies chat apps are shown as they are written (issue #325), by
 /// agent, conversation and chat: one per turn, from its first call until
 /// the runtime sends its last part or its connection ends.
 #[derive(Debug, Clone, Default)]
-pub struct ChatReplies(Arc<std::sync::Mutex<HashMap<ChatKey, ChatReply>>>);
+pub struct ChatReplies(Arc<std::sync::Mutex<ChatRepliesHeld>>);
 
 impl ChatReplies {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ChatKey, ChatReply>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ChatRepliesHeld> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -3338,14 +3354,14 @@ impl ChatReplies {
         turn: &str,
     ) -> (Option<String>, Option<String>) {
         let now = std::time::Instant::now();
-        let mut replies = self.lock();
-        replies.retain(|_, r| {
+        let mut held = self.lock();
+        held.replies.retain(|_, r| {
             r.ended
                 .is_none_or(|at| now.duration_since(at) < CHAT_REPLY_ENDED_KEPT)
         });
         let key = (agent_id, channel_id.to_string(), chat.to_string());
         let mut stale = None;
-        if let Some(found) = replies.get(&key) {
+        if let Some(found) = held.replies.get(&key) {
             if found.turn == turn {
                 let open = found.ended.is_none() && found.connection == connection;
                 return (open.then(|| found.reply.clone()), None);
@@ -3353,23 +3369,34 @@ impl ChatReplies {
             if found.ended.is_none() {
                 stale = Some(found.reply.clone());
             }
-            replies.remove(&key);
+            held.replies.remove(&key);
         }
-        let written = replies
+        let written = held
+            .replies
             .iter()
             .filter(|((agent, _, _), r)| *agent == agent_id && r.ended.is_none())
             .count();
         if written >= MAX_CHAT_REPLIES {
+            if held.full.insert(agent_id) {
+                warn!(
+                    %agent_id,
+                    max = MAX_CHAT_REPLIES,
+                    "the agent writes as many replies in chat apps as it may at once; \
+                     the next are shown once written"
+                );
+            }
             return (None, stale);
         }
+        held.full.remove(&agent_id);
         let reply = Uuid::now_v7().to_string();
-        replies.insert(
+        held.replies.insert(
             key,
             ChatReply {
                 reply: reply.clone(),
                 turn: turn.to_string(),
                 connection,
                 ended: None,
+                kept_alive: false,
             },
         );
         (Some(reply), stale)
@@ -3378,16 +3405,27 @@ impl ChatReplies {
     /// Whether `reply` is still being written there.
     fn is_open(&self, agent_id: AgentId, channel_id: &str, chat: &str, reply: &str) -> bool {
         self.lock()
+            .replies
             .get(&(agent_id, channel_id.to_string(), chat.to_string()))
             .is_some_and(|r| r.reply == reply && r.ended.is_none())
+    }
+
+    /// Whether the adapter is to be told, from now on, that `reply` is
+    /// still being written: true once, while it is.
+    fn keep_alive(&self, agent_id: AgentId, channel_id: &str, chat: &str, reply: &str) -> bool {
+        self.lock()
+            .replies
+            .get_mut(&(agent_id, channel_id.to_string(), chat.to_string()))
+            .filter(|r| r.reply == reply && r.ended.is_none())
+            .is_some_and(|r| !std::mem::replace(&mut r.kept_alive, true))
     }
 
     /// The id of the reply being written there, if any; it ends when this
     /// is its `last` part.
     fn of(&self, agent_id: AgentId, channel_id: &str, chat: &str, last: bool) -> Option<String> {
         let key = (agent_id, channel_id.to_string(), chat.to_string());
-        let mut replies = self.lock();
-        let found = replies.get_mut(&key).filter(|r| r.ended.is_none())?;
+        let mut held = self.lock();
+        let found = held.replies.get_mut(&key).filter(|r| r.ended.is_none())?;
         if last {
             found.ended = Some(std::time::Instant::now());
         }
@@ -3399,6 +3437,7 @@ impl ChatReplies {
     fn end_connection(&self, agent_id: AgentId, connection: u64) -> Vec<(String, String)> {
         let now = std::time::Instant::now();
         self.lock()
+            .replies
             .iter_mut()
             .filter(|((agent, _, _), r)| {
                 *agent == agent_id && r.connection == connection && r.ended.is_none()
@@ -3413,6 +3452,7 @@ impl ChatReplies {
 
 /// What a chat app's conversation is shown of a call of the reply being
 /// written there (issue #325).
+#[derive(Clone)]
 struct ChatWriting {
     router: crate::channel_router::ChannelRouter,
     replies: ChatReplies,
@@ -3429,7 +3469,8 @@ impl ChatWriting {
     /// For a call of a turn that marks its reply's last part, over
     /// `connection`, answering a chat app's conversation the agent may send
     /// to, whose adapter shows replies as they are written; `None` for any
-    /// other.
+    /// other. The first call of a reply has the adapter told, every
+    /// [`CHAT_REPLY_ALIVE_EVERY`], that it is still being written.
     async fn open(
         ctx: &AgentSocketCtx,
         agent_id: AgentId,
@@ -3464,7 +3505,7 @@ impl ChatWriting {
         if let Some(stale) = stale {
             end_chat_reply(&ctx.channel_router, &target.channel_id, stale).await;
         }
-        Some(Self {
+        let shown = Self {
             router: ctx.channel_router.clone(),
             replies: ctx.chat_replies.clone(),
             agent_id,
@@ -3481,34 +3522,67 @@ impl ChatWriting {
                     label: language.pick("Stop", "停止").to_string(),
                     data: "/stop".to_string(),
                 }]],
+                waiting: false,
+                alive: false,
             },
             waiting: language.pick("Replying…", "正在回复…").to_string(),
-        })
+        };
+        if shown
+            .replies
+            .keep_alive(agent_id, &shown.channel_id, &shown.chat, &shown.frame.reply)
+        {
+            tokio::spawn(keep_chat_reply_alive(shown.clone()));
+        }
+        Some(shown)
     }
 
-    /// Show `text`, or that the reply is being written when it is empty;
-    /// whether its reply is still being written (the runtime did not send
-    /// its last part). That is checked as the frame is queued, so none
-    /// goes after the reply's end.
-    async fn show(&mut self, text: &str) -> bool {
-        self.frame.text = if text.trim().is_empty() {
-            self.waiting.clone()
-        } else {
-            text.to_string()
-        };
+    /// Queue `frame` for the adapter while its reply is still being
+    /// written (the runtime did not send its last part): whether it is.
+    /// That is checked as the frame is queued, so none goes after the
+    /// reply's end.
+    async fn send(&self, frame: havn_proto::channel::ChannelWriting) -> bool {
         let (replies, agent_id) = (&self.replies, self.agent_id);
         let (channel_id, chat, reply) = (&self.channel_id, &self.chat, &self.frame.reply);
         let mut open = true;
         self.router
-            .writing(&self.channel, self.frame.clone(), || {
+            .writing(&self.channel, frame, || {
                 open = replies.is_open(agent_id, channel_id, chat, reply);
                 open
             })
             .await;
         open
     }
+
+    /// Show `text`, or that the reply is being written when it is empty;
+    /// whether its reply is still being written.
+    async fn show(&mut self, text: &str) -> bool {
+        self.frame.waiting = text.trim().is_empty();
+        self.frame.text = if self.frame.waiting {
+            self.waiting.clone()
+        } else {
+            text.to_string()
+        };
+        self.send(self.frame.clone()).await
+    }
 }
 
+/// Tell the adapter of `shown`'s reply, every [`CHAT_REPLY_ALIVE_EVERY`],
+/// that it is still being written, until it is not (issue #325).
+async fn keep_chat_reply_alive(shown: ChatWriting) {
+    let alive = havn_proto::channel::ChannelWriting {
+        text: String::new(),
+        buttons: Vec::new(),
+        waiting: false,
+        alive: true,
+        ..shown.frame.clone()
+    };
+    loop {
+        tokio::time::sleep(CHAT_REPLY_ALIVE_EVERY).await;
+        if !shown.send(alive.clone()).await {
+            return;
+        }
+    }
+}
 /// Show a call's text in a chat app (issue #325): at once that the reply
 /// is being written, then all the call has written, at most every
 /// [`CHAT_TEXT_EVERY`]. What it wrote last is not shown when it ends: the
@@ -4897,6 +4971,7 @@ mod tests {
             panic!("not a reply being written");
         };
         assert_eq!(written.text, "Half of");
+        assert!(first.waiting && !written.waiting && !written.alive);
         assert_eq!(written.reply, first.reply);
         dispatch(
             agent,
@@ -5041,6 +5116,70 @@ mod tests {
         assert!(third.is_some());
         // A call of the turn over another connection is not shown.
         assert_eq!(replies.open(agent, 2, "ch", "c1", "t3"), (None, None));
+        // Past the most an agent writes at once, none is shown, and that is
+        // said once; another's are.
+        for n in 1..MAX_CHAT_REPLIES {
+            assert!(
+                replies
+                    .open(agent, 1, "ch", &format!("more{n}"), "t")
+                    .0
+                    .is_some()
+            );
+        }
+        assert_eq!(replies.open(agent, 1, "ch", "one more", "t"), (None, None));
+        assert!(replies.lock().full.contains(&agent));
+        assert!(replies.open(AgentId::new(), 1, "ch", "c1", "t").0.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_shown_as_it_is_written_is_kept_alive_while_it_is() {
+        use havn_proto::channel::ChannelFrame;
+        let router = crate::channel_router::ChannelRouter::new();
+        let (tx, mut adapter) = mpsc::channel(8);
+        router
+            .register_as(
+                crate::channel_router::AccountKey::new("telegram", "bot"),
+                tx,
+                false,
+                true,
+            )
+            .await;
+        let replies = ChatReplies::default();
+        let agent = AgentId::new();
+        let (reply, _) = replies.open(agent, 1, "ch", "c1", "t1");
+        let reply = reply.expect("open");
+        assert!(replies.keep_alive(agent, "ch", "c1", &reply));
+        assert!(!replies.keep_alive(agent, "ch", "c1", &reply), "once");
+        let shown = ChatWriting {
+            router,
+            replies: replies.clone(),
+            agent_id: agent,
+            channel: "telegram".into(),
+            channel_id: "ch".into(),
+            chat: "c1".into(),
+            frame: havn_proto::channel::ChannelWriting {
+                account_id: "bot".into(),
+                to: "tg:1".into(),
+                in_reply_to: None,
+                reply: reply.clone(),
+                text: "Half of".into(),
+                buttons: Vec::new(),
+                waiting: false,
+                alive: false,
+            },
+            waiting: "Replying…".into(),
+        };
+        let alive = tokio::spawn(keep_chat_reply_alive(shown));
+        tokio::time::sleep(CHAT_REPLY_ALIVE_EVERY + Duration::from_secs(1)).await;
+        let Ok(ChannelFrame::Writing(w)) = adapter.try_recv() else {
+            panic!("not told it is alive");
+        };
+        assert!(w.alive && w.text.is_empty() && w.buttons.is_empty() && w.reply == reply);
+        // Once its last part came, it is not, and the telling stops.
+        replies.of(agent, "ch", "c1", true);
+        tokio::time::sleep(CHAT_REPLY_ALIVE_EVERY + Duration::from_secs(1)).await;
+        assert!(adapter.try_recv().is_err());
+        assert!(alive.is_finished());
     }
 
     #[tokio::test]
@@ -5072,6 +5211,7 @@ mod tests {
         assert!(
             ctx.chat_replies
                 .lock()
+                .replies
                 .values()
                 .any(|r| Some(&r.reply) == other.as_ref() && r.ended.is_none())
         );

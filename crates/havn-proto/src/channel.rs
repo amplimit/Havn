@@ -219,6 +219,16 @@ pub struct ChannelWriting {
     /// Under it: a button that stops the reply, as `/stop` does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buttons: Vec<Vec<havn_core::Button>>,
+    /// `text` is the line saying the reply is being written: the call has
+    /// written nothing yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting: bool,
+    /// Only to say the reply is still being written, about every minute
+    /// while nothing new is shown (its turn thinks, runs a tool, waits for
+    /// an approval): `text` and `buttons` are empty, and what is shown
+    /// stays as it is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub alive: bool,
 }
 
 /// Adapter → gateway: replay request after reconnect.
@@ -418,9 +428,12 @@ mod tests {
                 label: "Stop".into(),
                 data: "/stop".into(),
             }]],
+            waiting: false,
+            alive: false,
         });
         let s = serde_json::to_string(&writing).expect("json");
         assert!(s.contains(r#""kind":"writing""#), "{s}");
+        assert!(!s.contains("waiting") && !s.contains("alive"), "{s}");
         assert!(!s.contains("in_reply_to"), "{s}");
         let parsed: ChannelFrame = serde_json::from_str(&s).expect("parse");
         assert!(

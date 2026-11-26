@@ -743,6 +743,8 @@ mod tests {
             reply: "r1".into(),
             text: text.into(),
             buttons: Vec::new(),
+            waiting: false,
+            alive: false,
         };
         // An adapter that did not ask, as one before issue #325.
         let (older, mut older_rx) = mpsc::channel(8);
