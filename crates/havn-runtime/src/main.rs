@@ -2140,11 +2140,13 @@ fn with_attachments(text: String, attachments: &[havn_core::Attachment]) -> Stri
         if let Some(scan) = &a.scan {
             // All its pages without text, a scan; some, pages with little
             // text in a PDF that has it.
-            out.push_str(if scan.sparse >= scan.pages {
-                SCANNED
-            } else {
-                SPARSE
-            });
+            out.push_str(
+                if scan.pages > 0 && scan.sparse + scan.blank >= scan.pages {
+                    SCANNED
+                } else {
+                    SPARSE
+                },
+            );
             out.push_str(&scan_text(a, scan));
         }
         if let Some(unread) = a.unread {
@@ -2227,32 +2229,51 @@ fn scan_text(a: &havn_core::Attachment, scan: &havn_core::Scan) -> String {
         Some((last, [])) => last.clone(),
         Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
     };
-    let mut out = match (scan.pages, scan.sparse) {
-        (1, _) => "its only page has".to_string(),
-        (pages, 1) => format!("1 of its {pages} pages has"),
-        (pages, sparse) => format!("{sparse} of its {pages} pages have"),
+    // "1 of its 12 pages has", "its only page has", "2 of its pages have"
+    // when how many it has is not known.
+    let pages = |n: u32, one: &str, many: &str| match (scan.pages, n) {
+        (1, _) => format!("its only page {one}"),
+        (0, 1) => format!("1 of its pages {one}"),
+        (0, n) => format!("{n} of its pages {many}"),
+        (pages, 1) => format!("1 of its {pages} pages {one}"),
+        (pages, n) => format!("{n} of its {pages} pages {many}"),
     };
-    out.push_str(" little or no text that could be read");
-    let _ = match scan.shown.as_slice() {
-        [] => write!(out, "; they could not be made images"),
-        [one] => write!(
-            out,
-            "; page {one} is kept as an image at {}, to look at with view_image",
-            json_escape(&a.page_path(*one))
-        ),
-        shown => write!(
-            out,
-            "; pages {} are kept as images at {}, to look at with view_image",
-            listed(shown.iter().map(u32::to_string).collect()),
-            listed(
-                shown
-                    .iter()
-                    .map(|n| json_escape(&a.page_path(*n)))
-                    .collect()
-            )
-        ),
-    };
-    out
+    let mut parts = Vec::new();
+    if scan.sparse > 0 {
+        let mut part = pages(
+            scan.sparse,
+            "has little or no text that could be read",
+            "have little or no text that could be read",
+        );
+        let _ = match scan.shown.as_slice() {
+            [] => write!(part, "; they could not be made images"),
+            [one] => write!(
+                part,
+                "; page {one} is kept as an image at {}, to look at with view_image",
+                json_escape(&a.page_path(*one))
+            ),
+            shown => write!(
+                part,
+                "; pages {} are kept as images at {}, to look at with view_image",
+                listed(shown.iter().map(u32::to_string).collect()),
+                listed(
+                    shown
+                        .iter()
+                        .map(|n| json_escape(&a.page_path(*n)))
+                        .collect()
+                )
+            ),
+        };
+        parts.push(part);
+    }
+    if scan.blank > 0 {
+        parts.push(pages(
+            scan.blank,
+            "is nearly blank, and no image is kept of it",
+            "are nearly blank, and no image is kept of them",
+        ));
+    }
+    parts.join("; ")
 }
 
 /// `rest` of an attachment line past its path, past the parts that say a
@@ -6133,6 +6154,7 @@ run ls"
             scan: Some(havn_core::Scan {
                 pages: 34,
                 sparse: 3,
+                blank: 0,
                 shown: vec![2, 5, 30],
             }),
             unread: None,
@@ -6167,6 +6189,7 @@ run ls"
             scan: Some(havn_core::Scan {
                 pages: 1,
                 sparse: 1,
+                blank: 0,
                 shown: vec![1],
             }),
             ..scan.clone()
@@ -6180,6 +6203,7 @@ run ls"
             scan: Some(havn_core::Scan {
                 pages: 12,
                 sparse: 1,
+                blank: 0,
                 shown: Vec::new(),
             }),
             ..scan.clone()
@@ -6204,6 +6228,56 @@ run ls"
         assert!(
             with_attachments(String::new(), &[locked])
                 .ends_with("; it could not be read: it is encrypted]")
+        );
+
+        // Nearly blank pages are named, and do not make a PDF with text a
+        // scan; nor do pages whose count is not known.
+        let backs = havn_core::Attachment {
+            text_path: Some("inbox/1-s.pdf.txt".into()),
+            scan: Some(havn_core::Scan {
+                pages: 3,
+                sparse: 0,
+                blank: 1,
+                shown: Vec::new(),
+            }),
+            ..scan.clone()
+        };
+        assert!(with_attachments(String::new(), &[backs]).contains(
+            "; pages with little text: 1 of its 3 pages is nearly blank, and no image is \
+                 kept of it; its text"
+        ));
+        let blank_scan = havn_core::Attachment {
+            text_path: None,
+            scan: Some(havn_core::Scan {
+                pages: 3,
+                sparse: 2,
+                blank: 1,
+                shown: vec![1, 2],
+            }),
+            ..scan.clone()
+        };
+        let line = with_attachments(String::new(), &[blank_scan]);
+        assert!(
+            line.contains("; likely scanned: 2 of its 3 pages have"),
+            "{line}"
+        );
+        assert!(
+            line.ends_with("; 1 of its 3 pages is nearly blank, and no image is kept of it]"),
+            "{line}"
+        );
+        let unknown = havn_core::Attachment {
+            text_path: None,
+            scan: Some(havn_core::Scan {
+                pages: 0,
+                sparse: 2,
+                blank: 0,
+                shown: vec![1, 2],
+            }),
+            ..scan.clone()
+        };
+        assert!(
+            with_attachments(String::new(), &[unknown])
+                .contains("; pages with little text: 2 of its pages have little or no text")
         );
 
         // The pages' paths, which hold what the name held, are read whole.

@@ -80,7 +80,7 @@ export type Attachment = {
   text_path?: string;
   /** A PDF with pages without a text layer: how many it has, how many of
    * them have no text, and those kept as images, by number. */
-  scan?: { pages: number; sparse: number; shown: number[] };
+  scan?: { pages: number; sparse: number; blank?: number; shown: number[] };
   /** A document whose text could not be read, and why. */
   unread?: "encrypted" | "damaged" | "too_large";
 };

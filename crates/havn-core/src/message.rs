@@ -77,10 +77,14 @@ pub struct Attachment {
 /// The pages of a PDF without a text layer (issue #230).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scan {
-    /// How many pages it has.
+    /// How many pages it has; 0 when that is not known.
     pub pages: u32,
-    /// How many of them have little or no text that could be read.
+    /// How many of them have little or no text that could be read, apart
+    /// from those nearly blank.
     pub sparse: u32,
+    /// How many of them drew nearly blank: no image is kept of them.
+    #[serde(default)]
+    pub blank: u32,
     /// Those kept as images, by their number from 1, in order: at most
     /// [`MAX_SCAN_PAGES`].
     pub shown: Vec<u32>,
@@ -310,6 +314,7 @@ mod tests {
             scan: Some(Scan {
                 pages: 3,
                 sparse: 3,
+                blank: 0,
                 shown: vec![1, 2, 3],
             }),
             unread: None,

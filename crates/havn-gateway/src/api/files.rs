@@ -345,8 +345,10 @@ async fn keep_pages(
             return (None, unread);
         }
     };
-    // A blank back or divider is not a page without its text.
-    let sparse = sparse.saturating_sub(u32::try_from(drawn.blank.len()).unwrap_or(u32::MAX));
+    // A blank back or divider is told as nearly blank, not as a page
+    // without its text.
+    let blank = u32::try_from(drawn.blank.len()).unwrap_or(u32::MAX);
+    let sparse = sparse.saturating_sub(blank);
     let mut shown = Vec::new();
     for (n, image) in drawn.images {
         if keep(state, agent_id, Attachment::page_image(file, n), image)
@@ -357,13 +359,14 @@ async fn keep_pages(
         }
         shown.push(n);
     }
-    if sparse == 0 {
+    if sparse == 0 && blank == 0 {
         return (None, None);
     }
     (
         Some(havn_core::Scan {
             pages,
             sparse,
+            blank,
             shown,
         }),
         None,
@@ -499,15 +502,18 @@ pub async fn as_kept(
                 shown.truncate(havn_core::MAX_SCAN_PAGES as usize);
                 let sparse = sent.sparse.max(count(&shown));
                 Some(havn_core::Scan {
-                    pages: sent.pages.max(sparse),
+                    pages: sent.pages.max(sparse + sent.blank),
                     sparse,
+                    blank: sent.blank,
                     shown,
                 })
             }
-            // A page that did not send it: the pages that are there.
+            // A page that did not send it: the pages that are there, of a
+            // PDF whose other pages are not known.
             None if !kept.is_empty() => Some(havn_core::Scan {
-                pages: count(&kept),
+                pages: 0,
                 sparse: count(&kept),
+                blank: 0,
                 shown: kept,
             }),
             None => None,

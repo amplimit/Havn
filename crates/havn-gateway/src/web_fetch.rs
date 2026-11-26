@@ -1248,9 +1248,10 @@ pub const MAX_PAGES_BYTES: usize = 24 * 1024 * 1024;
 /// and deadline, counting the longest page made so far.
 const PAGES_TIME: Duration = Duration::from_secs(10);
 /// A pixel darker than this, in any channel, is ink; a page with fewer
-/// inked pixels than this, per thousand, drew blank.
+/// inked pixels than this, per ten thousand, drew nearly blank: a faint
+/// signature still has more.
 const INK: u8 = 200;
-const BLANK_PER_MILLE: usize = 2;
+const BLANK_PER_TEN_THOUSAND: usize = 5;
 
 /// Pages of a PDF made images (issue #230).
 #[derive(Debug, Default)]
@@ -1478,7 +1479,7 @@ fn page_images(
             .chunks_exact(3)
             .filter(|p| p.iter().any(|c| *c < INK))
             .count();
-        if inked * 1000 < rgb.len() / 3 * BLANK_PER_MILLE {
+        if inked * 10_000 < rgb.len() / 3 * BLANK_PER_TEN_THOUSAND {
             writeln!(out, "{n} 0").map_err(written)?;
             out.flush().map_err(written)?;
             longest = longest.max(began.elapsed());
