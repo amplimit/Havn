@@ -660,7 +660,8 @@ async fn handle_connection(
         Vec<GatewayToolSpec>,
         Vec<havn_proto::ModelChoice>,
         havn_core::Language,
-        havn_proto::Secrets,
+        // The agent's secrets, and its own MCP servers, which get them.
+        (havn_proto::Secrets, Vec<String>),
     ) = match agents_repo::find_by_id(&ctx.db, agent_id).await {
         Ok(Some(agent)) => {
             let model = agent
@@ -685,7 +686,10 @@ async fn handle_connection(
             let gateway_tools = gateway_tools_for(&ctx, &agent, &policy).await;
             let models = model_choices(&policy, &ctx.models.load());
             let language = havn_core::Language::of_config(&agent.config);
-            let secrets = ctx.secrets.for_runtime(&agent).await;
+            let secrets = (
+                ctx.secrets.for_runtime(&agent).await,
+                crate::secrets::own_mcp_servers(&agent.config, &policy),
+            );
             (
                 policy,
                 model,
@@ -707,7 +711,7 @@ async fn handle_connection(
                 Vec::new(),
                 Vec::new(),
                 havn_core::Language::English,
-                havn_proto::Secrets::default(),
+                (havn_proto::Secrets::default(), Vec::new()),
             )
         }
         Err(e) => {
@@ -720,10 +724,11 @@ async fn handle_connection(
                 Vec::new(),
                 Vec::new(),
                 havn_core::Language::English,
-                havn_proto::Secrets::default(),
+                (havn_proto::Secrets::default(), Vec::new()),
             )
         }
     };
+    let (secrets, own_mcp_servers) = secrets;
 
     let session_token = Uuid::now_v7().to_string();
     let welcome = GatewayToAgent::Welcome {
@@ -760,6 +765,7 @@ async fn handle_connection(
         language,
         cuts_calls: true,
         secrets,
+        own_mcp_servers,
     };
     let write_welcome = write_frame(&mut write, &welcome);
     let sent = match tokio::time::timeout(AGENT_WRITE_TIMEOUT, write_welcome).await {
@@ -2089,14 +2095,17 @@ async fn run_secret_request(
         Ok(None) => return Err(format!("agent {agent_id} not found")),
         Err(e) => return Err(format!("agent lookup failed: {e}")),
     };
-    let (text, was) = crate::secrets::run_request(&ctx.db, &agent, &call.input).await?;
-    if was != havn_db::repo::agent_secrets::Was::Set {
+    let (text, was) = crate::secrets::run_request(&ctx.db, &agent, call).await?;
+    // One entry per request: asking again for one still waiting only
+    // counts on it.
+    if was == havn_db::repo::agent_secrets::Was::Absent {
         let field = |key: &str| {
             call.input
                 .get(key)
                 .and_then(serde_json::Value::as_str)
                 .map(|s| s.trim().chars().take(500).collect::<String>())
         };
+        let (by, place, by_owner) = crate::secrets::asked_by(&ctx.db, &agent, call).await;
         crate::audit::record(
             &ctx.db,
             agent.owner_id,
@@ -2107,7 +2116,9 @@ async fn run_secret_request(
                 "name": field("name"),
                 "reason": field("reason"),
                 "env": field("env"),
-                "again": was == havn_db::repo::agent_secrets::Was::Requested,
+                "asked_by": by,
+                "asked_in": place,
+                "by_owner": by_owner,
             }),
         )
         .await;
@@ -4053,6 +4064,9 @@ mod tests {
             input: serde_json::json!({"url": url, "prompt": "what is it"}),
             conversation: None,
             chat: None,
+            sender: None,
+            from_owner: false,
+            in_group: false,
         };
 
         let refused = run_gateway_tool(denied, &call("https://example.com/"), &ctx).await;
@@ -4086,6 +4100,9 @@ mod tests {
             input: serde_json::json!({"query": "havn"}),
             conversation: None,
             chat: None,
+            sender: None,
+            from_owner: false,
+            in_group: false,
         };
 
         let unknown = run_gateway_tool(agent, &call("shell"), &ctx).await;

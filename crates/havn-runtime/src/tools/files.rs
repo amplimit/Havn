@@ -167,6 +167,19 @@ fn is_image(head: &[u8]) -> bool {
             .contains(&&head[8..12])
 }
 
+/// A refusal of text holding the marker of one of the agent's secrets
+/// (issue #233): the marker stands for a value redacted from what the agent
+/// read, and writing it back would put the marker in place of the value.
+fn holds_secret_marker(text: &str) -> Option<ToolResult> {
+    let name = crate::secrets::marker_in(text)?;
+    Some(ToolResult::Error(format!(
+        "not written: the text holds [secret:{name}], which stands for the value of the \
+         secret {name}, redacted from what you read; writing it would put the marker in place \
+         of the value. Leave that part of the file as it is (edit around it), or ask your \
+         owner."
+    )))
+}
+
 pub struct FileWriteTool;
 
 #[async_trait]
@@ -199,6 +212,9 @@ impl Tool for FileWriteTool {
         let Some(content) = input.get("content").and_then(Value::as_str) else {
             return ToolResult::Error("missing required field: content".into());
         };
+        if let Some(refused) = holds_secret_marker(content) {
+            return refused;
+        }
         if content.len() > MAX_FILE_BYTES {
             return ToolResult::Error(format!(
                 "content is {} bytes (cap {})",
@@ -298,6 +314,9 @@ impl Tool for FileEditTool {
             Ok(edits) => edits,
             Err(e) => return ToolResult::Error(e),
         };
+        if let Some(refused) = edits.iter().find_map(|e| holds_secret_marker(&e.new)) {
+            return refused;
+        }
         let resolved = match safe_join(&ctx.workspace_dir, path) {
             Ok(p) => p,
             Err(e) => return ToolResult::Error(e),
@@ -1317,6 +1336,25 @@ mod tests {
     use super::*;
     use havn_core::Policy;
     use std::sync::Arc;
+
+    #[test]
+    fn the_marker_of_a_secret_is_not_written_back() {
+        let _one = crate::secrets::tests::SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::secrets::set(havn_proto::Secrets {
+            values: std::collections::BTreeMap::from([(
+                "gh".to_string(),
+                "ghp-marker-0123".to_string(),
+            )]),
+            shell_env: std::collections::BTreeMap::new(),
+        });
+        let refused = holds_secret_marker("GH_TOKEN=[secret:gh]\n").expect("refused");
+        assert!(refused.is_error() && refused.text().contains("[secret:gh]"));
+        assert!(holds_secret_marker("GH_TOKEN=[secret:unknown]\n").is_none());
+        assert!(holds_secret_marker("plain text").is_none());
+        crate::secrets::set(havn_proto::Secrets::default());
+    }
 
     async fn ctx() -> ToolCtx {
         let pool = havn_db::agent::connect_in_memory().await.expect("agent db");

@@ -102,6 +102,7 @@ pub async fn patch(
             }
             validate_binary_name(&cfg.binary)
                 .map_err(|e| ApiError::BadRequest(format!("server {name:?}: {e}")))?;
+            cfg.validate_env(name)?;
         }
     }
 

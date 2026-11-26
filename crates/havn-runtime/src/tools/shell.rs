@@ -358,30 +358,50 @@ impl Output {
     }
 
     /// What it printed from byte `from` on, saying where bytes were not
-    /// kept, and where the next read starts.
-    fn since(&self, from: u64) -> (String, u64) {
+    /// kept, and where the next read starts. With `more` (the command still
+    /// runs), the end is held back when it could be the start of one of the
+    /// agent's secrets, or of a character, until the rest comes; where
+    /// bytes were not kept, a start or end of a secret beside the gap is
+    /// left out (issue #233). Redaction of whole values comes after.
+    fn since(&self, from: u64, more: bool) -> (String, u64) {
         let head_len = self.head.len() as u64;
         let tail_start = self.total - self.tail.len() as u64;
-        let mut text = String::new();
-        if from < head_len {
-            text.push_str(&String::from_utf8_lossy(
-                &self.head[usize::try_from(from).unwrap_or(0)..],
-            ));
-        }
         let skipped = tail_start.saturating_sub(from.max(head_len));
+        let mut head: &[u8] = if from < head_len {
+            &self.head[usize::try_from(from).unwrap_or(0)..]
+        } else {
+            &[]
+        };
+        let skip = usize::try_from(from.max(tail_start) - tail_start).unwrap_or(usize::MAX);
+        let mut rest: Vec<u8> = self.tail.iter().skip(skip).copied().collect();
+        if skipped > 0 {
+            head = &head[..crate::secrets::cut_end(head)];
+            rest.drain(..crate::secrets::cut_start(&rest));
+        }
+        let mut next = self.total;
+        if more {
+            if rest.is_empty() && skipped == 0 {
+                let shown = crate::secrets::emit_len(head);
+                next -= (head.len() - shown) as u64;
+                head = &head[..shown];
+            } else {
+                let shown = crate::secrets::emit_len(&rest);
+                next -= (rest.len() - shown) as u64;
+                rest.truncate(shown);
+            }
+        }
+        let mut text = String::from_utf8_lossy(head).into_owned();
         if skipped > 0 {
             let _ = write!(text, "\n[... {skipped} bytes of output not kept ...]\n");
         }
-        let skip = usize::try_from(from.max(tail_start) - tail_start).unwrap_or(usize::MAX);
-        let rest: Vec<u8> = self.tail.iter().skip(skip).copied().collect();
         text.push_str(&String::from_utf8_lossy(&rest));
-        (text, self.total)
+        (text, next)
     }
 }
 
 /// All `output` holds.
 fn printed(output: &Arc<Mutex<Output>>) -> String {
-    lock(output).since(0).0
+    lock(output).since(0, false).0
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -553,7 +573,8 @@ fn with_proc<T>(id: u32, f: impl FnOnce(&mut Proc) -> T) -> Option<T> {
 /// What process `id` printed since the last read, and how it is.
 fn read(id: u32) -> String {
     with_proc(id, |p| {
-        let (text, next) = lock(&p.output).since(p.read);
+        let more = p.ended.borrow().is_none();
+        let (text, next) = lock(&p.output).since(p.read, more);
         p.read = next;
         let state = match p.ended.borrow().as_ref() {
             Some(exit) => format!("ended, exit={exit}"),
@@ -884,12 +905,49 @@ mod tests {
         output.push(b"START");
         output.push(&vec![b'x'; HEAD_BYTES + TAIL_BYTES]);
         output.push(b"END");
-        let (all, next) = output.since(0);
+        let (all, next) = output.since(0, false);
         assert!(all.starts_with("START"));
         assert!(all.ends_with("END"));
         assert!(all.contains("bytes of output not kept"));
         assert_eq!(next, output.total);
-        assert_eq!(output.since(next).0, "");
+        assert_eq!(output.since(next, false).0, "");
+    }
+
+    #[test]
+    fn a_secret_printed_in_pieces_is_read_whole() {
+        let _one = crate::secrets::tests::SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::secrets::set(havn_proto::Secrets {
+            values: BTreeMap::from([("split".to_string(), "split-secret-0123".to_string())]),
+            shell_env: BTreeMap::new(),
+        });
+        // Read while it runs: the start of the value waits for its rest.
+        let mut output = Output::default();
+        output.push(b"token: split-sec");
+        let (first, next) = output.since(0, true);
+        assert_eq!(first, "token: ");
+        output.push(b"ret-0123 done");
+        let (second, _) = output.since(next, true);
+        assert_eq!(crate::secrets::redact(&second), "[secret:split] done");
+        // A character cut in two waits for its other half too.
+        let mut output = Output::default();
+        output.push(&"caf\u{e9}".as_bytes()[..4]);
+        let (first, next) = output.since(0, true);
+        assert_eq!((first.as_str(), next), ("caf", 3));
+        output.push(&"\u{e9}".as_bytes()[1..]);
+        assert_eq!(output.since(next, true).0, "\u{e9}");
+        // Where output was not kept, no piece of the value beside the gap.
+        let mut output = Output::default();
+        output.push(&vec![b'x'; HEAD_BYTES - 6]);
+        output.push(b"split-secret-0123");
+        output.push(&vec![b'y'; TAIL_BYTES + 100]);
+        output.push(b"split-secret-0123 end");
+        let all = output.since(0, false).0;
+        let (before, after) = all.split_once("not kept").expect("a gap");
+        assert!(!before.contains("split"), "the start beside the gap is shown");
+        assert!(crate::secrets::redact(after).ends_with("[secret:split] end"));
+        crate::secrets::set(havn_proto::Secrets::default());
     }
 
     #[tokio::test]

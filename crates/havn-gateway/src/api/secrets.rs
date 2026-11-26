@@ -35,6 +35,10 @@ pub struct SecretsView {
     pub encrypts: bool,
     /// Values shorter than this are not redacted from tool output.
     pub min_redacted_chars: usize,
+    /// MCP servers that refer to secrets but run with settings the owner's
+    /// role supplies, not the agent's own: their references are not
+    /// resolved, so they do not start.
+    pub refused_mcp_servers: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,6 +61,17 @@ pub struct RequestView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<String>,
     pub at: DateTime<Utc>,
+    /// Who the agent was answering: a name, or a chat-app sender's id;
+    /// absent for a scheduled task or a heartbeat.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asked_by: Option<String>,
+    /// Where: `web chat`, a chat app, `group on <app>`, `webhook`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asked_in: Option<String>,
+    /// The owner, in their own chat.
+    pub by_owner: bool,
+    /// Times the agent asked again since; the first request is kept.
+    pub again: i64,
 }
 
 async fn view(state: &AppState, agent: &Agent) -> Result<SecretsView, ApiError> {
@@ -72,15 +87,31 @@ async fn view(state: &AppState, agent: &Agent) -> Result<SecretsView, ApiError> 
                 reason: r.reason,
                 env: r.env,
                 at: r.at,
+                asked_by: r.asked_by,
+                asked_in: r.asked_in,
+                by_owner: r.by_owner,
+                again: r.again,
             }),
             name: row.name,
         })
         .collect();
+    let policy = crate::policy_resolver::for_session(
+        &state.db,
+        agent,
+        state.trusted_proxies.is_some(),
+    )
+    .await;
+    let refused_mcp_servers = if policy.permissions.can_use_mcp {
+        secrets::refused_mcp_servers(&agent.config, &policy)
+    } else {
+        Vec::new()
+    };
     Ok(SecretsView {
         secrets,
         shell_env,
         encrypts: state.secrets.encrypts(),
         min_redacted_chars: secret_ref::MIN_REDACTED_CHARS,
+        refused_mcp_servers,
     })
 }
 
@@ -110,37 +141,29 @@ impl std::fmt::Debug for SetRequest {
     }
 }
 
-/// The agent's shell environment with `variable` set to `value`, checked.
-fn with_variable(
-    agent: &Agent,
-    variable: &str,
-    value: String,
-) -> Result<BTreeMap<String, String>, ApiError> {
-    let mut env = secrets::shell_env(&agent.config);
-    env.insert(variable.to_string(), value);
-    secrets::check_shell_env(&env).map_err(ApiError::BadRequest)?;
-    Ok(env)
-}
-
+/// Write the agent's shell environment as `change` makes it from the one
+/// stored, in the same transaction, so a change made meanwhile is not
+/// lost. The result is checked before it is written.
 async fn write_shell_env(
     state: &AppState,
     agent: &Agent,
-    env: &BTreeMap<String, String>,
+    change: impl FnOnce(&mut BTreeMap<String, String>),
 ) -> Result<Agent, ApiError> {
-    let value = serde_json::to_value(env)
-        .map_err(|e| ApiError::Internal(format!("serialize shell_env: {e}")))?;
     let updated = havn_db::repo::agents::update_config(&state.db, agent.id, None, |current| {
+        let mut env = secrets::shell_env(current);
+        change(&mut env);
+        secrets::check_shell_env(&env)?;
         let mut config = current.as_object().cloned().unwrap_or_default();
         if env.is_empty() {
             config.remove("shell_env");
         } else {
+            let value = serde_json::to_value(&env).map_err(|e| e.to_string())?;
             config.insert("shell_env".into(), value);
         }
-        Ok::<_, std::convert::Infallible>(serde_json::Value::Object(config))
+        Ok::<_, String>(serde_json::Value::Object(config))
     })
     .await?;
-    let Ok(agent) = updated;
-    Ok(agent)
+    updated.map_err(ApiError::BadRequest)
 }
 
 /// `PUT /agents/:id/secrets/:name` with `{value, env?}` — set the secret,
@@ -156,27 +179,35 @@ pub async fn set(
     secret_ref::check_name(&name).map_err(|e| ApiError::BadRequest(e.into()))?;
     secrets::check_value(&body.value).map_err(ApiError::BadRequest)?;
     let env = body.env.as_deref().map(str::trim).filter(|e| !e.is_empty());
-    let shell_env = env
-        .map(|variable| {
-            secrets::check_env_name(variable).map_err(ApiError::BadRequest)?;
-            with_variable(&agent, variable, format!("{}{name}", secret_ref::PREFIX))
-        })
-        .transpose()?;
+    let reference = format!("{}{name}", secret_ref::PREFIX);
+    if let Some(variable) = env {
+        // Checked against the environment as it is now, so a variable that
+        // cannot be added refuses the whole change; written below from the
+        // one stored then.
+        secrets::check_env_name(variable).map_err(ApiError::BadRequest)?;
+        let mut next = secrets::shell_env(&agent.config);
+        next.insert(variable.to_string(), reference.clone());
+        secrets::check_shell_env(&next).map_err(ApiError::BadRequest)?;
+    }
     let was = state
         .secrets
         .set(agent.id, &name, &body.value)
         .await
         .map_err(|e| match e {
-            SetError::NoKey => ApiError::BadRequest(e.to_string()),
-            SetError::Encrypt(_) => {
-                tracing::error!(error = %e, "encrypting an agent secret failed");
-                ApiError::Internal("encrypting the secret failed".into())
+            SetError::NoKey | SetError::TooLarge(_) => ApiError::BadRequest(e.to_string()),
+            SetError::Encrypt(_) | SetError::Read(_) => {
+                tracing::error!(error = %e, "setting an agent secret failed");
+                ApiError::Internal("setting the secret failed".into())
             }
             SetError::Db(e) => ApiError::from(e),
         })?;
-    let agent = match &shell_env {
-        Some(env) => write_shell_env(&state, &agent, env).await?,
-        None => agent,
+    let written = match env {
+        Some(variable) => write_shell_env(&state, &agent, |stored| {
+            stored.insert(variable.to_string(), reference.clone());
+        })
+        .await
+        .map(Some),
+        None => Ok(None),
     };
     audit::record_agent_action(
         &state.db,
@@ -186,11 +217,21 @@ pub async fn set(
         serde_json::json!({
             "name": name,
             "was": was.as_str(),
-            "env": env,
+            "env": if written.as_ref().is_ok_and(Option::is_some) { env } else { None },
         }),
     )
     .await;
     state.secrets.push(&state.registry, agent.id).await;
+    let agent = match written {
+        Ok(Some(updated)) => updated,
+        Ok(None) => agent,
+        Err(e) => {
+            return Err(ApiError::Conflict(format!(
+                "the secret {name} is set, but shell commands do not get it as ${}: {e}",
+                env.unwrap_or_default()
+            )));
+        }
+    };
     Ok(Json(view(&state, &agent).await?))
 }
 
@@ -233,7 +274,7 @@ pub async fn put_shell_env(
 ) -> Result<Json<SecretsView>, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
     secrets::check_shell_env(&body.env).map_err(ApiError::BadRequest)?;
-    let agent = write_shell_env(&state, &agent, &body.env).await?;
+    let agent = write_shell_env(&state, &agent, |stored| stored.clone_from(&body.env)).await?;
     audit::record_agent_action(
         &state.db,
         user.id,

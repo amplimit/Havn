@@ -20,7 +20,7 @@ use havn_core::AgentId;
 use havn_core::secret_ref::{self, SecretRef};
 use havn_db::repo::agent_secrets::{self, Was};
 use havn_db::repo::agents::Agent;
-use havn_proto::{GatewayToAgent, GatewayToolSpec, Secrets};
+use havn_proto::{GatewayToAgent, GatewayToolCall, GatewayToolSpec, Secrets};
 use serde_json::json;
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
@@ -127,10 +127,8 @@ impl SecretStore {
         Ok(values)
     }
 
-    /// Every value set for the agent, by name.
-    pub async fn values(&self, agent_id: AgentId) -> Result<Values, String> {
-        let slot = self.slot(agent_id).await;
-        let mut held = slot.lock().await;
+    /// The agent's values held in `held`, read first when they are not.
+    async fn loaded(&self, agent_id: AgentId, held: &mut Option<Values>) -> Result<Values, String> {
         if let Some(values) = held.as_ref() {
             return Ok(values.clone());
         }
@@ -139,8 +137,18 @@ impl SecretStore {
         Ok(values)
     }
 
-    /// Set the agent's secret `name` to `value`. Returns what it was.
+    /// Every value set for the agent, by name.
+    pub async fn values(&self, agent_id: AgentId) -> Result<Values, String> {
+        let slot = self.slot(agent_id).await;
+        let mut held = slot.lock().await;
+        self.loaded(agent_id, &mut held).await
+    }
+
+    /// Set the agent's secret `name` to `value`, trimmed: what is used and
+    /// what is redacted are the same. Returns what it was. Refused when the
+    /// agent's secrets would take more than [`MAX_TOTAL_BYTES`].
     pub async fn set(&self, agent_id: AgentId, name: &str, value: &str) -> Result<Was, SetError> {
+        let value = value.trim();
         let ring = self.keyring.clone().ok_or(SetError::NoKey)?;
         let plain = value.as_bytes().to_vec();
         let ciphertext = tokio::task::spawn_blocking(move || ring.encrypt(&plain))
@@ -149,6 +157,19 @@ impl SecretStore {
             .map_err(|e| SetError::Encrypt(e.to_string()))?;
         let slot = self.slot(agent_id).await;
         let mut held = slot.lock().await;
+        let values = self
+            .loaded(agent_id, &mut held)
+            .await
+            .map_err(SetError::Read)?;
+        let total: usize = values
+            .iter()
+            .filter(|(n, _)| n.as_str() != name)
+            .map(|(_, v)| escaped_len(v))
+            .sum::<usize>()
+            + escaped_len(value);
+        if total > MAX_TOTAL_BYTES {
+            return Err(SetError::TooLarge(total));
+        }
         let was = agent_secrets::set(&self.db, agent_id, name, &ciphertext)
             .await
             .map_err(SetError::Db)?;
@@ -191,13 +212,17 @@ impl SecretStore {
     }
 
     /// Send the running runtime of `agent_id` its secrets again, after a
-    /// change. A runtime that is not connected gets them in its next
-    /// `Welcome`; one that stalls is disconnected by the registry, and
-    /// gets them when it connects again.
+    /// change. What it sends is read, and sent, under the agent's lock, so
+    /// sends go out in the order of the changes and a stale set never
+    /// follows a newer one. A runtime that is not connected gets them in
+    /// its next `Welcome`; one that stalls is disconnected by the registry,
+    /// and gets them when it connects again.
     pub async fn push(&self, registry: &AgentRegistry, agent_id: AgentId) {
         if !registry.is_connected(agent_id).await {
             return;
         }
+        let slot = self.slot(agent_id).await;
+        let mut held = slot.lock().await;
         let agent = match havn_db::repo::agents::find_by_id(&self.db, agent_id).await {
             Ok(Some(agent)) => agent,
             Ok(None) => return,
@@ -206,7 +231,17 @@ impl SecretStore {
                 return;
             }
         };
-        let secrets = self.for_runtime(&agent).await;
+        let values = match self.loaded(agent_id, &mut held).await {
+            Ok(values) => values,
+            Err(e) => {
+                warn!(%agent_id, error = %e, "could not read the agent's secrets to send them");
+                return;
+            }
+        };
+        let secrets = Secrets {
+            values,
+            shell_env: shell_env(&agent.config),
+        };
         if let Err(e) = registry
             .send(agent_id, GatewayToAgent::Secrets(secrets))
             .await
@@ -216,12 +251,29 @@ impl SecretStore {
     }
 }
 
+/// Bytes an agent's secrets may take in all, as JSON escapes them in the
+/// frames that carry them to its runtime (each frame at most 4 MiB).
+pub const MAX_TOTAL_BYTES: usize = 512 * 1024;
+
+/// Bytes `value` takes in a frame, escaped as JSON.
+fn escaped_len(value: &str) -> usize {
+    serde_json::to_string(value).map_or(value.len() * 6, |s| s.len())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SetError {
     #[error("secrets are not encrypted on this gateway: set HAVN_AGE_KEY and restart the gateway")]
     NoKey,
     #[error("encrypting the secret failed: {0}")]
     Encrypt(String),
+    #[error("{0}")]
+    Read(String),
+    #[error(
+        "an agent's secrets take at most {} KB in all; with this one they would take {} KB",
+        MAX_TOTAL_BYTES / 1024,
+        .0.div_ceil(1024)
+    )]
+    TooLarge(usize),
     #[error(transparent)]
     Db(havn_db::DbError),
 }
@@ -238,6 +290,42 @@ pub fn shell_env(config: &serde_json::Value) -> BTreeMap<String, String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The MCP servers of `policy` (the agent's, as resolved) that the agent's
+/// own settings (`config.policy.mcp_servers`) define as they run: only
+/// their `secret:<name>` references are resolved. In multi-user mode a
+/// server runs with the owner's role's settings, which a team admin
+/// writes; the owner's secret goes to one only where the owner wrote the
+/// same entry (issue #233).
+pub fn own_mcp_servers(config: &serde_json::Value, policy: &havn_core::Policy) -> Vec<String> {
+    let own: HashMap<String, havn_core::McpServerConfig> = config
+        .pointer("/policy/mcp_servers")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let mut names: Vec<String> = policy
+        .mcp_servers
+        .iter()
+        .filter(|(name, runs)| own.get(*name).is_some_and(|o| o.runs_as(runs)))
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The enabled MCP servers of `policy` that refer to secrets in their
+/// `env` but are not the agent's own ([`own_mcp_servers`]): they do not
+/// start, as their references are not resolved.
+pub fn refused_mcp_servers(config: &serde_json::Value, policy: &havn_core::Policy) -> Vec<String> {
+    let own = own_mcp_servers(config, policy);
+    let mut names: Vec<String> = policy
+        .mcp_servers
+        .iter()
+        .filter(|(name, server)| server.enabled && server.uses_secrets() && !own.contains(*name))
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.sort();
+    names
 }
 
 /// The shell variables of `config` that get the secret `name`.
@@ -368,14 +456,56 @@ pub fn spec() -> GatewayToolSpec {
     }
 }
 
+/// Who a tool call answered, as the owner sees it with a request: a name
+/// (the owner's, or the Havn user a chat-app sender is linked to, with the
+/// sender's id) or the sender's id; where (`web chat`, the chat app,
+/// `group on <app>`, `webhook`); and whether it was the owner in their own
+/// chat. Nobody for a scheduled task or a heartbeat.
+pub async fn asked_by(
+    db: &SqlitePool,
+    agent: &Agent,
+    call: &GatewayToolCall,
+) -> (Option<String>, Option<String>, bool) {
+    let by_owner = call.from_owner && !call.in_group;
+    let Some(conversation) = call.conversation.as_deref() else {
+        return (call.sender.clone(), None, false);
+    };
+    if conversation.starts_with(crate::agent_socket::WEBHOOK_CONVERSATION) {
+        return (call.sender.clone(), Some("webhook".into()), false);
+    }
+    if let Some((channel, _, peer)) = crate::channel_id_codec::decode(conversation) {
+        let sender = call.sender.clone().unwrap_or_else(|| peer.to_string());
+        let name = match havn_db::repo::channel_access::linked_user(db, channel, &sender).await {
+            Ok(Some(link)) => format!("{} ({sender})", link.user_name),
+            _ => sender,
+        };
+        let place = if call.in_group {
+            format!("group on {channel}")
+        } else {
+            channel.to_string()
+        };
+        return (Some(name), Some(place), by_owner);
+    }
+    if conversation.parse::<crate::webchat::SessionId>().is_ok() {
+        let owner = havn_db::repo::users::find_by_id(db, agent.owner_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|u| u.display_name);
+        return (owner, Some("web chat".into()), by_owner);
+    }
+    (call.sender.clone(), None, by_owner)
+}
+
 /// `secret_request`: record that `agent` asked for a secret, for its owner
-/// to set on the dashboard. Returns what the model is told, and what it
-/// was before.
+/// to set on the dashboard, with whom it was answering. Returns what the
+/// model is told, and what it was before.
 pub async fn run_request(
     db: &SqlitePool,
     agent: &Agent,
-    input: &serde_json::Value,
+    call: &GatewayToolCall,
 ) -> Result<(String, Was), String> {
+    let input = &call.input;
     let field = |key: &str| {
         input
             .get(key)
@@ -395,13 +525,34 @@ pub async fn run_request(
     if let Some(env) = env {
         check_env_name(env)?;
     }
-    let was = agent_secrets::request(db, agent.id, name, reason, env)
-        .await
-        .map_err(|e| match e {
-            havn_db::DbError::Conflict(why) => why.to_string(),
-            other => format!("recording the request failed: {other}"),
-        })?;
+    let (by, place, by_owner) = asked_by(db, agent, call).await;
+    let was = agent_secrets::request(
+        db,
+        agent.id,
+        name,
+        agent_secrets::NewRequest {
+            reason,
+            env,
+            asked_by: by.as_deref(),
+            asked_in: place.as_deref(),
+            by_owner,
+        },
+    )
+    .await
+    .map_err(|e| match e {
+        havn_db::DbError::Conflict(why) => why.to_string(),
+        other => format!("recording the request failed: {other}"),
+    })?;
     let reference = format!("`{}{name}`", secret_ref::PREFIX);
+    if was == Was::Requested {
+        return Ok((
+            format!(
+                "You asked for the secret `{name}` already, and the owner has not set it yet; \
+                 the dashboard keeps your first reason. Go on without it."
+            ),
+            was,
+        ));
+    }
     if was == Was::Set {
         let vars = variables_of(&agent.config, name);
         let reach = if vars.is_empty() {
@@ -527,26 +678,85 @@ mod tests {
         ));
     }
 
+    fn call(input: serde_json::Value, conversation: Option<String>, owner: bool) -> GatewayToolCall {
+        GatewayToolCall {
+            request_id: "r".into(),
+            name: TOOL_NAME.into(),
+            input,
+            conversation,
+            chat: None,
+            sender: Some("tg:42".into()),
+            from_owner: owner,
+            in_group: false,
+        }
+    }
+
     #[tokio::test]
     async fn the_agent_asks_and_is_told_where_a_set_secret_reaches() {
         let db = connect_in_memory().await.expect("db");
         let a = agent(&db, json!({"shell_env": {"GH_TOKEN": "secret:github"}})).await;
+        let telegram = Some(crate::channel_id_codec::encode("telegram", "bot", "tg:42"));
         let (text, was) = run_request(
             &db,
             &a,
-            &json!({"name": "github", "reason": "to open a PR", "env": "GH_TOKEN"}),
+            &call(
+                json!({"name": "github", "reason": "to open a PR", "env": "GH_TOKEN"}),
+                telegram.clone(),
+                false,
+            ),
         )
         .await
         .expect("asked");
         assert_eq!(was, Was::Absent);
         assert!(text.contains("dashboard") && text.contains("$GH_TOKEN"));
+        let request = agent_secrets::find(&db, a.id, "github")
+            .await
+            .expect("find")
+            .expect("row")
+            .request
+            .expect("asked");
+        assert_eq!(request.asked_by.as_deref(), Some("tg:42"));
+        assert_eq!(request.asked_in.as_deref(), Some("telegram"));
+        assert!(!request.by_owner);
+
+        // Asked again, from the owner's web chat: the first request stays.
+        let web = Some(uuid::Uuid::now_v7().to_string());
+        let (text, was) = run_request(
+            &db,
+            &a,
+            &call(
+                json!({"name": "github", "reason": "other", "env": "OTHER"}),
+                web.clone(),
+                true,
+            ),
+        )
+        .await
+        .expect("again");
+        assert_eq!(was, Was::Requested);
+        assert!(text.contains("already"));
+        let request = agent_secrets::find(&db, a.id, "github")
+            .await
+            .expect("find")
+            .expect("row")
+            .request
+            .expect("asked");
+        assert_eq!(request.reason, "to open a PR");
+        assert_eq!(request.env.as_deref(), Some("GH_TOKEN"));
+        assert_eq!(request.again, 1);
+
+        let (by, place, owner) = asked_by(&db, &a, &call(json!({}), web, true)).await;
+        assert_eq!(
+            (by.as_deref(), place.as_deref(), owner),
+            (Some("o"), Some("web chat"), true)
+        );
+
         assert!(
-            run_request(&db, &a, &json!({"name": "bad name", "reason": "x"}))
+            run_request(&db, &a, &call(json!({"name": "bad name", "reason": "x"}), None, true))
                 .await
                 .is_err()
         );
         assert!(
-            run_request(&db, &a, &json!({"name": "github"}))
+            run_request(&db, &a, &call(json!({"name": "github"}), None, true))
                 .await
                 .is_err()
         );
@@ -554,10 +764,55 @@ mod tests {
         agent_secrets::set(&db, a.id, "github", b"cipher")
             .await
             .expect("set");
-        let (text, was) = run_request(&db, &a, &json!({"name": "github", "reason": "again"}))
-            .await
-            .expect("told");
+        let (text, was) = run_request(
+            &db,
+            &a,
+            &call(json!({"name": "github", "reason": "again"}), telegram, false),
+        )
+        .await
+        .expect("told");
         assert_eq!(was, Was::Set);
         assert!(text.contains("set already") && text.contains("$GH_TOKEN"));
+    }
+
+    #[test]
+    fn only_entries_the_agent_defines_itself_get_its_secrets() {
+        let server = |url: &str| havn_core::McpServerConfig {
+            binary: "gh".into(),
+            args: vec![url.into()],
+            env: HashMap::from([("TOKEN".to_string(), "secret:github".to_string())]),
+            ..Default::default()
+        };
+        let config = json!({"policy": {"mcp_servers": {"gh": server("https://api.github.com")}}});
+        let mut policy = havn_core::Policy::default();
+        policy.mcp_servers = HashMap::from([("gh".to_string(), server("https://api.github.com"))]);
+        assert_eq!(own_mcp_servers(&config, &policy), vec!["gh".to_string()]);
+        assert!(refused_mcp_servers(&config, &policy).is_empty());
+        // The role's entry, as a team admin wrote it, sends it elsewhere.
+        policy.mcp_servers = HashMap::from([("gh".to_string(), server("https://evil.example"))]);
+        assert!(own_mcp_servers(&config, &policy).is_empty());
+        assert_eq!(refused_mcp_servers(&config, &policy), vec!["gh".to_string()]);
+        assert_eq!(
+            refused_mcp_servers(&json!({}), &policy),
+            vec!["gh".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn values_are_trimmed_and_their_total_size_is_capped() {
+        let db = connect_in_memory().await.expect("db");
+        let a = agent(&db, json!({})).await;
+        let store = SecretStore::new(db.clone(), Some(KeyRing::from_passphrase("test-key")));
+        store
+            .set(a.id, "t", "  tok-0123456789\n")
+            .await
+            .expect("set");
+        assert_eq!(store.values(a.id).await.expect("values")["t"], "tok-0123456789");
+        // Control characters take six bytes each in a frame.
+        let big = "\u{1}".repeat(MAX_TOTAL_BYTES / 6 + 10);
+        assert!(matches!(
+            store.set(a.id, "big", &format!("x{big}x")).await,
+            Err(SetError::TooLarge(_))
+        ));
     }
 }

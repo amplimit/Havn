@@ -424,11 +424,13 @@ async fn main() -> anyhow::Result<()> {
             language,
             cuts_calls,
             secrets: welcome_secrets,
+            own_mcp_servers,
         }) => {
             // One agent per runtime: its language is the process's.
             let _ = LANGUAGE.set(language);
             // Before anything that logs them or starts a process with them.
             secrets::set(welcome_secrets);
+            mcp::set_own_servers(own_mcp_servers);
             // Materialise the embedding provider from the
             // gateway-shipped JSON. Absent / null / "disabled"
             // → None, byte-for-byte v0.6 behaviour. Mis-config

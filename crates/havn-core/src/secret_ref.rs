@@ -116,33 +116,137 @@ pub fn marker(name: &str) -> String {
     format!("[{PREFIX}{name}]")
 }
 
-/// Secrets as [`redact`] takes them: `(value, name)`, trimmed, without the
-/// values too short to redact, longest first (so a value that contains
-/// another is replaced whole), then by name.
+/// Secrets `(name, value)` as [`redact`] takes them: `(form, name)` for
+/// each form a value is printed in (as it is, trimmed; escaped as Rust's
+/// `Debug` and as JSON escape it, which log fields and JSON output use),
+/// without the values too short to redact, longest first, then by name.
 #[must_use]
 pub fn redaction_list<'a>(
     secrets: impl IntoIterator<Item = (&'a String, &'a String)>,
 ) -> Vec<(String, String)> {
-    let mut list: Vec<(String, String)> = secrets
-        .into_iter()
-        .map(|(name, value)| (value.trim().to_string(), name.clone()))
-        .filter(|(value, _)| value.chars().count() >= MIN_REDACTED_CHARS)
-        .collect();
+    let mut list: Vec<(String, String)> = Vec::new();
+    for (name, value) in secrets {
+        let value = value.trim();
+        if value.chars().count() < MIN_REDACTED_CHARS {
+            continue;
+        }
+        let debug = format!("{value:?}");
+        let json = serde_json::to_string(value).unwrap_or_default();
+        for form in [
+            value,
+            debug.get(1..debug.len() - 1).unwrap_or_default(),
+            json.get(1..json.len().saturating_sub(1)).unwrap_or_default(),
+        ] {
+            if !form.is_empty() && !list.iter().any(|(f, n)| f == form && n == name) {
+                list.push((form.to_string(), name.clone()));
+            }
+        }
+    }
     list.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.1.cmp(&b.1)));
     list
 }
 
-/// `text` with every exact occurrence of a value in `list` (from
-/// [`redaction_list`]) replaced with [`marker`] of its name.
+/// `text` with every occurrence of a form in `list` (from
+/// [`redaction_list`]) replaced with [`marker`] of its name, in one pass:
+/// occurrences that overlap are replaced together, with the marker of each
+/// secret among them, so no part of either stays.
 #[must_use]
 pub fn redact<'a>(text: &'a str, list: &[(String, String)]) -> Cow<'a, str> {
-    let mut out = Cow::Borrowed(text);
-    for (value, name) in list {
-        if out.contains(value.as_str()) {
-            out = Cow::Owned(out.replace(value.as_str(), &marker(name)));
+    let mut found: Vec<(usize, usize, &str)> = Vec::new();
+    for (form, name) in list {
+        let mut from = 0;
+        while let Some(at) = text.get(from..).and_then(|rest| rest.find(form.as_str())) {
+            let start = from + at;
+            found.push((start, start + form.len(), name));
+            from = start + text[start..].chars().next().map_or(1, char::len_utf8);
         }
     }
-    out
+    if found.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    let mut out = String::with_capacity(text.len());
+    let mut done = 0;
+    let mut at = 0;
+    while at < found.len() {
+        let (start, mut end, name) = found[at];
+        let mut names = vec![name];
+        at += 1;
+        while at < found.len() && found[at].0 < end {
+            end = end.max(found[at].1);
+            if !names.contains(&found[at].2) {
+                names.push(found[at].2);
+            }
+            at += 1;
+        }
+        out.push_str(&text[done..start]);
+        for name in names {
+            out.push_str(&marker(name));
+        }
+        done = end;
+    }
+    out.push_str(&text[done..]);
+    Cow::Owned(out)
+}
+
+/// How many bytes at the end of `bytes` could be the start of a form in
+/// `list`: the longest suffix that is a proper prefix of one. Output cut
+/// or read in pieces holds them back, or drops them at a cut, so a piece
+/// never shows the start of a value whose rest is elsewhere.
+#[must_use]
+pub fn partial_end(bytes: &[u8], list: &[(String, String)]) -> usize {
+    let mut longest = 0;
+    for (form, _) in list {
+        let form = form.as_bytes();
+        for k in (longest + 1..form.len().min(bytes.len() + 1)).rev() {
+            if bytes.ends_with(&form[..k]) {
+                longest = k;
+                break;
+            }
+        }
+    }
+    longest
+}
+
+/// How many bytes at the start of `bytes` could be the end of a form in
+/// `list` whose start was cut off: the longest prefix that is a proper
+/// suffix of one.
+#[must_use]
+pub fn partial_start(bytes: &[u8], list: &[(String, String)]) -> usize {
+    let mut longest = 0;
+    for (form, _) in list {
+        let form = form.as_bytes();
+        for k in (longest + 1..form.len().min(bytes.len() + 1)).rev() {
+            if bytes.starts_with(&form[form.len() - k..]) {
+                longest = k;
+                break;
+            }
+        }
+    }
+    longest
+}
+
+/// `end`, or further when a form in `list` starts before it and ends past
+/// it (within `bytes`): where `bytes` can be split without splitting one.
+#[must_use]
+pub fn whole_end(bytes: &[u8], mut end: usize, list: &[(String, String)]) -> usize {
+    loop {
+        let mut moved = end;
+        for (form, _) in list {
+            let form = form.as_bytes();
+            let first = end.saturating_sub(form.len() - 1);
+            for start in first..end {
+                let stop = start + form.len();
+                if stop > end && stop <= bytes.len() && &bytes[start..stop] == form {
+                    moved = moved.max(stop);
+                }
+            }
+        }
+        if moved == end {
+            return end;
+        }
+        end = moved;
+    }
 }
 
 #[cfg(test)]
@@ -251,5 +355,54 @@ mod tests {
         let out = redact("a xx-ghp_0123456789-yy b ghp_0123456789 abc", &list);
         assert_eq!(out, "a [secret:long] b [secret:token] abc");
         assert!(matches!(redact("nothing here", &list), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn overlapping_values_leave_nothing_of_either() {
+        let secrets = BTreeMap::from([
+            ("a".to_string(), "AAAAAAAABBBB".to_string()),
+            ("b".to_string(), "BBBBCCCCCCCC".to_string()),
+        ]);
+        let list = redaction_list(&secrets);
+        assert_eq!(
+            redact("x AAAAAAAABBBBCCCCCCCC y", &list),
+            "x [secret:a][secret:b] y"
+        );
+        assert_eq!(
+            redact("AAAAAAAABBBB BBBBCCCCCCCC", &list),
+            "[secret:a] [secret:b]"
+        );
+    }
+
+    #[test]
+    fn escaped_forms_of_a_value_are_redacted() {
+        let secrets = BTreeMap::from([(
+            "pem".to_string(),
+            "-----BEGIN KEY-----\nab\"c\\d\n-----END KEY-----".to_string(),
+        )]);
+        let list = redaction_list(&secrets);
+        let value = &secrets["pem"];
+        let debug = format!("field={value:?}");
+        let json = serde_json::json!({ "v": value }).to_string();
+        for text in [value.clone(), debug, json] {
+            let out = redact(&text, &list);
+            assert!(out.contains("[secret:pem]"), "{out}");
+            assert!(!out.contains("BEGIN KEY"), "{out}");
+        }
+    }
+
+    #[test]
+    fn pieces_never_split_a_value() {
+        let secrets = BTreeMap::from([("t".to_string(), "tok-0123456789".to_string())]);
+        let list = redaction_list(&secrets);
+        assert_eq!(partial_end(b"output tok-012", &list), 7);
+        assert_eq!(partial_end(b"done.", &list), 0);
+        assert_eq!(partial_end(b"output", &list), 1, "a `t` may start it");
+        assert_eq!(partial_end(b"tok-0123456789", &list), 0, "a whole value is not held");
+        assert_eq!(partial_start(b"3456789 more", &list), 7);
+        assert_eq!(partial_start(b"more", &list), 0);
+        let bytes = b"a tok-0123456789 b";
+        assert_eq!(whole_end(bytes, 5, &list), 16);
+        assert_eq!(whole_end(bytes, 1, &list), 1);
     }
 }

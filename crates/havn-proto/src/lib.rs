@@ -414,6 +414,11 @@ pub enum GatewayToAgent {
         /// The agent's secrets and shell environment (issue #233).
         #[serde(default)]
         secrets: Secrets,
+        /// The MCP servers whose `secret:<name>` references the runtime
+        /// resolves: those the agent's own settings define as they run.
+        /// One a role supplies does not get the owner's secrets.
+        #[serde(default)]
+        own_mcp_servers: Vec<String>,
     },
     /// The owner changed the agent's secrets or shell environment: the
     /// whole new set, for shell commands from now on and for MCP servers
@@ -530,6 +535,16 @@ pub struct GatewayToolCall {
     /// task's results go to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat: Option<String>,
+    /// Who wrote the message the turn answers ([`InboundMessage::sender_id`],
+    /// or what started it, such as a webhook), when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
+    /// The turn answers the agent's owner.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub from_owner: bool,
+    /// The turn answers a message in a group.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_group: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1193,6 +1208,7 @@ mod tests {
             language: havn_core::Language::English,
             cuts_calls: true,
             secrets: Secrets::default(),
+            own_mcp_servers: Vec::new(),
         };
         let line = serde_json::to_string(&frame).expect("serialize");
         assert!(line.contains("\"type\":\"welcome\""));
@@ -1235,6 +1251,7 @@ mod tests {
             language: havn_core::Language::English,
             cuts_calls: true,
             secrets: Secrets::default(),
+            own_mcp_servers: Vec::new(),
         };
         let line = serde_json::to_string(&frame).expect("serialize");
         let parsed: GatewayToAgent = serde_json::from_str(&line).expect("parse");

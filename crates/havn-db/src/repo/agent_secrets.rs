@@ -33,13 +33,32 @@ impl std::fmt::Debug for AgentSecret {
     }
 }
 
-/// Why the agent asked for a secret it lacks.
+/// Why the agent asked for a secret it lacks, and in answer to whom.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     pub reason: String,
     /// The shell variable it asked to get it as.
     pub env: Option<String>,
     pub at: DateTime<Utc>,
+    /// Who it was answering: a name, or a sender's id on a chat app;
+    /// `None` for a scheduled task or a heartbeat.
+    pub asked_by: Option<String>,
+    /// Where: `web chat`, a chat app's name, `group on <app>`, `webhook`.
+    pub asked_in: Option<String>,
+    /// The owner, in their own chat.
+    pub by_owner: bool,
+    /// Times it asked again since; the first reason and variable stay.
+    pub again: i64,
+}
+
+/// A request as [`request`] records it.
+#[derive(Debug, Clone, Copy)]
+pub struct NewRequest<'a> {
+    pub reason: &'a str,
+    pub env: Option<&'a str>,
+    pub asked_by: Option<&'a str>,
+    pub asked_in: Option<&'a str>,
+    pub by_owner: bool,
 }
 
 /// What a secret was before a change.
@@ -60,16 +79,22 @@ impl Was {
     }
 }
 
-type Row = (
-    String,
-    Option<Vec<u8>>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    String,
-);
+#[derive(sqlx::FromRow)]
+struct Row {
+    name: String,
+    value: Option<Vec<u8>>,
+    reason: Option<String>,
+    env: Option<String>,
+    requested_at: Option<String>,
+    asked_by: Option<String>,
+    asked_in: Option<String>,
+    asked_by_owner: i64,
+    asked_again: i64,
+    updated_at: String,
+}
 
-const COLUMNS: &str = "name, value, reason, env, requested_at, updated_at";
+const COLUMNS: &str = "name, value, reason, env, requested_at, asked_by, asked_in, \
+                       asked_by_owner, asked_again, updated_at";
 
 fn time(value: &str, column: &'static str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
@@ -81,20 +106,23 @@ fn time(value: &str, column: &'static str) -> Result<DateTime<Utc>> {
 }
 
 fn from_row(row: Row) -> Result<AgentSecret> {
-    let (name, value, reason, env, requested_at, updated_at) = row;
-    let request = match (value.is_none(), reason, requested_at) {
+    let request = match (row.value.is_none(), row.reason, row.requested_at) {
         (true, Some(reason), Some(at)) => Some(Request {
             reason,
-            env,
+            env: row.env,
             at: time(&at, "agent_secrets.requested_at")?,
+            asked_by: row.asked_by,
+            asked_in: row.asked_in,
+            by_owner: row.asked_by_owner != 0,
+            again: row.asked_again,
         }),
         _ => None,
     };
     Ok(AgentSecret {
-        name,
-        value_ciphertext: value,
+        name: row.name,
+        value_ciphertext: row.value,
         request,
-        updated_at: time(&updated_at, "agent_secrets.updated_at")?,
+        updated_at: time(&row.updated_at, "agent_secrets.updated_at")?,
     })
 }
 
@@ -173,7 +201,8 @@ pub async fn set(
     sqlx::query(
         "INSERT INTO agent_secrets (agent_id, name, value) VALUES (?1, ?2, ?3) \
          ON CONFLICT (agent_id, name) DO UPDATE SET value = excluded.value, reason = NULL, \
-         env = NULL, requested_at = NULL, \
+         env = NULL, requested_at = NULL, asked_by = NULL, asked_in = NULL, \
+         asked_by_owner = 0, asked_again = 0, \
          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
     )
     .bind(agent_id.to_string())
@@ -187,19 +216,30 @@ pub async fn set(
 
 /// Record that the agent asked for the secret `name`, which it lacks.
 /// Returns what it was: a secret already set is left as it is; asking
-/// again replaces the reason. A conflict when the agent has asked for
-/// [`MAX_REQUESTED`] secrets not set, or has [`MAX_PER_AGENT`].
+/// again for one still waiting only counts, keeping the first reason,
+/// variable and who asked, which the owner may be reading. A conflict
+/// when the agent has asked for [`MAX_REQUESTED`] secrets not set, or has
+/// [`MAX_PER_AGENT`].
 pub async fn request(
     pool: &SqlitePool,
     agent_id: AgentId,
     name: &str,
-    reason: &str,
-    env: Option<&str>,
+    new: NewRequest<'_>,
 ) -> Result<Was> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let was = was(&mut tx, agent_id, name).await?;
     match was {
         Was::Set => return Ok(was),
+        Was::Requested => {
+            sqlx::query(
+                "UPDATE agent_secrets SET asked_again = asked_again + 1 \
+                 WHERE agent_id = ?1 AND name = ?2 AND value IS NULL",
+            )
+            .bind(agent_id.to_string())
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        }
         Was::Absent => {
             if count(&mut tx, agent_id, true).await? >= MAX_REQUESTED {
                 return Err(DbError::Conflict(
@@ -209,23 +249,22 @@ pub async fn request(
             if count(&mut tx, agent_id, false).await? >= MAX_PER_AGENT {
                 return Err(DbError::Conflict("an agent may have at most 100 secrets"));
             }
+            sqlx::query(
+                "INSERT INTO agent_secrets (agent_id, name, reason, env, requested_at, \
+                 asked_by, asked_in, asked_by_owner) \
+                 VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?5, ?6, ?7)",
+            )
+            .bind(agent_id.to_string())
+            .bind(name)
+            .bind(new.reason)
+            .bind(new.env)
+            .bind(new.asked_by)
+            .bind(new.asked_in)
+            .bind(i64::from(new.by_owner))
+            .execute(&mut *tx)
+            .await?;
         }
-        Was::Requested => {}
     }
-    sqlx::query(
-        "INSERT INTO agent_secrets (agent_id, name, reason, env, requested_at) \
-         VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) \
-         ON CONFLICT (agent_id, name) DO UPDATE SET reason = excluded.reason, \
-         env = excluded.env, requested_at = excluded.requested_at, \
-         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-         WHERE agent_secrets.value IS NULL",
-    )
-    .bind(agent_id.to_string())
-    .bind(name)
-    .bind(reason)
-    .bind(env)
-    .execute(&mut *tx)
-    .await?;
     tx.commit().await?;
     Ok(was)
 }
@@ -273,19 +312,49 @@ mod tests {
         .id
     }
 
+    fn asked<'a>(reason: &'a str, env: Option<&'a str>) -> NewRequest<'a> {
+        NewRequest {
+            reason,
+            env,
+            asked_by: Some("tg:42"),
+            asked_in: Some("telegram"),
+            by_owner: false,
+        }
+    }
+
     #[tokio::test]
     async fn a_request_is_ended_by_setting_and_never_replaces_a_value() {
         let pool = connect_in_memory().await.expect("db");
         let id = agent(&pool).await;
-        let was = request(&pool, id, "github", "to open the PR", Some("GH_TOKEN"))
+        let was = request(&pool, id, "github", asked("to open the PR", Some("GH_TOKEN")))
             .await
             .expect("request");
         assert_eq!(was, Was::Absent);
-        let asked = find(&pool, id, "github").await.expect("find").expect("row");
-        assert!(asked.value_ciphertext.is_none());
-        let request_row = asked.request.expect("a request");
+        let first = find(&pool, id, "github").await.expect("find").expect("row");
+        assert!(first.value_ciphertext.is_none());
+        let request_row = first.request.expect("a request");
         assert_eq!(request_row.reason, "to open the PR");
         assert_eq!(request_row.env.as_deref(), Some("GH_TOKEN"));
+        assert_eq!(request_row.asked_by.as_deref(), Some("tg:42"));
+        assert_eq!(request_row.asked_in.as_deref(), Some("telegram"));
+        assert!(!request_row.by_owner);
+
+        // Asked again: counted, the first reason and variable kept.
+        assert_eq!(
+            request(&pool, id, "github", asked("something else", Some("EVIL")))
+                .await
+                .expect("again"),
+            Was::Requested
+        );
+        let again = find(&pool, id, "github")
+            .await
+            .expect("find")
+            .expect("row")
+            .request
+            .expect("a request");
+        assert_eq!(again.reason, "to open the PR");
+        assert_eq!(again.env.as_deref(), Some("GH_TOKEN"));
+        assert_eq!(again.again, 1);
 
         assert_eq!(
             set(&pool, id, "github", b"cipher").await.expect("set"),
@@ -296,7 +365,7 @@ mod tests {
         assert!(set_row.request.is_none());
 
         assert_eq!(
-            request(&pool, id, "github", "again", None)
+            request(&pool, id, "github", asked("again", None))
                 .await
                 .expect("request"),
             Was::Set
@@ -322,21 +391,21 @@ mod tests {
         let pool = connect_in_memory().await.expect("db");
         let id = agent(&pool).await;
         for n in 0..MAX_REQUESTED {
-            request(&pool, id, &format!("s{n}"), "why", None)
+            request(&pool, id, &format!("s{n}"), asked("why", None))
                 .await
                 .expect("request");
         }
         assert!(matches!(
-            request(&pool, id, "one-more", "why", None).await,
+            request(&pool, id, "one-more", asked("why", None)).await,
             Err(DbError::Conflict(_))
         ));
         // Asking again for one already asked for is not a new request.
-        request(&pool, id, "s0", "why now", None)
+        request(&pool, id, "s0", asked("why now", None))
             .await
             .expect("again");
         // Setting one makes room.
         set(&pool, id, "s1", b"c").await.expect("set");
-        request(&pool, id, "one-more", "why", None)
+        request(&pool, id, "one-more", asked("why", None))
             .await
             .expect("room");
     }

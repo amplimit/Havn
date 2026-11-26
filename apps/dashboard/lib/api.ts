@@ -466,7 +466,19 @@ export type SecretView = {
   /** False while the agent asked for it and it is not set. */
   set: boolean;
   updated_at: string;
-  requested?: { reason: string; env?: string; at: string };
+  requested?: {
+    reason: string;
+    env?: string;
+    at: string;
+    /** Who the agent was answering: a name, or a chat-app sender's id; absent for a scheduled task or a heartbeat. */
+    asked_by?: string;
+    /** `web chat`, a chat app, `group on <app>`, `webhook`. */
+    asked_in?: string;
+    /** The owner, in their own chat. */
+    by_owner: boolean;
+    /** Times the agent asked again since; the first request is kept. */
+    again: number;
+  };
   /** The shell variables that get it. */
   variables: string[];
 };
@@ -480,6 +492,8 @@ export type SecretsView = {
   encrypts: boolean;
   /** Values shorter than this are not redacted from tool output. */
   min_redacted_chars: number;
+  /** MCP servers that refer to secrets but run with the settings of the owner's role: they do not start. */
+  refused_mcp_servers: string[];
 };
 
 export type BootstrapView = {

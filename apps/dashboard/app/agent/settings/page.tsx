@@ -2942,13 +2942,16 @@ function SecretsEditor({ agentId }: { agentId: string }) {
       cancelled = true;
     };
   }, [agentId]);
-  async function act(work: () => Promise<SecretsView>): Promise<boolean> {
+  async function act(work: () => Promise<SecretsView>, savesEnv = false): Promise<boolean> {
     setBusy(true);
     setError(null);
     try {
+      const before = view ? envText(view.shell_env) : "";
       const next = await work();
       setView(next);
-      setEnvDraft(envText(next.shell_env));
+      // Edits not saved yet stay; the saved environment replaces a draft
+      // that had none.
+      setEnvDraft((draft) => (savesEnv || draft === before ? envText(next.shell_env) : draft));
       return true;
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -2998,12 +3001,21 @@ function SecretsEditor({ agentId }: { agentId: string }) {
           agent&apos;s next start. Values are encrypted with the gateway&apos;s key and never shown again, here or
           in a chat: in what a tool prints, the agent&apos;s model sees{" "}
           <span className="font-mono">[secret:&lt;name&gt;]</span> in place of a value (values under{" "}
-          {view.min_redacted_chars} characters are not replaced). The agent can still use the value it is given,
-          and send it where it can reach: give a secret only to an agent you trust with it.
+          {view.min_redacted_chars} characters are not replaced; spaces around a value are dropped). The agent can
+          still use the value it is given, and send it where it can reach: give a secret only to an agent you trust
+          with it.
         </p>
         {!view.encrypts && (
           <p className="mb-2 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
             Secrets cannot be set: the gateway has no HAVN_AGE_KEY.
+          </p>
+        )}
+        {view.refused_mcp_servers.length > 0 && (
+          <p className="mb-2 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
+            Not started:{" "}
+            <span className="font-mono">{view.refused_mcp_servers.join(", ")}</span>. Their env refers to secrets,
+            and they run with settings your role supplies (which a team admin writes), not this agent&apos;s own, so
+            they do not get your secrets. Define the server in this agent&apos;s MCP settings to give it one.
           </p>
         )}
         {error && (
@@ -3019,17 +3031,35 @@ function SecretsEditor({ agentId }: { agentId: string }) {
             </p>
             <ul className="flex flex-col gap-3 text-sm">
               {requested.map((secret) => {
-                const env = secret.requested?.env;
-                const give = env !== undefined && (asVariable[secret.name] ?? true);
+                const asked = secret.requested;
+                const env = asked?.env;
+                const give = env !== undefined && (asVariable[secret.name] ?? false);
                 return (
                   <li key={secret.name}>
                     <div>
                       <span className="font-mono">{secret.name}</span>{" "}
                       <span className="text-xs" style={muted}>
-                        asked {secret.requested ? new Date(secret.requested.at).toLocaleString() : ""}
+                        asked {asked ? new Date(asked.at).toLocaleString() : ""}
+                        {asked && asked.again > 0
+                          ? ` · asked again ${asked.again} ${asked.again === 1 ? "time" : "times"}`
+                          : ""}
                       </span>
                     </div>
-                    {secret.requested && <div className="text-xs wrap-anywhere">{secret.requested.reason}</div>}
+                    {asked && (
+                      <div
+                        className="text-xs"
+                        style={asked.by_owner ? muted : { color: "var(--color-ruby)" }}
+                      >
+                        {asked.by_owner
+                          ? `In your own ${asked.asked_in ?? "chat"}.`
+                          : asked.asked_by || asked.asked_in
+                            ? `While answering someone else: ${asked.asked_by ?? "unknown"}${
+                                asked.asked_in ? `, in ${asked.asked_in}` : ""
+                              }.`
+                            : "In a scheduled task or a heartbeat, not in a chat."}
+                      </div>
+                    )}
+                    {asked && <div className="text-xs wrap-anywhere">The agent&apos;s reason: {asked.reason}</div>}
                     <div className="mt-1 flex flex-wrap items-center gap-2">
                       {valueInput(secret.name, `value of ${secret.name}`)}
                       {env !== undefined && (
@@ -3188,7 +3218,7 @@ function SecretsEditor({ agentId }: { agentId: string }) {
             disabled={busy || typeof shellEnv === "string" || envDraft === envText(view.shell_env)}
             onClick={() => {
               if (typeof shellEnv === "string") return;
-              void act(() => api.secrets.setShellEnv(agentId, shellEnv)).then((ok) => {
+              void act(() => api.secrets.setShellEnv(agentId, shellEnv), true).then((ok) => {
                 if (ok) flashEnv();
               });
             }}
