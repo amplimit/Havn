@@ -11,6 +11,8 @@
 //! what it printed so far comes back. One started with `background: true`
 //! goes on after the call, as a process the `process` tool lists, reads,
 //! waits on and kills; the turn's stop ends the ones it started.
+//! Commands get the agent's shell environment, `secret:<name>` resolved
+//! (issue #233).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
@@ -59,7 +61,9 @@ impl Tool for ShellTool {
          stdout and stderr come back as they were printed (the first 192 KB and the last \
          64 KB) with the exit code, and on a timeout what it printed so far. With \
          `background: true` it goes on after the call (a server, a long build): you get a \
-         process id to read, wait on or kill with the `process` tool."
+         process id to read, wait on or kill with the `process` tool. The variables your \
+         owner set for you are in its environment; the value of a secret shows as \
+         [secret:<name>] in what it prints."
     }
 
     fn input_schema(&self) -> Value {
@@ -123,6 +127,7 @@ impl Tool for ShellTool {
         cmd.process_group(0);
         #[cfg(target_os = "linux")]
         crate::sandbox::confine_tool(&mut cmd);
+        crate::secrets::apply_shell_env(&mut cmd);
 
         if background {
             // Counted and started under one lock: loops running at once

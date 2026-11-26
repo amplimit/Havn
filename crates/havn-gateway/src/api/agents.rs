@@ -150,6 +150,7 @@ pub async fn create(
     check_model(&state, req.config.as_ref().and_then(|c| c.get("model")))?;
     check_language(req.config.as_ref().and_then(|c| c.get("language")))?;
     check_heartbeat(req.config.as_ref().and_then(|c| c.get("heartbeat")))?;
+    check_shell_env(req.config.as_ref().and_then(|c| c.get("shell_env")))?;
 
     // Spec §6.3 enforcement: max_agents is checked here, before INSERT.
     // policy_resolver::for_user is the single source of truth for "what
@@ -257,6 +258,7 @@ pub async fn patch(
     check_model(&state, req.config.as_ref().and_then(|c| c.get("model")))?;
     check_language(req.config.as_ref().and_then(|c| c.get("language")))?;
     check_heartbeat(req.config.as_ref().and_then(|c| c.get("heartbeat")))?;
+    check_shell_env(req.config.as_ref().and_then(|c| c.get("shell_env")))?;
 
     let name = req.name.as_deref().map(str::trim);
     let updated = match &req.config {
@@ -292,6 +294,14 @@ pub async fn patch(
     )
     .await;
     info!(agent_id = %id, by = %user.id, "agent patched");
+    // The shell environment applies to the running agent's next command.
+    if req
+        .config
+        .as_ref()
+        .is_some_and(|c| c.contains_key("shell_env"))
+    {
+        state.secrets.push(&state.registry, id).await;
+    }
     let connected = state.registry.is_connected(id).await;
     Ok(Json(AgentView::from_agent(updated, connected)))
 }
@@ -337,6 +347,16 @@ fn check_heartbeat(raw: Option<&serde_json::Value>) -> Result<(), ApiError> {
         Some(_) => Err(ApiError::BadRequest(
             "config.heartbeat.deliver must be \"last\", \"web\" or a channel name".into(),
         )),
+    }
+}
+
+/// Rejects a `config.shell_env` the runtime would not use (issue #233).
+fn check_shell_env(raw: Option<&serde_json::Value>) -> Result<(), ApiError> {
+    match raw {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(env) => crate::secrets::read_shell_env(env)
+            .map(|_| ())
+            .map_err(|e| ApiError::BadRequest(format!("config.shell_env: {e}"))),
     }
 }
 
@@ -763,6 +783,8 @@ pub async fn delete(
     )
     .await;
     repo::delete(&state.db, id).await?;
+    // Its secrets went with the row.
+    state.secrets.forget(id).await;
 
     let workspace = workspace_for(&state, id);
     if let Err(e) = tokio::fs::remove_dir_all(&workspace).await

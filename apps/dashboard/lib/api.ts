@@ -460,6 +460,28 @@ export type McpView = {
   available_binaries: string[];
 };
 
+/** One of an agent's secrets (issue #233): never its value. */
+export type SecretView = {
+  name: string;
+  /** False while the agent asked for it and it is not set. */
+  set: boolean;
+  updated_at: string;
+  requested?: { reason: string; env?: string; at: string };
+  /** The shell variables that get it. */
+  variables: string[];
+};
+
+/** `/agents/{id}/secrets`: the agent's secrets and its shell environment. */
+export type SecretsView = {
+  secrets: SecretView[];
+  /** Variable name to text, or `secret:<name>`. */
+  shell_env: Record<string, string>;
+  /** Secrets can be set: the gateway has HAVN_AGE_KEY. */
+  encrypts: boolean;
+  /** Values shorter than this are not redacted from tool output. */
+  min_redacted_chars: number;
+};
+
 export type BootstrapView = {
   /** Persona + identity (tone, values, name, purpose). null = file
    * absent or empty. Edits take effect on the agent's next start
@@ -900,6 +922,22 @@ export const api = {
       }),
     remove: (agentId: string, id: string) =>
       request<void>(`/agents/${agentId}/webhooks/${id}`, { method: "DELETE" }),
+  },
+  secrets: {
+    list: (agentId: string) => request<SecretsView>(`/agents/${agentId}/secrets`),
+    /** With `env`, shell commands get it as that variable. */
+    set: (agentId: string, name: string, value: string, env?: string) =>
+      request<SecretsView>(`/agents/${agentId}/secrets/${encodeURIComponent(name)}`, {
+        method: "PUT",
+        body: JSON.stringify(env ? { value, env } : { value }),
+      }),
+    remove: (agentId: string, name: string) =>
+      request<SecretsView>(`/agents/${agentId}/secrets/${encodeURIComponent(name)}`, { method: "DELETE" }),
+    setShellEnv: (agentId: string, env: Record<string, string>) =>
+      request<SecretsView>(`/agents/${agentId}/shell-env`, {
+        method: "PUT",
+        body: JSON.stringify({ env }),
+      }),
   },
   setTimezone: (timezone: string | null) =>
     request<TimezoneView>("/me/timezone", {

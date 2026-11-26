@@ -407,6 +407,7 @@ pub(crate) mod tests {
             webchat_router.clone(),
             dummy_path.clone(),
         );
+        let secrets = crate::secrets::SecretStore::new(pool.clone(), None);
         let app = AppState {
             db: pool,
             bootstrap_user_id: bootstrap,
@@ -438,6 +439,7 @@ pub(crate) mod tests {
             )),
             agent_env_passthrough: Arc::new(Vec::new()),
             keyring: None,
+            secrets,
             supervisor: crate::supervisor::Supervisor::new(
                 crate::supervisor::RestartPolicy::default(),
                 havn_proto::LIVENESS_PING_INTERVAL,

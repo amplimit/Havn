@@ -231,14 +231,34 @@ async fn spawn_one(name: &str, cfg: &McpServerConfig) -> anyhow::Result<McpClien
     for arg in &cfg.args {
         command.arg(arg);
     }
+    // `secret:<name>` values are the agent's secrets (issue #233); a server
+    // whose secret is not set does not start.
     for (k, v) in &cfg.env {
-        command.env(k, v);
+        let value = crate::secrets::resolve(v).map_err(|e| anyhow::anyhow!("env {k}: {e}"))?;
+        command.env(k, value);
     }
-    // child stderr inherits the runtime's stderr by default (rmcp
-    // configures stdin/stdout for the JSON-RPC pipe), which means
-    // server log output ends up in the agent's tracing pipeline —
-    // useful for debugging without separate plumbing.
-    let transport = TokioChildProcess::new(command)?;
+    // The server's stderr goes to the runtime's, as its log, with the
+    // agent's secrets redacted line by line.
+    let (transport, stderr) = TokioChildProcess::builder(command)
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(stderr) = stderr {
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt as _;
+            let mut reader = tokio::io::BufReader::new(stderr);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                match reader.read_until(b'\n', &mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => eprint!(
+                        "{}",
+                        crate::secrets::redact(&String::from_utf8_lossy(&line))
+                    ),
+                }
+            }
+        });
+    }
     // `().serve(t)` performs the MCP `initialize` handshake; we get
     // back a handle that exposes `list_all_tools` and `call_tool`.
     let svc = ().serve(transport).await?;

@@ -167,6 +167,8 @@ pub struct AgentSocketCtx {
     /// that mode `LlmRequest`s short-circuit with NoCredential
     /// rather than touching the proxy.
     pub keyring: Option<crate::keyring::KeyRing>,
+    /// The agents' secrets (issue #233), shared with `AppState`.
+    pub secrets: crate::secrets::SecretStore,
     /// Backend selection and rate limit of the `web_search` gateway tool.
     pub search: Arc<crate::web_search::WebSearch>,
     /// Rate limit, page cache and answer model of the `web_fetch` gateway
@@ -650,7 +652,7 @@ async fn handle_connection(
     //    unavailable, ship `Policy::default()` rather than refuse the
     //    connection. Refusing here would just orphan the runtime; the
     //    spawner would retry into the same dead end.
-    let (policy, model, max_tokens, agent_name, gateway_tools, models, language): (
+    let (policy, model, max_tokens, agent_name, gateway_tools, models, language, secrets): (
         Policy,
         Option<String>,
         Option<u32>,
@@ -658,6 +660,7 @@ async fn handle_connection(
         Vec<GatewayToolSpec>,
         Vec<havn_proto::ModelChoice>,
         havn_core::Language,
+        havn_proto::Secrets,
     ) = match agents_repo::find_by_id(&ctx.db, agent_id).await {
         Ok(Some(agent)) => {
             let model = agent
@@ -682,6 +685,7 @@ async fn handle_connection(
             let gateway_tools = gateway_tools_for(&ctx, &agent, &policy).await;
             let models = model_choices(&policy, &ctx.models.load());
             let language = havn_core::Language::of_config(&agent.config);
+            let secrets = ctx.secrets.for_runtime(&agent).await;
             (
                 policy,
                 model,
@@ -690,6 +694,7 @@ async fn handle_connection(
                 gateway_tools,
                 models,
                 language,
+                secrets,
             )
         }
         Ok(None) => {
@@ -702,6 +707,7 @@ async fn handle_connection(
                 Vec::new(),
                 Vec::new(),
                 havn_core::Language::English,
+                havn_proto::Secrets::default(),
             )
         }
         Err(e) => {
@@ -714,6 +720,7 @@ async fn handle_connection(
                 Vec::new(),
                 Vec::new(),
                 havn_core::Language::English,
+                havn_proto::Secrets::default(),
             )
         }
     };
@@ -752,6 +759,7 @@ async fn handle_connection(
         models,
         language,
         cuts_calls: true,
+        secrets,
     };
     let write_welcome = write_frame(&mut write, &welcome);
     let sent = match tokio::time::timeout(AGENT_WRITE_TIMEOUT, write_welcome).await {
@@ -2020,6 +2028,13 @@ async fn gateway_tools_for(
     if policy.permissions.can_schedule_cron {
         tools.push(crate::schedule::spec());
     }
+    // Secrets reach shell commands and MCP servers; the owner can set
+    // them only with HAVN_AGE_KEY.
+    if ctx.secrets.encrypts()
+        && (policy.permissions.can_use_shell || policy.permissions.can_use_mcp)
+    {
+        tools.push(crate::secrets::spec());
+    }
     tools
 }
 
@@ -2053,8 +2068,51 @@ async fn run_gateway_tool(
         crate::web_fetch::TOOL_NAME => run_web_fetch(agent_id, call, ctx).await,
         crate::outbox::TOOL_NAME => run_send_file(agent_id, call, ctx).await,
         crate::choice::TOOL_NAME => run_ask_choice(agent_id, call, ctx).await,
+        crate::secrets::TOOL_NAME => run_secret_request(agent_id, call, ctx).await,
         other => Err(format!("the gateway has no tool named {other:?}")),
     }
+}
+
+/// `secret_request` (issue #233): the agent asks its owner for a secret it
+/// lacks, which the owner enters on the dashboard. Audited as
+/// `secret.requested`.
+async fn run_secret_request(
+    agent_id: AgentId,
+    call: &GatewayToolCall,
+    ctx: &AgentSocketCtx,
+) -> Result<String, String> {
+    if !ctx.secrets.encrypts() {
+        return Err("secrets cannot be set on this gateway (no HAVN_AGE_KEY)".into());
+    }
+    let agent = match agents_repo::find_by_id(&ctx.db, agent_id).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => return Err(format!("agent {agent_id} not found")),
+        Err(e) => return Err(format!("agent lookup failed: {e}")),
+    };
+    let (text, was) = crate::secrets::run_request(&ctx.db, &agent, &call.input).await?;
+    if was != havn_db::repo::agent_secrets::Was::Set {
+        let field = |key: &str| {
+            call.input
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.trim().chars().take(500).collect::<String>())
+        };
+        crate::audit::record(
+            &ctx.db,
+            agent.owner_id,
+            agent.team_id,
+            Some(agent_id),
+            "secret.requested",
+            serde_json::json!({
+                "name": field("name"),
+                "reason": field("reason"),
+                "env": field("env"),
+                "again": was == havn_db::repo::agent_secrets::Was::Requested,
+            }),
+        )
+        .await;
+    }
+    Ok(text)
 }
 
 /// `send_file`: copy the file into the agent's outbox and send its
@@ -3767,6 +3825,7 @@ mod tests {
         let db = connect_in_memory().await.expect("db");
         let registry = AgentRegistry::new();
         let webchat_router = WebChatRouter::new();
+        let secrets = crate::secrets::SecretStore::new(db.clone(), None);
         AgentSocketCtx {
             vision_refused: VisionRefused::default(),
             attachments: Arc::default(),
@@ -3800,6 +3859,7 @@ mod tests {
             tmpfs_mounts: Vec::new(),
             seccomp_allow_extra: Vec::new(),
             keyring: None,
+            secrets,
             search: Arc::new(crate::web_search::WebSearch::new(
                 crate::config::SearchConfig::default(),
                 &crate::config::LlmConfig::default(),

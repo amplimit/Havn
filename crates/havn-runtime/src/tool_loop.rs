@@ -763,9 +763,14 @@ async fn execute_tool_use(
         ToolResult::Error(s) => (s, true, None),
         ToolResult::Image { text, path } => (text, false, Some(path)),
     };
+    // Before the model sees it or it is kept (issue #233).
+    let text = crate::secrets::redact(&text);
     let step = traced(context).then(|| {
         let input = block.get("input").cloned().unwrap_or(Value::Null);
-        let input = clip(&input.to_string(), TRACE_INPUT_CHARS);
+        let input = clip(
+            &crate::secrets::redact(&input.to_string()),
+            TRACE_INPUT_CHARS,
+        );
         let result = clip(&text, TRACE_RESULT_CHARS);
         let mut chars = input.chars().count() + result.chars().count();
         let mut item = serde_json::json!({
@@ -819,7 +824,7 @@ fn show_step(handle: &LoopHandle, tool: &str, input: &Value) {
             channel_id,
             conversation,
             tool: tool.to_string(),
-            detail: step_detail(input),
+            detail: crate::secrets::redact(&step_detail(input)),
         }));
 }
 

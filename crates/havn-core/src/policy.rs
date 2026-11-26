@@ -507,6 +507,9 @@ pub struct McpServerConfig {
     /// at startup rather than silently picking up the directory itself.
     pub binary: String,
     pub args: Vec<String>,
+    /// The server's environment. A value `secret:<name>` is the agent's
+    /// secret of that name, set by its owner and resolved when the server
+    /// starts (issue #233); without it the server does not start.
     pub env: HashMap<String, String>,
     /// Read-write paths the spawner unions into Landlock.
     pub extra_paths_rw: Vec<PathBuf>,
