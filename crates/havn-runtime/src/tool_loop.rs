@@ -763,8 +763,8 @@ async fn execute_tool_use(
         ToolResult::Error(s) => (s, true, None),
         ToolResult::Image { text, path } => (text, false, Some(path)),
     };
-    // Before the model sees it or it is kept (issue #233).
-    let text = crate::secrets::redact(&text);
+    // The registry redacted the agent's secrets from `text`; the input the
+    // steps show is redacted here (issue #233).
     let step = traced(context).then(|| {
         let input = block.get("input").cloned().unwrap_or(Value::Null);
         let input = clip(
