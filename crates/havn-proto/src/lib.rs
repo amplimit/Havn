@@ -27,6 +27,9 @@ pub use codec::{FrameError, read_frame, write_frame};
 /// 0.7.0: `ChatTitled`.
 /// 0.8.0: `HeartbeatTick` names where its result goes.
 /// 0.10.0: `Welcome.secrets` and `Secrets` (issue #233).
+/// 0.11.0: the gateway tool `transcribe`, which a runtime must review in
+/// other people's conversations, and attachments' `scan` and `unread`
+/// (issue #230).
 /// 0.12.0: `McpStatus` and `Secrets.mcp_tokens` (issue #234).
 pub const PROTOCOL_VERSION: &str = "0.12.0";
 

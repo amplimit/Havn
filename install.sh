@@ -226,6 +226,21 @@ for bin in $BINARIES; do
     [ -x "$ARTIFACT_DIR/$bin" ] || die "missing build artifact: $ARTIFACT_DIR/$bin"
     $SUDO install -m 755 "$ARTIFACT_DIR/$bin" "$INSTALL_PREFIX/$bin"
 done
+# Havn's licence, and the third-party notices a release carries, beside
+# the prefix: /usr/local/share/doc/havn for /usr/local/bin.
+DOC_DIR="$(dirname "${INSTALL_PREFIX%/}")/share/doc/havn"
+for doc in LICENSE THIRD-PARTY-NOTICES.txt; do
+    for from in "$ARTIFACT_DIR/$doc" "${SRC_DIR:-/nonexistent}/$doc"; do
+        if [ -f "$from" ]; then
+            $SUDO install -d -m 755 "$DOC_DIR"
+            $SUDO install -m 644 "$from" "$DOC_DIR/$doc"
+            break
+        fi
+    done
+done
+if [ -f "$DOC_DIR/LICENSE" ]; then
+    ok "licences → $DOC_DIR"
+fi
 
 # 7. Network tools the gateway runs for agent egress (veth + NAT, spec §4.1).
 # Without iptables or nsenter the gateway still starts, but every agent has no

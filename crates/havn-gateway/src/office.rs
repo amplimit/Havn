@@ -1,4 +1,5 @@
-//! The text of Word and spreadsheet files (issue #106): a file sent in a
+//! The text of Word and spreadsheet files (issue #106), and of
+//! presentations with their speaker notes (issue #230): a file sent in a
 //! chat or read by `web_fetch`, as Markdown the agent can read. These
 //! parsers read untrusted archives, so they run only in the gateway's
 //! converter child (see [`crate::web_fetch`]), under its memory, CPU and
@@ -674,15 +675,15 @@ impl<'a> Body<'a> {
 }
 
 /// The part a package's relationship of type `…/officeDocument` names, by
-/// its path in the archive.
-fn main_part(archive: &mut Archive<'_>) -> Result<String, String> {
+/// its path in the archive; `usual` when none does.
+fn main_part(archive: &mut Archive<'_>, usual: &str) -> Result<String, String> {
     let named = part(archive, "_rels/.rels")?.and_then(|rels| {
         relationships(&rels)
             .into_iter()
             .find(|r| r.kind.ends_with("/officeDocument") && !r.external)
             .map(|r| r.target.trim_start_matches('/').to_string())
     });
-    Ok(named.unwrap_or_else(|| "word/document.xml".to_string()))
+    Ok(named.unwrap_or_else(|| usual.to_string()))
 }
 
 /// The text of Word document `input` (.docx) as Markdown: headings, lists,
@@ -690,7 +691,7 @@ fn main_part(archive: &mut Archive<'_>) -> Result<String, String> {
 /// comments with the text they are on. Tracked changes show accepted.
 pub fn docx_text(input: &[u8]) -> Result<String, String> {
     let mut archive = open(input)?;
-    let document = main_part(&mut archive)?;
+    let document = main_part(&mut archive, "word/document.xml")?;
     let xml =
         part(&mut archive, &document)?.ok_or("not a Word document: it has no document part")?;
     let (dir, file) = document.rsplit_once('/').unwrap_or(("", &document));
@@ -1133,6 +1134,378 @@ pub fn sheet_text(input: &[u8]) -> Result<String, String> {
     Ok(out)
 }
 
+/// Slides of a presentation shown.
+const MAX_SLIDES: usize = 2000;
+
+/// The path in the archive of `target`, a relationship's target from the
+/// part in directory `dir`: from the package root when it starts with `/`.
+fn resolve(dir: &str, target: &str) -> String {
+    let mut parts: Vec<&str> = match target.strip_prefix('/') {
+        Some(_) => Vec::new(),
+        None => dir.split('/').filter(|p| !p.is_empty()).collect(),
+    };
+    for part in target.trim_start_matches('/').split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    parts.join("/")
+}
+
+/// The directory of part `name` and where its relationships are.
+fn rels_of(name: &str) -> (&str, String) {
+    match name.rsplit_once('/') {
+        Some((dir, file)) => (dir, format!("{dir}/_rels/{file}.rels")),
+        None => ("", format!("_rels/{name}.rels")),
+    }
+}
+
+/// The relationship ids of a presentation's slides, in the order shown.
+fn slide_ids(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut reader = Reader::from_str(xml);
+    while let Ok(event) = reader.read_event() {
+        match event {
+            Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == "sldId" => {
+                // `r:id`, not the slide's own number `id`.
+                let id = e
+                    .attributes()
+                    .flatten()
+                    .find(|a| a.key.local_name().as_ref() == "id" && a.key.prefix().is_some())
+                    .and_then(|a| {
+                        a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                            .ok()
+                            .map(|v| v.into_owned())
+                    });
+                if let Some(id) = id {
+                    out.push(id);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A paragraph of a slide's shape: its text, list level, and whether it
+/// is a list item by its own bullet setting.
+#[derive(Default)]
+struct SlidePara {
+    text: String,
+    level: usize,
+    bullet: Option<bool>,
+}
+
+/// What a slide or its notes has been read into.
+#[derive(Default)]
+struct SlideText {
+    title: String,
+    body: String,
+    hidden: bool,
+}
+
+/// Placeholders whose text is the same on every slide, or is the slide
+/// itself on its notes page.
+const REPEATED: &[&str] = &["dt", "ftr", "sldNum", "hdr", "sldImg"];
+
+/// The text of slide `xml`, or of its notes page with `notes`: the title,
+/// then each shape's paragraphs, tables and image descriptions.
+fn slide_text(xml: &str, notes: bool) -> Result<SlideText, String> {
+    let mut out = SlideText::default();
+    let mut reader = Reader::from_str(xml);
+    // The shape being read: its placeholder's kind and paragraphs.
+    let mut shape: Option<(Option<String>, Vec<SlidePara>)> = None;
+    let mut para: Option<SlidePara> = None;
+    let mut in_text = false;
+    let mut in_picture = 0_usize;
+    let mut cells: Option<(Vec<Vec<String>>, Vec<String>, String)> = None;
+    let mut skip = 0_usize;
+    let push = |body: &mut String, text: &str| {
+        if !body.is_empty() && !body.ends_with("\n\n") {
+            body.push('\n');
+        }
+        body.push_str(text);
+        body.push('\n');
+    };
+    loop {
+        let event = reader
+            .read_event()
+            .map_err(|e| format!("not a readable presentation: {e}"))?;
+        if skip > 0 {
+            match event {
+                Event::Start(_) => skip += 1,
+                Event::End(_) => skip -= 1,
+                Event::Eof => break,
+                _ => {}
+            }
+            continue;
+        }
+        let empty = matches!(event, Event::Empty(_));
+        match event {
+            Event::Start(e) | Event::Empty(e) => {
+                match e.local_name().as_ref() {
+                    // What an app that cannot read the content above it
+                    // shows: the same again.
+                    "Fallback" if !empty => skip = 1,
+                    "sld" => {
+                        out.hidden = matches!(attr(&e, "show").as_deref(), Some("0" | "false"));
+                    }
+                    "sp" if !empty => shape = Some((None, Vec::new())),
+                    "pic" if !empty => in_picture += 1,
+                    "ph" => {
+                        if let Some((kind, _)) = &mut shape {
+                            *kind = Some(attr(&e, "type").unwrap_or_else(|| "obj".into()));
+                        }
+                    }
+                    "cNvPr" if in_picture > 0 && !notes => {
+                        let alt = attr(&e, "descr")
+                            .or_else(|| attr(&e, "title"))
+                            .map(|a| a.split_whitespace().collect::<Vec<_>>().join(" "))
+                            .filter(|a| !a.is_empty());
+                        match alt {
+                            Some(alt) => push(&mut out.body, &format!("[image: {alt}]")),
+                            None => push(&mut out.body, "[image]"),
+                        }
+                    }
+                    "chart" if !notes => push(&mut out.body, "[chart]"),
+                    "tbl" if !empty => cells = Some((Vec::new(), Vec::new(), String::new())),
+                    "tr" if !empty => {
+                        if let Some((_, row, _)) = &mut cells {
+                            row.clear();
+                        }
+                    }
+                    "tc" if !empty => {
+                        if let Some((_, _, cell)) = &mut cells {
+                            cell.clear();
+                        }
+                    }
+                    "p" => para = (!empty).then(SlidePara::default),
+                    "pPr" => {
+                        if let Some(p) = &mut para {
+                            p.level = attr(&e, "lvl")
+                                .and_then(|v| v.parse::<usize>().ok())
+                                .unwrap_or(0)
+                                .min(8);
+                        }
+                    }
+                    "buNone" => {
+                        if let Some(p) = &mut para {
+                            p.bullet = Some(false);
+                        }
+                    }
+                    "buChar" | "buAutoNum" | "buBlip" => {
+                        if let Some(p) = &mut para {
+                            p.bullet = Some(true);
+                        }
+                    }
+                    "t" if !empty => in_text = true,
+                    "br" => {
+                        if let Some(p) = &mut para {
+                            p.text.push('\n');
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Event::End(e) => match e.local_name().as_ref() {
+                "t" => in_text = false,
+                "pic" => in_picture = in_picture.saturating_sub(1),
+                "p" => {
+                    let Some(done) = para.take() else { continue };
+                    if done.text.trim().is_empty() {
+                        continue;
+                    }
+                    if let Some((_, _, cell)) = &mut cells {
+                        if !cell.is_empty() {
+                            cell.push('\n');
+                        }
+                        cell.push_str(done.text.trim());
+                    } else if let Some((_, paras)) = &mut shape {
+                        paras.push(done);
+                    } else {
+                        push(&mut out.body, done.text.trim());
+                    }
+                }
+                "tc" => {
+                    if let Some((_, row, cell)) = &mut cells {
+                        row.push(cell_text(cell));
+                    }
+                }
+                "tr" => {
+                    if let Some((rows, row, _)) = &mut cells {
+                        rows.push(std::mem::take(row));
+                    }
+                }
+                "tbl" => {
+                    if let Some((rows, _, _)) = cells.take() {
+                        let rows: Vec<Vec<String>> = rows.into_iter().take(MAX_ROWS).collect();
+                        push(&mut out.body, table(&rows).trim_end());
+                    }
+                }
+                "sp" => {
+                    let Some((kind, paras)) = shape.take() else {
+                        continue;
+                    };
+                    let kind = kind.as_deref();
+                    if kind.is_some_and(|k| REPEATED.contains(&k)) || paras.is_empty() {
+                        continue;
+                    }
+                    if !notes && matches!(kind, Some("title" | "ctrTitle")) {
+                        let title = paras
+                            .iter()
+                            .map(|p| p.text.split_whitespace().collect::<Vec<_>>().join(" "))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        if out.title.is_empty() {
+                            out.title = title;
+                        } else {
+                            push(&mut out.body, &title);
+                        }
+                        continue;
+                    }
+                    // A content placeholder's paragraphs are bullets unless
+                    // they say not; a text box's only when they say so.
+                    let listed = !notes && matches!(kind, Some("body" | "obj"));
+                    let lines: Vec<String> = paras
+                        .iter()
+                        .map(|p| {
+                            let text = p.text.trim().replace('\n', " ");
+                            if p.bullet.unwrap_or(listed) {
+                                format!("{}- {text}", "  ".repeat(p.level))
+                            } else {
+                                text
+                            }
+                        })
+                        .collect();
+                    push(&mut out.body, &lines.join("\n"));
+                    out.body.push('\n');
+                }
+                _ => {}
+            },
+            Event::Text(t) if in_text => {
+                if let Some(p) = &mut para {
+                    p.text.push_str(&t);
+                }
+            }
+            Event::GeneralRef(r) if in_text => {
+                if let (Some(p), Some(c)) = (&mut para, entity(&r)) {
+                    p.text.push(c);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    out.body = out.body.trim().to_string();
+    Ok(out)
+}
+
+/// The text of presentation `input` (.pptx, .pptm, .ppsx) as Markdown
+/// (issue #230): each slide in the order shown, under its number and
+/// title, with its text, tables and image descriptions, then its speaker
+/// notes.
+pub fn pptx_text(input: &[u8]) -> Result<String, String> {
+    let mut archive = open(input)?;
+    // What the parts read unpack to, all told: the parts a presentation
+    // names may repeat.
+    let mut unpacked: u64 = 0;
+    let mut counted = |archive: &mut Archive<'_>, name: &str| -> Result<Option<String>, String> {
+        let found = part(archive, name)?;
+        unpacked += found.as_ref().map_or(0, |text| text.len() as u64);
+        if unpacked > MAX_UNPACKED_BYTES {
+            return Err(format!(
+                "the file unpacks to more than {} MB",
+                MAX_UNPACKED_BYTES / (1024 * 1024)
+            ));
+        }
+        Ok(found)
+    };
+    let presentation = main_part(&mut archive, "ppt/presentation.xml")?;
+    let xml = counted(&mut archive, &presentation)?
+        .ok_or("not a presentation: it has no presentation part")?;
+    let (dir, rels_path) = rels_of(&presentation);
+    let rels = counted(&mut archive, &rels_path)?
+        .map(|x| relationships(&x))
+        .unwrap_or_default();
+    // Each slide once, however often the list names it.
+    let mut listed = std::collections::HashSet::new();
+    let mut slides: Vec<String> = slide_ids(&xml)
+        .iter()
+        .filter_map(|id| {
+            rels.iter()
+                .find(|r| r.id == *id && !r.external && r.kind.ends_with("/slide"))
+        })
+        .map(|r| resolve(dir, &r.target))
+        .filter(|path| listed.insert(path.clone()))
+        .collect();
+    // Without a list, the slides by their names' numbers.
+    if slides.is_empty() {
+        let mut named: Vec<(u32, String)> = archive
+            .file_names()
+            .filter_map(|name| {
+                let name = name.ok()?;
+                let n = name
+                    .strip_prefix("ppt/slides/slide")?
+                    .strip_suffix(".xml")?
+                    .parse::<u32>()
+                    .ok()?;
+                Some((n, name.to_string()))
+            })
+            .collect();
+        named.sort();
+        slides = named.into_iter().map(|(_, name)| name).collect();
+    }
+    let total = slides.len();
+    let mut out = String::new();
+    for (n, slide) in slides.iter().take(MAX_SLIDES).enumerate() {
+        if out.len() > MAX_TEXT_BYTES {
+            let _ = writeln!(out, "({} more slides not shown)", total - n);
+            break;
+        }
+        let Some(xml) = counted(&mut archive, slide)? else {
+            continue;
+        };
+        let read = slide_text(&xml, false)?;
+        let (slide_dir, slide_rels) = rels_of(slide);
+        let notes = counted(&mut archive, &slide_rels)?
+            .map(|x| relationships(&x))
+            .unwrap_or_default()
+            .into_iter()
+            .find(|r| r.kind.ends_with("/notesSlide") && !r.external)
+            .map(|r| resolve(slide_dir, &r.target));
+        let notes = match notes {
+            Some(path) => match counted(&mut archive, &path)? {
+                Some(xml) => slide_text(&xml, true)?.body,
+                None => String::new(),
+            },
+            None => String::new(),
+        };
+        let _ = write!(out, "## Slide {}", n + 1);
+        if !read.title.is_empty() {
+            let _ = write!(out, ": {}", read.title);
+        }
+        if read.hidden {
+            out.push_str(" (hidden)");
+        }
+        out.push_str("\n\n");
+        if !read.body.is_empty() {
+            let _ = write!(out, "{}\n\n", read.body);
+        }
+        if !notes.is_empty() {
+            let _ = write!(out, "Speaker notes:\n\n{notes}\n\n");
+        }
+    }
+    if total > MAX_SLIDES && out.len() <= MAX_TEXT_BYTES {
+        let _ = writeln!(out, "({} more slides not shown)", total - MAX_SLIDES);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -1150,6 +1523,94 @@ mod tests {
             zip.write_all(body.as_bytes()).expect("write");
         }
         zip.finish().expect("finish").into_inner()
+    }
+
+    const P: &str = r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main""#;
+
+    #[test]
+    fn a_presentation_reads_slide_by_slide_with_its_notes() {
+        let presentation = format!(
+            r#"<p:presentation {P}><p:sldIdLst><p:sldId id="256" r:id="rId3"/><p:sldId id="257" r:id="rId2"/><p:sldId id="258" r:id="rId2"/></p:sldIdLst></p:presentation>"#
+        );
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="/ppt/slides/slide2.xml"/></Relationships>"#;
+        let first = format!(
+            r#"<p:sld {P}><p:cSld><p:spTree>
+<p:sp><p:nvSpPr><p:cNvPr id="2" name="Title"/><p:cNvSpPr/><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>季度 &amp; plan</a:t></a:r></a:p></p:txBody></p:sp>
+<p:sp><p:nvSpPr><p:cNvPr id="3" name="Body"/><p:cNvSpPr/><p:nvPr><p:ph idx="1"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>Grow sales</a:t></a:r></a:p><a:p><a:pPr lvl="1"/><a:r><a:t>in Asia</a:t></a:r></a:p><a:p><a:pPr><a:buNone/></a:pPr><a:r><a:t>no bullet</a:t></a:r></a:p></p:txBody></p:sp>
+<p:sp><p:nvSpPr><p:cNvPr id="4" name="Number"/><p:cNvSpPr/><p:nvPr><p:ph type="sldNum"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>7</a:t></a:r></a:p></p:txBody></p:sp>
+<p:pic><p:nvPicPr><p:cNvPr id="5" name="Picture" descr="A map of Asia"/></p:nvPicPr></p:pic>
+<p:graphicFrame><a:graphic><a:graphicData><a:tbl><a:tr><a:tc><a:txBody><a:p><a:r><a:t>Region</a:t></a:r></a:p></a:txBody></a:tc><a:tc><a:txBody><a:p><a:r><a:t>Q1</a:t></a:r></a:p></a:txBody></a:tc></a:tr><a:tr><a:tc><a:txBody><a:p><a:r><a:t>East</a:t></a:r></a:p></a:txBody></a:tc><a:tc><a:txBody><a:p><a:r><a:t>12</a:t></a:r></a:p></a:txBody></a:tc></a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>
+</p:spTree></p:cSld></p:sld>"#
+        );
+        let first_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/></Relationships>"#;
+        let notes = format!(
+            r#"<p:notes {P}><p:cSld><p:spTree>
+<p:sp><p:nvSpPr><p:cNvPr id="2" name="Slide Image"/><p:cNvSpPr/><p:nvPr><p:ph type="sldImg"/></p:nvPr></p:nvSpPr></p:sp>
+<p:sp><p:nvSpPr><p:cNvPr id="3" name="Notes"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>Mention the new office.</a:t></a:r></a:p></p:txBody></p:sp>
+</p:spTree></p:cSld></p:notes>"#
+        );
+        let second = format!(
+            r#"<p:sld {P} show="false"><p:cSld><p:spTree>
+<p:sp><p:nvSpPr><p:cNvPr id="2" name="Box"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:txBody><a:p><a:r><a:t>Opening words</a:t></a:r></a:p></p:txBody></p:sp>
+</p:spTree></p:cSld></p:sld>"#
+        );
+        let file = archive(&[
+            ("ppt/presentation.xml", &presentation),
+            ("ppt/_rels/presentation.xml.rels", rels),
+            ("ppt/slides/slide1.xml", &first),
+            ("ppt/slides/_rels/slide1.xml.rels", first_rels),
+            ("ppt/notesSlides/notesSlide1.xml", &notes),
+            ("ppt/slides/slide2.xml", &second),
+        ]);
+        let text = pptx_text(&file).expect("text");
+        // In the order shown: the list's, not the files'.
+        assert!(
+            text.starts_with("## Slide 1 (hidden)\n\nOpening words\n\n## Slide 2: 季度 & plan\n\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- Grow sales\n  - in Asia\nno bullet\n"),
+            "{text}"
+        );
+        assert!(text.contains("[image: A map of Asia]"), "{text}");
+        assert!(
+            text.contains("| Region | Q1 |\n| --- | --- |\n| East | 12 |"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("Speaker notes:\n\nMention the new office.\n\n"),
+            "{text}"
+        );
+        assert!(!text.contains('7'), "the slide number is not text: {text}");
+        assert!(
+            !text.contains("Slide 3"),
+            "a slide listed twice is read once: {text}"
+        );
+    }
+
+    #[test]
+    fn a_presentation_without_its_list_reads_its_slides_by_number() {
+        let slide = |words: &str| {
+            format!(
+                r#"<p:sld {P}><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="Box"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:txBody><a:p><a:r><a:t>{words}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#
+            )
+        };
+        let file = archive(&[
+            ("ppt/presentation.xml", &format!("<p:presentation {P}/>")),
+            ("ppt/slides/slide10.xml", &slide("ten")),
+            ("ppt/slides/slide2.xml", &slide("two")),
+        ]);
+        let text = pptx_text(&file).expect("text");
+        assert!(
+            text.find("two").expect("two") < text.find("ten").expect("ten"),
+            "{text}"
+        );
+        assert!(pptx_text(b"not a zip").is_err());
+        assert_eq!(
+            resolve("ppt/slides", "../notesSlides/n1.xml"),
+            "ppt/notesSlides/n1.xml"
+        );
+        assert_eq!(resolve("ppt", "/ppt/slides/s.xml"), "ppt/slides/s.xml");
     }
 
     const W: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006""#;

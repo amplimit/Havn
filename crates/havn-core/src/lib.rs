@@ -17,8 +17,8 @@ pub use ids::{
     AgentId, ChannelBindingId, CredentialId, CronJobId, RoleId, SkillId, TeamId, UserId,
 };
 pub use message::{
-    Attachment, Branch, Button, INBOX_DIR, InboundMessage, MAX_BUTTON_DATA, MessageContent,
-    OutboundMessage, Poll,
+    Attachment, Branch, Button, INBOX_DIR, InboundMessage, MAX_BUTTON_DATA, MAX_SCAN_PAGES,
+    MessageContent, OutboundMessage, Poll, Scan, Unread,
 };
 pub use policy::{
     AGENT_CGROUP_PARENT, AGENT_CGROUP_PREFIX, AdminVisibility, BudgetExhaustAction, BudgetPolicy,

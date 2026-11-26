@@ -83,6 +83,10 @@ export type AgentWebView = {
   can_search_web: boolean;
   /** web_fetch: the gateway reads pages for the agent. */
   can_fetch_web: boolean;
+  /** transcribe: the gateway transcribes audio of the agent's workspace. */
+  can_transcribe: boolean;
+  /** The gateway has `[transcription]` set. */
+  transcription: boolean;
   /** Network egress from the agent's sandbox. */
   egress_allowed: boolean;
   /** That egress goes through the gateway's proxy, which asks about new domains. */
@@ -90,6 +94,7 @@ export type AgentWebView = {
   /** What the owner's policy permits; false only in multi-user mode. */
   search_permitted: boolean;
   fetch_permitted: boolean;
+  transcribe_permitted: boolean;
   egress_permitted: boolean;
   /** The backend this agent would search with, or null when none is set up. */
   search_backend: string | null;
@@ -113,6 +118,7 @@ export type MyDomainsView = {
 export type AgentWebPatch = {
   can_search_web?: boolean;
   can_fetch_web?: boolean;
+  can_transcribe?: boolean;
   egress_allowed?: boolean;
   egress_proxy?: boolean;
   allowed_domains?: string[];
