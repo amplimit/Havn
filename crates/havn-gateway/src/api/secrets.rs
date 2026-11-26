@@ -95,12 +95,9 @@ async fn view(state: &AppState, agent: &Agent) -> Result<SecretsView, ApiError> 
             name: row.name,
         })
         .collect();
-    let policy = crate::policy_resolver::for_session(
-        &state.db,
-        agent,
-        state.trusted_proxies.is_some(),
-    )
-    .await;
+    let policy =
+        crate::policy_resolver::for_session(&state.db, agent, state.trusted_proxies.is_some())
+            .await;
     let refused_mcp_servers = if policy.permissions.can_use_mcp {
         secrets::refused_mcp_servers(&agent.config, &policy)
     } else {

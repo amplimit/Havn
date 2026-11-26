@@ -135,7 +135,8 @@ pub fn redaction_list<'a>(
         for form in [
             value,
             debug.get(1..debug.len() - 1).unwrap_or_default(),
-            json.get(1..json.len().saturating_sub(1)).unwrap_or_default(),
+            json.get(1..json.len().saturating_sub(1))
+                .unwrap_or_default(),
         ] {
             if !form.is_empty() && !list.iter().any(|(f, n)| f == form && n == name) {
                 list.push((form.to_string(), name.clone()));
@@ -148,8 +149,9 @@ pub fn redaction_list<'a>(
 
 /// `text` with every occurrence of a form in `list` (from
 /// [`redaction_list`]) replaced with [`marker`] of its name, in one pass:
-/// occurrences that overlap are replaced together, with the marker of each
-/// secret among them, so no part of either stays.
+/// occurrences that overlap are replaced together, so no part of either
+/// stays, with the marker of each that reaches past the ones before it (one
+/// inside another adds none).
 #[must_use]
 pub fn redact<'a>(text: &'a str, list: &[(String, String)]) -> Cow<'a, str> {
     let mut found: Vec<(usize, usize, &str)> = Vec::new();
@@ -173,9 +175,13 @@ pub fn redact<'a>(text: &'a str, list: &[(String, String)]) -> Cow<'a, str> {
         let mut names = vec![name];
         at += 1;
         while at < found.len() && found[at].0 < end {
-            end = end.max(found[at].1);
-            if !names.contains(&found[at].2) {
-                names.push(found[at].2);
+            // One inside what is replaced already adds no marker; one that
+            // reaches past it does.
+            if found[at].1 > end {
+                end = found[at].1;
+                if !names.contains(&found[at].2) {
+                    names.push(found[at].2);
+                }
             }
             at += 1;
         }
@@ -398,7 +404,11 @@ mod tests {
         assert_eq!(partial_end(b"output tok-012", &list), 7);
         assert_eq!(partial_end(b"done.", &list), 0);
         assert_eq!(partial_end(b"output", &list), 1, "a `t` may start it");
-        assert_eq!(partial_end(b"tok-0123456789", &list), 0, "a whole value is not held");
+        assert_eq!(
+            partial_end(b"tok-0123456789", &list),
+            0,
+            "a whole value is not held"
+        );
         assert_eq!(partial_start(b"3456789 more", &list), 7);
         assert_eq!(partial_start(b"more", &list), 0);
         let bytes = b"a tok-0123456789 b";

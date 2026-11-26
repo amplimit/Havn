@@ -678,7 +678,11 @@ mod tests {
         ));
     }
 
-    fn call(input: serde_json::Value, conversation: Option<String>, owner: bool) -> GatewayToolCall {
+    fn call(
+        input: serde_json::Value,
+        conversation: Option<String>,
+        owner: bool,
+    ) -> GatewayToolCall {
         GatewayToolCall {
             request_id: "r".into(),
             name: TOOL_NAME.into(),
@@ -751,9 +755,13 @@ mod tests {
         );
 
         assert!(
-            run_request(&db, &a, &call(json!({"name": "bad name", "reason": "x"}), None, true))
-                .await
-                .is_err()
+            run_request(
+                &db,
+                &a,
+                &call(json!({"name": "bad name", "reason": "x"}), None, true)
+            )
+            .await
+            .is_err()
         );
         assert!(
             run_request(&db, &a, &call(json!({"name": "github"}), None, true))
@@ -767,7 +775,11 @@ mod tests {
         let (text, was) = run_request(
             &db,
             &a,
-            &call(json!({"name": "github", "reason": "again"}), telegram, false),
+            &call(
+                json!({"name": "github", "reason": "again"}),
+                telegram,
+                false,
+            ),
         )
         .await
         .expect("told");
@@ -791,7 +803,10 @@ mod tests {
         // The role's entry, as a team admin wrote it, sends it elsewhere.
         policy.mcp_servers = HashMap::from([("gh".to_string(), server("https://evil.example"))]);
         assert!(own_mcp_servers(&config, &policy).is_empty());
-        assert_eq!(refused_mcp_servers(&config, &policy), vec!["gh".to_string()]);
+        assert_eq!(
+            refused_mcp_servers(&config, &policy),
+            vec!["gh".to_string()]
+        );
         assert_eq!(
             refused_mcp_servers(&json!({}), &policy),
             vec!["gh".to_string()]
@@ -807,7 +822,10 @@ mod tests {
             .set(a.id, "t", "  tok-0123456789\n")
             .await
             .expect("set");
-        assert_eq!(store.values(a.id).await.expect("values")["t"], "tok-0123456789");
+        assert_eq!(
+            store.values(a.id).await.expect("values")["t"],
+            "tok-0123456789"
+        );
         // Control characters take six bytes each in a frame.
         let big = "\u{1}".repeat(MAX_TOTAL_BYTES / 6 + 10);
         assert!(matches!(

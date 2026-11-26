@@ -945,7 +945,10 @@ mod tests {
         output.push(b"split-secret-0123 end");
         let all = output.since(0, false).0;
         let (before, after) = all.split_once("not kept").expect("a gap");
-        assert!(!before.contains("split"), "the start beside the gap is shown");
+        assert!(
+            !before.contains("split"),
+            "the start beside the gap is shown"
+        );
         assert!(crate::secrets::redact(after).ends_with("[secret:split] end"));
         crate::secrets::set(havn_proto::Secrets::default());
     }

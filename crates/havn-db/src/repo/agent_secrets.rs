@@ -326,9 +326,14 @@ mod tests {
     async fn a_request_is_ended_by_setting_and_never_replaces_a_value() {
         let pool = connect_in_memory().await.expect("db");
         let id = agent(&pool).await;
-        let was = request(&pool, id, "github", asked("to open the PR", Some("GH_TOKEN")))
-            .await
-            .expect("request");
+        let was = request(
+            &pool,
+            id,
+            "github",
+            asked("to open the PR", Some("GH_TOKEN")),
+        )
+        .await
+        .expect("request");
         assert_eq!(was, Was::Absent);
         let first = find(&pool, id, "github").await.expect("find").expect("row");
         assert!(first.value_ciphertext.is_none());
