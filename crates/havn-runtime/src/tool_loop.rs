@@ -196,15 +196,18 @@ pub struct LoopHandle {
 pub struct Segments {
     pub channel_id: String,
     pub chat: String,
+    /// The message the reply answers, in a group (issue #263).
+    pub answers: Option<String>,
     pub sent: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Segments {
     #[must_use]
-    pub fn new(channel_id: String, chat: String) -> Self {
+    pub fn new(channel_id: String, chat: String, answers: Option<String>) -> Self {
         Self {
             channel_id,
             chat,
+            answers,
             sent: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
@@ -221,6 +224,7 @@ impl Segments {
             buttons: Vec::new(),
             poll: None,
             partial: true,
+            last: false,
         };
         if writer_tx
             .send(AgentToGateway::OutboundMessage(outbound))
@@ -869,7 +873,12 @@ async fn call_llm(
         options["tools"] = handle.registry.schemas_for(context);
     }
 
-    let reply = reply_stream(context);
+    // In a group, the reply shown as it is written answers the message the
+    // reply does.
+    let reply = reply_stream(context).map(|reply| havn_proto::ReplyStream {
+        answers: handle.segments.as_ref().and_then(|s| s.answers.clone()),
+        ..reply
+    });
     // A model that answers in place of the turn's goes on for the turn
     // (issue #216), without thinking: it may not take the turn's reasoning
     // so far, nor its own replies of this turn without any.
@@ -975,7 +984,8 @@ async fn call_llm(
 const MAX_FALLBACKS: usize = 3;
 
 /// Where a call of a loop in `context` shows its text as the model writes
-/// it: a turn answering someone, in their conversation.
+/// it: a turn answering someone, in their conversation. Its reply ends
+/// with an outbound that is `last` (issue #325).
 fn reply_stream(context: &'static str) -> Option<havn_proto::ReplyStream> {
     (context == crate::tools::context::WEBCHAT)
         .then(|| {
@@ -987,6 +997,8 @@ fn reply_stream(context: &'static str) -> Option<havn_proto::ReplyStream> {
         .map(|channel_id| havn_proto::ReplyStream {
             channel_id,
             conversation: crate::tools::gateway::CHAT.try_with(Clone::clone).ok(),
+            answers: None,
+            marks_last: true,
         })
 }
 
@@ -2009,5 +2021,42 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "nothing is sent");
+    }
+
+    #[tokio::test]
+    async fn a_chat_app_turn_names_the_message_its_reply_answers_and_marks_its_end() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (pending, _) = maps();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let mut handle = stoppable_handle(tx, &pending, &stop, true).await;
+        handle.segments = Some(Segments::new(
+            "ch|telegram|bot|tg:-1".into(),
+            "c1".into(),
+            Some("tg:chat:-1:msg:7".into()),
+        ));
+        let gateway = tokio::spawn({
+            let pending = Arc::clone(&pending);
+            async move {
+                let AgentToGateway::LlmRequest(asked) = next_frame(&mut rx).await else {
+                    panic!("no request");
+                };
+                answer(
+                    &pending,
+                    &asked.request_id,
+                    serde_json::json!({"stop_reason": "end_turn", "content": [
+                        {"type": "text", "text": "Done."}
+                    ]}),
+                )
+                .await;
+                asked
+            }
+        });
+        let trace = Arc::new(std::sync::Mutex::new(Trace::default()));
+        let ended = web_turn(&handle, &trace).await;
+        let asked = gateway.await.expect("gateway");
+        assert_eq!(ended.expect("a reply"), "Done.");
+        let reply = asked.reply.expect("shown as it is written");
+        assert!(reply.marks_last);
+        assert_eq!(reply.answers.as_deref(), Some("tg:chat:-1:msg:7"));
     }
 }

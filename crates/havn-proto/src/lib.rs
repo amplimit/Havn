@@ -906,6 +906,14 @@ pub struct ReplyStream {
     /// Its chat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
+    /// The message the reply answers, in a group (issue #263).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers: Option<String>,
+    /// The turn's reply ends with an outbound that is `last` (issue #325),
+    /// so a chat app can be shown it as it is written. Absent from an
+    /// older runtime: its replies are shown once written, as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub marks_last: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1292,5 +1300,25 @@ mod tests {
             parsed,
             AgentToGateway::LlmCancel { keep: true, .. }
         ));
+    }
+
+    #[test]
+    fn a_reply_of_an_older_runtime_does_not_mark_its_end() {
+        let older: ReplyStream =
+            serde_json::from_str(r#"{"channel_id":"ch|telegram|bot|tg:1","conversation":"c1"}"#)
+                .expect("parse");
+        assert!(!older.marks_last && older.answers.is_none());
+        let reply: havn_core::OutboundMessage = serde_json::from_str(
+            r#"{"channel_id":"c","content":{"kind":"text","text":"t"},"reply_to":null}"#,
+        )
+        .expect("parse");
+        assert!(!reply.last);
+        let marked = ReplyStream {
+            marks_last: true,
+            ..older
+        };
+        let line = serde_json::to_string(&marked).expect("serialize");
+        assert!(line.contains(r#""marks_last":true"#), "{line}");
+        assert!(!line.contains("answers"), "{line}");
     }
 }

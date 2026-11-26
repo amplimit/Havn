@@ -148,6 +148,10 @@ pub struct OutboundMessage {
     /// wrote before calling a tool, sent as it was written.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub partial: bool,
+    /// The last part of the reply of a turn answering someone (issue
+    /// #325): what a chat app was shown of it as it was written ends here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub last: bool,
     /// Optional message ID to thread / reply to.
     pub reply_to: Option<String>,
     /// The chat a reply belongs to, when it answers one.

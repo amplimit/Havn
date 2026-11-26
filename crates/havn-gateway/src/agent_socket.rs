@@ -131,6 +131,8 @@ pub struct AgentSocketCtx {
     /// The LLM calls in flight of turns answering someone (issues #162
     /// and #305).
     pub reply_streams: ReplyStreams,
+    /// The replies chat apps are shown as they are written (issue #325).
+    pub chat_replies: ChatReplies,
     /// `[llm]` settings: the `max_tokens` ceiling for every proxied LLM
     /// call, whatever the agent's config asks for, and provider base URLs.
     pub llm: Arc<crate::config::LlmConfig>,
@@ -782,6 +784,7 @@ async fn handle_connection(
 
     // 6. Cleanup
     ctx.registry.detach(agent_id, &tx).await;
+    end_chat_replies(agent_id, &ctx).await;
     let Some(result) = reader_result else {
         warn!(%agent_id, "agent writer stopped; connection closed");
         return Ok(());
@@ -795,6 +798,39 @@ async fn handle_connection(
         info!(%agent_id, "agent disconnected cleanly");
     }
     Ok(())
+}
+
+/// End what chat apps were shown of the replies of a runtime that is gone,
+/// as they were written (issue #325), with nothing more said: it will not
+/// send their last parts. Not when it is connected again.
+async fn end_chat_replies(agent_id: AgentId, ctx: &AgentSocketCtx) {
+    if ctx.registry.is_connected(agent_id).await {
+        return;
+    }
+    for (channel_id, reply) in ctx.chat_replies.take_all(agent_id) {
+        let Some((channel, account_id, to)) = crate::channel_id_codec::decode(&channel_id) else {
+            continue;
+        };
+        let ended = ctx
+            .channel_router
+            .deliver_with(
+                channel,
+                account_id,
+                to,
+                None,
+                havn_proto::channel::ChannelMessageContent::Text {
+                    text: String::new(),
+                },
+                Vec::new(),
+                None,
+                false,
+                Some(reply),
+            )
+            .await;
+        if let Err(e) = ended {
+            debug!(%agent_id, error = %e, "could not end a reply being written");
+        }
+    }
 }
 
 /// Write queued frames until the queue closes, a write fails or stalls, or
@@ -947,6 +983,7 @@ async fn oversized_reply(
                             buttons: Vec::new(),
                             poll: None,
                             partial: false,
+                            last: false,
                         },
                     )
                     .await;
@@ -1402,6 +1439,7 @@ async fn ask_for_approval(
             buttons,
             poll: None,
             partial: false,
+            last: false,
         };
         route_outbound(agent_id, message, ctx).await;
     }
@@ -1463,6 +1501,7 @@ async fn ask_owner_for_someone_else(
             buttons,
             poll: None,
             partial: false,
+            last: false,
         };
     if decoded.is_some() {
         route_outbound(
@@ -1842,6 +1881,15 @@ async fn deliver_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSo
     } else if let Some((channel, account_id, sender_id)) =
         crate::channel_id_codec::decode(&msg.channel_id)
     {
+        // A part of the reply being written there, or its end (issue #325).
+        let reply = msg
+            .conversation
+            .as_deref()
+            .filter(|_| msg.partial || msg.last)
+            .and_then(|chat| {
+                ctx.chat_replies
+                    .of(agent_id, &msg.channel_id, chat, msg.last)
+            });
         let refusal = channel_send_permitted(ctx, agent_id, channel, account_id, sender_id)
             .await
             .err();
@@ -1933,6 +1981,7 @@ async fn deliver_outbound(agent_id: AgentId, msg: OutboundMessage, ctx: &AgentSo
                     msg.buttons,
                     msg.poll,
                     msg.partial,
+                    reply,
                 )
                 .await
             {
@@ -2133,6 +2182,7 @@ async fn run_send_file(
             buttons: Vec::new(),
             poll: None,
             partial: false,
+            last: false,
         },
         ctx,
     )
@@ -2195,6 +2245,7 @@ async fn run_ask_choice(
             buttons: crate::choice::buttons(&asked, &id),
             poll: crate::choice::poll(&asked, &id),
             partial: false,
+            last: false,
         },
         ctx,
     )
@@ -2999,7 +3050,8 @@ enum ReplyPiece {
 type PieceSender = Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<ReplyPiece>>>>;
 
 /// A streamed call's text on its way to the tabs of the session its turn
-/// answers (issue #162). Dropping it, on any path, forgets the call.
+/// answers (issue #162), or to the chat app's conversation it answers
+/// (issue #325). Dropping it, on any path, forgets the call.
 struct ReplyText {
     sink: Box<llm_proxy::TextSink<'static>>,
     sender: PieceSender,
@@ -3007,8 +3059,9 @@ struct ReplyText {
 }
 
 impl ReplyText {
-    /// For a request whose turn answers a dashboard session of this agent;
-    /// `None` for any other.
+    /// For a request whose turn answers a dashboard session of this agent,
+    /// or a chat app's conversation whose adapter shows replies as they
+    /// are written; `None` for any other.
     async fn open(
         ctx: &AgentSocketCtx,
         agent_id: AgentId,
@@ -3016,25 +3069,32 @@ impl ReplyText {
         asked: &Arc<Asked>,
     ) -> Option<Self> {
         let target = req.reply.as_ref()?;
-        let session: crate::webchat::SessionId = target.channel_id.parse().ok()?;
-        if ctx.webchat_router.agent_for_session(session).await != Some(agent_id) {
-            return None;
-        }
-        let conversation = target
-            .conversation
-            .clone()
-            .filter(|c| c.len() <= crate::webchat::MAX_CONVERSATION_ID);
         let (tx, rx) = mpsc::unbounded_channel();
+        let forward = match target.channel_id.parse::<crate::webchat::SessionId>() {
+            Ok(session) => {
+                if ctx.webchat_router.agent_for_session(session).await != Some(agent_id) {
+                    return None;
+                }
+                let conversation = target
+                    .conversation
+                    .clone()
+                    .filter(|c| c.len() <= crate::webchat::MAX_CONVERSATION_ID);
+                tokio::spawn(forward_reply_text(
+                    ctx.webchat_router.clone(),
+                    agent_id,
+                    session,
+                    conversation,
+                    req.request_id.clone(),
+                    rx,
+                    Arc::clone(asked),
+                ))
+            }
+            Err(_) => {
+                let shown = ChatWriting::open(ctx, agent_id, target).await?;
+                tokio::spawn(forward_chat_text(shown, rx, Arc::clone(asked)))
+            }
+        };
         let sender: PieceSender = Arc::new(std::sync::Mutex::new(Some(tx)));
-        let forward = tokio::spawn(forward_reply_text(
-            ctx.webchat_router.clone(),
-            agent_id,
-            session,
-            conversation,
-            req.request_id.clone(),
-            rx,
-            Arc::clone(asked),
-        ));
         let pieces = Arc::clone(&sender);
         let asked = Arc::clone(asked);
         let sink: Box<llm_proxy::TextSink<'static>> = Box::new(move |event| {
@@ -3186,6 +3246,194 @@ async fn forward_reply_text(
                     )
                     .await;
             }
+        }
+    }
+}
+
+/// How often a chat app is shown what a call has written, at most (issue
+/// #325): its adapter edits a message for each, and chat apps allow about
+/// one edit a second.
+const CHAT_TEXT_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The replies chat apps are shown as they are written (issue #325), by
+/// agent, conversation and chat: the id each is shown by, from its first
+/// call until the runtime sends its last part.
+#[derive(Debug, Clone, Default)]
+pub struct ChatReplies(Arc<std::sync::Mutex<HashMap<(AgentId, String, String), String>>>);
+
+impl ChatReplies {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(AgentId, String, String), String>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The id of the reply being written in chat `chat` of `channel_id`,
+    /// one given now when it has none.
+    fn open(&self, agent_id: AgentId, channel_id: &str, chat: &str) -> String {
+        self.lock()
+            .entry((agent_id, channel_id.to_string(), chat.to_string()))
+            .or_insert_with(|| Uuid::now_v7().to_string())
+            .clone()
+    }
+
+    /// Whether `reply` is still being written there.
+    fn is_open(&self, agent_id: AgentId, channel_id: &str, chat: &str, reply: &str) -> bool {
+        self.lock()
+            .get(&(agent_id, channel_id.to_string(), chat.to_string()))
+            .is_some_and(|open| open == reply)
+    }
+
+    /// The id of the reply being written there, if any; forgotten when
+    /// this is its `last` part.
+    fn of(&self, agent_id: AgentId, channel_id: &str, chat: &str, last: bool) -> Option<String> {
+        let key = (agent_id, channel_id.to_string(), chat.to_string());
+        let mut replies = self.lock();
+        if last {
+            replies.remove(&key)
+        } else {
+            replies.get(&key).cloned()
+        }
+    }
+
+    /// Every reply of `agent_id` being written, as `(channel_id, reply)`,
+    /// forgotten.
+    fn take_all(&self, agent_id: AgentId) -> Vec<(String, String)> {
+        let mut replies = self.lock();
+        let of_agent: Vec<_> = replies
+            .keys()
+            .filter(|(agent, _, _)| *agent == agent_id)
+            .cloned()
+            .collect();
+        of_agent
+            .into_iter()
+            .filter_map(|key| {
+                let reply = replies.remove(&key)?;
+                Some((key.1, reply))
+            })
+            .collect()
+    }
+}
+
+/// What a chat app's conversation is shown of a call of the reply being
+/// written there (issue #325).
+struct ChatWriting {
+    router: crate::channel_router::ChannelRouter,
+    replies: ChatReplies,
+    agent_id: AgentId,
+    channel: String,
+    channel_id: String,
+    chat: String,
+    frame: havn_proto::channel::ChannelWriting,
+    /// Shown while the call has written nothing.
+    waiting: String,
+}
+
+impl ChatWriting {
+    /// For a turn that marks its reply's last part, answering a chat app's
+    /// conversation the agent may send to, whose adapter shows replies as
+    /// they are written; `None` for any other.
+    async fn open(
+        ctx: &AgentSocketCtx,
+        agent_id: AgentId,
+        target: &havn_proto::ReplyStream,
+    ) -> Option<Self> {
+        if !target.marks_last {
+            return None;
+        }
+        let chat = target.conversation.clone()?;
+        let (channel, account_id, to) = crate::channel_id_codec::decode(&target.channel_id)?;
+        let key = crate::channel_router::AccountKey::new(channel, account_id);
+        if !ctx.channel_router.takes_writing(&key).await {
+            return None;
+        }
+        channel_send_permitted(ctx, agent_id, channel, account_id, to)
+            .await
+            .ok()?;
+        let language = agents_repo::find_by_id(&ctx.db, agent_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|agent| havn_core::Language::of_config(&agent.config))
+            .unwrap_or_default();
+        let reply = ctx.chat_replies.open(agent_id, &target.channel_id, &chat);
+        Some(Self {
+            router: ctx.channel_router.clone(),
+            replies: ctx.chat_replies.clone(),
+            agent_id,
+            channel: channel.to_string(),
+            channel_id: target.channel_id.clone(),
+            chat,
+            frame: havn_proto::channel::ChannelWriting {
+                account_id: account_id.to_string(),
+                to: to.to_string(),
+                in_reply_to: target.answers.clone(),
+                reply,
+                text: String::new(),
+                buttons: vec![vec![havn_core::Button {
+                    label: language.pick("Stop", "停止").to_string(),
+                    data: "/stop".to_string(),
+                }]],
+            },
+            waiting: language.pick("Replying…", "正在回复…").to_string(),
+        })
+    }
+
+    /// Whether its reply is still being written: the runtime did not send
+    /// its last part.
+    fn is_open(&self) -> bool {
+        self.replies.is_open(
+            self.agent_id,
+            &self.channel_id,
+            &self.chat,
+            &self.frame.reply,
+        )
+    }
+
+    /// Show `text`, or that the reply is being written when it is empty.
+    async fn show(&mut self, text: &str) {
+        self.frame.text = if text.trim().is_empty() {
+            self.waiting.clone()
+        } else {
+            text.to_string()
+        };
+        self.router.writing(&self.channel, self.frame.clone()).await;
+    }
+}
+
+/// Show a call's text in a chat app (issue #325): at once that the reply
+/// is being written, then all the call has written, at most every
+/// [`CHAT_TEXT_EVERY`]. What it wrote last is not shown when it ends: the
+/// part of the reply the runtime sends next takes its place.
+async fn forward_chat_text(
+    mut shown: ChatWriting,
+    mut rx: mpsc::UnboundedReceiver<ReplyPiece>,
+    asked: Arc<Asked>,
+) {
+    let add = |piece: ReplyPiece, text: &mut String| match piece {
+        ReplyPiece::Text(piece) => text.push_str(&piece),
+        ReplyPiece::Reasoning(_) => {}
+        ReplyPiece::Restart => text.clear(),
+    };
+    shown.show("").await;
+    let (mut text, mut sent) = (String::new(), String::new());
+    while let Some(first) = rx.recv().await {
+        add(first, &mut text);
+        let flush = tokio::time::sleep(CHAT_TEXT_EVERY);
+        tokio::pin!(flush);
+        loop {
+            tokio::select! {
+                () = &mut flush => break,
+                piece = rx.recv() => match piece {
+                    Some(piece) => add(piece, &mut text),
+                    None => return,
+                },
+            }
+        }
+        if asked.dropped.load(std::sync::atomic::Ordering::Relaxed) || !shown.is_open() {
+            return;
+        }
+        if text != sent {
+            shown.show(&text).await;
+            sent.clone_from(&text);
         }
     }
 }
@@ -3698,6 +3946,7 @@ mod tests {
             buttons: approval_buttons(id),
             poll: None,
             partial: false,
+            last: false,
         };
         msg = from_agent(msg);
         assert!(msg.buttons.is_empty(), "an agent's buttons are dropped");
@@ -3791,6 +4040,7 @@ mod tests {
             )),
             multi_user,
             reply_streams: ReplyStreams::default(),
+            chat_replies: ChatReplies::default(),
             llm: Arc::new(crate::config::LlmConfig::default()),
             models: Arc::new(arc_swap::ArcSwap::from_pointee(
                 crate::model_catalog::ModelCatalog::default(),
@@ -4193,6 +4443,8 @@ mod tests {
             reply: Some(havn_proto::ReplyStream {
                 channel_id: "session".into(),
                 conversation: None,
+                answers: None,
+                marks_last: false,
             }),
             ..llm_request(request_id)
         };
@@ -4283,6 +4535,8 @@ mod tests {
             reply: Some(havn_proto::ReplyStream {
                 channel_id: session.to_string(),
                 conversation: None,
+                answers: None,
+                marks_last: true,
             }),
             ..llm_request("r1")
         };
@@ -4372,6 +4626,8 @@ mod tests {
             reply: Some(havn_proto::ReplyStream {
                 channel_id: "telegram:123".into(),
                 conversation: None,
+                answers: None,
+                marks_last: true,
             }),
             ..llm_request("r1")
         };
@@ -4413,6 +4669,228 @@ mod tests {
                 .any(|frame| matches!(frame, GatewayToAgent::LlmResponse(_))),
             "a second answer"
         );
+    }
+
+    /// Bind `agent` to Telegram account `bot`, open to anyone, with an
+    /// adapter that shows replies as they are written when `writing`: what
+    /// it is sent.
+    async fn telegram_adapter(
+        ctx: &mut AgentSocketCtx,
+        agent: AgentId,
+        writing: bool,
+    ) -> mpsc::Receiver<havn_proto::channel::ChannelFrame> {
+        ctx.bindings = Arc::new(vec![crate::config::ChannelBindingConfig {
+            agent_id: agent.to_string(),
+            channel: "telegram".into(),
+            account_id: "bot".into(),
+        }]);
+        let mut channels = std::collections::BTreeMap::new();
+        channels.insert(
+            "telegram".to_string(),
+            crate::config::ChannelEntry {
+                accounts: vec![crate::config::ChannelAccount {
+                    id: "bot".into(),
+                    adapter_token_ref: "secret:channel:telegram:bot".into(),
+                    dm_policy: crate::config::DmPolicy::Open,
+                    allow_from: Vec::new(),
+                    admins: Vec::new(),
+                    bot_username: None,
+                    group_policy: crate::config::GroupPolicy::Off,
+                    allow_groups: Vec::new(),
+                }],
+            },
+        );
+        ctx.channels.store(Arc::new(channels));
+        let (adapter_tx, adapter) = mpsc::channel(64);
+        ctx.channel_router
+            .register_as(
+                crate::channel_router::AccountKey::new("telegram", "bot"),
+                adapter_tx,
+                false,
+                writing,
+            )
+            .await;
+        adapter
+    }
+
+    /// The next frame an adapter is sent, within 10 seconds.
+    async fn next_frame(
+        adapter: &mut mpsc::Receiver<havn_proto::channel::ChannelFrame>,
+    ) -> havn_proto::channel::ChannelFrame {
+        tokio::time::timeout(Duration::from_secs(10), adapter.recv())
+            .await
+            .expect("a frame")
+            .expect("open")
+    }
+
+    #[tokio::test]
+    async fn a_chat_app_is_shown_the_reply_as_it_is_written_and_a_stop_keeps_it() {
+        use havn_proto::channel::ChannelFrame;
+        // A provider that writes some text, then nothing more.
+        let events = [
+            r#"{"type":"message_start","message":{"id":"m1","type":"message","role":"assistant","model":"m","content":[],"stop_reason":null,"usage":{"input_tokens":5,"output_tokens":1}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Half of"}}"#,
+        ];
+        let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || async move {
+                let written = futures_util::stream::iter([Ok::<_, std::convert::Infallible>(body)]);
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    axum::body::Body::from_stream(futures_util::StreamExt::chain(
+                        written,
+                        futures_util::stream::pending(),
+                    )),
+                )
+            }),
+        );
+        let (mut ctx, server) = ctx_calling(app).await;
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (agent, mut rx) = connected_agent(&ctx, owner, "a", serde_json::json!({})).await;
+        let mut adapter = telegram_adapter(&mut ctx, agent, true).await;
+        let channel_id = crate::channel_id_codec::encode("telegram", "bot", "tg:1");
+        let req = LlmRequest {
+            model: "lan:m".into(),
+            reply: Some(havn_proto::ReplyStream {
+                channel_id: channel_id.clone(),
+                conversation: Some("c1".into()),
+                answers: None,
+                marks_last: true,
+            }),
+            ..llm_request("r1")
+        };
+        dispatch(agent, AgentToGateway::LlmRequest(req), &ctx).await;
+        // That it is being written, at once, with a stop button; then what
+        // was written.
+        let ChannelFrame::Writing(first) = next_frame(&mut adapter).await else {
+            panic!("not a reply being written");
+        };
+        assert_eq!(
+            (first.to.as_str(), first.text.as_str()),
+            ("tg:1", "Replying…")
+        );
+        assert_eq!(first.buttons[0][0].data, "/stop");
+        let ChannelFrame::Writing(written) = next_frame(&mut adapter).await else {
+            panic!("not a reply being written");
+        };
+        assert_eq!(written.text, "Half of");
+        assert_eq!(written.reply, first.reply);
+        dispatch(
+            agent,
+            AgentToGateway::LlmCancel {
+                request_id: "r1".into(),
+                keep: true,
+            },
+            &ctx,
+        )
+        .await;
+        let answer = next_llm_response(&mut rx).await;
+        server.abort();
+        assert_eq!(answer.provider_response["stop_reason"], llm_proxy::STOPPED);
+        assert_eq!(
+            answer.provider_response["content"],
+            serde_json::json!([{"type": "text", "text": "Half of"}])
+        );
+        // The reply's last part ends what was shown, once.
+        let end = |text: &str| {
+            AgentToGateway::OutboundMessage(OutboundMessage {
+                channel_id: channel_id.clone(),
+                content: havn_core::MessageContent::Text { text: text.into() },
+                buttons: Vec::new(),
+                poll: None,
+                partial: false,
+                last: true,
+                reply_to: None,
+                conversation: Some("c1".into()),
+            })
+        };
+        dispatch(agent, end("Half of\n\n(stopped)"), &ctx).await;
+        let ChannelFrame::Outbound(o) = next_frame(&mut adapter).await else {
+            panic!("not a reply");
+        };
+        assert_eq!(o.reply.as_deref(), Some(first.reply.as_str()));
+        dispatch(agent, end("the next one"), &ctx).await;
+        let ChannelFrame::Outbound(o) = next_frame(&mut adapter).await else {
+            panic!("not a reply");
+        };
+        assert_eq!(o.reply, None, "a reply not shown as it was written");
+        forgotten(&ctx).await;
+    }
+
+    #[tokio::test]
+    async fn a_reply_is_shown_as_it_is_written_only_where_both_ends_mark_it() {
+        let mut ctx = ctx_with(false, false).await;
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (agent, _rx) = connected_agent(&ctx, owner, "a", serde_json::json!({})).await;
+        let target = |marks_last: bool| havn_proto::ReplyStream {
+            channel_id: crate::channel_id_codec::encode("telegram", "bot", "tg:1"),
+            conversation: Some("c1".into()),
+            answers: Some("tg:chat:1:msg:7".into()),
+            marks_last,
+        };
+        // An adapter before issue #325.
+        let _older = telegram_adapter(&mut ctx, agent, false).await;
+        assert!(
+            ChatWriting::open(&ctx, agent, &target(true))
+                .await
+                .is_none()
+        );
+        let _adapter = telegram_adapter(&mut ctx, agent, true).await;
+        // A runtime before issue #325, which does not mark its reply's end.
+        assert!(
+            ChatWriting::open(&ctx, agent, &target(false))
+                .await
+                .is_none()
+        );
+        let shown = ChatWriting::open(&ctx, agent, &target(true))
+            .await
+            .expect("shown");
+        assert_eq!(shown.frame.in_reply_to.as_deref(), Some("tg:chat:1:msg:7"));
+        // A conversation the agent may not send to.
+        assert!(
+            ChatWriting::open(&ctx, AgentId::new(), &target(true))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn replies_being_written_end_when_their_runtime_is_gone() {
+        use havn_proto::channel::ChannelFrame;
+        let mut ctx = ctx_with(false, false).await;
+        let agent = AgentId::new();
+        let mut adapter = telegram_adapter(&mut ctx, agent, true).await;
+        let channel_id = crate::channel_id_codec::encode("telegram", "bot", "tg:1");
+        let reply = ctx.chat_replies.open(agent, &channel_id, "c1");
+        assert_eq!(ctx.chat_replies.open(agent, &channel_id, "c1"), reply);
+        let other = ctx.chat_replies.open(AgentId::new(), &channel_id, "c2");
+        end_chat_replies(agent, &ctx).await;
+        let ChannelFrame::Outbound(o) = next_frame(&mut adapter).await else {
+            panic!("not a reply");
+        };
+        assert_eq!(o.reply, Some(reply));
+        assert_eq!(
+            o.content,
+            havn_proto::channel::ChannelMessageContent::Text {
+                text: String::new()
+            }
+        );
+        // Another agent's goes on.
+        assert!(adapter.try_recv().is_err());
+        assert_eq!(
+            ctx.chat_replies
+                .of(AgentId::new(), &channel_id, "c2", false),
+            None
+        );
+        assert!(ctx.chat_replies.lock().values().any(|r| *r == other));
     }
 
     /// The next LLM answer the agent is sent, within 10 seconds.
@@ -5206,6 +5684,7 @@ mod tests {
                 buttons: Vec::new(),
                 poll: None,
                 partial: false,
+                last: false,
             })
         };
         let mut bytes = Vec::new();
@@ -5269,6 +5748,7 @@ mod tests {
                     buttons: Vec::new(),
                     poll: None,
                     partial: false,
+                    last: false,
                 }),
             )
             .await
