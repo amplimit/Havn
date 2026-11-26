@@ -120,17 +120,18 @@ impl Tool for McpToolHandle {
 /// as a short placeholder — present so the LLM sees something came
 /// back, and tagged so a future vertical can handle them properly.
 fn render_content_blocks(result: &rmcp::model::CallToolResult) -> String {
-    use rmcp::model::RawContent;
+    use rmcp::model::ContentBlock;
     let mut parts: Vec<String> = Vec::with_capacity(result.content.len());
     for block in &result.content {
-        match &block.raw {
-            RawContent::Text(t) => parts.push(t.text.clone()),
-            RawContent::Image(_) => parts.push("[mcp image content omitted in v1]".into()),
-            RawContent::Audio(_) => parts.push("[mcp audio content omitted in v1]".into()),
-            RawContent::Resource(_) => parts.push("[mcp resource content omitted in v1]".into()),
-            RawContent::ResourceLink(_) => {
+        match block {
+            ContentBlock::Text(t) => parts.push(t.text.clone()),
+            ContentBlock::Image(_) => parts.push("[mcp image content omitted in v1]".into()),
+            ContentBlock::Audio(_) => parts.push("[mcp audio content omitted in v1]".into()),
+            ContentBlock::Resource(_) => parts.push("[mcp resource content omitted in v1]".into()),
+            ContentBlock::ResourceLink(_) => {
                 parts.push("[mcp resource link omitted in v1]".into());
             }
+            _ => parts.push("[mcp content of another kind omitted]".into()),
         }
     }
     if parts.is_empty() {
