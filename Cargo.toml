@@ -68,7 +68,7 @@ clap = { version = "4", features = ["derive", "env"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "chrono", "uuid", "json"] }
 
 # HTTP client (rustls — no OpenSSL dep).
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json", "stream", "http2", "multipart"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "http2", "multipart"] }
 
 # `web_fetch` page conversion (gateway, in a child process): HTML to
 # Markdown, PDF to text, legacy charsets to UTF-8. All pure Rust.
