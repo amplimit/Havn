@@ -235,9 +235,10 @@ impl ChannelRouter {
         self.register_as(key, tx, true, false).await;
     }
 
-    /// [`Self::register`], or [`Self::register_resuming`] when `resuming`,
-    /// for an adapter that shows replies as they are written when
-    /// `writing` (issue #325).
+    /// Register a connected adapter's outbound mpsc, keeping the seq counter
+    /// and replay buffer of a reconnecting one. When `resuming`, new
+    /// deliveries are only buffered until its replay catches up; when
+    /// `writing`, the adapter shows replies as they are written (issue #325).
     pub async fn register_as(
         &self,
         key: AccountKey,
