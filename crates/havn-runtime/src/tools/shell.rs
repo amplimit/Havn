@@ -946,7 +946,10 @@ mod tests {
         output.push(&vec![b'x'; HEAD_BYTES - 6]);
         output.push(b"split-");
         let (first, next) = output.since(0, true);
-        assert_eq!((first.len(), next), (HEAD_BYTES - 6, (HEAD_BYTES - 6) as u64));
+        assert_eq!(
+            (first.len(), next),
+            (HEAD_BYTES - 6, (HEAD_BYTES - 6) as u64)
+        );
         output.push(b"sec");
         let (second, again) = output.since(next, true);
         assert_eq!((second.as_str(), again), ("", next), "a half was shown");
