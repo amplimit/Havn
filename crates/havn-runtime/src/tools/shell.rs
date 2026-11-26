@@ -379,21 +379,25 @@ impl Output {
             rest.drain(..crate::secrets::cut_start(&rest));
         }
         let mut next = self.total;
-        if more {
-            if rest.is_empty() && skipped == 0 {
-                let shown = crate::secrets::emit_len(head);
-                next -= (head.len() - shown) as u64;
-                head = &head[..shown];
-            } else {
-                let shown = crate::secrets::emit_len(&rest);
-                next -= (rest.len() - shown) as u64;
-                rest.truncate(shown);
+        if skipped == 0 {
+            // Head and tail are one run of output: held back and read as
+            // one, so nothing straddling the head's end comes in halves.
+            let mut joined = head.to_vec();
+            joined.extend_from_slice(&rest);
+            if more {
+                let shown = crate::secrets::emit_len(&joined);
+                next -= (joined.len() - shown) as u64;
+                joined.truncate(shown);
             }
+            return (String::from_utf8_lossy(&joined).into_owned(), next);
+        }
+        if more {
+            let shown = crate::secrets::emit_len(&rest);
+            next -= (rest.len() - shown) as u64;
+            rest.truncate(shown);
         }
         let mut text = String::from_utf8_lossy(head).into_owned();
-        if skipped > 0 {
-            let _ = write!(text, "\n[... {skipped} bytes of output not kept ...]\n");
-        }
+        let _ = write!(text, "\n[... {skipped} bytes of output not kept ...]\n");
         text.push_str(&String::from_utf8_lossy(&rest));
         (text, next)
     }
@@ -937,6 +941,18 @@ mod tests {
         assert_eq!((first.as_str(), next), ("caf", 3));
         output.push(&"\u{e9}".as_bytes()[1..]);
         assert_eq!(output.since(next, true).0, "\u{e9}");
+        // Across the end of the kept head, which the tail goes on from.
+        let mut output = Output::default();
+        output.push(&vec![b'x'; HEAD_BYTES - 6]);
+        output.push(b"split-");
+        let (first, next) = output.since(0, true);
+        assert_eq!((first.len(), next), (HEAD_BYTES - 6, (HEAD_BYTES - 6) as u64));
+        output.push(b"sec");
+        let (second, again) = output.since(next, true);
+        assert_eq!((second.as_str(), again), ("", next), "a half was shown");
+        output.push(b"ret-0123 end");
+        let (third, _) = output.since(again, true);
+        assert_eq!(crate::secrets::redact(&third), "[secret:split] end");
         // Where output was not kept, no piece of the value beside the gap.
         let mut output = Output::default();
         output.push(&vec![b'x'; HEAD_BYTES - 6]);

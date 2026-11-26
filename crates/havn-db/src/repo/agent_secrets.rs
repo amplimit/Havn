@@ -45,7 +45,7 @@ pub struct Request {
     pub asked_by: Option<String>,
     /// Where: `web chat`, a chat app's name, `group on <app>`, `webhook`.
     pub asked_in: Option<String>,
-    /// The owner, in their own chat.
+    /// It was answering the owner (in a group when `asked_in` says so).
     pub by_owner: bool,
     /// Times it asked again since; the first reason and variable stay.
     pub again: i64,

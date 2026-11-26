@@ -459,14 +459,16 @@ pub fn spec() -> GatewayToolSpec {
 /// Who a tool call answered, as the owner sees it with a request: a name
 /// (the owner's, or the Havn user a chat-app sender is linked to, with the
 /// sender's id) or the sender's id; where (`web chat`, the chat app,
-/// `group on <app>`, `webhook`); and whether it was the owner in their own
-/// chat. Nobody for a scheduled task or a heartbeat.
+/// `group on <app>`, `webhook`); and whether the turn was answering the
+/// owner (which does not make the owner the one who asked: what the agent
+/// read in the turn can lead it to). Nobody for a scheduled task or a
+/// heartbeat.
 pub async fn asked_by(
     db: &SqlitePool,
     agent: &Agent,
     call: &GatewayToolCall,
 ) -> (Option<String>, Option<String>, bool) {
-    let by_owner = call.from_owner && !call.in_group;
+    let by_owner = call.from_owner;
     let Some(conversation) = call.conversation.as_deref() else {
         return (call.sender.clone(), None, false);
     };
@@ -753,6 +755,11 @@ mod tests {
             (by.as_deref(), place.as_deref(), owner),
             (Some("o"), Some("web chat"), true)
         );
+        // The owner's own message in a group: answering the owner, there.
+        let mut in_group = call(json!({}), telegram.clone(), true);
+        in_group.in_group = true;
+        let (_, place, owner) = asked_by(&db, &a, &in_group).await;
+        assert_eq!((place.as_deref(), owner), (Some("group on telegram"), true));
 
         assert!(
             run_request(

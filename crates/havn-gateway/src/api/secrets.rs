@@ -68,7 +68,8 @@ pub struct RequestView {
     /// Where: `web chat`, a chat app, `group on <app>`, `webhook`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub asked_in: Option<String>,
-    /// The owner, in their own chat.
+    /// The agent was answering the owner (in a group when `asked_in` says
+    /// so).
     pub by_owner: bool,
     /// Times the agent asked again since; the first request is kept.
     pub again: i64,

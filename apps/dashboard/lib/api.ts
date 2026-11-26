@@ -474,7 +474,7 @@ export type SecretView = {
     asked_by?: string;
     /** `web chat`, a chat app, `group on <app>`, `webhook`. */
     asked_in?: string;
-    /** The owner, in their own chat. */
+    /** The agent was answering the owner (in a group when `asked_in` says so). */
     by_owner: boolean;
     /** Times the agent asked again since; the first request is kept. */
     again: number;

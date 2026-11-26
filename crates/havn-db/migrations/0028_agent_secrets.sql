@@ -17,7 +17,7 @@ CREATE TABLE agent_secrets (
     -- Who the agent was answering when it asked (a name, or the sender's
     -- id on its chat app; NULL for a scheduled task or a heartbeat), where
     -- (`web chat`, a chat app's name, `group on <app>`, `webhook`), and
-    -- whether that was the owner in their own chat.
+    -- whether it was answering the owner.
     asked_by       TEXT,
     asked_in       TEXT,
     asked_by_owner INTEGER NOT NULL DEFAULT 0,

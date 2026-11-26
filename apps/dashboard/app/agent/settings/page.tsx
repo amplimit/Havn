@@ -3027,7 +3027,8 @@ function SecretsEditor({ agentId }: { agentId: string }) {
           <div className="mb-4">
             <h4 className="mb-1 text-sm font-semibold">asked for by the agent</h4>
             <p className="mb-2 text-xs" style={muted}>
-              Anyone who can chat with the agent can lead it to ask. Enter a value only for a request you expected.
+              Anyone who can chat with the agent, or what it reads (a web page, a file), can lead it to ask. Enter a
+              value only for a request you expected.
             </p>
             <ul className="flex flex-col gap-3 text-sm">
               {requested.map((secret) => {
@@ -3051,7 +3052,7 @@ function SecretsEditor({ agentId }: { agentId: string }) {
                         style={asked.by_owner ? muted : { color: "var(--color-ruby)" }}
                       >
                         {asked.by_owner
-                          ? `In your own ${asked.asked_in ?? "chat"}.`
+                          ? `While answering you${asked.asked_in ? `, in ${asked.asked_in === "web chat" ? "your web chat" : asked.asked_in}` : ""}.`
                           : asked.asked_by || asked.asked_in
                             ? `While answering someone else: ${asked.asked_by ?? "unknown"}${
                                 asked.asked_in ? `, in ${asked.asked_in}` : ""
