@@ -163,7 +163,7 @@ pub struct GatewayConfig {
     /// TOML form:
     /// ```toml
     /// [mcp]
-    /// remote = "on"                       # or "off"
+    /// remote = "on"                       # or "off"; left out, "off" with trust_header
     /// remote_hosts = ["mcp.notion.com"]   # empty: any host
     /// ```
     #[serde(default)]
@@ -420,36 +420,34 @@ pub struct NetworkConfig {
 /// `[mcp]`: whether agents may use remote MCP servers, and at which hosts.
 /// Within that, each agent reaches a server only as its network policy
 /// lets it reach the host.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpConfig {
-    /// `on` or `off`.
-    pub remote: String,
+    /// `on` or `off`. Left out, `on` on a single-user gateway and `off` with
+    /// `trust_header`, where every member could have the gateway send OAuth
+    /// requests to hosts of their choosing.
+    pub remote: Option<String>,
     /// When not empty, the only hosts remote servers may be at; an entry
     /// covers its subdomains, as `allowed_domains` do.
     pub remote_hosts: Vec<String>,
 }
 
-impl Default for McpConfig {
-    fn default() -> Self {
-        Self {
-            remote: "on".into(),
-            remote_hosts: Vec::new(),
-        }
-    }
-}
-
 impl McpConfig {
+    /// Whether agents may use remote servers at all.
+    pub fn remote_on(&self) -> bool {
+        self.remote.as_deref() != Some("off")
+    }
+
     /// Whether a remote server at `host` may be used.
     pub fn allows(&self, host: &str) -> bool {
-        self.remote == "on"
+        self.remote_on()
             && (self.remote_hosts.is_empty()
                 || havn_core::policy::domain_listed(&self.remote_hosts, host))
     }
 
     /// Why a remote server at `host` may not be used, when it may not.
     pub fn refusal(&self, host: &str) -> Option<String> {
-        if self.remote != "on" {
+        if !self.remote_on() {
             Some("this gateway's operator does not allow remote MCP servers ([mcp] remote)".into())
         } else if !self.allows(host) {
             Some(format!(
@@ -1136,11 +1134,17 @@ impl GatewayConfig {
             &parsed.network.blocked_domains,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if !matches!(parsed.mcp.remote.as_str(), "on" | "off") {
-            anyhow::bail!(
-                "[mcp] remote = {:?} must be \"on\" or \"off\"",
-                parsed.mcp.remote
-            );
+        match parsed.mcp.remote.as_deref() {
+            Some("on" | "off") => {}
+            None => {
+                let default = if parsed.trust_header.enabled {
+                    "off"
+                } else {
+                    "on"
+                };
+                parsed.mcp.remote = Some(default.into());
+            }
+            Some(other) => anyhow::bail!("[mcp] remote = {other:?} must be \"on\" or \"off\""),
         }
         havn_core::policy::validate_domains("[mcp] remote_hosts", &parsed.mcp.remote_hosts)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1945,6 +1949,14 @@ metrics_listen = \"{value}\"
     fn the_operator_allows_remote_mcp_servers_or_some_hosts() {
         let any = GatewayConfig::from_toml("").expect("default");
         assert!(any.mcp.allows("mcp.notion.com"));
+        // With trust_header every member could send the gateway's own OAuth
+        // requests anywhere: off unless the operator turns it on.
+        let multi = GatewayConfig::from_toml("[trust_header]\nenabled = true\n").expect("multi");
+        assert!(!multi.mcp.allows("mcp.notion.com"));
+        let multi_on =
+            GatewayConfig::from_toml("[trust_header]\nenabled = true\n[mcp]\nremote = \"on\"\n")
+                .expect("multi on");
+        assert!(multi_on.mcp.allows("mcp.notion.com"));
         let off = GatewayConfig::from_toml("[mcp]\nremote = \"off\"\n").expect("off");
         assert!(!off.mcp.allows("mcp.notion.com"));
         assert!(off.mcp.refusal("mcp.notion.com").is_some());

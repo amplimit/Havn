@@ -688,9 +688,11 @@ async fn handle_connection(
             let gateway_tools = gateway_tools_for(&ctx, &agent, &policy).await;
             let models = model_choices(&policy, &ctx.models.load());
             let language = havn_core::Language::of_config(&agent.config);
-            // Tokens that would expire while the agent starts are
-            // refreshed first.
-            ctx.secrets.oauth().refresh_due(agent.id).await;
+            // Due OAuth tokens are refreshed first, waited for at most 10 s
+            // so a slow provider does not hold the start.
+            ctx.secrets
+                .refresh_oauth(&ctx.registry, agent.id, std::time::Duration::from_secs(10))
+                .await;
             let secrets = (
                 ctx.secrets.for_runtime(&agent, &policy).await,
                 crate::secrets::own_mcp_servers(&agent.config, &policy),

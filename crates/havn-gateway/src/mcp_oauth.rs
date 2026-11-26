@@ -17,6 +17,9 @@
 //!
 //! The gateway makes these requests itself, to public addresses only, over
 //! https, and only for a server the agent's network policy lets it reach.
+//! Every endpoint the authorization server names is checked the same way
+//! before it is used, so its metadata cannot send the owner's browser to a
+//! `javascript:` URL or the gateway to a private address.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
@@ -48,12 +51,23 @@ use crate::keyring::KeyRing;
 pub const CALLBACK_PATH: &str = "/mcp/oauth/callback";
 /// How long a connect waits for its callback.
 const PENDING_FOR: Duration = Duration::from_secs(10 * 60);
+/// Connects one user may have waiting at once.
+const MAX_PENDING_PER_USER: usize = 8;
 /// Connects waiting at once, on the whole gateway.
-const MAX_PENDING: usize = 64;
-/// Tokens are refreshed when they expire within this.
+const MAX_PENDING: usize = 1024;
+/// A token is refreshed this long before it expires at most, and at half
+/// its lifetime when that is shorter.
 pub const REFRESH_AHEAD: chrono::Duration = chrono::Duration::minutes(5);
 /// How long one OAuth request may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long one refresh may take, discovery included.
+pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
+/// After a failed refresh, the next try waits this, doubling up to
+/// [`MAX_BACKOFF`].
+const FIRST_BACKOFF: Duration = Duration::from_secs(60);
+const MAX_BACKOFF: Duration = Duration::from_secs(60 * 60);
+/// Agents whose tokens are refreshed at once in the background.
+const PARALLEL_REFRESHES: usize = 8;
 /// Bytes of an OAuth response read at most.
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// Redirects an OAuth request follows, where rmcp lets it.
@@ -67,7 +81,13 @@ struct Grant {
     /// The server URL the tokens were issued for.
     url: String,
     client_id: String,
-    client_secret: Option<String>,
+    /// The client is one this gateway registered, not the owner's.
+    #[serde(default)]
+    registered: bool,
+    /// The secret registration gave that client, when it gave one. The
+    /// owner's client secret is not kept: it is resolved when it is used.
+    #[serde(default)]
+    registered_secret: Option<String>,
     redirect_uri: String,
     scopes: Vec<String>,
     metadata: AuthorizationMetadata,
@@ -91,15 +111,42 @@ impl Grant {
             .map(|t| t.access_token().secret().clone())
     }
 
-    /// When the access token expires, when the provider said.
-    fn expires_at(&self) -> Option<DateTime<Utc>> {
+    fn refresh_token(&self) -> Option<String> {
+        self.credentials
+            .token_response
+            .as_ref()
+            .and_then(|t| t.refresh_token())
+            .map(|t| t.secret().clone())
+    }
+
+    /// The access token's lifetime and when it expires, when the provider
+    /// said.
+    fn lifetime(&self) -> Option<(chrono::Duration, DateTime<Utc>)> {
         let token = self.credentials.token_response.as_ref()?;
-        let lifetime = token.expires_in()?;
-        let received = self.credentials.token_received_at?;
-        DateTime::from_timestamp(
-            i64::try_from(received.saturating_add(lifetime.as_secs())).ok()?,
-            0,
-        )
+        let lifetime = chrono::Duration::from_std(token.expires_in()?).ok()?;
+        let received =
+            DateTime::from_timestamp(i64::try_from(self.credentials.token_received_at?).ok()?, 0)?;
+        Some((lifetime, received + lifetime))
+    }
+
+    fn expires_at(&self) -> Option<DateTime<Utc>> {
+        self.lifetime().map(|(_, at)| at)
+    }
+
+    /// When the access token is refreshed: [`REFRESH_AHEAD`] before it
+    /// expires, or half its lifetime when that is shorter.
+    fn refresh_at(&self) -> Option<DateTime<Utc>> {
+        let (lifetime, expires) = self.lifetime()?;
+        Some(expires - REFRESH_AHEAD.min(lifetime / 2))
+    }
+
+    /// The client secret: the one registration gave, or the owner's.
+    fn client_secret(&self, owner_secret: Option<&str>) -> Option<String> {
+        if self.registered {
+            self.registered_secret.clone()
+        } else {
+            owner_secret.map(str::to_string)
+        }
     }
 }
 
@@ -111,16 +158,17 @@ struct Pending {
     url: String,
     session: AuthorizationSession,
     store: InMemoryCredentialStore,
-    client_secret: Option<String>,
+    registered: bool,
+    registered_secret: Option<String>,
     metadata: AuthorizationMetadata,
     started: Instant,
 }
 
 type Grants = BTreeMap<String, Grant>;
 
-/// The OAuth of every agent's remote MCP servers.
+/// The OAuth grants of every agent's remote MCP servers.
 #[derive(Clone)]
-pub struct McpOAuth {
+pub struct OAuthGrants {
     db: SqlitePool,
     keyring: Option<KeyRing>,
     http: Arc<Http>,
@@ -128,11 +176,14 @@ pub struct McpOAuth {
     /// Per agent, its grants once decrypted; each slot's lock serializes
     /// the agent's reads and changes.
     slots: Arc<Mutex<HashMap<AgentId, Arc<Mutex<Option<Grants>>>>>>,
+    /// Refreshes that failed, by agent and server: how many in a row, and
+    /// when the next may be tried.
+    failures: Arc<std::sync::Mutex<HashMap<(AgentId, String), (u32, Instant)>>>,
 }
 
-impl std::fmt::Debug for McpOAuth {
+impl std::fmt::Debug for OAuthGrants {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("McpOAuth").finish_non_exhaustive()
+        f.debug_struct("OAuthGrants").finish_non_exhaustive()
     }
 }
 
@@ -147,8 +198,13 @@ pub enum OAuthError {
     UnknownState,
     #[error("the authorization server: {0}")]
     Provider(String),
+    /// The provider refused the refresh token: the grant ended.
     #[error("{0}")]
     Rejected(String),
+    /// The provider gave no refresh token: the access token lasts until it
+    /// expires.
+    #[error("{0}")]
+    NoRefresh(String),
     #[error("{0}")]
     Internal(String),
 }
@@ -170,7 +226,41 @@ pub struct OAuthStatus {
     pub error: Option<String>,
 }
 
-impl McpOAuth {
+/// The servers of `policy` (the agent's, as resolved) whose OAuth tokens
+/// are used: the agent's `own`, remote, OAuth, at a host its network
+/// reaches and does not block. The operator's `[mcp]` is applied to the
+/// policy already.
+pub fn served<'a>(policy: &'a Policy, own: &[String]) -> Vec<(&'a String, &'a McpServerConfig)> {
+    let net = &policy.network_policy;
+    if !(policy.permissions.can_access_network && net.egress_allowed) {
+        return Vec::new();
+    }
+    policy
+        .mcp_servers
+        .iter()
+        .filter(|(name, cfg)| {
+            own.contains(name)
+                && matches!(cfg.auth, McpAuth::Oauth(_))
+                && cfg.remote_host().is_some_and(|host| !net.is_blocked(&host))
+        })
+        .collect()
+}
+
+/// Whether `grant` is still for `cfg`: its URL, and its client when the
+/// owner configured one.
+fn grant_fits(grant: &Grant, cfg: &McpServerConfig) -> bool {
+    let McpAuth::Oauth(oauth) = &cfg.auth else {
+        return false;
+    };
+    grant.url == cfg.url
+        && if oauth.client_id.is_empty() {
+            grant.registered
+        } else {
+            !grant.registered && grant.client_id == oauth.client_id
+        }
+}
+
+impl OAuthGrants {
     pub fn new(db: SqlitePool, keyring: Option<KeyRing>) -> Self {
         Self {
             db,
@@ -178,6 +268,7 @@ impl McpOAuth {
             http: Arc::new(Http::new()),
             pending: Arc::default(),
             slots: Arc::default(),
+            failures: Arc::default(),
         }
     }
 
@@ -238,8 +329,8 @@ impl McpOAuth {
     }
 
     /// Start connecting `server` of `agent` for its owner `user_id`: the URL
-    /// to send the owner's browser to. `cfg` is the server as the agent runs
-    /// it, its OAuth client secret resolved from `secrets`.
+    /// to send the owner's browser to, always https. `cfg` is the server as
+    /// the agent runs it; `owner_secret` its OAuth client secret, resolved.
     pub async fn start(
         &self,
         agent: &Agent,
@@ -247,7 +338,7 @@ impl McpOAuth {
         server: &str,
         cfg: &McpServerConfig,
         redirect_uri: &str,
-        secrets: &BTreeMap<String, String>,
+        owner_secret: Option<String>,
     ) -> Result<String, OAuthError> {
         if self.keyring.is_none() {
             return Err(OAuthError::NoKey);
@@ -257,15 +348,12 @@ impl McpOAuth {
                 "MCP server {server:?} does not use OAuth"
             )));
         };
-        let client_secret = if oauth.client_secret.is_empty() {
-            None
-        } else {
-            Some(resolve(&oauth.client_secret, secrets)?)
-        };
+        self.room_for(user_id)?;
         let mut manager =
             AuthorizationManager::new_with_oauth_http_client(cfg.url.as_str(), self.http.clone())
                 .await?;
         let resolution = manager.resolve_metadata().await?;
+        check_metadata(&resolution.metadata)?;
         let metadata = resolution.metadata.clone();
         manager.set_metadata(resolution.metadata);
         let store = InMemoryCredentialStore::new();
@@ -274,47 +362,62 @@ impl McpOAuth {
         if !oauth.scopes.is_empty() {
             request = request.with_scopes(oauth.scopes.iter().cloned());
         }
-        if !oauth.client_id.is_empty() {
-            request = request.with_preregistered_client(oauth.client_id.clone());
-            if let Some(secret) = &client_secret {
-                request = request.with_client_secret(secret.clone());
-            }
+        // The client: the owner's, one this gateway registered for this
+        // server and redirect before, or one it registers now; its secret
+        // goes with it.
+        let (client_id, client_secret, registered) = if !oauth.client_id.is_empty() {
+            (oauth.client_id.clone(), owner_secret, false)
         } else {
-            // A client this gateway registered for the server before, for
-            // the same redirect.
-            let slot = self.slot(agent.id).await;
-            let mut held = slot.lock().await;
-            let grants = self.loaded(agent.id, &mut held).await;
-            if let Some(old) = grants
-                .get(server)
-                .filter(|g| g.url == cfg.url && g.redirect_uri == redirect_uri)
-            {
-                request = request.with_preregistered_client(old.client_id.clone());
-                if let Some(secret) = &old.client_secret {
-                    request = request.with_client_secret(secret.clone());
+            let earlier = {
+                let slot = self.slot(agent.id).await;
+                let mut held = slot.lock().await;
+                self.loaded(agent.id, &mut held)
+                    .await
+                    .get(server)
+                    .filter(|g| g.registered && g.url == cfg.url && g.redirect_uri == redirect_uri)
+                    .map(|g| (g.client_id.clone(), g.registered_secret.clone()))
+            };
+            match earlier {
+                Some((id, secret)) => (id, secret, true),
+                None => {
+                    if metadata.registration_endpoint.is_none() {
+                        return Err(OAuthError::Refused(
+                            "the authorization server offers no client registration: set the \
+                             client id of an app registered there"
+                                .into(),
+                        ));
+                    }
+                    let scopes: Vec<&str> = oauth.scopes.iter().map(String::as_str).collect();
+                    let client = manager
+                        .register_client(CLIENT_NAME, redirect_uri, &scopes)
+                        .await?;
+                    (client.client_id, client.client_secret, true)
                 }
             }
+        };
+        request = request.with_preregistered_client(client_id);
+        if let Some(secret) = &client_secret {
+            request = request.with_client_secret(secret.clone());
         }
         let session = AuthorizationSession::new(manager, request)
             .await
             .map_err(|(_, e)| OAuthError::from(e))?;
-        let state = reqwest::Url::parse(&session.auth_url)
-            .ok()
-            .and_then(|url| {
-                url.query_pairs()
-                    .find(|(k, _)| k == "state")
-                    .map(|(_, v)| v.into_owned())
-            })
+        let url = reqwest::Url::parse(&session.auth_url)
+            .map_err(|e| OAuthError::Provider(format!("the authorization URL: {e}")))?;
+        check_url(&url).map_err(OAuthError::Refused)?;
+        let state = url
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .map(|(_, v)| v.into_owned())
             .ok_or_else(|| OAuthError::Internal("the authorization URL has no state".into()))?;
-        let url = session.auth_url.clone();
         let mut pending = self
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.retain(|_, p| p.started.elapsed() < PENDING_FOR);
-        if pending.len() >= MAX_PENDING {
+        // A state is ours and new: one already waiting is never replaced.
+        if pending.contains_key(&state) {
             return Err(OAuthError::Refused(
-                "too many connects wait for their providers; try again in a few minutes".into(),
+                "the authorization URL's state is not this connect's".into(),
             ));
         }
         pending.insert(
@@ -326,12 +429,29 @@ impl McpOAuth {
                 url: cfg.url.clone(),
                 session,
                 store,
-                client_secret,
+                registered,
+                registered_secret: if registered { client_secret } else { None },
                 metadata,
                 started: Instant::now(),
             },
         );
-        Ok(url)
+        Ok(url.to_string())
+    }
+
+    /// Whether `user_id` may start another connect.
+    fn room_for(&self, user_id: UserId) -> Result<(), OAuthError> {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.retain(|_, p| p.started.elapsed() < PENDING_FOR);
+        let theirs = pending.values().filter(|p| p.user_id == user_id).count();
+        if theirs >= MAX_PENDING_PER_USER || pending.len() >= MAX_PENDING {
+            return Err(OAuthError::Refused(
+                "too many connects wait for their providers; try again in a few minutes".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// The provider sent `user_id`'s browser back with `state` and `code`:
@@ -372,7 +492,8 @@ impl McpOAuth {
         let grant = Grant {
             url: pending.url,
             client_id,
-            client_secret: pending.client_secret,
+            registered: pending.registered,
+            registered_secret: pending.registered_secret,
             redirect_uri: pending.session.redirect_uri.clone(),
             scopes: credentials.granted_scopes.clone(),
             metadata: pending.metadata,
@@ -384,6 +505,10 @@ impl McpOAuth {
         self.save(pending.agent_id, &pending.server, &grant).await?;
         grants.insert(pending.server.clone(), grant);
         *held = Some(grants);
+        self.failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(pending.agent_id, pending.server.clone()));
         info!(agent_id = %pending.agent_id, server = %pending.server, "MCP server connected with OAuth");
         Ok((pending.agent_id, pending.server))
     }
@@ -409,17 +534,101 @@ impl McpOAuth {
         Some(target)
     }
 
-    /// Forget what `server` was connected with; whether it was.
-    pub async fn disconnect(&self, agent_id: AgentId, server: &str) -> Result<bool, OAuthError> {
+    /// Forget what `server` was connected with, and revoke its token at the
+    /// provider without waiting; whether it was. `owner_secret` is the
+    /// owner's client secret, for a revocation that needs it.
+    pub async fn disconnect(
+        &self,
+        agent_id: AgentId,
+        server: &str,
+        owner_secret: Option<String>,
+    ) -> Result<bool, OAuthError> {
         let slot = self.slot(agent_id).await;
         let mut held = slot.lock().await;
+        let mut grants = self.loaded(agent_id, &mut held).await;
         let was = agent_secrets::oauth_remove(&self.db, agent_id, server)
             .await
             .map_err(|e| OAuthError::Internal(e.to_string()))?;
-        if let Some(grants) = held.as_mut() {
-            grants.remove(server);
+        if let Some(grant) = grants.remove(server) {
+            self.revoke(grant, owner_secret);
         }
+        *held = Some(grants);
         Ok(was)
+    }
+
+    /// Forget the grants of the agent's servers that are gone from `servers`
+    /// (its own settings), or whose URL, authorization or client changed:
+    /// their tokens are for something else now.
+    pub async fn prune(&self, agent_id: AgentId, servers: &HashMap<String, McpServerConfig>) {
+        let stale: Vec<String> = {
+            let slot = self.slot(agent_id).await;
+            let mut held = slot.lock().await;
+            self.loaded(agent_id, &mut held)
+                .await
+                .iter()
+                .filter(|(name, grant)| {
+                    servers.get(*name).is_none_or(|cfg| !grant_fits(grant, cfg))
+                })
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+        for server in stale {
+            match self.disconnect(agent_id, &server, None).await {
+                Ok(_) => {
+                    info!(%agent_id, server, "an MCP server's OAuth is forgotten: the server changed")
+                }
+                Err(e) => {
+                    warn!(%agent_id, server, error = %e, "could not forget an MCP server's OAuth")
+                }
+            }
+        }
+    }
+
+    /// Revoke `grant`'s refresh token (or its access token without one) at
+    /// the provider's revocation endpoint, when it has one (RFC 7009), in
+    /// the background, best effort.
+    fn revoke(&self, grant: Grant, owner_secret: Option<String>) {
+        let Some(endpoint) = grant
+            .metadata
+            .additional_fields
+            .get("revocation_endpoint")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|e| reqwest::Url::parse(e).ok())
+            .filter(|e| check_url(e).is_ok())
+        else {
+            return;
+        };
+        let (token, hint) = match (grant.refresh_token(), grant.access_token()) {
+            (Some(refresh), _) => (refresh, "refresh_token"),
+            (None, Some(access)) => (access, "access_token"),
+            (None, None) => return,
+        };
+        let mut form = url::form_urlencoded::Serializer::new(String::new());
+        form.append_pair("token", &token)
+            .append_pair("token_type_hint", hint)
+            .append_pair("client_id", &grant.client_id);
+        if let Some(secret) = grant.client_secret(owner_secret.as_deref()) {
+            form.append_pair("client_secret", &secret);
+        }
+        let body = form.finish();
+        let client = self.http.stop.clone();
+        tokio::spawn(async move {
+            let sent = client
+                .post(endpoint)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded",
+                )
+                .body(body)
+                .send()
+                .await;
+            match sent {
+                Ok(response) => {
+                    info!(status = %response.status(), "an MCP server's OAuth token was revoked at its provider")
+                }
+                Err(e) => warn!(error = %e, "revoking an MCP server's OAuth token failed"),
+            }
+        });
     }
 
     /// Forget what was read of a deleted agent.
@@ -427,22 +636,15 @@ impl McpOAuth {
         self.slots.lock().await.remove(&agent_id);
     }
 
-    /// The access tokens of `own` servers of `policy` (the agent's, as
-    /// resolved) that use OAuth, each for the URL it was issued for, when
-    /// that is the server's URL.
+    /// The access tokens of the agent's [`served`] servers, each for the URL
+    /// it was issued for, when that is the server's URL.
     pub async fn tokens(
         &self,
         agent_id: AgentId,
         policy: &Policy,
         own: &[String],
     ) -> BTreeMap<String, McpToken> {
-        let wanted: Vec<(&String, &McpServerConfig)> = policy
-            .mcp_servers
-            .iter()
-            .filter(|(name, cfg)| {
-                own.contains(name) && matches!(cfg.auth, McpAuth::Oauth(_)) && cfg.is_remote()
-            })
-            .collect();
+        let wanted = served(policy, own);
         if wanted.is_empty() {
             return BTreeMap::new();
         }
@@ -452,7 +654,7 @@ impl McpOAuth {
         wanted
             .into_iter()
             .filter_map(|(name, cfg)| {
-                let grant = grants.get(name).filter(|g| g.url == cfg.url)?;
+                let grant = grants.get(name).filter(|g| grant_fits(g, cfg))?;
                 Some((
                     name.clone(),
                     McpToken {
@@ -488,16 +690,65 @@ impl McpOAuth {
         }
     }
 
-    /// Refresh the access token of `server`. A refusal is kept as the
-    /// server's error, for the owner to connect it again.
-    pub async fn refresh(&self, agent_id: AgentId, server: &str) -> Result<(), OAuthError> {
+    /// The servers among `wanted` whose tokens are due for a refresh now,
+    /// and not waiting after a failure.
+    pub async fn due(
+        &self,
+        agent_id: AgentId,
+        wanted: &[(&String, &McpServerConfig)],
+    ) -> Vec<String> {
+        let slot = self.slot(agent_id).await;
+        let mut held = slot.lock().await;
+        let grants = self.loaded(agent_id, &mut held).await;
+        let now = Utc::now();
+        let failures = self
+            .failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        wanted
+            .iter()
+            .filter(|(name, cfg)| {
+                grants.get(*name).is_some_and(|g| {
+                    grant_fits(g, cfg)
+                        && g.access_token().is_some()
+                        && g.refresh_at().is_some_and(|at| at <= now)
+                })
+            })
+            .filter(|(name, _)| {
+                failures
+                    .get(&(agent_id, (*name).clone()))
+                    .is_none_or(|(_, next)| *next <= Instant::now())
+            })
+            .map(|(name, _)| (*name).clone())
+            .collect()
+    }
+
+    /// Refresh the access token of `server`, within [`REFRESH_TIMEOUT`].
+    /// `owner_secret` is the owner's client secret, resolved now. A refusal
+    /// ends the grant; other failures wait longer each time.
+    pub async fn refresh(
+        &self,
+        agent_id: AgentId,
+        server: &str,
+        owner_secret: Option<String>,
+    ) -> Result<(), OAuthError> {
         let slot = self.slot(agent_id).await;
         let mut held = slot.lock().await;
         let mut grants = self.loaded(agent_id, &mut held).await;
         let Some(grant) = grants.get(server).cloned() else {
             return Ok(());
         };
-        match self.refreshed(&grant).await {
+        let secret = grant.client_secret(owner_secret.as_deref());
+        let outcome = tokio::time::timeout(REFRESH_TIMEOUT, self.refreshed(&grant, secret))
+            .await
+            .unwrap_or_else(|_| {
+                Err(OAuthError::Provider(format!(
+                    "no answer in {}s",
+                    REFRESH_TIMEOUT.as_secs()
+                )))
+            });
+        let key = (agent_id, server.to_string());
+        match outcome {
             Ok(credentials) => {
                 let grant = Grant {
                     credentials,
@@ -506,6 +757,10 @@ impl McpOAuth {
                 self.save(agent_id, server, &grant).await?;
                 grants.insert(server.to_string(), grant);
                 *held = Some(grants);
+                self.failures
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&key);
                 info!(%agent_id, server, "MCP server's OAuth token refreshed");
                 Ok(())
             }
@@ -514,14 +769,32 @@ impl McpOAuth {
                     OAuthError::Provider(_) => format!("refreshing the token failed: {e}"),
                     other => other.to_string(),
                 };
-                // A refusal ends the grant: its token is dropped, and it is
-                // not tried again until the owner connects the server again.
                 if matches!(e, OAuthError::Rejected(_)) {
+                    // The grant ended: its token is dropped, and it is not
+                    // tried again until the owner connects the server again.
                     let mut ended = grant;
                     ended.credentials.token_response = None;
                     self.save(agent_id, server, &ended).await?;
                     grants.insert(server.to_string(), ended);
                     *held = Some(grants);
+                } else {
+                    let mut failures = self
+                        .failures
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let count = failures.get(&key).map_or(1, |(n, _)| n + 1);
+                    let wait = FIRST_BACKOFF
+                        .saturating_mul(1 << (count - 1).min(10))
+                        .min(MAX_BACKOFF);
+                    // Without a refresh token there is nothing to try before
+                    // the token expires.
+                    let wait = match (&e, grant.expires_at()) {
+                        (OAuthError::NoRefresh(_), Some(at)) => {
+                            (at - Utc::now()).to_std().unwrap_or(wait).max(wait)
+                        }
+                        _ => wait,
+                    };
+                    failures.insert(key, (count, Instant::now() + wait));
                 }
                 if let Err(db) = agent_secrets::oauth_error(&self.db, agent_id, server, &why).await
                 {
@@ -532,19 +805,14 @@ impl McpOAuth {
         }
     }
 
-    /// Refresh the agent's tokens that expire soon, before it starts.
-    pub async fn refresh_due(&self, agent_id: AgentId) {
-        let soon = Utc::now() + REFRESH_AHEAD;
-        for (server, status) in self.status(agent_id).await {
-            if status.expires_at.is_some_and(|at| at < soon) {
-                if let Err(e) = self.refresh(agent_id, &server).await {
-                    warn!(%agent_id, server, error = %e, "an MCP server's OAuth token was not refreshed");
-                }
-            }
+    async fn refreshed(
+        &self,
+        grant: &Grant,
+        client_secret: Option<String>,
+    ) -> Result<StoredCredentials, OAuthError> {
+        if grant.refresh_token().is_none() {
+            return Err(no_refresh());
         }
-    }
-
-    async fn refreshed(&self, grant: &Grant) -> Result<StoredCredentials, OAuthError> {
         let mut manager =
             AuthorizationManager::new_with_oauth_http_client(grant.url.as_str(), self.http.clone())
                 .await?;
@@ -556,30 +824,30 @@ impl McpOAuth {
                 resolution.metadata
             }
             Ok(_) => {
-                return Err(OAuthError::Refused(
+                return Err(OAuthError::Rejected(
                     "the server's authorization server changed; connect it again".into(),
                 ));
             }
             Err(_) => grant.metadata.clone(),
         };
+        check_metadata(&metadata)?;
         manager.set_metadata(metadata);
         let mut client =
             OAuthClientConfig::new(grant.client_id.clone(), grant.redirect_uri.clone())
                 .with_scopes(grant.scopes.clone());
-        if let Some(secret) = &grant.client_secret {
-            client = client.with_client_secret(secret.clone());
+        if let Some(secret) = client_secret {
+            client = client.with_client_secret(secret);
         }
         manager.configure_client(client)?;
         let store = InMemoryCredentialStore::new();
         store.save(grant.credentials.clone()).await?;
         manager.set_credential_store(store.clone());
         manager.refresh_token().await.map_err(|e| match e {
-            AuthError::TokenRefreshRejected(_) | AuthError::AuthorizationRequired => {
-                OAuthError::Rejected(format!(
-                    "the authorization server refused to refresh the token ({e}); connect the \
-                     server again"
-                ))
-            }
+            AuthError::TokenRefreshRejected(_) => OAuthError::Rejected(format!(
+                "the authorization server refused to refresh the token ({e}); connect the \
+                 server again"
+            )),
+            AuthError::AuthorizationRequired => no_refresh(),
             other => OAuthError::from(other),
         })?;
         store
@@ -602,13 +870,15 @@ impl McpOAuth {
             "access_token": access_token,
             "token_type": "Bearer",
             "expires_in": 3600,
+            "refresh_token": "refresh-0123",
         }))
         .expect("token");
         let received = u64::try_from(Utc::now().timestamp()).unwrap_or_default();
         let grant = Grant {
             url: url.to_string(),
             client_id: "havn".into(),
-            client_secret: None,
+            registered: true,
+            registered_secret: None,
             redirect_uri: "http://localhost:3000/api/mcp/oauth/callback".into(),
             scopes: Vec::new(),
             metadata: AuthorizationMetadata::default(),
@@ -627,10 +897,18 @@ impl McpOAuth {
         *held = Some(grants);
     }
 
-    /// The agents and servers whose tokens expire soon.
-    pub async fn expiring(&self) -> Vec<(AgentId, String)> {
+    /// The agents with tokens that expire within [`REFRESH_AHEAD`].
+    pub async fn expiring_agents(&self) -> Vec<AgentId> {
         match agent_secrets::oauth_expiring(&self.db, Utc::now() + REFRESH_AHEAD).await {
-            Ok(due) => due,
+            Ok(due) => {
+                let mut agents: Vec<AgentId> = Vec::new();
+                for (agent, _) in due {
+                    if !agents.contains(&agent) {
+                        agents.push(agent);
+                    }
+                }
+                agents
+            }
             Err(e) => {
                 warn!(error = %e, "reading MCP OAuth tokens to refresh failed");
                 Vec::new()
@@ -639,8 +917,16 @@ impl McpOAuth {
     }
 }
 
+fn no_refresh() -> OAuthError {
+    OAuthError::NoRefresh(
+        "the authorization server gave no refresh token; connect the server again once its \
+         token expired"
+            .into(),
+    )
+}
+
 /// `value`, or the agent's secret it names.
-fn resolve(value: &str, secrets: &BTreeMap<String, String>) -> Result<String, OAuthError> {
+pub fn resolve(value: &str, secrets: &BTreeMap<String, String>) -> Result<String, OAuthError> {
     use havn_core::secret_ref::{self, SecretRef};
     if !value.starts_with(secret_ref::PREFIX) {
         return Ok(value.to_string());
@@ -655,6 +941,55 @@ fn resolve(value: &str, secrets: &BTreeMap<String, String>) -> Result<String, OA
             "{value} is not one of the agent's secrets"
         ))),
     }
+}
+
+/// The owner's client secret of `cfg`, resolved from `secrets`; `None`
+/// without one.
+pub fn owner_secret(
+    cfg: &McpServerConfig,
+    secrets: &BTreeMap<String, String>,
+) -> Result<Option<String>, OAuthError> {
+    match &cfg.auth {
+        McpAuth::Oauth(oauth) if !oauth.client_secret.is_empty() => {
+            resolve(&oauth.client_secret, secrets).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Every endpoint the authorization server names, as https to public
+/// addresses; its authorization endpoint without a `state` of its own.
+fn check_metadata(metadata: &AuthorizationMetadata) -> Result<(), OAuthError> {
+    let revocation = metadata
+        .additional_fields
+        .get("revocation_endpoint")
+        .and_then(serde_json::Value::as_str);
+    for (what, endpoint) in [
+        (
+            "authorization endpoint",
+            Some(metadata.authorization_endpoint.as_str()),
+        ),
+        ("token endpoint", Some(metadata.token_endpoint.as_str())),
+        (
+            "registration endpoint",
+            metadata.registration_endpoint.as_deref(),
+        ),
+        ("revocation endpoint", revocation),
+    ] {
+        let Some(endpoint) = endpoint else { continue };
+        let url = reqwest::Url::parse(endpoint)
+            .map_err(|e| OAuthError::Refused(format!("the authorization server's {what}: {e}")))?;
+        check_url(&url).map_err(|why| {
+            OAuthError::Refused(format!("the authorization server's {what}: {why}"))
+        })?;
+        if what == "authorization endpoint" && url.query_pairs().any(|(k, _)| k == "state") {
+            return Err(OAuthError::Refused(
+                "the authorization server's authorization endpoint carries a state of its own"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The gateway's HTTP for OAuth: https to public addresses only, at most
@@ -742,8 +1077,8 @@ impl OAuthHttpClient for Http {
     }
 }
 
-/// Refresh the tokens that expire soon, every minute, and send each running
-/// agent its new ones.
+/// Every minute, refresh the due tokens of running agents, at most
+/// [`PARALLEL_REFRESHES`] agents at once, and send each its new ones.
 pub async fn refresh_loop(
     secrets: crate::secrets::SecretStore,
     registry: crate::agent_registry::AgentRegistry,
@@ -752,18 +1087,21 @@ pub async fn refresh_loop(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
-        let oauth = secrets.oauth();
-        for (agent_id, server) in oauth.expiring().await {
-            if !registry.is_connected(agent_id).await {
-                continue;
-            }
-            match oauth.refresh(agent_id, &server).await {
-                Ok(()) => secrets.push(&registry, agent_id).await,
-                Err(e) => {
-                    warn!(%agent_id, server, error = %e, "an MCP server's OAuth token was not refreshed")
+        let agents = secrets.oauth().expiring_agents().await;
+        futures_util::stream::iter(agents)
+            .for_each_concurrent(PARALLEL_REFRESHES, |agent_id| {
+                let secrets = secrets.clone();
+                let registry = registry.clone();
+                async move {
+                    if !registry.is_connected(agent_id).await {
+                        return;
+                    }
+                    secrets
+                        .refresh_oauth(&registry, agent_id, REFRESH_TIMEOUT)
+                        .await;
                 }
-            }
-        }
+            })
+            .await;
     }
 }
 
@@ -780,6 +1118,8 @@ mod tests {
         assert!(check_url(&url("https://1.1.1.1/token")).is_ok());
         for bad in [
             "http://auth.example.com/token",
+            "javascript:alert(document.cookie)",
+            "data:text/html,<script>x</script>",
             "https://127.0.0.1/token",
             "https://10.0.0.5/token",
             "https://169.254.169.254/latest",
@@ -787,6 +1127,38 @@ mod tests {
         ] {
             assert!(check_url(&url(bad)).is_err(), "{bad}");
         }
+    }
+
+    fn metadata(authorize: &str) -> AuthorizationMetadata {
+        serde_json::from_value(serde_json::json!({
+            "authorization_endpoint": authorize,
+            "token_endpoint": "https://auth.example.com/token",
+            "registration_endpoint": "https://auth.example.com/register",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_authorization_server_names_https_endpoints_only() {
+        assert!(check_metadata(&metadata("https://auth.example.com/authorize")).is_ok());
+        for bad in [
+            "javascript:alert(document.domain)//",
+            "data:text/html,hi",
+            "http://auth.example.com/authorize",
+            "https://10.0.0.1/authorize",
+            "https://auth.example.com/authorize?state=fixed",
+        ] {
+            assert!(check_metadata(&metadata(bad)).is_err(), "{bad}");
+        }
+        let mut token = metadata("https://auth.example.com/authorize");
+        token.token_endpoint = "http://auth.example.com/token".into();
+        assert!(check_metadata(&token).is_err());
+        let mut revocation = metadata("https://auth.example.com/authorize");
+        revocation.additional_fields.insert(
+            "revocation_endpoint".into(),
+            serde_json::json!("https://127.0.0.1/revoke"),
+        );
+        assert!(check_metadata(&revocation).is_err());
     }
 
     #[test]
@@ -804,12 +1176,61 @@ mod tests {
     #[tokio::test]
     async fn a_callback_finishes_only_the_connect_its_user_started() {
         let db = havn_db::connect_in_memory().await.expect("db");
-        let oauth = McpOAuth::new(db, Some(KeyRing::from_passphrase("test-key")));
+        let oauth = OAuthGrants::new(db, Some(KeyRing::from_passphrase("test-key")));
         assert!(matches!(
             oauth
                 .finish(UserId::new(), "no-such-state", "code", None)
                 .await,
             Err(OAuthError::UnknownState)
         ));
+    }
+
+    #[test]
+    fn a_short_lived_token_is_refreshed_at_half_its_lifetime() {
+        let grant = |lifetime: u64| Grant {
+            url: "https://mcp.example.com/mcp".into(),
+            client_id: "c".into(),
+            registered: true,
+            registered_secret: None,
+            redirect_uri: "https://havn.example.com/api/mcp/oauth/callback".into(),
+            scopes: Vec::new(),
+            metadata: AuthorizationMetadata::default(),
+            credentials: StoredCredentials::new(
+                "c".into(),
+                Some(
+                    serde_json::from_value(serde_json::json!({
+                        "access_token": "a", "token_type": "Bearer", "expires_in": lifetime
+                    }))
+                    .unwrap(),
+                ),
+                Vec::new(),
+                Some(1_000_000),
+            ),
+        };
+        let at = |secs: i64| DateTime::from_timestamp(1_000_000 + secs, 0).unwrap();
+        assert_eq!(grant(120).refresh_at(), Some(at(60)));
+        assert_eq!(grant(3600).refresh_at(), Some(at(3300)));
+        let fits = McpServerConfig {
+            url: "https://mcp.example.com/mcp".into(),
+            auth: McpAuth::Oauth(havn_core::McpOAuthConfig::default()),
+            ..Default::default()
+        };
+        assert!(grant_fits(&grant(60), &fits));
+        let moved = McpServerConfig {
+            url: "https://mcp.example.com/v2".into(),
+            ..fits.clone()
+        };
+        assert!(!grant_fits(&grant(60), &moved));
+        let owners = McpServerConfig {
+            auth: McpAuth::Oauth(havn_core::McpOAuthConfig {
+                client_id: "mine".into(),
+                ..Default::default()
+            }),
+            ..fits
+        };
+        assert!(
+            !grant_fits(&grant(60), &owners),
+            "a registered client is not the owner's"
+        );
     }
 }

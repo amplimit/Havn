@@ -177,7 +177,8 @@ impl McpClient {
     /// `CallToolResult` so the caller (`tool::McpToolHandle`) can map
     /// it into the runtime's tool-result shape. Subject to the
     /// per-server timeout: a server that hangs doesn't pin the agent's
-    /// turn forever.
+    /// turn forever. rmcp tells the server with `notifications/cancelled`
+    /// when the timeout drops the call.
     pub async fn call_tool(
         &self,
         tool_name: &str,
@@ -272,13 +273,36 @@ impl McpServers {
         // Sort by server name so log lines are deterministic.
         let mut entries: Vec<(&String, &McpServerConfig)> = policy.mcp_servers.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
+        // Remote servers connect at once, each within its deadline, so a few
+        // that do not answer cannot hold the agent's start for long.
+        let remote = entries
+            .iter()
+            .filter(|(_, cfg)| cfg.enabled && cfg.is_remote())
+            .map(|(name, cfg)| async move {
+                let started = tokio::time::timeout(REMOTE_START, connect_remote(name, cfg, policy))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(anyhow::anyhow!(
+                            "it did not start in {}s",
+                            REMOTE_START.as_secs()
+                        ))
+                    });
+                ((*name).clone(), started)
+            });
+        let mut remote: HashMap<String, anyhow::Result<McpClient>> =
+            futures_util::future::join_all(remote)
+                .await
+                .into_iter()
+                .collect();
         for (name, cfg) in entries {
             if !cfg.enabled {
                 info!(server = %name, "MCP server disabled in policy; skipping");
                 continue;
             }
             let started = if cfg.is_remote() {
-                connect_remote(name, cfg, policy).await
+                remote
+                    .remove(name)
+                    .unwrap_or_else(|| Err(anyhow::anyhow!("it was not started")))
             } else {
                 if let Err(e) = validate_binary_name(&cfg.binary) {
                     warn!(
@@ -337,6 +361,9 @@ impl McpServers {
         Self { clients }
     }
 }
+
+/// How long a remote server may take to connect and list its tools.
+const REMOTE_START: Duration = Duration::from_secs(90);
 
 /// Connect to one remote server, do the handshake, list its tools.
 async fn connect_remote(

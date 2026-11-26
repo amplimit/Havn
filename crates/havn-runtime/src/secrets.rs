@@ -59,6 +59,25 @@ pub fn set(secrets: Secrets) {
             seen.push((name, value));
         }
     }
+    // An access token is worthless once it expired: of each server's, the
+    // last ones stay redacted, so a token refreshed every few minutes does
+    // not grow the list without end.
+    let mut later: BTreeMap<String, usize> = BTreeMap::new();
+    let mut keep: Vec<bool> = seen
+        .iter()
+        .rev()
+        .map(|(name, _)| {
+            if !name.starts_with(TOKEN_PREFIX) {
+                return true;
+            }
+            let count = later.entry(name.clone()).or_default();
+            *count += 1;
+            *count <= KEPT_TOKENS
+        })
+        .collect();
+    keep.reverse();
+    let mut keep = keep.into_iter();
+    seen.retain(|_| keep.next().unwrap_or(true));
     let redaction = secret_ref::redaction_list(seen.iter().map(|(n, v)| (n, v)));
     let next = Current {
         values: secrets.values,
@@ -80,8 +99,13 @@ pub fn set(secrets: Secrets) {
 /// The name an MCP server's OAuth token is redacted as: not one an owner can
 /// give a secret, or refer to.
 fn token_name(server: &str) -> String {
-    format!("mcp:{server}")
+    format!("{TOKEN_PREFIX}{server}")
 }
+
+const TOKEN_PREFIX: &str = "mcp:";
+/// An MCP server's OAuth access tokens kept redacted: the current one and
+/// the one before.
+const KEPT_TOKENS: usize = 2;
 
 /// The OAuth access token MCP server `server` was connected with, when it
 /// was issued for `url`.
@@ -428,5 +452,27 @@ pub(crate) mod tests {
         assert!(resolve("secret:mcp:notion").is_err());
         set(Secrets::default());
         assert_eq!(mcp_token("notion", "https://mcp.notion.com/mcp"), None);
+        // Refreshed tokens: the last two stay redacted, not every one.
+        for n in 0..10 {
+            set(Secrets {
+                mcp_tokens: BTreeMap::from([(
+                    "notion".to_string(),
+                    McpToken {
+                        url: "https://mcp.notion.com/mcp".into(),
+                        access_token: format!("oauth-refreshed-{n:04}"),
+                    },
+                )]),
+                ..Default::default()
+            });
+        }
+        let kept = read()
+            .seen
+            .iter()
+            .filter(|(name, _)| name == "mcp:notion")
+            .count();
+        assert_eq!(kept, KEPT_TOKENS);
+        assert_eq!(redact("oauth-refreshed-0009"), "[secret:mcp:notion]");
+        assert_eq!(redact("oauth-refreshed-0008"), "[secret:mcp:notion]");
+        set(Secrets::default());
     }
 }

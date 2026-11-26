@@ -526,7 +526,7 @@ mod tests {
             panic!("a role's server got the owner's secret");
         };
         assert!(e.to_string().contains("role"), "{e}");
-        cfg.auth = McpAuth::Oauth(havn_core::McpOAuth::default());
+        cfg.auth = McpAuth::Oauth(havn_core::McpOAuthConfig::default());
         let Err(e) = connect("x", &cfg, &networked(), false).await else {
             panic!("a role's server got the owner's token");
         };
@@ -536,7 +536,7 @@ mod tests {
     #[tokio::test]
     async fn an_oauth_server_without_a_token_is_not_connected() {
         let mut cfg = remote("https://mcp.example.com/mcp");
-        cfg.auth = McpAuth::Oauth(havn_core::McpOAuth::default());
+        cfg.auth = McpAuth::Oauth(havn_core::McpOAuthConfig::default());
         let Err(e) = connect("unconnected", &cfg, &networked(), true).await else {
             panic!("connected without a token");
         };

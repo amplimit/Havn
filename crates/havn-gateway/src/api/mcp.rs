@@ -136,7 +136,7 @@ async fn view(state: &AppState, agent: &havn_db::repo::agents::Agent) -> McpView
         servers,
         available_binaries: list_installed_binaries().await,
         remote: RemoteView {
-            allowed: operator.remote == "on",
+            allowed: operator.remote_on(),
             hosts: operator.remote_hosts,
         },
         status: state
@@ -185,6 +185,7 @@ pub async fn patch(
     // means the dashboard can show a precise field-level error before
     // the row is written.
     if let Some(map) = &req.servers {
+        let (_, before) = read_mcp_from_config(&agent.config);
         for (name, cfg) in map {
             if name.trim().is_empty() {
                 return Err(ApiError::BadRequest("server name must be non-empty".into()));
@@ -194,8 +195,13 @@ pub async fn patch(
                     .map_err(|e| ApiError::BadRequest(format!("server {name:?}: {e}")))?;
             }
             cfg.validate(name)?;
-            if let Some(why) = crate::policy_resolver::operator_refuses(cfg) {
-                return Err(ApiError::BadRequest(format!("server {name:?}: {why}")));
+            // A server the operator does not allow is not added or changed;
+            // one kept as it was stays, and does not run.
+            let kept = before.get(name).is_some_and(|old| old.runs_as(cfg));
+            if !kept {
+                if let Some(why) = crate::policy_resolver::operator_refuses(cfg) {
+                    return Err(ApiError::BadRequest(format!("server {name:?}: {why}")));
+                }
             }
         }
     }
@@ -238,7 +244,29 @@ pub async fn patch(
     )
     .await;
     info!(agent_id = %id, "mcp config patched");
+    // Tokens of a server that is gone, or whose URL or authorization
+    // changed, are for something else now.
+    if req.servers.is_some() {
+        let (_, servers) = read_mcp_from_config(&updated.config);
+        state.secrets.oauth().prune(id, &servers).await;
+        state.secrets.push(&state.registry, id).await;
+    }
     Ok(Json(view(&state, &updated).await))
+}
+
+/// The agent's secrets, and the owner's client secret of `cfg` resolved
+/// from them.
+async fn owner_secret(
+    state: &AppState,
+    agent_id: havn_core::AgentId,
+    cfg: &McpServerConfig,
+) -> Result<Option<String>, ApiError> {
+    let secrets = state
+        .secrets
+        .values(agent_id)
+        .await
+        .map_err(ApiError::Internal)?;
+    crate::mcp_oauth::owner_secret(cfg, &secrets).map_err(oauth_error)
 }
 
 #[derive(Debug, Serialize)]
@@ -292,15 +320,11 @@ pub async fn connect(
     }
     let origin = redirect_origin(&state, &headers)?;
     let redirect_uri = format!("{origin}/api{}", crate::mcp_oauth::CALLBACK_PATH);
-    let secrets = state
-        .secrets
-        .values(agent.id)
-        .await
-        .map_err(ApiError::Internal)?;
+    let secret = owner_secret(&state, agent.id, cfg).await?;
     let authorization_url = state
         .secrets
         .oauth()
-        .start(&agent, user.id, &server, cfg, &redirect_uri, &secrets)
+        .start(&agent, user.id, &server, cfg, &redirect_uri, secret)
         .await
         .map_err(oauth_error)?;
     info!(agent_id = %agent.id, server, "MCP server OAuth started");
@@ -452,10 +476,15 @@ pub async fn disconnect(
     Path((id, server)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let (_, servers) = read_mcp_from_config(&agent.config);
+    let secret = match servers.get(&server) {
+        Some(cfg) => owner_secret(&state, agent.id, cfg).await.unwrap_or(None),
+        None => None,
+    };
     let was = state
         .secrets
         .oauth()
-        .disconnect(agent.id, &server)
+        .disconnect(agent.id, &server, secret)
         .await
         .map_err(oauth_error)?;
     if !was {

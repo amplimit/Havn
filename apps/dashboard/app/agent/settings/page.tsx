@@ -2545,20 +2545,20 @@ function McpEditor({ agentId }: { agentId: string }) {
   // The form adds a server, or replaces the one being edited.
   const [editing, setEditing] = useState<string | null>(null);
   const [kind, setKind] = useState<"stdio" | "remote">("stdio");
-  const [newName, setNewName] = useState("");
-  const [newBinary, setNewBinary] = useState("");
-  const [newArgs, setNewArgs] = useState(""); // space-separated; empty = none
-  const [newPathsRw, setNewPathsRw] = useState(""); // newline-separated
-  const [newPathsRo, setNewPathsRo] = useState("");
-  const [newUrl, setNewUrl] = useState("");
-  const [newTransport, setNewTransport] = useState<McpTransport>("auto");
-  const [newHeaders, setNewHeaders] = useState(""); // `Name: value` a line
-  const [newAuth, setNewAuth] = useState<McpAuth["type"]>("none");
-  const [newToken, setNewToken] = useState("");
-  const [newClientId, setNewClientId] = useState("");
-  const [newClientSecret, setNewClientSecret] = useState("");
-  const [newScopes, setNewScopes] = useState("");
-  const [newTimeout, setNewTimeout] = useState(60);
+  const [draftName, setDraftName] = useState("");
+  const [draftBinary, setDraftBinary] = useState("");
+  const [draftArgs, setDraftArgs] = useState(""); // space-separated; empty = none
+  const [draftPathsRw, setDraftPathsRw] = useState(""); // newline-separated
+  const [draftPathsRo, setDraftPathsRo] = useState("");
+  const [draftUrl, setDraftUrl] = useState("");
+  const [draftTransport, setDraftTransport] = useState<McpTransport>("auto");
+  const [draftHeaders, setDraftHeaders] = useState(""); // `Name: value` a line
+  const [draftAuth, setDraftAuth] = useState<McpAuth["type"]>("none");
+  const [draftToken, setDraftToken] = useState("");
+  const [draftClientId, setDraftClientId] = useState("");
+  const [draftClientSecret, setDraftClientSecret] = useState("");
+  const [draftScopes, setDraftScopes] = useState("");
+  const [draftTimeout, setDraftTimeout] = useState(60);
 
   async function load() {
     try {
@@ -2645,20 +2645,20 @@ function McpEditor({ agentId }: { agentId: string }) {
 
   function resetForm() {
     setEditing(null);
-    setNewName("");
-    setNewBinary("");
-    setNewArgs("");
-    setNewPathsRw("");
-    setNewPathsRo("");
-    setNewUrl("");
-    setNewTransport("auto");
-    setNewHeaders("");
-    setNewAuth("none");
-    setNewToken("");
-    setNewClientId("");
-    setNewClientSecret("");
-    setNewScopes("");
-    setNewTimeout(60);
+    setDraftName("");
+    setDraftBinary("");
+    setDraftArgs("");
+    setDraftPathsRw("");
+    setDraftPathsRo("");
+    setDraftUrl("");
+    setDraftTransport("auto");
+    setDraftHeaders("");
+    setDraftAuth("none");
+    setDraftToken("");
+    setDraftClientId("");
+    setDraftClientSecret("");
+    setDraftScopes("");
+    setDraftTimeout(60);
   }
 
   function editServer(name: string) {
@@ -2666,27 +2666,27 @@ function McpEditor({ agentId }: { agentId: string }) {
     if (!cfg) return;
     resetForm();
     setEditing(name);
-    setNewName(name);
-    setNewTimeout(cfg.timeout_seconds);
+    setDraftName(name);
+    setDraftTimeout(cfg.timeout_seconds);
     if (cfg.url) {
       setKind("remote");
-      setNewUrl(cfg.url);
-      setNewTransport(cfg.transport ?? "auto");
-      setNewHeaders(headersText(cfg.headers ?? {}));
+      setDraftUrl(cfg.url);
+      setDraftTransport(cfg.transport ?? "auto");
+      setDraftHeaders(headersText(cfg.headers ?? {}));
       const auth = cfg.auth ?? { type: "none" };
-      setNewAuth(auth.type);
-      if (auth.type === "bearer") setNewToken(auth.token);
+      setDraftAuth(auth.type);
+      if (auth.type === "bearer") setDraftToken(auth.token);
       if (auth.type === "oauth") {
-        setNewClientId(auth.client_id ?? "");
-        setNewClientSecret(auth.client_secret ?? "");
-        setNewScopes((auth.scopes ?? []).join(" "));
+        setDraftClientId(auth.client_id ?? "");
+        setDraftClientSecret(auth.client_secret ?? "");
+        setDraftScopes((auth.scopes ?? []).join(" "));
       }
     } else {
       setKind("stdio");
-      setNewBinary(cfg.binary);
-      setNewArgs(cfg.args.join(" "));
-      setNewPathsRw(cfg.extra_paths_rw.join("\n"));
-      setNewPathsRo(cfg.extra_paths_ro.join("\n"));
+      setDraftBinary(cfg.binary);
+      setDraftArgs(cfg.args.join(" "));
+      setDraftPathsRw(cfg.extra_paths_rw.join("\n"));
+      setDraftPathsRo(cfg.extra_paths_ro.join("\n"));
     }
     if (form.current) form.current.open = true;
   }
@@ -2694,7 +2694,7 @@ function McpEditor({ agentId }: { agentId: string }) {
   async function addServer(e: React.FormEvent) {
     e.preventDefault();
     if (!view) return;
-    const trimmed = newName.trim();
+    const trimmed = draftName.trim();
     if (!trimmed) {
       setError("server name is required");
       return;
@@ -2706,47 +2706,47 @@ function McpEditor({ agentId }: { agentId: string }) {
     const kept = editing ? view.servers[editing] : undefined;
     let cfg: McpServerConfig;
     if (kind === "stdio") {
-      if (!newBinary) {
+      if (!draftBinary) {
         setError("pick a binary (operator must install it under /usr/share/havn/mcp-servers/ first)");
         return;
       }
       cfg = {
-        binary: newBinary,
-        args: newArgs.trim() ? newArgs.trim().split(/\s+/) : [],
+        binary: draftBinary,
+        args: draftArgs.trim() ? draftArgs.trim().split(/\s+/) : [],
         // env is set through the API and kept as it was.
         env: kept && !kept.url ? kept.env : {},
-        extra_paths_rw: splitPaths(newPathsRw),
-        extra_paths_ro: splitPaths(newPathsRo),
-        timeout_seconds: newTimeout,
+        extra_paths_rw: splitPaths(draftPathsRw),
+        extra_paths_ro: splitPaths(draftPathsRo),
+        timeout_seconds: draftTimeout,
         enabled: kept?.enabled ?? true,
       };
     } else {
-      const url = newUrl.trim();
+      const url = draftUrl.trim();
       if (!hostOf(url)) {
         setError("the URL must be http:// or https:// with a host");
         return;
       }
-      const headers = parseHeaders(newHeaders);
+      const headers = parseHeaders(draftHeaders);
       if (typeof headers === "string") {
         setError(headers);
         return;
       }
       let auth: McpAuth = { type: "none" };
-      if (newAuth === "bearer") {
-        if (!newToken.trim()) {
+      if (draftAuth === "bearer") {
+        if (!draftToken.trim()) {
           setError("a bearer token is required, best as secret:<name>");
           return;
         }
-        auth = { type: "bearer", token: newToken.trim() };
-      } else if (newAuth === "oauth") {
+        auth = { type: "bearer", token: draftToken.trim() };
+      } else if (draftAuth === "oauth") {
         if (!url.startsWith("https://")) {
           setError("OAuth needs an https URL");
           return;
         }
         auth = { type: "oauth" };
-        if (newClientId.trim()) auth.client_id = newClientId.trim();
-        if (newClientSecret.trim()) auth.client_secret = newClientSecret.trim();
-        const scopes = newScopes.trim() ? newScopes.trim().split(/\s+/) : [];
+        if (draftClientId.trim()) auth.client_id = draftClientId.trim();
+        if (draftClientSecret.trim()) auth.client_secret = draftClientSecret.trim();
+        const scopes = draftScopes.trim() ? draftScopes.trim().split(/\s+/) : [];
         if (scopes.length > 0) auth.scopes = scopes;
       }
       cfg = {
@@ -2755,10 +2755,10 @@ function McpEditor({ agentId }: { agentId: string }) {
         env: {},
         extra_paths_rw: [],
         extra_paths_ro: [],
-        timeout_seconds: newTimeout,
+        timeout_seconds: draftTimeout,
         enabled: kept?.enabled ?? true,
         url,
-        transport: newTransport,
+        transport: draftTransport,
         headers,
         auth,
       };
@@ -2773,6 +2773,12 @@ function McpEditor({ agentId }: { agentId: string }) {
     setError(null);
     try {
       const { authorization_url } = await api.mcp.connect(agentId, name);
+      // Only ever to an https page: a URL the server's metadata made up must
+      // not run as script here.
+      if (!isHttpsUrl(authorization_url)) {
+        setError("the authorization server's address is not an https URL; not following it");
+        return;
+      }
       window.location.assign(authorization_url);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -2812,14 +2818,14 @@ function McpEditor({ agentId }: { agentId: string }) {
 
   const serverEntries = view ? Object.entries(view.servers) : [];
   const literal = [
-    ...Object.entries(parseHeadersLoose(newHeaders))
+    ...Object.entries(parseHeadersLoose(draftHeaders))
       .filter(([, v]) => looksLikeSecret(v))
       .map(([k]) => `header ${k}`),
-    ...(newAuth === "bearer" && looksLikeSecret(newToken) ? ["the bearer token"] : []),
-    ...(newAuth === "oauth" && looksLikeSecret(newClientSecret) ? ["the client secret"] : []),
+    ...(draftAuth === "bearer" && looksLikeSecret(draftToken) ? ["the bearer token"] : []),
+    ...(draftAuth === "oauth" && looksLikeSecret(draftClientSecret) ? ["the client secret"] : []),
   ];
   const plainHttp =
-    newUrl.trim().startsWith("http://") && (newAuth !== "none" || newHeaders.trim() !== "");
+    draftUrl.trim().startsWith("http://") && (draftAuth !== "none" || draftHeaders.trim() !== "");
 
   return (
     <section className="mt-10 card px-4 py-4">
@@ -2927,8 +2933,8 @@ function McpEditor({ agentId }: { agentId: string }) {
               >
                 <input
                   type="text"
-                  value={newName}
-                  onChange={(e) => setNewName(e.target.value)}
+                  value={draftName}
+                  onChange={(e) => setDraftName(e.target.value)}
                   className="input font-mono"
                   placeholder="e.g. filesystem"
                 />
@@ -2959,8 +2965,8 @@ function McpEditor({ agentId }: { agentId: string }) {
                     }
                   >
                     <select
-                      value={newBinary}
-                      onChange={(e) => setNewBinary(e.target.value)}
+                      value={draftBinary}
+                      onChange={(e) => setDraftBinary(e.target.value)}
                       className="input font-mono"
                       disabled={view.available_binaries.length === 0}
                     >
@@ -2978,8 +2984,8 @@ function McpEditor({ agentId }: { agentId: string }) {
                   >
                     <input
                       type="text"
-                      value={newArgs}
-                      onChange={(e) => setNewArgs(e.target.value)}
+                      value={draftArgs}
+                      onChange={(e) => setDraftArgs(e.target.value)}
                       className="input font-mono"
                       placeholder="--root /workspace/data"
                     />
@@ -2989,8 +2995,8 @@ function McpEditor({ agentId }: { agentId: string }) {
                     hint="Newline-separated host paths the server may read+write. Unioned into the agent's Landlock allowlist. Typical: /workspace/data."
                   >
                     <textarea
-                      value={newPathsRw}
-                      onChange={(e) => setNewPathsRw(e.target.value)}
+                      value={draftPathsRw}
+                      onChange={(e) => setDraftPathsRw(e.target.value)}
                       className="input font-mono"
                       rows={2}
                       style={{ minHeight: 50, fontSize: 12 }}
@@ -3001,8 +3007,8 @@ function McpEditor({ agentId }: { agentId: string }) {
                     hint="Newline-separated host paths the server may read but not write."
                   >
                     <textarea
-                      value={newPathsRo}
-                      onChange={(e) => setNewPathsRo(e.target.value)}
+                      value={draftPathsRo}
+                      onChange={(e) => setDraftPathsRo(e.target.value)}
                       className="input font-mono"
                       rows={2}
                       style={{ minHeight: 50, fontSize: 12 }}
@@ -3021,8 +3027,8 @@ function McpEditor({ agentId }: { agentId: string }) {
                   >
                     <input
                       type="url"
-                      value={newUrl}
-                      onChange={(e) => setNewUrl(e.target.value)}
+                      value={draftUrl}
+                      onChange={(e) => setDraftUrl(e.target.value)}
                       className="input font-mono"
                       placeholder="https://mcp.example.com/mcp"
                     />
@@ -3032,8 +3038,8 @@ function McpEditor({ agentId }: { agentId: string }) {
                     hint="auto tries Streamable HTTP, then the older HTTP+SSE transport; pick one when the server speaks only that."
                   >
                     <select
-                      value={newTransport}
-                      onChange={(e) => setNewTransport(e.target.value as McpTransport)}
+                      value={draftTransport}
+                      onChange={(e) => setDraftTransport(e.target.value as McpTransport)}
                       className="input"
                     >
                       <option value="auto">auto</option>
@@ -3046,8 +3052,8 @@ function McpEditor({ agentId }: { agentId: string }) {
                     hint="One Name: value a line, sent with every request. A value secret:<name> is one of this agent's secrets (see Secrets); type keys there, not here."
                   >
                     <textarea
-                      value={newHeaders}
-                      onChange={(e) => setNewHeaders(e.target.value)}
+                      value={draftHeaders}
+                      onChange={(e) => setDraftHeaders(e.target.value)}
                       className="input font-mono"
                       rows={2}
                       style={{ minHeight: 50, fontSize: 12 }}
@@ -3059,8 +3065,8 @@ function McpEditor({ agentId }: { agentId: string }) {
                     hint="A bearer token, or OAuth: you connect the server here once it is saved, and the gateway keeps and refreshes its tokens."
                   >
                     <select
-                      value={newAuth}
-                      onChange={(e) => setNewAuth(e.target.value as McpAuth["type"])}
+                      value={draftAuth}
+                      onChange={(e) => setDraftAuth(e.target.value as McpAuth["type"])}
                       className="input"
                     >
                       <option value="none">none</option>
@@ -3068,22 +3074,22 @@ function McpEditor({ agentId }: { agentId: string }) {
                       <option value="oauth">OAuth</option>
                     </select>
                   </Field>
-                  {newAuth === "bearer" && (
+                  {draftAuth === "bearer" && (
                     <Field
                       label="token"
                       hint="Sent as Authorization: Bearer <token>. Best secret:<name>, one of this agent's secrets."
                     >
                       <input
                         type="text"
-                        value={newToken}
-                        onChange={(e) => setNewToken(e.target.value)}
+                        value={draftToken}
+                        onChange={(e) => setDraftToken(e.target.value)}
                         className="input font-mono"
                         placeholder="secret:linear"
                         autoComplete="off"
                       />
                     </Field>
                   )}
-                  {newAuth === "oauth" && (
+                  {draftAuth === "oauth" && (
                     <>
                       <Field
                         label="client id"
@@ -3091,8 +3097,8 @@ function McpEditor({ agentId }: { agentId: string }) {
                       >
                         <input
                           type="text"
-                          value={newClientId}
-                          onChange={(e) => setNewClientId(e.target.value)}
+                          value={draftClientId}
+                          onChange={(e) => setDraftClientId(e.target.value)}
                           className="input font-mono"
                           autoComplete="off"
                         />
@@ -3103,8 +3109,8 @@ function McpEditor({ agentId }: { agentId: string }) {
                       >
                         <input
                           type="text"
-                          value={newClientSecret}
-                          onChange={(e) => setNewClientSecret(e.target.value)}
+                          value={draftClientSecret}
+                          onChange={(e) => setDraftClientSecret(e.target.value)}
                           className="input font-mono"
                           placeholder="secret:example-client"
                           autoComplete="off"
@@ -3116,8 +3122,8 @@ function McpEditor({ agentId }: { agentId: string }) {
                       >
                         <input
                           type="text"
-                          value={newScopes}
-                          onChange={(e) => setNewScopes(e.target.value)}
+                          value={draftScopes}
+                          onChange={(e) => setDraftScopes(e.target.value)}
                           className="input font-mono"
                         />
                       </Field>
@@ -3144,8 +3150,8 @@ function McpEditor({ agentId }: { agentId: string }) {
                 <input
                   type="number"
                   min={1}
-                  value={newTimeout}
-                  onChange={(e) => setNewTimeout(Math.max(1, Number(e.target.value) || 1))}
+                  value={draftTimeout}
+                  onChange={(e) => setDraftTimeout(Math.max(1, Number(e.target.value) || 1))}
                   className="input font-mono"
                 />
               </Field>
@@ -3341,6 +3347,15 @@ function McpServerRow({
       )}
     </li>
   );
+}
+
+/** Whether `url` is an https URL. */
+function isHttpsUrl(url: string): boolean {
+  try {
+    return new URL(url).protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 /** The host of an http(s) URL, or null. */

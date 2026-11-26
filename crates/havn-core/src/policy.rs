@@ -570,7 +570,7 @@ pub enum McpAuth {
     Bearer { token: String },
     /// OAuth 2.1 as MCP specifies it: the owner connects the server on the
     /// dashboard, and the gateway keeps and refreshes its tokens.
-    Oauth(McpOAuth),
+    Oauth(McpOAuthConfig),
 }
 
 impl McpAuth {
@@ -584,7 +584,7 @@ impl McpAuth {
 /// registers itself with the authorization server.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct McpOAuth {
+pub struct McpOAuthConfig {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub client_id: String,
     /// The client's secret, best `secret:<name>`.
@@ -601,17 +601,20 @@ pub const MAX_MCP_HEADERS: usize = 32;
 pub const MAX_MCP_VALUE_BYTES: usize = 4096;
 
 /// Headers the runtime sets itself for a remote MCP server.
-const RESERVED_MCP_HEADERS: [&str; 10] = [
+const RESERVED_MCP_HEADERS: [&str; 13] = [
     "accept",
     "authorization",
     "connection",
     "content-length",
     "content-type",
+    "expect",
     "host",
     "keep-alive",
     "last-event-id",
     "te",
+    "trailer",
     "transfer-encoding",
+    "upgrade",
 ];
 
 /// Checks a value that may be `secret:<name>`: then it must name one of the
@@ -1736,7 +1739,7 @@ mod tests {
         let notion = &parsed["notion"];
         assert!(notion.is_remote());
         assert_eq!(notion.remote_host().as_deref(), Some("mcp.notion.com"));
-        assert_eq!(notion.auth, McpAuth::Oauth(McpOAuth::default()));
+        assert_eq!(notion.auth, McpAuth::Oauth(McpOAuthConfig::default()));
         assert!(notion.uses_secrets(), "OAuth tokens are the owner's");
         let linear = &parsed["linear"];
         assert_eq!(linear.transport, McpTransport::Sse);
@@ -1783,10 +1786,10 @@ mod tests {
             },
             |s| {
                 s.url = "http://mcp.example.com/mcp".into();
-                s.auth = McpAuth::Oauth(McpOAuth::default());
+                s.auth = McpAuth::Oauth(McpOAuthConfig::default());
             },
             |s| {
-                s.auth = McpAuth::Oauth(McpOAuth {
+                s.auth = McpAuth::Oauth(McpOAuthConfig {
                     client_secret: "secret:x".into(),
                     ..Default::default()
                 })

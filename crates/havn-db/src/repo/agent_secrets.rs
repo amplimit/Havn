@@ -288,7 +288,7 @@ pub async fn remove(pool: &SqlitePool, agent_id: AgentId, name: &str) -> Result<
 /// What the agent's owner connected one of its remote MCP servers with
 /// (issue #234): ciphertext the gateway made, and the URL it is for.
 #[derive(Clone)]
-pub struct McpOAuth {
+pub struct McpOAuthRow {
     pub server: String,
     pub url: String,
     pub value_ciphertext: Vec<u8>,
@@ -298,9 +298,9 @@ pub struct McpOAuth {
     pub updated_at: DateTime<Utc>,
 }
 
-impl std::fmt::Debug for McpOAuth {
+impl std::fmt::Debug for McpOAuthRow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("McpOAuth")
+        f.debug_struct("McpOAuthRow")
             .field("server", &self.server)
             .field("url", &self.url)
             .field("expires_at", &self.expires_at)
@@ -319,8 +319,8 @@ struct OAuthRow {
     updated_at: String,
 }
 
-fn from_oauth_row(row: OAuthRow) -> Result<McpOAuth> {
-    Ok(McpOAuth {
+fn from_oauth_row(row: OAuthRow) -> Result<McpOAuthRow> {
+    Ok(McpOAuthRow {
         server: row.server,
         url: row.url,
         value_ciphertext: row.value,
@@ -337,7 +337,7 @@ fn from_oauth_row(row: OAuthRow) -> Result<McpOAuth> {
 const OAUTH_COLUMNS: &str = "server, url, value, expires_at, error, updated_at";
 
 /// The agent's MCP servers connected with OAuth, by server name.
-pub async fn oauth_list(pool: &SqlitePool, agent_id: AgentId) -> Result<Vec<McpOAuth>> {
+pub async fn oauth_list(pool: &SqlitePool, agent_id: AgentId) -> Result<Vec<McpOAuthRow>> {
     let rows: Vec<OAuthRow> = sqlx::query_as(&format!(
         "SELECT {OAUTH_COLUMNS} FROM mcp_oauth WHERE agent_id = ?1 ORDER BY server"
     ))

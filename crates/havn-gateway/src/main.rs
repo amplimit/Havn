@@ -974,7 +974,9 @@ async fn serve() -> anyhow::Result<()> {
             )),
         )
         .with_state(state)
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http().make_span_with(
+            dashboard::request_span as fn(&axum::extract::Request) -> tracing::Span,
+        ));
 
     let addr: SocketAddr = cfg.listen.parse().context("parsing listen address")?;
     let listener = TcpListener::bind(addr).await.context("binding listener")?;
@@ -1519,6 +1521,11 @@ const BANNER: &str = r" _   _
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // rmcp's OAuth logs authorization codes at debug: never past info.
+    let filter = match "rmcp::transport::auth=info".parse() {
+        Ok(directive) => filter.add_directive(directive),
+        Err(_) => filter,
+    };
     tracing_subscriber::registry()
         .with(filter)
         .with(fmt::layer())
