@@ -3127,7 +3127,7 @@ function SecretsEditor({ agentId }: { agentId: string }) {
           {valueInput("", "value of the new secret")}
           <input
             className="input font-mono"
-            style={{ maxWidth: 200 }}
+            style={{ maxWidth: 260 }}
             placeholder="variable, such as GH_TOKEN"
             aria-label="shell variable for the new secret (optional)"
             value={variable}
