@@ -54,6 +54,10 @@ pub struct AgentWebView {
     pub can_search_web: bool,
     /// The agent's policy allows `web_fetch` (from its next start).
     pub can_fetch_web: bool,
+    /// The agent's policy allows `transcribe` (from its next start).
+    pub can_transcribe: bool,
+    /// The gateway transcribes audio: `[transcription]` is set.
+    pub transcription: bool,
     /// The agent's sandbox has network egress (from its next start).
     pub egress_allowed: bool,
     /// That egress goes through the egress proxy, which asks about new
@@ -63,6 +67,7 @@ pub struct AgentWebView {
     /// agent's own settings cannot go beyond it.
     pub search_permitted: bool,
     pub fetch_permitted: bool,
+    pub transcribe_permitted: bool,
     pub egress_permitted: bool,
     /// The backend this agent's searches would use, or `None` when its
     /// owner has none set up.
@@ -81,6 +86,7 @@ pub struct AgentWebView {
 pub struct AgentWebPatch {
     pub can_search_web: Option<bool>,
     pub can_fetch_web: Option<bool>,
+    pub can_transcribe: Option<bool>,
     pub egress_allowed: Option<bool>,
     pub egress_proxy: Option<bool>,
     /// Replace the agent's own lists.
@@ -92,6 +98,7 @@ impl AgentWebPatch {
     fn is_empty(&self) -> bool {
         self.can_search_web.is_none()
             && self.can_fetch_web.is_none()
+            && self.can_transcribe.is_none()
             && self.egress_allowed.is_none()
             && self.egress_proxy.is_none()
             && self.allowed_domains.is_none()
@@ -150,10 +157,13 @@ async fn view(state: &AppState, agent: &Agent) -> Result<AgentWebView, ApiError>
     Ok(AgentWebView {
         can_search_web: policy.permissions.can_search_web,
         can_fetch_web: policy.permissions.can_fetch_web,
+        can_transcribe: policy.permissions.transcribes(),
+        transcription: state.transcription.load().is_some(),
         egress_allowed: egress(&policy),
         egress_proxy: policy.network_policy.egress_proxy,
         search_permitted: !multi_user || owner.permissions.can_search_web,
         fetch_permitted: !multi_user || owner.permissions.can_fetch_web,
+        transcribe_permitted: !multi_user || owner.permissions.transcribes(),
         egress_permitted: !multi_user || egress(&owner),
         search_backend: backend.map(crate::web_search::Backend::name),
         allowed_domains: own_domains(agent, "allowed_domains"),
@@ -202,6 +212,7 @@ pub async fn agent_patch(
         serde_json::json!({
             "can_search_web": req.can_search_web,
             "can_fetch_web": req.can_fetch_web,
+            "can_transcribe": req.can_transcribe,
             "egress_allowed": req.egress_allowed,
             "egress_proxy": req.egress_proxy,
             "allowed_domains": req.allowed_domains.as_deref().map(tidy_domains),
@@ -235,6 +246,9 @@ fn with_web_access(config: &Value, patch: &AgentWebPatch) -> Value {
     }
     if let Some(on) = patch.can_fetch_web {
         set("permissions", "can_fetch_web", Value::Bool(on));
+    }
+    if let Some(on) = patch.can_transcribe {
+        set("permissions", "can_transcribe", Value::Bool(on));
     }
     if let Some(list) = &patch.allowed_domains {
         set(
@@ -352,6 +366,7 @@ mod tests {
             &AgentWebPatch {
                 can_search_web: Some(false),
                 can_fetch_web: Some(false),
+                can_transcribe: Some(false),
                 egress_allowed: Some(true),
                 ..AgentWebPatch::default()
             },
@@ -365,7 +380,8 @@ mod tests {
                         "can_use_shell": false,
                         "can_access_network": true,
                         "can_search_web": false,
-                        "can_fetch_web": false
+                        "can_fetch_web": false,
+                        "can_transcribe": false
                     },
                     "network_policy": {
                         "blocked_domains": ["example.com"],
@@ -378,6 +394,7 @@ mod tests {
             serde_json::from_value(patched["policy"].clone()).expect("policy");
         assert!(!policy.permissions.can_search_web);
         assert!(!policy.permissions.can_fetch_web);
+        assert!(!policy.permissions.transcribes());
         assert!(policy.network_policy.egress_allowed);
         assert!(!policy.permissions.can_use_shell);
 

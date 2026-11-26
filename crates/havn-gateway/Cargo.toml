@@ -53,6 +53,7 @@ regex.workspace = true
 url.workspace = true
 image.workspace = true
 heifer.workspace = true
+hayro.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -104,6 +104,42 @@ fn components(path: &str) -> Result<Vec<&str>, String> {
     Ok(parts)
 }
 
+/// The name and bytes of the file at `path` of `workspace`, a path its
+/// agent named, of at most `max_bytes`: a regular file reached through
+/// directories the gateway opened one by one, following no link. Why not,
+/// for the agent. Blocking: it reads a file.
+pub fn named_file(
+    workspace: &Path,
+    path: &str,
+    max_bytes: u64,
+) -> Result<(String, Vec<u8>), String> {
+    let parts = components(path)?;
+    let (name, dirs) = parts.split_last().ok_or("no file named")?;
+    let mut dir = crate::agent_files::WorkspaceDir::open(workspace)
+        .map_err(|e| format!("the workspace cannot be read: {e}"))?;
+    for part in dirs {
+        dir = dir
+            .subdir(part)
+            .map_err(|e| format!("{path:?} cannot be read: {e}"))?
+            .ok_or_else(|| format!("there is no {path:?} in your workspace"))?;
+    }
+    let bytes = match dir.read_bytes(name, max_bytes) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Err(format!("there is no {path:?} in your workspace")),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(format!(
+                "{path:?} is not a regular file of at most {} MB",
+                max_bytes / (1024 * 1024)
+            ));
+        }
+        Err(e) => return Err(format!("{path:?} cannot be read: {e}")),
+    };
+    if bytes.is_empty() {
+        return Err(format!("{path:?} is empty"));
+    }
+    Ok(((*name).to_string(), bytes))
+}
+
 /// Copy the file at `path` of `workspace` into `outbox` as sent to
 /// `channel_id` (chat `conversation`). Blocking: it reads and writes
 /// files.
@@ -115,30 +151,7 @@ pub fn send(
     channel_id: &str,
     conversation: Option<&str>,
 ) -> Result<Sent, String> {
-    let parts = components(path)?;
-    let (name, dirs) = parts.split_last().ok_or("no file named")?;
-    let mut dir = crate::agent_files::WorkspaceDir::open(workspace)
-        .map_err(|e| format!("the workspace cannot be read: {e}"))?;
-    for part in dirs {
-        dir = dir
-            .subdir(part)
-            .map_err(|e| format!("{path:?} cannot be read: {e}"))?
-            .ok_or_else(|| format!("there is no {path:?} in your workspace"))?;
-    }
-    let bytes = match dir.read_bytes(name, MAX_FILE_BYTES) {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => return Err(format!("there is no {path:?} in your workspace")),
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-            return Err(format!(
-                "{path:?} is not a regular file of at most {} MB",
-                MAX_FILE_BYTES / (1024 * 1024)
-            ));
-        }
-        Err(e) => return Err(format!("{path:?} cannot be read: {e}")),
-    };
-    if bytes.is_empty() {
-        return Err(format!("{path:?} is empty"));
-    }
+    let (name, bytes) = named_file(workspace, path, MAX_FILE_BYTES)?;
 
     make_dir(outbox).map_err(|e| format!("the outbox cannot be written: {e}"))?;
     // The root gateway leaves alone what the filesystem keeps for root.
@@ -152,8 +165,8 @@ pub fn send(
     }
     let sent = Sent {
         id: uuid::Uuid::now_v7().to_string(),
-        name: (*name).to_string(),
-        media_type: crate::api::files::type_of_name(name).to_string(),
+        media_type: crate::api::files::type_of_name(&name).to_string(),
+        name,
         size: bytes.len() as u64,
         channel_id: channel_id.to_string(),
         conversation: conversation.map(str::to_string),

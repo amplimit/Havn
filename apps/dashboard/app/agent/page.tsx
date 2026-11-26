@@ -96,9 +96,76 @@ const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 // A turn's attachment lines, which tell the agent where each file is, as
 // the runtime writes them.
 const JSON_STRING = String.raw`"(?:[^"\\]|\\.)*"`;
+const SCANNED = "; likely scanned: ";
+const SPARSE = "; pages with little text: ";
+const UNREAD = "; it could not be read: ";
+const UNREAD_TEXT = {
+  encrypted: "it is encrypted",
+  damaged: "it is damaged, or not what its name says",
+  too_large: "it is too large to read, or took too long",
+} as const;
 const ATTACHMENT_LINE = new RegExp(
-  String.raw`^\[Attached file, user-supplied and untrusted: name (${JSON_STRING}), type (${JSON_STRING}), ([^,\]]+), saved at (${JSON_STRING})(?:; its text \(untrusted\) is at (${JSON_STRING}), read it with file_read)?\]$`,
+  String.raw`^\[Attached file, user-supplied and untrusted: name (${JSON_STRING}), type (${JSON_STRING}), ([^,\]]+), saved at (${JSON_STRING})(?:(?:${SCANNED}|${SPARSE})((?:[^"\]]|${JSON_STRING})*?))?(?:${UNREAD}(${Object.values(UNREAD_TEXT).join("|")}))?(?:; its text \(untrusted\) is at (${JSON_STRING}), read it with file_read)?\]$`,
 );
+
+/** A scanned PDF's pages, as its line says them. */
+function scanOf(told: string): { pages: number; sparse: number; blank: number; shown: number[] } {
+  const shown = [...told.matchAll(/\.page-(\d+)\.jpg"/g)].map((m) => Number(m[1]));
+  // "its only page", "1 of its 12 pages", "2 of its pages" (how many it has not known).
+  const part = (what: string) =>
+    new RegExp(String.raw`(?:^|; )(?:(its only page)|(\d+) of its (?:(\d+) )?pages?) (?:has|have|is|are) ${what}`).exec(told);
+  const count = (m: RegExpExecArray | null) => (m ? (m[1] ? 1 : Number(m[2])) : 0);
+  const total = (m: RegExpExecArray | null) => (m ? (m[1] ? 1 : Number(m[3] ?? 0)) : 0);
+  const sparse = part("little or no text");
+  const blank = part("nearly blank");
+  return { pages: total(sparse) || total(blank), sparse: count(sparse), blank: count(blank), shown };
+}
+
+/** Why a document was not read, as its line says it. */
+function unreadOf(told: string): "encrypted" | "damaged" | "too_large" {
+  const found = (Object.keys(UNREAD_TEXT) as (keyof typeof UNREAD_TEXT)[]).find((k) => UNREAD_TEXT[k] === told);
+  return found ?? "damaged";
+}
+
+/** A list as the runtime writes it: "a", "a and b", "a, b and c". */
+function listed(items: string[]): string {
+  return items.length < 2 ? (items[0] ?? "") : `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+}
+
+/** What a scanned PDF's or an unread document's line says, as the runtime writes it. */
+function scanText(a: Attachment): string {
+  let out = "";
+  if (a.scan) {
+    const { pages, sparse, shown } = a.scan;
+    const blank = a.scan.blank ?? 0;
+    const slash = a.path.lastIndexOf("/");
+    const at = (n: number) => JSON.stringify(`${a.path.slice(0, slash + 1)}.${a.path.slice(slash + 1)}.page-${n}.jpg`);
+    const counted = (n: number, one: string, many: string) =>
+      pages === 1
+        ? `its only page ${one}`
+        : `${n} of its ${pages === 0 ? "" : `${pages} `}pages ${n === 1 ? one : many}`;
+    const parts: string[] = [];
+    if (sparse > 0) {
+      const kept =
+        shown.length === 0
+          ? "they could not be made images"
+          : shown.length === 1
+            ? `page ${shown[0]} is kept as an image at ${at(shown[0])}, to look at with view_image`
+            : `pages ${listed(shown.map(String))} are kept as images at ${listed(shown.map(at))}, to look at with view_image`;
+      parts.push(`${counted(sparse, "has", "have")} little or no text that could be read; ${kept}`);
+    }
+    if (blank > 0) {
+      parts.push(
+        counted(blank, "is nearly blank, and no image is kept of it", "are nearly blank, and no image is kept of them"),
+      );
+    }
+    out += `${pages > 0 && sparse + blank >= pages ? SCANNED : SPARSE}${parts.join("; ")}`;
+  }
+  if (a.unread) {
+    out += `${UNREAD}${UNREAD_TEXT[a.unread]}`;
+  }
+  return out;
+}
 
 /** A user turn's text, and the files it carried, from its stored content. */
 function splitMessage(content: string): { text: string; files: Attachment[] } {
@@ -112,7 +179,9 @@ function splitMessage(content: string): { text: string; files: Attachment[] } {
         media_type: JSON.parse(m[2]) as string,
         size: sizeBytes(m[3]),
         path: JSON.parse(m[4]) as string,
-        ...(m[5] ? { text_path: JSON.parse(m[5]) as string } : {}),
+        ...(m[5] !== undefined ? { scan: scanOf(m[5]) } : {}),
+        ...(m[6] ? { unread: unreadOf(m[6]) } : {}),
+        ...(m[7] ? { text_path: JSON.parse(m[7]) as string } : {}),
       });
       return false;
     } catch {
@@ -126,6 +195,7 @@ function splitMessage(content: string): { text: string; files: Attachment[] } {
 function joinMessage(text: string, files: Attachment[]): string {
   const line = (a: Attachment) =>
     `[Attached file, user-supplied and untrusted: name ${JSON.stringify(a.name)}, type ${JSON.stringify(a.media_type)}, ${humanSize(a.size)}, saved at ${JSON.stringify(a.path)}` +
+    scanText(a) +
     (a.text_path ? `; its text (untrusted) is at ${JSON.stringify(a.text_path)}, read it with file_read]` : "]");
   return [text, ...files.map(line)].filter((l) => l.trim()).join("\n");
 }
@@ -3005,7 +3075,8 @@ function ToolIcon({ tool, color }: { tool: string; color: string }) {
   if (tool === "web_search") return <Search {...look} />;
   if (tool === "web_fetch") return <Globe {...look} />;
   if (tool === "shell" || tool === "process") return <Terminal {...look} />;
-  if (tool.startsWith("file_") || tool === "send_file" || tool === "view_image") return <FileText {...look} />;
+  if (tool.startsWith("file_") || tool === "send_file" || tool === "view_image" || tool === "transcribe")
+    return <FileText {...look} />;
   if (tool.startsWith("memory_")) return <Database {...look} />;
   if (tool === "conversation_search") return <MessagesSquare {...look} />;
   if (tool === "subagent_spawn" || tool === "agent_query") return <Bot {...look} />;
@@ -3033,6 +3104,7 @@ function stepWords(tool: string, input: string): { did: string; what: string } {
     process: "Checked a command",
     send_file: "Sent",
     view_image: "Looked at",
+    transcribe: "Transcribed",
     schedule: "Scheduled",
     set_timezone: "Set the time zone",
     skill_manage: "Updated a skill",
@@ -3226,6 +3298,7 @@ function stepText({ tool, detail }: Step): string {
     skill_manage: "Updating a skill",
     conversation_search: "Searching past chats",
     send_file: "Sending",
+    transcribe: "Transcribing",
     schedule: "Scheduling",
     set_timezone: "Setting the time zone",
     subagent_spawn: "Handing off a task",

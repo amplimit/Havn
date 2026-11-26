@@ -2250,6 +2250,8 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
   if (unsupported) return null;
   const searchLocked = saving || (view !== null && !view.search_permitted && !view.can_search_web);
   const fetchLocked = saving || (view !== null && !view.fetch_permitted && !view.can_fetch_web);
+  const transcribeLocked =
+    saving || (view !== null && !view.transcribe_permitted && !view.can_transcribe);
   const egressLocked = saving || (view !== null && !view.egress_permitted && !view.egress_allowed);
 
   return (
@@ -2321,6 +2323,22 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
               without network access. The agent can read only links you sent it, search
               results and links on pages it read.
               {!view.fetch_permitted && " Your role does not allow it."}
+            </span>
+          </label>
+          <label className="flex items-start gap-3 text-sm">
+            <input
+              type="checkbox"
+              className={`mt-1 h-4 w-4 shrink-0 ${transcribeLocked ? "cursor-not-allowed" : "cursor-pointer"}`}
+              checked={view.can_transcribe}
+              disabled={transcribeLocked}
+              onChange={(e) => save({ can_transcribe: e.target.checked })}
+            />
+            <span>
+              <strong>transcribe audio</strong>: the gateway sends an audio file of the
+              agent&apos;s workspace to the transcription service and gives the agent its
+              transcript, counted against the agent&apos;s budget.
+              {!view.transcription && " The gateway has no [transcription] set up, so it is not offered."}
+              {!view.transcribe_permitted && " Your role does not allow it."}
             </span>
           </label>
           <label className="grid gap-1 text-sm">

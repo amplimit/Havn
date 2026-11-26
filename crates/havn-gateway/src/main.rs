@@ -678,6 +678,10 @@ async fn serve() -> anyhow::Result<()> {
             timezone::TOOL_PER_USER_PER_MINUTE,
         )),
         egress_proxy: egress_proxy_pool.map(|pool| (pool, cfg.network.egress_proxy_port)),
+        transcription: reload_handles.transcription.clone(),
+        transcribe_rate: Arc::new(web_search::UserRate::new(
+            transcribe::TOOL_PER_USER_PER_MINUTE,
+        )),
     };
     let socket_path = cfg.agent_socket_path.clone();
     let socket_task = tokio::spawn(async move {

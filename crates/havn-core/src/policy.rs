@@ -410,6 +410,23 @@ pub struct Permissions {
     /// gateway reads only URLs users sent, search results and links on
     /// pages it read, or `network_policy.allowed_domains`.
     pub can_fetch_web: bool,
+    /// `transcribe`, run by the gateway with `[transcription]`: an audio
+    /// file of the agent's workspace goes to the transcription endpoint or
+    /// model, on the owner's budget (issue #230). Unset, as in a policy
+    /// written before it, it is `can_fetch_web`'s: see
+    /// [`Permissions::transcribes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_transcribe: Option<bool>,
+}
+
+impl Permissions {
+    /// Whether `transcribe` is allowed: `can_transcribe`, or, unset, what
+    /// `can_fetch_web` says, so a policy that keeps files from leaving the
+    /// host through web_fetch keeps them from the transcription service too.
+    #[must_use]
+    pub fn transcribes(&self) -> bool {
+        self.can_transcribe.unwrap_or(self.can_fetch_web)
+    }
 }
 
 impl Default for Permissions {
@@ -427,6 +444,7 @@ impl Default for Permissions {
             can_query_other_agents: false,
             can_search_web: true,
             can_fetch_web: true,
+            can_transcribe: None,
         }
     }
 }
@@ -667,6 +685,7 @@ impl Policy {
                 can_query_other_agents: own.can_query_other_agents && cap.can_query_other_agents,
                 can_search_web: own.can_search_web && cap.can_search_web,
                 can_fetch_web: own.can_fetch_web && cap.can_fetch_web,
+                can_transcribe: Some(own.transcribes() && cap.transcribes()),
             },
             network_policy: NetworkPolicy {
                 egress_allowed: self.network_policy.egress_allowed
@@ -774,6 +793,7 @@ impl Policy {
                 can_query_other_agents: a.can_query_other_agents || b.can_query_other_agents,
                 can_search_web: a.can_search_web || b.can_search_web,
                 can_fetch_web: a.can_fetch_web || b.can_fetch_web,
+                can_transcribe: Some(a.transcribes() || b.transcribes()),
             },
             network_policy: NetworkPolicy {
                 egress_allowed: self.network_policy.egress_allowed
@@ -1131,12 +1151,24 @@ mod tests {
     }
 
     #[test]
+    fn transcribing_follows_reading_the_web_unless_set() {
+        let read = |json: &str| -> Permissions { serde_json::from_str(json).expect("permissions") };
+        assert!(read("{}").transcribes());
+        assert!(!read(r#"{"can_fetch_web": false}"#).transcribes());
+        assert!(read(r#"{"can_fetch_web": false, "can_transcribe": true}"#).transcribes());
+        assert!(!read(r#"{"can_transcribe": false}"#).transcribes());
+        let unset = serde_json::to_value(Permissions::default()).expect("json");
+        assert!(unset.get("can_transcribe").is_none(), "{unset}");
+    }
+
+    #[test]
     fn clamp_never_widens_permissions_or_limits() {
         let mut cap = Policy::default();
         cap.permissions.can_use_shell = false;
         cap.permissions.can_use_mcp = false;
         cap.permissions.can_search_web = false;
         cap.permissions.can_fetch_web = false;
+        cap.permissions.can_transcribe = Some(false);
         cap.resource_limits.memory_mb = 256;
         cap.resource_limits.pids_max = 32;
         cap.budget.max_tokens_per_day = 10_000;
@@ -1155,6 +1187,7 @@ mod tests {
         assert!(!p.permissions.can_spawn_subagents);
         assert!(!p.permissions.can_search_web);
         assert!(!p.permissions.can_fetch_web);
+        assert!(!p.permissions.transcribes());
         assert!(!p.network_policy.egress_allowed);
         assert_eq!(p.resource_limits.memory_mb, 256);
         assert_eq!(p.resource_limits.pids_max, 32);
