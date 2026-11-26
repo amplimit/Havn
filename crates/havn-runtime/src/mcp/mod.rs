@@ -13,8 +13,9 @@
 //! - **Tools only.** Resources / Prompts deferred — Resources fight
 //!   with the frozen-system-prompt invariant (§9.4) and Prompts
 //!   overlap with `SKILL.md`.
-//! - **stdio transport only.** SSE / streamable-HTTP cut to keep the
-//!   "default no network" invariant intact and avoid OAuth surface.
+//! - **stdio, or remote.** A server with a `url` is remote (issue #234):
+//!   Streamable HTTP or HTTP+SSE through the agent's network egress
+//!   ([`remote`]); its OAuth is the gateway's.
 //! - **No agent-side install.** Binaries are operator-managed; agents
 //!   can only invoke whitelisted ones. Same posture as "no
 //!   marketplace, no skill registry."
@@ -22,22 +23,85 @@
 //! Failure mode is fail-soft: a server that doesn't start, doesn't
 //! handshake, or doesn't list tools just doesn't register — the
 //! agent boots without it and logs the reason. We do NOT crash the
-//! agent for one broken MCP server.
+//! agent for one broken MCP server. How each started goes to the
+//! gateway ([`havn_proto::McpStatus`]) for the agent's settings page.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use havn_core::{McpServerConfig, Policy};
+use havn_proto::{AgentToGateway, McpServerStatus, McpStatus};
 use rmcp::RoleClient;
 use rmcp::ServiceExt as _;
 use rmcp::model::{CallToolRequestParams, CallToolResult, Tool as McpTool};
 use rmcp::service::{RunningService, ServiceError};
 use rmcp::transport::child_process::TokioChildProcess;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+pub mod remote;
 pub mod tool;
+
+/// How the agent's MCP servers are, as last sent to the gateway.
+static STATUS: Mutex<Vec<McpServerStatus>> = Mutex::new(Vec::new());
+/// Where [`STATUS`] goes.
+static REPORT: OnceLock<mpsc::Sender<AgentToGateway>> = OnceLock::new();
+
+/// Send how the servers started to the gateway through `writer`, and later
+/// changes too.
+pub fn report_to(writer: mpsc::Sender<AgentToGateway>) {
+    let _ = REPORT.set(writer);
+    send_status();
+}
+
+fn send_status() {
+    let Some(writer) = REPORT.get() else {
+        return;
+    };
+    let servers = STATUS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if writer
+        .try_send(AgentToGateway::McpStatus(McpStatus { servers }))
+        .is_err()
+    {
+        warn!("the MCP servers' status could not be sent to the gateway");
+    }
+}
+
+/// `error` as a status keeps it: the agent's secrets redacted, cut.
+fn status_error(error: &str) -> String {
+    let redacted = crate::secrets::redact(error);
+    if redacted.chars().count() <= havn_proto::MAX_MCP_ERROR_CHARS {
+        return redacted;
+    }
+    let cut: String = redacted
+        .chars()
+        .take(havn_proto::MAX_MCP_ERROR_CHARS)
+        .collect();
+    format!("{cut}…")
+}
+
+/// A call to `server` failed on its connection: its status says so.
+fn call_failed(server: &str, error: &str) {
+    {
+        let mut status = STATUS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = status.iter_mut().find(|s| s.name == server) else {
+            return;
+        };
+        let error = status_error(error);
+        if entry.error.as_deref() == Some(error.as_str()) {
+            return;
+        }
+        entry.error = Some(error);
+    }
+    send_status();
+}
 
 /// On-host directory where operators place MCP server binaries.
 /// Inside the agent namespace this path resolves through the existing
@@ -113,7 +177,8 @@ impl McpClient {
     /// `CallToolResult` so the caller (`tool::McpToolHandle`) can map
     /// it into the runtime's tool-result shape. Subject to the
     /// per-server timeout: a server that hangs doesn't pin the agent's
-    /// turn forever.
+    /// turn forever. rmcp tells the server with `notifications/cancelled`
+    /// when the timeout drops the call.
     pub async fn call_tool(
         &self,
         tool_name: &str,
@@ -139,14 +204,24 @@ impl McpClient {
             req = req.with_arguments(args);
         }
         let fut = self.inner.call_tool(req);
-        let result = tokio::time::timeout(self.timeout, fut)
-            .await
-            .map_err(|_| McpCallError::Timeout {
-                server: self.server_name.clone(),
-                seconds: self.timeout.as_secs(),
-            })?
-            .map_err(McpCallError::Service)?;
-        Ok(result)
+        let result =
+            tokio::time::timeout(self.timeout, fut)
+                .await
+                .map_err(|_| McpCallError::Timeout {
+                    server: self.server_name.clone(),
+                    seconds: self.timeout.as_secs(),
+                })?;
+        match result {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                // A server's own error answer is the tool's result; one of
+                // its connection is the server's state.
+                if !matches!(e, ServiceError::McpError(_)) {
+                    call_failed(&self.server_name, &e.to_string());
+                }
+                Err(McpCallError::Service(e))
+            }
+        }
     }
 }
 
@@ -194,45 +269,121 @@ impl McpServers {
             return Self::empty();
         }
         let mut clients: HashMap<String, Arc<McpClient>> = HashMap::new();
+        let mut status = Vec::new();
         // Sort by server name so log lines are deterministic.
         let mut entries: Vec<(&String, &McpServerConfig)> = policy.mcp_servers.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
+        // Remote servers connect at once, each within its deadline, so a few
+        // that do not answer cannot hold the agent's start for long.
+        let remote = entries
+            .iter()
+            .filter(|(_, cfg)| cfg.enabled && cfg.is_remote())
+            .map(|(name, cfg)| async move {
+                let started = tokio::time::timeout(REMOTE_START, connect_remote(name, cfg, policy))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(anyhow::anyhow!(
+                            "it did not start in {}s",
+                            REMOTE_START.as_secs()
+                        ))
+                    });
+                ((*name).clone(), started)
+            });
+        let mut remote: HashMap<String, anyhow::Result<McpClient>> =
+            futures_util::future::join_all(remote)
+                .await
+                .into_iter()
+                .collect();
         for (name, cfg) in entries {
             if !cfg.enabled {
                 info!(server = %name, "MCP server disabled in policy; skipping");
                 continue;
             }
-            if let Err(e) = validate_binary_name(&cfg.binary) {
-                warn!(
-                    server = %name,
-                    binary = %cfg.binary,
-                    error = e,
-                    "MCP server binary name rejected"
-                );
-                continue;
-            }
-            match spawn_one(name, cfg).await {
+            let started = if cfg.is_remote() {
+                remote
+                    .remove(name)
+                    .unwrap_or_else(|| Err(anyhow::anyhow!("it was not started")))
+            } else {
+                if let Err(e) = validate_binary_name(&cfg.binary) {
+                    warn!(
+                        server = %name,
+                        binary = %cfg.binary,
+                        error = e,
+                        "MCP server binary name rejected"
+                    );
+                    status.push(McpServerStatus {
+                        name: name.clone(),
+                        connected: false,
+                        tools: Vec::new(),
+                        error: Some(e.to_string()),
+                    });
+                    continue;
+                }
+                spawn_one(name, cfg).await
+            };
+            match started {
                 Ok(client) => {
                     info!(
                         server = %name,
                         binary = %cfg.binary,
+                        url = %cfg.url,
                         tool_count = client.tools.len(),
                         "MCP server up"
                     );
+                    status.push(McpServerStatus {
+                        name: name.clone(),
+                        connected: true,
+                        tools: client.tools.iter().map(|t| t.name.to_string()).collect(),
+                        error: None,
+                    });
                     clients.insert(name.clone(), Arc::new(client));
                 }
                 Err(e) => {
                     warn!(
                         server = %name,
                         binary = %cfg.binary,
+                        url = %cfg.url,
                         error = %e,
                         "MCP server failed to start; agent will boot without it"
                     );
+                    status.push(McpServerStatus {
+                        name: name.clone(),
+                        connected: false,
+                        tools: Vec::new(),
+                        error: Some(status_error(&format!("{e:#}"))),
+                    });
                 }
             }
         }
+        *STATUS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
         Self { clients }
     }
+}
+
+/// How long a remote server may take to connect and list its tools.
+const REMOTE_START: Duration = Duration::from_secs(90);
+
+/// Connect to one remote server, do the handshake, list its tools.
+async fn connect_remote(
+    name: &str,
+    cfg: &McpServerConfig,
+    policy: &Policy,
+) -> anyhow::Result<McpClient> {
+    let svc = remote::connect(name, cfg, policy, is_own(name)).await?;
+    let tools = tokio::time::timeout(
+        Duration::from_secs(cfg.timeout_seconds.max(1)),
+        svc.list_all_tools(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("tools/list timed out"))??;
+    Ok(McpClient {
+        server_name: name.to_string(),
+        inner: Arc::new(svc),
+        tools,
+        timeout: Duration::from_secs(cfg.timeout_seconds.max(1)),
+    })
 }
 
 /// Spawn one MCP server, do the handshake, list its tools.

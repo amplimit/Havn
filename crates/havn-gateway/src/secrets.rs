@@ -62,6 +62,10 @@ pub struct SecretStore {
     /// Per agent, its values once read; each slot's lock serializes the
     /// agent's reads and changes.
     slots: Arc<Mutex<HashMap<AgentId, Arc<Mutex<Option<Values>>>>>>,
+    /// The OAuth tokens of agents' remote MCP servers (issue #234).
+    oauth: crate::mcp_oauth::OAuthGrants,
+    /// Policies are clamped to their owners' (`trust_header`).
+    multi_user: bool,
 }
 
 impl std::fmt::Debug for SecretStore {
@@ -75,10 +79,34 @@ impl std::fmt::Debug for SecretStore {
 impl SecretStore {
     pub fn new(db: SqlitePool, keyring: Option<KeyRing>) -> Self {
         Self {
+            oauth: crate::mcp_oauth::OAuthGrants::new(db.clone(), keyring.clone()),
             db,
             keyring,
             slots: Arc::default(),
+            multi_user: false,
         }
+    }
+
+    /// Resolve agents' policies as a multi-user gateway does.
+    #[must_use]
+    pub fn with_multi_user(mut self, multi_user: bool) -> Self {
+        self.multi_user = multi_user;
+        self
+    }
+
+    /// The OAuth of the agents' remote MCP servers.
+    pub fn oauth(&self) -> &crate::mcp_oauth::OAuthGrants {
+        &self.oauth
+    }
+
+    /// OAuth requests made through `http`.
+    #[cfg(test)]
+    pub fn with_oauth_http(
+        mut self,
+        http: Arc<dyn rmcp::transport::auth::OAuthHttpClient>,
+    ) -> Self {
+        self.oauth = self.oauth.with_http(http);
+        self
     }
 
     /// Whether secrets can be set: `HAVN_AGE_KEY` is.
@@ -193,11 +221,76 @@ impl SecretStore {
     /// Forget what was read of a deleted agent.
     pub async fn forget(&self, agent_id: AgentId) {
         self.slots.lock().await.remove(&agent_id);
+        self.oauth.forget(agent_id).await;
     }
 
-    /// What the runtime of `agent` gets: its values and shell environment.
-    /// Values that cannot be read are left out, logged.
-    pub async fn for_runtime(&self, agent: &Agent) -> Secrets {
+    /// Refresh the due OAuth tokens of the agent's servers that get them,
+    /// together, and send the running runtime the new ones; waits at most
+    /// `deadline`, while a refresh that takes longer goes on (a refresh cut
+    /// off could lose a rotated refresh token). Whether they were done in
+    /// time. The owner's client secrets are resolved now, not kept with the
+    /// tokens.
+    pub async fn refresh_oauth(
+        &self,
+        registry: &AgentRegistry,
+        agent_id: AgentId,
+        deadline: std::time::Duration,
+    ) -> bool {
+        let store = self.clone();
+        let registry = registry.clone();
+        let task = tokio::spawn(async move {
+            let agent = match havn_db::repo::agents::find_by_id(&store.db, agent_id).await {
+                Ok(Some(agent)) => agent,
+                _ => return,
+            };
+            let policy =
+                crate::policy_resolver::for_session(&store.db, &agent, store.multi_user).await;
+            let own = own_mcp_servers(&agent.config, &policy);
+            let served = crate::mcp_oauth::served(&policy, &own);
+            let due = store.oauth.due(agent_id, &served).await;
+            if due.is_empty() {
+                return;
+            }
+            let values = store.values(agent_id).await.unwrap_or_default();
+            let work: Vec<(String, Option<String>)> = due
+                .into_iter()
+                .map(|server| {
+                    let secret = served
+                        .iter()
+                        .find(|(name, _)| **name == server)
+                        .and_then(|(_, cfg)| crate::mcp_oauth::owner_secret(cfg, &values).ok())
+                        .flatten();
+                    (server, secret)
+                })
+                .collect();
+            let refreshes = work.into_iter().map(|(server, secret)| {
+                let oauth = store.oauth.clone();
+                async move {
+                    match oauth.refresh(agent_id, &server, secret).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            warn!(%agent_id, server, error = %e, "an MCP server's OAuth token was not refreshed");
+                            false
+                        }
+                    }
+                }
+            });
+            let refreshed = futures_util::future::join_all(refreshes).await;
+            if refreshed.into_iter().any(|r| r) {
+                store.push(&registry, agent_id).await;
+            }
+        });
+        if tokio::time::timeout(deadline, task).await.is_err() {
+            warn!(%agent_id, "refreshing the agent's MCP OAuth tokens takes long; going on without waiting");
+            return false;
+        }
+        true
+    }
+
+    /// What the runtime of `agent` gets, under `policy`: its values, shell
+    /// environment, and the OAuth tokens of its own MCP servers. Values that
+    /// cannot be read are left out, logged.
+    pub async fn for_runtime(&self, agent: &Agent, policy: &havn_core::Policy) -> Secrets {
         let values = match self.values(agent.id).await {
             Ok(values) => values,
             Err(e) => {
@@ -205,9 +298,11 @@ impl SecretStore {
                 Values::new()
             }
         };
+        let own = own_mcp_servers(&agent.config, policy);
         Secrets {
             values,
             shell_env: shell_env(&agent.config),
+            mcp_tokens: self.oauth.tokens(agent.id, policy, &own).await,
         }
     }
 
@@ -238,9 +333,12 @@ impl SecretStore {
                 return;
             }
         };
+        let policy = crate::policy_resolver::for_session(&self.db, &agent, self.multi_user).await;
+        let own = own_mcp_servers(&agent.config, &policy);
         let secrets = Secrets {
             values,
             shell_env: shell_env(&agent.config),
+            mcp_tokens: self.oauth.tokens(agent_id, &policy, &own).await,
         };
         if let Err(e) = registry
             .send(agent_id, GatewayToAgent::Secrets(secrets))
@@ -666,7 +764,7 @@ mod tests {
 
         // Another store over the same database decrypts it.
         let fresh = SecretStore::new(db.clone(), Some(KeyRing::from_passphrase("test-key")));
-        let secrets = fresh.for_runtime(&a).await;
+        let secrets = fresh.for_runtime(&a, &havn_core::Policy::default()).await;
         assert_eq!(secrets.values["github"], "ghp_0123456789");
         assert_eq!(secrets.shell_env["GH_TOKEN"], "secret:github");
 
@@ -818,6 +916,186 @@ mod tests {
             refused_mcp_servers(&json!({}), &policy),
             vec!["gh".to_string()]
         );
+    }
+
+    #[test]
+    fn a_role_cannot_point_the_owners_oauth_server_elsewhere() {
+        let server = |url: &str| havn_core::McpServerConfig {
+            url: url.into(),
+            auth: havn_core::McpAuth::Oauth(havn_core::McpOAuthConfig::default()),
+            ..Default::default()
+        };
+        let config =
+            json!({"policy": {"mcp_servers": {"notion": server("https://mcp.notion.com/mcp")}}});
+        let mut policy = havn_core::Policy::default();
+        policy.mcp_servers =
+            HashMap::from([("notion".to_string(), server("https://mcp.notion.com/mcp"))]);
+        assert_eq!(
+            own_mcp_servers(&config, &policy),
+            vec!["notion".to_string()]
+        );
+        policy.mcp_servers =
+            HashMap::from([("notion".to_string(), server("https://evil.example/mcp"))]);
+        assert!(own_mcp_servers(&config, &policy).is_empty());
+        assert_eq!(
+            refused_mcp_servers(&config, &policy),
+            vec!["notion".to_string()]
+        );
+    }
+
+    /// A provider that takes half a minute to answer anything.
+    struct Slow;
+
+    impl rmcp::transport::auth::OAuthHttpClient for Slow {
+        fn execute(
+            &self,
+            _request: rmcp::transport::auth::OAuthHttpRequest,
+        ) -> rmcp::transport::auth::OAuthHttpClientFuture<'_> {
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                Err("too slow".into())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_provider_does_not_delay_an_agents_start() {
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let url = "https://mcp.example.com/mcp";
+        let server = json!({"url": url, "auth": {"type": "oauth"}});
+        let a = agent(
+            &db,
+            json!({"policy": {
+                "permissions": {"can_use_mcp": true, "can_access_network": true},
+                "network_policy": {"egress_allowed": true, "egress_proxy": false},
+                "mcp_servers": {"slow": server},
+            }}),
+        )
+        .await;
+        let store = SecretStore::new(db.clone(), Some(KeyRing::from_passphrase("test-key")))
+            .with_oauth_http(Arc::new(Slow));
+        // Due: an hour's token issued 3500 s ago.
+        store
+            .oauth()
+            .keep_for_test(a.id, "slow", url, "oauth-access-slow", 3500)
+            .await;
+        let registry = AgentRegistry::new();
+        // As before Welcome: the refresh is waited for 300 ms, then the
+        // runtime's secrets are read, with the token there is.
+        let started = std::time::Instant::now();
+        let done = store
+            .refresh_oauth(&registry, a.id, std::time::Duration::from_millis(300))
+            .await;
+        assert!(!done, "the slow refresh was still running");
+        let policy = crate::policy_resolver::for_session(&db, &a, false).await;
+        let secrets = store.for_runtime(&a, &policy).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(secrets.mcp_tokens["slow"].access_token, "oauth-access-slow");
+    }
+
+    #[tokio::test]
+    async fn the_runtime_gets_oauth_tokens_of_its_own_servers_at_their_url_only() {
+        let db = havn_db::connect_in_memory().await.expect("db");
+        let a = agent(&db, json!({})).await;
+        let store = SecretStore::new(db.clone(), Some(KeyRing::from_passphrase("test-key")));
+        let server = |url: &str| havn_core::McpServerConfig {
+            url: url.into(),
+            auth: havn_core::McpAuth::Oauth(havn_core::McpOAuthConfig::default()),
+            ..Default::default()
+        };
+        let mut policy = havn_core::Policy::default();
+        policy.permissions.can_access_network = true;
+        policy.network_policy.egress_allowed = true;
+        policy.mcp_servers = HashMap::from([
+            ("notion".to_string(), server("https://mcp.notion.com/mcp")),
+            ("moved".to_string(), server("https://mcp.example.com/v2")),
+        ]);
+        let own = vec!["notion".to_string(), "moved".to_string()];
+        // Nothing connected: no tokens.
+        assert!(store.oauth().tokens(a.id, &policy, &own).await.is_empty());
+        store
+            .oauth()
+            .keep_for_test(
+                a.id,
+                "notion",
+                "https://mcp.notion.com/mcp",
+                "oauth-access-1",
+                0,
+            )
+            .await;
+        store
+            .oauth()
+            .keep_for_test(
+                a.id,
+                "moved",
+                "https://mcp.example.com/v1",
+                "oauth-access-2",
+                0,
+            )
+            .await;
+        let tokens = store.oauth().tokens(a.id, &policy, &own).await;
+        assert_eq!(
+            tokens.len(),
+            1,
+            "a token goes only to the URL it was issued for"
+        );
+        assert_eq!(tokens["notion"].access_token, "oauth-access-1");
+        // A server that is not the agent's own gets none.
+        let theirs = store
+            .oauth()
+            .tokens(a.id, &policy, &["moved".to_string()])
+            .await;
+        assert!(theirs.is_empty());
+        // Stored encrypted, decrypted by another store.
+        let rows = agent_secrets::oauth_list(&db, a.id).await.expect("rows");
+        assert!(
+            rows.iter()
+                .all(|r| crate::keyring::is_age_ciphertext(&r.value_ciphertext))
+        );
+        let fresh = SecretStore::new(db.clone(), Some(KeyRing::from_passphrase("test-key")));
+        let tokens = fresh.oauth().tokens(a.id, &policy, &own).await;
+        assert_eq!(tokens["notion"].access_token, "oauth-access-1");
+        // None to a host the agent's network does not reach.
+        let mut blocked = policy.clone();
+        blocked.network_policy.blocked_domains = vec!["notion.com".into()];
+        assert!(fresh.oauth().tokens(a.id, &blocked, &own).await.is_empty());
+        let mut offline = policy.clone();
+        offline.network_policy.egress_allowed = false;
+        assert!(fresh.oauth().tokens(a.id, &offline, &own).await.is_empty());
+        // A server whose URL changed, or that is gone, loses its grant.
+        let now = HashMap::from([("notion".to_string(), server("https://mcp.notion.com/v2"))]);
+        fresh
+            .oauth()
+            .prune(a.id, &now, &HashMap::new(), &BTreeMap::new())
+            .await;
+        assert!(
+            agent_secrets::oauth_list(&db, a.id)
+                .await
+                .expect("rows")
+                .is_empty()
+        );
+        fresh
+            .oauth()
+            .keep_for_test(
+                a.id,
+                "notion",
+                "https://mcp.notion.com/mcp",
+                "oauth-access-3",
+                0,
+            )
+            .await;
+        assert!(
+            fresh
+                .oauth()
+                .disconnect(a.id, "notion", None)
+                .await
+                .expect("disconnect")
+        );
+        assert!(fresh.oauth().tokens(a.id, &policy, &own).await.is_empty());
     }
 
     #[tokio::test]

@@ -83,6 +83,32 @@ pub fn operator_blocked_domains() -> &'static [String] {
     OPERATOR_BLOCKED_DOMAINS.get().map_or(&[], Vec::as_slice)
 }
 
+/// The operator's `[mcp]`.
+static OPERATOR_MCP: OnceLock<crate::config::McpConfig> = OnceLock::new();
+
+/// Set once, at startup.
+pub fn set_operator_mcp(mcp: crate::config::McpConfig) {
+    let _ = OPERATOR_MCP.set(mcp);
+}
+
+/// The operator's `[mcp]`, its defaults when it was not set.
+pub fn operator_mcp() -> crate::config::McpConfig {
+    OPERATOR_MCP.get().cloned().unwrap_or_default()
+}
+
+/// Why the operator does not let agents use the remote MCP server `server`,
+/// when it is one they do not.
+#[must_use]
+pub fn operator_refuses(server: &havn_core::McpServerConfig) -> Option<String> {
+    if !server.is_remote() {
+        return None;
+    }
+    match server.remote_host() {
+        Some(host) => operator_mcp().refusal(&host),
+        None => Some("its URL does not parse".into()),
+    }
+}
+
 /// Resolve the effective policy for a user (independent of any one
 /// agent — used to enforce `max_agents`, `can_bind_channels`,
 /// `can_schedule_cron`, etc. *before* an agent is created or a
@@ -379,6 +405,11 @@ pub async fn for_session(db: &SqlitePool, agent: &Agent, multi_user: bool) -> Po
     if !lists_read {
         unguarded(&mut policy);
     }
+    // Remote MCP servers the operator does not allow are not the agent's,
+    // whoever set them.
+    policy
+        .mcp_servers
+        .retain(|_, server| operator_refuses(server).is_none());
     policy
 }
 

@@ -387,7 +387,12 @@ async fn run_watcher(
             .is_ok()
         {}
 
-        match GatewayConfig::load_from(&config_path) {
+        match GatewayConfig::load_from(&config_path).map(|mut new_cfg| {
+            // Defaults that follow trust_header follow the running gateway's too,
+            // which HAVN_TRUST_HEADER may have turned on.
+            new_cfg.settle_defaults(new_cfg.trust_header.enabled || current.trust_header.enabled);
+            new_cfg
+        }) {
             Ok(new_cfg) => {
                 let old_v = serde_json::to_value(&current).unwrap_or(Value::Null);
                 let new_v = serde_json::to_value(&new_cfg).unwrap_or(Value::Null);

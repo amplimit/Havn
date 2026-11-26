@@ -924,7 +924,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::secrets::set(havn_proto::Secrets {
             values: BTreeMap::from([("split".to_string(), "split-secret-0123".to_string())]),
-            shell_env: BTreeMap::new(),
+            ..Default::default()
         });
         // Read while it runs: the start of the value waits for its rest.
         let mut output = Output::default();

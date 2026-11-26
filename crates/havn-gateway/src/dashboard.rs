@@ -46,7 +46,21 @@ pub fn router(api: Router<AppState>, state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), named_host))
         .layer(Extension(SameOrigin))
         .with_state(state)
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(request_span as fn(&Request) -> tracing::Span),
+        )
+}
+
+/// A request as the log names it: its method and path, never its query,
+/// which can hold an OAuth code (`/api/mcp/oauth/callback?code=...`).
+pub fn request_span(request: &Request) -> tracing::Span {
+    tracing::debug_span!(
+        "request",
+        method = %request.method(),
+        path = %request.uri().path(),
+        version = ?request.version(),
+    )
 }
 
 /// Whether `origin` is the page's own: `http://` or `https://` and the

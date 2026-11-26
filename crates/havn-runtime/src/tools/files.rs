@@ -1347,7 +1347,7 @@ mod tests {
                 "gh".to_string(),
                 "ghp-marker-0123".to_string(),
             )]),
-            shell_env: std::collections::BTreeMap::new(),
+            ..Default::default()
         });
         let refused = holds_secret_marker("GH_TOKEN=[secret:gh]\n").expect("refused");
         assert!(refused.is_error() && refused.text().contains("[secret:gh]"));

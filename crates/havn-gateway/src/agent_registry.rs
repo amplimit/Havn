@@ -63,6 +63,8 @@ struct Entry {
     /// (a slow delivery) keeps it from reading pings, which counts against
     /// the agent only past [`LivenessLimits::busy`].
     busy_since: Option<Instant>,
+    /// How its MCP servers started, as the connected runtime said.
+    mcp: Option<havn_proto::McpStatus>,
 }
 
 /// How long an instance may stay quiet before it counts as hung.
@@ -194,6 +196,7 @@ impl AgentRegistry {
                 query_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_AGENT_QUERIES)),
                 tool_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_TOOL_CALLS)),
                 disconnect: None,
+                mcp: None,
             },
         );
         // Nothing can reach a connection of the replaced entry any more.
@@ -288,6 +291,7 @@ impl AgentRegistry {
         entry.tx = Some(tx);
         entry.connected_at = Some(Instant::now());
         entry.disconnect = Some(Arc::new(Notify::new()));
+        entry.mcp = None;
         Ok(())
     }
 
@@ -502,6 +506,30 @@ impl AgentRegistry {
     /// from "spawned, awaiting handshake".
     pub async fn is_registered(&self, agent_id: AgentId) -> bool {
         self.inner.lock().await.contains_key(&agent_id)
+    }
+
+    /// The runtime connected as `tx` said how its MCP servers are.
+    pub async fn set_mcp_status(
+        &self,
+        agent_id: AgentId,
+        tx: &mpsc::Sender<GatewayToAgent>,
+        status: havn_proto::McpStatus,
+    ) {
+        if let Some(entry) = self.inner.lock().await.get_mut(&agent_id)
+            && entry.is_connection(tx)
+        {
+            entry.mcp = Some(status);
+        }
+    }
+
+    /// How the agent's MCP servers are, while its runtime is connected.
+    pub async fn mcp_status(&self, agent_id: AgentId) -> Option<havn_proto::McpStatus> {
+        self.inner
+            .lock()
+            .await
+            .get(&agent_id)
+            .filter(|e| e.tx.as_ref().is_some_and(|tx| !tx.is_closed()))
+            .and_then(|e| e.mcp.clone())
     }
 }
 

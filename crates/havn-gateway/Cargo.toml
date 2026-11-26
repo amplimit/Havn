@@ -54,6 +54,10 @@ url.workspace = true
 image.workspace = true
 heifer.workspace = true
 hayro.workspace = true
+# OAuth of remote MCP servers (issue #234): discovery, registration,
+# authorization code with PKCE, refresh.
+rmcp = { workspace = true, features = ["auth"] }
+oauth2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

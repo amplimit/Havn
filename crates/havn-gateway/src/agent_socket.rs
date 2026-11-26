@@ -693,8 +693,13 @@ async fn handle_connection(
             let gateway_tools = gateway_tools_for(&ctx, &agent, &policy).await;
             let models = model_choices(&policy, &ctx.models.load());
             let language = havn_core::Language::of_config(&agent.config);
+            // Due OAuth tokens are refreshed first, waited for at most 10 s
+            // so a slow provider does not hold the start.
+            ctx.secrets
+                .refresh_oauth(&ctx.registry, agent.id, std::time::Duration::from_secs(10))
+                .await;
             let secrets = (
-                ctx.secrets.for_runtime(&agent).await,
+                ctx.secrets.for_runtime(&agent, &policy).await,
                 crate::secrets::own_mcp_servers(&agent.config, &policy),
             );
             (
@@ -1081,10 +1086,41 @@ where
         // for the pings this reader is not reading.
         let ping = matches!(frame, AgentToGateway::LivenessPing);
         ctx.registry.frame_received(agent_id, tx, ping).await;
-        dispatch(agent_id, frame, ctx).await;
+        match frame {
+            // Kept for this connection only: a status is the runtime's.
+            AgentToGateway::McpStatus(status) => {
+                ctx.registry
+                    .set_mcp_status(agent_id, tx, bounded_mcp_status(status))
+                    .await;
+            }
+            frame => dispatch(agent_id, frame, ctx).await,
+        }
         ctx.registry.frame_handled(agent_id, tx).await;
     }
     Ok(())
+}
+
+/// MCP servers, and tools of each, a status keeps at most.
+const MAX_MCP_STATUS_SERVERS: usize = 64;
+const MAX_MCP_STATUS_TOOLS: usize = 256;
+/// Characters of a tool's or server's name a status keeps.
+const MAX_MCP_STATUS_NAME: usize = 128;
+
+/// `status` within the bounds above, its errors cut.
+fn bounded_mcp_status(mut status: havn_proto::McpStatus) -> havn_proto::McpStatus {
+    let cut = |s: &str, n: usize| s.chars().take(n).collect::<String>();
+    status.servers.truncate(MAX_MCP_STATUS_SERVERS);
+    for server in &mut status.servers {
+        server.name = cut(&server.name, MAX_MCP_STATUS_NAME);
+        server.tools.truncate(MAX_MCP_STATUS_TOOLS);
+        for tool in &mut server.tools {
+            *tool = cut(tool, MAX_MCP_STATUS_NAME);
+        }
+        if let Some(error) = &mut server.error {
+            *error = cut(error, havn_proto::MAX_MCP_ERROR_CHARS + 1);
+        }
+    }
+    status
 }
 
 async fn dispatch(agent_id: AgentId, frame: AgentToGateway, ctx: &AgentSocketCtx) {

@@ -706,6 +706,7 @@ async fn main() -> anyhow::Result<()> {
     // The writer channel exists before the registry: gateway tools send
     // through it. Its task starts in step 5.
     let (writer_tx, mut writer_rx) = mpsc::channel::<AgentToGateway>(OUTBOUND_QUEUE_CAPACITY);
+    mcp::report_to(writer_tx.clone());
     let gateway_pending: tools::gateway::PendingGatewayCalls = Arc::default();
     let approvals = Arc::new(approvals::Approvals::new(writer_tx.clone()));
     approvals::install(Arc::clone(&approvals));

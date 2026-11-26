@@ -24,7 +24,9 @@ import {
   type AgentWebView,
   type BootstrapView,
   type EmbeddingStatus,
+  type McpAuth,
   type McpServerConfig,
+  type McpTransport,
   type McpView,
   type ModelsView,
   type CronJobView,
@@ -2539,45 +2541,75 @@ function MyDomainsEditor({ onSaved }: { onSaved: () => void }) {
 }
 
 /**
- * MCP servers section (spec §13 Phase 3). Lets the owner toggle the
- * master gate (`policy.permissions.can_use_mcp`) and edit the
- * whitelist (`policy.mcp_servers`) without leaving the dashboard. The
- * gateway re-validates everything on PATCH; we still pre-validate the
- * binary name client-side so obvious mistakes surface immediately.
+ * MCP servers section (spec §13 Phase 3, remote servers issue #234). Lets
+ * the owner toggle the master gate (`policy.permissions.can_use_mcp`) and
+ * edit the whitelist (`policy.mcp_servers`): stdio binaries the operator
+ * installed, and remote servers over Streamable HTTP or HTTP+SSE, with
+ * headers, a bearer token or OAuth. The gateway re-validates everything on
+ * PATCH; obvious mistakes are caught here first.
  *
  * Edits land on the agent's NEXT start (frozen-prompt invariant — the
  * runtime materialises the MCP server set in its boot sequence and
  * holds it for the rest of the session).
  */
 function McpEditor({ agentId }: { agentId: string }) {
+  const params = useSearchParams();
   const [view, setView] = useState<McpView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [justSaved, flashSaved] = useFlash();
+  const form = useRef<HTMLDetailsElement>(null);
 
-  // "draft" form for adding a new server. We don't allow inline rename;
-  // remove + re-add is enough.
-  const [newName, setNewName] = useState("");
-  const [newBinary, setNewBinary] = useState("");
-  const [newArgs, setNewArgs] = useState(""); // space-separated; empty = none
-  const [newPathsRw, setNewPathsRw] = useState(""); // newline-separated
-  const [newPathsRo, setNewPathsRo] = useState("");
+  // The form adds a server, or replaces the one being edited.
+  const [editing, setEditing] = useState<string | null>(null);
+  const [kind, setKind] = useState<"stdio" | "remote">("stdio");
+  const [draftName, setDraftName] = useState("");
+  const [draftBinary, setDraftBinary] = useState("");
+  const [draftArgs, setDraftArgs] = useState(""); // space-separated; empty = none
+  const [draftPathsRw, setDraftPathsRw] = useState(""); // newline-separated
+  const [draftPathsRo, setDraftPathsRo] = useState("");
+  const [draftUrl, setDraftUrl] = useState("");
+  const [draftTransport, setDraftTransport] = useState<McpTransport>("auto");
+  const [draftHeaders, setDraftHeaders] = useState(""); // `Name: value` a line
+  const [draftAuth, setDraftAuth] = useState<McpAuth["type"]>("none");
+  const [draftToken, setDraftToken] = useState("");
+  const [draftClientId, setDraftClientId] = useState("");
+  const [draftClientSecret, setDraftClientSecret] = useState("");
+  const [draftScopes, setDraftScopes] = useState("");
+  const [draftTimeout, setDraftTimeout] = useState(60);
+
+  async function load() {
+    try {
+      setView(await api.mcp.get(agentId));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
-    (async () => {
-      try {
-        const v = await api.mcp.get(agentId);
+    api.mcp
+      .get(agentId)
+      .then((v) => {
         if (!cancelled) setView(v);
-      } catch (e) {
-        if (!cancelled)
-          setError(e instanceof Error ? e.message : String(e));
-      }
-    })();
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      });
     return () => {
       cancelled = true;
     };
   }, [agentId]);
+
+  // Back from a provider: the callback says how connecting went.
+  const backServer = params.get("mcp_server");
+  const backFailed = params.get("mcp_oauth_error");
+  const notice =
+    backServer && params.get("mcp_oauth") === "connected"
+      ? `"${backServer}" is connected. The agent uses it from its next start: stop and start it to use it now.`
+      : null;
+  const shownError =
+    error ?? (backServer && backFailed ? `Connecting "${backServer}" failed: ${backFailed}` : null);
 
   async function setEnabled(can_use_mcp: boolean) {
     setSaving(true);
@@ -2595,15 +2627,17 @@ function McpEditor({ agentId }: { agentId: string }) {
 
   async function commitServers(
     next: Record<string, McpServerConfig>,
-  ): Promise<void> {
+  ): Promise<boolean> {
     setSaving(true);
     setError(null);
     try {
       const updated = await api.mcp.patch(agentId, { servers: next });
       setView(updated);
       flashSaved();
+      return true;
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      return false;
     } finally {
       setSaving(false);
     }
@@ -2627,58 +2661,214 @@ function McpEditor({ agentId }: { agentId: string }) {
     await commitServers(next);
   }
 
+  function resetForm() {
+    setEditing(null);
+    setDraftName("");
+    setDraftBinary("");
+    setDraftArgs("");
+    setDraftPathsRw("");
+    setDraftPathsRo("");
+    setDraftUrl("");
+    setDraftTransport("auto");
+    setDraftHeaders("");
+    setDraftAuth("none");
+    setDraftToken("");
+    setDraftClientId("");
+    setDraftClientSecret("");
+    setDraftScopes("");
+    setDraftTimeout(60);
+  }
+
+  function editServer(name: string) {
+    const cfg = view?.servers[name];
+    if (!cfg) return;
+    resetForm();
+    setEditing(name);
+    setDraftName(name);
+    setDraftTimeout(cfg.timeout_seconds);
+    if (cfg.url) {
+      setKind("remote");
+      setDraftUrl(cfg.url);
+      setDraftTransport(cfg.transport ?? "auto");
+      setDraftHeaders(headersText(cfg.headers ?? {}));
+      const auth = cfg.auth ?? { type: "none" };
+      setDraftAuth(auth.type);
+      if (auth.type === "bearer") setDraftToken(auth.token);
+      if (auth.type === "oauth") {
+        setDraftClientId(auth.client_id ?? "");
+        setDraftClientSecret(auth.client_secret ?? "");
+        setDraftScopes((auth.scopes ?? []).join(" "));
+      }
+    } else {
+      setKind("stdio");
+      setDraftBinary(cfg.binary);
+      setDraftArgs(cfg.args.join(" "));
+      setDraftPathsRw(cfg.extra_paths_rw.join("\n"));
+      setDraftPathsRo(cfg.extra_paths_ro.join("\n"));
+    }
+    if (form.current) form.current.open = true;
+  }
+
   async function addServer(e: React.FormEvent) {
     e.preventDefault();
     if (!view) return;
-    const trimmed = newName.trim();
+    const trimmed = draftName.trim();
     if (!trimmed) {
       setError("server name is required");
       return;
     }
-    if (view.servers[trimmed]) {
+    if (trimmed !== editing && view.servers[trimmed]) {
       setError(`server name "${trimmed}" already exists`);
       return;
     }
-    if (!newBinary) {
-      setError("pick a binary (operator must install it under /usr/share/havn/mcp-servers/ first)");
-      return;
+    const kept = editing ? view.servers[editing] : undefined;
+    let cfg: McpServerConfig;
+    if (kind === "stdio") {
+      if (!draftBinary) {
+        setError("pick a binary (operator must install it under /usr/share/havn/mcp-servers/ first)");
+        return;
+      }
+      cfg = {
+        binary: draftBinary,
+        args: draftArgs.trim() ? draftArgs.trim().split(/\s+/) : [],
+        // env is set through the API and kept as it was.
+        env: kept && !kept.url ? kept.env : {},
+        extra_paths_rw: splitPaths(draftPathsRw),
+        extra_paths_ro: splitPaths(draftPathsRo),
+        timeout_seconds: draftTimeout,
+        enabled: kept?.enabled ?? true,
+      };
+    } else {
+      const url = draftUrl.trim();
+      if (!hostOf(url)) {
+        setError("the URL must be http:// or https:// with a host");
+        return;
+      }
+      const headers = parseHeaders(draftHeaders);
+      if (typeof headers === "string") {
+        setError(headers);
+        return;
+      }
+      let auth: McpAuth = { type: "none" };
+      if (draftAuth === "bearer") {
+        if (!draftToken.trim()) {
+          setError("a bearer token is required, best as secret:<name>");
+          return;
+        }
+        auth = { type: "bearer", token: draftToken.trim() };
+      } else if (draftAuth === "oauth") {
+        if (!url.startsWith("https://")) {
+          setError("OAuth needs an https URL");
+          return;
+        }
+        auth = { type: "oauth" };
+        if (draftClientId.trim()) auth.client_id = draftClientId.trim();
+        if (draftClientSecret.trim()) auth.client_secret = draftClientSecret.trim();
+        const scopes = draftScopes.trim() ? draftScopes.trim().split(/\s+/) : [];
+        if (scopes.length > 0) auth.scopes = scopes;
+      }
+      cfg = {
+        binary: "",
+        args: [],
+        env: {},
+        extra_paths_rw: [],
+        extra_paths_ro: [],
+        timeout_seconds: draftTimeout,
+        enabled: kept?.enabled ?? true,
+        url,
+        transport: draftTransport,
+        headers,
+        auth,
+      };
     }
-    const cfg: McpServerConfig = {
-      binary: newBinary,
-      args: newArgs.trim() ? newArgs.trim().split(/\s+/) : [],
-      env: {},
-      extra_paths_rw: splitPaths(newPathsRw),
-      extra_paths_ro: splitPaths(newPathsRo),
-      timeout_seconds: 60,
-      enabled: true,
-    };
-    const next = { ...view.servers, [trimmed]: cfg };
-    await commitServers(next);
-    // reset form on success (state already advanced via commitServers)
-    if (!error) {
-      setNewName("");
-      setNewBinary("");
-      setNewArgs("");
-      setNewPathsRw("");
-      setNewPathsRo("");
+    const next = { ...view.servers };
+    if (editing) delete next[editing];
+    next[trimmed] = cfg;
+    if (await commitServers(next)) resetForm();
+  }
+
+  async function connect(name: string) {
+    setError(null);
+    try {
+      const { authorization_url } = await api.mcp.connect(agentId, name);
+      // Only ever to an https page: a URL the server's metadata made up must
+      // not run as script here.
+      if (!isHttpsUrl(authorization_url)) {
+        setError("the authorization server's address is not an https URL; not following it");
+        return;
+      }
+      window.location.assign(authorization_url);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function disconnect(name: string) {
+    if (
+      !window.confirm(
+        `Forget the OAuth tokens of "${name}"? The agent loses the server at its next start. Revoke the grant at the provider too.`,
+      )
+    )
+      return;
+    setError(null);
+    try {
+      await api.mcp.disconnect(agentId, name);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function allowHost(host: string) {
+    setError(null);
+    try {
+      const web = await api.search.agent(agentId);
+      if (!web.allowed_domains.includes(host)) {
+        await api.search.patchAgent(agentId, {
+          allowed_domains: [...web.allowed_domains, host],
+        });
+      }
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     }
   }
 
   const serverEntries = view ? Object.entries(view.servers) : [];
+  const literal = [
+    ...Object.entries(parseHeadersLoose(draftHeaders))
+      .filter(([, v]) => looksLikeSecret(v))
+      .map(([k]) => `header ${k}`),
+    ...(draftAuth === "bearer" && looksLikeSecret(draftToken) ? ["the bearer token"] : []),
+    ...(draftAuth === "oauth" && looksLikeSecret(draftClientSecret) ? ["the client secret"] : []),
+  ];
+  const plainHttp =
+    draftUrl.trim().startsWith("http://") && (draftAuth !== "none" || draftHeaders.trim() !== "");
 
   return (
     <section className="mt-10 card px-4 py-4">
       <h3 className="display-h3 mb-2">MCP servers</h3>
       <p className="mb-3 text-sm" style={{ color: "var(--color-body)" }}>
-        Model Context Protocol servers: stdio binaries the operator
-        installed, which the agent can invoke as
-        <code className="font-mono"> mcp__&lt;server&gt;__&lt;tool&gt;</code>.
-        Only binaries placed under{" "}
-        <code className="font-mono">/usr/share/havn/mcp-servers/</code>{" "}
-        on the host are reachable; &quot;no marketplace&quot; means agents can&apos;t
-        install new ones. Changes apply on the agent&apos;s next start.
+        Model Context Protocol servers the agent can invoke as
+        <code className="font-mono"> mcp__&lt;server&gt;__&lt;tool&gt;</code>:
+        stdio binaries the operator installed under{" "}
+        <code className="font-mono">/usr/share/havn/mcp-servers/</code>, and
+        remote servers at a URL, which the agent reaches through its network
+        access like any other host. Changes apply on the agent&apos;s next start.
       </p>
-      {error && (
+      {notice && (
+        <div
+          className="mb-3 px-3 py-2 text-sm"
+          style={{
+            border: "1px solid var(--color-border)",
+            borderRadius: 4,
+            color: "var(--color-success-text)",
+          }}
+        >
+          {notice}
+        </div>
+      )}
+      {shownError && (
         <div
           className="mb-3 px-3 py-2 text-sm"
           style={{
@@ -2688,7 +2878,7 @@ function McpEditor({ agentId }: { agentId: string }) {
             color: "var(--color-ruby)",
           }}
         >
-          {error}
+          {shownError}
         </div>
       )}
       {!view ? (
@@ -2717,92 +2907,35 @@ function McpEditor({ agentId }: { agentId: string }) {
             >
               No servers configured yet.{" "}
               {view.available_binaries.length === 0
-                ? "No binaries detected at /usr/share/havn/mcp-servers/ either — install one first."
+                ? "No binaries detected at /usr/share/havn/mcp-servers/."
                 : `${view.available_binaries.length} binary/-ies detected on host.`}
             </p>
           ) : (
-            <table className="mb-4 w-full text-sm">
-              <thead>
-                <tr style={{ color: "var(--color-body)", textAlign: "left" }}>
-                  <th className="py-1 pr-2">name</th>
-                  <th className="py-1 pr-2">binary</th>
-                  <th className="py-1 pr-2">args</th>
-                  <th className="py-1 pr-2">paths</th>
-                  <th className="py-1 pr-2">enabled</th>
-                  <th className="py-1"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {serverEntries.map(([name, cfg]) => (
-                  <tr
-                    key={name}
-                    style={{
-                      borderTop: "1px solid var(--color-border)",
-                    }}
-                  >
-                    <td className="py-2 pr-2">
-                      <code className="font-mono">{name}</code>
-                    </td>
-                    <td className="py-2 pr-2">
-                      <code
-                        className="font-mono"
-                        style={{ fontSize: 12 }}
-                      >
-                        {cfg.binary}
-                      </code>
-                    </td>
-                    <td
-                      className="py-2 pr-2"
-                      style={{ fontSize: 12, color: "var(--color-body)" }}
-                    >
-                      {cfg.args.length > 0 ? cfg.args.join(" ") : "—"}
-                    </td>
-                    <td
-                      className="py-2 pr-2"
-                      style={{ fontSize: 12, color: "var(--color-body)" }}
-                    >
-                      {cfg.extra_paths_rw.length === 0 &&
-                      cfg.extra_paths_ro.length === 0
-                        ? "—"
-                        : `${cfg.extra_paths_rw.length} rw / ${cfg.extra_paths_ro.length} ro`}
-                    </td>
-                    <td className="py-2 pr-2">
-                      <input
-                        type="checkbox"
-                        checked={cfg.enabled}
-                        disabled={saving}
-                        onChange={() => toggleServerEnabled(name)}
-                      />
-                    </td>
-                    <td className="py-2">
-                      <button
-                        type="button"
-                        onClick={() => removeServer(name)}
-                        disabled={saving}
-                        className="text-xs"
-                        style={{
-                          color: "var(--color-ruby)",
-                          background: "none",
-                          border: "none",
-                          cursor: saving ? "not-allowed" : "pointer",
-                          padding: 0,
-                        }}
-                      >
-                        remove
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <ul className="mb-4 grid gap-2 text-sm">
+              {serverEntries.map(([name, cfg]) => (
+                <McpServerRow
+                  key={name}
+                  name={name}
+                  cfg={cfg}
+                  view={view}
+                  saving={saving}
+                  onToggle={() => toggleServerEnabled(name)}
+                  onEdit={() => editServer(name)}
+                  onRemove={() => removeServer(name)}
+                  onConnect={() => connect(name)}
+                  onDisconnect={() => disconnect(name)}
+                  onAllow={allowHost}
+                />
+              ))}
+            </ul>
           )}
 
-          <details className="mt-2">
+          <details className="mt-2" ref={form}>
             <summary
               className="cursor-pointer text-sm"
               style={{ color: "var(--color-stripe-purple)" }}
             >
-              add a server
+              {editing ? `edit ${editing}` : "add a server"}
             </summary>
             <form
               onSubmit={addServer}
@@ -2814,82 +2947,245 @@ function McpEditor({ agentId }: { agentId: string }) {
             >
               <Field
                 label="name"
-                hint="Operator-chosen alias. Becomes the prefix in mcp__<name>__<tool>; must be unique within this agent."
+                hint="Your alias. Becomes the prefix in mcp__<name>__<tool>; must be unique within this agent."
               >
                 <input
                   type="text"
-                  value={newName}
-                  onChange={(e) => setNewName(e.target.value)}
+                  value={draftName}
+                  onChange={(e) => setDraftName(e.target.value)}
                   className="input font-mono"
                   placeholder="e.g. filesystem"
                 />
               </Field>
               <Field
-                label="binary"
-                hint={
-                  view.available_binaries.length === 0
-                    ? "No binaries detected. Install one at /usr/share/havn/mcp-servers/<name> on the host before configuring."
-                    : "File name under /usr/share/havn/mcp-servers/ — never a path."
-                }
+                label="kind"
+                hint="A binary the operator installed, run in the agent's sandbox, or a server at a URL."
               >
                 <select
-                  value={newBinary}
-                  onChange={(e) => setNewBinary(e.target.value)}
-                  className="input font-mono"
-                  disabled={view.available_binaries.length === 0}
+                  value={kind}
+                  onChange={(e) => setKind(e.target.value as "stdio" | "remote")}
+                  className="input"
                 >
-                  <option value="">—</option>
-                  {view.available_binaries.map((b) => (
-                    <option key={b} value={b}>
-                      {b}
-                    </option>
-                  ))}
+                  <option value="stdio">stdio binary</option>
+                  <option value="remote" disabled={!view.remote.allowed}>
+                    remote URL{view.remote.allowed ? "" : " (not allowed by the operator)"}
+                  </option>
                 </select>
               </Field>
+              {kind === "stdio" ? (
+                <>
+                  <Field
+                    label="binary"
+                    hint={
+                      view.available_binaries.length === 0
+                        ? "No binaries detected. Install one at /usr/share/havn/mcp-servers/<name> on the host before configuring."
+                        : "File name under /usr/share/havn/mcp-servers/ — never a path."
+                    }
+                  >
+                    <select
+                      value={draftBinary}
+                      onChange={(e) => setDraftBinary(e.target.value)}
+                      className="input font-mono"
+                      disabled={view.available_binaries.length === 0}
+                    >
+                      <option value="">—</option>
+                      {view.available_binaries.map((b) => (
+                        <option key={b} value={b}>
+                          {b}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                  <Field
+                    label="args"
+                    hint="Space-separated. Leave empty for none. Quoting / shell expansion is NOT supported — args go straight to execve."
+                  >
+                    <input
+                      type="text"
+                      value={draftArgs}
+                      onChange={(e) => setDraftArgs(e.target.value)}
+                      className="input font-mono"
+                      placeholder="--root /workspace/data"
+                    />
+                  </Field>
+                  <Field
+                    label="extra_paths_rw"
+                    hint="Newline-separated host paths the server may read+write. Unioned into the agent's Landlock allowlist. Typical: /workspace/data."
+                  >
+                    <textarea
+                      value={draftPathsRw}
+                      onChange={(e) => setDraftPathsRw(e.target.value)}
+                      className="input font-mono"
+                      rows={2}
+                      style={{ minHeight: 50, fontSize: 12 }}
+                    />
+                  </Field>
+                  <Field
+                    label="extra_paths_ro"
+                    hint="Newline-separated host paths the server may read but not write."
+                  >
+                    <textarea
+                      value={draftPathsRo}
+                      onChange={(e) => setDraftPathsRo(e.target.value)}
+                      className="input font-mono"
+                      rows={2}
+                      style={{ minHeight: 50, fontSize: 12 }}
+                    />
+                  </Field>
+                </>
+              ) : (
+                <>
+                  <Field
+                    label="URL"
+                    hint={
+                      view.remote.hosts.length > 0
+                        ? `The server's MCP endpoint. The operator allows these hosts only: ${view.remote.hosts.join(", ")}.`
+                        : "The server's MCP endpoint, such as https://mcp.example.com/mcp. Through the egress proxy, on port 443 (https) or 80 (http)."
+                    }
+                  >
+                    <input
+                      type="url"
+                      value={draftUrl}
+                      onChange={(e) => setDraftUrl(e.target.value)}
+                      className="input font-mono"
+                      placeholder="https://mcp.example.com/mcp"
+                    />
+                  </Field>
+                  <Field
+                    label="transport"
+                    hint="auto tries Streamable HTTP, then the older HTTP+SSE transport; pick one when the server speaks only that."
+                  >
+                    <select
+                      value={draftTransport}
+                      onChange={(e) => setDraftTransport(e.target.value as McpTransport)}
+                      className="input"
+                    >
+                      <option value="auto">auto</option>
+                      <option value="streamable_http">Streamable HTTP</option>
+                      <option value="sse">HTTP+SSE</option>
+                    </select>
+                  </Field>
+                  <Field
+                    label="headers"
+                    hint="One Name: value a line, sent with every request. A value secret:<name> is one of this agent's secrets (see Secrets); type keys there, not here."
+                  >
+                    <textarea
+                      value={draftHeaders}
+                      onChange={(e) => setDraftHeaders(e.target.value)}
+                      className="input font-mono"
+                      rows={2}
+                      style={{ minHeight: 50, fontSize: 12 }}
+                      placeholder="X-Api-Key: secret:example"
+                    />
+                  </Field>
+                  <Field
+                    label="authorization"
+                    hint="A bearer token, or OAuth: you connect the server here once it is saved, and the gateway keeps and refreshes its tokens."
+                  >
+                    <select
+                      value={draftAuth}
+                      onChange={(e) => setDraftAuth(e.target.value as McpAuth["type"])}
+                      className="input"
+                    >
+                      <option value="none">none</option>
+                      <option value="bearer">bearer token</option>
+                      <option value="oauth">OAuth</option>
+                    </select>
+                  </Field>
+                  {draftAuth === "bearer" && (
+                    <Field
+                      label="token"
+                      hint="Sent as Authorization: Bearer <token>. Best secret:<name>, one of this agent's secrets."
+                    >
+                      <input
+                        type="text"
+                        value={draftToken}
+                        onChange={(e) => setDraftToken(e.target.value)}
+                        className="input font-mono"
+                        placeholder="secret:linear"
+                        autoComplete="off"
+                      />
+                    </Field>
+                  )}
+                  {draftAuth === "oauth" && (
+                    <>
+                      <Field
+                        label="client id"
+                        hint="Leave empty when the server registers clients itself (most do). Otherwise the id of an app you registered with the provider, with this redirect URL: the dashboard's address followed by /api/mcp/oauth/callback."
+                      >
+                        <input
+                          type="text"
+                          value={draftClientId}
+                          onChange={(e) => setDraftClientId(e.target.value)}
+                          className="input font-mono"
+                          autoComplete="off"
+                        />
+                      </Field>
+                      <Field
+                        label="client secret"
+                        hint="Only with a client id whose app has one; best secret:<name>."
+                      >
+                        <input
+                          type="text"
+                          value={draftClientSecret}
+                          onChange={(e) => setDraftClientSecret(e.target.value)}
+                          className="input font-mono"
+                          placeholder="secret:example-client"
+                          autoComplete="off"
+                        />
+                      </Field>
+                      <Field
+                        label="scopes"
+                        hint="Space-separated; empty asks for those the server names."
+                      >
+                        <input
+                          type="text"
+                          value={draftScopes}
+                          onChange={(e) => setDraftScopes(e.target.value)}
+                          className="input font-mono"
+                        />
+                      </Field>
+                    </>
+                  )}
+                  {literal.length > 0 && (
+                    <p className="text-xs" style={{ color: "var(--color-ruby)" }}>
+                      {literal.join(", ")} looks like a key typed in as text. It is stored in the
+                      agent&apos;s settings as it is, where the settings page and the API show it.
+                      Set it as a secret in the Secrets section and write secret:&lt;name&gt; here instead.
+                    </p>
+                  )}
+                  {plainHttp && (
+                    <p className="text-xs" style={{ color: "var(--color-ruby)" }}>
+                      This URL is plain http: the headers and token cross the network unencrypted.
+                    </p>
+                  )}
+                </>
+              )}
               <Field
-                label="args"
-                hint="Space-separated. Leave empty for none. Quoting / shell expansion is NOT supported — args go straight to execve."
+                label="timeout_seconds"
+                hint="How long one tool call may run before it returns an error to the agent."
               >
                 <input
-                  type="text"
-                  value={newArgs}
-                  onChange={(e) => setNewArgs(e.target.value)}
+                  type="number"
+                  min={1}
+                  value={draftTimeout}
+                  onChange={(e) => setDraftTimeout(Math.max(1, Number(e.target.value) || 1))}
                   className="input font-mono"
-                  placeholder="--root /workspace/data"
                 />
               </Field>
-              <Field
-                label="extra_paths_rw"
-                hint="Newline-separated host paths the server may read+write. Unioned into the agent's Landlock allowlist. Typical: /workspace/data."
-              >
-                <textarea
-                  value={newPathsRw}
-                  onChange={(e) => setNewPathsRw(e.target.value)}
-                  className="input font-mono"
-                  rows={2}
-                  style={{ minHeight: 50, fontSize: 12 }}
-                />
-              </Field>
-              <Field
-                label="extra_paths_ro"
-                hint="Newline-separated host paths the server may read but not write."
-              >
-                <textarea
-                  value={newPathsRo}
-                  onChange={(e) => setNewPathsRo(e.target.value)}
-                  className="input font-mono"
-                  rows={2}
-                  style={{ minHeight: 50, fontSize: 12 }}
-                />
-              </Field>
-              <div>
+              <div className="flex items-center gap-2">
                 <button
                   type="submit"
                   className="btn-primary"
                   disabled={saving}
                 >
-                  {saving ? "saving…" : "add server"}
+                  {saving ? "saving…" : editing ? "save server" : "add server"}
                 </button>
+                {editing && (
+                  <button type="button" className="text-xs" onClick={resetForm}>
+                    cancel
+                  </button>
+                )}
                 {justSaved && (
                   <span
                     className="ml-2 text-xs"
@@ -2905,6 +3201,224 @@ function McpEditor({ agentId }: { agentId: string }) {
       )}
     </section>
   );
+}
+
+/** One server of the MCP section: what it is, how it runs, and its OAuth. */
+function McpServerRow({
+  name,
+  cfg,
+  view,
+  saving,
+  onToggle,
+  onEdit,
+  onRemove,
+  onConnect,
+  onDisconnect,
+  onAllow,
+}: {
+  name: string;
+  cfg: McpServerConfig;
+  view: McpView;
+  saving: boolean;
+  onToggle: () => void;
+  onEdit: () => void;
+  onRemove: () => void;
+  onConnect: () => void;
+  onDisconnect: () => void;
+  onAllow: (host: string) => void;
+}) {
+  const muted = { fontSize: 12, color: "var(--color-body)" };
+  const bad = { fontSize: 12, color: "var(--color-ruby)" };
+  const link = {
+    background: "none",
+    border: "none",
+    cursor: saving ? "not-allowed" : "pointer",
+    padding: 0,
+  };
+  const status = view.status?.find((s) => s.name === name);
+  const host = cfg.url ? hostOf(cfg.url) : null;
+  const reach = view.reach[name];
+  const oauth = cfg.auth?.type === "oauth" ? view.oauth[name] : undefined;
+  const oauthCurrent = oauth && oauth.url === cfg.url && !oauth.error;
+  return (
+    <li
+      className="grid gap-1 py-2"
+      style={{ borderTop: "1px solid var(--color-border)" }}
+    >
+      <div className="flex flex-wrap items-center gap-3">
+        <code className="font-mono">{name}</code>
+        <span style={muted}>{cfg.url ? "remote" : "stdio"}</span>
+        <label className="flex items-center gap-1" style={muted}>
+          <input
+            type="checkbox"
+            checked={cfg.enabled}
+            disabled={saving}
+            onChange={onToggle}
+          />
+          enabled
+        </label>
+        <button type="button" onClick={onEdit} disabled={saving} className="text-xs" style={link}>
+          edit
+        </button>
+        <button
+          type="button"
+          onClick={onRemove}
+          disabled={saving}
+          className="text-xs"
+          style={{ ...link, color: "var(--color-ruby)" }}
+        >
+          remove
+        </button>
+      </div>
+      {cfg.url ? (
+        <div style={muted}>
+          <code className="font-mono">{cfg.url}</code>
+          {" · "}
+          {cfg.transport === "sse"
+            ? "HTTP+SSE"
+            : cfg.transport === "streamable_http"
+              ? "Streamable HTTP"
+              : "auto"}
+          {" · "}
+          {cfg.auth?.type === "bearer"
+            ? "bearer token"
+            : cfg.auth?.type === "oauth"
+              ? "OAuth"
+              : "no authorization"}
+          {Object.keys(cfg.headers ?? {}).length > 0 &&
+            ` · headers ${Object.keys(cfg.headers ?? {}).join(", ")}`}
+        </div>
+      ) : (
+        <div style={muted}>
+          <code className="font-mono">{cfg.binary}</code>
+          {cfg.args.length > 0 && ` ${cfg.args.join(" ")}`}
+          {(cfg.extra_paths_rw.length > 0 || cfg.extra_paths_ro.length > 0) &&
+            ` · ${cfg.extra_paths_rw.length} rw / ${cfg.extra_paths_ro.length} ro paths`}
+        </div>
+      )}
+      {view.refused[name] && <div style={bad}>Does not run as set here: {view.refused[name]}.</div>}
+      {host && reach === "none" && (
+        <div style={bad}>This agent has no network access, so it cannot reach {host}.</div>
+      )}
+      {host && reach === "blocked" && <div style={bad}>{host} is on this agent&apos;s blocked domains.</div>}
+      {host && reach === "ask" && (
+        <div style={muted}>
+          {host} is not on this agent&apos;s allowed domains: you are asked in the chat when the agent
+          connects.{" "}
+          <button
+            type="button"
+            className="text-xs underline"
+            style={link}
+            onClick={() => onAllow(host)}
+          >
+            allow {host}
+          </button>
+        </div>
+      )}
+      {cfg.auth?.type === "oauth" && (
+        <div className="flex flex-wrap items-center gap-2" style={muted}>
+          {oauthCurrent ? (
+            <>
+              <span style={{ color: "var(--color-success-text)" }}>OAuth connected</span>
+              {oauth.expires_at && <span>token refreshed before {new Date(oauth.expires_at).toLocaleString()}</span>}
+              <button type="button" className="text-xs underline" style={link} onClick={onDisconnect}>
+                disconnect
+              </button>
+            </>
+          ) : (
+            <>
+              <span>
+                {oauth?.error
+                  ? `OAuth: ${oauth.error}`
+                  : oauth
+                    ? "OAuth was connected for another URL"
+                    : "OAuth not connected"}
+              </span>
+              <button
+                type="button"
+                className="text-xs underline"
+                style={link}
+                onClick={onConnect}
+                disabled={saving || Boolean(view.refused[name])}
+              >
+                connect
+              </button>
+              {oauth && (
+                <button type="button" className="text-xs underline" style={link} onClick={onDisconnect}>
+                  forget
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      )}
+      {cfg.enabled && view.can_use_mcp && (
+        <div style={status?.error ? bad : muted}>
+          {!view.status
+            ? "The agent is not running; the server starts with it."
+            : !status
+              ? "Not running: added or changed since the agent started."
+              : status.connected
+                ? `Up, ${status.tools?.length ?? 0} tools${status.tools?.length ? `: ${status.tools.join(", ")}` : ""}${status.error ? `. Since: ${status.error}` : ""}`
+                : `Did not start: ${status.error ?? "unknown"}`}
+        </div>
+      )}
+    </li>
+  );
+}
+
+/** Whether `url` is an https URL. */
+function isHttpsUrl(url: string): boolean {
+  try {
+    return new URL(url).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+/** The host of an http(s) URL, or null. */
+function hostOf(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+    return parsed.hostname || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Headers as the editor shows them: one `Name: value` a line. */
+function headersText(headers: Record<string, string>): string {
+  return Object.entries(headers)
+    .map(([name, value]) => `${name}: ${value}`)
+    .join("\n");
+}
+
+/** `Name: value` lines as headers, or why they are not. */
+function parseHeaders(text: string): Record<string, string> | string {
+  const headers: Record<string, string> = {};
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    const at = line.indexOf(":");
+    if (at <= 0) return `"${line}" is not Name: value`;
+    headers[line.slice(0, at).trim()] = line.slice(at + 1).trim();
+  }
+  return headers;
+}
+
+/** The headers of lines that parse, for the warning while typing. */
+function parseHeadersLoose(text: string): Record<string, string> {
+  const parsed = parseHeaders(text);
+  return typeof parsed === "string" ? {} : parsed;
+}
+
+/** A value typed in as text that looks like a key rather than `secret:<name>`. */
+function looksLikeSecret(value: string): boolean {
+  const text = value.trim();
+  if (!text || text.startsWith("secret:")) return false;
+  const word = text.split(/\s+/).pop() ?? "";
+  return word.length >= 16 && /[A-Za-z]/.test(word) && /[0-9]/.test(word);
 }
 
 /** The shell environment as the editor shows it: one `NAME=value` a line. */

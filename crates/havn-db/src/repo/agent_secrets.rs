@@ -285,6 +285,141 @@ pub async fn remove(pool: &SqlitePool, agent_id: AgentId, name: &str) -> Result<
     Ok(was)
 }
 
+/// What the agent's owner connected one of its remote MCP servers with
+/// (issue #234): ciphertext the gateway made, and the URL it is for.
+#[derive(Clone)]
+pub struct McpOAuthRow {
+    pub server: String,
+    pub url: String,
+    pub value_ciphertext: Vec<u8>,
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Why the last refresh failed.
+    pub error: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for McpOAuthRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpOAuthRow")
+            .field("server", &self.server)
+            .field("url", &self.url)
+            .field("expires_at", &self.expires_at)
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct OAuthRow {
+    server: String,
+    url: String,
+    value: Vec<u8>,
+    expires_at: Option<String>,
+    error: Option<String>,
+    updated_at: String,
+}
+
+fn from_oauth_row(row: OAuthRow) -> Result<McpOAuthRow> {
+    Ok(McpOAuthRow {
+        server: row.server,
+        url: row.url,
+        value_ciphertext: row.value,
+        expires_at: row
+            .expires_at
+            .as_deref()
+            .map(|at| time(at, "mcp_oauth.expires_at"))
+            .transpose()?,
+        error: row.error,
+        updated_at: time(&row.updated_at, "mcp_oauth.updated_at")?,
+    })
+}
+
+const OAUTH_COLUMNS: &str = "server, url, value, expires_at, error, updated_at";
+
+/// The agent's MCP servers connected with OAuth, by server name.
+pub async fn oauth_list(pool: &SqlitePool, agent_id: AgentId) -> Result<Vec<McpOAuthRow>> {
+    let rows: Vec<OAuthRow> = sqlx::query_as(&format!(
+        "SELECT {OAUTH_COLUMNS} FROM mcp_oauth WHERE agent_id = ?1 ORDER BY server"
+    ))
+    .bind(agent_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(from_oauth_row).collect()
+}
+
+/// Keep what `server` of the agent was connected with, in place of what it
+/// had, with no error.
+pub async fn oauth_set(
+    pool: &SqlitePool,
+    agent_id: AgentId,
+    server: &str,
+    url: &str,
+    value_ciphertext: &[u8],
+    expires_at: Option<DateTime<Utc>>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO mcp_oauth (agent_id, server, url, value, expires_at, error) \
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL) \
+         ON CONFLICT (agent_id, server) DO UPDATE SET url = excluded.url, \
+         value = excluded.value, expires_at = excluded.expires_at, error = NULL, \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+    )
+    .bind(agent_id.to_string())
+    .bind(server)
+    .bind(url)
+    .bind(value_ciphertext)
+    .bind(expires_at.map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Note why refreshing `server`'s token failed.
+pub async fn oauth_error(
+    pool: &SqlitePool,
+    agent_id: AgentId,
+    server: &str,
+    error: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE mcp_oauth SET error = ?3 WHERE agent_id = ?1 AND server = ?2")
+        .bind(agent_id.to_string())
+        .bind(server)
+        .bind(error)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Forget what `server` was connected with; whether there was anything.
+pub async fn oauth_remove(pool: &SqlitePool, agent_id: AgentId, server: &str) -> Result<bool> {
+    let done = sqlx::query("DELETE FROM mcp_oauth WHERE agent_id = ?1 AND server = ?2")
+        .bind(agent_id.to_string())
+        .bind(server)
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// The agents and servers whose access tokens expire before `before`.
+pub async fn oauth_expiring(
+    pool: &SqlitePool,
+    before: DateTime<Utc>,
+) -> Result<Vec<(AgentId, String)>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT agent_id, server FROM mcp_oauth \
+         WHERE expires_at IS NOT NULL AND expires_at < ?1 ORDER BY expires_at",
+    )
+    .bind(before.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|(agent, server)| {
+            let id = crate::repo::parse_db_uuid(&agent, "mcp_oauth.agent_id")?;
+            Ok((AgentId::from_uuid(id), server))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -424,6 +559,69 @@ mod tests {
             .await
             .expect("delete");
         let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agent_secrets")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_oauth_is_kept_refreshed_and_goes_with_its_agent() {
+        let pool = connect_in_memory().await.expect("db");
+        let id = agent(&pool).await;
+        let soon = Utc::now() + chrono::Duration::minutes(2);
+        oauth_set(
+            &pool,
+            id,
+            "notion",
+            "https://mcp.notion.com/mcp",
+            b"c1",
+            Some(soon),
+        )
+        .await
+        .expect("set");
+        oauth_set(
+            &pool,
+            id,
+            "plain",
+            "https://mcp.example.com/mcp",
+            b"c2",
+            None,
+        )
+        .await
+        .expect("set");
+        let due = oauth_expiring(&pool, Utc::now() + chrono::Duration::minutes(5))
+            .await
+            .expect("due");
+        assert_eq!(due, vec![(id, "notion".to_string())]);
+        oauth_error(&pool, id, "notion", "refused")
+            .await
+            .expect("error");
+        let rows = oauth_list(&pool, id).await.expect("list");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].server, "notion");
+        assert_eq!(rows[0].error.as_deref(), Some("refused"));
+        assert_eq!(rows[0].value_ciphertext, b"c1");
+        // Connecting again clears the error.
+        oauth_set(
+            &pool,
+            id,
+            "notion",
+            "https://mcp.notion.com/mcp",
+            b"c3",
+            None,
+        )
+        .await
+        .expect("again");
+        let rows = oauth_list(&pool, id).await.expect("list");
+        assert_eq!(rows[0].error, None);
+        assert_eq!(rows[0].value_ciphertext, b"c3");
+        assert!(oauth_remove(&pool, id, "plain").await.expect("remove"));
+        assert!(!oauth_remove(&pool, id, "plain").await.expect("again"));
+        crate::repo::agents::delete(&pool, id)
+            .await
+            .expect("delete");
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mcp_oauth")
             .fetch_one(&pool)
             .await
             .expect("count");

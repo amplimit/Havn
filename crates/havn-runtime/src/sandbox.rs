@@ -278,6 +278,11 @@ pub fn set_tool_proxy(url: String) {
     let _ = TOOL_PROXY.set(url);
 }
 
+/// The egress proxy, when the agent's network goes through it.
+pub fn tool_proxy() -> Option<&'static str> {
+    TOOL_PROXY.get().map(String::as_str)
+}
+
 /// Set the proxy variables common tools read (pip, npm, git, curl) on
 /// `command`, when there is a proxy.
 pub fn apply_tool_proxy(command: &mut tokio::process::Command) {

@@ -952,7 +952,7 @@ fn fetch_client(resolver: Arc<dyn Resolve>) -> reqwest::Result<reqwest::Client> 
 /// Resolves names to their public addresses only, so a connection never
 /// goes to an address that [`is_public`] refuses, whatever DNS answers.
 #[derive(Debug)]
-struct PublicResolver;
+pub(crate) struct PublicResolver;
 
 impl Resolve for PublicResolver {
     fn resolve(&self, name: Name) -> Resolving {

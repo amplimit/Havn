@@ -22,11 +22,20 @@
 //! decision: "agent self can't acquire new MCP servers — only
 //! whitelisted ones already on the host").
 
+//!
+//! Remote servers (issue #234) are entries with a `url`. One whose `auth`
+//! is OAuth is connected by its owner: `POST /agents/:id/mcp/:server/oauth`
+//! answers the URL to send the browser to, the provider sends it back to
+//! `GET /mcp/oauth/callback`, and `DELETE /agents/:id/mcp/:server/oauth`
+//! forgets the tokens.
+
 use axum::Json;
-use axum::extract::{Path, State};
-use havn_core::McpServerConfig;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Redirect, Response};
+use havn_core::{McpAuth, McpServerConfig};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tokio::fs;
 use tracing::{info, warn};
 
@@ -34,6 +43,7 @@ use crate::AppState;
 use crate::api::ApiError;
 use crate::audit;
 use crate::auth::AuthedUser;
+use crate::mcp_oauth::{OAuthError, OAuthStatus};
 
 /// Same fixed path the runtime uses (`havn_runtime::mcp::MCP_SERVERS_DIR`)
 /// — keep in sync if either ever moves. Re-listing it here rather than
@@ -53,6 +63,91 @@ pub struct McpView {
     /// have to type names. Empty when the directory is missing
     /// (single-user dev install with no servers yet).
     pub available_binaries: Vec<String>,
+    /// What the operator allows of remote servers (`[mcp]`).
+    pub remote: RemoteView,
+    /// How the servers started, while the agent runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<Vec<havn_proto::McpServerStatus>>,
+    /// The servers connected with OAuth, by name.
+    pub oauth: BTreeMap<String, OAuthStatus>,
+    /// Servers of the agent that do not run as it has them, and why: the
+    /// operator does not allow them, or a role supplies their settings.
+    pub refused: BTreeMap<String, String>,
+    /// For each remote server, whether the agent's network reaches its
+    /// host: `allowed`, `ask` (through the egress proxy, which asks the
+    /// owner), `blocked` or `none` (no network access).
+    pub reach: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RemoteView {
+    pub allowed: bool,
+    /// When not empty, the only hosts allowed.
+    pub hosts: Vec<String>,
+}
+
+async fn view(state: &AppState, agent: &havn_db::repo::agents::Agent) -> McpView {
+    let (can_use_mcp, servers) = read_mcp_from_config(&agent.config);
+    let policy =
+        crate::policy_resolver::for_session(&state.db, agent, state.trusted_proxies.is_some())
+            .await;
+    let own = crate::secrets::own_mcp_servers(&agent.config, &policy);
+    let mut refused = BTreeMap::new();
+    for (name, server) in &servers {
+        let why = if let Some(why) = crate::policy_resolver::operator_refuses(server) {
+            Some(why)
+        } else if !server.enabled {
+            None
+        } else {
+            match policy.mcp_servers.get(name) {
+                Some(runs) if runs.uses_secrets() && !own.contains(name) => Some(
+                    "it runs with the settings of the owner's role, which do not get the \
+                     owner's secrets or OAuth tokens"
+                        .to_string(),
+                ),
+                Some(_) => None,
+                None => Some("the owner's role does not list a server of this name".to_string()),
+            }
+        };
+        if let Some(why) = why {
+            refused.insert(name.clone(), why);
+        }
+    }
+    let net = &policy.network_policy;
+    let reach = servers
+        .iter()
+        .filter_map(|(name, server)| {
+            let host = server.remote_host()?;
+            let how = if !(policy.permissions.can_access_network && net.egress_allowed) {
+                "none"
+            } else if net.is_blocked(&host) {
+                "blocked"
+            } else if net.egress_proxy && !net.is_allowed(&host) {
+                "ask"
+            } else {
+                "allowed"
+            };
+            Some((name.clone(), how.to_string()))
+        })
+        .collect();
+    let operator = crate::policy_resolver::operator_mcp();
+    McpView {
+        can_use_mcp,
+        servers,
+        available_binaries: list_installed_binaries().await,
+        remote: RemoteView {
+            allowed: operator.remote_on(),
+            hosts: operator.remote_hosts,
+        },
+        status: state
+            .registry
+            .mcp_status(agent.id)
+            .await
+            .map(|status| status.servers),
+        oauth: state.secrets.oauth().status(agent.id).await,
+        refused,
+        reach,
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -73,13 +168,7 @@ pub async fn get(
     Path(id): Path<String>,
 ) -> Result<Json<McpView>, ApiError> {
     let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
-    let (can_use_mcp, servers) = read_mcp_from_config(&agent.config);
-    let available_binaries = list_installed_binaries().await;
-    Ok(Json(McpView {
-        can_use_mcp,
-        servers,
-        available_binaries,
-    }))
+    Ok(Json(view(&state, &agent).await))
 }
 
 pub async fn patch(
@@ -96,13 +185,24 @@ pub async fn patch(
     // means the dashboard can show a precise field-level error before
     // the row is written.
     if let Some(map) = &req.servers {
+        let (_, before) = read_mcp_from_config(&agent.config);
         for (name, cfg) in map {
             if name.trim().is_empty() {
                 return Err(ApiError::BadRequest("server name must be non-empty".into()));
             }
-            validate_binary_name(&cfg.binary)
-                .map_err(|e| ApiError::BadRequest(format!("server {name:?}: {e}")))?;
-            cfg.validate_env(name)?;
+            if !cfg.is_remote() {
+                validate_binary_name(&cfg.binary)
+                    .map_err(|e| ApiError::BadRequest(format!("server {name:?}: {e}")))?;
+            }
+            cfg.validate(name)?;
+            // A server the operator does not allow is not added or changed;
+            // one kept as it was stays, and does not run.
+            let kept = before.get(name).is_some_and(|old| old.runs_as(cfg));
+            if !kept {
+                if let Some(why) = crate::policy_resolver::operator_refuses(cfg) {
+                    return Err(ApiError::BadRequest(format!("server {name:?}: {why}")));
+                }
+            }
         }
     }
 
@@ -144,13 +244,268 @@ pub async fn patch(
     )
     .await;
     info!(agent_id = %id, "mcp config patched");
+    // Tokens of a server that is gone, or whose URL or authorization
+    // changed, are for something else now.
+    if req.servers.is_some() {
+        let (_, servers) = read_mcp_from_config(&updated.config);
+        let (_, before) = read_mcp_from_config(&agent.config);
+        let secrets = state.secrets.values(id).await.unwrap_or_default();
+        state
+            .secrets
+            .oauth()
+            .prune(id, &servers, &before, &secrets)
+            .await;
+        state.secrets.push(&state.registry, id).await;
+    }
+    Ok(Json(view(&state, &updated).await))
+}
 
-    let (can_use_mcp, servers) = read_mcp_from_config(&updated.config);
-    Ok(Json(McpView {
-        can_use_mcp,
-        servers,
-        available_binaries: list_installed_binaries().await,
-    }))
+/// The agent's secrets, and the owner's client secret of `cfg` resolved
+/// from them.
+async fn owner_secret(
+    state: &AppState,
+    agent_id: havn_core::AgentId,
+    cfg: &McpServerConfig,
+) -> Result<Option<String>, ApiError> {
+    let secrets = state
+        .secrets
+        .values(agent_id)
+        .await
+        .map_err(ApiError::Internal)?;
+    crate::mcp_oauth::owner_secret(cfg, &secrets).map_err(oauth_error)
+}
+
+#[derive(Debug, Serialize)]
+pub struct Connect {
+    /// Where to send the owner's browser.
+    pub authorization_url: String,
+}
+
+/// `POST /agents/:id/mcp/:server/oauth`: start connecting a server whose
+/// `auth` is OAuth. Only the agent's own server, as it runs, at a host its
+/// network policy lets it reach. The provider sends the browser back to the
+/// origin the dashboard was opened at.
+pub async fn connect(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path((id, server)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<Connect>, ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let policy =
+        crate::policy_resolver::for_session(&state.db, &agent, state.trusted_proxies.is_some())
+            .await;
+    let Some(cfg) = policy.mcp_servers.get(&server) else {
+        return Err(ApiError::BadRequest(format!(
+            "{server:?} is not one of the agent's MCP servers (with a team role, the role must \
+             list it, and the gateway's operator must allow remote servers at its host)"
+        )));
+    };
+    if !matches!(cfg.auth, McpAuth::Oauth(_)) || !cfg.is_remote() {
+        return Err(ApiError::BadRequest(format!(
+            "MCP server {server:?} does not use OAuth"
+        )));
+    }
+    if !crate::secrets::own_mcp_servers(&agent.config, &policy).contains(&server) {
+        return Err(ApiError::BadRequest(format!(
+            "MCP server {server:?} runs with the settings of the owner's role, which do not get \
+             the owner's tokens; define it the same in the agent's MCP settings"
+        )));
+    }
+    let host = cfg.remote_host().unwrap_or_default();
+    let net = &policy.network_policy;
+    if !(policy.permissions.can_access_network && net.egress_allowed) {
+        return Err(ApiError::BadRequest(
+            "the agent has no network access, so it could not reach the server".into(),
+        ));
+    }
+    if net.is_blocked(&host) {
+        return Err(ApiError::BadRequest(format!(
+            "{host} is on the agent's blocked domains"
+        )));
+    }
+    let origin = redirect_origin(&state, &headers)?;
+    let redirect_uri = format!("{origin}/api{}", crate::mcp_oauth::CALLBACK_PATH);
+    let secret = owner_secret(&state, agent.id, cfg).await?;
+    let authorization_url = state
+        .secrets
+        .oauth()
+        .start(&agent, user.id, &server, cfg, &redirect_uri, secret)
+        .await
+        .map_err(oauth_error)?;
+    info!(agent_id = %agent.id, server, "MCP server OAuth started");
+    Ok(Json(Connect { authorization_url }))
+}
+
+/// The origin the dashboard was opened at, from the request's `Origin`: its
+/// own (the gateway's dashboard, or a proxy in front of it), one of
+/// `allowed_origins`, or, without `trust_header`, a loopback one (the
+/// development server).
+fn redirect_origin(state: &AppState, headers: &HeaderMap) -> Result<String, ApiError> {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .trim_end_matches('/');
+    let Ok(url) = reqwest::Url::parse(origin) else {
+        return Err(ApiError::BadRequest(
+            "connect from the dashboard: the request has no Origin to send the browser back to"
+                .into(),
+        ));
+    };
+    let loopback = state.trusted_proxies.is_none()
+        && match url.host() {
+            Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        };
+    let listed = state
+        .allowed_origins
+        .load()
+        .iter()
+        .any(|o| o.trim_end_matches('/') == origin);
+    let web = matches!(url.scheme(), "http" | "https") && url.path() == "/";
+    if web && (crate::dashboard::same_origin(origin, headers) || listed || loopback) {
+        Ok(origin.to_string())
+    } else {
+        Err(ApiError::BadRequest(format!(
+            "the dashboard's origin {origin} is not this gateway's, nor in allowed_origins"
+        )))
+    }
+}
+
+fn oauth_error(e: OAuthError) -> ApiError {
+    match e {
+        OAuthError::NoKey => ApiError::Conflict(e.to_string()),
+        OAuthError::Internal(why) => ApiError::Internal(why),
+        other => ApiError::BadRequest(other.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Callback {
+    code: Option<String>,
+    state: Option<String>,
+    iss: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+/// `GET /mcp/oauth/callback`: the provider sent the owner's browser back.
+/// The tokens are kept, and the browser goes on to the agent's settings.
+pub async fn callback(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Query(query): Query<Callback>,
+) -> Response {
+    let oauth = state.secrets.oauth();
+    let Some(key) = query.state.as_deref() else {
+        return page("The authorization server sent no state back; connect the server again.");
+    };
+    if let Some(error) = &query.error {
+        let why = query
+            .error_description
+            .as_deref()
+            .map_or_else(|| error.clone(), |d| format!("{error}: {d}"));
+        return match oauth.abandon(user.id, key) {
+            Some((agent_id, server)) => back(
+                agent_id,
+                &server,
+                Err(format!("the provider refused: {why}")),
+            ),
+            None => page("This connect is unknown or expired; connect the server again."),
+        };
+    }
+    let Some(code) = query.code.as_deref() else {
+        return page("The authorization server sent no code back; connect the server again.");
+    };
+    let target = oauth.target(user.id, key);
+    match oauth.finish(user.id, key, code, query.iss.as_deref()).await {
+        Ok((agent_id, server)) => {
+            audit::record_agent_action(
+                &state.db,
+                user.id,
+                agent_id,
+                "agent.mcp.oauth.connected",
+                serde_json::json!({ "server": server }),
+            )
+            .await;
+            state.secrets.push(&state.registry, agent_id).await;
+            back(agent_id, &server, Ok(()))
+        }
+        Err(e) => {
+            warn!(error = %e, "an MCP server's OAuth callback failed");
+            match target {
+                Some((agent_id, server)) => back(agent_id, &server, Err(e.to_string())),
+                None => page(&e.to_string()),
+            }
+        }
+    }
+}
+
+/// The browser goes on to the agent's settings, which say how it went.
+fn back(agent_id: havn_core::AgentId, server: &str, outcome: Result<(), String>) -> Response {
+    let mut url = format!(
+        "/agent/settings?id={agent_id}&mcp_server={}",
+        url_escape(server)
+    );
+    match outcome {
+        Ok(()) => url.push_str("&mcp_oauth=connected"),
+        Err(why) => {
+            url.push_str("&mcp_oauth_error=");
+            url.push_str(&url_escape(&why.chars().take(300).collect::<String>()));
+        }
+    }
+    Redirect::to(&url).into_response()
+}
+
+fn url_escape(text: &str) -> String {
+    url::form_urlencoded::byte_serialize(text.as_bytes()).collect()
+}
+
+/// A short page for a callback that cannot go back to an agent.
+fn page(text: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        text.to_string(),
+    )
+        .into_response()
+}
+
+/// `DELETE /agents/:id/mcp/:server/oauth`: forget the server's tokens. The
+/// grant stays at the provider until it is revoked there.
+pub async fn disconnect(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path((id, server)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let agent = crate::api::agents::resolve_agent(&id, &user, &state).await?;
+    let (_, servers) = read_mcp_from_config(&agent.config);
+    let secret = match servers.get(&server) {
+        Some(cfg) => owner_secret(&state, agent.id, cfg).await.unwrap_or(None),
+        None => None,
+    };
+    let was = state
+        .secrets
+        .oauth()
+        .disconnect(agent.id, &server, secret)
+        .await
+        .map_err(oauth_error)?;
+    if !was {
+        return Err(ApiError::NotFound);
+    }
+    audit::record_agent_action(
+        &state.db,
+        user.id,
+        agent.id,
+        "agent.mcp.oauth.disconnected",
+        serde_json::json!({ "server": server }),
+    )
+    .await;
+    state.secrets.push(&state.registry, agent.id).await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Pull the (can_use_mcp, mcp_servers) pair out of agent.config.

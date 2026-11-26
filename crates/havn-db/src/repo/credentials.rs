@@ -210,14 +210,15 @@ pub async fn list_active_for_provider(
 }
 
 /// Count of every row in the table, regardless of scope or enabled
-/// flag, plus every agent secret set (issue #233), which the same key
-/// encrypts. Used by the gateway's startup boot guard to decide whether
-/// missing `HAVN_AGE_KEY` is a fresh-install (allowed) or an
-/// unmigrated-rows hazard (refuse).
+/// flag, plus every agent secret set (issue #233) and MCP server connected
+/// with OAuth (issue #234), which the same key encrypts. Used by the
+/// gateway's startup boot guard to decide whether missing `HAVN_AGE_KEY`
+/// is a fresh-install (allowed) or an unmigrated-rows hazard (refuse).
 pub async fn count_all(pool: &SqlitePool) -> Result<i64> {
     let n: i64 = sqlx::query_scalar(
         "SELECT (SELECT COUNT(*) FROM credentials) \
-         + (SELECT COUNT(*) FROM agent_secrets WHERE value IS NOT NULL)",
+         + (SELECT COUNT(*) FROM agent_secrets WHERE value IS NOT NULL) \
+         + (SELECT COUNT(*) FROM mcp_oauth)",
     )
     .fetch_one(pool)
     .await?;
