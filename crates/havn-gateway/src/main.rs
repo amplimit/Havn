@@ -242,11 +242,11 @@ async fn serve() -> anyhow::Result<()> {
             }
             _ => {}
         }
-        writeln!(
+        let _ = writeln!(
             std::io::stdout(),
             "{BANNER}havn-gateway {}\n",
             env!("CARGO_PKG_VERSION")
-        )?;
+        );
     }
     init_tracing();
 
