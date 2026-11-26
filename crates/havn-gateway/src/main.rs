@@ -242,6 +242,11 @@ async fn serve() -> anyhow::Result<()> {
             }
             _ => {}
         }
+        writeln!(
+            std::io::stdout(),
+            "{BANNER}havn-gateway {}\n",
+            env!("CARGO_PKG_VERSION")
+        )?;
     }
     init_tracing();
 
@@ -1476,6 +1481,14 @@ fn is_loopback(listen: &str) -> bool {
     let host = listen.rsplit_once(':').map_or(listen, |(h, _)| h);
     matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
 }
+
+const BANNER: &str = r" _   _
+| | | | __ ___   ___ __
+| |_| |/ _` \ \ / / '_ \
+|  _  | (_| |\ V /| | | |
+|_| |_|\__,_| \_/ |_| |_|
+
+";
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
