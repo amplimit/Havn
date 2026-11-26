@@ -1252,7 +1252,9 @@ fn slide_text(xml: &str, notes: bool) -> Result<SlideText, String> {
                     // What an app that cannot read the content above it
                     // shows: the same again.
                     "Fallback" if !empty => skip = 1,
-                    "sld" => out.hidden = attr(&e, "show").as_deref() == Some("0"),
+                    "sld" => {
+                        out.hidden = matches!(attr(&e, "show").as_deref(), Some("0" | "false"));
+                    }
                     "sp" if !empty => shape = Some((None, Vec::new())),
                     "pic" if !empty => in_picture += 1,
                     "ph" => {
@@ -1409,13 +1411,29 @@ fn slide_text(xml: &str, notes: bool) -> Result<SlideText, String> {
 /// notes.
 pub fn pptx_text(input: &[u8]) -> Result<String, String> {
     let mut archive = open(input)?;
+    // What the parts read unpack to, all told: the parts a presentation
+    // names may repeat.
+    let mut unpacked: u64 = 0;
+    let mut counted = |archive: &mut Archive<'_>, name: &str| -> Result<Option<String>, String> {
+        let found = part(archive, name)?;
+        unpacked += found.as_ref().map_or(0, |text| text.len() as u64);
+        if unpacked > MAX_UNPACKED_BYTES {
+            return Err(format!(
+                "the file unpacks to more than {} MB",
+                MAX_UNPACKED_BYTES / (1024 * 1024)
+            ));
+        }
+        Ok(found)
+    };
     let presentation = main_part(&mut archive, "ppt/presentation.xml")?;
-    let xml = part(&mut archive, &presentation)?
+    let xml = counted(&mut archive, &presentation)?
         .ok_or("not a presentation: it has no presentation part")?;
     let (dir, rels_path) = rels_of(&presentation);
-    let rels = part(&mut archive, &rels_path)?
+    let rels = counted(&mut archive, &rels_path)?
         .map(|x| relationships(&x))
         .unwrap_or_default();
+    // Each slide once, however often the list names it.
+    let mut listed = std::collections::HashSet::new();
     let mut slides: Vec<String> = slide_ids(&xml)
         .iter()
         .filter_map(|id| {
@@ -1423,6 +1441,7 @@ pub fn pptx_text(input: &[u8]) -> Result<String, String> {
                 .find(|r| r.id == *id && !r.external && r.kind.ends_with("/slide"))
         })
         .map(|r| resolve(dir, &r.target))
+        .filter(|path| listed.insert(path.clone()))
         .collect();
     // Without a list, the slides by their names' numbers.
     if slides.is_empty() {
@@ -1448,19 +1467,19 @@ pub fn pptx_text(input: &[u8]) -> Result<String, String> {
             let _ = writeln!(out, "({} more slides not shown)", total - n);
             break;
         }
-        let Some(xml) = part(&mut archive, slide)? else {
+        let Some(xml) = counted(&mut archive, slide)? else {
             continue;
         };
         let read = slide_text(&xml, false)?;
         let (slide_dir, slide_rels) = rels_of(slide);
-        let notes = part(&mut archive, &slide_rels)?
+        let notes = counted(&mut archive, &slide_rels)?
             .map(|x| relationships(&x))
             .unwrap_or_default()
             .into_iter()
             .find(|r| r.kind.ends_with("/notesSlide") && !r.external)
             .map(|r| resolve(slide_dir, &r.target));
         let notes = match notes {
-            Some(path) => match part(&mut archive, &path)? {
+            Some(path) => match counted(&mut archive, &path)? {
                 Some(xml) => slide_text(&xml, true)?.body,
                 None => String::new(),
             },
@@ -1511,7 +1530,7 @@ mod tests {
     #[test]
     fn a_presentation_reads_slide_by_slide_with_its_notes() {
         let presentation = format!(
-            r#"<p:presentation {P}><p:sldIdLst><p:sldId id="256" r:id="rId3"/><p:sldId id="257" r:id="rId2"/></p:sldIdLst></p:presentation>"#
+            r#"<p:presentation {P}><p:sldIdLst><p:sldId id="256" r:id="rId3"/><p:sldId id="257" r:id="rId2"/><p:sldId id="258" r:id="rId2"/></p:sldIdLst></p:presentation>"#
         );
         let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="/ppt/slides/slide2.xml"/></Relationships>"#;
         let first = format!(
@@ -1531,7 +1550,7 @@ mod tests {
 </p:spTree></p:cSld></p:notes>"#
         );
         let second = format!(
-            r#"<p:sld {P} show="0"><p:cSld><p:spTree>
+            r#"<p:sld {P} show="false"><p:cSld><p:spTree>
 <p:sp><p:nvSpPr><p:cNvPr id="2" name="Box"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:txBody><a:p><a:r><a:t>Opening words</a:t></a:r></a:p></p:txBody></p:sp>
 </p:spTree></p:cSld></p:sld>"#
         );
@@ -1563,6 +1582,10 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains('7'), "the slide number is not text: {text}");
+        assert!(
+            !text.contains("Slide 3"),
+            "a slide listed twice is read once: {text}"
+        );
     }
 
     #[test]

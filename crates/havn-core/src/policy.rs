@@ -410,6 +410,10 @@ pub struct Permissions {
     /// gateway reads only URLs users sent, search results and links on
     /// pages it read, or `network_policy.allowed_domains`.
     pub can_fetch_web: bool,
+    /// `transcribe`, run by the gateway with `[transcription]`: an audio
+    /// file of the agent's workspace goes to the transcription endpoint or
+    /// model, on the owner's budget (issue #230).
+    pub can_transcribe: bool,
 }
 
 impl Default for Permissions {
@@ -427,6 +431,7 @@ impl Default for Permissions {
             can_query_other_agents: false,
             can_search_web: true,
             can_fetch_web: true,
+            can_transcribe: true,
         }
     }
 }
@@ -667,6 +672,7 @@ impl Policy {
                 can_query_other_agents: own.can_query_other_agents && cap.can_query_other_agents,
                 can_search_web: own.can_search_web && cap.can_search_web,
                 can_fetch_web: own.can_fetch_web && cap.can_fetch_web,
+                can_transcribe: own.can_transcribe && cap.can_transcribe,
             },
             network_policy: NetworkPolicy {
                 egress_allowed: self.network_policy.egress_allowed
@@ -774,6 +780,7 @@ impl Policy {
                 can_query_other_agents: a.can_query_other_agents || b.can_query_other_agents,
                 can_search_web: a.can_search_web || b.can_search_web,
                 can_fetch_web: a.can_fetch_web || b.can_fetch_web,
+                can_transcribe: a.can_transcribe || b.can_transcribe,
             },
             network_policy: NetworkPolicy {
                 egress_allowed: self.network_policy.egress_allowed
@@ -1137,6 +1144,7 @@ mod tests {
         cap.permissions.can_use_mcp = false;
         cap.permissions.can_search_web = false;
         cap.permissions.can_fetch_web = false;
+        cap.permissions.can_transcribe = false;
         cap.resource_limits.memory_mb = 256;
         cap.resource_limits.pids_max = 32;
         cap.budget.max_tokens_per_day = 10_000;
@@ -1155,6 +1163,7 @@ mod tests {
         assert!(!p.permissions.can_spawn_subagents);
         assert!(!p.permissions.can_search_web);
         assert!(!p.permissions.can_fetch_web);
+        assert!(!p.permissions.can_transcribe);
         assert!(!p.network_policy.egress_allowed);
         assert_eq!(p.resource_limits.memory_mb, 256);
         assert_eq!(p.resource_limits.pids_max, 32);

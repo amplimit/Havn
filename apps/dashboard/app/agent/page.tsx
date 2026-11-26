@@ -96,34 +96,46 @@ const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 // A turn's attachment lines, which tell the agent where each file is, as
 // the runtime writes them.
 const JSON_STRING = String.raw`"(?:[^"\\]|\\.)*"`;
-const SCANNED = "; little or no text could be read from it, so it is likely a scan: ";
+const SCANNED = "; likely scanned: ";
+const UNREAD = "; it could not be read: ";
 const ATTACHMENT_LINE = new RegExp(
-  String.raw`^\[Attached file, user-supplied and untrusted: name (${JSON_STRING}), type (${JSON_STRING}), ([^,\]]+), saved at (${JSON_STRING})(?:${SCANNED}((?:[^"\]]|${JSON_STRING})*?))?(?:; its text \(untrusted\) is at (${JSON_STRING}), read it with file_read)?\]$`,
+  String.raw`^\[Attached file, user-supplied and untrusted: name (${JSON_STRING}), type (${JSON_STRING}), ([^,\]]+), saved at (${JSON_STRING})(?:${SCANNED}((?:[^"\]]|${JSON_STRING})*?))?(?:${UNREAD}(it is encrypted|it is damaged, or not what its name says))?(?:; its text \(untrusted\) is at (${JSON_STRING}), read it with file_read)?\]$`,
 );
 
 /** A scanned PDF's pages, as its line says them. */
-function scanOf(told: string): { pages: number; shown: number } {
-  const many = /^pages 1 to (\d+) of (\d+) /.exec(told);
-  if (many) return { shown: Number(many[1]), pages: Number(many[2]) };
-  const one = /^page 1 of (\d+) /.exec(told);
-  if (one) return { shown: 1, pages: Number(one[1]) };
-  return { shown: 0, pages: 0 };
+function scanOf(told: string): { pages: number; sparse: number; shown: number[] } {
+  const shown = [...told.matchAll(/\.page-(\d+)\.jpg"/g)].map((m) => Number(m[1]));
+  if (told.startsWith("its only page ")) return { pages: 1, sparse: 1, shown };
+  const counted = /^(\d+) of its (\d+) pages /.exec(told);
+  return { pages: Number(counted?.[2] ?? 0), sparse: Number(counted?.[1] ?? 0), shown };
 }
 
-/** What a scanned PDF's line says of its pages, as the runtime writes it. */
+/** A list as the runtime writes it: "a", "a and b", "a, b and c". */
+function listed(items: string[]): string {
+  return items.length < 2 ? (items[0] ?? "") : `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+}
+
+/** What a scanned PDF's or an unread document's line says, as the runtime writes it. */
 function scanText(a: Attachment): string {
-  if (!a.scan) return "";
-  const { pages, shown } = a.scan;
-  const slash = a.path.lastIndexOf("/");
-  const at = (n: number) =>
-    JSON.stringify(`${a.path.slice(0, slash + 1)}.${a.path.slice(slash + 1)}.page-${n}.jpg`);
-  const told =
-    shown === 0
-      ? "its pages could not be made images"
-      : shown === 1
-        ? `page 1 of ${pages} is an image at ${at(1)}, to look at with view_image`
-        : `pages 1 to ${shown} of ${pages} are images at ${at(1)} to ${at(shown)}, to look at with view_image`;
-  return `${SCANNED}${told}`;
+  let out = "";
+  if (a.scan) {
+    const { pages, sparse, shown } = a.scan;
+    const slash = a.path.lastIndexOf("/");
+    const at = (n: number) => JSON.stringify(`${a.path.slice(0, slash + 1)}.${a.path.slice(slash + 1)}.page-${n}.jpg`);
+    const head =
+      pages === 1 ? "its only page has" : sparse === 1 ? `1 of its ${pages} pages has` : `${sparse} of its ${pages} pages have`;
+    const kept =
+      shown.length === 0
+        ? "they could not be made images"
+        : shown.length === 1
+          ? `page ${shown[0]} is kept as an image at ${at(shown[0])}, to look at with view_image`
+          : `pages ${listed(shown.map(String))} are kept as images at ${listed(shown.map(at))}, to look at with view_image`;
+    out += `${SCANNED}${head} little or no text that could be read; ${kept}`;
+  }
+  if (a.unread) {
+    out += `${UNREAD}${a.unread === "encrypted" ? "it is encrypted" : "it is damaged, or not what its name says"}`;
+  }
+  return out;
 }
 
 /** A user turn's text, and the files it carried, from its stored content. */
@@ -139,7 +151,8 @@ function splitMessage(content: string): { text: string; files: Attachment[] } {
         size: sizeBytes(m[3]),
         path: JSON.parse(m[4]) as string,
         ...(m[5] !== undefined ? { scan: scanOf(m[5]) } : {}),
-        ...(m[6] ? { text_path: JSON.parse(m[6]) as string } : {}),
+        ...(m[6] ? { unread: m[6] === "it is encrypted" ? ("encrypted" as const) : ("damaged" as const) } : {}),
+        ...(m[7] ? { text_path: JSON.parse(m[7]) as string } : {}),
       });
       return false;
     } catch {

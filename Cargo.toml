@@ -93,7 +93,8 @@ heifer = { version = "=0.5.1", default-features = false }
 # Pages of a PDF sent in without a text layer, a scan, made images a model
 # can be shown (issue #230), in the converter child too. Pure Rust; the
 # standard fonts and CJK CMaps it embeds draw PDFs that do not carry them.
-hayro = "0.9"
+# It parses untrusted files and changes quickly, so it is pinned.
+hayro = "=0.9.0"
 
 # Filesystem watch + atomic Arc swap for hot config reload (spec §8.4).
 notify = "8"

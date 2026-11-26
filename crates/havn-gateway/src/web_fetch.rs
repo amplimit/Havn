@@ -791,7 +791,11 @@ impl WebFetch {
                     MAX_BODY_BYTES / (1024 * 1024)
                 ));
             }
-            let (text, text_cut) = self.convert(kind, body, &content_type, &url).await?;
+            let Document {
+                text,
+                cut: text_cut,
+                ..
+            } = self.convert(kind, body, &content_type, &url).await?;
             return Ok(Fetched::Page(Page {
                 url,
                 text,
@@ -808,7 +812,7 @@ impl WebFetch {
         body: Vec<u8>,
         content_type: &str,
         url: &Url,
-    ) -> Result<(String, bool), String> {
+    ) -> Result<Document, String> {
         let _slot = Arc::clone(&self.conversions)
             .acquire_owned()
             .await
@@ -821,7 +825,10 @@ impl WebFetch {
         match self.converter {
             Converter::Child => convert_in_child(kind, &input, url).await,
             #[cfg(test)]
-            Converter::InProcess => convert(kind, &input, url).map(cap_text),
+            Converter::InProcess => convert(kind, &input, url).map(|(text, layout)| {
+                let (text, cut) = cap_text(text);
+                Document { text, cut, layout }
+            }),
         }
     }
 }
@@ -832,7 +839,9 @@ impl WebFetch {
 /// so in the log instead of in every call.
 pub async fn self_test() -> Result<(), String> {
     let url = Url::parse("https://example.com/").map_err(|e| e.to_string())?;
-    let (text, _) = convert_in_child(Kind::Html, b"<p>converter ok</p>", &url).await?;
+    let text = convert_in_child(Kind::Html, b"<p>converter ok</p>", &url)
+        .await?
+        .text;
     if text.contains("converter ok") {
         Ok(())
     } else {
@@ -1193,8 +1202,8 @@ fn error_chain(e: &dyn std::error::Error) -> String {
 
 /// The text of document `input` of `kind` (issue #106: a file sent in a
 /// chat), read in a converter child under the same limits as a fetched
-/// page, and whether it was cut.
-pub async fn document_text(kind: Kind, input: &[u8]) -> Result<(String, bool), String> {
+/// page.
+pub async fn document_text(kind: Kind, input: &[u8]) -> Result<Document, String> {
     let _slot = UPLOAD_CONVERSIONS
         .acquire()
         .await
@@ -1219,56 +1228,92 @@ pub async fn image_to_show(input: &[u8]) -> Result<Vec<u8>, String> {
 
 /// The converter's argument for an image, made a copy a model can be shown.
 const IMAGE: &str = "image";
-/// The converter's argument for the pages of a PDF made images (issue
-/// #230), followed by the characters of its text.
+/// The converter's argument for pages of a PDF made images (issue #230),
+/// followed by their numbers, or [`FIRST_PAGES`].
 const PAGES: &str = "pages";
+/// The pages to make images when which have no text is not known: the
+/// first ones.
+const FIRST_PAGES: &str = "first";
 
-/// Characters other than white space a PDF's text has per page, on
-/// average, below which it is taken for one without a text layer (issue
-/// #230): a scan, or pages of pictures.
-const MIN_PAGE_CHARS: usize = 50;
+/// Characters other than white space a PDF's page has, below which it is
+/// taken for one without a text layer (issue #230): a scan, a picture.
+const MIN_PAGE_CHARS: usize = 32;
 /// Longest side, in pixels, of a page made an image: as large as models
 /// read small print at.
 const PAGE_SIDE: f32 = 1600.0;
 const PAGE_QUALITY: u8 = 80;
 /// Bytes of the images one PDF's pages are made, at most.
 pub const MAX_PAGES_BYTES: usize = 24 * 1024 * 1024;
-/// How long the converter goes on starting pages: within its CPU time.
-const PAGES_TIME: Duration = Duration::from_secs(12);
+/// How long the converter goes on starting pages: well within its CPU time
+/// and deadline, counting the longest page made so far.
+const PAGES_TIME: Duration = Duration::from_secs(10);
 
-/// A PDF with too little text for its pages (issue #230): how many pages
-/// it has, and its first pages as JPEG images, in order.
+/// Pages of a PDF made images (issue #230).
 #[derive(Debug, Default)]
-pub struct Pages {
-    pub count: u32,
-    pub images: Vec<Vec<u8>>,
+pub struct Drawn {
+    /// How many pages the PDF has, when the converter got that far.
+    pub count: Option<u32>,
+    /// The pages made, by number from 1, each a JPEG image.
+    pub images: Vec<(u32, Vec<u8>)>,
+    /// Why it stopped before all were made, when it failed.
+    pub failed: Option<String>,
 }
 
-/// The pages of PDF `input` (a file sent in a chat), whose text has `chars`
-/// characters other than white space, as images a model can be shown, when
-/// that is too little text for its pages (issue #230); `None` when it has a
-/// text layer. Made in a converter child under the same limits as a
-/// document's text.
-pub async fn scanned_pages(input: &[u8], chars: usize) -> Result<Option<Pages>, String> {
-    let _slot = UPLOAD_CONVERSIONS
-        .acquire()
-        .await
-        .map_err(|e| e.to_string())?;
-    let chars = chars.to_string();
-    let out = run_converter(
-        &[PAGES, &chars],
-        input,
-        &upload_url()?,
-        MAX_PAGES_BYTES + 64 * 1024,
-    )
-    .await?;
-    read_pages(&out)
+impl Drawn {
+    /// The converter could not open the PDF: it is encrypted.
+    #[must_use]
+    pub fn encrypted(&self) -> bool {
+        self.failed
+            .as_deref()
+            .is_some_and(|why| why.contains(ENCRYPTED))
+    }
 }
 
-/// The pages the converter wrote: a line `text <count>` for a PDF with a
-/// text layer, else `scan <count>` and each image, after a line with its
-/// length.
-fn read_pages(out: &[u8]) -> Result<Option<Pages>, String> {
+/// What the converter says of a PDF it cannot open for a password.
+const ENCRYPTED: &str = "the PDF is encrypted";
+
+/// Pages `wanted` of PDF `input` (a file sent in a chat), or its first
+/// pages when that is `None`, made images a model can be shown (issue
+/// #230) in a converter child under the same limits as a document's text.
+/// The pages made before it failed or ran out of time are kept.
+pub async fn scanned_pages(input: &[u8], wanted: Option<&[u32]>) -> Drawn {
+    let Ok(_slot) = UPLOAD_CONVERSIONS.acquire().await else {
+        return Drawn {
+            failed: Some("the gateway is shutting down".into()),
+            ..Drawn::default()
+        };
+    };
+    let pages = match wanted {
+        Some(wanted) => wanted
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        None => FIRST_PAGES.to_string(),
+    };
+    let url = match upload_url() {
+        Ok(url) => url,
+        Err(why) => {
+            return Drawn {
+                failed: Some(why),
+                ..Drawn::default()
+            };
+        }
+    };
+    let (out, done) =
+        converter_output(&[PAGES, &pages], input, &url, MAX_PAGES_BYTES + 64 * 1024).await;
+    let (count, images) = read_pages(&out);
+    Drawn {
+        count,
+        images,
+        failed: done.err(),
+    }
+}
+
+/// The pages the converter wrote: a line with how many the PDF has, then
+/// for each page made a line with its number and length, and its JPEG.
+/// A page cut short, or not a JPEG, ends them.
+fn read_pages(out: &[u8]) -> (Option<u32>, Vec<(u32, Vec<u8>)>) {
     let line = |bytes: &[u8]| -> Option<(String, usize)> {
         let end = bytes.iter().position(|b| *b == b'\n')?;
         Some((
@@ -1276,59 +1321,69 @@ fn read_pages(out: &[u8]) -> Result<Option<Pages>, String> {
             end + 1,
         ))
     };
-    let unreadable = || "the converter wrote no pages".to_string();
-    let (head, mut at) = line(out).ok_or_else(unreadable)?;
-    let (kind, count) = head.split_once(' ').ok_or_else(unreadable)?;
-    let count: u32 = count.parse().map_err(|_| unreadable())?;
-    match kind {
-        "text" => return Ok(None),
-        "scan" => {}
-        _ => return Err(unreadable()),
-    }
+    let Some((count, mut at)) = line(out) else {
+        return (None, Vec::new());
+    };
+    let count = count.parse().ok();
     let mut images = Vec::new();
-    while at < out.len() {
-        let (size, after) = line(&out[at..]).ok_or_else(unreadable)?;
-        let size: usize = size.parse().map_err(|_| unreadable())?;
+    while let Some((head, after)) = line(&out[at..]) {
+        let Some((page, size)) = head.split_once(' ') else {
+            break;
+        };
+        let (Ok(page), Ok(size)) = (page.parse::<u32>(), size.parse::<usize>()) else {
+            break;
+        };
         let start = at + after;
-        let image = out.get(start..start + size).ok_or_else(unreadable)?;
+        let Some(image) = out.get(start..start.saturating_add(size)) else {
+            break;
+        };
         if llm_proxy::image_type(image) != Some("image/jpeg") {
-            return Err(unreadable());
+            break;
         }
-        images.push(image.to_vec());
+        images.push((page, image.to_vec()));
         at = start + size;
     }
-    Ok(Some(Pages { count, images }))
+    (count, images)
 }
 
-/// Whether `chars` characters of text are too few for `pages` pages.
-fn lacks_text(chars: usize, pages: usize) -> bool {
-    chars < MIN_PAGE_CHARS * pages.max(1)
-}
-
-/// What the converter writes for PDF `input` with `chars` characters of
-/// text, as [`read_pages`] reads it: its first pages drawn as JPEG images,
-/// when that is too little text for them. The bytes are untrusted: this
-/// runs in the converter child.
-fn page_images(input: &[u8], chars: usize) -> Result<Vec<u8>, String> {
+/// Make pages `wanted` of PDF `input`, or its first pages when that is
+/// `None`, JPEG images, written to `out` as [`read_pages`] reads them, each
+/// as soon as it is made. The bytes are untrusted: this runs in the
+/// converter child.
+fn page_images(
+    input: &[u8],
+    wanted: Option<&[u32]>,
+    out: &mut dyn std::io::Write,
+) -> Result<(), String> {
     use hayro::hayro_syntax::{LoadPdfError, Pdf};
     use image::ImageEncoder as _;
+    let written = |e: std::io::Error| format!("writing the pages failed: {e}");
     let pdf = Pdf::new(Arc::new(input.to_vec())).map_err(|e| match e {
-        LoadPdfError::Decryption(_) => "the PDF is encrypted".to_string(),
+        LoadPdfError::Decryption(_) => ENCRYPTED.to_string(),
         LoadPdfError::Invalid => "not a readable PDF".to_string(),
     })?;
     let pages = pdf.pages();
-    let mut out = Vec::new();
-    if !lacks_text(chars, pages.len()) {
-        out.extend_from_slice(format!("text {}\n", pages.len()).as_bytes());
-        return Ok(out);
-    }
-    out.extend_from_slice(format!("scan {}\n", pages.len()).as_bytes());
+    writeln!(out, "{}", pages.len()).map_err(written)?;
+    out.flush().map_err(written)?;
+    let numbers: Vec<u32> = match wanted {
+        Some(wanted) => wanted
+            .iter()
+            .copied()
+            .filter(|n| *n >= 1 && (*n as usize) <= pages.len())
+            .take(havn_core::MAX_SCAN_PAGES as usize)
+            .collect(),
+        None => (1..=pages.len().min(havn_core::MAX_SCAN_PAGES as usize) as u32).collect(),
+    };
     let started = Instant::now();
     let settings = hayro::hayro_interpret::InterpreterSettings::default();
-    for page in pages.iter().take(havn_core::MAX_SCAN_PAGES as usize) {
-        if started.elapsed() > PAGES_TIME {
+    let (mut longest, mut largest, mut total) = (Duration::ZERO, 0, 0);
+    for n in numbers {
+        // A page not started when the next might not end in time, or fit.
+        if started.elapsed() + longest > PAGES_TIME || total + 2 * largest > MAX_PAGES_BYTES {
             break;
         }
+        let began = Instant::now();
+        let page = &pages[n as usize - 1];
         let (width, height) = page.render_dimensions();
         let scale = PAGE_SIDE / width.max(height).max(1.0);
         // A cache of its own for each page, so the images a page decoded
@@ -1352,23 +1407,26 @@ fn page_images(input: &[u8], chars: usize) -> Result<Vec<u8>, String> {
             .flat_map(|p| [p[0], p[1], p[2]])
             .collect();
         let mut jpeg = Vec::new();
-        let written = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, PAGE_QUALITY)
+        let encoded = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, PAGE_QUALITY)
             .write_image(
                 &rgb,
                 u32::from(pixmap.width()),
                 u32::from(pixmap.height()),
                 image::ExtendedColorType::Rgb8,
             );
-        // A page that cannot be drawn ends the pages shown.
-        if written.is_err() || out.len() + jpeg.len() > MAX_PAGES_BYTES {
+        // A page that cannot be made an image ends the pages made.
+        if encoded.is_err() || total + jpeg.len() > MAX_PAGES_BYTES {
             break;
         }
-        out.extend_from_slice(format!("{}\n", jpeg.len()).as_bytes());
-        out.extend_from_slice(&jpeg);
+        writeln!(out, "{n} {}", jpeg.len()).map_err(written)?;
+        out.write_all(&jpeg).map_err(written)?;
+        out.flush().map_err(written)?;
+        longest = longest.max(began.elapsed());
+        largest = largest.max(jpeg.len());
+        total += jpeg.len();
     }
-    Ok(out)
+    Ok(())
 }
-
 /// Converters of uploads, apart from the tool's: each may take
 /// [`CONVERT_MEMORY_BYTES`].
 static UPLOAD_CONVERSIONS: Semaphore = Semaphore::const_new(2);
@@ -1388,15 +1446,70 @@ fn converter_program() -> PathBuf {
     }
 }
 
+/// A document's text, as a converter child made it.
+#[derive(Debug)]
+pub struct Document {
+    pub text: String,
+    /// It was cut at [`MAX_TEXT_BYTES`].
+    pub cut: bool,
+    /// A PDF's pages, and those of little or no text (issue #230).
+    pub layout: Option<Layout>,
+}
+
+/// The pages of a PDF, and those with little or no text that could be
+/// read (issue #230).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layout {
+    pub pages: u32,
+    /// How many have fewer than [`MIN_PAGE_CHARS`] characters of text.
+    pub sparse: u32,
+    /// The first [`havn_core::MAX_SCAN_PAGES`] of them, by number from 1.
+    pub draw: Vec<u32>,
+}
+
+impl Layout {
+    /// As the converter's first line carries it, after `full` or `cut`.
+    fn line(&self) -> String {
+        let draw: Vec<String> = self.draw.iter().map(u32::to_string).collect();
+        format!(" {} {} {}", self.pages, self.sparse, draw.join(","))
+    }
+
+    /// From the words of the converter's first line after `full` or `cut`.
+    fn read(words: &[&str]) -> Option<Self> {
+        let [pages, sparse, rest @ ..] = words else {
+            return None;
+        };
+        let draw = match rest.first() {
+            Some(list) if !list.is_empty() => list
+                .split(',')
+                .map(str::parse)
+                .collect::<Result<Vec<u32>, _>>()
+                .ok()?,
+            _ => Vec::new(),
+        };
+        Some(Self {
+            pages: pages.parse().ok()?,
+            sparse: sparse.parse().ok()?,
+            draw,
+        })
+    }
+}
+
 /// Convert `input` in a converter child. The URL, the base for relative
 /// links, goes on the first line of its stdin rather than in its arguments,
 /// where other local users would see it. The child answers with a line
-/// saying whether it cut the text, then the text.
-async fn convert_in_child(kind: Kind, input: &[u8], url: &Url) -> Result<(String, bool), String> {
-    let out = run_converter(&[kind.name()], input, url, MAX_TEXT_BYTES + 16).await?;
+/// saying whether it cut the text (and, for a PDF, its pages), then the
+/// text.
+async fn convert_in_child(kind: Kind, input: &[u8], url: &Url) -> Result<Document, String> {
+    let out = run_converter(&[kind.name()], input, url, MAX_TEXT_BYTES + 256).await?;
     let out = String::from_utf8_lossy(&out);
-    let (flag, text) = out.split_once('\n').unwrap_or(("full", ""));
-    Ok((text.to_string(), flag == "cut"))
+    let (head, text) = out.split_once('\n').unwrap_or(("full", ""));
+    let words: Vec<&str> = head.split(' ').collect();
+    Ok(Document {
+        text: text.to_string(),
+        cut: words.first() == Some(&"cut"),
+        layout: Layout::read(words.get(1..).unwrap_or_default()),
+    })
 }
 
 /// Run a converter child on `input` with arguments `args`: what it wrote,
@@ -1407,6 +1520,31 @@ async fn run_converter(
     url: &Url,
     max_out: usize,
 ) -> Result<Vec<u8>, String> {
+    let (out, done) = converter_output(args, input, url, max_out).await;
+    done.map(|()| out)
+}
+
+/// Run a converter child on `input` with arguments `args`: what it wrote,
+/// up to `max_out` bytes, also when it failed or ran out of time, and
+/// whether it finished.
+async fn converter_output(
+    args: &[&str],
+    input: &[u8],
+    url: &Url,
+    max_out: usize,
+) -> (Vec<u8>, Result<(), String>) {
+    let mut out = Vec::new();
+    let done = run_child(args, input, url, max_out, &mut out).await;
+    (out, done)
+}
+
+async fn run_child(
+    args: &[&str],
+    input: &[u8],
+    url: &Url,
+    max_out: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
     let mut command = tokio::process::Command::new(converter_program());
     command
         .arg(CONVERT_ARG)
@@ -1444,14 +1582,9 @@ async fn run_converter(
             drop(stdin);
             result
         };
-        let read = async {
-            let mut out = Vec::new();
-            (&mut stdout)
-                .take(max_out as u64)
-                .read_to_end(&mut out)
-                .await
-                .map(|_| out)
-        };
+        // Into `out` as it comes, so what came stays when time runs out.
+        let mut limited = (&mut stdout).take(max_out as u64);
+        let read = limited.read_to_end(out);
         let read_err = async {
             let mut err = Vec::new();
             (&mut stderr).take(4096).read_to_end(&mut err).await?;
@@ -1459,11 +1592,11 @@ async fn run_converter(
             tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await?;
             Ok::<_, std::io::Error>(err)
         };
-        let (_, out, err) = tokio::join!(write, read, read_err);
+        let (_, read, err) = tokio::join!(write, read, read_err);
         let status = child.wait().await;
-        (out, err, status)
+        (read, err, status)
     };
-    let (out, err, status) = tokio::time::timeout(CONVERT_DEADLINE, run)
+    let (read, err, status) = tokio::time::timeout(CONVERT_DEADLINE, run)
         .await
         .map_err(|_| {
             format!(
@@ -1482,7 +1615,8 @@ async fn run_converter(
             format!("could not read {url}: {message}")
         });
     }
-    out.map_err(|e| format!("reading the page converter's output failed: {e}"))
+    read.map(|_| ())
+        .map_err(|e| format!("reading the page converter's output failed: {e}"))
 }
 
 #[cfg(unix)]
@@ -1547,8 +1681,8 @@ fn confine_converter(command: &mut tokio::process::Command) {
 /// `havn-gateway --convert-page <kind>`: convert the document on stdin,
 /// after a first line holding its URL, to a line `full` or `cut` and the
 /// text on stdout; with [`IMAGE`], the image to the copy a model is shown
-/// (issue #225); with [`PAGES`] and the characters of a PDF's text, its
-/// pages to images when it has too little text (issue #230). Run by the
+/// (issue #225); with [`PAGES`] and page numbers, those pages of a PDF to
+/// images (issue #230). Run by the
 /// gateway only, before any async runtime starts. False when it failed,
 /// with the reason on stderr.
 pub fn convert_main(args: &[String]) -> bool {
@@ -1558,13 +1692,21 @@ pub fn convert_main(args: &[String]) -> bool {
         false
     };
     let usage = "usage: havn-gateway --convert-page <html|pdf|text|docx|sheet|pptx|image> \
-                 | pages <characters>";
+                 | pages <first|n,n,...>";
     // `None` for an image, made a copy a model can be shown, or a PDF's
     // pages, made images.
     let (kind, pages) = match args.first().map(String::as_str) {
         Some(IMAGE) => (None, None),
-        Some(PAGES) => match args.get(1).and_then(|c| c.parse::<usize>().ok()) {
-            Some(chars) => (None, Some(chars)),
+        Some(PAGES) => match args.get(1).map(String::as_str) {
+            Some(FIRST_PAGES) => (None, Some(None)),
+            Some(list) => match list
+                .split(',')
+                .map(str::parse)
+                .collect::<Result<Vec<u32>, _>>()
+            {
+                Ok(wanted) => (None, Some(Some(wanted))),
+                Err(_) => return fail(usage),
+            },
             None => return fail(usage),
         },
         named => match named.and_then(Kind::named) {
@@ -1605,12 +1747,9 @@ pub fn convert_main(args: &[String]) -> bool {
     };
     #[cfg(not(unix))]
     let mut out = std::io::stdout();
-    if let Some(chars) = pages {
-        return match page_images(&input[newline + 1..], chars) {
-            Ok(pages) => match out.write_all(&pages).and_then(|()| out.flush()) {
-                Ok(()) => true,
-                Err(e) => fail(&format!("writing the pages failed: {e}")),
-            },
+    if let Some(wanted) = pages {
+        return match page_images(&input[newline + 1..], wanted.as_deref(), &mut out) {
+            Ok(()) => true,
             Err(message) => fail(&message),
         };
     }
@@ -1624,10 +1763,15 @@ pub fn convert_main(args: &[String]) -> bool {
         };
     };
     match convert(kind, &input[newline + 1..], &url) {
-        Ok(text) => {
+        Ok((text, layout)) => {
             let (text, cut) = cap_text(text);
+            let head = format!(
+                "{}{}\n",
+                if cut { "cut" } else { "full" },
+                layout.as_ref().map(Layout::line).unwrap_or_default()
+            );
             let written = out
-                .write_all(if cut { b"cut\n" } else { b"full\n" })
+                .write_all(head.as_bytes())
                 .and_then(|()| out.write_all(text.as_bytes()))
                 .and_then(|()| out.flush());
             match written {
@@ -1653,19 +1797,48 @@ fn cap_text(mut text: String) -> (String, bool) {
     (text, true)
 }
 
-/// The text of a document: HTML, Word, spreadsheets and presentations as Markdown, PDF
-/// as plain text, text as it is. HTML and text arrive as UTF-8.
-fn convert(kind: Kind, input: &[u8], url: &Url) -> Result<String, String> {
-    let text = match kind {
-        Kind::Text => String::from_utf8_lossy(input).into_owned(),
-        Kind::Html => html_to_markdown(&String::from_utf8_lossy(input), url)?,
-        Kind::Pdf => pdf_extract::extract_text_from_mem(input)
-            .map_err(|e| format!("not a readable PDF: {e}"))?,
-        Kind::Docx => crate::office::docx_text(input)?,
-        Kind::Sheet => crate::office::sheet_text(input)?,
-        Kind::Slides => crate::office::pptx_text(input)?,
+/// The text of a document: HTML, Word, spreadsheets and presentations as
+/// Markdown, PDF as plain text (with its pages), text as it is. HTML and
+/// text arrive as UTF-8.
+fn convert(kind: Kind, input: &[u8], url: &Url) -> Result<(String, Option<Layout>), String> {
+    let (text, layout) = match kind {
+        Kind::Text => (String::from_utf8_lossy(input).into_owned(), None),
+        Kind::Html => (
+            html_to_markdown(&String::from_utf8_lossy(input), url)?,
+            None,
+        ),
+        Kind::Pdf => {
+            let (text, layout) = pdf_text(input)?;
+            (text, Some(layout))
+        }
+        Kind::Docx => (crate::office::docx_text(input)?, None),
+        Kind::Sheet => (crate::office::sheet_text(input)?, None),
+        Kind::Slides => (crate::office::pptx_text(input)?, None),
     };
-    Ok(tidy(&text))
+    Ok((tidy(&text), layout))
+}
+
+/// The text of PDF `input`, page by page, and which pages have too little
+/// of it (issue #230).
+fn pdf_text(input: &[u8]) -> Result<(String, Layout), String> {
+    let pages = pdf_extract::extract_text_from_mem_by_pages(input)
+        .map_err(|e| format!("not a readable PDF: {e}"))?;
+    let mut sparse = 0;
+    let mut draw = Vec::new();
+    for (n, page) in (1..).zip(&pages) {
+        if page.chars().filter(|c| !c.is_whitespace()).count() < MIN_PAGE_CHARS {
+            sparse += 1;
+            if draw.len() < havn_core::MAX_SCAN_PAGES as usize {
+                draw.push(n);
+            }
+        }
+    }
+    let layout = Layout {
+        pages: u32::try_from(pages.len()).unwrap_or(u32::MAX),
+        sparse,
+        draw,
+    };
+    Ok((pages.join("\n\n"), layout))
 }
 
 fn html_to_markdown(html: &str, base: &Url) -> Result<String, String> {
@@ -1980,7 +2153,8 @@ mod tests {
             html.as_bytes(),
             &url("https://example.com/blog/post"),
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(md.contains("# Release notes"), "{md}");
         assert!(
             md.contains("[the guide](https://example.com/docs/install?x=1)"),
@@ -2008,9 +2182,10 @@ mod tests {
         );
     }
 
-    /// A PDF of `pages` pages of 300 by 400 points, each a grey square and,
-    /// with `text`, a line of it.
-    pub(crate) fn pdf(pages: usize, text: Option<&str>) -> Vec<u8> {
+    /// A PDF of a page of 300 by 400 points for each of `texts`, each a
+    /// grey square and, with its text, a line of it.
+    pub(crate) fn pdf(texts: &[Option<&str>]) -> Vec<u8> {
+        let pages = texts.len();
         let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", 4 + 2 * i)).collect();
         let mut objects = vec![
             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
@@ -2020,7 +2195,7 @@ mod tests {
             ),
             "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
         ];
-        for i in 0..pages {
+        for (i, text) in texts.iter().enumerate() {
             let mut content = "0.5 g 50 50 200 200 re f".to_string();
             if let Some(text) = text {
                 content.push_str(&format!(" BT /F1 12 Tf 20 350 Td ({text}) Tj ET"));
@@ -2059,23 +2234,53 @@ mod tests {
     }
 
     #[test]
-    fn a_pdf_without_text_has_its_pages_drawn() {
+    fn a_pdf_s_pages_without_text_are_found_and_drawn() {
         let base = url("https://upload.invalid/");
-        let chars = |input: &[u8]| {
-            convert(Kind::Pdf, input, &base)
-                .unwrap_or_default()
-                .chars()
-                .filter(|c| !c.is_whitespace())
-                .count()
-        };
-        let scan = pdf(3, None);
-        assert_eq!(chars(&scan), 0);
-        let pages = read_pages(&page_images(&scan, 0).expect("drawn"))
-            .expect("read")
-            .expect("a scan");
-        assert_eq!(pages.count, 3);
-        assert_eq!(pages.images.len(), 3);
-        let first = image::load_from_memory(&pages.images[0])
+        let words = "words of a page ".repeat(5);
+        let mixed = pdf(&[
+            Some(&words),
+            None,
+            Some("Scanned with CamScanner"),
+            Some(&words),
+        ]);
+        let (text, layout) = convert(Kind::Pdf, &mixed, &base).expect("read");
+        assert!(text.contains("words of a page"), "{text}");
+        assert_eq!(
+            layout,
+            Some(Layout {
+                pages: 4,
+                sparse: 2,
+                draw: vec![2, 3]
+            })
+        );
+        // As the converter's first line carries it.
+        let carried = layout.expect("layout").line();
+        let words: Vec<&str> = carried.trim_start().split(' ').collect();
+        assert_eq!(
+            Layout::read(&words),
+            Some(Layout {
+                pages: 4,
+                sparse: 2,
+                draw: vec![2, 3]
+            })
+        );
+        // No page without text: the line ends with an empty list.
+        let none = Layout {
+            pages: 3,
+            sparse: 0,
+            draw: Vec::new(),
+        }
+        .line();
+        let words: Vec<&str> = none.trim_start().split(' ').collect();
+        assert_eq!(Layout::read(&words).map(|l| l.draw), Some(Vec::new()));
+
+        // The pages asked for are drawn, each as it is made.
+        let mut out = Vec::new();
+        page_images(&mixed, Some(&[2, 3, 9]), &mut out).expect("drawn");
+        let (count, images) = read_pages(&out);
+        assert_eq!(count, Some(4));
+        assert_eq!(images.iter().map(|(n, _)| *n).collect::<Vec<_>>(), [2, 3]);
+        let first = image::load_from_memory(&images[0].1)
             .expect("a JPEG")
             .to_luma8();
         assert_eq!((first.width(), first.height()), (1200, 1600));
@@ -2083,23 +2288,21 @@ mod tests {
         let grey = first.get_pixel(600, 1000).0[0];
         assert!((110..=145).contains(&grey), "{grey}");
         assert!(first.get_pixel(20, 20).0[0] > 240);
+        // Without a list, the first pages.
+        let mut first_pages = Vec::new();
+        page_images(&mixed, None, &mut first_pages).expect("drawn");
+        assert_eq!(read_pages(&first_pages).1.len(), 4);
 
-        // Text enough for its pages: none drawn.
-        let typed = pdf(2, Some(&"words of a page ".repeat(5)));
-        let found = chars(&typed);
-        assert!(found >= 2 * MIN_PAGE_CHARS, "{found}");
-        assert!(
-            read_pages(&page_images(&typed, found).expect("read"))
-                .expect("read")
-                .is_none()
-        );
-        // A little text on each page, as a scanning app stamps, is a scan.
-        assert!(lacks_text(21 * 30, 30));
-        assert!(page_images(b"%PDF-1.4 not really", 0).is_err());
-        // What the converter wrote, cut short or not a JPEG, is refused.
-        assert!(read_pages(b"scan 1\n5\nhello").is_err());
-        assert!(read_pages(b"scan 1\n99\n\xff\xd8\xff").is_err());
-        assert!(read_pages(b"other 1\n").is_err());
+        // What came before the converter stopped is kept; what it cut short
+        // or that is not a JPEG is not.
+        let whole = out.len();
+        let (_, cut) = read_pages(&out[..whole - 10]);
+        assert_eq!(cut.len(), 1);
+        assert_eq!(read_pages(b"4\n1 5\nhello").1.len(), 0);
+        assert_eq!(read_pages(b"").0, None);
+
+        let mut nothing = Vec::new();
+        assert!(page_images(b"%PDF-1.4 not really", None, &mut nothing).is_err());
     }
 
     #[test]

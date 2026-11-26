@@ -18,7 +18,7 @@ pub use ids::{
 };
 pub use message::{
     Attachment, Branch, Button, INBOX_DIR, InboundMessage, MAX_BUTTON_DATA, MAX_SCAN_PAGES,
-    MessageContent, OutboundMessage, Poll, Scan,
+    MessageContent, OutboundMessage, Poll, Scan, Unread,
 };
 pub use policy::{
     AGENT_CGROUP_PARENT, AGENT_CGROUP_PREFIX, AdminVisibility, BudgetExhaustAction, BudgetPolicy,

@@ -194,14 +194,28 @@ pub async fn receive(
     // A picture a model cannot be shown as it is, too large or a HEIC
     // photo, gets a copy it can, shown in its place (issue #225).
     let copied = media_type.starts_with("image/") && crate::llm_proxy::needs_copy(&body);
+    // Room for what is made of it: bytes and entries.
     let reserve = if text_kind == Some(crate::web_fetch::Kind::Pdf) {
-        TEXT_BYTES + crate::web_fetch::MAX_PAGES_BYTES as u64
+        Reserve {
+            bytes: TEXT_BYTES + crate::web_fetch::MAX_PAGES_BYTES as u64,
+            entries: 1 + havn_core::MAX_SCAN_PAGES as usize,
+        }
     } else if text_kind.is_some() {
-        TEXT_BYTES
+        Reserve {
+            bytes: TEXT_BYTES,
+            entries: 1,
+        }
     } else if copied {
-        crate::llm_proxy::MAX_IMAGE_BYTES
+        Reserve {
+            bytes: crate::llm_proxy::MAX_IMAGE_BYTES,
+            entries: 1,
+        }
     } else {
-        0
+        // A transcript, perhaps.
+        Reserve {
+            bytes: 0,
+            entries: 1,
+        }
     };
     let file = name.clone();
     let stored =
@@ -215,22 +229,30 @@ pub async fn receive(
     // whose text cannot be read still arrives.
     let mut text_path = None;
     let mut scan = None;
+    let mut unread = None;
     if let Some(kind) = text_kind {
-        let text = match crate::web_fetch::document_text(kind, &body).await {
-            Ok((text, _)) => text,
-            Err(e) => {
-                tracing::info!(agent_id = %agent_id, error = %e, "no text read from an uploaded document");
-                String::new()
-            }
-        };
-        // A PDF with too little text for its pages, a scan, is told as one,
-        // with its pages as images (issue #230).
-        if kind == crate::web_fetch::Kind::Pdf {
-            let chars = text.chars().filter(|c| !c.is_whitespace()).count();
-            scan = keep_pages(state, agent_id, &stored.file, &body, chars).await;
+        let read = crate::web_fetch::document_text(kind, &body).await;
+        if let Err(e) = &read {
+            tracing::info!(agent_id = %agent_id, error = %e, "no text read from an uploaded document");
         }
-        if !text.trim().is_empty() {
-            text_path = keep(state, agent_id, text_name(&stored.file), text.into_bytes()).await;
+        // A PDF's pages with too little text, scans, are told as such, and
+        // made images (issue #230); what cannot be read at all says why.
+        if kind == crate::web_fetch::Kind::Pdf {
+            let layout = read.as_ref().ok().map(|doc| doc.layout.clone());
+            (scan, unread) = keep_pages(state, agent_id, &stored.file, &body, layout).await;
+        } else if read.is_err() {
+            unread = Some(havn_core::Unread::Damaged);
+        }
+        if let Ok(doc) = read
+            && !doc.text.trim().is_empty()
+        {
+            text_path = keep(
+                state,
+                agent_id,
+                text_name(&stored.file),
+                doc.text.into_bytes(),
+            )
+            .await;
         }
     }
     // An audio file's transcript (issue #164), kept as its text and shown
@@ -278,42 +300,71 @@ pub async fn receive(
         text_path,
         transcript,
         scan,
+        unread,
     };
     Ok(attachment)
 }
 
-/// The pages of PDF `body`, kept in the inbox as `file`, made images when
-/// its text, of `chars` characters other than white space, is too little
-/// for them (issue #230): how many it has and how many were kept. `None`
-/// for a PDF with a text layer; with none kept when they could not be
-/// made, and no text could be read either.
+/// The pages of PDF `body`, kept in the inbox as `file`, that have little
+/// or no text by `layout`, made images and kept next to it (issue #230);
+/// when its text could not be read (`layout` is `None`), its first pages.
+/// `None` for a PDF with text on every page; why it could not be read,
+/// when the renderer could not read it either.
 async fn keep_pages(
     state: &AppState,
     agent_id: havn_core::AgentId,
     file: &str,
     body: &[u8],
-    chars: usize,
-) -> Option<havn_core::Scan> {
-    let pages = match crate::web_fetch::scanned_pages(body, chars).await {
-        Ok(Some(pages)) => pages,
-        Ok(None) => return None,
-        Err(why) => {
-            tracing::info!(agent_id = %agent_id, why, "the pages of a PDF were not made images");
-            return (chars == 0).then_some(havn_core::Scan { pages: 0, shown: 0 });
-        }
+    layout: Option<Option<crate::web_fetch::Layout>>,
+) -> (Option<havn_core::Scan>, Option<havn_core::Unread>) {
+    let layout = layout.flatten();
+    if layout.as_ref().is_some_and(|l| l.draw.is_empty()) {
+        return (None, None);
+    }
+    let drawn = crate::web_fetch::scanned_pages(body, layout.as_ref().map(|l| &l.draw[..])).await;
+    if let Some(why) = &drawn.failed {
+        tracing::info!(agent_id = %agent_id, why, "not all the pages of a PDF were made images");
+    }
+    let (pages, sparse) = match (&layout, drawn.count) {
+        (Some(layout), _) => (layout.pages, layout.sparse),
+        // No text could be read: every page lacks it.
+        (None, Some(count)) => (count, count),
+        (None, None) if drawn.encrypted() => return (None, Some(havn_core::Unread::Encrypted)),
+        (None, None) => return (None, Some(havn_core::Unread::Damaged)),
     };
-    let mut shown = 0;
-    for (n, image) in (1..).zip(pages.images) {
-        let name = Attachment::page_image(file, n);
-        if keep(state, agent_id, name, image).await.is_none() {
+    let mut shown = Vec::new();
+    for (n, image) in drawn.images {
+        if keep(state, agent_id, Attachment::page_image(file, n), image)
+            .await
+            .is_none()
+        {
             break;
         }
-        shown = n;
+        shown.push(n);
     }
-    Some(havn_core::Scan {
-        pages: pages.count,
-        shown,
-    })
+    (
+        Some(havn_core::Scan {
+            pages,
+            sparse,
+            shown,
+        }),
+        None,
+    )
+}
+
+/// The pages of PDF `file` kept as images in `inbox`, by number, in order.
+fn kept_pages(inbox: &WorkspaceDir, file: &str) -> Vec<u32> {
+    let mut pages: Vec<u32> = inbox
+        .regular_files(
+            |entry| Attachment::page_of(file, entry).is_some(),
+            MAX_INBOX_FILES,
+        )
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|(entry, _)| Attachment::page_of(file, entry))
+        .collect();
+    pages.sort_unstable();
+    pages
 }
 
 /// Where the text of inbox file `file` is kept, next to it.
@@ -403,31 +454,38 @@ pub async fn as_kept(
     {
         let file = file.clone();
         let kept = tokio::task::spawn_blocking(move || {
-            let inbox = inbox(&workspace).ok()?;
-            let shown = (1..=havn_core::MAX_SCAN_PAGES)
-                .take_while(|n| {
-                    inbox
-                        .has(&Attachment::page_image(&file, *n))
-                        .unwrap_or(false)
-                })
-                .count() as u32;
-            Some(shown)
+            inbox(&workspace)
+                .ok()
+                .map(|inbox| kept_pages(&inbox, &file))
         })
         .await
         .ok()
-        .flatten();
-        attachment.scan = match (sent_scan, kept) {
+        .flatten()
+        .unwrap_or_default();
+        let count = |pages: &[u32]| u32::try_from(pages.len()).unwrap_or(u32::MAX);
+        attachment.scan = match sent_scan {
             // What the page sent, as far as the pages are there.
-            (Some(sent), Some(kept)) => Some(havn_core::Scan {
-                pages: sent.pages.max(kept),
-                shown: sent.shown.min(kept),
-            }),
+            Some(sent) => {
+                let shown: Vec<u32> = sent
+                    .shown
+                    .iter()
+                    .copied()
+                    .filter(|n| kept.contains(n))
+                    .collect();
+                let sparse = sent.sparse.max(count(&shown));
+                Some(havn_core::Scan {
+                    pages: sent.pages.max(sparse),
+                    sparse,
+                    shown,
+                })
+            }
             // A page that did not send it: the pages that are there.
-            (None, Some(kept)) if kept > 0 => Some(havn_core::Scan {
-                pages: kept,
+            None if !kept.is_empty() => Some(havn_core::Scan {
+                pages: count(&kept),
+                sparse: count(&kept),
                 shown: kept,
             }),
-            _ => None,
+            None => None,
         };
         return attachment;
     }
@@ -472,9 +530,14 @@ pub fn discard_path(workspace: &std::path::Path, path: &str, text_path: Option<&
     let file = name(path);
     let copy = file.as_deref().map(crate::llm_proxy::shown_copy);
     // A scan's pages, kept as images (issue #230).
-    let pages = file.iter().flat_map(|file| {
-        (1..=havn_core::MAX_SCAN_PAGES).map(move |n| Attachment::page_image(file, n))
-    });
+    let pages: Vec<String> = file
+        .iter()
+        .flat_map(|file| {
+            kept_pages(&inbox, file)
+                .into_iter()
+                .map(move |n| Attachment::page_image(file, n))
+        })
+        .collect();
     let names = std::iter::once(path)
         .chain(text_path)
         .filter_map(name)
@@ -497,16 +560,24 @@ fn inbox(workspace: &std::path::Path) -> std::io::Result<WorkspaceDir> {
     })
 }
 
+/// Room kept in the inbox for what is made of a file sent: its text, the
+/// copy of it shown, its pages.
+#[derive(Debug, Clone, Copy)]
+struct Reserve {
+    bytes: u64,
+    entries: usize,
+}
+
 /// Save `bytes` in the inbox as `<stamp>-<name>`, numbered when that is
 /// taken, unless the inbox would then hold more than its caps (keeping
-/// `reserve` bytes for what goes with the file) or the filesystem too
-/// little free space.
+/// `reserve` bytes and entries for what goes with the file) or the
+/// filesystem too little free space.
 fn save(
     workspace: &std::path::Path,
     stamp: &str,
     name: &str,
     bytes: &[u8],
-    reserve: u64,
+    reserve: Reserve,
 ) -> Result<Stored, ApiError> {
     let internal = |e: std::io::Error| ApiError::Internal(format!("saving the file: {e}"));
     let _saving = SAVING
@@ -518,12 +589,14 @@ fn save(
         .regular_files(|_| true, MAX_INBOX_FILES + 1)
         .map_err(internal)?;
     let used: u64 = held.iter().map(|(_, meta)| meta.len()).sum();
-    if entries >= MAX_INBOX_FILES || used + bytes.len() as u64 + reserve > MAX_INBOX_BYTES {
+    if entries + 1 + reserve.entries > MAX_INBOX_FILES
+        || used + bytes.len() as u64 + reserve.bytes > MAX_INBOX_BYTES
+    {
         return Err(ApiError::Conflict(
             "the agent's inbox is full; remove files from its inbox/ first".into(),
         ));
     }
-    match inbox.require_free(bytes.len() as u64 + reserve + MIN_FREE_BYTES) {
+    match inbox.require_free(bytes.len() as u64 + reserve.bytes + MIN_FREE_BYTES) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::StorageFull => {
             return Err(ApiError::Conflict(
@@ -1662,12 +1735,17 @@ mod tests {
         assert!(UserUploads::take(Uploader::User(user)).is_some());
     }
 
+    const NONE: Reserve = Reserve {
+        bytes: 0,
+        entries: 0,
+    };
+
     #[test]
     fn files_are_saved_in_the_inbox_without_following_links() {
         let dir = tempfile::tempdir().expect("tmp");
-        let first = save(dir.path(), "20261115-120000", "a.txt", b"one", 0).expect("save");
+        let first = save(dir.path(), "20261115-120000", "a.txt", b"one", NONE).expect("save");
         assert_eq!(first.file, "20261115-120000-a.txt");
-        let second = save(dir.path(), "20261115-120000", "a.txt", b"two", 0).expect("save");
+        let second = save(dir.path(), "20261115-120000", "a.txt", b"two", NONE).expect("save");
         assert_eq!(second.file, "20261115-120000-1-a.txt");
         assert_eq!(
             std::fs::read(dir.path().join("inbox").join(&first.file)).unwrap(),
@@ -1678,7 +1756,7 @@ mod tests {
         let other = tempfile::tempdir().expect("tmp");
         let ws = tempfile::tempdir().expect("tmp");
         std::os::unix::fs::symlink(other.path(), ws.path().join("inbox")).expect("link");
-        assert!(save(ws.path(), "20261115-120000", "a.txt", b"x", 0).is_err());
+        assert!(save(ws.path(), "20261115-120000", "a.txt", b"x", NONE).is_err());
         assert_eq!(std::fs::read_dir(other.path()).unwrap().count(), 0);
     }
 }

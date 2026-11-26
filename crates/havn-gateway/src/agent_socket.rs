@@ -2081,7 +2081,8 @@ async fn egress_proxy_for(ctx: &AgentSocketCtx, agent_id: AgentId) -> Option<Str
 
 /// The gateway-run tools `agent` may use: `web_search` when its policy
 /// allows it and its owner has a search backend, `web_fetch` when its
-/// policy allows it, `transcribe` when the gateway transcribes audio.
+/// policy allows it, `transcribe` when its policy allows it and the
+/// gateway transcribes audio.
 async fn gateway_tools_for(
     ctx: &AgentSocketCtx,
     agent: &havn_db::repo::agents::Agent,
@@ -2116,7 +2117,9 @@ async fn gateway_tools_for(
     if policy.permissions.can_schedule_cron {
         tools.push(crate::schedule::spec());
     }
-    if let Some(how) = &**ctx.transcription.load() {
+    if policy.permissions.can_transcribe
+        && let Some(how) = &**ctx.transcription.load()
+    {
         tools.push(crate::transcribe::spec(how));
     }
     // Secrets reach shell commands and MCP servers; the owner can set
@@ -2202,52 +2205,37 @@ async fn run_transcribe(
         .chars()
         .take(1024)
         .collect();
-    let heard = async {
-        let workspace = ctx
-            .workspace_root
-            .join(agent_id.to_string())
-            .join("workspace");
-        let named = path.clone();
-        let (name, bytes) = tokio::task::spawn_blocking(move || {
-            crate::outbox::named_file(
-                &workspace,
-                &named,
-                crate::transcribe::MAX_AUDIO_BYTES as u64,
-            )
-        })
-        .await
-        .map_err(|e| format!("reading the file failed: {e}"))??;
-        let format = crate::transcribe::file_format(&how, &name, &bytes[..bytes.len().min(64)])?;
-        let size = bytes.len();
-        let models = ctx.models.load();
-        let gateway = crate::transcribe::Gateway {
-            db: &ctx.db,
-            http: &ctx.http,
-            keyring: ctx.keyring.as_ref(),
-            llm: &ctx.llm,
-            models: &models,
-            multi_user: ctx.multi_user,
-        };
-        let text = tokio::time::timeout(
-            crate::transcribe::TOOL_DEADLINE,
-            crate::transcribe::for_agent(gateway, &agent, &how, bytes, format),
-        )
-        .await
-        .map_err(|_| {
-            format!(
-                "the transcription took longer than {}s: cut the audio into shorter parts",
-                crate::transcribe::TOOL_DEADLINE.as_secs()
-            )
-        })??;
-        Ok::<_, String>((text, format, size))
-    }
-    .await;
+    let workspace = ctx
+        .workspace_root
+        .join(agent_id.to_string())
+        .join("workspace");
+    let models = ctx.models.load();
+    let gateway = crate::transcribe::Gateway {
+        db: &ctx.db,
+        http: &ctx.http,
+        keyring: ctx.keyring.as_ref(),
+        llm: &ctx.llm,
+        models: &models,
+        multi_user: ctx.multi_user,
+    };
+    // Waiting for a turn counts within the limit too.
+    let heard = tokio::time::timeout(
+        crate::transcribe::TOOL_DEADLINE,
+        crate::transcribe::run_tool(gateway, &agent, &how, workspace, &path),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(format!(
+            "the transcription took longer than {}s: cut the audio into shorter parts",
+            crate::transcribe::TOOL_DEADLINE.as_secs()
+        ))
+    });
     let details = match &heard {
-        Ok((text, format, size)) => serde_json::json!({
+        Ok(heard) => serde_json::json!({
             "path": path,
-            "format": format,
-            "bytes": size,
-            "chars": text.chars().count(),
+            "format": heard.format,
+            "bytes": heard.bytes,
+            "chars": heard.text.chars().count(),
         }),
         Err(message) => serde_json::json!({ "path": path, "error": message }),
     };
@@ -2260,7 +2248,7 @@ async fn run_transcribe(
         details,
     )
     .await;
-    heard.map(|(text, _, _)| crate::transcribe::told(&path, &text))
+    heard.map(|heard| crate::transcribe::told(&path, &heard.text))
 }
 
 /// `secret_request` (issue #233): the agent asks its owner for a secret it
@@ -4681,6 +4669,18 @@ mod tests {
             "{heard}"
         );
         assert!(heard.ends_with("hello, sent as ogg: true"), "{heard}");
+        // Counted against the agent's budget, as a model's call would be.
+        let used: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT provider, model, tokens_in FROM credential_usages WHERE agent_id = ?1",
+        )
+        .bind(agent.to_string())
+        .fetch_all(&ctx.db)
+        .await
+        .expect("usage");
+        assert_eq!(
+            used,
+            [("transcription".to_string(), "whisper-1".to_string(), 10)]
+        );
 
         // Nothing through a link, nothing outside the workspace, no video.
         for (path, why) in [

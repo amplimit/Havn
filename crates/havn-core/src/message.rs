@@ -64,18 +64,36 @@ pub struct Attachment {
     /// shown to the agent with the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<String>,
-    /// A PDF with little or no text (issue #230), likely scanned: its
-    /// first pages are kept as images, at [`Attachment::page_image`].
+    /// A PDF with pages of little or no text (issue #230), likely
+    /// scanned: those pages are kept as images, at
+    /// [`Attachment::page_image`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan: Option<Scan>,
+    /// A document whose text could not be read, and why (issue #230).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread: Option<Unread>,
 }
 
-/// The pages of a PDF without a text layer (issue #230): how many it has,
-/// and how many of them, from the first, are kept as images.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The pages of a PDF without a text layer (issue #230).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scan {
+    /// How many pages it has.
     pub pages: u32,
-    pub shown: u32,
+    /// How many of them have little or no text that could be read.
+    pub sparse: u32,
+    /// Those kept as images, by their number from 1, in order: at most
+    /// [`MAX_SCAN_PAGES`].
+    pub shown: Vec<u32>,
+}
+
+/// Why no text was read from a document (issue #230).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unread {
+    /// It is encrypted, and opens with no password.
+    Encrypted,
+    /// It is damaged, or not what its name says.
+    Damaged,
 }
 
 /// Most pages of a PDF without a text layer kept as images.
@@ -115,6 +133,21 @@ impl Attachment {
     #[must_use]
     pub fn page_image(name: &str, page: u32) -> String {
         format!(".{name}.page-{page}.jpg")
+    }
+
+    /// The page of PDF `name` whose image is inbox entry `entry`, if it is
+    /// one, as [`Self::page_image`] names it.
+    #[must_use]
+    pub fn page_of(name: &str, entry: &str) -> Option<u32> {
+        let page = entry
+            .strip_prefix('.')?
+            .strip_prefix(name)?
+            .strip_prefix(".page-")?
+            .strip_suffix(".jpg")?;
+        if page.is_empty() || page.starts_with('0') || !page.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        page.parse().ok()
     }
 
     /// Where page `page` of this PDF is kept as an image, next to it, when
@@ -272,9 +305,29 @@ mod tests {
             size: 1,
             text_path: None,
             transcript: None,
-            scan: Some(Scan { pages: 3, shown: 3 }),
+            scan: Some(Scan {
+                pages: 3,
+                sparse: 3,
+                shown: vec![1, 2, 3],
+            }),
+            unread: None,
         };
         assert_eq!(pdf.page_path(2), "inbox/.20261126-scan.pdf.page-2.jpg");
         assert!(!Attachment::in_inbox(&pdf.page_path(1)));
+        let file = "20261126-scan.pdf";
+        assert_eq!(
+            Attachment::page_of(file, &Attachment::page_image(file, 12)),
+            Some(12)
+        );
+        for other in [
+            ".20261126-scan.pdf.shown",
+            ".20261126-scan.pdf.page-.jpg",
+            ".20261126-scan.pdf.page-01.jpg",
+            ".20261126-scan.pdf.page-1.jpg.txt",
+            ".20261126-other.pdf.page-1.jpg",
+            "20261126-scan.pdf.page-1.jpg",
+        ] {
+            assert_eq!(Attachment::page_of(file, other), None, "{other}");
+        }
     }
 }
