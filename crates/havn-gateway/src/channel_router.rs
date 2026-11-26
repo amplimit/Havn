@@ -381,22 +381,28 @@ impl ChannelRouter {
     }
 
     /// Send `writing` to the adapter of `(channel, writing.account_id)`,
-    /// when it takes them (issue #325); whether it went. Never numbered nor
-    /// kept for a resume, and never sent where it could fill the queue
-    /// replies go through, nor ahead of a replay.
-    pub async fn writing(&self, channel: &str, writing: ChannelWriting) -> bool {
+    /// when it takes them (issue #325) and `still` says its reply is still
+    /// being written; whether it went. `still` is asked as it is queued, so
+    /// none goes after the reply's end, which is delivered after the reply
+    /// stops being written. Never numbered nor kept for a resume, and never
+    /// sent where it could fill the queue replies go through, nor ahead of
+    /// a replay.
+    pub async fn writing(
+        &self,
+        channel: &str,
+        writing: ChannelWriting,
+        still: impl FnOnce() -> bool,
+    ) -> bool {
         let key = AccountKey::new(channel, &writing.account_id);
-        let tx = {
-            let map = self.inner.lock().await;
-            let Some(state) = map.get(&key) else {
-                return false;
-            };
-            match &state.tx {
-                Some(tx) if state.writing && state.replaying.is_none() => tx.clone(),
-                _ => return false,
-            }
+        let map = self.inner.lock().await;
+        let Some(state) = map.get(&key) else {
+            return false;
         };
-        if tx.capacity() * 2 <= tx.max_capacity() {
+        let tx = match &state.tx {
+            Some(tx) if state.writing && state.replaying.is_none() => tx,
+            _ => return false,
+        };
+        if tx.capacity() * 2 <= tx.max_capacity() || !still() {
             return false;
         }
         tx.try_send(ChannelFrame::Writing(writing)).is_ok()
@@ -742,7 +748,7 @@ mod tests {
         let (older, mut older_rx) = mpsc::channel(8);
         router.register(key.clone(), older).await;
         assert!(!router.takes_writing(&key).await);
-        assert!(!router.writing("telegram", writing("a")).await);
+        assert!(!router.writing("telegram", writing("a"), || true).await);
         assert!(older_rx.try_recv().is_err());
 
         let (tx, mut rx) = mpsc::channel(8);
@@ -750,8 +756,11 @@ mod tests {
             .register_as(key.clone(), tx.clone(), false, true)
             .await;
         assert!(router.takes_writing(&key).await);
-        assert!(router.writing("telegram", writing("b")).await);
+        assert!(router.writing("telegram", writing("b"), || true).await);
         assert!(matches!(rx.try_recv(), Ok(ChannelFrame::Writing(w)) if w.text == "b"));
+        // Nor once its reply ended.
+        assert!(!router.writing("telegram", writing("b2"), || false).await);
+        assert!(rx.try_recv().is_err());
         // Not numbered: the next reply's seq follows the last reply's.
         let first = router
             .deliver(
@@ -763,7 +772,7 @@ mod tests {
             )
             .await
             .expect("deliver");
-        assert!(router.writing("telegram", writing("c")).await);
+        assert!(router.writing("telegram", writing("c"), || true).await);
         let second = router
             .deliver(
                 "telegram",
@@ -796,11 +805,11 @@ mod tests {
                 .await
                 .expect("deliver");
         }
-        assert!(!router.writing("telegram", writing("d")).await);
+        assert!(!router.writing("telegram", writing("d"), || true).await);
         while rx.try_recv().is_ok() {}
         // Nor ahead of a replay.
         router.register_as(key.clone(), tx, true, true).await;
-        assert!(!router.writing("telegram", writing("e")).await);
+        assert!(!router.writing("telegram", writing("e"), || true).await);
     }
 
     #[tokio::test]

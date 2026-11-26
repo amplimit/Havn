@@ -198,6 +198,8 @@ pub struct Segments {
     pub chat: String,
     /// The message the reply answers, in a group (issue #263).
     pub answers: Option<String>,
+    /// Names the turn to the gateway (issue #325): its calls share it.
+    pub turn: String,
     pub sent: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
@@ -208,6 +210,7 @@ impl Segments {
             channel_id,
             chat,
             answers,
+            turn: Uuid::now_v7().to_string(),
             sent: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
@@ -877,6 +880,7 @@ async fn call_llm(
     // reply does.
     let reply = reply_stream(context).map(|reply| havn_proto::ReplyStream {
         answers: handle.segments.as_ref().and_then(|s| s.answers.clone()),
+        turn: handle.segments.as_ref().map(|s| s.turn.clone()),
         ..reply
     });
     // A model that answers in place of the turn's goes on for the turn
@@ -999,6 +1003,7 @@ fn reply_stream(context: &'static str) -> Option<havn_proto::ReplyStream> {
             conversation: crate::tools::gateway::CHAT.try_with(Clone::clone).ok(),
             answers: None,
             marks_last: true,
+            turn: None,
         })
 }
 
@@ -2037,26 +2042,41 @@ mod tests {
         let gateway = tokio::spawn({
             let pending = Arc::clone(&pending);
             async move {
-                let AgentToGateway::LlmRequest(asked) = next_frame(&mut rx).await else {
-                    panic!("no request");
-                };
-                answer(
-                    &pending,
-                    &asked.request_id,
+                let mut asked = Vec::new();
+                for answered in [
+                    serde_json::json!({"stop_reason": "tool_use", "content": [
+                        {"type": "text", "text": "Looking."},
+                        {"type": "tool_use", "id": "t1", "name": "no_such_tool", "input": {}}
+                    ]}),
                     serde_json::json!({"stop_reason": "end_turn", "content": [
                         {"type": "text", "text": "Done."}
                     ]}),
-                )
-                .await;
+                ] {
+                    let request = loop {
+                        if let AgentToGateway::LlmRequest(request) = next_frame(&mut rx).await {
+                            break request;
+                        }
+                    };
+                    answer(&pending, &request.request_id, answered).await;
+                    asked.push(request);
+                }
                 asked
             }
         });
         let trace = Arc::new(std::sync::Mutex::new(Trace::default()));
         let ended = web_turn(&handle, &trace).await;
         let asked = gateway.await.expect("gateway");
-        assert_eq!(ended.expect("a reply"), "Done.");
-        let reply = asked.reply.expect("shown as it is written");
-        assert!(reply.marks_last);
-        assert_eq!(reply.answers.as_deref(), Some("tg:chat:-1:msg:7"));
+        assert_eq!(ended.expect("a reply"), "Looking.\n\nDone.");
+        let replies: Vec<_> = asked
+            .into_iter()
+            .map(|a| a.reply.expect("shown as it is written"))
+            .collect();
+        assert!(replies.iter().all(|r| r.marks_last));
+        assert_eq!(replies[0].answers.as_deref(), Some("tg:chat:-1:msg:7"));
+        // Both calls are of one turn, and the next turn is another.
+        let turn = replies[0].turn.clone().expect("a turn");
+        assert_eq!(replies[1].turn.as_deref(), Some(turn.as_str()));
+        let next = Segments::new("ch|telegram|bot|tg:-1".into(), "c1".into(), None);
+        assert_ne!(next.turn, turn);
     }
 }

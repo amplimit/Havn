@@ -914,6 +914,10 @@ pub struct ReplyStream {
     /// older runtime: its replies are shown once written, as before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub marks_last: bool,
+    /// The turn the call is part of, the same for each of its calls (issue
+    /// #325): a chat app shows each turn's reply apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
