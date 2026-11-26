@@ -64,7 +64,22 @@ pub struct Attachment {
     /// shown to the agent with the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<String>,
+    /// A PDF with little or no text (issue #230), likely scanned: its
+    /// first pages are kept as images, at [`Attachment::page_image`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan: Option<Scan>,
 }
+
+/// The pages of a PDF without a text layer (issue #230): how many it has,
+/// and how many of them, from the first, are kept as images.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scan {
+    pub pages: u32,
+    pub shown: u32,
+}
+
+/// Most pages of a PDF without a text layer kept as images.
+pub const MAX_SCAN_PAGES: u32 = 20;
 
 /// Where the files people send are saved, in an agent's workspace.
 pub const INBOX_DIR: &str = "inbox";
@@ -93,6 +108,23 @@ impl Attachment {
     #[must_use]
     pub fn shown_copy(name: &str) -> String {
         format!(".{name}.shown")
+    }
+
+    /// The name, in the inbox, of page `page` (from 1) of PDF `name` kept
+    /// as an image (issue #230): hidden, as a shown copy is.
+    #[must_use]
+    pub fn page_image(name: &str, page: u32) -> String {
+        format!(".{name}.page-{page}.jpg")
+    }
+
+    /// Where page `page` of this PDF is kept as an image, next to it, when
+    /// it is a scan (issue #230).
+    #[must_use]
+    pub fn page_path(&self, page: u32) -> String {
+        match self.path.rsplit_once('/') {
+            Some((dir, file)) => format!("{dir}/{}", Self::page_image(file, page)),
+            None => Self::page_image(&self.path, page),
+        }
     }
 }
 
@@ -229,5 +261,20 @@ mod tests {
         ] {
             assert!(!Attachment::in_inbox(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_scan_s_pages_are_hidden_next_to_it() {
+        let pdf = Attachment {
+            path: "inbox/20261126-scan.pdf".into(),
+            name: "scan.pdf".into(),
+            media_type: "application/pdf".into(),
+            size: 1,
+            text_path: None,
+            transcript: None,
+            scan: Some(Scan { pages: 3, shown: 3 }),
+        };
+        assert_eq!(pdf.page_path(2), "inbox/.20261126-scan.pdf.page-2.jpg");
+        assert!(!Attachment::in_inbox(&pdf.page_path(1)));
     }
 }

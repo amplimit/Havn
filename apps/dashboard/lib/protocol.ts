@@ -78,6 +78,8 @@ export type Attachment = {
   size: number;
   /** Where its text is, when it was extracted (a PDF). */
   text_path?: string;
+  /** A PDF without a text layer: its pages, and how many are kept as images. */
+  scan?: { pages: number; shown: number };
 };
 
 export type MemoryChange = {

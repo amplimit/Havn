@@ -3,7 +3,8 @@
 //! `inbox/`, through [`crate::agent_files`] so that nothing the agent put
 //! there is followed, and the text of a PDF, Word document or spreadsheet
 //! is saved next to it, as is the copy of a picture a model cannot be
-//! shown as it is (issue #225). The answer is
+//! shown as it is (issue #225), and the pages of a PDF without a text
+//! layer as images (issue #230). The answer is
 //! the [`Attachment`] the chat message then carries.
 
 use axum::Json;
@@ -193,7 +194,9 @@ pub async fn receive(
     // A picture a model cannot be shown as it is, too large or a HEIC
     // photo, gets a copy it can, shown in its place (issue #225).
     let copied = media_type.starts_with("image/") && crate::llm_proxy::needs_copy(&body);
-    let reserve = if text_kind.is_some() {
+    let reserve = if text_kind == Some(crate::web_fetch::Kind::Pdf) {
+        TEXT_BYTES + crate::web_fetch::MAX_PAGES_BYTES as u64
+    } else if text_kind.is_some() {
         TEXT_BYTES
     } else if copied {
         crate::llm_proxy::MAX_IMAGE_BYTES
@@ -211,15 +214,23 @@ pub async fn receive(
     // A document's text, for the agent to read with file_read. A file
     // whose text cannot be read still arrives.
     let mut text_path = None;
+    let mut scan = None;
     if let Some(kind) = text_kind {
-        match crate::web_fetch::document_text(kind, &body).await {
-            Ok((text, _)) if !text.trim().is_empty() => {
-                text_path = keep(state, agent_id, text_name(&stored.file), text.into_bytes()).await;
-            }
-            Ok(_) => {}
+        let text = match crate::web_fetch::document_text(kind, &body).await {
+            Ok((text, _)) => text,
             Err(e) => {
-                tracing::info!(agent_id = %agent_id, error = %e, "no text read from an uploaded document")
+                tracing::info!(agent_id = %agent_id, error = %e, "no text read from an uploaded document");
+                String::new()
             }
+        };
+        // A PDF with too little text for its pages, a scan, is told as one,
+        // with its pages as images (issue #230).
+        if kind == crate::web_fetch::Kind::Pdf {
+            let chars = text.chars().filter(|c| !c.is_whitespace()).count();
+            scan = keep_pages(state, agent_id, &stored.file, &body, chars).await;
+        }
+        if !text.trim().is_empty() {
+            text_path = keep(state, agent_id, text_name(&stored.file), text.into_bytes()).await;
         }
     }
     // An audio file's transcript (issue #164), kept as its text and shown
@@ -266,8 +277,43 @@ pub async fn receive(
         size: body.len() as u64,
         text_path,
         transcript,
+        scan,
     };
     Ok(attachment)
+}
+
+/// The pages of PDF `body`, kept in the inbox as `file`, made images when
+/// its text, of `chars` characters other than white space, is too little
+/// for them (issue #230): how many it has and how many were kept. `None`
+/// for a PDF with a text layer; with none kept when they could not be
+/// made, and no text could be read either.
+async fn keep_pages(
+    state: &AppState,
+    agent_id: havn_core::AgentId,
+    file: &str,
+    body: &[u8],
+    chars: usize,
+) -> Option<havn_core::Scan> {
+    let pages = match crate::web_fetch::scanned_pages(body, chars).await {
+        Ok(Some(pages)) => pages,
+        Ok(None) => return None,
+        Err(why) => {
+            tracing::info!(agent_id = %agent_id, why, "the pages of a PDF were not made images");
+            return (chars == 0).then_some(havn_core::Scan { pages: 0, shown: 0 });
+        }
+    };
+    let mut shown = 0;
+    for (n, image) in (1..).zip(pages.images) {
+        let name = Attachment::page_image(file, n);
+        if keep(state, agent_id, name, image).await.is_none() {
+            break;
+        }
+        shown = n;
+    }
+    Some(havn_core::Scan {
+        pages: pages.count,
+        shown,
+    })
 }
 
 /// Where the text of inbox file `file` is kept, next to it.
@@ -320,49 +366,77 @@ async fn transcribe_for(
         .await
         .map_err(|e| format!("agent lookup failed: {e}"))?
         .ok_or("the agent is gone")?;
-    let policy =
-        crate::policy_resolver::for_session(&state.db, &agent, state.trusted_proxies.is_some())
-            .await;
     let models = state.models.load();
-    let call = crate::transcribe::ModelCall {
+    let gateway = crate::transcribe::Gateway {
         db: &state.db,
+        http: &state.http,
         keyring: state.keyring.as_ref(),
         llm: &state.llm,
         models: &models,
-        billing: crate::llm_proxy::Billing {
-            user_id: agent.owner_id,
-            agent_id: Some(agent_id),
-            agent_team: agent.team_id,
-            budget: policy.budget.clone(),
-        },
-        allowed: &policy.allowed_models,
+        multi_user: state.trusted_proxies.is_some(),
     };
-    crate::transcribe::transcribe(how, &state.http, call, bytes, format).await
+    crate::transcribe::for_agent(gateway, &agent, how, bytes, format).await
 }
 
 /// `attachment`, a file of agent `agent_id`'s inbox a web chat message
-/// names, with the transcript the gateway kept for it: none that the
-/// page sent is taken (issue #164).
-pub async fn with_transcript(
+/// names, with what the gateway kept for it: its transcript, none that the
+/// page sent being taken (issue #164), and the pages of a scan kept as
+/// images, as many as there are (issue #230).
+pub async fn as_kept(
     state: &AppState,
     agent_id: havn_core::AgentId,
     mut attachment: Attachment,
 ) -> Attachment {
     attachment.transcript = None;
+    let sent_scan = attachment.scan.take();
+    let Some(file) = attachment
+        .path
+        .strip_prefix(INBOX_DIR)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .map(str::to_string)
+    else {
+        return attachment;
+    };
+    let workspace = crate::api::agents::workspace_for(state, agent_id);
+    if crate::web_fetch::Kind::of_file(&attachment.media_type, &attachment.name)
+        == Some(crate::web_fetch::Kind::Pdf)
+    {
+        let file = file.clone();
+        let kept = tokio::task::spawn_blocking(move || {
+            let inbox = inbox(&workspace).ok()?;
+            let shown = (1..=havn_core::MAX_SCAN_PAGES)
+                .take_while(|n| {
+                    inbox
+                        .has(&Attachment::page_image(&file, *n))
+                        .unwrap_or(false)
+                })
+                .count() as u32;
+            Some(shown)
+        })
+        .await
+        .ok()
+        .flatten();
+        attachment.scan = match (sent_scan, kept) {
+            // What the page sent, as far as the pages are there.
+            (Some(sent), Some(kept)) => Some(havn_core::Scan {
+                pages: sent.pages.max(kept),
+                shown: sent.shown.min(kept),
+            }),
+            // A page that did not send it: the pages that are there.
+            (None, Some(kept)) if kept > 0 => Some(havn_core::Scan {
+                pages: kept,
+                shown: kept,
+            }),
+            _ => None,
+        };
+        return attachment;
+    }
     if crate::transcribe::audio_format(&attachment.media_type, &attachment.name).is_none() {
         return attachment;
     }
     // Where the gateway kept it, next to the file: not a path the page
     // names.
-    let Some(name) = attachment
-        .path
-        .strip_prefix(INBOX_DIR)
-        .and_then(|rest| rest.strip_prefix('/'))
-        .map(text_name)
-    else {
-        return attachment;
-    };
-    let workspace = crate::api::agents::workspace_for(state, agent_id);
+    let name = text_name(&file);
     let limit = (crate::transcribe::MAX_TRANSCRIPT_CHARS * 4) as u64;
     let read =
         tokio::task::spawn_blocking(move || inbox(&workspace)?.read_bytes(&name, limit)).await;
@@ -395,11 +469,17 @@ pub fn discard_path(workspace: &std::path::Path, path: &str, text_path: Option<&
             .and_then(|rest| rest.strip_prefix('/'))
             .map(str::to_string)
     };
-    let copy = name(path).map(|file| crate::llm_proxy::shown_copy(&file));
+    let file = name(path);
+    let copy = file.as_deref().map(crate::llm_proxy::shown_copy);
+    // A scan's pages, kept as images (issue #230).
+    let pages = file.iter().flat_map(|file| {
+        (1..=havn_core::MAX_SCAN_PAGES).map(move |n| Attachment::page_image(file, n))
+    });
     let names = std::iter::once(path)
         .chain(text_path)
         .filter_map(name)
-        .chain(copy);
+        .chain(copy)
+        .chain(pages);
     for name in names {
         let _ = inbox.remove(&name);
     }
@@ -1369,7 +1449,16 @@ mod tests {
         let inbox = ws.path().join(INBOX_DIR);
         std::fs::create_dir_all(&inbox).unwrap();
         let copy = crate::llm_proxy::shown_copy("1-a.png");
-        for name in ["1-a.png", "1-a.png.txt", copy.as_str(), "2-b.png"] {
+        let page = Attachment::page_image("1-a.png", 3);
+        let other = Attachment::page_image("2-b.png", 1);
+        for name in [
+            "1-a.png",
+            "1-a.png.txt",
+            copy.as_str(),
+            &page,
+            &other,
+            "2-b.png",
+        ] {
             std::fs::write(inbox.join(name), b"x").unwrap();
         }
         std::fs::write(ws.path().join("secret"), b"x").unwrap();
@@ -1380,7 +1469,7 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(left, ["2-b.png".to_string()].into());
+        assert_eq!(left, ["2-b.png".to_string(), other].into());
         assert!(
             ws.path().join("secret").exists(),
             "nothing outside the inbox"

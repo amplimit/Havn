@@ -66,7 +66,9 @@ impl Review {
     #[must_use]
     pub fn of(tool: &str) -> Option<Self> {
         match tool {
-            "memory_search" | "file_read" | "file_find" | "file_search" => Some(Self::Result),
+            "memory_search" | "file_read" | "file_find" | "file_search" | "transcribe" => {
+                Some(Self::Result)
+            }
             "shell" | "process" | "file_write" | "file_edit" | "skill_manage" | "send_file"
             | "set_timezone" | "view_image" => Some(Self::Call),
             _ if tool.starts_with("mcp__") => Some(Self::Call),
@@ -715,6 +717,7 @@ mod tests {
     fn viewing_an_image_in_someone_else_s_chat_is_asked_about_first() {
         assert!(matches!(Review::of("view_image"), Some(Review::Call)));
         assert!(matches!(Review::of("file_read"), Some(Review::Result)));
+        assert!(matches!(Review::of("transcribe"), Some(Review::Result)));
     }
 
     fn decision(channel: &str, id: &str, approve: bool, remember: bool) -> ApprovalDecision {

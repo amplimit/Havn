@@ -458,9 +458,12 @@ async fn serve_session<Si, St, E>(
                     for mut a in sent {
                         match commands.as_ref() {
                             Some((state, _)) => {
-                                a = crate::api::files::with_transcript(state, agent_id, a).await;
+                                a = crate::api::files::as_kept(state, agent_id, a).await;
                             }
-                            None => a.transcript = None,
+                            None => {
+                                a.transcript = None;
+                                a.scan = None;
+                            }
                         }
                         attachments.push(a);
                     }

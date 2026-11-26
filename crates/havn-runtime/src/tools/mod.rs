@@ -319,8 +319,9 @@ impl ToolRegistry {
     /// `policy.context_toolsets[context].disabled`.
     /// Disabling `file_write` disables `file_edit` too: both change files,
     /// and a policy written before `file_edit` existed means both. Likewise
-    /// disabling `file_read` disables `file_find` and `file_search`, and
-    /// disabling `shell` disables `process`, which reaches what it started.
+    /// disabling `file_read` disables `file_find`, `file_search`, `view_image`
+    /// and `transcribe`, and disabling `shell` disables `process`, which
+    /// reaches what it started.
     fn disabled_in(&self, context: &str, tool_name: &str) -> bool {
         // Scheduled runs, heartbeats and other agents' queries answer no
         // one's chat message: there are no past chats of theirs to search.
@@ -341,7 +342,10 @@ impl ToolRegistry {
                     d == tool_name
                         || (d == "file_write" && tool_name == "file_edit")
                         || (d == "file_read"
-                            && matches!(tool_name, "file_find" | "file_search" | "view_image"))
+                            && matches!(
+                                tool_name,
+                                "file_find" | "file_search" | "view_image" | "transcribe"
+                            ))
                         || (d == "shell" && tool_name == "process")
                 })
             })
@@ -553,7 +557,7 @@ fn flatten_input_for_hook(tool: &str, input: &serde_json::Value) -> String {
     match tool {
         "shell" => pick("command"),
         "web_fetch" => pick("url"),
-        "file_read" | "file_write" | "file_edit" | "view_image" => pick("path"),
+        "file_read" | "file_write" | "file_edit" | "view_image" | "transcribe" => pick("path"),
         "file_find" | "file_search" => pick("path"),
         "memory_search" => pick("query"),
         "memory_remember" | "memory_forget" => pick("key"),

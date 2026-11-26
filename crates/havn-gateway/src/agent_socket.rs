@@ -180,6 +180,11 @@ pub struct AgentSocketCtx {
     pub egress_proxy: Option<(havn_spawner::network::AgentSubnetPool, u16)>,
     /// Rate of the `set_timezone` gateway tool, per owner.
     pub timezone_rate: Arc<crate::web_search::UserRate>,
+    /// `[transcription]`, hot-reloaded, shared with `AppState`: with it,
+    /// agents are offered `transcribe` (issue #230).
+    pub transcription: Arc<arc_swap::ArcSwap<Option<crate::transcribe::Transcription>>>,
+    /// Rate of the `transcribe` gateway tool, per owner.
+    pub transcribe_rate: Arc<crate::web_search::UserRate>,
 }
 
 /// Model entries, by id and hash, whose provider refused images.
@@ -2076,7 +2081,7 @@ async fn egress_proxy_for(ctx: &AgentSocketCtx, agent_id: AgentId) -> Option<Str
 
 /// The gateway-run tools `agent` may use: `web_search` when its policy
 /// allows it and its owner has a search backend, `web_fetch` when its
-/// policy allows it.
+/// policy allows it, `transcribe` when the gateway transcribes audio.
 async fn gateway_tools_for(
     ctx: &AgentSocketCtx,
     agent: &havn_db::repo::agents::Agent,
@@ -2110,6 +2115,9 @@ async fn gateway_tools_for(
     }
     if policy.permissions.can_schedule_cron {
         tools.push(crate::schedule::spec());
+    }
+    if let Some(how) = &**ctx.transcription.load() {
+        tools.push(crate::transcribe::spec(how));
     }
     // Secrets reach shell commands and MCP servers; the owner can set
     // them only with HAVN_AGE_KEY.
@@ -2152,8 +2160,107 @@ async fn run_gateway_tool(
         crate::outbox::TOOL_NAME => run_send_file(agent_id, call, ctx).await,
         crate::choice::TOOL_NAME => run_ask_choice(agent_id, call, ctx).await,
         crate::secrets::TOOL_NAME => run_secret_request(agent_id, call, ctx).await,
+        crate::transcribe::TOOL_NAME => run_transcribe(agent_id, call, ctx).await,
         other => Err(format!("the gateway has no tool named {other:?}")),
     }
+}
+
+/// `transcribe` (issue #230): the transcript of an audio file of the
+/// agent's workspace, made with `[transcription]` as a voice note's is, a
+/// model's use counted as the agent's. Audited as `audio.transcribe`.
+async fn run_transcribe(
+    agent_id: AgentId,
+    call: &GatewayToolCall,
+    ctx: &AgentSocketCtx,
+) -> Result<String, String> {
+    let agent = match agents_repo::find_by_id(&ctx.db, agent_id).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => return Err(format!("agent {agent_id} not found")),
+        Err(e) => return Err(format!("agent lookup failed: {e}")),
+    };
+    // Counted before any other work, as for web_fetch.
+    if !ctx.transcribe_rate.admit(agent.owner_id).await {
+        return Err(format!(
+            "this user's agents have asked for {} transcriptions in the last minute; wait and \
+             retry",
+            crate::transcribe::TOOL_PER_USER_PER_MINUTE
+        ));
+    }
+    // Set since the tool was offered, or not any more.
+    let Some(how) = (**ctx.transcription.load()).clone() else {
+        return Err(
+            "this gateway does not transcribe audio: its operator has not set \
+                    [transcription]"
+                .into(),
+        );
+    };
+    let path: String = call
+        .input
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing required field: path")?
+        .chars()
+        .take(1024)
+        .collect();
+    let heard = async {
+        let workspace = ctx
+            .workspace_root
+            .join(agent_id.to_string())
+            .join("workspace");
+        let named = path.clone();
+        let (name, bytes) = tokio::task::spawn_blocking(move || {
+            crate::outbox::named_file(
+                &workspace,
+                &named,
+                crate::transcribe::MAX_AUDIO_BYTES as u64,
+            )
+        })
+        .await
+        .map_err(|e| format!("reading the file failed: {e}"))??;
+        let format = crate::transcribe::file_format(&how, &name, &bytes[..bytes.len().min(64)])?;
+        let size = bytes.len();
+        let models = ctx.models.load();
+        let gateway = crate::transcribe::Gateway {
+            db: &ctx.db,
+            http: &ctx.http,
+            keyring: ctx.keyring.as_ref(),
+            llm: &ctx.llm,
+            models: &models,
+            multi_user: ctx.multi_user,
+        };
+        let text = tokio::time::timeout(
+            crate::transcribe::TOOL_DEADLINE,
+            crate::transcribe::for_agent(gateway, &agent, &how, bytes, format),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "the transcription took longer than {}s: cut the audio into shorter parts",
+                crate::transcribe::TOOL_DEADLINE.as_secs()
+            )
+        })??;
+        Ok::<_, String>((text, format, size))
+    }
+    .await;
+    let details = match &heard {
+        Ok((text, format, size)) => serde_json::json!({
+            "path": path,
+            "format": format,
+            "bytes": size,
+            "chars": text.chars().count(),
+        }),
+        Err(message) => serde_json::json!({ "path": path, "error": message }),
+    };
+    crate::audit::record(
+        &ctx.db,
+        agent.owner_id,
+        agent.team_id,
+        Some(agent_id),
+        "audio.transcribe",
+        details,
+    )
+    .await;
+    heard.map(|(text, _, _)| crate::transcribe::told(&path, &text))
 }
 
 /// `secret_request` (issue #233): the agent asks its owner for a secret it
@@ -4330,6 +4437,10 @@ mod tests {
                 crate::timezone::TOOL_PER_USER_PER_MINUTE,
             )),
             egress_proxy: None,
+            transcription: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+            transcribe_rate: Arc::new(crate::web_search::UserRate::new(
+                crate::transcribe::TOOL_PER_USER_PER_MINUTE,
+            )),
         }
     }
 
@@ -4494,6 +4605,105 @@ mod tests {
             ["set_timezone", "send_file", "ask_choice", "schedule"],
             "policy denies search and fetch"
         );
+    }
+
+    #[tokio::test]
+    async fn transcribe_reads_the_agent_s_own_audio_and_says_why_not() {
+        let mut ctx = ctx_with(false, false).await;
+        let root = tempfile::tempdir().expect("tempdir");
+        ctx.workspace_root = root.path().to_path_buf();
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (agent, _rx) = connected_agent(&ctx, owner, "a", serde_json::json!({})).await;
+        let workspace = root.path().join(agent.to_string()).join("workspace");
+        std::fs::create_dir_all(workspace.join("rec")).expect("workspace");
+        std::fs::write(workspace.join("rec/call.ogg"), b"OggS\0\x02 a voice").expect("audio");
+        std::fs::write(workspace.join("clip.mov"), b"\0\0\0\x14ftypqt  ").expect("video");
+        std::fs::write(root.path().join("secret.mp3"), b"ID3 not the agent's").expect("secret");
+        std::os::unix::fs::symlink(root.path().join("secret.mp3"), workspace.join("link.mp3"))
+            .expect("link");
+        std::os::unix::fs::symlink(root.path(), workspace.join("up")).expect("dir link");
+        let call = |path: &str| GatewayToolCall {
+            request_id: "t1".into(),
+            name: crate::transcribe::TOOL_NAME.into(),
+            input: serde_json::json!({ "path": path }),
+            conversation: None,
+            chat: None,
+            sender: None,
+            from_owner: true,
+            in_group: false,
+        };
+        let names =
+            |tools: Vec<GatewayToolSpec>| tools.into_iter().map(|t| t.name).collect::<Vec<_>>();
+        let row = agents_repo::find_by_id(&ctx.db, agent)
+            .await
+            .expect("lookup")
+            .expect("agent");
+        let policy = policy_resolver::for_session(&ctx.db, &row, false).await;
+
+        // Not offered, and refused, without [transcription].
+        assert!(
+            !names(gateway_tools_for(&ctx, &row, &policy).await)
+                .contains(&"transcribe".to_string())
+        );
+        let off = run_gateway_tool(agent, &call("rec/call.ogg"), &ctx).await;
+        assert!(off.expect_err("off").contains("does not transcribe audio"));
+
+        // An endpoint that answers what it got.
+        let app = axum::Router::new().route(
+            "/v1/audio/transcriptions",
+            axum::routing::post(|body: axum::body::Bytes| async move {
+                let named = String::from_utf8_lossy(&body).contains("filename=\"audio.ogg\"");
+                axum::Json(serde_json::json!({"text": format!("hello, sent as ogg: {named}")}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        ctx.transcription
+            .store(Arc::new(Some(crate::transcribe::Transcription::Endpoint {
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                model: "whisper-1".into(),
+                api_key_env: "HAVN_TEST_NO_SUCH_KEY".into(),
+            })));
+        assert!(
+            names(gateway_tools_for(&ctx, &row, &policy).await).contains(&"transcribe".to_string())
+        );
+        let heard = run_gateway_tool(agent, &call("rec/call.ogg"), &ctx)
+            .await
+            .expect("heard");
+        assert!(
+            heard.starts_with("Transcript of \"rec/call.ogg\""),
+            "{heard}"
+        );
+        assert!(heard.ends_with("hello, sent as ogg: true"), "{heard}");
+
+        // Nothing through a link, nothing outside the workspace, no video.
+        for (path, why) in [
+            ("link.mp3", "cannot be read"),
+            ("up/secret.mp3", "cannot be read"),
+            ("../secret.mp3", "not a path inside your workspace"),
+            ("/etc/hostname", "relative to your workspace"),
+            ("rec", "not a regular file"),
+            ("none.mp3", "there is no"),
+            ("clip.mov", "extract its sound first"),
+        ] {
+            let refused = run_gateway_tool(agent, &call(path), &ctx)
+                .await
+                .expect_err(path);
+            assert!(refused.contains(why), "{path}: {refused}");
+        }
+        let audited: Vec<String> =
+            sqlx::query_scalar("SELECT details FROM audit_log WHERE action = 'audio.transcribe'")
+                .fetch_all(&ctx.db)
+                .await
+                .expect("audit");
+        assert_eq!(audited.len(), 8, "{audited:?}");
+        assert!(audited[0].contains("\"format\":\"ogg\""), "{}", audited[0]);
     }
 
     #[tokio::test]

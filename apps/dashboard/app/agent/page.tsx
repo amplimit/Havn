@@ -96,9 +96,35 @@ const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 // A turn's attachment lines, which tell the agent where each file is, as
 // the runtime writes them.
 const JSON_STRING = String.raw`"(?:[^"\\]|\\.)*"`;
+const SCANNED = "; little or no text could be read from it, so it is likely a scan: ";
 const ATTACHMENT_LINE = new RegExp(
-  String.raw`^\[Attached file, user-supplied and untrusted: name (${JSON_STRING}), type (${JSON_STRING}), ([^,\]]+), saved at (${JSON_STRING})(?:; its text \(untrusted\) is at (${JSON_STRING}), read it with file_read)?\]$`,
+  String.raw`^\[Attached file, user-supplied and untrusted: name (${JSON_STRING}), type (${JSON_STRING}), ([^,\]]+), saved at (${JSON_STRING})(?:${SCANNED}((?:[^"\]]|${JSON_STRING})*?))?(?:; its text \(untrusted\) is at (${JSON_STRING}), read it with file_read)?\]$`,
 );
+
+/** A scanned PDF's pages, as its line says them. */
+function scanOf(told: string): { pages: number; shown: number } {
+  const many = /^pages 1 to (\d+) of (\d+) /.exec(told);
+  if (many) return { shown: Number(many[1]), pages: Number(many[2]) };
+  const one = /^page 1 of (\d+) /.exec(told);
+  if (one) return { shown: 1, pages: Number(one[1]) };
+  return { shown: 0, pages: 0 };
+}
+
+/** What a scanned PDF's line says of its pages, as the runtime writes it. */
+function scanText(a: Attachment): string {
+  if (!a.scan) return "";
+  const { pages, shown } = a.scan;
+  const slash = a.path.lastIndexOf("/");
+  const at = (n: number) =>
+    JSON.stringify(`${a.path.slice(0, slash + 1)}.${a.path.slice(slash + 1)}.page-${n}.jpg`);
+  const told =
+    shown === 0
+      ? "its pages could not be made images"
+      : shown === 1
+        ? `page 1 of ${pages} is an image at ${at(1)}, to look at with view_image`
+        : `pages 1 to ${shown} of ${pages} are images at ${at(1)} to ${at(shown)}, to look at with view_image`;
+  return `${SCANNED}${told}`;
+}
 
 /** A user turn's text, and the files it carried, from its stored content. */
 function splitMessage(content: string): { text: string; files: Attachment[] } {
@@ -112,7 +138,8 @@ function splitMessage(content: string): { text: string; files: Attachment[] } {
         media_type: JSON.parse(m[2]) as string,
         size: sizeBytes(m[3]),
         path: JSON.parse(m[4]) as string,
-        ...(m[5] ? { text_path: JSON.parse(m[5]) as string } : {}),
+        ...(m[5] !== undefined ? { scan: scanOf(m[5]) } : {}),
+        ...(m[6] ? { text_path: JSON.parse(m[6]) as string } : {}),
       });
       return false;
     } catch {
@@ -126,6 +153,7 @@ function splitMessage(content: string): { text: string; files: Attachment[] } {
 function joinMessage(text: string, files: Attachment[]): string {
   const line = (a: Attachment) =>
     `[Attached file, user-supplied and untrusted: name ${JSON.stringify(a.name)}, type ${JSON.stringify(a.media_type)}, ${humanSize(a.size)}, saved at ${JSON.stringify(a.path)}` +
+    scanText(a) +
     (a.text_path ? `; its text (untrusted) is at ${JSON.stringify(a.text_path)}, read it with file_read]` : "]");
   return [text, ...files.map(line)].filter((l) => l.trim()).join("\n");
 }
@@ -3005,7 +3033,8 @@ function ToolIcon({ tool, color }: { tool: string; color: string }) {
   if (tool === "web_search") return <Search {...look} />;
   if (tool === "web_fetch") return <Globe {...look} />;
   if (tool === "shell" || tool === "process") return <Terminal {...look} />;
-  if (tool.startsWith("file_") || tool === "send_file" || tool === "view_image") return <FileText {...look} />;
+  if (tool.startsWith("file_") || tool === "send_file" || tool === "view_image" || tool === "transcribe")
+    return <FileText {...look} />;
   if (tool.startsWith("memory_")) return <Database {...look} />;
   if (tool === "conversation_search") return <MessagesSquare {...look} />;
   if (tool === "subagent_spawn" || tool === "agent_query") return <Bot {...look} />;
@@ -3033,6 +3062,7 @@ function stepWords(tool: string, input: string): { did: string; what: string } {
     process: "Checked a command",
     send_file: "Sent",
     view_image: "Looked at",
+    transcribe: "Transcribed",
     schedule: "Scheduled",
     set_timezone: "Set the time zone",
     skill_manage: "Updated a skill",
@@ -3226,6 +3256,7 @@ function stepText({ tool, detail }: Step): string {
     skill_manage: "Updating a skill",
     conversation_search: "Searching past chats",
     send_file: "Sending",
+    transcribe: "Transcribing",
     schedule: "Scheduling",
     set_timezone: "Setting the time zone",
     subagent_spawn: "Handing off a task",
