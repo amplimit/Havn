@@ -973,3 +973,5 @@ Some agent workloads need capabilities havn doesn't build into core (browser, co
 Copyright 2025-2026 Amplimit
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+
+Each release tarball carries `LICENSE` and `THIRD-PARTY-NOTICES.txt`: the licences of the Rust crates its binaries are built from (with the files some of them bundle, such as hayro's PDF fonts and CMaps) and of the npm packages of the dashboard `havn-gateway` embeds. The release build makes the notices with [cargo-about](https://github.com/EmbarkStudios/cargo-about) and `contrib/notices/`, and fails when a dependency is under a licence `deny.toml` does not allow. `install.sh` puts both files in `/usr/local/share/doc/havn` (next to the prefix the binaries go to); `havn update` replaces only the binaries.

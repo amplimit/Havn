@@ -143,6 +143,32 @@ jobs:
             || { echo "::error::$bin does not carry the dashboard"; exit 1; }
           echo "ok: dashboard embedded"
 
+      - name: third-party notices
+        # THIRD-PARTY-NOTICES.txt: the licences of the crates these binaries
+        # are built from, by cargo-about (contrib/notices/about.toml, whose
+        # list is deny.toml's: a crate under another licence fails the
+        # build), then those of the npm packages of the dashboard
+        # havn-gateway embeds (production packages of the lockfile, checked
+        # against the same list). Offline, from the locked sources.
+        env:
+          CARGO_ABOUT: "0.9.3"
+          CARGO_ABOUT_SHA256: 3ad1e94ea1e63d69d1961f4fb15ccbbe9575d906111f96d2cb4dce6df48f71b4
+        run: |
+          tool="cargo-about-${CARGO_ABOUT}-x86_64-unknown-linux-musl"
+          curl -fsSL -o "${RUNNER_TEMP}/${tool}.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-about/releases/download/${CARGO_ABOUT}/${tool}.tar.gz"
+          echo "${CARGO_ABOUT_SHA256}  ${RUNNER_TEMP}/${tool}.tar.gz" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/${tool}.tar.gz" -C "${RUNNER_TEMP}"
+          cargo fetch --locked
+          mkdir -p target/notices
+          "${RUNNER_TEMP}/${tool}/cargo-about" generate --frozen --fail --workspace \
+            --target ${{ matrix.target }} \
+            -c contrib/notices/about.toml -o target/notices/THIRD-PARTY-NOTICES.txt \
+            contrib/notices/notices.hbs
+          ( cd apps/dashboard && node ../../contrib/notices/npm-notices.mjs ../../contrib/notices/about.toml ) \
+            >> target/notices/THIRD-PARTY-NOTICES.txt
+          ls -l target/notices
+
       - name: package
         id: pkg
         run: |
@@ -152,7 +178,9 @@ jobs:
           tar -czf "dist/${asset}" \
             -C "target/${triple}/release" \
             havn havn-gateway havn-runtime havn-init \
-            -C "${GITHUB_WORKSPACE}/contrib/systemd" havn.service
+            -C "${GITHUB_WORKSPACE}/contrib/systemd" havn.service \
+            -C "${GITHUB_WORKSPACE}" LICENSE \
+            -C "${GITHUB_WORKSPACE}/target/notices" THIRD-PARTY-NOTICES.txt
           ( cd dist && sha256sum "${asset}" > "${asset}.sha256" )
           echo "asset=${asset}" >> "$GITHUB_OUTPUT"
           ls -lh dist

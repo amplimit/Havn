@@ -1,0 +1,19 @@
+THIRD-PARTY NOTICES
+
+Havn's binaries are built from the Rust crates below, and havn-gateway also
+embeds the dashboard, built from the npm packages listed after them. Each
+licence is given once, with the packages under it.
+
+=============================================================================
+Rust crates
+=============================================================================
+{{#each licenses}}
+
+-----------------------------------------------------------------------------
+{{{name}}}, used by:
+{{#each used_by}}
+    {{crate.name}} {{crate.version}}
+{{/each}}
+
+{{{text}}}
+{{/each}}

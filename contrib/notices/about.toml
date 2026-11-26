@@ -1,0 +1,63 @@
+# cargo-about: the licences of the crates Havn's release binaries are built
+# from, for THIRD-PARTY-NOTICES.txt in each release tarball. `accepted` is
+# deny.toml's [licenses] allow list; keep the two the same. A crate under
+# any other licence fails the release build.
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "0BSD",
+    "NCSA",
+    "CDLA-Permissive-2.0",
+]
+# What ships: neither build scripts and proc macros nor test-only crates.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Files a crate bundles under licences its Cargo.toml does not name: the
+# standard PDF fonts of PDFium (Foxit) in hayro-font, and Adobe's
+# predefined CMaps in hayro-cmap, both BSD-3-Clause (issue #230). The
+# checksums pin the files read; a new release of either needs them again.
+[hayro-font.clarify]
+license = "(Apache-2.0 OR MIT) AND BSD-3-Clause"
+
+[[hayro-font.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9"
+
+[[hayro-font.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "51b50e6120c344dcc146bbd6375ca1c78e079d97c8bea76e67a53d6ff0efebac"
+
+[[hayro-font.clarify.files]]
+path = "assets/LICENSE_FOXIT"
+license = "BSD-3-Clause"
+checksum = "b578cdd2345840ada550bd12519533812320d5f1d21cf4c1c7e1b1b0a31c98b7"
+
+[hayro-cmap.clarify]
+license = "(Apache-2.0 OR MIT) AND BSD-3-Clause"
+
+[[hayro-cmap.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9"
+
+[[hayro-cmap.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "51b50e6120c344dcc146bbd6375ca1c78e079d97c8bea76e67a53d6ff0efebac"
+
+[[hayro-cmap.clarify.files]]
+path = "assets/LICENSE.txt"
+license = "BSD-3-Clause"
+checksum = "742665db9c8e1bc72603c6d319ca3e90b83bd6d95202f0cd4ef11068a07a9c29"
