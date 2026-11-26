@@ -48,6 +48,23 @@ pub mod tool;
 /// inside the agent.
 pub const MCP_SERVERS_DIR: &str = "/usr/share/havn/mcp-servers";
 
+/// The servers the agent's own settings define as they run (from
+/// `Welcome`): only theirs resolve `secret:<name>` in `env`. A server a
+/// role supplies, which a team admin writes, never gets the owner's
+/// secrets (issue #233).
+static OWN_SERVERS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Set once, from `Welcome`.
+pub fn set_own_servers(names: Vec<String>) {
+    let _ = OWN_SERVERS.set(names);
+}
+
+fn is_own(name: &str) -> bool {
+    OWN_SERVERS
+        .get()
+        .is_some_and(|own| own.iter().any(|n| n == name))
+}
+
 /// Live handles to every successfully-spawned MCP server for this
 /// agent session. Read by `McpToolHandle::execute` to forward
 /// `tools/call`. Held in an `Arc` so the registry can clone cheaply
@@ -231,14 +248,40 @@ async fn spawn_one(name: &str, cfg: &McpServerConfig) -> anyhow::Result<McpClien
     for arg in &cfg.args {
         command.arg(arg);
     }
-    for (k, v) in &cfg.env {
-        command.env(k, v);
+    // `secret:<name>` values are the agent's secrets (issue #233), resolved
+    // only for a server the agent's own settings define; a server whose
+    // secret is not set, or that a role supplies, does not start.
+    if cfg.uses_secrets() && !is_own(name) {
+        anyhow::bail!(
+            "its env refers to secrets, and it runs with settings the owner's role supplies, \
+             not the agent's own, so they are not resolved; the owner can define the server \
+             in the agent's MCP settings"
+        );
     }
-    // child stderr inherits the runtime's stderr by default (rmcp
-    // configures stdin/stdout for the JSON-RPC pipe), which means
-    // server log output ends up in the agent's tracing pipeline —
-    // useful for debugging without separate plumbing.
-    let transport = TokioChildProcess::new(command)?;
+    for (k, v) in &cfg.env {
+        let value = crate::secrets::resolve(v).map_err(|e| anyhow::anyhow!("env {k}: {e}"))?;
+        command.env(k, value);
+    }
+    // The server's stderr goes to the runtime's, as its log, with the
+    // agent's secrets redacted, also those over several lines, and long
+    // lines cut.
+    let (transport, stderr) = TokioChildProcess::builder(command)
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(mut stderr) = stderr {
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let mut stream = crate::secrets::Stream::default();
+            let mut buf = vec![0_u8; 8 * 1024];
+            loop {
+                match stderr.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => crate::secrets::write_stderr(&stream.push(&buf[..n])),
+                }
+            }
+            crate::secrets::write_stderr(&stream.finish());
+        });
+    }
     // `().serve(t)` performs the MCP `initialize` handshake; we get
     // back a handle that exposes `list_all_tools` and `call_tool`.
     let svc = ().serve(transport).await?;
@@ -313,6 +356,20 @@ mod tests {
                 "expected {ok:?} to be accepted"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_server_a_role_supplies_gets_no_secrets() {
+        // Welcome named no server as the agent's own here.
+        let cfg = McpServerConfig {
+            binary: "gh-mcp".into(),
+            env: HashMap::from([("GH_TOKEN".to_string(), "secret:github".to_string())]),
+            ..Default::default()
+        };
+        let Err(e) = spawn_one("gh", &cfg).await else {
+            panic!("a role's server started with the owner's secret");
+        };
+        assert!(e.to_string().contains("role"), "{e}");
     }
 
     #[tokio::test]

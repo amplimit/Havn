@@ -27,6 +27,7 @@ mod memory_aging;
 mod sandbox;
 #[cfg(target_os = "linux")]
 mod seccomp;
+mod secrets;
 mod skills;
 mod steps;
 mod system_prompt;
@@ -422,9 +423,14 @@ async fn main() -> anyhow::Result<()> {
             models,
             language,
             cuts_calls,
+            secrets: welcome_secrets,
+            own_mcp_servers,
         }) => {
             // One agent per runtime: its language is the process's.
             let _ = LANGUAGE.set(language);
+            // Before anything that logs them or starts a process with them.
+            secrets::set(welcome_secrets);
+            mcp::set_own_servers(own_mcp_servers);
             // Materialise the embedding provider from the
             // gateway-shipped JSON. Absent / null / "disabled"
             // → None, byte-for-byte v0.6 behaviour. Mis-config
@@ -1071,6 +1077,14 @@ where
         match frame {
             GatewayToAgent::Welcome { .. } => {
                 warn!("unexpected duplicate Welcome");
+            }
+            GatewayToAgent::Secrets(update) => {
+                info!(
+                    secrets = update.values.len(),
+                    shell_env = update.shell_env.len(),
+                    "secrets updated"
+                );
+                secrets::set(update);
             }
             GatewayToAgent::TimezoneUpdate(update) => {
                 let zone = zone_or_utc(Some(&update.timezone));
@@ -4082,7 +4096,7 @@ fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer())
+        .with(fmt::layer().with_writer(secrets::LogWriter))
         .init();
 }
 

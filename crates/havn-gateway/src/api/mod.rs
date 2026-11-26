@@ -33,6 +33,7 @@ pub mod memory;
 pub mod models;
 pub mod roles;
 pub mod search;
+pub mod secrets;
 pub mod skills;
 pub mod team_credentials;
 pub mod teams;

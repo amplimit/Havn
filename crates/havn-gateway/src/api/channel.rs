@@ -42,7 +42,7 @@ use crate::api::{ApiError, WS_SEND_TIMEOUT};
 use crate::channel_id_codec;
 use crate::channel_router::{self, AccountKey};
 use crate::config::DmPolicy;
-use crate::secret_ref;
+use havn_core::secret_ref::{self, SecretRef};
 
 /// Header carrying the operator-generated adapter authentication
 /// token (spec §3.3). The matching credential row is keyed by
@@ -686,6 +686,21 @@ async fn authenticate(
         );
         ApiError::Unauthorized
     })?;
+    // An agent's own secret (`secret:<name>`) belongs to that agent, not
+    // to a bot the gateway runs for every agent bound to it.
+    let SecretRef::Credential {
+        provider: ref_provider,
+        name: ref_name,
+    } = parsed_ref
+    else {
+        warn!(
+            channel = %q.channel,
+            account = %q.account,
+            "channel WS: adapter_token_ref names an agent's secret; it must name a credential \
+             (`secret:channel:<channel>:<name>`)"
+        );
+        return Err(ApiError::Unauthorized);
+    };
 
     // v0.2 single-user channel adapters live under the bootstrap
     // user's scope. Team-scope lookup is intentionally deferred to
@@ -695,8 +710,8 @@ async fn authenticate(
         &state.db,
         CredentialScope::User,
         &state.bootstrap_user_id.to_string(),
-        &parsed_ref.provider,
-        &parsed_ref.name,
+        &ref_provider,
+        &ref_name,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("credential lookup: {e}")))?
@@ -704,8 +719,8 @@ async fn authenticate(
         warn!(
             channel = %q.channel,
             account = %q.account,
-            ref_provider = %parsed_ref.provider,
-            ref_name = %parsed_ref.name,
+            ref_provider = %ref_provider,
+            ref_name = %ref_name,
             "channel WS: adapter_token_ref points at a credential row that doesn't exist (run `havn credential add`)"
         );
         ApiError::Unauthorized

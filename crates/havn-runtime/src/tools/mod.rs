@@ -100,6 +100,19 @@ impl ToolResult {
             Self::Ok(s) | Self::Error(s) | Self::Image { text: s, .. } => s,
         }
     }
+
+    /// With the agent's secrets redacted from its text (issue #233).
+    #[must_use]
+    pub fn redacted(self) -> Self {
+        match self {
+            Self::Ok(s) => Self::Ok(crate::secrets::redact(&s)),
+            Self::Error(s) => Self::Error(crate::secrets::redact(&s)),
+            Self::Image { text, path } => Self::Image {
+                text: crate::secrets::redact(&text),
+                path,
+            },
+        }
+    }
 }
 
 #[async_trait]
@@ -492,6 +505,10 @@ impl ToolRegistry {
             obj.insert(files::GUARDED_READS.into(), serde_json::json!(guarded));
         }
 
+        // The agent's secrets are redacted from what the tool returns
+        // before anyone sees it: the owner reviewing it, the model, the
+        // chat that keeps it (issue #233).
+        let run = async { tool.execute(ctx, input).await.redacted() };
         match (review, shown) {
             (Some(review), Some(shown)) => {
                 let approvals = self.approvals.clone().or_else(crate::approvals::global);
@@ -502,11 +519,11 @@ impl ToolRegistry {
                     name,
                     &shown,
                     must_ask,
-                    tool.execute(ctx, input),
+                    run,
                 )
                 .await
             }
-            _ => tool.execute(ctx, input).await,
+            _ => run.await,
         }
     }
 }
