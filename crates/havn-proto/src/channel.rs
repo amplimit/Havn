@@ -42,6 +42,10 @@ pub enum ChannelFrame {
     /// the gateway answers, for a platform's command menu (Telegram's
     /// `setMyCommands`). An adapter that predates it skips it.
     Commands(ChannelCommands),
+    /// Gateway -> adapter, only to one that asked for it on the upgrade
+    /// (`writing=true`, issue #325): a reply as it is being written, for
+    /// the adapter to show in a message it edits.
+    Writing(ChannelWriting),
 }
 
 /// Gateway -> adapter: see [`ChannelFrame::Commands`].
@@ -186,6 +190,45 @@ pub struct ChannelOutbound {
     /// still working, so an adapter keeps showing that it is.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub partial: bool,
+    /// The reply being written (a [`ChannelWriting`]'s `reply`) this is a
+    /// part of, with `partial`, or the end of (issue #325): it takes the
+    /// place of what was shown of it. A message without one leaves the
+    /// reply being written as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<String>,
+}
+
+/// Gateway -> adapter: see [`ChannelFrame::Writing`]. Not numbered nor
+/// kept for a `Resume`: one that is lost is followed by the next, or by
+/// the reply's end.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelWriting {
+    pub account_id: String,
+    /// Where the reply goes, as an outbound's `to`.
+    pub to: String,
+    /// The message it answers, as an outbound's `in_reply_to`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    /// Which reply it is: the `reply` of the outbound frames that are its
+    /// parts and its end.
+    pub reply: String,
+    /// What to show: all the model call in progress has written so far,
+    /// or a line saying the reply is being written. A call after a part
+    /// of the reply (an outbound with `partial`) is shown below that part.
+    pub text: String,
+    /// Under it: a button that stops the reply, as `/stop` does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buttons: Vec<Vec<havn_core::Button>>,
+    /// `text` is the line saying the reply is being written: the call has
+    /// written nothing yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting: bool,
+    /// Only to say the reply is still being written, about every minute
+    /// while nothing new is shown (its turn thinks, runs a tool, waits for
+    /// an approval): `text` and `buttons` are empty, and what is shown
+    /// stays as it is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub alive: bool,
 }
 
 /// Adapter → gateway: replay request after reconnect.
@@ -329,6 +372,7 @@ mod tests {
             buttons: Vec::new(),
             poll: None,
             partial: false,
+            reply: None,
         });
         let s = serde_json::to_string(&frame).expect("serialize");
         let parsed: ChannelFrame = serde_json::from_str(&s).expect("parse");
@@ -351,6 +395,7 @@ mod tests {
             buttons,
             poll: None,
             partial: false,
+            reply: None,
         };
         let plain = serde_json::to_string(&outbound(Vec::new())).expect("json");
         assert!(!plain.contains("buttons"), "{plain}");
@@ -369,6 +414,43 @@ mod tests {
         )
         .expect("old frame");
         assert!(old.buttons.is_empty());
+    }
+
+    #[test]
+    fn a_reply_being_written_is_named_by_its_parts_and_its_end() {
+        let writing = ChannelFrame::Writing(ChannelWriting {
+            account_id: "a".into(),
+            to: "tg:1".into(),
+            in_reply_to: None,
+            reply: "r1".into(),
+            text: "Half of".into(),
+            buttons: vec![vec![havn_core::Button {
+                label: "Stop".into(),
+                data: "/stop".into(),
+            }]],
+            waiting: false,
+            alive: false,
+        });
+        let s = serde_json::to_string(&writing).expect("json");
+        assert!(s.contains(r#""kind":"writing""#), "{s}");
+        assert!(!s.contains("waiting") && !s.contains("alive"), "{s}");
+        assert!(!s.contains("in_reply_to"), "{s}");
+        let parsed: ChannelFrame = serde_json::from_str(&s).expect("parse");
+        assert!(
+            matches!(parsed, ChannelFrame::Writing(w) if w.reply == "r1" && w.text == "Half of")
+        );
+        // An outbound of no reply being written says nothing of one.
+        let end: ChannelOutbound = serde_json::from_str(
+            r#"{"seq":1,"account_id":"a","to":"tg:1","content":{"type":"text","text":"t"},"reply":"r1"}"#,
+        )
+        .expect("end");
+        assert_eq!(end.reply.as_deref(), Some("r1"));
+        let plain = ChannelOutbound { reply: None, ..end };
+        assert!(
+            !serde_json::to_string(&plain)
+                .expect("json")
+                .contains("reply")
+        );
     }
 
     #[test]

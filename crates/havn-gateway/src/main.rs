@@ -661,6 +661,7 @@ async fn serve() -> anyhow::Result<()> {
         embedding_config: embedding_config.clone(),
         multi_user: cfg.trust_header.enabled,
         reply_streams: agent_socket::ReplyStreams::default(),
+        chat_replies: agent_socket::ChatReplies::default(),
         llm,
         models,
         verify_peer_cgroup: isolated_agent_pool.is_some(),

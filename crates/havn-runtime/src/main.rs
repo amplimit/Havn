@@ -1215,6 +1215,7 @@ where
                     buttons: Vec::new(),
                     poll: None,
                     partial: false,
+                    last: false,
                 };
                 if let Err(e) = ctx.writer_tx.try_send(AgentToGateway::CommandReply(reply)) {
                     warn!(error = %e, "could not answer a chat command");
@@ -1637,6 +1638,7 @@ async fn owner_outbound(
         buttons: Vec::new(),
         poll: None,
         partial: false,
+        last: false,
     })
 }
 
@@ -2827,6 +2829,7 @@ fn send_text(ctx: &Ctx, channel_id: String, conversation: Option<String>, text: 
         buttons: Vec::new(),
         poll: None,
         partial: false,
+        last: false,
     };
     // Never wait on a full writer queue: the reader loop calls this, and
     // replies it must route would stall behind it.
@@ -3192,8 +3195,9 @@ async fn handle_inbound(
     let started = std::time::Instant::now();
     // A chat app gets what the model says before each tool call as it is
     // said (issue #212); the web chat shows it as it is written already.
-    let segments = (msg.channel != "webchat")
-        .then(|| tool_loop::Segments::new(msg.channel_id.clone(), chat.clone()));
+    let segments = (msg.channel != "webchat").then(|| {
+        tool_loop::Segments::new(msg.channel_id.clone(), chat.clone(), msg.answers.clone())
+    });
     // Where this turn's own messages start.
     let turn_start = messages.len();
     let mut final_text_failed: Option<String> = None;
@@ -3391,8 +3395,33 @@ async fn handle_inbound(
             }
             Some(turn)
         }
-        // The chat was deleted while it ran: its reply goes nowhere.
-        Ok(None) => return,
+        // The chat was deleted while it ran: its reply goes nowhere, and
+        // what a chat app was shown of it as it was written ends (issue
+        // #325), with nothing more to say.
+        Ok(None) => {
+            if segments.is_some() {
+                let end = OutboundMessage {
+                    conversation: Some(chat.clone()),
+                    channel_id: msg.channel_id.clone(),
+                    content: MessageContent::Text {
+                        text: String::new(),
+                    },
+                    reply_to: None,
+                    buttons: Vec::new(),
+                    poll: None,
+                    partial: false,
+                    last: true,
+                };
+                if let Err(e) = ctx
+                    .writer_tx
+                    .send(AgentToGateway::OutboundMessage(end))
+                    .await
+                {
+                    warn!(error = ?e, "could not end the reply of a deleted chat");
+                }
+            }
+            return;
+        }
         Err(e) => {
             warn!(error = %e, "could not persist assistant turn");
             None
@@ -3413,6 +3442,9 @@ async fn handle_inbound(
         buttons: Vec::new(),
         poll: None,
         partial: false,
+        // What a chat app was shown of the reply as it was written ends
+        // with it (issue #325).
+        last: true,
     };
     if let Err(e) = ctx
         .writer_tx
@@ -4220,6 +4252,7 @@ async fn tell(ctx: &Ctx, channel_id: String, chat: String, text: &str) {
         buttons: Vec::new(),
         poll: None,
         partial: false,
+        last: false,
     };
     if let Err(e) = ctx
         .writer_tx

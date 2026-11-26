@@ -295,6 +295,11 @@ pub struct ChannelQuery {
     /// it, which a `Resume` frame read later cannot promise.
     #[serde(default)]
     pub since: Option<u64>,
+    /// On the WebSocket upgrade: the adapter shows replies as they are
+    /// written (issue #325), so it is sent [`ChannelFrame::Writing`]. An
+    /// older adapter does not ask, and gets replies once written.
+    #[serde(default)]
+    pub writing: bool,
 }
 
 /// HTTP handler for the WebSocket upgrade. Authenticates the request
@@ -308,8 +313,10 @@ pub async fn handler(
     authenticate(&state, &q, &headers).await?;
     let account_id = q.account.clone();
     let channel_id = q.channel.clone();
-    let since = q.since;
-    Ok(ws.on_upgrade(move |socket| handle_session(socket, state, channel_id, account_id, since)))
+    let (since, writing) = (q.since, q.writing);
+    Ok(ws.on_upgrade(move |socket| {
+        handle_session(socket, state, channel_id, account_id, since, writing)
+    }))
 }
 
 /// `GET /api/v1/channel/files/:agent/:file?channel=&account=` — a file an
@@ -412,6 +419,7 @@ pub async fn upload(
         channel: q.channel.clone(),
         account: q.account.clone(),
         since: None,
+        writing: false,
     };
     authenticate(&state, &account, &headers).await?;
     channel_id_codec::validate_channel_id_part("sender_id", &q.sender)
@@ -852,8 +860,9 @@ async fn handle_session(
     channel_id: String,
     account_id: String,
     since: Option<u64>,
+    writing: bool,
 ) {
-    info!(channel = %channel_id, account = %account_id, "channel WS opened");
+    info!(channel = %channel_id, account = %account_id, writing, "channel WS opened");
 
     let key = AccountKey::new(&channel_id, &account_id);
     let (frame_tx, mut frame_rx) = mpsc::channel::<ChannelFrame>(ADAPTER_OUTBOUND_CAPACITY);
@@ -871,14 +880,10 @@ async fn handle_session(
     }
     // Resuming from `since`: new replies only wait in the buffer until the
     // replay below has sent what came before them.
-    if since.is_some() {
-        state
-            .channel_router
-            .register_resuming(key.clone(), frame_tx)
-            .await;
-    } else {
-        state.channel_router.register(key.clone(), frame_tx).await;
-    }
+    state
+        .channel_router
+        .register_as(key.clone(), frame_tx, since.is_some(), writing)
+        .await;
 
     // Separate mpsc for raw WS control frames (Pong replies to
     // protocol-level Pings). Keeps `ChannelRouter` typed on
@@ -2663,6 +2668,7 @@ async fn tell_owner(
             buttons,
             None,
             false,
+            None,
         )
         .await
     {

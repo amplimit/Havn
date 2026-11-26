@@ -34,7 +34,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use havn_proto::channel::{ChannelFrame, ChannelMessageContent, ChannelOutbound};
+use havn_proto::channel::{ChannelFrame, ChannelMessageContent, ChannelOutbound, ChannelWriting};
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc};
 use tracing::warn;
@@ -100,6 +100,9 @@ struct AccountState {
     /// Per group id, whether the bot sees every message there, as its
     /// adapter last said with a message from it.
     sees_all: HashMap<String, bool>,
+    /// The adapter holding `tx` shows replies as they are written (issue
+    /// #325): it asked for [`ChannelFrame::Writing`] on the upgrade.
+    writing: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +133,7 @@ impl AccountState {
             replay: VecDeque::new(),
             replaying: None,
             sees_all: HashMap::new(),
+            writing: false,
         }
     }
 }
@@ -217,23 +221,36 @@ impl ChannelRouter {
     /// `tx` replaces the old one and the seq counter + replay buffer
     /// are preserved — `Resume{since_seq}` from the adapter can then
     /// pull missed frames via [`Self::replay_since`].
+    #[cfg(test)]
     pub async fn register(&self, key: AccountKey, tx: mpsc::Sender<ChannelFrame>) {
-        self.register_as(key, tx, false).await;
+        self.register_as(key, tx, false, false).await;
     }
 
     /// [`Self::register`] for an adapter that resumes as it connects: until
     /// its replay ([`Self::replay_since`], [`Self::replay_more`]) catches
     /// up, new deliveries are only buffered, so none reaches it before the
     /// ones it missed.
+    #[cfg(test)]
     pub async fn register_resuming(&self, key: AccountKey, tx: mpsc::Sender<ChannelFrame>) {
-        self.register_as(key, tx, true).await;
+        self.register_as(key, tx, true, false).await;
     }
 
-    async fn register_as(&self, key: AccountKey, tx: mpsc::Sender<ChannelFrame>, resuming: bool) {
+    /// Register a connected adapter's outbound mpsc, keeping the seq counter
+    /// and replay buffer of a reconnecting one. When `resuming`, new
+    /// deliveries are only buffered until its replay catches up; when
+    /// `writing`, the adapter shows replies as they are written (issue #325).
+    pub async fn register_as(
+        &self,
+        key: AccountKey,
+        tx: mpsc::Sender<ChannelFrame>,
+        resuming: bool,
+        writing: bool,
+    ) {
         let mut map = self.inner.lock().await;
         let state = map.entry(key).or_insert_with(|| AccountState::new(None));
         state.replaying = resuming.then(|| tx.clone());
         state.tx = Some(tx);
+        state.writing = writing;
     }
 
     /// Where a `Resume` from `since_seq` starts: there, unless it is a seq
@@ -282,12 +299,14 @@ impl ChannelRouter {
             Vec::new(),
             None,
             false,
+            None,
         )
         .await
     }
 
     /// [`Self::deliver`], with rows of buttons under the message, or a poll
-    /// in its place.
+    /// in its place; a part of a reply, and of the reply being written it
+    /// is (issue #325).
     #[allow(clippy::too_many_arguments)]
     pub async fn deliver_with(
         &self,
@@ -299,6 +318,7 @@ impl ChannelRouter {
         buttons: Vec<Vec<havn_core::Button>>,
         poll: Option<havn_core::Poll>,
         partial: bool,
+        reply: Option<String>,
     ) -> Result<u64, DeliverError> {
         let key = AccountKey::new(channel, account_id);
         let (tx, frame, seq) = {
@@ -319,6 +339,7 @@ impl ChannelRouter {
                 buttons,
                 poll,
                 partial,
+                reply,
             });
             // Buffered even while the adapter is away, so its `Resume`
             // after reconnecting gets it.
@@ -348,6 +369,44 @@ impl ChannelRouter {
                 Err(DeliverError::Stalled(key))
             }
         }
+    }
+
+    /// Whether the adapter holding `key` now shows replies as they are
+    /// written (issue #325).
+    pub async fn takes_writing(&self, key: &AccountKey) -> bool {
+        self.inner
+            .lock()
+            .await
+            .get(key)
+            .is_some_and(|s| s.writing && s.tx.as_ref().is_some_and(|tx| !tx.is_closed()))
+    }
+
+    /// Send `writing` to the adapter of `(channel, writing.account_id)`,
+    /// when it takes them (issue #325) and `still` says its reply is still
+    /// being written; whether it went. `still` is asked as it is queued, so
+    /// none goes after the reply's end, which is delivered after the reply
+    /// stops being written. Never numbered nor kept for a resume, and never
+    /// sent where it could fill the queue replies go through, nor ahead of
+    /// a replay.
+    pub async fn writing(
+        &self,
+        channel: &str,
+        writing: ChannelWriting,
+        still: impl FnOnce() -> bool,
+    ) -> bool {
+        let key = AccountKey::new(channel, &writing.account_id);
+        let map = self.inner.lock().await;
+        let Some(state) = map.get(&key) else {
+            return false;
+        };
+        let tx = match &state.tx {
+            Some(tx) if state.writing && state.replaying.is_none() => tx,
+            _ => return false,
+        };
+        if tx.capacity() * 2 <= tx.max_capacity() || !still() {
+            return false;
+        }
+        tx.try_send(ChannelFrame::Writing(writing)).is_ok()
     }
 
     /// Collect buffered outbound frames with `seq > since_seq` for
@@ -672,6 +731,88 @@ mod tests {
             }
             other => panic!("expected Outbound, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_reply_being_written_goes_only_to_an_adapter_that_asked_and_has_room() {
+        let router = ChannelRouter::new();
+        let key = AccountKey::new("telegram", "bot");
+        let writing = |text: &str| ChannelWriting {
+            account_id: "bot".into(),
+            to: "tg:1".into(),
+            in_reply_to: None,
+            reply: "r1".into(),
+            text: text.into(),
+            buttons: Vec::new(),
+            waiting: false,
+            alive: false,
+        };
+        // An adapter that did not ask, as one before issue #325.
+        let (older, mut older_rx) = mpsc::channel(8);
+        router.register(key.clone(), older).await;
+        assert!(!router.takes_writing(&key).await);
+        assert!(!router.writing("telegram", writing("a"), || true).await);
+        assert!(older_rx.try_recv().is_err());
+
+        let (tx, mut rx) = mpsc::channel(8);
+        router
+            .register_as(key.clone(), tx.clone(), false, true)
+            .await;
+        assert!(router.takes_writing(&key).await);
+        assert!(router.writing("telegram", writing("b"), || true).await);
+        assert!(matches!(rx.try_recv(), Ok(ChannelFrame::Writing(w)) if w.text == "b"));
+        // Nor once its reply ended.
+        assert!(!router.writing("telegram", writing("b2"), || false).await);
+        assert!(rx.try_recv().is_err());
+        // Not numbered: the next reply's seq follows the last reply's.
+        let first = router
+            .deliver(
+                "telegram",
+                "bot",
+                "tg:1",
+                None,
+                ChannelMessageContent::Text { text: "x".into() },
+            )
+            .await
+            .expect("deliver");
+        assert!(router.writing("telegram", writing("c"), || true).await);
+        let second = router
+            .deliver(
+                "telegram",
+                "bot",
+                "tg:1",
+                None,
+                ChannelMessageContent::Text { text: "y".into() },
+            )
+            .await
+            .expect("deliver");
+        assert_eq!(second, first + 1);
+        let kept = router.replay_since(&key, 0, &stranger()).await;
+        assert!(
+            kept.iter().all(|f| matches!(f, ChannelFrame::Outbound(_))),
+            "kept for a resume"
+        );
+        while rx.try_recv().is_ok() {}
+        // A queue half full takes replies only.
+        for n in 0..4 {
+            router
+                .deliver(
+                    "telegram",
+                    "bot",
+                    "tg:1",
+                    None,
+                    ChannelMessageContent::Text {
+                        text: n.to_string(),
+                    },
+                )
+                .await
+                .expect("deliver");
+        }
+        assert!(!router.writing("telegram", writing("d"), || true).await);
+        while rx.try_recv().is_ok() {}
+        // Nor ahead of a replay.
+        router.register_as(key.clone(), tx, true, true).await;
+        assert!(!router.writing("telegram", writing("e"), || true).await);
     }
 
     #[tokio::test]

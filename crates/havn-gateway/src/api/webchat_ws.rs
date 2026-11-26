@@ -673,6 +673,7 @@ mod tests {
                         buttons: Vec::new(),
                         poll: None,
                         partial: false,
+                        last: false,
                     },
                 )
                 .await

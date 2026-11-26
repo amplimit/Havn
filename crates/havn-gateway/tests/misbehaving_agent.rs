@@ -548,6 +548,7 @@ fn outbound(channel_id: &str, text: &str) -> AgentToGateway {
         buttons: Vec::new(),
         poll: None,
         partial: false,
+        last: false,
     })
 }
 
