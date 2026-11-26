@@ -463,6 +463,7 @@ async fn serve_session<Si, St, E>(
                             None => {
                                 a.transcript = None;
                                 a.scan = None;
+                                a.unread = None;
                             }
                         }
                         attachments.push(a);

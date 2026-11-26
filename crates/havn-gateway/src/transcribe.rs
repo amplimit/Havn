@@ -321,7 +321,7 @@ pub async fn run_tool(
     path: &str,
 ) -> Result<Heard, String> {
     let policy = crate::policy_resolver::for_session(gateway.db, agent, gateway.multi_user).await;
-    if !policy.permissions.can_transcribe {
+    if !policy.permissions.transcribes() {
         return Err("this agent's policy does not allow transcribing audio".into());
     }
     let Some(_mine) = UserCall::take(agent.owner_id) else {
@@ -472,20 +472,25 @@ const TOKENS_PER_SECOND: i64 = 10;
 /// Tokens a second of speech is written in, at most about.
 const TEXT_TOKENS_PER_SECOND: i64 = 5;
 
-/// About how many seconds of sound `bytes`, audio in `format`, hold: a
-/// WAV's by its header, any other's by its size at the bit rate its format
-/// is usually at.
+/// How many seconds of sound `bytes`, audio in `format`, may hold, erring
+/// long: a WAV's from its sample rate, channels and sample size (within
+/// what a recording has), any other's from its size at a low bit rate for
+/// its format. What the endpoint then reports replaces it.
 fn seconds_about(bytes: &[u8], format: &str) -> i64 {
+    let field = |at: usize, len: usize| -> Option<i64> {
+        let b = bytes.get(at..at + len)?;
+        Some(b.iter().rev().fold(0, |n, byte| n << 8 | i64::from(*byte)))
+    };
     let rate = match format {
-        "wav" => bytes
-            .get(28..32)
-            .map(|b| i64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
-            .filter(|rate| *rate > 0)
-            .unwrap_or(32_000),
-        "ogg" | "webm" => 6_000,
-        "flac" => 80_000,
-        "mp4" => 24_000,
-        _ => 16_000,
+        "wav" => match (field(24, 4), field(22, 2), field(34, 2)) {
+            (Some(rate), Some(channels), Some(bits)) => rate * channels * bits / 8,
+            _ => 8_000,
+        }
+        // From 8 kHz mono 8-bit to 48 kHz stereo 16-bit.
+        .clamp(8_000, 192_000),
+        "ogg" | "webm" => 1_500,
+        "flac" => 20_000,
+        _ => 6_000,
     };
     (bytes.len() as i64 / rate).max(1)
 }
@@ -541,8 +546,8 @@ async fn endpoint(
         day_start: &day_start,
         minute_start: &minute_start,
     };
-    let guard = match credential_usage::reserve(call.db, reservation).await {
-        Ok(Some(reserved)) => crate::llm_proxy::ReservationGuard::new(call.db, reserved.id),
+    let reserved = match credential_usage::reserve(call.db, reservation).await {
+        Ok(Some(reserved)) => reserved.id,
         Ok(None) => {
             return Err(
                 "the agent's daily token budget leaves no room for this transcription".into(),
@@ -565,11 +570,22 @@ async fn endpoint(
     {
         request = request.bearer_auth(key);
     }
+    // What was sent is paid for, whatever comes back, or if nothing does in
+    // time: the reservation stays as the use, unless sending failed.
     let answer = async {
-        let response = request
-            .send()
-            .await
-            .map_err(|e| format!("the transcription endpoint could not be reached: {e}"))?;
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(e) => {
+                if e.is_connect() || e.is_builder() {
+                    if let Err(e) = credential_usage::release(call.db, &reserved).await {
+                        tracing::warn!(error = %e, "releasing a transcription's reservation failed");
+                    }
+                }
+                return Err(format!(
+                    "the transcription endpoint could not be reached: {e}"
+                ));
+            }
+        };
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -590,16 +606,16 @@ async fn endpoint(
         Ok((tokens_of(&body, seconds, &text), text))
     }
     .await;
-    match answer {
-        Ok(((tokens_in, tokens_out), text)) => {
-            guard.settle_tokens(model, tokens_in, tokens_out).await;
-            Ok(text)
-        }
-        Err(message) => {
-            guard.release().await;
-            Err(message)
-        }
+    let ((tokens_in, tokens_out), text) = answer?;
+    let used = credential_usage::Used {
+        tokens_in,
+        tokens_out,
+        ..credential_usage::Used::default()
+    };
+    if let Err(e) = credential_usage::settle(call.db, &reserved, model, used).await {
+        tracing::warn!(error = %e, "settling a transcription's use failed");
     }
+    Ok(text)
 }
 
 /// What a model is asked.
@@ -748,12 +764,18 @@ mod tests {
 
     #[test]
     fn an_endpoint_s_use_is_counted_by_what_it_says_or_the_sound_s_length() {
+        // 16 kHz mono 16-bit, 3 seconds; the byte rate field says more,
+        // which is not taken.
         let mut wav = b"RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x80\x3e\0\0".to_vec();
-        // 16 kHz mono 16-bit: 32000 bytes a second, for 3 seconds.
-        wav.extend_from_slice(&32_000_u32.to_le_bytes());
+        wav.extend_from_slice(&10_000_000_u32.to_le_bytes());
+        wav.extend_from_slice(b"\x02\0\x10\0");
         wav.resize(96_000, 0);
         assert_eq!(seconds_about(&wav, "wav"), 3);
-        assert_eq!(seconds_about(&[0; 60_000], "ogg"), 10);
+        // A header claiming a huge rate is held to what recordings have.
+        let mut loud = wav.clone();
+        loud[24..28].copy_from_slice(&4_000_000_000_u32.to_le_bytes());
+        assert_eq!(seconds_about(&loud, "wav"), 1);
+        assert_eq!(seconds_about(&[0; 60_000], "ogg"), 40);
         assert_eq!(seconds_about(b"x", "mp3"), 1);
         let said = serde_json::json!({"text": "hi", "usage": {"type": "tokens", "input_tokens": 120, "output_tokens": 7}});
         assert_eq!(tokens_of(&said, 3, "hi"), (120, 7));

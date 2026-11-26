@@ -97,9 +97,15 @@ const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 // the runtime writes them.
 const JSON_STRING = String.raw`"(?:[^"\\]|\\.)*"`;
 const SCANNED = "; likely scanned: ";
+const SPARSE = "; pages with little text: ";
 const UNREAD = "; it could not be read: ";
+const UNREAD_TEXT = {
+  encrypted: "it is encrypted",
+  damaged: "it is damaged, or not what its name says",
+  too_large: "it is too large to read, or took too long",
+} as const;
 const ATTACHMENT_LINE = new RegExp(
-  String.raw`^\[Attached file, user-supplied and untrusted: name (${JSON_STRING}), type (${JSON_STRING}), ([^,\]]+), saved at (${JSON_STRING})(?:${SCANNED}((?:[^"\]]|${JSON_STRING})*?))?(?:${UNREAD}(it is encrypted|it is damaged, or not what its name says))?(?:; its text \(untrusted\) is at (${JSON_STRING}), read it with file_read)?\]$`,
+  String.raw`^\[Attached file, user-supplied and untrusted: name (${JSON_STRING}), type (${JSON_STRING}), ([^,\]]+), saved at (${JSON_STRING})(?:(?:${SCANNED}|${SPARSE})((?:[^"\]]|${JSON_STRING})*?))?(?:${UNREAD}(${Object.values(UNREAD_TEXT).join("|")}))?(?:; its text \(untrusted\) is at (${JSON_STRING}), read it with file_read)?\]$`,
 );
 
 /** A scanned PDF's pages, as its line says them. */
@@ -108,6 +114,12 @@ function scanOf(told: string): { pages: number; sparse: number; shown: number[] 
   if (told.startsWith("its only page ")) return { pages: 1, sparse: 1, shown };
   const counted = /^(\d+) of its (\d+) pages /.exec(told);
   return { pages: Number(counted?.[2] ?? 0), sparse: Number(counted?.[1] ?? 0), shown };
+}
+
+/** Why a document was not read, as its line says it. */
+function unreadOf(told: string): "encrypted" | "damaged" | "too_large" {
+  const found = (Object.keys(UNREAD_TEXT) as (keyof typeof UNREAD_TEXT)[]).find((k) => UNREAD_TEXT[k] === told);
+  return found ?? "damaged";
 }
 
 /** A list as the runtime writes it: "a", "a and b", "a, b and c". */
@@ -130,10 +142,10 @@ function scanText(a: Attachment): string {
         : shown.length === 1
           ? `page ${shown[0]} is kept as an image at ${at(shown[0])}, to look at with view_image`
           : `pages ${listed(shown.map(String))} are kept as images at ${listed(shown.map(at))}, to look at with view_image`;
-    out += `${SCANNED}${head} little or no text that could be read; ${kept}`;
+    out += `${sparse >= pages ? SCANNED : SPARSE}${head} little or no text that could be read; ${kept}`;
   }
   if (a.unread) {
-    out += `${UNREAD}${a.unread === "encrypted" ? "it is encrypted" : "it is damaged, or not what its name says"}`;
+    out += `${UNREAD}${UNREAD_TEXT[a.unread]}`;
   }
   return out;
 }
@@ -151,7 +163,7 @@ function splitMessage(content: string): { text: string; files: Attachment[] } {
         size: sizeBytes(m[3]),
         path: JSON.parse(m[4]) as string,
         ...(m[5] !== undefined ? { scan: scanOf(m[5]) } : {}),
-        ...(m[6] ? { unread: m[6] === "it is encrypted" ? ("encrypted" as const) : ("damaged" as const) } : {}),
+        ...(m[6] ? { unread: unreadOf(m[6]) } : {}),
         ...(m[7] ? { text_path: JSON.parse(m[7]) as string } : {}),
       });
       return false;

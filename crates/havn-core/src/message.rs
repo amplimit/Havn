@@ -94,6 +94,8 @@ pub enum Unread {
     Encrypted,
     /// It is damaged, or not what its name says.
     Damaged,
+    /// It is too large to read, or took too long.
+    TooLarge,
 }
 
 /// Most pages of a PDF without a text layer kept as images.

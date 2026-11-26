@@ -194,7 +194,7 @@ fn restrictive_fallback() -> Policy {
     p.permissions.can_schedule_cron = false;
     p.permissions.can_search_web = false;
     p.permissions.can_fetch_web = false;
-    p.permissions.can_transcribe = false;
+    p.permissions.can_transcribe = Some(false);
     p
 }
 

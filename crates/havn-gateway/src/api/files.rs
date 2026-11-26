@@ -238,10 +238,13 @@ pub async fn receive(
         // A PDF's pages with too little text, scans, are told as such, and
         // made images (issue #230); what cannot be read at all says why.
         if kind == crate::web_fetch::Kind::Pdf {
-            let layout = read.as_ref().ok().map(|doc| doc.layout.clone());
+            let layout = match &read {
+                Ok(doc) => Ok(doc.layout.clone().unwrap_or_default()),
+                Err(why) => Err(why.as_str()),
+            };
             (scan, unread) = keep_pages(state, agent_id, &stored.file, &body, layout).await;
-        } else if read.is_err() {
-            unread = Some(havn_core::Unread::Damaged);
+        } else if let Err(why) = &read {
+            unread = crate::web_fetch::unread_of(why);
         }
         if let Ok(doc) = read
             && !doc.text.trim().is_empty()
@@ -307,31 +310,43 @@ pub async fn receive(
 
 /// The pages of PDF `body`, kept in the inbox as `file`, that have little
 /// or no text by `layout`, made images and kept next to it (issue #230);
-/// when its text could not be read (`layout` is `None`), its first pages.
-/// `None` for a PDF with text on every page; why it could not be read,
-/// when the renderer could not read it either.
+/// when its text could not be read (`layout` is why not), its first pages.
+/// Pages that draw blank are not counted. `None` for a PDF with text on
+/// every other page; why it could not be read, when the renderer could not
+/// read it either.
 async fn keep_pages(
     state: &AppState,
     agent_id: havn_core::AgentId,
     file: &str,
     body: &[u8],
-    layout: Option<Option<crate::web_fetch::Layout>>,
+    layout: Result<crate::web_fetch::Layout, &str>,
 ) -> (Option<havn_core::Scan>, Option<havn_core::Unread>) {
-    let layout = layout.flatten();
-    if layout.as_ref().is_some_and(|l| l.draw.is_empty()) {
+    if layout.as_ref().is_ok_and(|l| l.draw.is_empty()) {
         return (None, None);
     }
-    let drawn = crate::web_fetch::scanned_pages(body, layout.as_ref().map(|l| &l.draw[..])).await;
+    let wanted = layout.as_ref().ok().map(|l| &l.draw[..]);
+    let drawn = crate::web_fetch::scanned_pages(body, wanted).await;
     if let Some(why) = &drawn.failed {
         tracing::info!(agent_id = %agent_id, why, "not all the pages of a PDF were made images");
     }
     let (pages, sparse) = match (&layout, drawn.count) {
-        (Some(layout), _) => (layout.pages, layout.sparse),
+        (Ok(layout), _) => (layout.pages, layout.sparse),
         // No text could be read: every page lacks it.
-        (None, Some(count)) if count > 0 => (count, count),
-        (None, _) if drawn.encrypted() => return (None, Some(havn_core::Unread::Encrypted)),
-        (None, _) => return (None, Some(havn_core::Unread::Damaged)),
+        (Err(_), Some(count)) if count > 0 => (count, count),
+        // Neither could read it: why, as the renderer or else the text
+        // reader says.
+        (Err(why), _) => {
+            let unread = drawn
+                .failed
+                .as_deref()
+                .and_then(crate::web_fetch::unread_of)
+                .filter(|u| *u == havn_core::Unread::Encrypted)
+                .or_else(|| crate::web_fetch::unread_of(why));
+            return (None, unread);
+        }
     };
+    // A blank back or divider is not a page without its text.
+    let sparse = sparse.saturating_sub(u32::try_from(drawn.blank.len()).unwrap_or(u32::MAX));
     let mut shown = Vec::new();
     for (n, image) in drawn.images {
         if keep(state, agent_id, Attachment::page_image(file, n), image)
@@ -341,6 +356,9 @@ async fn keep_pages(
             break;
         }
         shown.push(n);
+    }
+    if sparse == 0 {
+        return (None, None);
     }
     (
         Some(havn_core::Scan {
@@ -439,6 +457,9 @@ pub async fn as_kept(
     mut attachment: Attachment,
 ) -> Attachment {
     attachment.transcript = None;
+    // Why a document could not be read is the gateway's to say, when it
+    // received it: not the page's.
+    attachment.unread = None;
     let sent_scan = attachment.scan.take();
     let Some(file) = attachment
         .path
@@ -464,14 +485,18 @@ pub async fn as_kept(
         .unwrap_or_default();
         let count = |pages: &[u32]| u32::try_from(pages.len()).unwrap_or(u32::MAX);
         attachment.scan = match sent_scan {
-            // What the page sent, as far as the pages are there.
+            // What the page sent, as far as the pages are there: each once,
+            // in order, as many as are kept.
             Some(sent) => {
-                let shown: Vec<u32> = sent
+                let mut shown: Vec<u32> = sent
                     .shown
                     .iter()
                     .copied()
                     .filter(|n| kept.contains(n))
                     .collect();
+                shown.sort_unstable();
+                shown.dedup();
+                shown.truncate(havn_core::MAX_SCAN_PAGES as usize);
                 let sparse = sent.sparse.max(count(&shown));
                 Some(havn_core::Scan {
                     pages: sent.pages.max(sparse),

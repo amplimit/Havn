@@ -82,7 +82,7 @@ export type Attachment = {
    * them have no text, and those kept as images, by number. */
   scan?: { pages: number; sparse: number; shown: number[] };
   /** A document whose text could not be read, and why. */
-  unread?: "encrypted" | "damaged";
+  unread?: "encrypted" | "damaged" | "too_large";
 };
 
 export type MemoryChange = {

@@ -2117,7 +2117,7 @@ async fn gateway_tools_for(
     if policy.permissions.can_schedule_cron {
         tools.push(crate::schedule::spec());
     }
-    if policy.permissions.can_transcribe
+    if policy.permissions.transcribes()
         && let Some(how) = &**ctx.transcription.load()
     {
         tools.push(crate::transcribe::spec(how));
@@ -4598,6 +4598,7 @@ mod tests {
     #[tokio::test]
     async fn transcribe_reads_the_agent_s_own_audio_and_says_why_not() {
         let mut ctx = ctx_with(false, false).await;
+        ctx.transcribe_rate = Arc::new(crate::web_search::UserRate::new(100));
         let root = tempfile::tempdir().expect("tempdir");
         ctx.workspace_root = root.path().to_path_buf();
         let owner = create_user(&ctx.db, NewUser { display_name: "o" })
@@ -4643,8 +4644,14 @@ mod tests {
         let app = axum::Router::new().route(
             "/v1/audio/transcriptions",
             axum::routing::post(|body: axum::body::Bytes| async move {
-                let named = String::from_utf8_lossy(&body).contains("filename=\"audio.ogg\"");
+                use axum::response::IntoResponse as _;
+                let sent = String::from_utf8_lossy(&body);
+                if sent.contains("FAIL") {
+                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+                }
+                let named = sent.contains("filename=\"audio.ogg\"");
                 axum::Json(serde_json::json!({"text": format!("hello, sent as ogg: {named}")}))
+                    .into_response()
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -4704,6 +4711,34 @@ mod tests {
                 .expect("audit");
         assert_eq!(audited.len(), 8, "{audited:?}");
         assert!(audited[0].contains("\"format\":\"ogg\""), "{}", audited[0]);
+
+        // Sent, and answered with a failure: the estimate stays as the use.
+        std::fs::write(workspace.join("rec/bad.ogg"), b"OggS\0\x02 FAIL").expect("audio");
+        let failed = run_gateway_tool(agent, &call("rec/bad.ogg"), &ctx)
+            .await
+            .expect_err("a failure");
+        assert!(failed.contains("500"), "{failed}");
+        // Not sent at all: nothing is counted.
+        ctx.transcription
+            .store(Arc::new(Some(crate::transcribe::Transcription::Endpoint {
+                base_url: "http://127.0.0.1:1/v1".into(),
+                model: "whisper-1".into(),
+                api_key_env: "HAVN_TEST_NO_SUCH_KEY".into(),
+            })));
+        let unsent = run_gateway_tool(agent, &call("rec/call.ogg"), &ctx)
+            .await
+            .expect_err("unreachable");
+        assert!(unsent.contains("could not be reached"), "{unsent}");
+        let counted: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM credential_usages WHERE agent_id = ?1")
+                .bind(agent.to_string())
+                .fetch_one(&ctx.db)
+                .await
+                .expect("usage");
+        assert_eq!(
+            counted, 2,
+            "the one heard and the one that failed after it was sent"
+        );
     }
 
     #[tokio::test]

@@ -157,13 +157,13 @@ async fn view(state: &AppState, agent: &Agent) -> Result<AgentWebView, ApiError>
     Ok(AgentWebView {
         can_search_web: policy.permissions.can_search_web,
         can_fetch_web: policy.permissions.can_fetch_web,
-        can_transcribe: policy.permissions.can_transcribe,
+        can_transcribe: policy.permissions.transcribes(),
         transcription: state.transcription.load().is_some(),
         egress_allowed: egress(&policy),
         egress_proxy: policy.network_policy.egress_proxy,
         search_permitted: !multi_user || owner.permissions.can_search_web,
         fetch_permitted: !multi_user || owner.permissions.can_fetch_web,
-        transcribe_permitted: !multi_user || owner.permissions.can_transcribe,
+        transcribe_permitted: !multi_user || owner.permissions.transcribes(),
         egress_permitted: !multi_user || egress(&owner),
         search_backend: backend.map(crate::web_search::Backend::name),
         allowed_domains: own_domains(agent, "allowed_domains"),
@@ -394,7 +394,7 @@ mod tests {
             serde_json::from_value(patched["policy"].clone()).expect("policy");
         assert!(!policy.permissions.can_search_web);
         assert!(!policy.permissions.can_fetch_web);
-        assert!(!policy.permissions.can_transcribe);
+        assert!(!policy.permissions.transcribes());
         assert!(policy.network_policy.egress_allowed);
         assert!(!policy.permissions.can_use_shell);
 

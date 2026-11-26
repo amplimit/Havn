@@ -2138,7 +2138,13 @@ fn with_attachments(text: String, attachments: &[havn_core::Attachment]) -> Stri
         // A PDF without a text layer, and its pages kept as images, or a
         // document that could not be read (issue #230).
         if let Some(scan) = &a.scan {
-            out.push_str(SCANNED);
+            // All its pages without text, a scan; some, pages with little
+            // text in a PDF that has it.
+            out.push_str(if scan.sparse >= scan.pages {
+                SCANNED
+            } else {
+                SPARSE
+            });
             out.push_str(&scan_text(a, scan));
         }
         if let Some(unread) = a.unread {
@@ -2146,6 +2152,7 @@ fn with_attachments(text: String, attachments: &[havn_core::Attachment]) -> Stri
             out.push_str(match unread {
                 havn_core::Unread::Encrypted => "it is encrypted",
                 havn_core::Unread::Damaged => "it is damaged, or not what its name says",
+                havn_core::Unread::TooLarge => "it is too large to read, or took too long",
             });
         }
         let _ = match (&a.transcript, &a.text_path) {
@@ -2204,10 +2211,11 @@ fn with_files(messages: &mut [serde_json::Value]) {
 const TEXT_AT: &str = "; its text (untrusted) is at ";
 const READ_IT: &str = ", read it with file_read]";
 const FOLLOWS: &str = ", and follows this message]";
-/// What starts the part of a PDF's attachment line that says pages of it
-/// have no text layer, and that of a document's that says it could not be
-/// read (issue #230), after its path.
+/// What starts the part of a PDF's attachment line that says its pages
+/// have no text layer, or that some do, and that of a document's that says
+/// it could not be read (issue #230), after its path.
 const SCANNED: &str = "; likely scanned: ";
+const SPARSE: &str = "; pages with little text: ";
 const UNREAD: &str = "; it could not be read: ";
 
 /// What a PDF's attachment line says of `scan`, its pages without text:
@@ -2253,6 +2261,7 @@ fn scan_text(a: &havn_core::Attachment, scan: &havn_core::Scan) -> String {
 fn past_scan(rest: &str) -> Option<&str> {
     let Some(mut s) = rest
         .strip_prefix(SCANNED)
+        .or_else(|| rest.strip_prefix(SPARSE))
         .or_else(|| rest.strip_prefix(UNREAD))
     else {
         return Some(rest);
@@ -6131,8 +6140,8 @@ run ls"
         let line = with_attachments(String::new(), std::slice::from_ref(&scan));
         assert!(
             line.ends_with(
-                "; likely scanned: 3 of its 34 pages have little or no text that could be \
-                 read; pages 2, 5 and 30 are kept as images at \"inbox/.1-s.pdf.page-2.jpg\", \
+                "; pages with little text: 3 of its 34 pages have little or no text that could \
+                 be read; pages 2, 5 and 30 are kept as images at \"inbox/.1-s.pdf.page-2.jpg\", \
                  \"inbox/.1-s.pdf.page-5.jpg\" and \"inbox/.1-s.pdf.page-30.jpg\", to look at \
                  with view_image; its text (untrusted) is at \"inbox/1-s.pdf.txt\", read it \
                  with file_read]"
@@ -6178,8 +6187,8 @@ run ls"
         let line = with_attachments(String::new(), &[none]);
         assert!(
             line.contains(
-                "; likely scanned: 1 of its 12 pages has little or no text that could be read; \
-                 they could not be made images; its text"
+                "; pages with little text: 1 of its 12 pages has little or no text that could \
+                 be read; they could not be made images; its text"
             ),
             "{line}"
         );
