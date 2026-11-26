@@ -328,9 +328,9 @@ async fn keep_pages(
     let (pages, sparse) = match (&layout, drawn.count) {
         (Some(layout), _) => (layout.pages, layout.sparse),
         // No text could be read: every page lacks it.
-        (None, Some(count)) => (count, count),
-        (None, None) if drawn.encrypted() => return (None, Some(havn_core::Unread::Encrypted)),
-        (None, None) => return (None, Some(havn_core::Unread::Damaged)),
+        (None, Some(count)) if count > 0 => (count, count),
+        (None, _) if drawn.encrypted() => return (None, Some(havn_core::Unread::Encrypted)),
+        (None, _) => return (None, Some(havn_core::Unread::Damaged)),
     };
     let mut shown = Vec::new();
     for (n, image) in drawn.images {
