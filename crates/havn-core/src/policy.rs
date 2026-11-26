@@ -191,6 +191,9 @@ impl Policy {
             "network_policy.blocked_domains",
             &self.network_policy.blocked_domains,
         )?;
+        for (server, config) in &self.mcp_servers {
+            config.validate_env(server)?;
+        }
         self.hooks.validate()
     }
 }
@@ -507,6 +510,9 @@ pub struct McpServerConfig {
     /// at startup rather than silently picking up the directory itself.
     pub binary: String,
     pub args: Vec<String>,
+    /// The server's environment. A value `secret:<name>` is the agent's
+    /// secret of that name, set by its owner and resolved when the server
+    /// starts (issue #233); without it the server does not start.
     pub env: HashMap<String, String>,
     /// Read-write paths the spawner unions into Landlock.
     pub extra_paths_rw: Vec<PathBuf>,
@@ -520,6 +526,54 @@ pub struct McpServerConfig {
     /// Disable a server without removing the entry — useful when an
     /// operator is debugging.
     pub enabled: bool,
+}
+
+impl McpServerConfig {
+    /// Checks that each `env` value starting with `secret:` names one of the
+    /// agent's own secrets (`secret:<name>`), as the runtime resolves it.
+    pub fn validate_env(&self, server: &str) -> crate::Result<()> {
+        use crate::secret_ref::{self, SecretRef};
+        for (var, value) in &self.env {
+            if !value.starts_with(secret_ref::PREFIX) {
+                continue;
+            }
+            match secret_ref::parse(value) {
+                Ok(SecretRef::Agent { .. }) => {}
+                Ok(SecretRef::Credential { .. }) => {
+                    return Err(crate::Error::InvalidPolicy(format!(
+                        "mcp_servers.{server}.env.{var}: {value:?} names a gateway credential; \
+                         an MCP server gets only the agent's own secrets, as `secret:<name>`"
+                    )));
+                }
+                Err(e) => {
+                    return Err(crate::Error::InvalidPolicy(format!(
+                        "mcp_servers.{server}.env.{var}: {e}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `self` runs as `other`: the same binary, arguments,
+    /// environment and paths (whether each is enabled, and its timeout,
+    /// aside).
+    #[must_use]
+    pub fn runs_as(&self, other: &McpServerConfig) -> bool {
+        self.binary == other.binary
+            && self.args == other.args
+            && self.env == other.env
+            && self.extra_paths_rw == other.extra_paths_rw
+            && self.extra_paths_ro == other.extra_paths_ro
+    }
+
+    /// Whether its `env` refers to a secret.
+    #[must_use]
+    pub fn uses_secrets(&self) -> bool {
+        self.env
+            .values()
+            .any(|v| v.starts_with(crate::secret_ref::PREFIX))
+    }
 }
 
 impl Default for McpServerConfig {
@@ -1401,5 +1455,26 @@ mod tests {
             p.allowed_models = vec![bad.into()];
             assert!(p.validate().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn mcp_env_refers_only_to_the_agents_own_secrets() {
+        let mut p = Policy::default();
+        let server = |value: &str| McpServerConfig {
+            binary: "gh".into(),
+            env: HashMap::from([("TOKEN".to_string(), value.to_string())]),
+            ..Default::default()
+        };
+        for ok in ["plain", "secret:github"] {
+            p.mcp_servers = HashMap::from([("gh".to_string(), server(ok))]);
+            assert!(p.validate().is_ok(), "{ok}");
+        }
+        for bad in ["secret:channel:telegram:bot", "secret:", "secret:-x"] {
+            p.mcp_servers = HashMap::from([("gh".to_string(), server(bad))]);
+            assert!(p.validate().is_err(), "{bad}");
+        }
+        assert!(server("secret:github").uses_secrets());
+        assert!(server("secret:github").runs_as(&server("secret:github")));
+        assert!(!server("secret:github").runs_as(&server("secret:gitlab")));
     }
 }

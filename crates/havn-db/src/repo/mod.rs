@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::DbError;
 
+pub mod agent_secrets;
 pub mod agents;
 pub mod audit;
 pub mod channel_access;

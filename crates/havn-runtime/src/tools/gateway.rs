@@ -109,6 +109,9 @@ impl Tool for GatewayTool {
             input,
             conversation: CONVERSATION.try_with(Clone::clone).ok(),
             chat: CHAT.try_with(Clone::clone).ok(),
+            sender: ASKED.try_with(|asked| asked.0.clone()).ok(),
+            from_owner: FROM_OWNER.try_with(|owner| *owner).unwrap_or(false),
+            in_group: IN_GROUP.try_with(|group| *group).unwrap_or(false),
         });
         if self.writer_tx.send(frame).await.is_err() {
             return ToolResult::Error("the gateway connection is closed".into());

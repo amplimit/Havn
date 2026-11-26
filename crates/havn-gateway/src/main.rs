@@ -29,7 +29,7 @@ mod policy_resolver;
 mod query_broker;
 mod reload;
 mod schedule;
-mod secret_ref;
+mod secrets;
 mod supervisor;
 mod timezone;
 mod transcribe;
@@ -50,7 +50,7 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
+    routing::{get, patch, post, put},
 };
 use havn_core::UserId;
 use havn_spawner::{AgentSpawner, subprocess::SubprocessSpawner};
@@ -178,6 +178,8 @@ struct AppState {
     /// key, so callers can assume `Some` whenever a credential read
     /// happens (the `Credential` row would not exist otherwise).
     pub keyring: Option<keyring::KeyRing>,
+    /// The agents' secrets (issue #233).
+    pub secrets: secrets::SecretStore,
     /// Restart bookkeeping for agents whose process exits or goes silent.
     pub supervisor: supervisor::Supervisor,
     /// `[llm]` settings, applied to the LLM test endpoint as to agent
@@ -242,6 +244,11 @@ async fn serve() -> anyhow::Result<()> {
             }
             _ => {}
         }
+        let _ = writeln!(
+            std::io::stdout(),
+            "{BANNER}havn-gateway {}\n",
+            env!("CARGO_PKG_VERSION")
+        );
     }
     init_tracing();
 
@@ -412,7 +419,8 @@ async fn serve() -> anyhow::Result<()> {
                 .context("checking credentials table")?;
             if count > 0 {
                 anyhow::bail!(
-                    "HAVN_AGE_KEY env var is not set, but {count} credential row(s) exist. \
+                    "HAVN_AGE_KEY env var is not set, but {count} credential(s) or agent \
+                     secret(s) exist. \
                      Set HAVN_AGE_KEY to the operator passphrase before starting the gateway. \
                      Refusing to boot with credentials in an unmigrated / undecryptable state \
                      (spec §13 Phase 3)."
@@ -558,6 +566,7 @@ async fn serve() -> anyhow::Result<()> {
     }
     let search = Arc::new(web_search::WebSearch::new(cfg.search.clone(), &cfg.llm));
     let llm = Arc::new(cfg.llm.clone());
+    let secret_store = secrets::SecretStore::new(db.clone(), keyring.clone());
     let state = AppState {
         db: db.clone(),
         bootstrap_user_id: user.id,
@@ -587,6 +596,7 @@ async fn serve() -> anyhow::Result<()> {
         embedding_config: embedding_config.clone(),
         agent_env_passthrough: Arc::new(api::agents::embedding_env_passthrough(&cfg.embedding)),
         keyring: keyring.clone(),
+        secrets: secret_store.clone(),
         supervisor: supervisor::Supervisor::new(
             supervisor::RestartPolicy::default(),
             havn_proto::LIVENESS_PING_INTERVAL,
@@ -659,6 +669,7 @@ async fn serve() -> anyhow::Result<()> {
         tmpfs_mounts: cfg.tmpfs_mounts.clone(),
         seccomp_allow_extra: cfg.seccomp.allow_extra.clone(),
         keyring: keyring.clone(),
+        secrets: secret_store,
         search,
         fetch: Arc::new(
             web_fetch::WebFetch::new(cfg.fetch.clone()).context("building the web_fetch client")?,
@@ -791,6 +802,12 @@ async fn serve() -> anyhow::Result<()> {
             "/agents/{id}/mcp",
             get(api::mcp::get).patch(api::mcp::patch),
         )
+        .route("/agents/{id}/secrets", get(api::secrets::list))
+        .route(
+            "/agents/{id}/secrets/{name}",
+            put(api::secrets::set).delete(api::secrets::remove),
+        )
+        .route("/agents/{id}/shell-env", put(api::secrets::put_shell_env))
         .route(
             "/agents/{id}/web",
             get(api::search::agent_get).patch(api::search::agent_patch),
@@ -1477,6 +1494,14 @@ fn is_loopback(listen: &str) -> bool {
     let host = listen.rsplit_once(':').map_or(listen, |(h, _)| h);
     matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
 }
+
+const BANNER: &str = r" _   _
+| | | | __ ___   ___ __
+| |_| |/ _` \ \ / / '_ \
+|  _  | (_| |\ V /| | | |
+|_| |_|\__,_| \_/ |_| |_|
+
+";
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));

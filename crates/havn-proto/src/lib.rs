@@ -9,6 +9,8 @@
 pub mod channel;
 pub mod codec;
 
+use std::collections::BTreeMap;
+
 use havn_core::{InboundMessage, OutboundMessage, Policy};
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +26,8 @@ pub use codec::{FrameError, read_frame, write_frame};
 /// 0.6.0: `ChatCommand`.
 /// 0.7.0: `ChatTitled`.
 /// 0.8.0: `HeartbeatTick` names where its result goes.
-pub const PROTOCOL_VERSION: &str = "0.9.0";
+/// 0.10.0: `Welcome.secrets` and `Secrets` (issue #233).
+pub const PROTOCOL_VERSION: &str = "0.10.0";
 
 /// How often a runtime sends [`AgentToGateway::LivenessPing`] once it is
 /// up. The gateway restarts an agent that stays connected but silent for
@@ -182,6 +185,28 @@ pub const MAX_MEMORY_CHANGE_CHARS: usize = 500;
 pub struct TimezoneUpdate {
     /// IANA name, such as `Asia/Shanghai`.
     pub timezone: String,
+}
+
+/// The agent's secrets and its shell environment (issue #233), in
+/// [`GatewayToAgent::Welcome`] and, whenever its owner changes them,
+/// [`GatewayToAgent::Secrets`]. Its `Debug` shows names only.
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Secrets {
+    /// Name to value, for `secret:<name>` references and redaction.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub values: BTreeMap<String, String>,
+    /// Variables shell commands get: a value, or `secret:<name>`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shell_env: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for Secrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Secrets")
+            .field("values", &self.values.keys().collect::<Vec<_>>())
+            .field("shell_env", &self.shell_env.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 /// See [`GatewayToAgent::StopTurn`].
@@ -386,7 +411,19 @@ pub enum GatewayToAgent {
         /// call.
         #[serde(default)]
         cuts_calls: bool,
+        /// The agent's secrets and shell environment (issue #233).
+        #[serde(default)]
+        secrets: Secrets,
+        /// The MCP servers whose `secret:<name>` references the runtime
+        /// resolves: those the agent's own settings define as they run.
+        /// One a role supplies does not get the owner's secrets.
+        #[serde(default)]
+        own_mcp_servers: Vec<String>,
     },
+    /// The owner changed the agent's secrets or shell environment: the
+    /// whole new set, for shell commands from now on and for MCP servers
+    /// from the runtime's next start.
+    Secrets(Secrets),
     /// Inbound message from a channel adapter.
     InboundMessage(InboundMessage),
     /// The owner's time zone changed.
@@ -498,6 +535,16 @@ pub struct GatewayToolCall {
     /// task's results go to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat: Option<String>,
+    /// Who wrote the message the turn answers ([`InboundMessage::sender_id`],
+    /// or what started it, such as a webhook), when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
+    /// The turn answers the agent's owner.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub from_owner: bool,
+    /// The turn answers a message in a group.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_group: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1172,6 +1219,8 @@ mod tests {
             models: Vec::new(),
             language: havn_core::Language::English,
             cuts_calls: true,
+            secrets: Secrets::default(),
+            own_mcp_servers: Vec::new(),
         };
         let line = serde_json::to_string(&frame).expect("serialize");
         assert!(line.contains("\"type\":\"welcome\""));
@@ -1213,6 +1262,8 @@ mod tests {
             models: Vec::new(),
             language: havn_core::Language::English,
             cuts_calls: true,
+            secrets: Secrets::default(),
+            own_mcp_servers: Vec::new(),
         };
         let line = serde_json::to_string(&frame).expect("serialize");
         let parsed: GatewayToAgent = serde_json::from_str(&line).expect("parse");
@@ -1255,6 +1306,22 @@ mod tests {
         assert!(policy.permissions.can_use_shell);
         assert!(policy.hooks.pre_tool_use.is_empty());
         assert_eq!(max_tokens, None);
+    }
+
+    #[test]
+    fn secrets_round_trip_and_debug_shows_names_only() {
+        let secrets = Secrets {
+            values: BTreeMap::from([("github".to_string(), "ghp_value_1234".to_string())]),
+            shell_env: BTreeMap::from([("GH_TOKEN".to_string(), "secret:github".to_string())]),
+        };
+        let line = serde_json::to_string(&GatewayToAgent::Secrets(secrets.clone())).expect("ser");
+        let GatewayToAgent::Secrets(parsed) = serde_json::from_str(&line).expect("parse") else {
+            panic!("wrong variant");
+        };
+        assert_eq!(parsed, secrets);
+        let debug = format!("{:?}", GatewayToAgent::Secrets(secrets));
+        assert!(debug.contains("github") && debug.contains("GH_TOKEN"));
+        assert!(!debug.contains("ghp_value_1234"));
     }
 
     #[test]

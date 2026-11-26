@@ -10,6 +10,7 @@ pub mod ids;
 pub mod message;
 pub mod policy;
 pub mod release;
+pub mod secret_ref;
 
 pub use error::{Error, Result};
 pub use ids::{

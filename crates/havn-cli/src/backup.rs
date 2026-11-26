@@ -383,7 +383,8 @@ pub async fn backup(install: &Install, output: &Path) -> anyhow::Result<Manifest
         gateway_schema,
         agent_schema,
         incomplete,
-        key: "Credentials are encrypted with the gateway's HAVN_AGE_KEY, which this archive \
+        key: "Credentials and agent secrets are encrypted with the gateway's HAVN_AGE_KEY, \
+              which this archive \
               does not hold; restoring needs the same key."
             .into(),
     };

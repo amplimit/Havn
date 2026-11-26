@@ -41,6 +41,7 @@ import {
   type MyDomainsView,
   type TimezoneView,
   type WebhookView,
+  type SecretsView,
 } from "@/lib/api";
 
 function useFlash(ms = 4000): [boolean, () => void] {
@@ -387,6 +388,10 @@ function Settings({ id }: { id: string }) {
       <McpEditor agentId={id} />
       </Group>
 
+      <Group id="secrets">
+      <SecretsEditor agentId={id} />
+      </Group>
+
       <Group id="advanced">
       {embedding && (
         <RetrievalEditor embedding={embedding} onChange={(next) => setEmbedding(next)} />
@@ -432,6 +437,7 @@ const GROUPS = [
   { id: "prompt", title: "Prompt and schedule" },
   { id: "chat-apps", title: "Chat apps" },
   { id: "tools", title: "Tools and permissions" },
+  { id: "secrets", title: "Secrets" },
   { id: "advanced", title: "Advanced" },
 ] as const;
 
@@ -2880,6 +2886,352 @@ function McpEditor({ agentId }: { agentId: string }) {
         </>
       )}
     </section>
+  );
+}
+
+/** The shell environment as the editor shows it: one `NAME=value` a line. */
+function envText(env: Record<string, string>): string {
+  return Object.entries(env)
+    .map(([name, value]) => `${name}=${value}`)
+    .join("\n");
+}
+
+/** `NAME=value` lines as a shell environment; blank lines are skipped. */
+function parseEnv(text: string): Record<string, string> | string {
+  const env: Record<string, string> = {};
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    const at = line.indexOf("=");
+    if (at <= 0) return `"${line}" is not NAME=value`;
+    env[line.slice(0, at).trim()] = line.slice(at + 1).trim();
+  }
+  return env;
+}
+
+/**
+ * The agent's secrets (issue #233): set and remove them, answer the ones the
+ * agent asked for, and give shell commands variables. No value is ever
+ * shown again, here or to the agent's model.
+ */
+function SecretsEditor({ agentId }: { agentId: string }) {
+  const [view, setView] = useState<SecretsView | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  // What is typed for each secret, by name; "" for the new one.
+  const [values, setValues] = useState<Record<string, string>>({});
+  // For a requested secret: give it as the variable the agent asked for.
+  const [asVariable, setAsVariable] = useState<Record<string, boolean>>({});
+  const [name, setName] = useState("");
+  const [variable, setVariable] = useState("");
+  const [envDraft, setEnvDraft] = useState("");
+  const [savedEnv, flashEnv] = useFlash();
+  useEffect(() => {
+    let cancelled = false;
+    api.secrets.list(agentId).then(
+      (v) => {
+        if (cancelled) return;
+        setView(v);
+        setEnvDraft(envText(v.shell_env));
+      },
+      (e: unknown) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId]);
+  async function act(work: () => Promise<SecretsView>, savesEnv = false): Promise<boolean> {
+    setBusy(true);
+    setError(null);
+    try {
+      const before = view ? envText(view.shell_env) : "";
+      const next = await work();
+      setView(next);
+      // Edits not saved yet stay; the saved environment replaces a draft
+      // that had none.
+      setEnvDraft((draft) => (savesEnv || draft === before ? envText(next.shell_env) : draft));
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+  function typed(key: string, value: string) {
+    setValues((all) => ({ ...all, [key]: value }));
+  }
+  async function set(secret: string, key: string, env?: string) {
+    const value = values[key] ?? "";
+    const ok = await act(() => api.secrets.set(agentId, secret, value, env));
+    // The value is not kept in the page once sent.
+    typed(key, "");
+    return ok;
+  }
+  if (!view) return error ? <p className="mt-10 text-sm" role="alert">{error}</p> : null;
+  const muted = { color: "var(--color-body)" };
+  const requested = view.secrets.filter((s) => !s.set);
+  const kept = view.secrets.filter((s) => s.set);
+  const shellEnv = parseEnv(envDraft);
+  const valueInput = (key: string, label: string) => (
+    <input
+      type="password"
+      className="input"
+      style={{ maxWidth: 320 }}
+      autoComplete="new-password"
+      spellCheck={false}
+      placeholder="value"
+      aria-label={label}
+      value={values[key] ?? ""}
+      disabled={busy || !view.encrypts}
+      onChange={(e) => typed(key, e.target.value)}
+    />
+  );
+  return (
+    <>
+      <section className="mt-10 card px-4 py-4" aria-labelledby="secrets-title">
+        <h3 id="secrets-title" className="display-h3 mb-2">
+          secrets for tools
+        </h3>
+        <p className="mb-2 text-sm" style={muted}>
+          Tokens and keys the agent&apos;s tools use. Shell commands get a secret as the variable you give it
+          below; an MCP server through <span className="font-mono">secret:&lt;name&gt;</span> in its env, from the
+          agent&apos;s next start. Values are encrypted with the gateway&apos;s key and never shown again, here or
+          in a chat: in what a tool prints, the agent&apos;s model sees{" "}
+          <span className="font-mono">[secret:&lt;name&gt;]</span> in place of a value (values under{" "}
+          {view.min_redacted_chars} characters are not replaced; spaces around a value are dropped). The agent can
+          still use the value it is given, and send it where it can reach: give a secret only to an agent you trust
+          with it.
+        </p>
+        {!view.encrypts && (
+          <p className="mb-2 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
+            Secrets cannot be set: the gateway has no HAVN_AGE_KEY.
+          </p>
+        )}
+        {view.refused_mcp_servers.length > 0 && (
+          <p className="mb-2 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
+            Not started:{" "}
+            <span className="font-mono">{view.refused_mcp_servers.join(", ")}</span>. Their env refers to secrets,
+            and they run with settings your role supplies (which a team admin writes), not this agent&apos;s own, so
+            they do not get your secrets. Define the server in this agent&apos;s MCP settings to give it one.
+          </p>
+        )}
+        {error && (
+          <p className="mb-2 text-sm" role="alert" style={{ color: "var(--color-ruby)" }}>
+            {error}
+          </p>
+        )}
+        {requested.length > 0 && (
+          <div className="mb-4">
+            <h4 className="mb-1 text-sm font-semibold">asked for by the agent</h4>
+            <p className="mb-2 text-xs" style={muted}>
+              Anyone who can chat with the agent, or what it reads (a web page, a file), can lead it to ask. Enter a
+              value only for a request you expected.
+            </p>
+            <ul className="flex flex-col gap-3 text-sm">
+              {requested.map((secret) => {
+                const asked = secret.requested;
+                const env = asked?.env;
+                const give = env !== undefined && (asVariable[secret.name] ?? false);
+                return (
+                  <li key={secret.name}>
+                    <div>
+                      <span className="font-mono">{secret.name}</span>{" "}
+                      <span className="text-xs" style={muted}>
+                        asked {asked ? new Date(asked.at).toLocaleString() : ""}
+                        {asked && asked.again > 0
+                          ? ` · asked again ${asked.again} ${asked.again === 1 ? "time" : "times"}`
+                          : ""}
+                      </span>
+                    </div>
+                    {asked && (
+                      <div
+                        className="text-xs"
+                        style={asked.by_owner ? muted : { color: "var(--color-ruby)" }}
+                      >
+                        {asked.by_owner
+                          ? `While answering you${asked.asked_in ? `, in ${asked.asked_in === "web chat" ? "your web chat" : asked.asked_in}` : ""}.`
+                          : asked.asked_by || asked.asked_in
+                            ? `While answering someone else: ${asked.asked_by ?? "unknown"}${
+                                asked.asked_in ? `, in ${asked.asked_in}` : ""
+                              }.`
+                            : "In a scheduled task or a heartbeat, not in a chat."}
+                      </div>
+                    )}
+                    {asked && <div className="text-xs wrap-anywhere">The agent&apos;s reason: {asked.reason}</div>}
+                    <div className="mt-1 flex flex-wrap items-center gap-2">
+                      {valueInput(secret.name, `value of ${secret.name}`)}
+                      {env !== undefined && (
+                        <label className="inline-flex items-center gap-1 text-xs">
+                          <input
+                            type="checkbox"
+                            checked={give}
+                            disabled={busy}
+                            onChange={(e) => setAsVariable((all) => ({ ...all, [secret.name]: e.target.checked }))}
+                          />
+                          shell commands get it as <span className="font-mono">${env}</span>
+                        </label>
+                      )}
+                      <button
+                        type="button"
+                        className="btn-ghost"
+                        disabled={busy || !view.encrypts || !(values[secret.name] ?? "").trim()}
+                        onClick={() => void set(secret.name, secret.name, give ? env : undefined)}
+                      >
+                        set
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-ghost"
+                        disabled={busy}
+                        onClick={() => void act(() => api.secrets.remove(agentId, secret.name))}
+                      >
+                        dismiss
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
+        {kept.length === 0 ? (
+          <p className="mb-3 text-sm" style={muted}>
+            No secrets set.
+          </p>
+        ) : (
+          <ul className="mb-4 flex flex-col gap-3 text-sm">
+            {kept.map((secret) => (
+              <li key={secret.name}>
+                <div>
+                  <span className="font-mono">{secret.name}</span>{" "}
+                  <span className="text-xs" style={muted}>
+                    set {new Date(secret.updated_at).toLocaleString()}
+                    {secret.variables.length > 0
+                      ? ` · shell commands get it as ${secret.variables.map((v) => `$${v}`).join(", ")}`
+                      : " · no shell variable gets it"}
+                  </span>
+                </div>
+                <div className="mt-1 flex flex-wrap items-center gap-2">
+                  {valueInput(secret.name, `new value of ${secret.name}`)}
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    disabled={busy || !view.encrypts || !(values[secret.name] ?? "").trim()}
+                    onClick={() => void set(secret.name, secret.name)}
+                  >
+                    replace
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    disabled={busy}
+                    onClick={() => {
+                      if (
+                        window.confirm(
+                          `Remove the secret ${secret.name}? Shell commands lose it at once, MCP servers at the agent's next start. What the agent already did with it cannot be undone.`,
+                        )
+                      ) {
+                        void act(() => api.secrets.remove(agentId, secret.name));
+                      }
+                    }}
+                  >
+                    remove
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <input
+            className="input"
+            style={{ maxWidth: 200 }}
+            placeholder="name, such as github"
+            aria-label="name of a new secret"
+            value={name}
+            disabled={busy || !view.encrypts}
+            onChange={(e) => setName(e.target.value)}
+          />
+          {valueInput("", "value of the new secret")}
+          <input
+            className="input font-mono"
+            style={{ maxWidth: 260 }}
+            placeholder="variable, such as GH_TOKEN"
+            aria-label="shell variable for the new secret (optional)"
+            value={variable}
+            disabled={busy || !view.encrypts}
+            onChange={(e) => setVariable(e.target.value)}
+          />
+          <button
+            type="button"
+            className="btn-ghost"
+            disabled={busy || !view.encrypts || !name.trim() || !(values[""] ?? "").trim()}
+            onClick={() =>
+              void set(name.trim(), "", variable.trim() || undefined).then((ok) => {
+                if (ok) {
+                  setName("");
+                  setVariable("");
+                }
+              })
+            }
+          >
+            set
+          </button>
+        </div>
+        <p className="mt-1 text-xs" style={muted}>
+          A name has letters, digits, <span className="font-mono">_</span>, <span className="font-mono">-</span> and{" "}
+          <span className="font-mono">.</span>. The variable is optional; you can also map one below.
+        </p>
+      </section>
+
+      <section className="mt-10 card px-4 py-4" aria-labelledby="shell-env-title">
+        <h3 id="shell-env-title" className="display-h3 mb-2">
+          shell environment
+        </h3>
+        <p className="mb-3 text-sm" style={muted}>
+          Variables every shell command of the agent gets, one <span className="font-mono">NAME=value</span> a line.
+          A value <span className="font-mono">secret:&lt;name&gt;</span> is that secret; one not set leaves the
+          variable out. Other values are kept as you write them, in the agent&apos;s settings, so put anything
+          sensitive in a secret. Applies to the next command, also of a running agent.
+        </p>
+        <textarea
+          className="input w-full font-mono text-xs"
+          rows={4}
+          value={envDraft}
+          disabled={busy}
+          spellCheck={false}
+          placeholder="GH_TOKEN=secret:github"
+          onChange={(e) => setEnvDraft(e.target.value)}
+          aria-label="shell environment"
+        />
+        {typeof shellEnv === "string" && (
+          <p className="mt-1 text-xs" role="alert" style={{ color: "var(--color-ruby)" }}>
+            {shellEnv}
+          </p>
+        )}
+        <div className="mt-2 flex items-center gap-3">
+          <button
+            type="button"
+            className="btn-ghost"
+            disabled={busy || typeof shellEnv === "string" || envDraft === envText(view.shell_env)}
+            onClick={() => {
+              if (typeof shellEnv === "string") return;
+              void act(() => api.secrets.setShellEnv(agentId, shellEnv), true).then((ok) => {
+                if (ok) flashEnv();
+              });
+            }}
+          >
+            save
+          </button>
+          <span className="text-xs" style={{ color: "var(--color-success-text)" }} role="status">
+            {savedEnv ? "saved" : ""}
+          </span>
+        </div>
+      </section>
+    </>
   );
 }
 
