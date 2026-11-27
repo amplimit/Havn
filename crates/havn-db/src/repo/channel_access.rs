@@ -527,6 +527,55 @@ pub async fn unlink(
     Ok(true)
 }
 
+/// Move what is kept under sender `from` on `channel` to `to`, the same
+/// person by another id (issue #262): their admissions, link and turned-
+/// away record, and the invites they used. A row `to` has already stays,
+/// and `from`'s is dropped. Whether anything was kept under `from`.
+pub async fn move_sender(pool: &SqlitePool, channel: &str, from: &str, to: &str) -> Result<bool> {
+    let kept: Option<(i64,)> = sqlx::query_as(
+        "SELECT 1 FROM channel_allowlist WHERE channel = ?1 AND sender_id = ?2 \
+         UNION ALL SELECT 1 FROM channel_links WHERE channel = ?1 AND sender_id = ?2 \
+         UNION ALL SELECT 1 FROM channel_refusals WHERE channel = ?1 AND sender_id = ?2 \
+         UNION ALL SELECT 1 FROM channel_invites WHERE channel = ?1 AND used_by_sender = ?2 \
+         LIMIT 1",
+    )
+    .bind(channel)
+    .bind(from)
+    .fetch_optional(pool)
+    .await?;
+    if kept.is_none() || from == to {
+        return Ok(false);
+    }
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for table in ["channel_allowlist", "channel_links", "channel_refusals"] {
+        sqlx::query(&format!(
+            "UPDATE OR IGNORE {table} SET sender_id = ?3 WHERE channel = ?1 AND sender_id = ?2"
+        ))
+        .bind(channel)
+        .bind(from)
+        .bind(to)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE channel = ?1 AND sender_id = ?2"
+        ))
+        .bind(channel)
+        .bind(from)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query(
+        "UPDATE channel_invites SET used_by_sender = ?3 WHERE channel = ?1 AND used_by_sender = ?2",
+    )
+    .bind(channel)
+    .bind(from)
+    .bind(to)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 pub async fn is_allowed(
     pool: &SqlitePool,
     channel: &str,
@@ -2077,6 +2126,123 @@ mod tests {
                 .is_none(),
             "once only"
         );
+    }
+
+    #[tokio::test]
+    async fn a_sender_s_admission_link_and_refusal_move_to_its_new_id() {
+        let pool = connect_in_memory().await.expect("db");
+        let alice = user(&pool, "Alice").await;
+        let code = create_link_code(&pool, "lark", "bot", alice)
+            .await
+            .expect("code");
+        redeem(
+            &pool,
+            "lark",
+            "bot",
+            "lark:ou_a",
+            &code.code,
+            Utc::now(),
+            false,
+        )
+        .await
+        .expect("redeem");
+        assert!(
+            admit(&pool, "lark", "other", "lark:ou_a")
+                .await
+                .expect("admit")
+        );
+        record_refusal(&pool, "lark", "third", "lark:ou_a", "hi", Utc::now())
+            .await
+            .expect("refusal");
+        assert!(
+            move_sender(&pool, "lark", "lark:ou_a", "lark:on_a")
+                .await
+                .expect("move")
+        );
+        for account in ["bot", "other"] {
+            assert!(
+                is_allowed(&pool, "lark", account, "lark:on_a")
+                    .await
+                    .expect("allowed")
+            );
+            assert!(
+                !is_allowed(&pool, "lark", account, "lark:ou_a")
+                    .await
+                    .expect("allowed")
+            );
+        }
+        let link = linked_user(&pool, "lark", "lark:on_a").await.expect("link");
+        assert_eq!(link.map(|l| l.user_id), Some(alice));
+        assert!(
+            linked_user(&pool, "lark", "lark:ou_a")
+                .await
+                .expect("link")
+                .is_none()
+        );
+        let refused = list_refusals(&pool, "lark", "third")
+            .await
+            .expect("refusals");
+        assert_eq!(
+            refused
+                .iter()
+                .map(|r| r.sender_id.as_str())
+                .collect::<Vec<_>>(),
+            ["lark:on_a"]
+        );
+        // Nothing is left under the old id, and another channel's is not touched.
+        assert!(
+            !move_sender(&pool, "lark", "lark:ou_a", "lark:on_a")
+                .await
+                .expect("move")
+        );
+        assert!(
+            admit(&pool, "telegram", "bot", "lark:ou_a")
+                .await
+                .expect("admit")
+        );
+        assert!(
+            !move_sender(&pool, "lark", "lark:ou_a", "lark:on_a")
+                .await
+                .expect("move")
+        );
+        assert!(
+            is_allowed(&pool, "telegram", "bot", "lark:ou_a")
+                .await
+                .expect("allowed")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_id_s_own_link_stays_when_the_old_one_moves() {
+        let pool = connect_in_memory().await.expect("db");
+        let (alice, bob) = (user(&pool, "Alice").await, user(&pool, "Bob").await);
+        for (user, sender) in [(alice, "lark:ou_a"), (bob, "lark:on_a")] {
+            let code = create_link_code(&pool, "lark", "bot", user)
+                .await
+                .expect("code");
+            redeem(&pool, "lark", "bot", sender, &code.code, Utc::now(), false)
+                .await
+                .expect("redeem");
+        }
+        assert!(
+            move_sender(&pool, "lark", "lark:ou_a", "lark:on_a")
+                .await
+                .expect("move")
+        );
+        let link = linked_user(&pool, "lark", "lark:on_a").await.expect("link");
+        assert_eq!(link.map(|l| l.user_id), Some(bob));
+        assert!(
+            linked_user(&pool, "lark", "lark:ou_a")
+                .await
+                .expect("link")
+                .is_none()
+        );
+        assert!(
+            is_allowed(&pool, "lark", "bot", "lark:on_a")
+                .await
+                .expect("allowed")
+        );
+        assert_eq!(count_allowed(&pool, "lark", "bot").await.expect("count"), 1);
     }
 
     #[tokio::test]

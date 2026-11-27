@@ -59,6 +59,11 @@ pub struct ChannelCommands {
     /// them for private ones.
     #[serde(default)]
     pub groups: bool,
+    /// The gateway takes [`ChannelInbound::sender_aliases`] (issue #262):
+    /// an adapter whose senders change ids sends the new one only to a
+    /// gateway that says so, and the id an older gateway knows to others.
+    #[serde(default)]
+    pub sender_aliases: bool,
 }
 
 /// One entry of [`ChannelCommands`].
@@ -111,6 +116,13 @@ pub struct ChannelInbound {
     /// chat. Replies go to the group, which is one conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<ChannelGroup>,
+    /// Other ids the same sender went by on this channel (issue #262),
+    /// such as Lark's per-app `open_id` before the `union_id` in
+    /// `sender_id`: what the gateway keeps under them (admissions, links,
+    /// turned-away senders) moves to `sender_id`, and `allow_from` and
+    /// `admins` naming them still match.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sender_aliases: Vec<String>,
 }
 
 /// The group a message was sent in (issue #263).
@@ -332,6 +344,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sender_aliases_are_absent_from_older_frames() {
+        let commands: ChannelCommands =
+            serde_json::from_str(r#"{"account_id":"bot","commands":[],"groups":true}"#)
+                .expect("an older gateway's menu");
+        assert!(!commands.sender_aliases);
+        let inbound: ChannelInbound = serde_json::from_str(
+            r#"{"seq":1,"account_id":"bot","channel_message_id":"m","sender_id":"lark:ou_a",
+                "content":{"type":"text","text":"hi"},"timestamp":"2026-01-01T00:00:00Z"}"#,
+        )
+        .expect("an older adapter's inbound");
+        assert!(inbound.sender_aliases.is_empty());
+        let json = serde_json::to_string(&ChannelFrame::Inbound(inbound)).expect("serialize");
+        assert!(!json.contains("sender_aliases"), "none, none sent");
+    }
+
+    #[test]
     fn inbound_round_trips_with_optional_raw_omitted() {
         let frame = ChannelFrame::Inbound(ChannelInbound {
             seq: 42,
@@ -345,6 +373,7 @@ mod tests {
             raw: None,
             attachments: Vec::new(),
             group: None,
+            sender_aliases: Vec::new(),
         });
         let s = serde_json::to_string(&frame).expect("serialize");
         // Sanity-check the discriminator and absence of raw.

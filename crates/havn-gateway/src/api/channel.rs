@@ -444,6 +444,7 @@ pub async fn upload(
         raw: None,
         attachments: Vec::new(),
         group: None,
+        sender_aliases: Vec::new(),
     };
     let allowed = match &q.group {
         Some(group) => {
@@ -874,6 +875,7 @@ async fn handle_session(
         account_id: account_id.clone(),
         commands: crate::commands::menu(),
         groups: true,
+        sender_aliases: true,
     });
     if let Err(e) = frame_tx.try_send(commands) {
         warn!(channel = %channel_id, account = %account_id, error = %e, "could not send the command menu");
@@ -1113,6 +1115,10 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
         );
         return;
     }
+
+    // The ids the sender went by before (issue #262): what is kept under
+    // them moves to the one it goes by now.
+    take_aliases(state, channel, &mut inb).await;
 
     // A group's message (issue #263): the group is let in, not its sender;
     // it is one conversation, and replies go to it. One not to the bot is
@@ -1387,8 +1393,14 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
                         format!("{} on {channel} account {}", inb.sender_id, inb.account_id),
                         format!("{channel} 账号 {} 上的 {}", inb.account_id, inb.sender_id),
                     ),
-                    admin: is_admin(state, channel, &inb.account_id, &inb.sender_id, agent_id)
-                        .await,
+                    admin: is_admin(
+                        state,
+                        channel,
+                        &inb.account_id,
+                        (&inb.sender_id, &inb.sender_aliases),
+                        agent_id,
+                    )
+                    .await,
                     owner: owner_linked(state, channel, agent_id, &inb.sender_id).await,
                     admin_hint: language.pick(
                         "the agent's owner (after connecting this account on the agent's \
@@ -1663,11 +1675,13 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
 /// Whether `sender_id` may use the admin commands on `(channel,
 /// account_id)`: listed among the account's admins in the gateway's
 /// config, or linked from the web to the agent's owner (issue #182).
+/// Whether the sender, its id and the ids it went by before, is an admin
+/// of `account_id`.
 async fn is_admin(
     state: &AppState,
     channel: &str,
     account_id: &str,
-    sender_id: &str,
+    (sender_id, aliases): (&str, &[String]),
     agent_id: havn_core::AgentId,
 ) -> bool {
     let listed = state
@@ -1675,8 +1689,137 @@ async fn is_admin(
         .load_full()
         .get(channel)
         .and_then(|entry| entry.accounts.iter().find(|a| a.id == account_id))
-        .is_some_and(|acct| acct.admins.iter().any(|id| id == sender_id));
+        .is_some_and(|acct| names_sender(&acct.admins, sender_id, aliases));
     listed || owner_linked(state, channel, agent_id, sender_id).await
+}
+
+/// Whether `listed`, an account's `admins`, names the sender: by its id,
+/// or by one it went by before (issue #262).
+fn names_sender(listed: &[String], sender_id: &str, aliases: &[String]) -> bool {
+    listed
+        .iter()
+        .any(|id| id == sender_id || aliases.contains(id))
+}
+
+/// Aliases of a sender taken at most (issue #262).
+const MAX_SENDER_ALIASES: usize = 4;
+
+/// The `admins` entries that name a sender by an id it no longer goes by,
+/// said once each.
+fn told_aliases() -> &'static std::sync::Mutex<std::collections::HashSet<(String, String)>> {
+    static TOLD: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    > = std::sync::OnceLock::new();
+    TOLD.get_or_init(Default::default)
+}
+
+/// Keep those of `inb`'s sender aliases (issue #262) that are ids of the
+/// same platform, and move what is kept under each (admissions, link,
+/// turned-away record) to its sender id. An alias in `allow_from` admits
+/// the sender id; one in `admins` still matches. Either is said, to be
+/// replaced there.
+async fn take_aliases(state: &AppState, channel: &str, inb: &mut ChannelInbound) {
+    if inb.sender_aliases.is_empty() {
+        return;
+    }
+    let platform = |id: &str| id.split_once(':').map(|(p, _)| p.to_string());
+    let own = platform(&inb.sender_id);
+    let sender = inb.sender_id.clone();
+    inb.sender_aliases.retain(|alias| {
+        *alias != sender
+            && alias.len() <= MAX_SENDER_BYTES
+            && channel_id_codec::validate_channel_id_part("sender_alias", alias).is_ok()
+            && platform(alias) == own
+    });
+    inb.sender_aliases.truncate(MAX_SENDER_ALIASES);
+    for alias in &inb.sender_aliases {
+        match channel_access::move_sender(&state.db, channel, alias, &inb.sender_id).await {
+            Ok(true) => {
+                info!(channel, from = %alias, to = %inb.sender_id, "a sender's admissions and link moved to its new id");
+                crate::audit::record_user_action(
+                    &state.db,
+                    state.bootstrap_user_id,
+                    "channel_sender.moved",
+                    serde_json::json!({
+                        "channel": channel,
+                        "account_id": inb.account_id,
+                        "from": alias,
+                        "to": inb.sender_id,
+                    }),
+                )
+                .await;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(channel, from = %alias, error = %e, "could not move a sender's admissions to its new id")
+            }
+        }
+    }
+    let channels = state.channels.load_full();
+    let Some(account) = channels
+        .get(channel)
+        .and_then(|entry| entry.accounts.iter().find(|a| a.id == inb.account_id))
+    else {
+        return;
+    };
+    let listed = |entries: &[String]| {
+        if entries.contains(&inb.sender_id) {
+            return None;
+        }
+        inb.sender_aliases
+            .iter()
+            .find(|alias| entries.contains(alias))
+            .cloned()
+    };
+    // An old id in `allow_from` admits the new one, as an invite does, so
+    // the agent may write to it as well.
+    if account.dm_policy == DmPolicy::Allowlist
+        && let Some(alias) = listed(&account.allow_from)
+    {
+        match channel_access::admit(&state.db, channel, &inb.account_id, &inb.sender_id).await {
+            Ok(true) => {
+                warn!(
+                    channel,
+                    account = %inb.account_id,
+                    "allow_from names {alias}, which this sender now goes by as {}: admitted as \
+                     that; replace it in config.toml",
+                    inb.sender_id
+                );
+                crate::audit::record_user_action(
+                    &state.db,
+                    state.bootstrap_user_id,
+                    "channel_access.granted",
+                    serde_json::json!({
+                        "channel": channel,
+                        "account_id": inb.account_id,
+                        "sender_id": inb.sender_id,
+                        "by": "allow_from",
+                        "from": alias,
+                    }),
+                )
+                .await;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(channel, account = %inb.account_id, error = %e, "could not admit a sender listed in allow_from by its old id");
+            }
+        }
+    }
+    if let Some(alias) = listed(&account.admins) {
+        let first = told_aliases()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((format!("{channel}|{}", inb.account_id), alias.clone()));
+        if first {
+            warn!(
+                channel,
+                account = %inb.account_id,
+                "admins names {alias}, which this sender now goes by as {}; it still matches, but \
+                 replace it in config.toml",
+                inb.sender_id
+            );
+        }
+    }
 }
 
 /// Whether `sender_id` on `channel` is linked to the owner of `agent_id`.
@@ -4352,6 +4495,7 @@ mod tests {
                 timestamp: chrono::Utc::now(),
                 raw: None,
                 attachments: Vec::new(),
+                sender_aliases: Vec::new(),
             }
         }
 
@@ -4661,6 +4805,49 @@ mod tests {
                 f.forwarded(),
                 vec!["tg:toml".to_string(), "tg:db".to_string()]
             );
+        }
+
+        #[tokio::test]
+        async fn a_sender_with_a_new_id_keeps_its_admission_and_link() {
+            let mut f = fixture(DmPolicy::Allowlist, &["tg:listed"]).await;
+            let code = f.invite("bot").await;
+            f.send("tg:old", &code).await;
+            assert!(f.allowed("tg:old").await);
+            channel_access::admit(&f.state.db, "telegram", "bot", "tg:old")
+                .await
+                .expect("admit");
+            sqlx::query("INSERT INTO channel_links (channel, sender_id, user_id) VALUES ('telegram', 'tg:old', ?1)")
+                .bind(f.owner.to_string())
+                .execute(&f.state.db)
+                .await
+                .expect("link");
+            f.replies();
+            f.forwarded();
+            let mut inb = text_from("tg:new", "hi");
+            inb.sender_aliases = vec!["tg:old".into(), "discord:old".into(), "tg:new".into()];
+            handle_inbound(&f.state, "telegram", inb).await;
+            assert_eq!(f.forwarded(), vec!["tg:new".to_string()]);
+            assert!(f.allowed("tg:new").await && !f.allowed("tg:old").await);
+            let link = channel_access::linked_user(&f.state.db, "telegram", "tg:new")
+                .await
+                .expect("link");
+            assert_eq!(link.map(|l| l.user_id), Some(f.owner));
+            // An `allow_from` entry naming the old id admits the new one, to
+            // which the agent may then write too.
+            let mut inb = text_from("tg:renamed", "hello");
+            inb.sender_aliases = vec!["tg:listed".into()];
+            handle_inbound(&f.state, "telegram", inb).await;
+            assert_eq!(f.forwarded(), vec!["tg:renamed".to_string()]);
+            assert!(f.allowed("tg:renamed").await);
+            // An alias of another platform moves nothing and admits no one.
+            channel_access::admit(&f.state.db, "telegram", "bot", "slack:x")
+                .await
+                .expect("admit");
+            let mut inb = text_from("tg:stranger", "hello");
+            inb.sender_aliases = vec!["slack:x".into()];
+            handle_inbound(&f.state, "telegram", inb).await;
+            assert!(f.forwarded().is_empty());
+            assert!(f.allowed("slack:x").await && !f.allowed("tg:stranger").await);
         }
 
         #[tokio::test]
