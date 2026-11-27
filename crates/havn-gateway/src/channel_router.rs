@@ -208,7 +208,15 @@ impl ChannelRouter {
         let mut map = self.inner.lock().await;
         let state = map.entry(key).or_insert_with(|| AccountState::new(None));
         keep_known(&mut state.sees_all, group, sees_all);
-        keep_known(&mut state.reaches, group, reaches.filter(|r| !r.is_empty()));
+        // A kind it does not know names nothing to say.
+        let reaches = reaches
+            .map(|r| {
+                r.into_iter()
+                    .filter(|r| *r != havn_proto::channel::ChannelReach::Unknown)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|r| !r.is_empty());
+        keep_known(&mut state.reaches, group, reaches);
     }
 
     /// Which messages to `key`'s bot reach it in `group`, as its adapter
@@ -732,6 +740,36 @@ async fn group_permitted(
 mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
+
+    #[tokio::test]
+    async fn what_reaches_a_bot_is_kept_without_kinds_it_does_not_know() {
+        use havn_proto::channel::ChannelReach;
+        let router = ChannelRouter::new();
+        let key = AccountKey::new("lark", "bot");
+        router
+            .note_sees_all(
+                key.clone(),
+                "lark:oc_1",
+                Some(false),
+                Some(vec![ChannelReach::Unknown, ChannelReach::Mention]),
+            )
+            .await;
+        assert_eq!(
+            router.reaches(&key, "lark:oc_1").await,
+            Some(vec![ChannelReach::Mention])
+        );
+        // Only kinds it does not know: nothing known.
+        router
+            .note_sees_all(
+                key.clone(),
+                "lark:oc_1",
+                Some(false),
+                Some(vec![ChannelReach::Unknown]),
+            )
+            .await;
+        assert_eq!(router.reaches(&key, "lark:oc_1").await, None);
+        assert_eq!(router.sees_all(&key, "lark:oc_1").await, Some(false));
+    }
 
     fn binding(agent: &str, channel: &str, account: &str) -> ChannelBindingConfig {
         ChannelBindingConfig {

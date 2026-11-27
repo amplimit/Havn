@@ -179,6 +179,10 @@ pub enum ChannelReach {
     Reply,
     /// A command.
     Command,
+    /// One this gateway does not know, from a newer adapter: left out, so
+    /// the message is taken all the same.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A space or a thread of a [`ChannelGroup`] (issue #285).
@@ -362,6 +366,24 @@ pub enum ChannelMessageContent {
 mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn a_kind_of_reach_this_gateway_does_not_know_keeps_the_message() {
+        let frame: ChannelFrame = serde_json::from_str(
+            r#"{"kind":"inbound","seq":1,"account_id":"bot","channel_message_id":"m",
+                "sender_id":"lark:on_a","content":{"type":"text","text":"hi"},
+                "timestamp":"2026-01-01T00:00:00Z",
+                "group":{"id":"lark:oc_1","addressed":true,"reaches":["mention","wave"]}}"#,
+        )
+        .expect("a newer adapter's group message");
+        let ChannelFrame::Inbound(inbound) = frame else {
+            panic!("an inbound");
+        };
+        assert_eq!(
+            inbound.group.and_then(|g| g.reaches),
+            Some(vec![ChannelReach::Mention, ChannelReach::Unknown])
+        );
+    }
 
     #[test]
     fn sender_aliases_are_absent_from_older_frames() {

@@ -788,7 +788,7 @@ Havn ships a stable HTTP + WebSocket protocol at `/api/v1/channel` for external 
 
 From v0.2.13, `sudo havn update` updates the adapters on the machine after the gateway, each from its own latest release (see "Upgrading").
 
-The Lark / Feishu adapter takes Lark's events over Lark's long connection, which needs no public URL, or on an HTTP webhook (`im.message.receive_v1`), and answers 1:1 chats only; see its README for setup and the message kinds it carries.
+The Lark / Feishu adapter takes Lark's events over Lark's long connection, which needs no public URL, or on an HTTP webhook (`im.message.receive_v1`). It answers private chats, and groups and their threads (topics): a mention of the bot in a group, a reply to one of its messages or a command is to it, and a thread is a conversation of its own (see "Group chats"). See its README for setup, the permissions groups need, and the message kinds it carries.
 
 The Discord adapter answers private messages and server channels: a mention of the bot in a channel, or a reply to one of its messages, opens a thread, a conversation of its own, and a server can be let in as a whole or a channel at a time (see "Group chats"). See its README for the bot's setup.
 
@@ -947,7 +947,7 @@ Invited senders are stored per account and outlive config edits. If an account i
 
 ### Group chats
 
-A bot can be used in the groups of its platform (Telegram groups and supergroups, not broadcast channels; Discord servers' channels and their threads), set per account:
+A bot can be used in the groups of its platform (Telegram groups and supergroups, not broadcast channels; Discord servers' channels and their threads; Lark groups and their threads), set per account:
 
 ```toml
 [[channels.telegram.accounts]]
