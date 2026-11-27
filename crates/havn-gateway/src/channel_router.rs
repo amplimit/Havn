@@ -583,7 +583,7 @@ pub fn outbound_permitted(
 }
 
 /// [`outbound_permitted`], or the recipient was admitted by invite code
-/// (kept in the DB).
+/// (kept in the DB), or by an id it went by before (issue #262).
 pub async fn send_permitted(
     db: &sqlx::SqlitePool,
     bindings: &[ChannelBindingConfig],
@@ -599,6 +599,7 @@ pub async fn send_permitted(
                 .await
             {
                 Ok(true) => Ok(()),
+                Ok(false) if by_alias(db, channels, channel, account_id, recipient).await => Ok(()),
                 Ok(false) => group_permitted(db, channels, channel, account_id, recipient).await,
                 Err(e) => {
                     warn!(%agent_id, error = %e, "channel allowlist lookup failed");
@@ -608,6 +609,36 @@ pub async fn send_permitted(
         }
         other => other,
     }
+}
+
+/// Whether `recipient` went by an id before on the account (issue #262)
+/// that `allow_from` names or a code or the owner admitted.
+async fn by_alias(
+    db: &sqlx::SqlitePool,
+    channels: &std::collections::BTreeMap<String, ChannelEntry>,
+    channel: &str,
+    account_id: &str,
+    recipient: &str,
+) -> bool {
+    use havn_db::repo::channel_access;
+    let Ok(aliases) = channel_access::aliases_of(db, channel, account_id, recipient).await else {
+        return false;
+    };
+    let listed = channels
+        .get(channel)
+        .and_then(|entry| entry.accounts.iter().find(|a| a.id == account_id))
+        .map(|a| a.allow_from.clone())
+        .unwrap_or_default();
+    for alias in &aliases {
+        if listed.contains(alias)
+            || channel_access::is_allowed(db, channel, account_id, alias)
+                .await
+                .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether `recipient` is a group the account may be used in (issue
