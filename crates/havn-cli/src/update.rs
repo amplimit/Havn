@@ -69,7 +69,10 @@ const ADAPTERS: [&str; 3] = [
 
 /// Packs that install no directory of their own name: theirs, and the
 /// directory under [`PACKS`] that shows one is installed.
-const KNOWN_PACKS: [(&str, &str); 1] = [("havn-pack-browser", "playwright-cli")];
+const KNOWN_PACKS: [(&str, &str); 2] = [
+    ("havn-pack-browser", "playwright-cli"),
+    ("havn-pack-video", "ffmpeg"),
+];
 
 /// What an adapter logs when it has connected to the gateway.
 const CONNECTED: &str = "havn WS connected";
@@ -2536,7 +2539,7 @@ mod tests {
         );
 
         let packs = tempfile::tempdir().unwrap();
-        for dir in ["playwright-cli", "chromium", "maps", "empty"] {
+        for dir in ["playwright-cli", "chromium", "ffmpeg", "watch", "maps", "empty"] {
             std::fs::create_dir(packs.path().join(dir)).unwrap();
         }
         std::fs::write(packs.path().join("maps/SKILL.md"), "skill").unwrap();
@@ -2600,6 +2603,7 @@ mod tests {
         assert_eq!(
             packs,
             vec![
+                ("havn-pack-video", "amplimit/havn-pack-video"),
                 ("maps", ""),
                 ("havn-pack-browser", "amplimit/havn-pack-browser")
             ]
