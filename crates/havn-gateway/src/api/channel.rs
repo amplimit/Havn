@@ -368,6 +368,11 @@ pub struct UploadQuery {
     /// own.
     #[serde(default)]
     pub thread: Option<String>,
+    /// The ids the sender went by before (issue #262), comma-separated, as
+    /// the message the file comes with names them: the file may come before
+    /// the gateway noted them.
+    #[serde(default)]
+    pub aliases: Option<String>,
 }
 
 /// A file a channel's sender sent, waiting for the message that carries it.
@@ -444,10 +449,23 @@ pub async fn upload(
         raw: None,
         attachments: Vec::new(),
         group: None,
-        // The ids the sender went by before on the account (issue #262).
-        sender_aliases: channel_access::aliases_of(&state.db, &q.channel, &q.account, &q.sender)
-            .await
-            .unwrap_or_default(),
+        // The ids the sender went by before on the account (issue #262):
+        // noted, and those its message names.
+        sender_aliases: {
+            let mut aliases =
+                channel_access::aliases_of(&state.db, &q.channel, &q.account, &q.sender)
+                    .await
+                    .unwrap_or_default();
+            aliases.extend(
+                q.aliases
+                    .iter()
+                    .flat_map(|a| a.split(','))
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .map(String::from),
+            );
+            kept_aliases(&q.sender, aliases)
+        },
     };
     let allowed = match &q.group {
         Some(group) => {
@@ -1733,6 +1751,24 @@ fn told_aliases() -> &'static std::sync::Mutex<std::collections::HashSet<(String
     TOLD.get_or_init(Default::default)
 }
 
+/// Those of `aliases` that may be earlier ids of `sender` (issue #262): ids
+/// of its platform (the part before `:`), not itself, valid in a channel
+/// id, at most [`MAX_SENDER_ALIASES`].
+fn kept_aliases(sender: &str, mut aliases: Vec<String>) -> Vec<String> {
+    let platform = |id: &str| id.split_once(':').map(|(p, _)| p.to_string());
+    let own = platform(sender);
+    let mut seen = std::collections::HashSet::new();
+    aliases.retain(|alias| {
+        alias != sender
+            && seen.insert(alias.clone())
+            && alias.len() <= MAX_SENDER_BYTES
+            && channel_id_codec::validate_channel_id_part("sender_alias", alias).is_ok()
+            && platform(alias) == own
+    });
+    aliases.truncate(MAX_SENDER_ALIASES);
+    aliases
+}
+
 /// Keep those of `inb`'s sender aliases (issue #262) that are ids of the
 /// same platform, and note each as an id the sender went by on this
 /// account. What the gateway kept under an old id stays there: its
@@ -1745,16 +1781,8 @@ async fn take_aliases(state: &AppState, channel: &str, inb: &mut ChannelInbound)
     if inb.sender_aliases.is_empty() {
         return;
     }
-    let platform = |id: &str| id.split_once(':').map(|(p, _)| p.to_string());
-    let own = platform(&inb.sender_id);
     let sender = inb.sender_id.clone();
-    inb.sender_aliases.retain(|alias| {
-        *alias != sender
-            && alias.len() <= MAX_SENDER_BYTES
-            && channel_id_codec::validate_channel_id_part("sender_alias", alias).is_ok()
-            && platform(alias) == own
-    });
-    inb.sender_aliases.truncate(MAX_SENDER_ALIASES);
+    inb.sender_aliases = kept_aliases(&sender, std::mem::take(&mut inb.sender_aliases));
     let account_id = inb.account_id.clone();
     for alias in &inb.sender_aliases {
         match channel_access::note_alias(&state.db, channel, &account_id, alias, &sender).await {
@@ -4904,6 +4932,29 @@ mod tests {
             handle_inbound(&f.state, "telegram", inb).await;
             assert!(f.forwarded().is_empty());
             assert!(!f.may_send("tg:stranger").await);
+        }
+
+        #[test]
+        fn only_earlier_ids_of_the_sender_s_platform_are_kept() {
+            let given: Vec<String> = [
+                "lark:ou_a",
+                "tg:1",
+                "lark:on_x",
+                "lark:ou_a",
+                "lark:o|u",
+                "",
+                "lark:ou_b",
+                "lark:ou_c",
+                "lark:ou_d",
+                "lark:ou_e",
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+            assert_eq!(
+                kept_aliases("lark:on_x", given),
+                ["lark:ou_a", "lark:ou_b", "lark:ou_c", "lark:ou_d"]
+            );
         }
 
         #[tokio::test]
