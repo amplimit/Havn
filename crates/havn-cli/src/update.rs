@@ -2539,7 +2539,14 @@ mod tests {
         );
 
         let packs = tempfile::tempdir().unwrap();
-        for dir in ["playwright-cli", "chromium", "ffmpeg", "watch", "maps", "empty"] {
+        for dir in [
+            "playwright-cli",
+            "chromium",
+            "ffmpeg",
+            "watch",
+            "maps",
+            "empty",
+        ] {
             std::fs::create_dir(packs.path().join(dir)).unwrap();
         }
         std::fs::write(packs.path().join("maps/SKILL.md"), "skill").unwrap();
