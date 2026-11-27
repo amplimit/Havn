@@ -285,7 +285,9 @@ pub struct LinkedScope {
 }
 
 /// `user`'s channel chat scopes with `agent`. Only their own linked
-/// senders: other people's chats with the agent are not theirs to see.
+/// senders, by their ids and the earlier ids whose link to them moved to
+/// those (issue #262): other people's chats with the agent are not theirs
+/// to see.
 pub async fn linked_scopes(
     db: &sqlx::SqlitePool,
     bindings: &[crate::config::ChannelBindingConfig],
@@ -301,16 +303,26 @@ pub async fn linked_scopes(
                 == Some(agent.as_str())
     }) {
         for link in links.iter().filter(|l| l.channel == binding.channel) {
-            scopes.push(LinkedScope {
-                scope: crate::channel_id_codec::encode(
-                    &binding.channel,
-                    &binding.account_id,
-                    &link.sender_id,
-                ),
-                channel: binding.channel.clone(),
-                account_id: binding.account_id.clone(),
-                sender_id: link.sender_id.clone(),
-            });
+            let earlier = havn_db::repo::channel_access::aliases_linked_to(
+                db,
+                &binding.channel,
+                &binding.account_id,
+                &link.sender_id,
+                user,
+            )
+            .await?;
+            for sender_id in std::iter::once(link.sender_id.clone()).chain(earlier) {
+                scopes.push(LinkedScope {
+                    scope: crate::channel_id_codec::encode(
+                        &binding.channel,
+                        &binding.account_id,
+                        &sender_id,
+                    ),
+                    channel: binding.channel.clone(),
+                    account_id: binding.account_id.clone(),
+                    sender_id,
+                });
+            }
         }
     }
     Ok(scopes)

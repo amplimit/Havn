@@ -527,6 +527,203 @@ pub async fn unlink(
     Ok(true)
 }
 
+/// Earlier ids kept for one sender of an account at most (issue #262), so
+/// an adapter cannot slow every check of the sender with thousands.
+pub const MAX_ALIASES: i64 = 4;
+
+/// Note that on `(channel, account_id)` the sender `sender_id` went by
+/// `alias` before (issue #262), as an inbound on that account said. Whether
+/// it was not noted so yet (new, or then another sender's). Past
+/// [`MAX_ALIASES`] for the sender, the oldest go, those whose link moved
+/// last.
+pub async fn note_alias(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    alias: &str,
+    sender_id: &str,
+) -> Result<bool> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let res = sqlx::query(
+        "INSERT INTO channel_sender_aliases (channel, account_id, alias, sender_id) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT (channel, account_id, alias) DO UPDATE \
+         SET sender_id = excluded.sender_id, noted_at = excluded.noted_at, link_user = NULL \
+         WHERE channel_sender_aliases.sender_id <> excluded.sender_id",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(alias)
+    .bind(sender_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM channel_sender_aliases \
+         WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 AND alias NOT IN ( \
+           SELECT alias FROM channel_sender_aliases \
+           WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 \
+           ORDER BY link_user IS NOT NULL DESC, noted_at DESC, alias DESC LIMIT ?4)",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(sender_id)
+    .bind(MAX_ALIASES)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// The ids `sender_id` went by before on `(channel, account_id)`, as
+/// [`note_alias`] noted them, oldest first.
+pub async fn aliases_of(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    sender_id: &str,
+) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT alias FROM channel_sender_aliases \
+         WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 ORDER BY noted_at, alias \
+         LIMIT ?4",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(sender_id)
+    .bind(MAX_ALIASES)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(a,)| a).collect())
+}
+
+/// The ids `sender_id` went by before on `(channel, account_id)` whose
+/// link, to `user`, moved to it (or was `user`'s as its own is): the
+/// earlier chats that are `user`'s to see.
+pub async fn aliases_linked_to(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    sender_id: &str,
+    user: UserId,
+) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT alias FROM channel_sender_aliases \
+         WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 AND link_user = ?4 \
+         ORDER BY noted_at, alias LIMIT ?5",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(sender_id)
+    .bind(user.to_string())
+    .bind(MAX_ALIASES)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(a,)| a).collect())
+}
+
+/// What [`move_link`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkMove {
+    /// `from` has no link, or nothing on the account says it is its sender.
+    Nothing,
+    /// The link of `from`, to this user, is `to`'s now.
+    Moved(UserId),
+    /// `to` had a link already, to `kept`: `from`'s, to `dropped`, is gone.
+    Dropped { dropped: UserId, kept: UserId },
+}
+
+/// Move the link of `from` on `channel` to `to`, the same person by its
+/// new id (issue #262), when `from` has something on `account_id` that
+/// shows the account knows it: an admission, a turned-away record, or an
+/// invite it used. Nothing on another account counts, so an account's
+/// adapter cannot take the link of a sender of another. A link `to` has
+/// already stays, and `from`'s goes. When the link was to the user `to`'s
+/// is to now, the alias noted for it says so ([`aliases_linked_to`]).
+pub async fn move_link(
+    pool: &SqlitePool,
+    channel: &str,
+    account_id: &str,
+    from: &str,
+    to: &str,
+) -> Result<LinkMove> {
+    if from == to {
+        return Ok(LinkMove::Nothing);
+    }
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let known: Option<(i64,)> = sqlx::query_as(
+        "SELECT 1 FROM channel_allowlist WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 \
+         UNION ALL SELECT 1 FROM channel_refusals \
+           WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 \
+         UNION ALL SELECT 1 FROM channel_invites \
+           WHERE channel = ?1 AND account_id = ?2 AND used_by_sender = ?3 \
+         LIMIT 1",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(from)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if known.is_none() {
+        return Ok(LinkMove::Nothing);
+    }
+    let Some(old) = linked_to(&mut tx, channel, from).await? else {
+        return Ok(LinkMove::Nothing);
+    };
+    let kept = linked_to(&mut tx, channel, to).await?;
+    if kept.is_none_or(|kept| kept == old) {
+        sqlx::query(
+            "UPDATE channel_sender_aliases SET link_user = ?5 \
+             WHERE channel = ?1 AND account_id = ?2 AND alias = ?3 AND sender_id = ?4",
+        )
+        .bind(channel)
+        .bind(account_id)
+        .bind(from)
+        .bind(to)
+        .bind(old.to_string())
+        .execute(&mut *tx)
+        .await?;
+    }
+    let moved = match kept {
+        None => {
+            sqlx::query(
+                "UPDATE channel_links SET sender_id = ?3 WHERE channel = ?1 AND sender_id = ?2",
+            )
+            .bind(channel)
+            .bind(from)
+            .bind(to)
+            .execute(&mut *tx)
+            .await?;
+            LinkMove::Moved(old)
+        }
+        Some(kept) => {
+            sqlx::query("DELETE FROM channel_links WHERE channel = ?1 AND sender_id = ?2")
+                .bind(channel)
+                .bind(from)
+                .execute(&mut *tx)
+                .await?;
+            LinkMove::Dropped { dropped: old, kept }
+        }
+    };
+    tx.commit().await?;
+    Ok(moved)
+}
+
+/// The user `sender_id` on `channel` is linked to, within a transaction.
+async fn linked_to(
+    conn: &mut sqlx::SqliteConnection,
+    channel: &str,
+    sender_id: &str,
+) -> Result<Option<UserId>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT user_id FROM channel_links WHERE channel = ?1 AND sender_id = ?2")
+            .bind(channel)
+            .bind(sender_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    row.map(|(u,)| parse_db_uuid(&u, "channel_links.user_id").map(UserId::from_uuid))
+        .transpose()
+}
+
 pub async fn is_allowed(
     pool: &SqlitePool,
     channel: &str,
@@ -2077,6 +2274,223 @@ mod tests {
                 .is_none(),
             "once only"
         );
+    }
+
+    #[tokio::test]
+    async fn a_sender_s_old_id_is_noted_and_its_link_moves_with_what_this_account_knows() {
+        let pool = connect_in_memory().await.expect("db");
+        let alice = user(&pool, "Alice").await;
+        let code = create_link_code(&pool, "lark", "bot", alice)
+            .await
+            .expect("code");
+        redeem(
+            &pool,
+            "lark",
+            "bot",
+            "lark:ou_a",
+            &code.code,
+            Utc::now(),
+            false,
+        )
+        .await
+        .expect("redeem");
+        assert!(
+            note_alias(&pool, "lark", "bot", "lark:ou_a", "lark:on_a")
+                .await
+                .expect("note")
+        );
+        assert!(
+            !note_alias(&pool, "lark", "bot", "lark:ou_a", "lark:on_a")
+                .await
+                .expect("note")
+        );
+        assert_eq!(
+            aliases_of(&pool, "lark", "bot", "lark:on_a")
+                .await
+                .expect("aliases"),
+            ["lark:ou_a"]
+        );
+        assert!(
+            aliases_of(&pool, "lark", "other", "lark:on_a")
+                .await
+                .expect("aliases")
+                .is_empty()
+        );
+        assert_eq!(
+            move_link(&pool, "lark", "bot", "lark:ou_a", "lark:on_a")
+                .await
+                .expect("move"),
+            LinkMove::Moved(alice)
+        );
+        let link = linked_user(&pool, "lark", "lark:on_a").await.expect("link");
+        assert_eq!(link.map(|l| l.user_id), Some(alice));
+        assert!(
+            linked_user(&pool, "lark", "lark:ou_a")
+                .await
+                .expect("link")
+                .is_none()
+        );
+        assert_eq!(
+            aliases_linked_to(&pool, "lark", "bot", "lark:on_a", alice)
+                .await
+                .expect("aliases"),
+            ["lark:ou_a"]
+        );
+        // The old id's admission stays, for its chats and tasks.
+        assert!(
+            is_allowed(&pool, "lark", "bot", "lark:ou_a")
+                .await
+                .expect("allowed")
+        );
+        assert!(
+            !is_allowed(&pool, "lark", "bot", "lark:on_a")
+                .await
+                .expect("allowed")
+        );
+        assert_eq!(
+            move_link(&pool, "lark", "bot", "lark:ou_a", "lark:on_a")
+                .await
+                .expect("move"),
+            LinkMove::Nothing,
+            "once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sender_keeps_its_newest_aliases_and_the_one_its_link_moved_from() {
+        let pool = connect_in_memory().await.expect("db");
+        let alice = user(&pool, "Alice").await;
+        let code = create_link_code(&pool, "lark", "bot", alice)
+            .await
+            .expect("code");
+        redeem(
+            &pool,
+            "lark",
+            "bot",
+            "lark:ou_0",
+            &code.code,
+            Utc::now(),
+            false,
+        )
+        .await
+        .expect("redeem");
+        note_alias(&pool, "lark", "bot", "lark:ou_0", "lark:on_a")
+            .await
+            .expect("note");
+        assert_eq!(
+            move_link(&pool, "lark", "bot", "lark:ou_0", "lark:on_a")
+                .await
+                .expect("move"),
+            LinkMove::Moved(alice)
+        );
+        for n in 1..=9 {
+            note_alias(&pool, "lark", "bot", &format!("lark:ou_{n}"), "lark:on_a")
+                .await
+                .expect("note");
+        }
+        let kept: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM channel_sender_aliases WHERE sender_id = 'lark:on_a'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(kept.0, MAX_ALIASES);
+        let aliases = aliases_of(&pool, "lark", "bot", "lark:on_a")
+            .await
+            .expect("aliases");
+        assert_eq!(aliases.len(), 4);
+        assert!(aliases.contains(&"lark:ou_0".to_string()), "{aliases:?}");
+        assert!(aliases.contains(&"lark:ou_9".to_string()), "{aliases:?}");
+        assert!(!aliases.contains(&"lark:ou_1".to_string()), "{aliases:?}");
+        assert_eq!(
+            aliases_linked_to(&pool, "lark", "bot", "lark:on_a", alice)
+                .await
+                .expect("aliases"),
+            ["lark:ou_0"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_link_moves_only_for_an_account_that_knows_the_old_id() {
+        let pool = connect_in_memory().await.expect("db");
+        let alice = user(&pool, "Alice").await;
+        let code = create_link_code(&pool, "lark", "victim-bot", alice)
+            .await
+            .expect("code");
+        redeem(
+            &pool,
+            "lark",
+            "victim-bot",
+            "lark:ou_v",
+            &code.code,
+            Utc::now(),
+            false,
+        )
+        .await
+        .expect("redeem");
+        // Another account's adapter names the victim's id as its sender's.
+        assert_eq!(
+            move_link(&pool, "lark", "bot", "lark:ou_v", "lark:on_attacker")
+                .await
+                .expect("move"),
+            LinkMove::Nothing
+        );
+        let link = linked_user(&pool, "lark", "lark:ou_v").await.expect("link");
+        assert_eq!(link.map(|l| l.user_id), Some(alice));
+        // A turned-away record on the account is enough.
+        record_refusal(&pool, "lark", "bot", "lark:ou_v", "hi", Utc::now())
+            .await
+            .expect("refusal");
+        assert_eq!(
+            move_link(&pool, "lark", "bot", "lark:ou_v", "lark:on_v")
+                .await
+                .expect("move"),
+            LinkMove::Moved(alice)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_id_s_own_link_stays_and_the_old_one_is_dropped() {
+        let pool = connect_in_memory().await.expect("db");
+        let (alice, bob) = (user(&pool, "Alice").await, user(&pool, "Bob").await);
+        for (user, sender) in [(alice, "lark:ou_a"), (bob, "lark:on_a")] {
+            let code = create_link_code(&pool, "lark", "bot", user)
+                .await
+                .expect("code");
+            redeem(&pool, "lark", "bot", sender, &code.code, Utc::now(), false)
+                .await
+                .expect("redeem");
+        }
+        assert_eq!(
+            move_link(&pool, "lark", "bot", "lark:ou_a", "lark:on_a")
+                .await
+                .expect("move"),
+            LinkMove::Dropped {
+                dropped: alice,
+                kept: bob
+            }
+        );
+        let link = linked_user(&pool, "lark", "lark:on_a").await.expect("link");
+        assert_eq!(link.map(|l| l.user_id), Some(bob));
+        assert!(
+            linked_user(&pool, "lark", "lark:ou_a")
+                .await
+                .expect("link")
+                .is_none()
+        );
+        // Alice's old chats are not Bob's to see, nor those of an id noted
+        // without a link.
+        note_alias(&pool, "lark", "bot", "lark:ou_x", "lark:on_a")
+            .await
+            .expect("note");
+        for user in [alice, bob] {
+            assert!(
+                aliases_linked_to(&pool, "lark", "bot", "lark:on_a", user)
+                    .await
+                    .expect("aliases")
+                    .is_empty()
+            );
+        }
     }
 
     #[tokio::test]

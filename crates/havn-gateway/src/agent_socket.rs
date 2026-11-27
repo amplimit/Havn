@@ -1467,7 +1467,13 @@ async fn ask_for_approval(
         let admins = !admins_of_account.is_empty() || owner_linked;
         // The person in this chat decides with a press when they may
         // (issue #203); the text says how by command either way.
-        let sender_admin = admins_of_account.iter().any(|id| id == sender)
+        // By its id, or one it went by before on the account (issue #262).
+        let aliases = havn_db::repo::channel_access::aliases_of(&ctx.db, channel, account, sender)
+            .await
+            .unwrap_or_default();
+        let sender_admin = admins_of_account
+            .iter()
+            .any(|id| id == sender || aliases.contains(id))
             || match owner {
                 Some(owner) => havn_db::repo::channel_access::linked_user(&ctx.db, channel, sender)
                     .await
