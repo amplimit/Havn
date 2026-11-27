@@ -527,9 +527,15 @@ pub async fn unlink(
     Ok(true)
 }
 
+/// Earlier ids kept for one sender of an account at most (issue #262), so
+/// an adapter cannot slow every check of the sender with thousands.
+pub const MAX_ALIASES: i64 = 4;
+
 /// Note that on `(channel, account_id)` the sender `sender_id` went by
 /// `alias` before (issue #262), as an inbound on that account said. Whether
-/// it was not noted so yet (new, or then another sender's).
+/// it was not noted so yet (new, or then another sender's). Past
+/// [`MAX_ALIASES`] for the sender, the oldest go, those whose link moved
+/// last.
 pub async fn note_alias(
     pool: &SqlitePool,
     channel: &str,
@@ -537,6 +543,7 @@ pub async fn note_alias(
     alias: &str,
     sender_id: &str,
 ) -> Result<bool> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let res = sqlx::query(
         "INSERT INTO channel_sender_aliases (channel, account_id, alias, sender_id) \
          VALUES (?1, ?2, ?3, ?4) \
@@ -548,8 +555,22 @@ pub async fn note_alias(
     .bind(account_id)
     .bind(alias)
     .bind(sender_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    sqlx::query(
+        "DELETE FROM channel_sender_aliases \
+         WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 AND alias NOT IN ( \
+           SELECT alias FROM channel_sender_aliases \
+           WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 \
+           ORDER BY link_user IS NOT NULL DESC, noted_at DESC, alias DESC LIMIT ?4)",
+    )
+    .bind(channel)
+    .bind(account_id)
+    .bind(sender_id)
+    .bind(MAX_ALIASES)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -563,11 +584,13 @@ pub async fn aliases_of(
 ) -> Result<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT alias FROM channel_sender_aliases \
-         WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 ORDER BY noted_at, alias",
+         WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 ORDER BY noted_at, alias \
+         LIMIT ?4",
     )
     .bind(channel)
     .bind(account_id)
     .bind(sender_id)
+    .bind(MAX_ALIASES)
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(|(a,)| a).collect())
@@ -586,12 +609,13 @@ pub async fn aliases_linked_to(
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT alias FROM channel_sender_aliases \
          WHERE channel = ?1 AND account_id = ?2 AND sender_id = ?3 AND link_user = ?4 \
-         ORDER BY noted_at, alias",
+         ORDER BY noted_at, alias LIMIT ?5",
     )
     .bind(channel)
     .bind(account_id)
     .bind(sender_id)
     .bind(user.to_string())
+    .bind(MAX_ALIASES)
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(|(a,)| a).collect())
@@ -2329,6 +2353,60 @@ mod tests {
                 .expect("move"),
             LinkMove::Nothing,
             "once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sender_keeps_its_newest_aliases_and_the_one_its_link_moved_from() {
+        let pool = connect_in_memory().await.expect("db");
+        let alice = user(&pool, "Alice").await;
+        let code = create_link_code(&pool, "lark", "bot", alice)
+            .await
+            .expect("code");
+        redeem(
+            &pool,
+            "lark",
+            "bot",
+            "lark:ou_0",
+            &code.code,
+            Utc::now(),
+            false,
+        )
+        .await
+        .expect("redeem");
+        note_alias(&pool, "lark", "bot", "lark:ou_0", "lark:on_a")
+            .await
+            .expect("note");
+        assert_eq!(
+            move_link(&pool, "lark", "bot", "lark:ou_0", "lark:on_a")
+                .await
+                .expect("move"),
+            LinkMove::Moved(alice)
+        );
+        for n in 1..=9 {
+            note_alias(&pool, "lark", "bot", &format!("lark:ou_{n}"), "lark:on_a")
+                .await
+                .expect("note");
+        }
+        let kept: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM channel_sender_aliases WHERE sender_id = 'lark:on_a'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(kept.0, MAX_ALIASES);
+        let aliases = aliases_of(&pool, "lark", "bot", "lark:on_a")
+            .await
+            .expect("aliases");
+        assert_eq!(aliases.len(), 4);
+        assert!(aliases.contains(&"lark:ou_0".to_string()), "{aliases:?}");
+        assert!(aliases.contains(&"lark:ou_9".to_string()), "{aliases:?}");
+        assert!(!aliases.contains(&"lark:ou_1".to_string()), "{aliases:?}");
+        assert_eq!(
+            aliases_linked_to(&pool, "lark", "bot", "lark:on_a", alice)
+                .await
+                .expect("aliases"),
+            ["lark:ou_0"]
         );
     }
 
