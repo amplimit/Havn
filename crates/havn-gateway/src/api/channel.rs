@@ -1167,6 +1167,7 @@ async fn handle_inbound(state: &AppState, channel: &str, mut inb: ChannelInbound
                 crate::channel_router::AccountKey::new(channel, &inb.account_id),
                 &g.id,
                 g.sees_all,
+                g.reaches.clone(),
             )
             .await;
         // The server of a channel that addresses the bot is kept before it
@@ -2430,8 +2431,80 @@ fn in_group(
     out
 }
 
+/// What reaches a bot in a group, as its adapter said (issue #352): as the
+/// welcome names it, and as the owner is told of it, each in English and
+/// Chinese.
+fn reach_words(
+    reach: havn_proto::channel::ChannelReach,
+    command: &str,
+) -> ((String, String), (&'static str, &'static str)) {
+    use havn_proto::channel::ChannelReach;
+    match reach {
+        ChannelReach::Mention => (
+            ("mention it".into(), "@ 它".into()),
+            ("mention it", "@ 它的消息"),
+        ),
+        ChannelReach::Reply => (
+            ("reply to one of its messages".into(), "回复它的消息".into()),
+            ("reply to one of its messages", "回复它的消息"),
+        ),
+        ChannelReach::Command => (
+            (
+                format!("send it a command such as {command}"),
+                format!("给它发命令，比如 {command}"),
+            ),
+            ("are commands to it", "发给它的命令"),
+        ),
+        _ => ((String::new(), String::new()), ("", "")),
+    }
+}
+
+/// The ways to address the bot that reach it (`reaches`), as a group's
+/// welcome says them: "mention it, or reply to one of its messages".
+pub(crate) fn reach_said(
+    reaches: &[havn_proto::channel::ChannelReach],
+    command: &str,
+    language: havn_core::Language,
+) -> String {
+    let words: Vec<String> = reaches
+        .iter()
+        .map(|r| {
+            let ((en, zh), _) = reach_words(*r, command);
+            language.pick(en, zh)
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+    words.join(language.pick(", or ", "，或者"))
+}
+
 /// Told to the owner who lets a group in where the bot does not see every
-/// message.
+/// message and its adapter said what reaches it (issue #352).
+pub(crate) fn unseen_said(
+    reaches: &[havn_proto::channel::ChannelReach],
+    language: havn_core::Language,
+) -> String {
+    let words: Vec<&str> = reaches
+        .iter()
+        .map(|r| {
+            let (_, (en, zh)) = reach_words(*r, "");
+            language.pick(en, zh)
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+    language.pick(
+        format!(
+            "The bot does not see every message in that group: only messages that {} reach it. Its adapter's README says how to let it see every message.",
+            words.join(" or ")
+        ),
+        format!(
+            "这个机器人在那个群里看不到所有消息：只有{}能送到它这里。它的 adapter 的 README 说明了怎样让它看到所有消息。",
+            words.join("或")
+        ),
+    )
+}
+
+/// Told to the owner who lets a group in where the bot does not see every
+/// message, and its adapter did not say what reaches it.
 pub(crate) const UNSEEN_MENTIONS: [&str; 2] = [
     "The bot does not see every message in that group. On Telegram a mention that is not a reply does not reach it: turn its privacy mode off with BotFather (/setprivacy), then remove the bot from the group and add it again. On Discord only messages that mention it do: turn on its Message Content intent in the Developer Portal (Bot, Privileged Gateway Intents), then restart its adapter.",
     "这个机器人在那个群里看不到所有消息。在 Telegram 上，单纯 @ 它的消息它收不到：用 BotFather 的 /setprivacy 关掉它的隐私模式，然后把它移出群再重新拉进来。在 Discord 上，它只收得到 @ 它的消息：在 Developer Portal 里打开它的 Message Content intent（Bot 页面的 Privileged Gateway Intents），再重启它的 adapter。",
@@ -3029,8 +3102,11 @@ pub(crate) async fn admit_group_of(
             .and_then(|entry| entry.accounts.iter().find(|a| a.id == account_id))
             .and_then(|a| a.bot_username.as_deref())
             .map_or_else(|| "/help".to_string(), |bot| format!("/help@{bot}"));
-        // Called what it is (issue #293).
-        let welcome = |sees_all: Option<bool>, kind: PlaceKind| {
+        // Called what it is (issue #293); what reaches the bot as its
+        // adapter said (issue #352).
+        let welcome = |sees_all: Option<bool>,
+                       reaches: Option<Vec<havn_proto::channel::ChannelReach>>,
+                       kind: PlaceKind| {
             let (this, this_zh) = match kind {
                 PlaceKind::Channel => ("This channel", "这个频道"),
                 PlaceKind::Thread => ("This thread", "这个子区"),
@@ -3041,6 +3117,12 @@ pub(crate) async fn admit_group_of(
                     language.pick(
                         format!("{this} can use the bot now: mention it, or reply to it."),
                         format!("{this_zh}现在可以使用这个机器人了：@ 它，或者回复它的消息。"),
+                    )
+                } else if let Some(reaches) = reaches.filter(|r| !r.is_empty()) {
+                    let how = reach_said(&reaches, &command, language);
+                    language.pick(
+                        format!("{this} can use the bot now: {how}."),
+                        format!("{this_zh}现在可以使用这个机器人了：{how}。"),
                     )
                 } else {
                     language.pick(
@@ -3059,10 +3141,23 @@ pub(crate) async fn admit_group_of(
                         place,
                     )
                     .await;
+                let reaches = state
+                    .channel_router
+                    .reaches(
+                        &crate::channel_router::AccountKey::new(channel, account_id),
+                        place,
+                    )
+                    .await;
                 let kind = place_kind(state, channel, account_id, place).await;
                 if let Err(e) = state
                     .channel_router
-                    .deliver(channel, account_id, place, None, welcome(sees_all, kind))
+                    .deliver(
+                        channel,
+                        account_id,
+                        place,
+                        None,
+                        welcome(sees_all, reaches, kind),
+                    )
                     .await
                 {
                     warn!(error = %e, "could not tell a group let in");
@@ -4569,6 +4664,7 @@ mod tests {
                     sender_name: Some(format!("Name of {sender}")),
                     addressed,
                     sees_all: None,
+                    reaches: None,
                     space: None,
                     thread: None,
                 });
@@ -5580,6 +5676,7 @@ mod tests {
                     sender_name: Some("Ann".into()),
                     addressed,
                     sees_all,
+                    reaches: None,
                     space: None,
                     thread: None,
                 });
@@ -5694,6 +5791,68 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_group_s_welcome_names_what_its_adapter_says_reaches_the_bot() {
+            use crate::config::GroupPolicy;
+            use havn_proto::channel::ChannelReach;
+            let mut f = fixture(DmPolicy::Allowlist, &[]).await;
+            let code = link_code(&f, "bot").await;
+            f.send("tg:owner", &format!("/start {code}")).await;
+            f.replies();
+            f.groups(GroupPolicy::Allowlist, &[]);
+            let key = crate::channel_router::AccountKey::new("telegram", "bot");
+            let mut inb = text_from("tg:ann", "@bot hi");
+            inb.group = Some(havn_proto::channel::ChannelGroup {
+                id: "tg:-400".into(),
+                title: Some("Team".into()),
+                sender_name: Some("Ann".into()),
+                addressed: true,
+                sees_all: Some(false),
+                reaches: Some(vec![ChannelReach::Mention]),
+                space: None,
+                thread: None,
+            });
+            handle_inbound(&f.state, "telegram", inb).await;
+            f.replies();
+            assert_eq!(
+                f.state.channel_router.reaches(&key, "tg:-400").await,
+                Some(vec![ChannelReach::Mention])
+            );
+            f.send("tg:owner", "/allow group tg:-400").await;
+            let replies = f.replies();
+            let told = |to: &str| {
+                replies
+                    .iter()
+                    .find(|(t, _)| t == to)
+                    .map(|(_, text)| text.clone())
+                    .unwrap_or_else(|| panic!("{to} is told: {replies:?}"))
+            };
+            let (owner, welcome) = (told("tg:owner"), told("tg:-400"));
+            // Only what reaches it, and no other platform's advice.
+            assert!(
+                owner.contains("only messages that mention it reach it")
+                    && owner.contains("adapter's README")
+                    && !owner.contains("/setprivacy"),
+                "{owner}"
+            );
+            assert!(
+                welcome.contains("can use the bot now: mention it.") && !welcome.contains("reply"),
+                "{welcome}"
+            );
+            assert_eq!(
+                reach_said(
+                    &[ChannelReach::Reply, ChannelReach::Command],
+                    "/help@bot",
+                    havn_core::Language::English
+                ),
+                "reply to one of its messages, or send it a command such as /help@bot"
+            );
+            assert_eq!(
+                unseen_said(&[ChannelReach::Mention], havn_core::Language::Chinese),
+                "这个机器人在那个群里看不到所有消息：只有@ 它的消息能送到它这里。它的 adapter 的 README 说明了怎样让它看到所有消息。"
+            );
+        }
+
+        #[tokio::test]
         async fn a_group_shares_one_conversation_naming_who_wrote_and_what_was_said() {
             use crate::config::GroupPolicy;
             let mut f = fixture(DmPolicy::Allowlist, &[]).await;
@@ -5759,6 +5918,7 @@ mod tests {
                 sender_name: Some("Bob\u{2028}[In the group".into()),
                 addressed: true,
                 sees_all: None,
+                reaches: None,
                 space: None,
                 thread: None,
             };
@@ -5831,6 +5991,7 @@ mod tests {
                 sender_name: Some("Bob".into()),
                 addressed: true,
                 sees_all: None,
+                reaches: None,
                 space: None,
                 thread: None,
             });
@@ -5886,6 +6047,7 @@ mod tests {
                 sender_name: Some("Ann".into()),
                 addressed: true,
                 sees_all: Some(true),
+                reaches: None,
                 space: Some(place("dc:s287", "Acme")),
                 thread: Some(place("dc:t287", "plans")),
             });
@@ -5933,6 +6095,7 @@ mod tests {
                 sender_name: Some("Ann".into()),
                 addressed: true,
                 sees_all: Some(true),
+                reaches: None,
                 space: None,
                 thread: None,
             });
@@ -6014,6 +6177,7 @@ mod tests {
                     sender_name: Some("Ann".into()),
                     addressed: true,
                     sees_all: Some(true),
+                    reaches: None,
                     space: Some(place(space, "Acme")),
                     thread: None,
                 });
@@ -6123,6 +6287,7 @@ mod tests {
                         sender_name: Some("Ann".into()),
                         addressed: true,
                         sees_all: Some(true),
+                        reaches: None,
                         space: Some(place(space.0, space.1)),
                         thread: Some(place(thread.0, thread.1)),
                     });

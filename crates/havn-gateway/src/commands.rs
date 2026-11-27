@@ -915,10 +915,21 @@ async fn allow(state: &AppState, asker: &Asker, args: &str) -> String {
                         sender,
                     )
                     .await;
-                let hint = if sees_all == Some(false) {
-                    format!(" {}", language.of(crate::api::channel::UNSEEN_MENTIONS))
-                } else {
-                    String::new()
+                let reaches = state
+                    .channel_router
+                    .reaches(
+                        &crate::channel_router::AccountKey::new(channel, account_id),
+                        sender,
+                    )
+                    .await;
+                let hint = match (sees_all, reaches) {
+                    (Some(false), Some(reaches)) => {
+                        format!(" {}", crate::api::channel::unseen_said(&reaches, language))
+                    }
+                    (Some(false), None) => {
+                        format!(" {}", language.of(crate::api::channel::UNSEEN_MENTIONS))
+                    }
+                    _ => String::new(),
                 };
                 language.pick(
                     format!("(The {place} can use this bot now.){hint}"),
