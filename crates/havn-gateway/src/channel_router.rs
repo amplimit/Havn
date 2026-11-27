@@ -100,6 +100,9 @@ struct AccountState {
     /// Per group id, whether the bot sees every message there, as its
     /// adapter last said with a message from it.
     sees_all: HashMap<String, bool>,
+    /// Per group id, which messages to the bot reach it there, as its
+    /// adapter last said (issue #352).
+    reaches: HashMap<String, Vec<havn_proto::channel::ChannelReach>>,
     /// The adapter holding `tx` shows replies as they are written (issue
     /// #325): it asked for [`ChannelFrame::Writing`] on the upgrade.
     writing: bool,
@@ -114,6 +117,21 @@ struct ReplayEntry {
 
 /// Groups whose `sees_all` an account keeps at most.
 const GROUPS_KNOWN: usize = 1000;
+
+/// Keep `value` for `group` in `known`, or forget it when `None`; at most
+/// `GROUPS_KNOWN` groups, one let go for a new one past that.
+fn keep_known<T>(known: &mut HashMap<String, T>, group: &str, value: Option<T>) {
+    let Some(value) = value else {
+        known.remove(group);
+        return;
+    };
+    if known.len() >= GROUPS_KNOWN && !known.contains_key(group) {
+        if let Some(any) = known.keys().next().cloned() {
+            known.remove(&any);
+        }
+    }
+    known.insert(group.to_string(), value);
+}
 
 /// The first seq of an account: microseconds since the epoch, past the
 /// seqs of a gateway that ran before (unless it gave more than one frame
@@ -133,6 +151,7 @@ impl AccountState {
             replay: VecDeque::new(),
             replaying: None,
             sees_all: HashMap::new(),
+            reaches: HashMap::new(),
             writing: false,
         }
     }
@@ -175,25 +194,35 @@ impl ChannelRouter {
             .count()
     }
 
-    /// Note whether `key`'s bot sees every message in `group`, as its
-    /// adapter says with a message from it: `None`, that it does not know
-    /// (any more). At most `GROUPS_KNOWN` groups are kept per account.
-    pub async fn note_sees_all(&self, key: AccountKey, group: &str, sees_all: Option<bool>) {
+    /// Note whether `key`'s bot sees every message in `group`, and which
+    /// messages to it reach it there (issue #352), as its adapter says with
+    /// a message from it: `None`, that it does not know (any more). At most
+    /// `GROUPS_KNOWN` groups are kept per account.
+    pub async fn note_sees_all(
+        &self,
+        key: AccountKey,
+        group: &str,
+        sees_all: Option<bool>,
+        reaches: Option<Vec<havn_proto::channel::ChannelReach>>,
+    ) {
         let mut map = self.inner.lock().await;
-        let known = &mut map
-            .entry(key)
-            .or_insert_with(|| AccountState::new(None))
-            .sees_all;
-        let Some(sees_all) = sees_all else {
-            known.remove(group);
-            return;
-        };
-        if known.len() >= GROUPS_KNOWN && !known.contains_key(group) {
-            if let Some(any) = known.keys().next().cloned() {
-                known.remove(&any);
-            }
-        }
-        known.insert(group.to_string(), sees_all);
+        let state = map.entry(key).or_insert_with(|| AccountState::new(None));
+        keep_known(&mut state.sees_all, group, sees_all);
+        keep_known(&mut state.reaches, group, reaches.filter(|r| !r.is_empty()));
+    }
+
+    /// Which messages to `key`'s bot reach it in `group`, as its adapter
+    /// last said (issue #352); `None` before it said.
+    pub async fn reaches(
+        &self,
+        key: &AccountKey,
+        group: &str,
+    ) -> Option<Vec<havn_proto::channel::ChannelReach>> {
+        self.inner
+            .lock()
+            .await
+            .get(key)
+            .and_then(|s| s.reaches.get(group).cloned())
     }
 
     /// Whether `key`'s bot sees every message in `group`, as its adapter
