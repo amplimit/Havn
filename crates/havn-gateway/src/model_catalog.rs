@@ -1459,7 +1459,7 @@ mod tests {
             &video_entry("openrouter:google/gemini-3.8-flash", None),
             openrouter,
             &http,
-            "http://127.0.0.1:9",
+            "http://127.0.0.1:9/takes-video-test",
         )
         .await
         .expect_err("not known");

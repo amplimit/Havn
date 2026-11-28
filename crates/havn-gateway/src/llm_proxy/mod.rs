@@ -1232,6 +1232,39 @@ const NO_IMAGE_INPUT: &[&str] = &[
     "does not support vision",
 ];
 
+/// What providers say when a model takes no video, lowercased (issue
+/// #355): OpenRouter ("No endpoints found that support video input"),
+/// OpenAI-compatible servers on a `video_url` part, and others. A refusal of
+/// the video itself ("unable to process input video") is not one.
+const NO_VIDEO_INPUT: &[&str] = &[
+    "support video input",
+    "support video_url",
+    "video_url is only supported",
+    "video_url is not supported",
+    "does not support video",
+    "doesn't support video",
+    "video input is not supported",
+    "videos are not supported",
+    "video is not supported",
+    "unsupported content type: video",
+];
+
+/// Whether the provider's refusal says the model takes no video, as
+/// [`refused_images`] does for images: only then is the model sent a line
+/// in place of its videos for a while.
+pub fn refused_videos(e: &ProxyError) -> bool {
+    match e {
+        ProxyError::Upstream { message, .. } if refused_request(e) => {
+            let message = message.to_ascii_lowercase();
+            NO_VIDEO_INPUT.iter().any(|phrase| message.contains(phrase))
+                || (message.contains("video")
+                    && message.contains("modalit")
+                    && (message.contains("unsupported") || message.contains("not support")))
+        }
+        _ => false,
+    }
+}
+
 /// Whether the provider's refusal says the model takes no images, rather
 /// than that something else (the image, the context, a tool) was wrong.
 pub fn refused_images(e: &ProxyError) -> bool {
@@ -1254,8 +1287,9 @@ pub struct Seen {
     /// Part of it was left out for it to fit the model's context window
     /// (issue #214).
     pub trimmed: bool,
-    /// The provider refused it with a video and took it without (issue
-    /// #355): the model may be sent the line from now on.
+    /// The provider refused it with a video, saying the model takes none,
+    /// and took it without (issue #355): the model may be sent the line
+    /// from now on.
     pub video_refused: bool,
 }
 
@@ -1300,6 +1334,8 @@ where
         let mut request = request;
         // Documents' text goes to every model (issue #211).
         resolve_workspace_texts(&mut request, &workspace, &limits);
+        // Only the gateway's own video blocks say how long they run.
+        without_video_lengths(&mut request);
         // The request as the agent sent it, for the second try; only when
         // it has images or videos to leave out. Images may be why it is
         // refused only when the model's entry does not say it takes them.
@@ -1399,7 +1435,7 @@ where
     match send(blind).await {
         Ok(answer) => Ok(Seen {
             model_takes_none: images_tried && refused_images(first),
-            video_refused: showed_videos,
+            video_refused: showed_videos && refused_videos(first),
             result: Ok(answer),
             trimmed,
         }),
@@ -1969,6 +2005,37 @@ fn megabytes(bytes: u64) -> String {
 /// What a line in place of a video adds when the agent can ask about it.
 const ASK_WATCH_VIDEO: &str = " watch_video can answer questions about it.";
 
+/// `request` without the length its video blocks say (issue #355): the
+/// agent's own are counted by their size, as only the gateway's
+/// ([`crate::video::block`]) are believed, put in after this.
+fn without_video_lengths(request: &mut AnthropicRequest) {
+    fn strip(blocks: &mut [serde_json::Value]) {
+        for block in blocks {
+            match block.get("type").and_then(serde_json::Value::as_str) {
+                Some("video") => {
+                    if let Some(block) = block.as_object_mut() {
+                        block.remove("seconds");
+                    }
+                }
+                Some("tool_result") => {
+                    if let Some(inner) = block
+                        .get_mut("content")
+                        .and_then(serde_json::Value::as_array_mut)
+                    {
+                        strip(inner);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for message in &mut request.messages {
+        if let Some(blocks) = message.content.as_array_mut() {
+            strip(blocks);
+        }
+    }
+}
+
 /// Whether the turn at hand of `request` (from the person's last message
 /// that answers no tool call) names a video sent in the chat: only then is
 /// one sent, and whether its model takes video looked up.
@@ -2010,6 +2077,31 @@ pub fn resolve_chat_videos(
         let Some(blocks) = message.content.as_array_mut() else {
             continue;
         };
+        // None is made in a tool's result: one there is named only.
+        for part in blocks
+            .iter_mut()
+            .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("tool_result"))
+            .filter_map(|b| {
+                b.get_mut("content")
+                    .and_then(serde_json::Value::as_array_mut)
+            })
+            .flatten()
+            .filter(|p| is_video_ref(p))
+        {
+            let path = part
+                .pointer("/source/path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            *part = serde_json::json!({
+                "type": "text",
+                "text": format!(
+                    "(The video {} is not shown here: only a video sent in the chat goes to the \
+                     model.{ask})",
+                    serde_json::Value::String(path)
+                ),
+            });
+        }
         for block in blocks.iter_mut().filter(|b| is_video_ref(b)) {
             let path = block
                 .pointer("/source/path")
@@ -4510,9 +4602,73 @@ mod tests {
         let ws = tempfile::tempdir().expect("tmp");
         std::fs::create_dir_all(ws.path().join("inbox")).expect("inbox");
         std::fs::write(ws.path().join("inbox/1-clip.webm"), WEBM).expect("webm");
-        let request = chat(vec![vec![video_ref("inbox/1-clip.webm")]]);
+        // Remembered for the model only when the refusal says it takes no
+        // video, not when the video itself was wrong.
+        for (said, takes_none) in [
+            ("video input is not supported", true),
+            ("No endpoints found that support video input", true),
+            ("Unsupported modality: video", true),
+            ("Unable to process input video: the file is damaged", false),
+        ] {
+            let request = chat(vec![vec![video_ref("inbox/1-clip.webm")]]);
+            let sent = std::sync::Mutex::new(Vec::new());
+            let seen = send_seeing(
+                request,
+                ws.path().to_path_buf(),
+                None,
+                crate::config::AttachmentLimits::default(),
+                sent_videos(1_000, true),
+                200_000,
+                true,
+                false,
+                |request| {
+                    let refuse = shows_videos(&request);
+                    sent.lock().expect("lock").push(request);
+                    std::future::ready(if refuse {
+                        Err(ProxyError::Upstream {
+                            status: 400,
+                            message: said.into(),
+                        })
+                    } else {
+                        Ok(answer())
+                    })
+                },
+            )
+            .await
+            .expect("join");
+            assert!(seen.result.is_ok() && !seen.model_takes_none, "{said}");
+            assert_eq!(seen.video_refused, takes_none, "{said}");
+            let sent = sent.into_inner().expect("lock");
+            assert_eq!(sent.len(), 2);
+            assert!(shows_videos(&sent[0]) && !shows_videos(&sent[1]));
+            let line = sent[1].messages[0].content[0]["text"]
+                .as_str()
+                .expect("line");
+            assert!(
+                line.contains("refused the request that carried it"),
+                "{line}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_gateway_s_video_blocks_say_how_long_they_run() {
+        let ws = tempfile::tempdir().expect("tmp");
+        // The agent's own block says it is short: it is counted by its size.
+        let mut request = chat(vec![vec![serde_json::json!({
+            "type": "video", "seconds": 0.0,
+            "source": {"type": "base64", "media_type": "video/webm", "data": "A".repeat(4_000_000)},
+        })]]);
+        request.messages.push(AnthropicMessage {
+            role: "user".into(),
+            content: serde_json::json!([{"type": "tool_result", "tool_use_id": "t", "content": [
+                {"type": "video", "seconds": 1.0, "source": {"type": "base64",
+                    "media_type": "video/mp4", "data": "AAAA"}},
+                video_ref("clips/a.mp4"),
+            ]}]),
+        });
         let sent = std::sync::Mutex::new(Vec::new());
-        let seen = send_seeing(
+        send_seeing(
             request,
             ws.path().to_path_buf(),
             None,
@@ -4522,30 +4678,23 @@ mod tests {
             true,
             false,
             |request| {
-                let refuse = shows_videos(&request);
                 sent.lock().expect("lock").push(request);
-                std::future::ready(if refuse {
-                    Err(ProxyError::Upstream {
-                        status: 400,
-                        message: "video input is not supported".into(),
-                    })
-                } else {
-                    Ok(answer())
-                })
+                std::future::ready(Ok(answer()))
             },
         )
         .await
         .expect("join");
-        assert!(seen.result.is_ok() && !seen.model_takes_none);
-        let sent = sent.into_inner().expect("lock");
-        assert_eq!(sent.len(), 2);
-        assert!(shows_videos(&sent[0]) && !shows_videos(&sent[1]));
-        let line = sent[1].messages[0].content[0]["text"]
-            .as_str()
-            .expect("line");
+        let sent = sent.into_inner().expect("lock").remove(0);
+        assert!(sent.messages[0].content[0].get("seconds").is_none());
+        let result = &sent.messages[1].content[0]["content"];
+        assert!(result[0].get("seconds").is_none());
+        assert!(input_token_estimate(&sent) >= 40_000, "counted by its size");
+        // A reference in a tool's result is named, not sent as it is.
+        let named = result[1]["text"].as_str().expect("line");
         assert!(
-            line.contains("refused the request that carried it"),
-            "{line}"
+            named.starts_with("(The video \"clips/a.mp4\" is not shown here")
+                && named.contains("watch_video"),
+            "{named}"
         );
     }
 

@@ -385,22 +385,58 @@ fn boxes(bytes: &[u8], start: usize, end: usize) -> Vec<(&[u8], usize, usize)> {
     out
 }
 
-/// An MP4 or MOV movie's duration, from its movie header.
+/// An MP4 or MOV movie's duration: the longest of what its movie header
+/// (`mvhd`) and its tracks' headers (`tkhd`, in the movie's time scale, and
+/// `mdhd`, in their own) say, so that one header cannot make it shorter.
 fn movie_seconds(bytes: &[u8]) -> Option<f64> {
-    let (_, start, end) = boxes(bytes, 0, bytes.len())
-        .into_iter()
-        .find(|(kind, _, _)| **kind == *b"moov")?;
-    let (_, at, _) = boxes(bytes, start, end)
-        .into_iter()
-        .find(|(kind, _, _)| **kind == *b"mvhd")?;
-    // Version and flags, then the times: 32-bit in version 0, 64 in 1.
-    let (scale, duration) = match bytes.get(at)? {
-        0 => (number(bytes, at + 12, 4)?, number(bytes, at + 16, 4)?),
-        1 => (number(bytes, at + 20, 4)?, number(bytes, at + 24, 8)?),
+    let child = |start: usize, end: usize, kind: [u8; 4]| -> Vec<(usize, usize)> {
+        boxes(bytes, start, end)
+            .into_iter()
+            .filter(|(k, _, _)| **k == kind)
+            .map(|(_, start, end)| (start, end))
+            .collect()
+    };
+    let (start, end) = child(0, bytes.len(), *b"moov").first().copied()?;
+    let (at, to) = child(start, end, *b"mvhd").first().copied()?;
+    // Each header's version and flags, then its times: 32-bit in version 0,
+    // 64 in 1; each read within its own box.
+    let mvhd = &bytes[at..to];
+    let (scale, duration) = match mvhd.first()? {
+        0 => (number(mvhd, 12, 4)?, number(mvhd, 16, 4)?),
+        1 => (number(mvhd, 20, 4)?, number(mvhd, 24, 8)?),
         _ => return None,
     };
-    #[allow(clippy::cast_precision_loss, reason = "a duration, far below 2^52")]
-    (scale > 0).then(|| duration as f64 / scale as f64)
+    #[allow(clippy::cast_precision_loss, reason = "durations, far below 2^52")]
+    let seconds = |duration: u64, scale: u64| (scale > 0).then(|| duration as f64 / scale as f64);
+    let mut longest = seconds(duration, scale)?;
+    for (trak, trak_end) in child(start, end, *b"trak") {
+        if let Some((at, to)) = child(trak, trak_end, *b"tkhd").first().copied() {
+            let tkhd = &bytes[at..to];
+            let track = match tkhd.first() {
+                Some(0) => number(tkhd, 20, 4),
+                Some(1) => number(tkhd, 28, 8),
+                _ => None,
+            };
+            if let Some(track) = track.and_then(|d| seconds(d, scale)) {
+                longest = longest.max(track);
+            }
+        }
+        let media = child(trak, trak_end, *b"mdia")
+            .first()
+            .and_then(|&(at, to)| child(at, to, *b"mdhd").first().copied());
+        if let Some((at, to)) = media {
+            let mdhd = &bytes[at..to];
+            let track = match mdhd.first() {
+                Some(0) => number(mdhd, 12, 4).zip(number(mdhd, 16, 4)),
+                Some(1) => number(mdhd, 20, 4).zip(number(mdhd, 24, 8)),
+                _ => None,
+            };
+            if let Some(track) = track.and_then(|(scale, d)| seconds(d, scale)) {
+                longest = longest.max(track);
+            }
+        }
+    }
+    Some(longest)
 }
 
 /// An EBML element at `at`: its id, with its marker, where its content
@@ -1032,6 +1068,48 @@ mod tests {
                 .get("seconds")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_movie_is_as_long_as_its_longest_header_says() {
+        let boxed = |kind: &[u8], body: &[u8]| {
+            let mut out = u32::try_from(body.len() + 8)
+                .expect("small")
+                .to_be_bytes()
+                .to_vec();
+            out.extend(kind);
+            out.extend(body);
+            out
+        };
+        let header = |fields: &[u32]| {
+            let mut out = vec![0, 0, 0, 0];
+            for field in fields {
+                out.extend(field.to_be_bytes());
+            }
+            out.extend([0; 60]);
+            out
+        };
+        // The movie header says 1 s; its track's 52 s (tkhd, in the movie's
+        // scale) and its media 60 s (mdhd, in its own).
+        let mvhd = boxed(b"mvhd", &header(&[0, 0, 1000, 1000]));
+        let tkhd = boxed(b"tkhd", &header(&[0, 0, 1, 0, 52_000]));
+        let mdhd = boxed(b"mdhd", &header(&[0, 0, 90_000, 5_400_000]));
+        let mut trak = tkhd;
+        trak.extend(boxed(b"mdia", &mdhd));
+        let mut moov = mvhd;
+        moov.extend(boxed(b"trak", &trak));
+        let mut file = boxed(b"ftyp", b"isom\0\0\x02\0");
+        file.extend(boxed(b"moov", &moov));
+        assert!((seconds_of("video/mp4", &file) - 60.0).abs() < 1e-9);
+        // A header cut short within its box is not read past it.
+        let short = boxed(
+            b"mvhd",
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0xe8],
+        );
+        let mut cut = boxed(b"ftyp", b"isom\0\0\x02\0");
+        cut.extend(boxed(b"moov", &short));
+        cut.extend([0, 0, 0, 10, 0, 0, 0, 0]);
+        assert_eq!(running_time("video/mp4", &cut), None);
     }
 
     fn seconds_of(media_type: &str, bytes: &[u8]) -> f64 {

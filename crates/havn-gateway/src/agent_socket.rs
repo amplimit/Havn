@@ -4989,12 +4989,14 @@ mod tests {
     async fn a_turn_s_video_goes_as_its_model_and_the_request_s_tools_say() {
         let mut ctx = ctx_with(false, false).await;
         let mut llm = crate::config::LlmConfig::default();
-        llm.base_url
-            .insert("openrouter".into(), "http://127.0.0.1:9".into());
+        llm.base_url.insert(
+            "openrouter".into(),
+            "http://127.0.0.1:9/chat-videos-test".into(),
+        );
         ctx.llm = Arc::new(llm);
         assert_eq!(
             llm_proxy::base_url_of("openrouter", &ctx.llm).as_deref(),
-            Some("http://127.0.0.1:9")
+            Some("http://127.0.0.1:9/chat-videos-test")
         );
         let entry = |id: &str, video: Option<bool>| crate::model_catalog::ModelEntry {
             id: id.into(),
