@@ -441,9 +441,11 @@ pub async fn run_tool(
             "another video is being watched for this user's agents; wait for it to end".into(),
         );
     };
+    // One video is watched at a time: a call that waited its whole time
+    // for its turn is told the tool was busy, not that its video was long.
     let _turn = tokio::time::timeout_at(deadline, TOOL_RUNNING.acquire())
         .await
-        .map_err(|_| late())?
+        .map_err(|_| "another video was being watched all this time; try again later".to_string())?
         .map_err(|e| format!("watching videos is closed: {e}"))?;
     let call = crate::transcribe::model_call(gateway, agent, &policy);
     let (entry, api) = model_for(&call, how.model())?;
