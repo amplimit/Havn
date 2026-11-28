@@ -642,6 +642,7 @@ mod tests {
             label: None,
             max_output_tokens: None,
             vision: None,
+            video: None,
             thinking: None,
             context_window: None,
             fallback: Vec::new(),

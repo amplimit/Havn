@@ -727,6 +727,11 @@ pub fn type_of_name(name: &str) -> &'static str {
         "xlsm" => "application/vnd.ms-excel.sheet.macroEnabled.12",
         "xls" => "application/vnd.ms-excel",
         "ods" => "application/vnd.oasis.opendocument.spreadsheet",
+        // Videos a model may be sent (issue #355).
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mpeg" | "mpg" => "video/mpeg",
         _ => "application/octet-stream",
     }
 }

@@ -423,6 +423,14 @@ fn route<'a>(
     })
 }
 
+/// The base URL calls to `provider_name` go to, as `llm` moves it.
+#[must_use]
+pub fn base_url_of(provider_name: &str, llm: &LlmConfig) -> Option<String> {
+    route(provider_name, None, llm)
+        .ok()
+        .map(|route| route.base_url.to_string())
+}
+
 /// The implementation an `[llm.endpoints]` server of `api` is called with.
 fn endpoint_provider(api: crate::config::EndpointApi) -> &'static dyn LlmProvider {
     static ANTHROPIC: anthropic::AnthropicProvider = anthropic::AnthropicProvider;
@@ -1142,6 +1150,29 @@ fn names_workspace_images(request: &AnthropicRequest) -> bool {
     })
 }
 
+/// Whether `request` sends the model a video.
+pub fn shows_videos(request: &AnthropicRequest) -> bool {
+    has_block(request, |b| {
+        b.get("type").and_then(serde_json::Value::as_str) == Some("video")
+            && b.pointer("/source/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("base64")
+    })
+}
+
+/// Whether `request` names a video sent in the chat (issue #355).
+pub fn names_chat_videos(request: &AnthropicRequest) -> bool {
+    has_block(request, is_video_ref)
+}
+
+fn is_video_ref(block: &serde_json::Value) -> bool {
+    block.get("type").and_then(serde_json::Value::as_str) == Some("video")
+        && block
+            .pointer("/source/type")
+            .and_then(serde_json::Value::as_str)
+            == Some("workspace")
+}
+
 /// Whether a block of `request`, or of a tool's result in it (issue
 /// #227), is one `found` looks for.
 fn has_block(request: &AnthropicRequest, found: impl Fn(&serde_json::Value) -> bool) -> bool {
@@ -1212,17 +1243,20 @@ pub struct Seen {
 /// Send `request` (by `send`) with the images its turn names in
 /// `workspace` shown when `show`, those of tools' results as `kept` keeps
 /// them once shown, fitted to a context window of `context`
-/// tokens ([`fit_context`]). A request the provider refuses as too long
-/// goes once more, fitted tighter. With `retry_blind`, a request that
+/// tokens ([`fit_context`]). The videos sent in the chat go as `videos`
+/// says ([`resolve_chat_videos`]). A request the provider refuses as too
+/// long goes once more, fitted tighter. With `retry_blind`, a request that
 /// showed images and was refused outright goes once more with each image a
-/// line saying the model cannot see it; if that is refused too, the first
-/// refusal is the result.
+/// line saying the model cannot see it, and so does one that sent a video,
+/// each video a line; if that is refused too, the first refusal is the
+/// result.
 #[allow(clippy::too_many_arguments)]
 pub async fn send_seeing<F, Fut>(
     request: AnthropicRequest,
     workspace: std::path::PathBuf,
     kept: Option<KeptImages>,
     limits: crate::config::AttachmentLimits,
+    videos: ChatVideos,
     context: u32,
     show: bool,
     retry_blind: bool,
@@ -1233,18 +1267,24 @@ where
     Fut: std::future::Future<Output = Result<AnthropicResponse, ProxyError>>,
 {
     let limits_blind = limits.clone();
+    let (workspace_blind, kept_blind) = (workspace.clone(), kept.clone());
+    let watch = videos.watch;
     // Copies of images too large to show are made by the converter, from
     // the blocking task (issue #227).
     let handle = tokio::runtime::Handle::current();
-    let (shown, blind, again, trimmed) = tokio::task::spawn_blocking(move || {
+    let handle_blind = handle.clone();
+    let (shown, blind, again, trimmed, images_tried) = tokio::task::spawn_blocking(move || {
         let shrink = |bytes: &[u8]| handle.block_on(crate::web_fetch::image_to_show(bytes));
         let mut request = request;
         // Documents' text goes to every model (issue #211).
         resolve_workspace_texts(&mut request, &workspace, &limits);
         // The request as the agent sent it, for the second try; only when
-        // it has images to leave out.
-        let blind =
-            (show && retry_blind && names_workspace_images(&request)).then(|| request.clone());
+        // it has images or videos to leave out. Images may be why it is
+        // refused only when the model's entry does not say it takes them.
+        let images_tried = show && retry_blind && names_workspace_images(&request);
+        let videos_sent = videos.refused.is_none() && names_chat_videos(&request);
+        let blind = (images_tried || videos_sent).then(|| request.clone());
+        resolve_chat_videos(&mut request, &workspace, &videos);
         resolve_workspace_images(
             &mut request,
             &workspace,
@@ -1258,11 +1298,11 @@ where
         let near = context_tokens(&request) * 2 > window_budget(&request, context, FIT_SHARE);
         let again = near.then(|| request.clone());
         let trimmed = fit_context(&mut request, context, FIT_SHARE);
-        (request, blind, again, trimmed)
+        (request, blind, again, trimmed, images_tried)
     })
     .await?;
     let mut trimmed = trimmed;
-    let showed = shows_images(&shown);
+    let showed = (images_tried && shows_images(&shown)) || shows_videos(&shown);
     let result = send(shown).await;
     if let (Err(e), Some(again)) = (&result, again)
         && too_long(e)
@@ -1295,19 +1335,31 @@ where
             trimmed,
         });
     }
-    // Without vision no file is read.
-    resolve_workspace_images(
-        &mut blind,
-        std::path::Path::new(""),
-        false,
-        &limits_blind,
-        &|_| Err(String::new()),
-        None,
-    );
-    trimmed |= fit_context(&mut blind, context, FIT_SHARE);
+    // No video goes again, nor an image that may be why; others do.
+    let blind = tokio::task::spawn_blocking(move || {
+        let shrink = |bytes: &[u8]| handle_blind.block_on(crate::web_fetch::image_to_show(bytes));
+        resolve_chat_videos(
+            &mut blind,
+            &workspace_blind,
+            &ChatVideos::refused("the provider refused the request that carried it", watch),
+        );
+        resolve_workspace_images(
+            &mut blind,
+            &workspace_blind,
+            show && !images_tried,
+            &limits_blind,
+            &shrink,
+            kept_blind.as_ref(),
+        );
+        let trimmed = fit_context(&mut blind, context, FIT_SHARE);
+        (blind, trimmed)
+    })
+    .await?;
+    let (blind, cut) = blind;
+    trimmed |= cut;
     match send(blind).await {
         Ok(answer) => Ok(Seen {
-            model_takes_none: refused_images(first),
+            model_takes_none: images_tried && refused_images(first),
             result: Ok(answer),
             trimmed,
         }),
@@ -1804,6 +1856,158 @@ pub fn resolve_workspace_texts(
             *block = serde_json::json!({"type": "text", "text": text});
         }
     }
+}
+
+/// How the videos sent in a chat go to the model of a request (issue
+/// #355).
+#[derive(Debug, Clone)]
+pub struct ChatVideos {
+    /// Why the model is not sent them; `None` when it is.
+    pub refused: Option<String>,
+    /// The most bytes of video a request carries.
+    pub most: u64,
+    /// The agent is offered `watch_video`, which answers questions about
+    /// them whatever its model.
+    pub watch: bool,
+}
+
+impl ChatVideos {
+    /// Sent to a model that takes video within `limits`, and, for Gemini's
+    /// own API (`inline`), within the inline data it takes in a request.
+    #[must_use]
+    pub fn sent(limits: &crate::config::AttachmentLimits, inline: bool, watch: bool) -> Self {
+        let mut most = limits
+            .video_bytes
+            .min(crate::video::MOST_MB * 1024 * 1024);
+        if inline {
+            most = most.min(crate::video::GEMINI_INLINE_BYTES as u64 / 4 * 3);
+        }
+        Self {
+            refused: None,
+            most,
+            watch,
+        }
+    }
+
+    /// Not sent, as `why` says.
+    #[must_use]
+    pub fn refused(why: impl Into<String>, watch: bool) -> Self {
+        Self {
+            refused: Some(why.into()),
+            most: 0,
+            watch,
+        }
+    }
+}
+
+/// What a line in place of a video adds when the agent can ask about it.
+const ASK_WATCH_VIDEO: &str = " watch_video can answer questions about it.";
+
+/// Put the videos sent in the chat (issue #355) in `request`: the runtime
+/// names a file of its inbox (`{"type": "video", "source": {"type":
+/// "workspace", "path": "inbox/<name>"}}`), read here through
+/// [`crate::agent_files`]. Only a model that takes video is sent them, and
+/// only with the turn they were sent in, its continuation included: every
+/// request of a turn carries the conversation again, so a video an
+/// earlier turn sent becomes a line saying so. MP4, MOV, WebM and MPEG, by
+/// [`crate::video::media_type`], up to `videos.most` bytes in all, the
+/// newest first. Every other one becomes a line saying why, and that
+/// `watch_video` answers questions about it when the agent has it.
+/// Blocking: it reads files.
+pub fn resolve_chat_videos(
+    request: &mut AnthropicRequest,
+    workspace: &std::path::Path,
+    videos: &ChatVideos,
+) {
+    let turn = request.messages.iter().rposition(starts_turn).unwrap_or(0);
+    let mut inbox: Option<std::io::Result<Option<crate::agent_files::WorkspaceDir>>> = None;
+    let mut left = videos.most;
+    let ask = if videos.watch { ASK_WATCH_VIDEO } else { "" };
+    for (n, message) in request.messages.iter_mut().enumerate().rev() {
+        let Some(blocks) = message.content.as_array_mut() else {
+            continue;
+        };
+        for block in blocks.iter_mut().filter(|b| is_video_ref(b)) {
+            let path = block
+                .pointer("/source/path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let quoted = serde_json::Value::String(path.clone());
+            let read = match &videos.refused {
+                Some(why) => Err(why.clone()),
+                None if n < turn => {
+                    *block = serde_json::json!({
+                        "type": "text",
+                        "text": format!(
+                            "(The video {quoted} went to the model with this message, in its \
+                             own turn; later turns do not carry it again, as every request \
+                             would send it once more.{ask})"
+                        ),
+                    });
+                    continue;
+                }
+                None => {
+                    let dir = inbox.get_or_insert_with(|| {
+                        crate::agent_files::WorkspaceDir::open(workspace)
+                            .and_then(|root| root.subdir(havn_core::INBOX_DIR))
+                    });
+                    inbox_video(dir, &path, left, videos.most)
+                }
+            };
+            *block = match read {
+                Ok((media_type, bytes)) => {
+                    left -= bytes.len() as u64;
+                    serde_json::json!({
+                        "type": "video",
+                        "source": {"type": "base64", "media_type": media_type, "data": base64(&bytes)},
+                    })
+                }
+                Err(why) => serde_json::json!({
+                    "type": "text",
+                    "text": format!("(The video {quoted} is not shown: {why}.{ask})"),
+                }),
+            };
+        }
+    }
+}
+
+/// The media type and bytes of the video at `path` of the inbox, if it is
+/// one a model is sent, of at most `room` bytes of a request's `most`.
+fn inbox_video(
+    inbox: &std::io::Result<Option<crate::agent_files::WorkspaceDir>>,
+    path: &str,
+    room: u64,
+    most: u64,
+) -> Result<(&'static str, Vec<u8>), String> {
+    if !havn_core::Attachment::in_inbox(path) {
+        return Err("it is not a file of the inbox".into());
+    }
+    let name = &path[havn_core::INBOX_DIR.len() + 1..];
+    let dir = match inbox {
+        Ok(Some(dir)) => dir,
+        Ok(None) => return Err("the inbox is gone".into()),
+        Err(e) => return Err(format!("the inbox cannot be read ({e})")),
+    };
+    let bytes = match dir.read_bytes(name, room) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Err(GONE.into()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData && e.to_string().contains("larger") => {
+            return Err(if room < most {
+                "the videos of this turn are too large together".to_string()
+            } else {
+                format!(
+                    "it is over {} MB, the most of video a request carries",
+                    most / 1_000_000
+                )
+            });
+        }
+        Err(e) => return Err(format!("it cannot be read ({e})")),
+    };
+    let head = &bytes[..bytes.len().min(4096)];
+    let media_type = crate::video::media_type(name, head)
+        .map_err(|_| "it is not an MP4, MOV, WebM or MPEG video".to_string())?;
+    Ok((media_type, bytes))
 }
 
 /// `text`, of the file `name` kept at `path`, marked as a file's text and
@@ -3922,6 +4126,7 @@ mod tests {
                 ws.path().to_path_buf(),
                 Some(kept.clone()),
                 crate::config::AttachmentLimits::default(),
+                ChatVideos::refused("this model does not take video", false),
                 200_000,
                 true,
                 false,
@@ -3958,6 +4163,200 @@ mod tests {
             assert_eq!(base64(input.as_bytes()), expected, "{input}");
         }
         assert_eq!(base64(&[0xff, 0xfe, 0xfd]), "//79");
+    }
+
+    /// The first bytes of a WebM file.
+    const WEBM: &[u8] = b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01\x42\x82\x84webm\x42\x87";
+
+    fn video_ref(path: &str) -> serde_json::Value {
+        serde_json::json!({"type": "video", "source": {"type": "workspace", "path": path}})
+    }
+
+    fn sent_videos(most: u64, watch: bool) -> ChatVideos {
+        ChatVideos {
+            refused: None,
+            most,
+            watch,
+        }
+    }
+
+    #[test]
+    fn a_video_sent_in_the_turn_goes_to_a_model_that_takes_video() {
+        let ws = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir_all(ws.path().join("inbox")).expect("inbox");
+        std::fs::write(ws.path().join("inbox/1-clip.webm"), WEBM).expect("webm");
+        let mut request = chat(vec![vec![
+            serde_json::json!({"type": "text", "text": "what happens?"}),
+            video_ref("inbox/1-clip.webm"),
+        ]]);
+        assert!(names_chat_videos(&request) && !shows_videos(&request));
+        resolve_chat_videos(&mut request, ws.path(), &sent_videos(1_000, true));
+        let video = &request.messages[0].content[1];
+        assert_eq!(video["type"], "video");
+        assert_eq!(video["source"]["type"], "base64");
+        assert_eq!(video["source"]["media_type"], "video/webm");
+        assert_eq!(video["source"]["data"], base64(WEBM));
+        assert!(shows_videos(&request));
+        // Counted by its size, as part 1 books a video.
+        assert!(input_token_estimate(&request) >= i64::try_from(MIN_VIDEO_TOKENS).expect("n"));
+    }
+
+    #[test]
+    fn a_video_a_model_does_not_take_is_a_line_naming_watch_video() {
+        let ws = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir_all(ws.path().join("inbox")).expect("inbox");
+        std::fs::write(ws.path().join("inbox/1-clip.webm"), WEBM).expect("webm");
+        let line = |watch: bool| {
+            let mut request = chat(vec![vec![video_ref("inbox/1-clip.webm")]]);
+            resolve_chat_videos(
+                &mut request,
+                ws.path(),
+                &ChatVideos::refused("this model does not take video", watch),
+            );
+            assert!(!shows_videos(&request));
+            request.messages[0].content[0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let told = line(true);
+        assert!(
+            told.starts_with("(The video \"inbox/1-clip.webm\" is not shown: this model does not take video.")
+                && told.contains("watch_video"),
+            "{told}"
+        );
+        // Without the tool, it is not named.
+        assert!(!line(false).contains("watch_video"));
+    }
+
+    #[test]
+    fn a_video_past_the_limit_or_of_another_kind_is_a_line() {
+        let ws = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir_all(ws.path().join("inbox")).expect("inbox");
+        std::fs::write(ws.path().join("inbox/1-big.webm"), [WEBM, &[0_u8; 64]].concat())
+            .expect("webm");
+        std::fs::write(ws.path().join("inbox/2-clip.webm"), WEBM).expect("webm");
+        std::fs::write(ws.path().join("inbox/3-clip.mkv"), b"\x1a\x45\xdf\xa3matroska")
+            .expect("mkv");
+        let text = |request: &AnthropicRequest, n: usize| {
+            request.messages[0].content[n]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        // Larger than a request carries.
+        let mut request = chat(vec![vec![video_ref("inbox/1-big.webm")]]);
+        resolve_chat_videos(&mut request, ws.path(), &sent_videos(40, false));
+        assert!(text(&request, 0).contains("over"), "{}", text(&request, 0));
+        // Two that do not fit together: the first goes, the other is said.
+        let mut request = chat(vec![vec![
+            video_ref("inbox/2-clip.webm"),
+            video_ref("inbox/1-big.webm"),
+        ]]);
+        let most = (WEBM.len() + 64) as u64;
+        resolve_chat_videos(&mut request, ws.path(), &sent_videos(most, false));
+        assert_eq!(request.messages[0].content[0]["type"], "video");
+        assert!(text(&request, 1).contains("too large together"), "{}", text(&request, 1));
+        // Not a video a model is sent, missing, outside the inbox.
+        let mut request = chat(vec![vec![
+            video_ref("inbox/3-clip.mkv"),
+            video_ref("inbox/4-gone.webm"),
+            video_ref("notes/clip.webm"),
+        ]]);
+        resolve_chat_videos(&mut request, ws.path(), &sent_videos(1_000, false));
+        assert!(text(&request, 0).contains("not an MP4, MOV, WebM or MPEG video"));
+        assert!(text(&request, 1).contains(GONE));
+        assert!(text(&request, 2).contains("not a file of the inbox"));
+        assert!(!shows_videos(&request));
+    }
+
+    #[test]
+    fn a_video_of_an_earlier_turn_is_a_line_and_its_turn_carries_it() {
+        let ws = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir_all(ws.path().join("inbox")).expect("inbox");
+        std::fs::write(ws.path().join("inbox/1-old.webm"), WEBM).expect("webm");
+        std::fs::write(ws.path().join("inbox/2-new.webm"), WEBM).expect("webm");
+        // The turn's own rounds: its video, a tool call and its result.
+        let mut request = chat(vec![
+            vec![video_ref("inbox/1-old.webm")],
+            vec![
+                serde_json::json!({"type": "text", "text": "and this one?"}),
+                video_ref("inbox/2-new.webm"),
+            ],
+        ]);
+        request.messages.push(turn(
+            "assistant",
+            serde_json::json!([{"type": "tool_use", "id": "t1", "name": "file_read", "input": {}}]),
+        ));
+        request.messages.push(turn(
+            "user",
+            serde_json::json!([{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]),
+        ));
+        resolve_chat_videos(&mut request, ws.path(), &sent_videos(1_000, true));
+        let earlier = request.messages[0].content[0]["text"]
+            .as_str()
+            .expect("line");
+        assert!(
+            earlier.contains("\"inbox/1-old.webm\"")
+                && earlier.contains("later turns do not carry it")
+                && earlier.contains("watch_video"),
+            "{earlier}"
+        );
+        assert_eq!(request.messages[1].content[1]["type"], "video");
+    }
+
+    #[test]
+    fn videos_go_within_gemini_s_inline_limit_and_the_most_held() {
+        let limits = crate::config::AttachmentLimits {
+            video_bytes: 50_000_000,
+            ..Default::default()
+        };
+        assert_eq!(ChatVideos::sent(&limits, false, false).most, 30 * 1024 * 1024);
+        assert_eq!(ChatVideos::sent(&limits, true, false).most, 15_000_000);
+        let default = crate::config::AttachmentLimits::default();
+        assert_eq!(ChatVideos::sent(&default, false, true).most, 20_000_000);
+        assert!(ChatVideos::sent(&default, false, true).watch);
+    }
+
+    #[tokio::test]
+    async fn a_request_refused_with_a_video_goes_again_with_a_line() {
+        let ws = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir_all(ws.path().join("inbox")).expect("inbox");
+        std::fs::write(ws.path().join("inbox/1-clip.webm"), WEBM).expect("webm");
+        let request = chat(vec![vec![video_ref("inbox/1-clip.webm")]]);
+        let sent = std::sync::Mutex::new(Vec::new());
+        let seen = send_seeing(
+            request,
+            ws.path().to_path_buf(),
+            None,
+            crate::config::AttachmentLimits::default(),
+            sent_videos(1_000, true),
+            200_000,
+            true,
+            false,
+            |request| {
+                let refuse = shows_videos(&request);
+                sent.lock().expect("lock").push(request);
+                std::future::ready(if refuse {
+                    Err(ProxyError::Upstream {
+                        status: 400,
+                        message: "video input is not supported".into(),
+                    })
+                } else {
+                    Ok(answer())
+                })
+            },
+        )
+        .await
+        .expect("join");
+        assert!(seen.result.is_ok() && !seen.model_takes_none);
+        let sent = sent.into_inner().expect("lock");
+        assert_eq!(sent.len(), 2);
+        assert!(shows_videos(&sent[0]) && !shows_videos(&sent[1]));
+        let line = sent[1].messages[0].content[0]["text"]
+            .as_str()
+            .expect("line");
+        assert!(line.contains("refused the request that carried it"), "{line}");
     }
 
     fn answer() -> AnthropicResponse {
@@ -4060,6 +4459,7 @@ mod tests {
             ws.path().to_path_buf(),
             None,
             crate::config::AttachmentLimits::default(),
+            ChatVideos::refused("this model does not take video", false),
             200_000,
             true,
             true,
@@ -4105,6 +4505,7 @@ mod tests {
             ws.path().to_path_buf(),
             None,
             crate::config::AttachmentLimits::default(),
+            ChatVideos::refused("this model does not take video", false),
             200_000,
             true,
             true,
@@ -4133,6 +4534,7 @@ mod tests {
                 ws.path().to_path_buf(),
                 None,
                 crate::config::AttachmentLimits::default(),
+                ChatVideos::refused("this model does not take video", false),
                 200_000,
                 show,
                 retry,
@@ -4155,6 +4557,7 @@ mod tests {
             ws.path().to_path_buf(),
             None,
             crate::config::AttachmentLimits::default(),
+            ChatVideos::refused("this model does not take video", false),
             200_000,
             true,
             true,
@@ -4181,6 +4584,7 @@ mod tests {
             ws.path().to_path_buf(),
             None,
             crate::config::AttachmentLimits::default(),
+            ChatVideos::refused("this model does not take video", false),
             200_000,
             true,
             true,
@@ -4206,6 +4610,7 @@ mod tests {
             ws.path().to_path_buf(),
             None,
             crate::config::AttachmentLimits::default(),
+            ChatVideos::refused("this model does not take video", false),
             200_000,
             true,
             true,

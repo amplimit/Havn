@@ -41,7 +41,7 @@ fn default_max_mb() -> u64 {
 
 /// The most `max_mb` takes: while a video is sent, its base64 is held about
 /// three times over (the request, the provider's body, the bytes sent).
-const MOST_MB: u64 = 30;
+pub const MOST_MB: u64 = 30;
 
 impl Video {
     fn model(&self) -> &str {
@@ -93,7 +93,7 @@ const OTHER_VIDEO: &[&str] = &["mkv", "avi", "wmv", "flv", "3gp", "3g2", "ogv", 
 /// video only when its bytes are one.
 const TRANSPORT_STREAM: &[&str] = &["ts", "mts", "m2ts"];
 /// The most a request to Gemini's own API carries inline, base64 included.
-const GEMINI_INLINE_BYTES: usize = 20_000_000;
+pub const GEMINI_INLINE_BYTES: usize = 20_000_000;
 
 /// The `watch_video` tool, as `how` watches.
 #[must_use]
@@ -489,12 +489,6 @@ pub async fn run_tool(
     })
 }
 
-/// Whether a model of a provider with API `api` is sent a video: OpenRouter
-/// takes `video_url`, Gemini inline data; the others none.
-fn takes_video(api: &str) -> bool {
-    matches!(api, "openrouter" | "gemini")
-}
-
 /// The entry of `model`, and its provider's API, when it is sent a video
 /// and the agent's policy allows it; why not.
 fn model_for(
@@ -507,7 +501,7 @@ fn model_for(
         .endpoints
         .api_of(entry.provider())
         .unwrap_or_default();
-    if !takes_video(api) {
+    if !crate::model_catalog::sends_video(api) {
         return Err(format!(
             "{} cannot be sent a video: [video] needs an OpenRouter or Gemini model that takes \
              video",
@@ -781,8 +775,8 @@ mod tests {
             ..asked
         };
         assert!(!ask(&whole).contains("Look only"));
-        assert!(takes_video("openrouter") && takes_video("gemini"));
-        assert!(!takes_video("anthropic") && !takes_video("openai"));
+        assert!(crate::model_catalog::sends_video("openrouter") && crate::model_catalog::sends_video("gemini"));
+        assert!(!crate::model_catalog::sends_video("anthropic") && !crate::model_catalog::sends_video("openai"));
     }
 
     #[test]

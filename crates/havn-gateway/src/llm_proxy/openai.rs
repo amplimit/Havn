@@ -33,6 +33,8 @@ use super::{AnthropicMessage, AnthropicRequest, AnthropicResponse, AnthropicUsag
 
 const OPENAI_URL: &str = "https://api.openai.com/v1";
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1";
+/// The OpenRouter provider a video to a Gemini model goes to first.
+const GEMINI_CACHING_ROUTE: &str = "google-ai-studio";
 
 /// OpenAI-compatible Chat Completions provider. The same translator backs
 /// OpenAI itself and OpenRouter — the only differences are the base URL and a
@@ -306,6 +308,18 @@ fn anthropic_to_openai(
     }
     if let Some(tools) = req.tools.as_ref() {
         body["tools"] = translate_tools_to_openai(tools)?;
+    }
+    // A video goes to a Gemini model through Google AI Studio first (issue
+    // #355): its implicit cache takes the repeats of a turn's requests, at
+    // about a tenth of the price, where Vertex, which OpenRouter also sends
+    // Gemini requests to, took none when measured. Cache marks are not
+    // set: OpenRouter's explicit Gemini cache counted the video twice and
+    // cost three times as much a repeat.
+    if provider == OpenAiProvider::OPENROUTER_NAME
+        && req.model.starts_with("google/")
+        && super::shows_videos(req)
+    {
+        body["provider"] = json!({"order": [GEMINI_CACHING_ROUTE], "allow_fallbacks": true});
     }
     Ok(body)
 }
@@ -960,6 +974,43 @@ mod tests {
             parts[1],
             json!({"type": "video_url", "video_url": {"url": "data:video/webm;base64,AAAA"}})
         );
+    }
+
+    #[test]
+    fn a_video_to_gemini_goes_through_ai_studio_first_and_is_not_marked() {
+        let video = |model: &str| {
+            let mut r = req(
+                vec![AnthropicMessage {
+                    role: "user".into(),
+                    content: json!([
+                        {"type": "text", "text": "what happens?"},
+                        {"type": "video", "source": {"type": "base64", "media_type": "video/webm", "data": "AAAA"}},
+                    ]),
+                }],
+                Some("You are an agent."),
+            );
+            r.model = model.into();
+            r.system_stable = 5;
+            r
+        };
+        let body = anthropic_to_openai(&video("google/gemini-3.8-flash"), "max_tokens", "openrouter")
+            .expect("translate");
+        assert_eq!(
+            body["provider"],
+            json!({"order": ["google-ai-studio"], "allow_fallbacks": true})
+        );
+        assert!(!body.to_string().contains("cache_control"), "{body}");
+        // Not for another model, another provider, or a request without one.
+        let qwen = anthropic_to_openai(&video("qwen/qwen3.8-flash"), "max_tokens", "openrouter")
+            .expect("translate");
+        assert!(qwen.get("provider").is_none());
+        let direct = anthropic_to_openai(&video("google/gemini-3.8-flash"), "max_tokens", "openai")
+            .expect("translate");
+        assert!(direct.get("provider").is_none());
+        let mut plain = video("google/gemini-3.8-flash");
+        plain.messages[0].content = json!("hello");
+        let plain = anthropic_to_openai(&plain, "max_tokens", "openrouter").expect("translate");
+        assert!(plain.get("provider").is_none());
     }
 
     #[test]

@@ -195,6 +195,32 @@ pub struct AgentSocketCtx {
 /// Model entries, by id and hash, whose provider refused images.
 pub type VisionRefused = Arc<std::sync::Mutex<std::collections::HashSet<(String, u64)>>>;
 
+/// How the videos `request` names go to `entry`'s model (issue #355):
+/// whether it takes them is looked up only when there are some.
+async fn chat_videos(
+    ctx: &AgentSocketCtx,
+    entry: &crate::model_catalog::ModelEntry,
+    request: &llm_proxy::AnthropicRequest,
+    limits: &crate::config::AttachmentLimits,
+) -> llm_proxy::ChatVideos {
+    let watch = request.tools.as_ref().is_some_and(|tools| {
+        tools.as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|t| t.get("name").and_then(serde_json::Value::as_str) == Some(crate::video::TOOL_NAME))
+        })
+    });
+    if !llm_proxy::names_chat_videos(request) {
+        return llm_proxy::ChatVideos::refused("", watch);
+    }
+    let api = ctx.llm.endpoints.api_of(entry.provider());
+    let openrouter = llm_proxy::base_url_of("openrouter", &ctx.llm).unwrap_or_default();
+    match crate::model_catalog::takes_video(entry, api, &ctx.http, &openrouter).await {
+        Ok(()) => llm_proxy::ChatVideos::sent(limits, api == Some("gemini"), watch),
+        Err(why) => llm_proxy::ChatVideos::refused(why, watch),
+    }
+}
+
 /// The key of `entry` in [`VisionRefused`]: an edited entry is tried again.
 fn vision_key(entry: &crate::model_catalog::ModelEntry) -> (String, u64) {
     use std::hash::{Hash as _, Hasher as _};
@@ -3143,11 +3169,15 @@ async fn handle_llm_request(
             );
             // Images its tools showed, kept as they were shown (issue #354).
             let kept = llm_proxy::KeptImages::of(&ctx.workspace_root, agent_id);
+            // Videos sent in the chat, to a model that takes them (issue
+            // #355).
+            let videos = chat_videos(&ctx, &entry, &ar, &limits).await;
             let seeing = llm_proxy::send_seeing(
                 ar,
                 workspace,
                 Some(kept),
                 limits,
+                videos,
                 context,
                 show,
                 try_blind,
@@ -4678,6 +4708,7 @@ mod tests {
                     label: None,
                     max_output_tokens: None,
                     vision: None,
+                    video: None,
                     thinking: None,
                     context_window: None,
                     fallback: Vec::new(),
@@ -5001,6 +5032,7 @@ mod tests {
             label: None,
             max_output_tokens: None,
             vision: None,
+            video: None,
             thinking: None,
             context_window: None,
             fallback: Vec::new(),
@@ -5366,6 +5398,7 @@ mod tests {
                         label: None,
                         max_output_tokens: None,
                         vision: None,
+                        video: None,
                         thinking: None,
                         context_window: None,
                         fallback: Vec::new(),
@@ -6267,6 +6300,7 @@ mod tests {
                     label: None,
                     max_output_tokens: None,
                     vision: None,
+                    video: None,
                     thinking: None,
                     context_window: None,
                     fallback: Vec::new(),
