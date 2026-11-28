@@ -418,6 +418,16 @@ enum ModelAction {
         /// it, only a note saying so.
         #[arg(long)]
         no_vision: bool,
+        /// It takes video (an OpenRouter or Gemini model): videos sent in a
+        /// chat go to it with the message. Without this or --no-video, as
+        /// OpenRouter lists the model (a Gemini of Gemini's own API takes
+        /// them).
+        #[arg(long, conflicts_with = "no_video")]
+        video: bool,
+        /// It takes no video: videos sent in a chat stay files, and the
+        /// model gets a line saying so.
+        #[arg(long)]
+        no_video: bool,
         /// Tokens it takes in one request, input and output. Without it,
         /// what its family is known to take (32000 for an unknown one, such
         /// as a local model).
@@ -750,10 +760,12 @@ async fn run_model(action: ModelAction) -> anyhow::Result<()> {
             max_output_tokens,
             vision,
             no_vision,
+            video,
+            no_video,
             context_window,
             default,
         } => {
-            let sight = match (vision, no_vision) {
+            let either = |on: bool, off: bool| match (on, off) {
                 (true, _) => Some(true),
                 (_, true) => Some(false),
                 _ => None,
@@ -762,7 +774,8 @@ async fn run_model(action: ModelAction) -> anyhow::Result<()> {
                 &id,
                 label.as_deref(),
                 max_output_tokens,
-                sight,
+                either(vision, no_vision),
+                either(video, no_video),
                 context_window,
                 default,
             )

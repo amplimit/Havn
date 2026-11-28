@@ -47,6 +47,9 @@ export default function ModelsPage() {
   const [maxOutput, setMaxOutput] = useState("");
   const [makeDefault, setMakeDefault] = useState(false);
   const [vision, setVision] = useState<"" | "yes" | "no">("");
+  const [video, setVideo] = useState<"" | "yes" | "no">("");
+  // Only OpenRouter and Gemini models are sent videos (issue #355).
+  const sendsVideo = provider === "openrouter" || provider === "gemini";
 
   useEffect(() => {
     api.models
@@ -93,6 +96,7 @@ export default function ModelsPage() {
     const entry: ModelEntry = { id };
     if (label.trim()) entry.label = label.trim();
     if (vision) entry.vision = vision === "yes";
+    if (video && sendsVideo) entry.video = video === "yes";
     if (maxOutput.trim()) {
       const n = Number(maxOutput);
       if (!Number.isInteger(n) || n <= 0) {
@@ -111,6 +115,7 @@ export default function ModelsPage() {
       setMaxOutput("");
       setMakeDefault(false);
       setVision("");
+      setVideo("");
     }
   }
 
@@ -298,6 +303,21 @@ export default function ModelsPage() {
                 <option value="no">never shown</option>
               </select>
             </div>
+            {sendsVideo && (
+              <div title="Whether videos sent in a chat go to this model with the message, in the turn they are sent in. Unset, as OpenRouter lists the model (a Gemini of Gemini's own API takes them).">
+                <label className="label" htmlFor="model-video">videos</label>
+                <select
+                  id="model-video"
+                  className="input"
+                  value={video}
+                  onChange={(e) => setVideo(e.target.value as "" | "yes" | "no")}
+                >
+                  <option value="">as listed</option>
+                  <option value="yes">sent</option>
+                  <option value="no">never sent</option>
+                </select>
+              </div>
+            )}
             <div className="flex flex-wrap items-center justify-between gap-3 md:col-span-4">
               <label className="flex items-center gap-2 text-sm" style={{ color: "var(--color-label)" }}>
                 <input
@@ -343,6 +363,8 @@ export default function ModelsPage() {
                 )}
                 {m.vision === true && <span className="pill pill-stopped">sees images</span>}
                 {m.vision === false && <span className="pill pill-stopped">no images</span>}
+                {m.video === true && <span className="pill pill-stopped">watches video</span>}
+                {m.video === false && <span className="pill pill-stopped">no video</span>}
                 {m.thinking && (
                   <span className="pill pill-stopped">
                     thinks: {thinkingChoices(m.thinking).join(" / ")}

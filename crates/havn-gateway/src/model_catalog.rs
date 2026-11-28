@@ -24,6 +24,13 @@ pub struct ModelEntry {
     /// a model that refuses them is then sent a note in their place.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
+    /// Whether it takes video (issue #355): videos sent in a chat go to it
+    /// with the message with `true`, never with `false`, and unset, as
+    /// OpenRouter lists its input for an OpenRouter model, or for a Gemini
+    /// model of Gemini's own API. Only OpenRouter and Gemini models are
+    /// sent videos.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<bool>,
     /// How it thinks, when it can (issue #190): absent, it is not asked to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingSpec>,
@@ -327,6 +334,7 @@ mod context_tests {
             label: None,
             max_output_tokens: None,
             vision: None,
+            video: None,
             thinking: None,
             context_window: window,
             fallback: Vec::new(),
@@ -394,6 +402,157 @@ impl ModelEntry {
     #[must_use]
     pub fn model(&self) -> &str {
         split_model_ref(&self.id).map_or("", |(_, model)| model)
+    }
+}
+
+/// Whether a model of a provider speaking `api` is sent a video (issue
+/// #355): OpenRouter takes `video_url`, Gemini inline data; the others
+/// none.
+#[must_use]
+pub fn sends_video(api: &str) -> bool {
+    matches!(api, "openrouter" | "gemini")
+}
+
+/// Whether each model OpenRouter lists, by its id, takes video: its
+/// `architecture.input_modalities` names it (issue #355).
+#[must_use]
+pub fn video_inputs(list: &serde_json::Value) -> std::collections::HashMap<String, bool> {
+    list.get("data")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model.get("id")?.as_str()?;
+            let inputs = model
+                .pointer("/architecture/input_modalities")?
+                .as_array()?;
+            let video = inputs.iter().any(|i| i.as_str() == Some("video"));
+            Some((id.to_string(), video))
+        })
+        .collect()
+}
+
+/// OpenRouter's list of what its models take, as read last from a base
+/// URL: when, and what it gave.
+struct Listed {
+    at: std::time::Instant,
+    inputs: Result<std::sync::Arc<std::collections::HashMap<String, bool>>, String>,
+}
+
+/// The lists read, by the base URL they were read at.
+static LISTED: std::sync::Mutex<Option<std::collections::HashMap<String, Listed>>> =
+    std::sync::Mutex::new(None);
+
+/// One read of a list at a time: requests that wait for one take what it
+/// read.
+static READING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// How long OpenRouter's list is kept, and a failure to read it before it
+/// is read again.
+const LISTED_KEPT: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+const LISTED_FAILURE_KEPT: std::time::Duration = std::time::Duration::from_secs(300);
+/// How long reading it may take: a request waits for it.
+const LISTED_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The list read from `base`, while it is kept.
+fn listed(
+    base: &str,
+) -> Option<Result<std::sync::Arc<std::collections::HashMap<String, bool>>, ()>> {
+    let lists = LISTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let listed = lists.as_ref()?.get(base)?;
+    let kept = if listed.inputs.is_ok() {
+        LISTED_KEPT
+    } else {
+        LISTED_FAILURE_KEPT
+    };
+    (listed.at.elapsed() < kept).then(|| listed.inputs.clone().map_err(|_| ()))
+}
+
+/// What OpenRouter, at base URL `base`, lists of its models' input, read
+/// once a day; `Err` when it could not be read, which is logged.
+async fn openrouter_inputs(
+    http: &reqwest::Client,
+    base: &str,
+) -> Result<std::sync::Arc<std::collections::HashMap<String, bool>>, ()> {
+    if let Some(kept) = listed(base) {
+        return kept;
+    }
+    let _reading = READING.lock().await;
+    if let Some(kept) = listed(base) {
+        return kept;
+    }
+    let read = async {
+        let response = http
+            .get(format!("{base}/models"))
+            .timeout(LISTED_WAIT)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("it answered {}", response.status()));
+        }
+        let list: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+        let inputs = video_inputs(&list);
+        if inputs.is_empty() {
+            return Err("it listed no models".to_string());
+        }
+        Ok(std::sync::Arc::new(inputs))
+    }
+    .await;
+    if let Err(e) = &read {
+        tracing::warn!(error = %e, "could not read which models OpenRouter lists as taking video");
+    }
+    LISTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(
+            base.to_string(),
+            Listed {
+                at: std::time::Instant::now(),
+                inputs: read.clone(),
+            },
+        );
+    read.map_err(|_| ())
+}
+
+/// Whether `entry`, of a provider speaking `api`, is sent the videos of a
+/// chat (issue #355): as its `video` says, else, for an OpenRouter model,
+/// as OpenRouter (at base URL `openrouter`) lists it, a routing variant
+/// (`:nitro`, `:floor`, ...) as its model when it is not listed itself,
+/// and for a Gemini model of Gemini's own API, when it is a Gemini; never
+/// for another API. Why not, for the model.
+pub async fn takes_video(
+    entry: &ModelEntry,
+    api: Option<&str>,
+    http: &reqwest::Client,
+    openrouter: &str,
+) -> Result<(), String> {
+    let api = api.unwrap_or_default();
+    if !sends_video(api) {
+        return Err("this model's provider is not sent videos".into());
+    }
+    let takes = match (entry.video, api) {
+        (Some(takes), _) => takes,
+        (None, "gemini") => entry.model().starts_with("gemini-"),
+        (None, _) => {
+            let inputs = openrouter_inputs(http, openrouter)
+                .await
+                .map_err(|()| "it is not known whether this model takes video".to_string())?;
+            let model = entry.model();
+            inputs
+                .get(model)
+                .or_else(|| model.split_once(':').and_then(|(base, _)| inputs.get(base)))
+                .copied()
+                .unwrap_or(false)
+        }
+    };
+    if takes {
+        Ok(())
+    } else {
+        Err("this model does not take video".into())
     }
 }
 
@@ -467,6 +626,13 @@ impl ModelCatalog {
             }
             if let Some(price) = &entry.price {
                 price.validate(&entry.id)?;
+            }
+            if entry.video == Some(true) && !api.is_some_and(sends_video) {
+                anyhow::bail!(
+                    "[[llm.models]] {:?}: video = true is for OpenRouter and Gemini models, the \
+                     only ones sent videos",
+                    entry.id
+                );
             }
             if let Some(thinking) = &entry.thinking {
                 thinking.validate(&entry.id, api)?;
@@ -754,6 +920,12 @@ fn write_checked(
                     table.remove("vision");
                 }
             }
+            match entry.video {
+                Some(watches) => table["video"] = value(watches),
+                None => {
+                    table.remove("video");
+                }
+            }
             match &entry.thinking {
                 Some(thinking) => table["thinking"] = value(thinking.to_toml()),
                 None => {
@@ -1031,6 +1203,7 @@ pub async fn upgrade(
                         label: None,
                         max_output_tokens: None,
                         vision: None,
+                        video: None,
                         thinking: None,
                         context_window: None,
                         fallback: Vec::new(),
@@ -1132,6 +1305,167 @@ mod tests {
         assert_eq!(toggle.resolve(Some("on")), Reasoning::On);
     }
 
+    fn video_entry(id: &str, video: Option<bool>) -> ModelEntry {
+        ModelEntry {
+            id: id.into(),
+            label: None,
+            max_output_tokens: None,
+            vision: None,
+            video,
+            thinking: None,
+            context_window: None,
+            fallback: Vec::new(),
+            price: None,
+        }
+    }
+
+    #[test]
+    fn each_video_setting_is_written_read_back_and_checked() {
+        let mut c = ModelCatalog::default();
+        c.models = vec![
+            video_entry("openrouter:google/gemini-3.8-flash", Some(true)),
+            video_entry("gemini:gemini-3.8-flash", Some(false)),
+            video_entry("openrouter:deepseek/deepseek-v4.1-flash-1017", None),
+        ];
+        c.validate(&NO_ENDPOINTS).expect("valid");
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").expect("write");
+        write_to_file(&path, &c).expect("written");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            text.contains("video = true") && text.contains("video = false"),
+            "{text}"
+        );
+        assert_eq!(read_from_file(&path).expect("read back"), c);
+        c.models[0].video = None;
+        write_to_file(&path, &c).expect("written");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(text.matches("video =").count(), 1, "{text}");
+        // Only OpenRouter and Gemini models are sent videos.
+        let mut anthropic = ModelCatalog::default();
+        anthropic.models = vec![video_entry("anthropic:claude-x", Some(true))];
+        let refused = anthropic.validate(&NO_ENDPOINTS).expect_err("refused");
+        assert!(refused.to_string().contains("video = true"), "{refused}");
+        anthropic.models[0].video = Some(false);
+        anthropic.validate(&NO_ENDPOINTS).expect("false is fine");
+    }
+
+    #[test]
+    fn openrouter_s_input_modalities_say_which_models_take_video() {
+        let list = serde_json::json!({"data": [
+            {"id": "google/gemini-3.8-flash", "architecture": {
+                "modality": "text+image+file+audio+video->text",
+                "input_modalities": ["text", "image", "video", "file", "audio"]}},
+            {"id": "deepseek/deepseek-v4.1-flash-1017", "architecture": {
+                "input_modalities": ["text"]}},
+            {"id": "odd/no-architecture"},
+        ]});
+        let inputs = video_inputs(&list);
+        assert_eq!(inputs.get("google/gemini-3.8-flash"), Some(&true));
+        assert_eq!(
+            inputs.get("deepseek/deepseek-v4.1-flash-1017"),
+            Some(&false)
+        );
+        assert_eq!(inputs.get("odd/no-architecture"), None);
+        assert!(video_inputs(&serde_json::json!({"error": "x"})).is_empty());
+    }
+
+    #[tokio::test]
+    async fn whether_a_model_takes_video_is_set_listed_or_known() {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get({
+                let reads = std::sync::Arc::clone(&reads);
+                move || async move {
+                    reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(serde_json::json!({"data": [
+                        {"id": "google/gemini-3.8-flash",
+                         "architecture": {"input_modalities": ["text", "video"]}},
+                        {"id": "deepseek/deepseek-v4.1-flash-1017",
+                         "architecture": {"input_modalities": ["text"]}},
+                    ]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let http = reqwest::Client::new();
+        let takes = |id: &str, video: Option<bool>, api: Option<&'static str>| {
+            let (http, base, entry) = (http.clone(), base.clone(), video_entry(id, video));
+            async move { takes_video(&entry, api, &http, &base).await }
+        };
+        let openrouter = Some("openrouter");
+        assert_eq!(
+            takes("openrouter:google/gemini-3.8-flash", None, openrouter).await,
+            Ok(())
+        );
+        let deepseek = takes(
+            "openrouter:deepseek/deepseek-v4.1-flash-1017",
+            None,
+            openrouter,
+        )
+        .await;
+        assert_eq!(deepseek, Err("this model does not take video".into()));
+        // A routing variant is its model.
+        assert_eq!(
+            takes("openrouter:google/gemini-3.8-flash:nitro", None, openrouter).await,
+            Ok(())
+        );
+        // Not listed: not sent.
+        assert!(takes("openrouter:a/new", None, openrouter).await.is_err());
+        // Read once.
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Set, as set.
+        assert_eq!(
+            takes(
+                "openrouter:deepseek/deepseek-v4.1-flash-1017",
+                Some(true),
+                openrouter
+            )
+            .await,
+            Ok(())
+        );
+        assert!(
+            takes(
+                "openrouter:google/gemini-3.8-flash",
+                Some(false),
+                openrouter
+            )
+            .await
+            .is_err()
+        );
+        // Gemini's own API: a Gemini takes it; another provider never.
+        assert_eq!(
+            takes("gemini:gemini-3.8-flash", None, Some("gemini")).await,
+            Ok(())
+        );
+        assert!(
+            takes("gemini:gemma-4-27b-it", None, Some("gemini"))
+                .await
+                .is_err()
+        );
+        let anthropic = takes("anthropic:claude-x", Some(true), Some("anthropic")).await;
+        assert_eq!(
+            anthropic,
+            Err("this model's provider is not sent videos".into())
+        );
+        // A list that cannot be read is said, and tried again later.
+        let gone = takes_video(
+            &video_entry("openrouter:google/gemini-3.8-flash", None),
+            openrouter,
+            &http,
+            "http://127.0.0.1:9/takes-video-test",
+        )
+        .await
+        .expect_err("not known");
+        assert_eq!(gone, "it is not known whether this model takes video");
+    }
+
     #[test]
     fn each_vision_setting_is_written_and_read_back() {
         let entry = |id: &str, vision: Option<bool>| ModelEntry {
@@ -1139,6 +1473,7 @@ mod tests {
             label: None,
             max_output_tokens: None,
             vision,
+            video: None,
             thinking: None,
             context_window: None,
             fallback: Vec::new(),
@@ -1199,6 +1534,7 @@ mod tests {
             label: None,
             max_output_tokens: None,
             vision: None,
+            video: None,
             thinking: Some(ThinkingSpec {
                 style: ThinkingStyle::Effort,
                 levels: vec!["low".into(), "medium".into(), "high".into()],
@@ -1243,6 +1579,7 @@ mod tests {
             label: None,
             max_output_tokens: None,
             vision: None,
+            video: None,
             thinking: None,
             context_window: None,
             fallback: Vec::new(),

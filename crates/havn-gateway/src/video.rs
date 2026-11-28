@@ -332,6 +332,206 @@ fn sniffed(head: &[u8]) -> Option<Sniffed> {
     }
 }
 
+/// The longest a video is taken to be: a duration past it is misread.
+const MOST_SECONDS: f64 = 24.0 * 3600.0;
+
+/// How long a video of `media_type` with `bytes` runs, in seconds, as its
+/// container says: an MP4 or MOV movie header (`mvhd`), wherever its
+/// `moov` is, or a WebM segment's `Info` before its first cluster. `None`
+/// for MPEG, and for a container that does not say (a WebM recorded live
+/// may not).
+#[must_use]
+pub fn running_time(media_type: &str, bytes: &[u8]) -> Option<f64> {
+    let seconds = match media_type {
+        "video/mp4" | "video/mov" => movie_seconds(bytes),
+        "video/webm" => webm_seconds(bytes),
+        _ => None,
+    }?;
+    (seconds.is_finite() && seconds > 0.0 && seconds <= MOST_SECONDS).then_some(seconds)
+}
+
+/// The big-endian number of the `len` bytes of `bytes` at `at`.
+fn number(bytes: &[u8], at: usize, len: usize) -> Option<u64> {
+    let part = bytes.get(at..at.checked_add(len)?)?;
+    Some(part.iter().fold(0, |n, b| n << 8 | u64::from(*b)))
+}
+
+/// The boxes of an ISO media file between `start` and `end`: each one's
+/// type, and where its content starts and ends.
+fn boxes(bytes: &[u8], start: usize, end: usize) -> Vec<(&[u8], usize, usize)> {
+    let mut out = Vec::new();
+    let mut at = start;
+    while at + 8 <= end {
+        let (Some(size), Some(kind)) = (number(bytes, at, 4), bytes.get(at + 4..at + 8)) else {
+            break;
+        };
+        let (size, header): (u64, usize) = match size {
+            0 => ((end - at) as u64, 8),
+            1 => match number(bytes, at + 8, 8) {
+                Some(large) => (large, 16),
+                None => break,
+            },
+            size => (size, 8),
+        };
+        let Some(next) = usize::try_from(size).ok().and_then(|s| at.checked_add(s)) else {
+            break;
+        };
+        if size < header as u64 || next > end {
+            break;
+        }
+        out.push((kind, at + header, next));
+        at = next;
+    }
+    out
+}
+
+/// An MP4 or MOV movie's duration: the longest of what its movie header
+/// (`mvhd`) and its tracks' headers (`tkhd`, in the movie's time scale, and
+/// `mdhd`, in their own) say, so that one header cannot make it shorter.
+fn movie_seconds(bytes: &[u8]) -> Option<f64> {
+    let child = |start: usize, end: usize, kind: [u8; 4]| -> Vec<(usize, usize)> {
+        boxes(bytes, start, end)
+            .into_iter()
+            .filter(|(k, _, _)| **k == kind)
+            .map(|(_, start, end)| (start, end))
+            .collect()
+    };
+    let (start, end) = child(0, bytes.len(), *b"moov").first().copied()?;
+    let (at, to) = child(start, end, *b"mvhd").first().copied()?;
+    // Each header's version and flags, then its times: 32-bit in version 0,
+    // 64 in 1; each read within its own box.
+    let mvhd = &bytes[at..to];
+    let (scale, duration) = match mvhd.first()? {
+        0 => (number(mvhd, 12, 4)?, number(mvhd, 16, 4)?),
+        1 => (number(mvhd, 20, 4)?, number(mvhd, 24, 8)?),
+        _ => return None,
+    };
+    #[allow(clippy::cast_precision_loss, reason = "durations, far below 2^52")]
+    let seconds = |duration: u64, scale: u64| (scale > 0).then(|| duration as f64 / scale as f64);
+    let mut longest = seconds(duration, scale)?;
+    for (trak, trak_end) in child(start, end, *b"trak") {
+        if let Some((at, to)) = child(trak, trak_end, *b"tkhd").first().copied() {
+            let tkhd = &bytes[at..to];
+            let track = match tkhd.first() {
+                Some(0) => number(tkhd, 20, 4),
+                Some(1) => number(tkhd, 28, 8),
+                _ => None,
+            };
+            if let Some(track) = track.and_then(|d| seconds(d, scale)) {
+                longest = longest.max(track);
+            }
+        }
+        let media = child(trak, trak_end, *b"mdia")
+            .first()
+            .and_then(|&(at, to)| child(at, to, *b"mdhd").first().copied());
+        if let Some((at, to)) = media {
+            let mdhd = &bytes[at..to];
+            let track = match mdhd.first() {
+                Some(0) => number(mdhd, 12, 4).zip(number(mdhd, 16, 4)),
+                Some(1) => number(mdhd, 20, 4).zip(number(mdhd, 24, 8)),
+                _ => None,
+            };
+            if let Some(track) = track.and_then(|(scale, d)| seconds(d, scale)) {
+                longest = longest.max(track);
+            }
+        }
+    }
+    Some(longest)
+}
+
+/// An EBML element at `at`: its id, with its marker, where its content
+/// starts, and where it ends, `None` for one of unknown size.
+fn ebml(bytes: &[u8], at: usize) -> Option<(u64, usize, Option<usize>)> {
+    let id_len = bytes.get(at)?.leading_zeros() as usize + 1;
+    if id_len > 4 {
+        return None;
+    }
+    let id = number(bytes, at, id_len)?;
+    let size_at = at + id_len;
+    let size_len = bytes.get(size_at)?.leading_zeros() as usize + 1;
+    if size_len > 8 {
+        return None;
+    }
+    let all = (1_u64 << (7 * size_len)) - 1;
+    let size = number(bytes, size_at, size_len)? & all;
+    let start = size_at + size_len;
+    let end = if size == all {
+        None
+    } else {
+        Some(start.checked_add(usize::try_from(size).ok()?)?)
+    };
+    Some((id, start, end))
+}
+
+/// A WebM video's duration, from its segment's `Info`: `Duration` in
+/// units of `TimecodeScale` nanoseconds (a millisecond unless it says).
+fn webm_seconds(bytes: &[u8]) -> Option<f64> {
+    const EBML: u64 = 0x1A45_DFA3;
+    const SEGMENT: u64 = 0x1853_8067;
+    const INFO: u64 = 0x1549_A966;
+    const CLUSTER: u64 = 0x1F43_B675;
+    const SCALE: u64 = 0x2A_D7B1;
+    const DURATION: u64 = 0x4489;
+    let (id, _, end) = ebml(bytes, 0)?;
+    if id != EBML {
+        return None;
+    }
+    let (id, mut at, segment_end) = ebml(bytes, end?)?;
+    if id != SEGMENT {
+        return None;
+    }
+    let segment_end = segment_end.unwrap_or(bytes.len()).min(bytes.len());
+    while at < segment_end {
+        let (id, start, end) = ebml(bytes, at)?;
+        match id {
+            INFO => {
+                let end = end?.min(bytes.len());
+                let (mut scale, mut duration) = (1_000_000_u64, None);
+                let mut inner = start;
+                while inner < end {
+                    let (id, value, value_end) = ebml(bytes, inner)?;
+                    let value_end = value_end?;
+                    let len = value_end.checked_sub(value)?;
+                    match (id, len) {
+                        (SCALE, 1..=8) => scale = number(bytes, value, len)?,
+                        (DURATION, 4) => {
+                            let raw = u32::try_from(number(bytes, value, 4)?).ok()?;
+                            duration = Some(f64::from(f32::from_bits(raw)));
+                        }
+                        (DURATION, 8) => duration = Some(f64::from_bits(number(bytes, value, 8)?)),
+                        _ => {}
+                    }
+                    inner = value_end;
+                }
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "a timecode scale, far below 2^52"
+                )]
+                return duration.map(|d| d * scale as f64 / 1e9);
+            }
+            // Its header comes before its first cluster.
+            CLUSTER => return None,
+            _ => at = end?,
+        }
+    }
+    None
+}
+
+/// A `video` block of `bytes` of `media_type` for a request, with how long
+/// it runs when its container says, which its tokens are counted by
+/// ([`crate::llm_proxy`]).
+#[must_use]
+pub fn block(media_type: &str, bytes: &[u8]) -> serde_json::Value {
+    let mut block = json!({
+        "type": "video",
+        "source": {"type": "base64", "media_type": media_type, "data": llm_proxy::base64(bytes)},
+    });
+    if let Some(seconds) = running_time(media_type, bytes) {
+        block["seconds"] = json!(seconds);
+    }
+    block
+}
+
 /// What the model is asked, with the question.
 const ASK: &str = "Answer the question below from this video: what it shows and what is said \
                    in it. Give times as MM:SS (H:MM:SS past an hour). Where the video does not \
@@ -370,14 +570,7 @@ fn request(
         reasoning: None,
         messages: vec![AnthropicMessage {
             role: "user".into(),
-            content: json!([
-                {"type": "video", "source": {
-                    "type": "base64",
-                    "media_type": media_type,
-                    "data": llm_proxy::base64(bytes),
-                }},
-                {"type": "text", "text": ask(asked)},
-            ]),
+            content: json!([block(media_type, bytes), {"type": "text", "text": ask(asked)}]),
         }],
         system: None,
         temperature: None,
@@ -492,12 +685,6 @@ pub async fn run_tool(
     })
 }
 
-/// Whether a model of a provider with API `api` is sent a video: OpenRouter
-/// takes `video_url`, Gemini inline data; the others none.
-fn takes_video(api: &str) -> bool {
-    matches!(api, "openrouter" | "gemini")
-}
-
 /// The entry of `model`, and its provider's API, when it is sent a video
 /// and the agent's policy allows it; why not.
 fn model_for(
@@ -510,7 +697,7 @@ fn model_for(
         .endpoints
         .api_of(entry.provider())
         .unwrap_or_default();
-    if !takes_video(api) {
+    if !crate::model_catalog::sends_video(api) {
         return Err(format!(
             "{} cannot be sent a video: [video] needs an OpenRouter or Gemini model that takes \
              video",
@@ -788,8 +975,14 @@ mod tests {
             ..asked
         };
         assert!(!ask(&whole).contains("Look only"));
-        assert!(takes_video("openrouter") && takes_video("gemini"));
-        assert!(!takes_video("anthropic") && !takes_video("openai"));
+        assert!(
+            crate::model_catalog::sends_video("openrouter")
+                && crate::model_catalog::sends_video("gemini")
+        );
+        assert!(
+            !crate::model_catalog::sends_video("anthropic")
+                && !crate::model_catalog::sends_video("openai")
+        );
     }
 
     #[test]
@@ -799,5 +992,127 @@ mod tests {
         let long = "x".repeat(MAX_ANSWER_CHARS + 1);
         assert!(told("a.mp4", &long).contains("Cut at"));
         assert!(!told("a.mp4", &long).contains(&long));
+    }
+
+    /// The first 300 bytes of a 2-minute WebM screencast (ffmpeg's
+    /// Lavf63): its EBML header, segment, seek head and `Info`.
+    const SCREENCAST_HEAD: &str = "1a45dfa39f4286810142f7810142f2810442f381084282847765626d42878104428581021853806701000000000f2670114d9b74bb4dbb8b53ab841549a96653ac81a14dbb8b53ab841654ae6b53ac81d64dbb8c53ab841254c36753ac8201a64dbb8d53ab841c53bb6b53ac830f2486ec0100000000000058000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001549a966b02ad7b1830f42404d808c4c61766636332e312e31303257418c4c61766636332e312e31303244898840fd4c80000000001654ae6b40caae0100000000000050d7810173c588c3c452736d7162039c810022b59c83756e";
+
+    fn hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    /// An MP4 with its `moov` after its media data, as a camera writes it,
+    /// and a movie header of `version` saying `duration` in `scale` units.
+    fn movie(version: u8, scale: u32, duration: u64) -> Vec<u8> {
+        let mut mvhd = vec![version, 0, 0, 0];
+        if version == 0 {
+            mvhd.extend([0; 8]);
+            mvhd.extend(scale.to_be_bytes());
+            mvhd.extend(u32::try_from(duration).expect("small").to_be_bytes());
+        } else {
+            mvhd.extend([0; 16]);
+            mvhd.extend(scale.to_be_bytes());
+            mvhd.extend(duration.to_be_bytes());
+        }
+        mvhd.extend([0; 80]);
+        let boxed = |kind: &[u8], body: &[u8]| {
+            let mut out = u32::try_from(body.len() + 8)
+                .expect("small")
+                .to_be_bytes()
+                .to_vec();
+            out.extend(kind);
+            out.extend(body);
+            out
+        };
+        let mut file = boxed(b"ftyp", b"isom\0\0\x02\0isomiso2mp41");
+        file.extend(boxed(b"mdat", &[7; 5000]));
+        let mut moov = boxed(b"mvhd", &mvhd);
+        moov.extend(boxed(b"trak", &[0; 16]));
+        file.extend(boxed(b"moov", &moov));
+        file
+    }
+
+    #[test]
+    fn how_long_a_video_runs_is_read_from_its_header() {
+        let webm = hex(SCREENCAST_HEAD);
+        let webm_seconds = running_time("video/webm", &webm).expect("webm");
+        assert!((webm_seconds - 120.008).abs() < 0.001, "{webm_seconds}");
+        let mp4 = movie(0, 1000, 52_209);
+        assert!((seconds_of("video/mp4", &mp4) - 52.209).abs() < 1e-9);
+        let mov = movie(1, 600, 600 * 1200);
+        assert!((seconds_of("video/mov", &mov) - 1200.0).abs() < 1e-9);
+        // Not said, or not to be believed: not known.
+        assert_eq!(running_time("video/mp4", &movie(0, 0, 10)), None);
+        assert_eq!(running_time("video/mp4", &movie(1, 1, u64::MAX / 2)), None);
+        assert_eq!(running_time("video/mp4", &mp4[..mp4.len() - 20]), None);
+        assert_eq!(running_time("video/mpeg", &[0, 0, 1, 0xBA, 0x44]), None);
+        assert_eq!(running_time("video/webm", &webm[..200]), None);
+        let mut live = webm.clone();
+        // A recording without its duration (its id made another).
+        let at = live
+            .windows(2)
+            .position(|w| w == [0x44, 0x89])
+            .expect("duration");
+        live[at + 1] = 0x8A;
+        assert_eq!(running_time("video/webm", &live), None);
+        // The block says it, for its tokens to be counted by it.
+        let block = block("video/mp4", &mp4);
+        assert_eq!(block["type"], "video");
+        assert!((block["seconds"].as_f64().expect("seconds") - 52.209).abs() < 1e-9);
+        assert!(
+            super::block("video/mpeg", b"\0\0\x01\xba")
+                .get("seconds")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_movie_is_as_long_as_its_longest_header_says() {
+        let boxed = |kind: &[u8], body: &[u8]| {
+            let mut out = u32::try_from(body.len() + 8)
+                .expect("small")
+                .to_be_bytes()
+                .to_vec();
+            out.extend(kind);
+            out.extend(body);
+            out
+        };
+        let header = |fields: &[u32]| {
+            let mut out = vec![0, 0, 0, 0];
+            for field in fields {
+                out.extend(field.to_be_bytes());
+            }
+            out.extend([0; 60]);
+            out
+        };
+        // The movie header says 1 s; its track's 52 s (tkhd, in the movie's
+        // scale) and its media 60 s (mdhd, in its own).
+        let mvhd = boxed(b"mvhd", &header(&[0, 0, 1000, 1000]));
+        let tkhd = boxed(b"tkhd", &header(&[0, 0, 1, 0, 52_000]));
+        let mdhd = boxed(b"mdhd", &header(&[0, 0, 90_000, 5_400_000]));
+        let mut trak = tkhd;
+        trak.extend(boxed(b"mdia", &mdhd));
+        let mut moov = mvhd;
+        moov.extend(boxed(b"trak", &trak));
+        let mut file = boxed(b"ftyp", b"isom\0\0\x02\0");
+        file.extend(boxed(b"moov", &moov));
+        assert!((seconds_of("video/mp4", &file) - 60.0).abs() < 1e-9);
+        // A header cut short within its box is not read past it.
+        let short = boxed(
+            b"mvhd",
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0xe8],
+        );
+        let mut cut = boxed(b"ftyp", b"isom\0\0\x02\0");
+        cut.extend(boxed(b"moov", &short));
+        cut.extend([0, 0, 0, 10, 0, 0, 0, 0]);
+        assert_eq!(running_time("video/mp4", &cut), None);
+    }
+
+    fn seconds_of(media_type: &str, bytes: &[u8]) -> f64 {
+        running_time(media_type, bytes).expect("seconds")
     }
 }

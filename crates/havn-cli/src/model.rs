@@ -16,6 +16,10 @@ pub struct ModelEntry {
     /// Shown images: always, never, or tried when unset (issue #202).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
+    /// Sent the videos of a chat: always, never, or as OpenRouter lists it
+    /// when unset (issue #355).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<bool>,
     /// How it thinks (issue #190), passed through as the gateway has it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<serde_json::Value>,
@@ -108,7 +112,12 @@ pub async fn list() -> anyhow::Result<()> {
             Some(false) => "  no images",
             None => "",
         };
-        println!("{}{label}{limit}{vision}{default}{title}", m.id);
+        let video = match m.video {
+            Some(true) => "  watches video",
+            Some(false) => "  no video",
+            None => "",
+        };
+        println!("{}{label}{limit}{vision}{video}{default}{title}", m.id);
     }
     print_endpoints(&view.endpoints);
     Ok(())
@@ -130,6 +139,7 @@ pub async fn add(
     label: Option<&str>,
     max_output_tokens: Option<u32>,
     vision: Option<bool>,
+    video: Option<bool>,
     context_window: Option<u32>,
     make_default: bool,
 ) -> anyhow::Result<()> {
@@ -144,6 +154,7 @@ pub async fn add(
         label: label.map(str::to_string),
         max_output_tokens,
         vision,
+        video,
         thinking: None,
         context_window,
         fallback: Vec::new(),

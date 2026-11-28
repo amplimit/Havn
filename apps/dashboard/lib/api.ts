@@ -360,6 +360,9 @@ export type ModelEntry = {
   max_output_tokens?: number;
   /** Shown images: always (true), never (false), or tried when unset. */
   vision?: boolean;
+  /** Sent the videos of a chat: always (true), never (false), or as
+   *  OpenRouter lists it when unset (issue #355). */
+  video?: boolean;
   /** How it thinks; absent, it is not asked to. */
   thinking?: ThinkingSpec;
   /** What its tokens cost, in US dollars per million (issue #235). */

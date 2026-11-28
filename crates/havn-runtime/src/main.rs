@@ -2177,10 +2177,11 @@ fn with_attachments(text: String, attachments: &[havn_core::Attachment]) -> Stri
 }
 
 /// Add to every user message of `messages` what its attachment lines
-/// name, where it was sent (issue #211): an image block for each image and
-/// the text of each document, by their files in the inbox. The gateway
-/// reads them, as the bytes would not fit a frame, and caps how many and
-/// how large, the newest first.
+/// name, where it was sent (issue #211): an image block for each image, a
+/// video block for each video (issue #355) and the text of each document,
+/// by their files in the inbox. The gateway reads them, as the bytes would
+/// not fit a frame, and caps how many and how large, the newest first; a
+/// video goes only with the turn it was sent in.
 fn with_files(messages: &mut [serde_json::Value]) {
     for message in messages.iter_mut().filter(|m| m["role"] == "user") {
         let Some(text) = message["content"].as_str() else {
@@ -2302,8 +2303,8 @@ fn past_scan(rest: &str) -> Option<&str> {
     }
 }
 
-/// A block for each image and document `text`'s attachment lines name (as
-/// [`with_attachments`] writes them), by its file in the inbox.
+/// A block for each image, video and document `text`'s attachment lines
+/// name (as [`with_attachments`] writes them), by its file in the inbox.
 fn attached(text: &str) -> Vec<serde_json::Value> {
     text.lines()
         .filter_map(|line| {
@@ -2320,6 +2321,14 @@ fn attached(text: &str) -> Vec<serde_json::Value> {
             if kind.to_ascii_lowercase().starts_with("image/") {
                 return Some(serde_json::json!({
                     "type": "image",
+                    "source": {"type": "workspace", "path": path},
+                }));
+            }
+            // A video (issue #355): the gateway sends it to a model that
+            // takes video, with the turn it was sent in.
+            if kind.to_ascii_lowercase().starts_with("video/") {
+                return Some(serde_json::json!({
+                    "type": "video",
                     "source": {"type": "workspace", "path": path},
                 }));
             }
@@ -5549,6 +5558,47 @@ run ls"
         assert_eq!(
             clean_title(&long).map(|t| t.chars().count()),
             Some(conversations::MAX_TITLE_CHARS)
+        );
+    }
+
+    #[test]
+    fn a_video_sent_is_named_for_the_gateway_to_send() {
+        let file = |path: &str, kind: &str| havn_core::Attachment {
+            path: path.into(),
+            name: "clip".into(),
+            media_type: kind.into(),
+            size: 4_400_000,
+            text_path: None,
+            transcript: None,
+            scan: None,
+            unread: None,
+        };
+        let line = with_attachments(
+            "what happens at 1:30?".into(),
+            &[
+                file("inbox/1-clip.webm", "video/webm"),
+                file("inbox/2-clip.mov", "video/quicktime"),
+            ],
+        );
+        let mut messages = vec![serde_json::json!({"role": "user", "content": line})];
+        with_files(&mut messages);
+        let blocks = messages[0]["content"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 3, "the text, then each video");
+        for (block, path) in blocks[1..]
+            .iter()
+            .zip(["inbox/1-clip.webm", "inbox/2-clip.mov"])
+        {
+            assert_eq!(block["type"], "video");
+            assert_eq!(block["source"]["type"], "workspace");
+            assert_eq!(block["source"]["path"], path);
+        }
+        // Its line stays, so later turns still know the file.
+        assert!(
+            blocks[0]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("saved at \"inbox/1-clip.webm\"")),
+            "{}",
+            blocks[0]
         );
     }
 
