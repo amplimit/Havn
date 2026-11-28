@@ -432,45 +432,56 @@ pub fn video_inputs(list: &serde_json::Value) -> std::collections::HashMap<Strin
         .collect()
 }
 
-/// OpenRouter's list of what its models take, as read last: from the base
-/// URL it was read at, when, and what it gave.
+/// OpenRouter's list of what its models take, as read last from a base
+/// URL: when, and what it gave.
 struct Listed {
-    base: String,
     at: std::time::Instant,
     inputs: Result<std::sync::Arc<std::collections::HashMap<String, bool>>, String>,
 }
 
-static LISTED: std::sync::Mutex<Option<Listed>> = std::sync::Mutex::new(None);
+/// The lists read, by the base URL they were read at.
+static LISTED: std::sync::Mutex<Option<std::collections::HashMap<String, Listed>>> =
+    std::sync::Mutex::new(None);
+
+/// One read of a list at a time: requests that wait for one take what it
+/// read.
+static READING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// How long OpenRouter's list is kept, and a failure to read it before it
 /// is read again.
 const LISTED_KEPT: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 const LISTED_FAILURE_KEPT: std::time::Duration = std::time::Duration::from_secs(300);
 /// How long reading it may take: a request waits for it.
-const LISTED_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+const LISTED_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The list read from `base`, while it is kept.
+fn listed(
+    base: &str,
+) -> Option<Result<std::sync::Arc<std::collections::HashMap<String, bool>>, ()>> {
+    let lists = LISTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let listed = lists.as_ref()?.get(base)?;
+    let kept = if listed.inputs.is_ok() {
+        LISTED_KEPT
+    } else {
+        LISTED_FAILURE_KEPT
+    };
+    (listed.at.elapsed() < kept).then(|| listed.inputs.clone().map_err(|_| ()))
+}
 
 /// What OpenRouter, at base URL `base`, lists of its models' input, read
-/// once a day.
+/// once a day; `Err` when it could not be read, which is logged.
 async fn openrouter_inputs(
     http: &reqwest::Client,
     base: &str,
-) -> Result<std::sync::Arc<std::collections::HashMap<String, bool>>, String> {
-    let lock = || {
-        LISTED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    };
-    if let Some(listed) = lock().as_ref()
-        && listed.base == base
-    {
-        let kept = if listed.inputs.is_ok() {
-            LISTED_KEPT
-        } else {
-            LISTED_FAILURE_KEPT
-        };
-        if listed.at.elapsed() < kept {
-            return listed.inputs.clone();
-        }
+) -> Result<std::sync::Arc<std::collections::HashMap<String, bool>>, ()> {
+    if let Some(kept) = listed(base) {
+        return kept;
+    }
+    let _reading = READING.lock().await;
+    if let Some(kept) = listed(base) {
+        return kept;
     }
     let read = async {
         let response = http
@@ -493,19 +504,26 @@ async fn openrouter_inputs(
     if let Err(e) = &read {
         tracing::warn!(error = %e, "could not read which models OpenRouter lists as taking video");
     }
-    *lock() = Some(Listed {
-        base: base.to_string(),
-        at: std::time::Instant::now(),
-        inputs: read.clone(),
-    });
-    read
+    LISTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(
+            base.to_string(),
+            Listed {
+                at: std::time::Instant::now(),
+                inputs: read.clone(),
+            },
+        );
+    read.map_err(|_| ())
 }
 
 /// Whether `entry`, of a provider speaking `api`, is sent the videos of a
 /// chat (issue #355): as its `video` says, else, for an OpenRouter model,
-/// as OpenRouter (at base URL `openrouter`) lists it, and for a Gemini
-/// model of Gemini's own API, when it is a Gemini; never for another API.
-/// Why not, for the model.
+/// as OpenRouter (at base URL `openrouter`) lists it, a routing variant
+/// (`:nitro`, `:floor`, ...) as its model when it is not listed itself,
+/// and for a Gemini model of Gemini's own API, when it is a Gemini; never
+/// for another API. Why not, for the model.
 pub async fn takes_video(
     entry: &ModelEntry,
     api: Option<&str>,
@@ -520,13 +538,15 @@ pub async fn takes_video(
         (Some(takes), _) => takes,
         (None, "gemini") => entry.model().starts_with("gemini-"),
         (None, _) => {
-            let inputs = openrouter_inputs(http, openrouter).await.map_err(|e| {
-                format!(
-                    "whether this model takes video is not known, as OpenRouter's list of models \
-                     could not be read ({e})"
-                )
-            })?;
-            inputs.get(entry.model()).copied().unwrap_or(false)
+            let inputs = openrouter_inputs(http, openrouter)
+                .await
+                .map_err(|()| "it is not known whether this model takes video".to_string())?;
+            let model = entry.model();
+            inputs
+                .get(model)
+                .or_else(|| model.split_once(':').and_then(|(base, _)| inputs.get(base)))
+                .copied()
+                .unwrap_or(false)
         }
     };
     if takes {
@@ -1391,6 +1411,11 @@ mod tests {
         )
         .await;
         assert_eq!(deepseek, Err("this model does not take video".into()));
+        // A routing variant is its model.
+        assert_eq!(
+            takes("openrouter:google/gemini-3.8-flash:nitro", None, openrouter).await,
+            Ok(())
+        );
         // Not listed: not sent.
         assert!(takes("openrouter:a/new", None, openrouter).await.is_err());
         // Read once.
@@ -1438,7 +1463,7 @@ mod tests {
         )
         .await
         .expect_err("not known");
-        assert!(gone.contains("could not be read"), "{gone}");
+        assert_eq!(gone, "it is not known whether this model takes video");
     }
 
     #[test]

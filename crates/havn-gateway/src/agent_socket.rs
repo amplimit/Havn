@@ -195,30 +195,78 @@ pub struct AgentSocketCtx {
 /// Model entries, by id and hash, whose provider refused images.
 pub type VisionRefused = Arc<std::sync::Mutex<std::collections::HashSet<(String, u64)>>>;
 
-/// How the videos `request` names go to `entry`'s model (issue #355):
-/// whether it takes them is looked up only when there are some.
+/// The models, by [`vision_key`], whose provider refused a request carrying
+/// a video it then took without (issue #355), and when: they are sent a
+/// line in its place for [`VIDEO_REFUSAL_KEPT`], so that each round of a
+/// turn does not upload it to be refused again.
+static VIDEO_REFUSED: std::sync::Mutex<Vec<((String, u64), std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+const VIDEO_REFUSAL_KEPT: Duration = Duration::from_secs(3600);
+
+/// Whether `key`'s model had a video refused within [`VIDEO_REFUSAL_KEPT`];
+/// with `refused`, it has now.
+fn video_refused(key: &(String, u64), refused: bool) -> bool {
+    let mut kept = VIDEO_REFUSED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    kept.retain(|(_, at)| at.elapsed() < VIDEO_REFUSAL_KEPT);
+    if refused {
+        kept.retain(|(k, _)| k != key);
+        kept.push((key.clone(), std::time::Instant::now()));
+    }
+    kept.iter().any(|(k, _)| k == key)
+}
+
+/// How the videos `request` names go to `entry`'s model (issue #355), and
+/// the room for files of a request to it. Whether the model takes video is
+/// looked up only when the turn at hand names one, and given up when `cut`
+/// stops the turn.
 async fn chat_videos(
     ctx: &AgentSocketCtx,
     entry: &crate::model_catalog::ModelEntry,
     request: &llm_proxy::AnthropicRequest,
     limits: &crate::config::AttachmentLimits,
+    cut: Option<&tokio_util::sync::CancellationToken>,
 ) -> llm_proxy::ChatVideos {
-    let watch = request.tools.as_ref().is_some_and(|tools| {
-        tools.as_array().is_some_and(|tools| {
-            tools.iter().any(|t| {
-                t.get("name").and_then(serde_json::Value::as_str) == Some(crate::video::TOOL_NAME)
-            })
-        })
-    });
-    if !llm_proxy::names_chat_videos(request) {
-        return llm_proxy::ChatVideos::refused("", watch);
-    }
+    let watch = offers(request, crate::video::TOOL_NAME);
     let api = ctx.llm.endpoints.api_of(entry.provider());
-    let openrouter = llm_proxy::base_url_of("openrouter", &ctx.llm).unwrap_or_default();
-    match crate::model_catalog::takes_video(entry, api, &ctx.http, &openrouter).await {
-        Ok(()) => llm_proxy::ChatVideos::sent(limits, api == Some("gemini"), watch),
-        Err(why) => llm_proxy::ChatVideos::refused(why, watch),
+    let inline = api == Some("gemini");
+    if !llm_proxy::turn_names_videos(request) {
+        return llm_proxy::ChatVideos::refused("none is sent in this turn", inline, watch);
     }
+    if video_refused(&vision_key(entry), false) {
+        return llm_proxy::ChatVideos::refused(
+            "its provider refused this model a video within the last hour",
+            inline,
+            watch,
+        );
+    }
+    let openrouter = llm_proxy::base_url_of("openrouter", &ctx.llm).unwrap_or_default();
+    let looked = crate::model_catalog::takes_video(entry, api, &ctx.http, &openrouter);
+    let takes = match cut {
+        Some(cut) => tokio::select! {
+            takes = looked => takes,
+            () = cut.cancelled() => Err("the turn was stopped".into()),
+        },
+        None => looked.await,
+    };
+    match takes {
+        Ok(()) => llm_proxy::ChatVideos::sent(limits, inline, watch),
+        Err(why) => llm_proxy::ChatVideos::refused(why, inline, watch),
+    }
+}
+
+/// Whether `request` offers the model the tool `name`.
+fn offers(request: &llm_proxy::AnthropicRequest, name: &str) -> bool {
+    request
+        .tools
+        .as_ref()
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|t| t.get("name").and_then(serde_json::Value::as_str) == Some(name))
+        })
 }
 
 /// The key of `entry` in [`VisionRefused`]: an edited entry is tried again.
@@ -3174,7 +3222,7 @@ async fn handle_llm_request(
             let kept = llm_proxy::KeptImages::of(&ctx.workspace_root, agent_id);
             // Videos sent in the chat, to a model that takes them (issue
             // #355).
-            let videos = chat_videos(&ctx, &entry, &ar, &limits).await;
+            let videos = chat_videos(&ctx, &entry, &ar, &limits, cut).await;
             let seeing = llm_proxy::send_seeing(
                 ar,
                 workspace,
@@ -3239,6 +3287,15 @@ async fn handle_llm_request(
                             "the provider refused images for this model; it is sent a note in their \
                              place from now on (until its entry changes or the gateway restarts). \
                              Set `vision = false` on it in [[llm.models]] to skip the first try"
+                        );
+                    }
+                    if seen.video_refused {
+                        video_refused(&vision_key(&entry), true);
+                        warn!(
+                            model = %entry.id,
+                            "the provider refused a request carrying a video for this model; it is \
+                             sent a line in the video's place for an hour (until its entry changes). \
+                             Set `video = false` on it in [[llm.models]] to skip the first try"
                         );
                     }
                     if seen.trimmed {
@@ -4929,6 +4986,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_turn_s_video_goes_as_its_model_and_the_request_s_tools_say() {
+        let mut ctx = ctx_with(false, false).await;
+        let mut llm = crate::config::LlmConfig::default();
+        llm.base_url
+            .insert("openrouter".into(), "http://127.0.0.1:9".into());
+        ctx.llm = Arc::new(llm);
+        assert_eq!(
+            llm_proxy::base_url_of("openrouter", &ctx.llm).as_deref(),
+            Some("http://127.0.0.1:9")
+        );
+        let entry = |id: &str, video: Option<bool>| crate::model_catalog::ModelEntry {
+            id: id.into(),
+            label: None,
+            max_output_tokens: None,
+            vision: None,
+            video,
+            thinking: None,
+            context_window: None,
+            fallback: Vec::new(),
+            price: None,
+        };
+        let request =
+            |tools: Option<serde_json::Value>, messages: Vec<AnthropicMessage>| AnthropicRequest {
+                model: "m".into(),
+                max_tokens: 10,
+                reasoning: None,
+                messages,
+                system: None,
+                temperature: None,
+                tools,
+                system_stable: 0,
+            };
+        let user = |content: serde_json::Value| AnthropicMessage {
+            role: "user".into(),
+            content,
+        };
+        let sent = || {
+            user(serde_json::json!([
+                {"type": "text", "text": "look"},
+                {"type": "video", "source": {"type": "workspace", "path": "inbox/1-a.webm"}},
+            ]))
+        };
+        let tools =
+            serde_json::json!([{"name": "watch_video", "description": "", "input_schema": {}}]);
+        let limits = crate::config::AttachmentLimits::default();
+        let videos = |id: &str, video: Option<bool>, request: AnthropicRequest| {
+            let (ctx, entry, limits) = (&ctx, entry(id, video), &limits);
+            async move { chat_videos(ctx, &entry, &request, limits, None).await }
+        };
+
+        // A Gemini of Gemini's own API: sent, in its inline room, the tool
+        // named.
+        let gemini = videos(
+            "gemini:gemini-3.8-flash",
+            None,
+            request(Some(tools.clone()), vec![sent()]),
+        )
+        .await;
+        assert!(gemini.refused.is_none() && gemini.watch, "{gemini:?}");
+        assert_eq!((gemini.most, gemini.media), (13_500_000, 13_500_000));
+        // Set off, without the tool: refused, and the tool not named.
+        let off = videos(
+            "openrouter:google/gemini-3.8-flash",
+            Some(false),
+            request(None, vec![sent()]),
+        )
+        .await;
+        assert_eq!(
+            off.refused.as_deref(),
+            Some("this model does not take video")
+        );
+        assert!(!off.watch);
+        assert_eq!(off.media, 22_500_000);
+        // Unset, with OpenRouter's list out of reach: not known, and the
+        // error is not told to the model.
+        let unknown = videos(
+            "openrouter:google/gemini-3.8-flash",
+            None,
+            request(Some(tools.clone()), vec![sent()]),
+        )
+        .await;
+        assert_eq!(
+            unknown.refused.as_deref(),
+            Some("it is not known whether this model takes video")
+        );
+        // A video of an earlier turn only: nothing is looked up.
+        let earlier = videos(
+            "openrouter:google/gemini-3.8-flash",
+            None,
+            request(
+                Some(tools.clone()),
+                vec![
+                    sent(),
+                    AnthropicMessage {
+                        role: "assistant".into(),
+                        content: serde_json::json!("ok"),
+                    },
+                    user(serde_json::json!("and now?")),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(
+            earlier.refused.as_deref(),
+            Some("none is sent in this turn")
+        );
+        // A model whose provider refused one is sent the line for a while.
+        let refused = entry("gemini:gemini-refused-once", None);
+        assert!(!video_refused(&vision_key(&refused), false));
+        assert!(video_refused(&vision_key(&refused), true));
+        let again = videos(
+            "gemini:gemini-refused-once",
+            None,
+            request(Some(tools), vec![sent()]),
+        )
+        .await;
+        assert!(
+            again
+                .refused
+                .as_deref()
+                .is_some_and(|why| why.contains("refused this model a video")),
+            "{again:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn watch_video_sends_the_agent_s_own_video_and_its_question() {
         let mut ctx = ctx_with(false, false).await;
         ctx.video_rate = Arc::new(crate::web_search::UserRate::new(100));
@@ -5177,7 +5360,7 @@ mod tests {
         .await
         .expect("usage");
         assert_eq!(booked.len(), 2, "{booked:?}");
-        assert!(booked[1] >= 5_000, "the input as booked: {booked:?}");
+        assert!(booked[1] >= 1_000, "the input as booked: {booked:?}");
 
         // One call at a time for a user's agents.
         let running =

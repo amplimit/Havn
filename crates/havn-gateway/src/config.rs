@@ -505,13 +505,15 @@ pub struct WorkspaceConfig {
 /// every request carries the images and documents' text of the chat where
 /// they were sent, the newest first, up to these; older ones are named
 /// only. A video goes only with the requests of the turn it was sent in
-/// (issue #355), to a model that takes video.
+/// (issue #355), to a model that takes video; videos and images share a
+/// request's room for files (30 MB of base64, 18 MB on Gemini's own API),
+/// the turn's videos first.
 ///
 /// ```toml
 /// [attachments]
 /// images         = 10          # images in a request
 /// image_bytes    = 10000000    # their bytes in all
-/// video_bytes    = 20000000    # videos' bytes in a request, at most 30 MB
+/// video_bytes    = 20000000    # videos' bytes in a request, within its room
 /// document_chars = 100000      # documents' text in a request, as shown
 /// file_chars     = 30000       # one document's text
 /// ```

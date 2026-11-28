@@ -20,6 +20,27 @@ use std::path::{Path, PathBuf};
 
 const NOFOLLOW_FLAGS: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
 
+/// Why [`WorkspaceDir::read_bytes`] refused a file over its limit, apart
+/// from one that is not a regular file (both `InvalidData`).
+#[derive(Debug)]
+pub struct TooLarge(String);
+
+impl std::fmt::Display for TooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TooLarge {}
+
+impl TooLarge {
+    /// Whether `e` is one.
+    #[must_use]
+    pub fn is(e: &io::Error) -> bool {
+        e.get_ref().is_some_and(|inner| inner.is::<Self>())
+    }
+}
+
 /// An open directory inside (or equal to) an agent workspace.
 #[derive(Debug)]
 pub struct WorkspaceDir {
@@ -64,7 +85,7 @@ impl WorkspaceDir {
         if meta.len() > max_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{name} is larger than {max_bytes} bytes"),
+                TooLarge(format!("{name} is larger than {max_bytes} bytes")),
             ));
         }
         let mut bytes = Vec::new();
