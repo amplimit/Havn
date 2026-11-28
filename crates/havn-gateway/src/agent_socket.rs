@@ -2312,6 +2312,17 @@ async fn run_watch_video(
     call: &GatewayToolCall,
     ctx: &AgentSocketCtx,
 ) -> Result<String, String> {
+    let deadline = tokio::time::Instant::now() + crate::video::TOOL_DEADLINE;
+    watch_video_by(agent_id, call, ctx, deadline).await
+}
+
+/// [`run_watch_video`], answered by `deadline`.
+async fn watch_video_by(
+    agent_id: AgentId,
+    call: &GatewayToolCall,
+    ctx: &AgentSocketCtx,
+    deadline: tokio::time::Instant,
+) -> Result<String, String> {
     let agent = match agents_repo::find_by_id(&ctx.db, agent_id).await {
         Ok(Some(agent)) => agent,
         Ok(None) => return Err(format!("agent {agent_id} not found")),
@@ -2342,19 +2353,15 @@ async fn run_watch_video(
         models: &models,
         multi_user: ctx.multi_user,
     };
-    // Waiting for a turn counts within the limit too.
-    let watched = tokio::time::timeout(
-        crate::video::TOOL_DEADLINE,
-        crate::video::run_tool(gateway, &agent, &how, workspace, &asked),
+    // Waiting for a turn counts within the limit too. The tool keeps to
+    // `deadline` itself, so that a call cut once sent is billed; this only
+    // guards against one that does not.
+    let watched = tokio::time::timeout_at(
+        deadline + std::time::Duration::from_secs(5),
+        crate::video::run_tool(gateway, &agent, &how, workspace, &asked, deadline),
     )
     .await
-    .unwrap_or_else(|_| {
-        Err(format!(
-            "the video model took longer than {}s: ask about a shorter video, or a part cut \
-             out of it",
-            crate::video::TOOL_DEADLINE.as_secs()
-        ))
-    });
+    .unwrap_or_else(|_| Err(crate::video::late()));
     let details = match &watched {
         Ok(watched) => serde_json::json!({
             "path": asked.path,
@@ -4951,7 +4958,11 @@ mod tests {
             axum::routing::post({
                 let seen = Arc::clone(&seen);
                 move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    let slow = body.to_string().contains("SLOW");
                     seen.lock().expect("seen").push(body);
+                    if slow {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
                     axum::Json(serde_json::json!({
                         "choices": [{"message": {"content": "It prints 43.199999999999996, at 00:42."},
                             "finish_reason": "stop"}],
@@ -5110,6 +5121,115 @@ mod tests {
             audited[0]
         );
 
+        ctx.video.store(Arc::new(Some(crate::video::Video::Model {
+            model: "openrouter:google/gemini-3.8-flash".into(),
+            max_mb: 1,
+        })));
+
+        // Cut at its deadline once sent: its input stays booked, as the
+        // provider may have read the video, and the agent is told why.
+        let slow = call(serde_json::json!({"path": "talk.webm", "question": "SLOW, please"}));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let late = watch_video_by(agent, &slow, &ctx, deadline)
+            .await
+            .expect_err("late");
+        assert!(late.contains("took longer than"), "{late}");
+        let booked: Vec<i64> = sqlx::query_scalar(
+            "SELECT tokens_in FROM credential_usages WHERE agent_id = ?1 ORDER BY rowid",
+        )
+        .bind(agent.to_string())
+        .fetch_all(&ctx.db)
+        .await
+        .expect("usage");
+        assert_eq!(booked.len(), 2, "{booked:?}");
+        assert!(booked[1] >= 5_000, "the input as booked: {booked:?}");
+
+        // One call at a time for a user's agents.
+        let running =
+            crate::transcribe::UserCall::take(crate::video::TOOL_NAME, owner).expect("free");
+        let busy = run_gateway_tool(agent, &asking("talk.webm"), &ctx)
+            .await
+            .expect_err("busy");
+        assert!(busy.contains("another video is being watched"), "{busy}");
+        drop(running);
+
+        // A policy that does not allow it, set or from transcribing, and a
+        // model the policy does not allow.
+        let policy_of = |set: &dyn Fn(&mut Policy)| {
+            let mut p = Policy::default();
+            set(&mut p);
+            serde_json::json!({ "policy": p })
+        };
+        let (off, _rx2) = connected_agent(
+            &ctx,
+            owner,
+            "b",
+            policy_of(&|p| p.permissions.can_watch_video = Some(false)),
+        )
+        .await;
+        let (quiet, _rx3) = connected_agent(
+            &ctx,
+            owner,
+            "c",
+            policy_of(&|p| p.permissions.can_transcribe = Some(false)),
+        )
+        .await;
+        let (narrow, _rx4) = connected_agent(
+            &ctx,
+            owner,
+            "d",
+            policy_of(&|p| p.allowed_models = vec!["anthropic:claude-x".into()]),
+        )
+        .await;
+        std::fs::create_dir_all(root.path().join(narrow.to_string()).join("workspace"))
+            .expect("workspace");
+        for denied in [off, quiet] {
+            let row = agents_repo::find_by_id(&ctx.db, denied)
+                .await
+                .expect("lookup")
+                .expect("agent");
+            let policy = policy_resolver::for_session(&ctx.db, &row, false).await;
+            assert!(
+                !names(gateway_tools_for(&ctx, &row, &policy).await)
+                    .contains(&"watch_video".to_string())
+            );
+            let refused = run_gateway_tool(denied, &asking("talk.webm"), &ctx)
+                .await
+                .expect_err("denied");
+            assert!(
+                refused.contains("does not allow watching videos"),
+                "{refused}"
+            );
+        }
+        let refused = run_gateway_tool(narrow, &asking("talk.webm"), &ctx)
+            .await
+            .expect_err("model");
+        assert!(
+            refused.contains("is not allowed by this agent's policy"),
+            "{refused}"
+        );
+
+        // The late and busy calls are audited too, and no entry holds the
+        // question.
+        let audited: Vec<String> =
+            sqlx::query_scalar("SELECT details FROM audit_log WHERE action = 'video.watch'")
+                .fetch_all(&ctx.db)
+                .await
+                .expect("audit");
+        assert_eq!(audited.len(), 12, "{audited:?}");
+        assert!(audited.iter().any(|a| a.contains("took longer than")));
+        assert!(
+            audited
+                .iter()
+                .any(|a| a.contains("another video is being watched"))
+        );
+        assert!(
+            audited
+                .iter()
+                .all(|a| !a.contains("first run print") && !a.contains("SLOW")),
+            "{audited:?}"
+        );
+
         // A user's agents ask about so many videos a minute.
         ctx.video_rate = Arc::new(crate::web_search::UserRate::new(1));
         let _ = run_gateway_tool(agent, &asking("talk.webm"), &ctx).await;
@@ -5117,22 +5237,6 @@ mod tests {
             .await
             .expect_err("limited");
         assert!(limited.contains("in the last minute"), "{limited}");
-
-        // A policy that keeps the agent from transcribing keeps videos
-        // from leaving too.
-        let mut p = Policy::default();
-        p.permissions.can_transcribe = Some(false);
-        let (denied, _rx2) =
-            connected_agent(&ctx, owner, "b", serde_json::json!({ "policy": p })).await;
-        let denied_row = agents_repo::find_by_id(&ctx.db, denied)
-            .await
-            .expect("lookup")
-            .expect("agent");
-        let denied_policy = policy_resolver::for_session(&ctx.db, &denied_row, false).await;
-        assert!(
-            !names(gateway_tools_for(&ctx, &denied_row, &denied_policy).await)
-                .contains(&"watch_video".to_string())
-        );
     }
 
     #[tokio::test]

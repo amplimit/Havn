@@ -1086,6 +1086,9 @@ impl GatewayConfig {
         let mut parsed: Self = toml::from_str(raw)?;
         parsed.validate_channel_ids()?;
         parsed.warn_channel_texts();
+        if let Some(warning) = parsed.video.as_ref().and_then(crate::video::Video::clamped) {
+            tracing::warn!("{warning}");
+        }
         parsed.validate_llm()?;
         parsed.validate_search()?;
         if !matches!(

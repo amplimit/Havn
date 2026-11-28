@@ -567,15 +567,15 @@ mod tests {
         let cfg = GatewayConfig::default();
         let handles = ReloadHandles::from_config(&cfg);
         assert!(handles.video.load().is_none());
-        let mut new_cfg = cfg.clone();
-        new_cfg.video = Some(crate::video::Video::Model {
+        let mut edited = cfg.clone();
+        edited.video = Some(crate::video::Video::Model {
             model: "openrouter:google/gemini-3.8-flash".into(),
             max_mb: 20,
         });
         let plan = ReloadPlan::build(&["video".to_string()]);
         assert!(plan.restart_paths.is_empty());
-        handles.apply_hot(&new_cfg, &plan.hot_paths);
-        assert_eq!(*handles.video.load_full(), new_cfg.video);
+        handles.apply_hot(&edited, &plan.hot_paths);
+        assert_eq!(*handles.video.load_full(), edited.video);
     }
 
     #[test]

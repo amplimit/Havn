@@ -7,7 +7,7 @@
 //! [video]
 //! kind   = "model"
 //! model  = "openrouter:google/gemini-3.8-flash"  # an OpenRouter or Gemini model that takes video
-//! max_mb = 20                                    # default: the largest video sent
+//! max_mb = 20                                    # default: the largest video sent, at most 30
 //! ```
 //!
 //! The file is read as `transcribe` reads one, through
@@ -39,9 +39,9 @@ fn default_max_mb() -> u64 {
     20
 }
 
-/// The most `max_mb` takes: a video is held in memory, with its base64,
-/// while it is sent.
-const MOST_MB: u64 = 50;
+/// The most `max_mb` takes: while a video is sent, its base64 is held about
+/// three times over (the request, the provider's body, the bytes sent).
+const MOST_MB: u64 = 30;
 
 impl Video {
     fn model(&self) -> &str {
@@ -57,6 +57,16 @@ impl Video {
             Self::Model { max_mb, .. } => (*max_mb).clamp(1, MOST_MB) * 1024 * 1024,
         }
     }
+
+    /// A warning for a `max_mb` outside what is taken, which is held to it.
+    #[must_use]
+    pub fn clamped(&self) -> Option<String> {
+        let Self::Model { max_mb, .. } = self;
+        let held = (*max_mb).clamp(1, MOST_MB);
+        (held != *max_mb).then(|| {
+            format!("[video] max_mb = {max_mb} is held to {held}: it takes 1 to {MOST_MB}")
+        })
+    }
 }
 
 pub const TOOL_NAME: &str = "watch_video";
@@ -71,15 +81,19 @@ pub const MAX_ANSWER_CHARS: usize = 20_000;
 const MAX_QUESTION_CHARS: usize = 2_000;
 /// Most an answer may be, in tokens.
 const MAX_TOKENS: u32 = 8_192;
-/// `watch_video` calls running at once across all agents.
-static TOOL_RUNNING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+/// `watch_video` calls running at once across all agents: each holds its
+/// video several times over in memory.
+static TOOL_RUNNING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 /// Bytes of a file read to tell its format.
 const HEAD_BYTES: usize = 4096;
 /// Extensions of videos the models take in another container: converted
 /// first.
-const OTHER_VIDEO: &[&str] = &[
-    "mkv", "avi", "wmv", "flv", "3gp", "3g2", "ts", "mts", "m2ts", "ogv", "vob",
-];
+const OTHER_VIDEO: &[&str] = &["mkv", "avi", "wmv", "flv", "3gp", "3g2", "ogv", "vob"];
+/// Extensions of MPEG transport streams, `.ts` a TypeScript file's too: a
+/// video only when its bytes are one.
+const TRANSPORT_STREAM: &[&str] = &["ts", "mts", "m2ts"];
+/// The most a request to Gemini's own API carries inline, base64 included.
+const GEMINI_INLINE_BYTES: usize = 20_000_000;
 
 /// The `watch_video` tool, as `how` watches.
 #[must_use]
@@ -194,7 +208,9 @@ fn seconds(field: &str, value: Option<&serde_json::Value>) -> Result<Option<u64>
     for (n, part) in parts.iter().enumerate() {
         let whole = match part.split_once('.') {
             Some((whole, fraction))
-                if n + 1 == parts.len() && fraction.bytes().all(|b| b.is_ascii_digit()) =>
+                if n + 1 == parts.len()
+                    && !fraction.is_empty()
+                    && fraction.bytes().all(|b| b.is_ascii_digit()) =>
             {
                 whole
             }
@@ -228,6 +244,7 @@ fn clock(seconds: u64) -> String {
 /// extension or else its first bytes; why not, for the agent.
 pub fn media_type(name: &str, head: &[u8]) -> Result<&'static str, String> {
     let audio = || format!("{name:?} is audio, not a video: transcribe it instead");
+    let not_video = || format!("{name:?} is not a video this sends: MP4, MOV, WebM or MPEG");
     let convert = || {
         format!(
             "{name:?} is a video in a format this does not send: convert it first (ffmpeg -i \
@@ -240,21 +257,37 @@ pub fn media_type(name: &str, head: &[u8]) -> Result<&'static str, String> {
         .unwrap_or_default();
     match extension.as_str() {
         "mp4" | "m4v" if audio_brand(head) => Err(audio()),
+        "mp4" | "m4v" if image_brand(head) => Err(not_video()),
         "mp4" | "m4v" => Ok("video/mp4"),
         "mov" | "qt" => Ok("video/mov"),
         "webm" => Ok("video/webm"),
         "mpeg" | "mpg" => Ok("video/mpeg"),
         e if OTHER_VIDEO.contains(&e) => Err(convert()),
+        e if TRANSPORT_STREAM.contains(&e) && transport_stream(head) => Err(convert()),
+        e if TRANSPORT_STREAM.contains(&e) => Err(not_video()),
         _ if crate::transcribe::audio_format("", name).is_some() => Err(audio()),
         _ => match sniffed(head) {
             Some(Sniffed::Video(media_type)) => Ok(media_type),
             Some(Sniffed::Audio) => Err(audio()),
             Some(Sniffed::Other) => Err(convert()),
-            None => Err(format!(
-                "{name:?} is not a video this sends: MP4, MOV, WebM or MPEG"
-            )),
+            Some(Sniffed::Image) | None => Err(not_video()),
         },
     }
+}
+
+/// Whether a file starting with `head` is an MPEG transport stream: a sync
+/// byte at the start of its first two packets.
+fn transport_stream(head: &[u8]) -> bool {
+    head.first() == Some(&0x47) && head.get(188) == Some(&0x47)
+}
+
+/// Whether an ISO media file starting with `head` is an image (HEIF, AVIF),
+/// by its brand.
+fn image_brand(head: &[u8]) -> bool {
+    matches!(
+        head.get(8..12),
+        Some(b"heic" | b"heix" | b"mif1" | b"msf1" | b"avif" | b"avis")
+    )
 }
 
 /// Whether an MP4 file starting with `head` is audio only, by its brand.
@@ -266,6 +299,7 @@ fn audio_brand(head: &[u8]) -> bool {
 enum Sniffed {
     Video(&'static str),
     Audio,
+    Image,
     /// A video in another container.
     Other,
 }
@@ -274,6 +308,7 @@ fn sniffed(head: &[u8]) -> Option<Sniffed> {
     if head.get(4..8) == Some(b"ftyp") {
         Some(match head.get(8..12) {
             _ if audio_brand(head) => Sniffed::Audio,
+            _ if image_brand(head) => Sniffed::Image,
             Some(b"qt  ") => Sniffed::Video("video/mov"),
             _ => Sniffed::Video("video/mp4"),
         })
@@ -285,7 +320,9 @@ fn sniffed(head: &[u8]) -> Option<Sniffed> {
         })
     } else if head.starts_with(&[0, 0, 1, 0xBA]) || head.starts_with(&[0, 0, 1, 0xB3]) {
         Some(Sniffed::Video("video/mpeg"))
-    } else if head.starts_with(b"RIFF") && head.get(8..12) == Some(b"AVI ") {
+    } else if (head.starts_with(b"RIFF") && head.get(8..12) == Some(b"AVI "))
+        || transport_stream(head)
+    {
         Some(Sniffed::Other)
     } else {
         None
@@ -314,12 +351,19 @@ fn ask(asked: &Asked) -> String {
     format!("{ASK}{part}\n\nQuestion: {}", asked.question)
 }
 
-/// The one request `watch_video` sends to `model`: the video, `bytes` of
-/// `media_type`, then what is asked of it.
-fn request(model: &str, media_type: &str, bytes: &[u8], asked: &Asked) -> AnthropicRequest {
+/// The one request `watch_video` sends to `model`, for an answer of at
+/// most `max_tokens`: the video, `bytes` of `media_type`, then what is
+/// asked of it.
+fn request(
+    model: &str,
+    max_tokens: u32,
+    media_type: &str,
+    bytes: &[u8],
+    asked: &Asked,
+) -> AnthropicRequest {
     AnthropicRequest {
         model: model.to_string(),
-        max_tokens: MAX_TOKENS,
+        max_tokens,
         reasoning: None,
         messages: vec![AnthropicMessage {
             role: "user".into(),
@@ -365,17 +409,28 @@ pub struct Watched {
     pub bytes: usize,
 }
 
+/// What the agent is told of a call that ran out of time.
+#[must_use]
+pub fn late() -> String {
+    format!(
+        "the video model took longer than {}s: ask about a shorter video, or a part cut out of it",
+        TOOL_DEADLINE.as_secs()
+    )
+}
+
 /// `watch_video` for `agent`: what `asked` asks of the video at its path
-/// of the agent's workspace `workspace`, answered with `how`, once its
-/// policy allows it, no other call of its owner's agents runs and one of
-/// the tool's turns is free; only then is the file read. Billed as a
-/// transcription by a model is.
+/// of the agent's workspace `workspace`, answered with `how` by
+/// `deadline`, once its policy allows it, no other call of its owner's
+/// agents runs and the tool's turn is free; only then is the file read.
+/// Billed as a transcription by a model is; a call cut at `deadline` once
+/// sent is billed for its input, as the provider may have read it.
 pub async fn run_tool(
     gateway: Gateway<'_>,
     agent: &havn_db::repo::agents::Agent,
     how: &Video,
     workspace: std::path::PathBuf,
     asked: &Asked,
+    deadline: tokio::time::Instant,
 ) -> Result<Watched, String> {
     let policy = crate::policy_resolver::for_session(gateway.db, agent, gateway.multi_user).await;
     if !policy.permissions.watches_video() {
@@ -386,20 +441,45 @@ pub async fn run_tool(
             "another video is being watched for this user's agents; wait for it to end".into(),
         );
     };
-    let _turn = TOOL_RUNNING
-        .acquire()
+    let _turn = tokio::time::timeout_at(deadline, TOOL_RUNNING.acquire())
         .await
+        .map_err(|_| late())?
         .map_err(|e| format!("watching videos is closed: {e}"))?;
+    let call = crate::transcribe::model_call(gateway, agent, &policy);
+    let (entry, api) = model_for(&call, how.model())?;
+    let keyring = call
+        .keyring
+        .ok_or("credential encryption is not configured")?;
     let named = asked.path.clone();
     let most = how.max_bytes();
-    let (name, bytes) =
-        tokio::task::spawn_blocking(move || crate::outbox::named_file(&workspace, &named, most))
-            .await
-            .map_err(|e| format!("reading the file failed: {e}"))??;
+    let (name, bytes) = tokio::time::timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(move || crate::outbox::named_file(&workspace, &named, most)),
+    )
+    .await
+    .map_err(|_| late())?
+    .map_err(|e| format!("reading the file failed: {e}"))??;
     let media_type = media_type(&name, &bytes[..bytes.len().min(HEAD_BYTES)])?;
     let size = bytes.len();
-    let call = crate::transcribe::model_call(gateway, agent, &policy);
-    let text = by_model(gateway.http, call, how.model(), &bytes, media_type, asked).await?;
+    if api == "gemini" && size.div_ceil(3) * 4 > GEMINI_INLINE_BYTES {
+        return Err(format!(
+            "{} is sent videos inline, and Gemini's API takes at most {} MB of inline data a \
+             request, about {} MB of video: ask about a shorter video, or use an OpenRouter model",
+            entry.id,
+            GEMINI_INLINE_BYTES / 1_000_000,
+            GEMINI_INLINE_BYTES / 4 * 3 / 1_000_000
+        ));
+    }
+    let max_tokens = llm_proxy::provider::clamp_max_tokens(
+        entry.model(),
+        entry.max_output_tokens,
+        MAX_TOKENS,
+        call.llm.max_tokens_ceiling,
+    );
+    let request = request(entry.model(), max_tokens, media_type, &bytes, asked);
+    // Only its base64 is sent.
+    drop(bytes);
+    let text = answer(gateway.http, &call, keyring, &entry, &request, deadline).await?;
     Ok(Watched {
         text,
         media_type,
@@ -413,21 +493,19 @@ fn takes_video(api: &str) -> bool {
     matches!(api, "openrouter" | "gemini")
 }
 
-async fn by_model(
-    http: &reqwest::Client,
-    call: ModelCall<'_>,
+/// The entry of `model`, and its provider's API, when it is sent a video
+/// and the agent's policy allows it; why not.
+fn model_for(
+    call: &ModelCall<'_>,
     model: &str,
-    bytes: &[u8],
-    media_type: &str,
-    asked: &Asked,
-) -> Result<String, String> {
+) -> Result<(crate::model_catalog::ModelEntry, &'static str), String> {
     let entry = call.models.resolve(model)?.clone();
-    if !takes_video(
-        call.llm
-            .endpoints
-            .api_of(entry.provider())
-            .unwrap_or_default(),
-    ) {
+    let api = call
+        .llm
+        .endpoints
+        .api_of(entry.provider())
+        .unwrap_or_default();
+    if !takes_video(api) {
         return Err(format!(
             "{} cannot be sent a video: [video] needs an OpenRouter or Gemini model that takes \
              video",
@@ -440,22 +518,45 @@ async fn by_model(
             entry.id
         ));
     }
-    let keyring = call
-        .keyring
-        .ok_or("credential encryption is not configured")?;
-    let request = request(entry.model(), media_type, bytes, asked);
-    let answer = llm_proxy::complete_with_provider(
+    Ok((entry, api))
+}
+
+/// The model's answer to `request`, cut at `deadline`: a call cut once
+/// sent keeps its input booked.
+async fn answer(
+    http: &reqwest::Client,
+    call: &ModelCall<'_>,
+    keyring: &crate::keyring::KeyRing,
+    entry: &crate::model_catalog::ModelEntry,
+    request: &AnthropicRequest,
+    deadline: tokio::time::Instant,
+) -> Result<String, String> {
+    let cut = tokio_util::sync::CancellationToken::new();
+    let unread = |_: llm_proxy::provider::TextEvent<'_>| {};
+    let work = llm_proxy::stream_with_provider(
         call.db,
         http,
         keyring,
         &call.billing,
         entry.provider(),
         entry.max_output_tokens,
-        &request,
+        request,
         call.llm,
-    )
-    .await
+        &unread,
+        &cut,
+    );
+    tokio::pin!(work);
+    let answer = tokio::select! {
+        answer = &mut work => answer,
+        () = tokio::time::sleep_until(deadline) => {
+            cut.cancel();
+            work.await
+        }
+    }
     .map_err(|e| format!("the video model failed: {e}"))?;
+    if answer.stop_reason.as_deref() == Some(llm_proxy::STOPPED) {
+        return Err(late());
+    }
     let text = crate::transcribe::text_of(&answer);
     let text = text.trim();
     if text.is_empty() {
@@ -492,6 +593,17 @@ mod tests {
         let huge: Video =
             toml::from_str("kind = \"model\"\nmodel = \"m\"\nmax_mb = 4000\n").expect("huge");
         assert_eq!(huge.max_bytes(), MOST_MB * 1024 * 1024, "held to the most");
+        assert_eq!(MOST_MB, 30);
+        assert!(
+            huge.clamped()
+                .is_some_and(|w| w.contains("max_mb = 4000 is held to 30")),
+            "{:?}",
+            huge.clamped()
+        );
+        assert_eq!(video.clamped(), None);
+        let none: Video =
+            toml::from_str("kind = \"model\"\nmodel = \"m\"\nmax_mb = 0\n").expect("zero");
+        assert!(none.clamped().is_some_and(|w| w.contains("held to 1")));
         assert!(toml::from_str::<Video>("kind = \"model\"\n").is_err());
         assert!(toml::from_str::<Video>("kind = \"endpoint\"\nmodel = \"m\"\n").is_err());
         assert!(toml::from_str::<Video>("kind = \"model\"\nmodel = \"m\"\nfps = 2\n").is_err());
@@ -579,7 +691,7 @@ mod tests {
         assert_eq!(of(json!("90:00")), Ok(Some(5400)));
         assert_eq!(of(json!("1:01:30")), Ok(Some(3690)));
         for bad in [
-            "1:2:3:4", "1:60", "1:00:60", "a", "1.5:00", "1:", ":30", "1e3", "-1",
+            "1:2:3:4", "1:60", "1:00:60", "a", "1.5:00", "1:", ":30", "1e3", "-1", "1:30.", "90.",
         ] {
             assert!(of(json!(bad)).is_err(), "{bad}");
         }
@@ -603,6 +715,13 @@ mod tests {
         assert_eq!(media_type("clip", mov), Ok("video/mov"));
         assert_eq!(media_type("clip.bin", webm), Ok("video/webm"));
         assert_eq!(media_type("clip", b"\0\0\x01\xba\x44"), Ok("video/mpeg"));
+        // An MPEG transport stream, by its sync bytes; a TypeScript file
+        // named .ts is not one.
+        let mut stream = vec![0_u8; 400];
+        stream[0] = 0x47;
+        stream[188] = 0x47;
+        let heic = b"\0\0\0\x18ftypheic\0\0\0\0";
+        let avif = b"\0\0\0\x1cftypavif\0\0\0\0";
         for (name, head, why) in [
             ("voice.mp4", &m4a[..], "is audio"),
             ("voice", m4a, "is audio"),
@@ -611,6 +730,12 @@ mod tests {
             ("clip", mkv, "convert it first"),
             ("clip", b"RIFF\0\0\0\0AVI LIST", "convert it first"),
             ("notes.txt", b"hello", "not a video this sends"),
+            ("clip.ts", &stream[..], "convert it first"),
+            ("clip.m2ts", &stream[..], "convert it first"),
+            ("clip", &stream[..], "convert it first"),
+            ("app.ts", b"export const a = 1;\n", "not a video this sends"),
+            ("photo", heic, "not a video this sends"),
+            ("photo.mp4", avif, "not a video this sends"),
         ] {
             let refused = media_type(name, head).expect_err(name);
             assert!(refused.contains(why), "{name}: {refused}");
@@ -625,8 +750,15 @@ mod tests {
             start: Some(30),
             end: None,
         };
-        let request = request("google/gemini-3.8-flash", "video/webm", b"\x1a\x45", &asked);
+        let request = request(
+            "google/gemini-3.8-flash",
+            MAX_TOKENS,
+            "video/webm",
+            b"\x1a\x45",
+            &asked,
+        );
         assert_eq!(request.model, "google/gemini-3.8-flash");
+        assert_eq!(request.max_tokens, MAX_TOKENS);
         assert_eq!(request.messages.len(), 1);
         let content = &request.messages[0].content;
         assert_eq!(
