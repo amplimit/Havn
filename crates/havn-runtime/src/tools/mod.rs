@@ -452,8 +452,7 @@ impl ToolRegistry {
             // The snapshot guard is not held across the approval wait.
             let verdict = {
                 let snapshot = hooks.load();
-                (!snapshot.is_empty())
-                    .then(|| snapshot.veto(name, &flatten_input_for_hook(name, &input)))
+                (!snapshot.is_empty()).then(|| snapshot.veto_any(name, &hook_inputs(name, &input)))
             };
             if let Some(veto) = verdict {
                 match veto {
@@ -584,6 +583,49 @@ fn flatten_input_for_hook(tool: &str, input: &serde_json::Value) -> String {
         // raw blob are blunt but safe.
         _ => input.to_string(),
     }
+}
+
+/// What hook rules match for a call: its flattened input and, when the
+/// input has a `path`, that path as written and as the built-in tools
+/// resolve it, so a rule such as `^private/` also stops `./private/a.txt`.
+/// The runtime's file tools take the path as written; the gateway's
+/// (`send_file`, `transcribe`, `watch_video`), `file_find` and
+/// `file_search` trim it first, so both forms are resolved.
+fn hook_inputs(tool: &str, input: &serde_json::Value) -> Vec<String> {
+    let mut inputs = vec![flatten_input_for_hook(tool, input)];
+    if let Some(path) = input.get("path").and_then(serde_json::Value::as_str) {
+        let forms = [
+            Some(path.to_string()),
+            resolved_path(path),
+            resolved_path(path.trim()),
+        ];
+        for form in forms.into_iter().flatten() {
+            if !inputs.contains(&form) {
+                inputs.push(form);
+            }
+        }
+    }
+    inputs
+}
+
+/// `path` as a built-in tool finds its file, by its text alone: without
+/// `.` segments and repeated or trailing `/`. `None` when it has a `..`
+/// segment, which no built-in tool takes: such a path is matched as given.
+fn resolved_path(path: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            name => parts.push(name),
+        }
+    }
+    let joined = parts.join("/");
+    Some(if path.starts_with('/') {
+        format!("/{joined}")
+    } else {
+        joined
+    })
 }
 
 #[cfg(test)]
@@ -772,6 +814,145 @@ mod tests {
             .await;
         assert!(res.is_error(), "{}", res.text());
         assert!(!dir.path().join("out.md").exists());
+    }
+
+    #[test]
+    fn a_path_resolves_as_the_tools_find_its_file() {
+        for (given, resolved) in [
+            ("private/a.txt", Some("private/a.txt")),
+            ("./private/a.txt", Some("private/a.txt")),
+            ("././private/a.txt", Some("private/a.txt")),
+            (".//private//a.txt", Some("private/a.txt")),
+            ("private/./a.txt", Some("private/a.txt")),
+            ("private/", Some("private")),
+            (".", Some("")),
+            // Untrimmed: the runtime's file tools open `private/ `.
+            ("./private/ ", Some("private/ ")),
+            ("./private/.\n", Some("private/.\n")),
+            (" private/a.txt", Some(" private/a.txt")),
+            ("/private/./a.txt", Some("/private/a.txt")),
+            ("x/../private/a.txt", None),
+            ("../private/a.txt", None),
+        ] {
+            assert_eq!(resolved_path(given).as_deref(), resolved, "{given:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_rules_see_a_path_as_the_tool_resolves_it() {
+        use crate::hooks::Veto;
+        let mut policy = Policy::default();
+        for tool in ["file_read", "send_file", "shell"] {
+            policy.hooks.pre_tool_use.push(havn_core::ToolHookRule {
+                tool: tool.into(),
+                deny: vec!["^private/".into(), r"^\./raw$".into()],
+                ask: vec!["^shared/".into()],
+            });
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let set = crate::hooks::load(&policy.hooks, dir.path())
+            .await
+            .expect("hooks");
+        let veto =
+            |tool: &str, input: serde_json::Value| set.veto_any(tool, &hook_inputs(tool, &input));
+        // send_file's input is matched as its JSON, and its path besides;
+        // watch_video's by the rule about file_read.
+        for tool in ["file_read", "send_file", "watch_video"] {
+            for path in [
+                "private/a",
+                "./private/a",
+                // The gateway's tools and file_find trim the path.
+                " private/a",
+                ".//private/a",
+                "private//a/",
+                // The runtime's file tools do not.
+                "./private/ ",
+                "./private/.\n",
+                "./private/..\n",
+                "./raw",
+            ] {
+                let got = veto(tool, serde_json::json!({"path": path}));
+                assert!(matches!(got, Veto::Deny { .. }), "{tool} {path:?}: {got:?}");
+            }
+            for path in ["shared/a", "./shared/a", " shared//a\n", "./shared/ "] {
+                let got = veto(tool, serde_json::json!({"path": path}));
+                assert!(matches!(got, Veto::Ask { .. }), "{tool} {path:?}: {got:?}");
+            }
+            // A path with `..`, or absolute, is refused by the tool itself.
+            for path in [
+                "public/a",
+                "./public/a",
+                "privates/a",
+                "x/../private/a",
+                "../private/a",
+                "/private/a",
+            ] {
+                let got = veto(tool, serde_json::json!({"path": path}));
+                assert_eq!(got, Veto::Allow, "{tool} {path:?}");
+            }
+        }
+        // A tool without a path is matched as before.
+        assert_eq!(
+            hook_inputs("shell", &serde_json::json!({"command": "./private/a"})),
+            ["./private/a"]
+        );
+        assert_eq!(
+            veto("shell", serde_json::json!({"command": "./private/a"})),
+            Veto::Allow
+        );
+        assert!(matches!(
+            veto("shell", serde_json::json!({"command": "private/a"})),
+            Veto::Deny { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_rule_about_a_folder_stops_reading_it_by_another_path() {
+        gateway::FROM_OWNER
+            .scope(true, async {
+                let mut policy = Policy::default();
+                policy.hooks.pre_tool_use.push(havn_core::ToolHookRule {
+                    tool: "file_read".into(),
+                    deny: vec!["^private/".into()],
+                    ask: Vec::new(),
+                });
+                let dir = tempfile::tempdir().expect("tempdir");
+                std::fs::create_dir_all(dir.path().join("private")).expect("dir");
+                std::fs::write(dir.path().join("private/a"), "kept").expect("write");
+                std::fs::write(dir.path().join("private/ "), "kept").expect("write");
+                std::fs::write(dir.path().join("notes.md"), "shown").expect("write");
+                let set = crate::hooks::load(&policy.hooks, dir.path())
+                    .await
+                    .expect("hooks");
+                let reg = registry(policy).with_hooks(crate::hooks::handle(set));
+                let env = ToolCtx {
+                    workspace_dir: dir.path().to_path_buf(),
+                    agent_db: dummy_pool().await,
+                    policy: Arc::clone(&reg.policy),
+                    embedder: None,
+                };
+                let read = |path: &str| {
+                    reg.execute_for(
+                        context::WEBCHAT,
+                        "file_read",
+                        serde_json::json!({ "path": path }),
+                        &env,
+                    )
+                };
+                for path in ["private/a", "./private/a", ".//private/a", "./private/ "] {
+                    let res = read(path).await;
+                    assert!(res.is_error(), "{path:?}: {}", res.text());
+                    assert!(
+                        res.text().contains("denied by hook"),
+                        "{path:?}: {}",
+                        res.text()
+                    );
+                    assert!(!res.text().contains("kept"), "{path:?}: {}", res.text());
+                }
+                let res = read("./notes.md").await;
+                assert!(res.text().contains("shown"), "{}", res.text());
+            })
+            .await;
     }
 
     #[tokio::test]
