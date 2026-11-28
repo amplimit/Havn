@@ -796,13 +796,8 @@ async fn execute_tool_use(
         }
         (item, chars)
     });
-    // An image goes with the text as the gateway's reference to its file,
-    // which it reads and shows in its place (issue #227).
     let content = match image {
-        Some(path) => serde_json::json!([
-            {"type": "text", "text": text},
-            {"type": "image", "source": {"type": "workspace", "path": path}},
-        ]),
+        Some(path) => image_result(text, &path),
         None => Value::String(text),
     };
     let result = serde_json::json!({
@@ -812,6 +807,30 @@ async fn execute_tool_use(
         "is_error": is_error,
     });
     (result, step)
+}
+
+/// A tool's result showing the image at `path` with `text`: the gateway's
+/// reference to its file, which it reads and shows in its place (issue
+/// #227). The reference has a key of its own, by which the gateway keeps
+/// what it showed for the rest of the turn whatever becomes of the file,
+/// and names the conversation and chat it is shown in, which take it when
+/// they are deleted (issue #354).
+fn image_result(text: String, path: &str) -> Value {
+    let mut source = serde_json::json!({
+        "type": "workspace",
+        "path": path,
+        "key": uuid::Uuid::now_v7().simple().to_string(),
+    });
+    if let Ok(channel) = crate::tools::gateway::CONVERSATION.try_with(Clone::clone) {
+        source["channel"] = Value::String(channel);
+    }
+    if let Ok(chat) = crate::tools::gateway::CHAT.try_with(Clone::clone) {
+        source["chat"] = Value::String(chat);
+    }
+    serde_json::json!([
+        {"type": "text", "text": text},
+        {"type": "image", "source": source},
+    ])
 }
 
 /// Tell the conversation the turn answers which tool it is about to call
@@ -1390,6 +1409,29 @@ mod tests {
 
 (stopped)"
         );
+    }
+
+    #[tokio::test]
+    async fn an_image_shown_has_a_key_of_its_own_and_names_its_chat() {
+        let alone = image_result("The image a.png:".into(), "a.png");
+        assert_eq!(alone[0]["text"], "The image a.png:");
+        let source = &alone[1]["source"];
+        assert_eq!(source["type"], "workspace");
+        assert_eq!(source["path"], "a.png");
+        assert!(source.get("channel").is_none() && source.get("chat").is_none());
+        let key = source["key"].as_str().expect("key");
+        assert!(!key.is_empty() && key.chars().all(|c| c.is_ascii_hexdigit()));
+        let again = image_result(String::new(), "a.png");
+        assert_ne!(source["key"], again[1]["source"]["key"]);
+        let shown = crate::tools::gateway::CONVERSATION
+            .scope(
+                "web".into(),
+                crate::tools::gateway::CHAT
+                    .scope("c1".into(), async { image_result(String::new(), "a.png") }),
+            )
+            .await;
+        assert_eq!(shown[1]["source"]["channel"], "web");
+        assert_eq!(shown[1]["source"]["chat"], "c1");
     }
 
     #[tokio::test]

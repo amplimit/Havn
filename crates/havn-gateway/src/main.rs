@@ -330,6 +330,10 @@ async fn serve() -> anyhow::Result<()> {
     // cgroups or the egress chain: a second gateway stops here instead of
     // killing the first one's agents and taking over its socket (#80).
     let _instance_locks = instance_locks(&cfg.db_path, &cfg.agent_socket_path, host_lock())?;
+    // Images tools showed age out though their agents show no more (issue
+    // #354).
+    let root = cfg.workspace_root.clone();
+    tokio::task::spawn_blocking(move || llm_proxy::KeptImages::prune_all(&root));
 
     let db = havn_db::connect(&cfg.db_path)
         .await

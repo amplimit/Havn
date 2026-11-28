@@ -390,7 +390,7 @@ mod tests {
             json!({"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "t1", "is_error": false, "content": [
                     {"type": "text", "text": "The image chart.png:"},
-                    {"type": "image", "source": {"type": "workspace", "path": "chart.png"}},
+                    {"type": "image", "source": {"type": "workspace", "path": "chart.png", "key": "k1"}},
                 ]},
             ]}),
             json!({"role": "assistant", "content": [{"type": "text", "text": "A rising line."}]}),
@@ -398,7 +398,10 @@ mod tests {
         let kept: Vec<Value> =
             serde_json::from_str(&of_turn(&messages, "A rising line.").expect("steps"))
                 .expect("json");
+        // No reference goes on past its turn, by its key or otherwise: the
+        // turns after are told it was shown (issue #354).
         let parts = &kept[1]["content"][0]["content"];
+        assert!(!parts.to_string().contains("\"key\""));
         assert_eq!(parts[0]["text"], "The image chart.png:");
         assert_eq!(parts[1]["type"], "text");
         assert!(

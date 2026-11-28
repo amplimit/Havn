@@ -3134,8 +3134,18 @@ async fn handle_llm_request(
                 ar.max_tokens,
                 ctx.llm.max_tokens_ceiling,
             );
-            let seeing =
-                llm_proxy::send_seeing(ar, workspace, limits, context, show, try_blind, send);
+            // Images its tools showed, kept as they were shown (issue #354).
+            let kept = llm_proxy::KeptImages::of(&ctx.workspace_root, agent_id);
+            let seeing = llm_proxy::send_seeing(
+                ar,
+                workspace,
+                Some(kept),
+                limits,
+                context,
+                show,
+                try_blind,
+                send,
+            );
             // A call shown to nobody is not cut short: it runs on and
             // records what it used, as before issue #305, and the turn's
             // stop is answered at once with nothing written.
@@ -5492,6 +5502,78 @@ mod tests {
             .await
             .expect("rows");
         assert_eq!(used, vec![(14,)]);
+    }
+
+    #[tokio::test]
+    async fn an_image_a_tool_showed_is_kept_for_its_agent_and_shown_again() {
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let asked = Arc::clone(&bodies);
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let asked = Arc::clone(&asked);
+                async move {
+                    asked.lock().unwrap().push(body);
+                    axum::Json(serde_json::json!({
+                        "id": "m1", "type": "message", "role": "assistant", "model": "m",
+                        "content": [{"type": "text", "text": "A chart."}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 5, "output_tokens": 2}
+                    }))
+                }
+            }),
+        );
+        let (mut ctx, server) = ctx_calling(app).await;
+        let root = tempfile::tempdir().expect("root");
+        ctx.workspace_root = root.path().to_path_buf();
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (agent, mut rx) = connected_agent(&ctx, owner, "a", serde_json::json!({})).await;
+        let workspace = root.path().join(agent.to_string()).join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let chart = b"\x89PNG\r\n\x1a\nchart".to_vec();
+        std::fs::write(workspace.join("chart.png"), &chart).expect("chart");
+        let req = || LlmRequest {
+            model: "lan:m".into(),
+            messages: serde_json::json!([
+                {"role": "user", "content": "look"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_0", "name": "view_image", "input": {"path": "chart.png"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_0", "content": [
+                        {"type": "text", "text": "The image chart.png:"},
+                        {"type": "image", "source": {"type": "workspace", "path": "chart.png", "key": "k1"}},
+                    ]},
+                ]},
+            ]),
+            ..llm_request("r1")
+        };
+        dispatch(agent, AgentToGateway::LlmRequest(req()), &ctx).await;
+        assert!(matches!(
+            next_llm_response(&mut rx).await.outcome,
+            LlmOutcome::Ok
+        ));
+        // The agent removes the file; the next request shows it all the same.
+        std::fs::remove_file(workspace.join("chart.png")).expect("rm");
+        dispatch(agent, AgentToGateway::LlmRequest(req()), &ctx).await;
+        assert!(matches!(
+            next_llm_response(&mut rx).await.outcome,
+            LlmOutcome::Ok
+        ));
+        server.abort();
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2);
+        let shown = llm_proxy::base64(&chart);
+        for body in &bodies {
+            assert!(body.to_string().contains(&shown), "{body}");
+        }
+        assert!(
+            llm_proxy::KeptImages::of(root.path(), agent).dir.is_dir(),
+            "kept next to the workspace"
+        );
     }
 
     #[tokio::test]
