@@ -2133,9 +2133,9 @@ pub struct KeptImages {
 }
 
 /// What an agent's kept images take at most, in bytes and images, and for
-/// how many days one not shown since is kept: as long as a file it sent
-/// ([`crate::outbox`]). A request keeps its images past them until the
-/// next one prunes.
+/// how many days one not shown since is kept: a day, as no image outlives
+/// the turn that showed it (a stored turn names it in a line instead). A
+/// request keeps its images past them until the next one prunes.
 #[cfg(not(test))]
 const KEPT_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(test)]
@@ -2144,7 +2144,7 @@ const KEPT_IMAGE_BYTES: u64 = 4 * 1024;
 const KEPT_IMAGES: usize = 2000;
 #[cfg(test)]
 const KEPT_IMAGES: usize = 4;
-const KEPT_IMAGE_DAYS: u64 = 30;
+const KEPT_IMAGE_DAYS: u64 = 1;
 /// Free space keeping an image leaves on the filesystem at least.
 const KEPT_IMAGE_FREE_BYTES: u64 = 1024 * 1024 * 1024;
 
