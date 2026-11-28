@@ -1876,9 +1876,7 @@ impl ChatVideos {
     /// own API (`inline`), within the inline data it takes in a request.
     #[must_use]
     pub fn sent(limits: &crate::config::AttachmentLimits, inline: bool, watch: bool) -> Self {
-        let mut most = limits
-            .video_bytes
-            .min(crate::video::MOST_MB * 1024 * 1024);
+        let mut most = limits.video_bytes.min(crate::video::MOST_MB * 1024 * 1024);
         if inline {
             most = most.min(crate::video::GEMINI_INLINE_BYTES as u64 / 4 * 3);
         }
@@ -1992,7 +1990,9 @@ fn inbox_video(
     let bytes = match dir.read_bytes(name, room) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return Err(GONE.into()),
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidData && e.to_string().contains("larger") => {
+        Err(e)
+            if e.kind() == std::io::ErrorKind::InvalidData && e.to_string().contains("larger") =>
+        {
             return Err(if room < most {
                 "the videos of this turn are too large together".to_string()
             } else {
@@ -4221,8 +4221,9 @@ mod tests {
         };
         let told = line(true);
         assert!(
-            told.starts_with("(The video \"inbox/1-clip.webm\" is not shown: this model does not take video.")
-                && told.contains("watch_video"),
+            told.starts_with(
+                "(The video \"inbox/1-clip.webm\" is not shown: this model does not take video."
+            ) && told.contains("watch_video"),
             "{told}"
         );
         // Without the tool, it is not named.
@@ -4233,11 +4234,17 @@ mod tests {
     fn a_video_past_the_limit_or_of_another_kind_is_a_line() {
         let ws = tempfile::tempdir().expect("tmp");
         std::fs::create_dir_all(ws.path().join("inbox")).expect("inbox");
-        std::fs::write(ws.path().join("inbox/1-big.webm"), [WEBM, &[0_u8; 64]].concat())
-            .expect("webm");
+        std::fs::write(
+            ws.path().join("inbox/1-big.webm"),
+            [WEBM, &[0_u8; 64]].concat(),
+        )
+        .expect("webm");
         std::fs::write(ws.path().join("inbox/2-clip.webm"), WEBM).expect("webm");
-        std::fs::write(ws.path().join("inbox/3-clip.mkv"), b"\x1a\x45\xdf\xa3matroska")
-            .expect("mkv");
+        std::fs::write(
+            ws.path().join("inbox/3-clip.mkv"),
+            b"\x1a\x45\xdf\xa3matroska",
+        )
+        .expect("mkv");
         let text = |request: &AnthropicRequest, n: usize| {
             request.messages[0].content[n]["text"]
                 .as_str()
@@ -4256,7 +4263,11 @@ mod tests {
         let most = (WEBM.len() + 64) as u64;
         resolve_chat_videos(&mut request, ws.path(), &sent_videos(most, false));
         assert_eq!(request.messages[0].content[0]["type"], "video");
-        assert!(text(&request, 1).contains("too large together"), "{}", text(&request, 1));
+        assert!(
+            text(&request, 1).contains("too large together"),
+            "{}",
+            text(&request, 1)
+        );
         // Not a video a model is sent, missing, outside the inbox.
         let mut request = chat(vec![vec![
             video_ref("inbox/3-clip.mkv"),
@@ -4311,7 +4322,10 @@ mod tests {
             video_bytes: 50_000_000,
             ..Default::default()
         };
-        assert_eq!(ChatVideos::sent(&limits, false, false).most, 30 * 1024 * 1024);
+        assert_eq!(
+            ChatVideos::sent(&limits, false, false).most,
+            30 * 1024 * 1024
+        );
         assert_eq!(ChatVideos::sent(&limits, true, false).most, 15_000_000);
         let default = crate::config::AttachmentLimits::default();
         assert_eq!(ChatVideos::sent(&default, false, true).most, 20_000_000);
@@ -4356,7 +4370,10 @@ mod tests {
         let line = sent[1].messages[0].content[0]["text"]
             .as_str()
             .expect("line");
-        assert!(line.contains("refused the request that carried it"), "{line}");
+        assert!(
+            line.contains("refused the request that carried it"),
+            "{line}"
+        );
     }
 
     fn answer() -> AnthropicResponse {

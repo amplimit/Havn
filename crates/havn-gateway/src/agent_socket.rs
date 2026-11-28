@@ -205,9 +205,9 @@ async fn chat_videos(
 ) -> llm_proxy::ChatVideos {
     let watch = request.tools.as_ref().is_some_and(|tools| {
         tools.as_array().is_some_and(|tools| {
-            tools
-                .iter()
-                .any(|t| t.get("name").and_then(serde_json::Value::as_str) == Some(crate::video::TOOL_NAME))
+            tools.iter().any(|t| {
+                t.get("name").and_then(serde_json::Value::as_str) == Some(crate::video::TOOL_NAME)
+            })
         })
     });
     if !llm_proxy::names_chat_videos(request) {

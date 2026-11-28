@@ -5584,7 +5584,10 @@ run ls"
         with_files(&mut messages);
         let blocks = messages[0]["content"].as_array().expect("blocks");
         assert_eq!(blocks.len(), 3, "the text, then each video");
-        for (block, path) in blocks[1..].iter().zip(["inbox/1-clip.webm", "inbox/2-clip.mov"]) {
+        for (block, path) in blocks[1..]
+            .iter()
+            .zip(["inbox/1-clip.webm", "inbox/2-clip.mov"])
+        {
             assert_eq!(block["type"], "video");
             assert_eq!(block["source"]["type"], "workspace");
             assert_eq!(block["source"]["path"], path);

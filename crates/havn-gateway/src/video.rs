@@ -782,8 +782,14 @@ mod tests {
             ..asked
         };
         assert!(!ask(&whole).contains("Look only"));
-        assert!(crate::model_catalog::sends_video("openrouter") && crate::model_catalog::sends_video("gemini"));
-        assert!(!crate::model_catalog::sends_video("anthropic") && !crate::model_catalog::sends_video("openai"));
+        assert!(
+            crate::model_catalog::sends_video("openrouter")
+                && crate::model_catalog::sends_video("gemini")
+        );
+        assert!(
+            !crate::model_catalog::sends_video("anthropic")
+                && !crate::model_catalog::sends_video("openai")
+        );
     }
 
     #[test]

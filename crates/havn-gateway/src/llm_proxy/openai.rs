@@ -993,8 +993,12 @@ mod tests {
             r.system_stable = 5;
             r
         };
-        let body = anthropic_to_openai(&video("google/gemini-3.8-flash"), "max_tokens", "openrouter")
-            .expect("translate");
+        let body = anthropic_to_openai(
+            &video("google/gemini-3.8-flash"),
+            "max_tokens",
+            "openrouter",
+        )
+        .expect("translate");
         assert_eq!(
             body["provider"],
             json!({"order": ["google-ai-studio"], "allow_fallbacks": true})

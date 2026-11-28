@@ -1313,7 +1313,10 @@ mod tests {
         std::fs::write(&path, "").expect("write");
         write_to_file(&path, &c).expect("written");
         let text = std::fs::read_to_string(&path).expect("read");
-        assert!(text.contains("video = true") && text.contains("video = false"), "{text}");
+        assert!(
+            text.contains("video = true") && text.contains("video = false"),
+            "{text}"
+        );
         assert_eq!(read_from_file(&path).expect("read back"), c);
         c.models[0].video = None;
         write_to_file(&path, &c).expect("written");
@@ -1340,7 +1343,10 @@ mod tests {
         ]});
         let inputs = video_inputs(&list);
         assert_eq!(inputs.get("google/gemini-3.8-flash"), Some(&true));
-        assert_eq!(inputs.get("deepseek/deepseek-v4.1-flash-1017"), Some(&false));
+        assert_eq!(
+            inputs.get("deepseek/deepseek-v4.1-flash-1017"),
+            Some(&false)
+        );
         assert_eq!(inputs.get("odd/no-architecture"), None);
         assert!(video_inputs(&serde_json::json!({"error": "x"})).is_empty());
     }
@@ -1374,21 +1380,55 @@ mod tests {
             async move { takes_video(&entry, api, &http, &base).await }
         };
         let openrouter = Some("openrouter");
-        assert_eq!(takes("openrouter:google/gemini-3.8-flash", None, openrouter).await, Ok(()));
-        let deepseek = takes("openrouter:deepseek/deepseek-v4.1-flash-1017", None, openrouter).await;
+        assert_eq!(
+            takes("openrouter:google/gemini-3.8-flash", None, openrouter).await,
+            Ok(())
+        );
+        let deepseek = takes(
+            "openrouter:deepseek/deepseek-v4.1-flash-1017",
+            None,
+            openrouter,
+        )
+        .await;
         assert_eq!(deepseek, Err("this model does not take video".into()));
         // Not listed: not sent.
         assert!(takes("openrouter:a/new", None, openrouter).await.is_err());
         // Read once.
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
         // Set, as set.
-        assert_eq!(takes("openrouter:deepseek/deepseek-v4.1-flash-1017", Some(true), openrouter).await, Ok(()));
-        assert!(takes("openrouter:google/gemini-3.8-flash", Some(false), openrouter).await.is_err());
+        assert_eq!(
+            takes(
+                "openrouter:deepseek/deepseek-v4.1-flash-1017",
+                Some(true),
+                openrouter
+            )
+            .await,
+            Ok(())
+        );
+        assert!(
+            takes(
+                "openrouter:google/gemini-3.8-flash",
+                Some(false),
+                openrouter
+            )
+            .await
+            .is_err()
+        );
         // Gemini's own API: a Gemini takes it; another provider never.
-        assert_eq!(takes("gemini:gemini-3.8-flash", None, Some("gemini")).await, Ok(()));
-        assert!(takes("gemini:gemma-4-27b-it", None, Some("gemini")).await.is_err());
+        assert_eq!(
+            takes("gemini:gemini-3.8-flash", None, Some("gemini")).await,
+            Ok(())
+        );
+        assert!(
+            takes("gemini:gemma-4-27b-it", None, Some("gemini"))
+                .await
+                .is_err()
+        );
         let anthropic = takes("anthropic:claude-x", Some(true), Some("anthropic")).await;
-        assert_eq!(anthropic, Err("this model's provider is not sent videos".into()));
+        assert_eq!(
+            anthropic,
+            Err("this model's provider is not sent videos".into())
+        );
         // A list that cannot be read is said, and tried again later.
         let gone = takes_video(
             &video_entry("openrouter:google/gemini-3.8-flash", None),
@@ -1408,6 +1448,7 @@ mod tests {
             label: None,
             max_output_tokens: None,
             vision,
+            video: None,
             thinking: None,
             context_window: None,
             fallback: Vec::new(),
