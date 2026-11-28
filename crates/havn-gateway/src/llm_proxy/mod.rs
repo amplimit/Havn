@@ -79,11 +79,20 @@ const VIDEO_TOKENS_PER_SECOND: f64 = 110.0;
 const VIDEO_BASE64_BYTES_PER_TOKEN: u64 = 100;
 const UNTIMED_VIDEO_TOKENS: u64 = 100_000;
 const MIN_VIDEO_TOKENS: u64 = 1_000;
+/// A length its size could not fill: fewer base64 bytes a second than this
+/// (a slideshow runs to some thousands) is a header that is not believed,
+/// and the video is counted as one whose length is not known.
+const LEAST_VIDEO_BASE64_BYTES_PER_SECOND: f64 = 1_000.0;
 
 /// The tokens [`VIDEO_TOKENS_PER_SECOND`] gives a video of `seconds`, or
 /// its `base64` bytes when how long it runs is not known.
 fn video_tokens(seconds: Option<f64>, base64: u64) -> u64 {
-    let tokens = match seconds {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a size compared with a rate, not counted"
+    )]
+    let believed = seconds.filter(|s| base64 as f64 / s >= LEAST_VIDEO_BASE64_BYTES_PER_SECOND);
+    let tokens = match believed {
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -5793,6 +5802,11 @@ mod tests {
             let phone = json!([{"type": "video", "seconds": 12.0, "source": {"type": "base64",
                 "media_type": "video/mp4", "data": "A".repeat(20_000_000)}}]);
             assert!(estimate(phone) < 2_000);
+            // A header that says a day for what its size could not fill is
+            // not believed: counted as untimed, at most the untimed most.
+            let day = json!([{"type": "video", "seconds": 86_000.0, "source": {"type": "base64",
+                "media_type": "video/mp4", "data": "A".repeat(20_000_000)}}]);
+            assert_eq!(estimate(day), 2 + 100_000);
             // Untimed and dense: held to the most.
             let dense = json!([{"type": "video", "source": {"type": "base64",
                 "media_type": "video/mpeg", "data": "A".repeat(20_000_000)}}]);
