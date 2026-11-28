@@ -221,6 +221,7 @@ fn restrictive_fallback() -> Policy {
     p.permissions.can_search_web = false;
     p.permissions.can_fetch_web = false;
     p.permissions.can_transcribe = Some(false);
+    p.permissions.can_watch_video = Some(false);
     p
 }
 

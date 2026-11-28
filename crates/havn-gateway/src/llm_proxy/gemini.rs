@@ -338,7 +338,7 @@ fn translate_message_to_gemini(m: &AnthropicMessage) -> Result<Value, String> {
                     "functionResponse": {"name": name, "response": content}
                 }));
             }
-            "image" | "audio"
+            "image" | "audio" | "video"
                 if block.pointer("/source/type").and_then(Value::as_str) == Some("base64") =>
             {
                 parts.push(inline_data(block));
@@ -359,7 +359,8 @@ fn translate_message_to_gemini(m: &AnthropicMessage) -> Result<Value, String> {
     Ok(json!({"role": role, "parts": parts}))
 }
 
-/// Base64 block `block` (an image, audio) as an `inline_data` part.
+/// Base64 block `block` (an image, audio, a video) as an `inline_data`
+/// part.
 fn inline_data(block: &Value) -> Value {
     json!({
         "inline_data": {
@@ -694,6 +695,27 @@ mod tests {
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0]["role"], "user");
         assert_eq!(contents[0]["parts"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn a_video_is_inline_data_of_its_type() {
+        let r = req(
+            vec![AnthropicMessage {
+                role: "user".into(),
+                content: json!([
+                    {"type": "video", "source": {"type": "base64", "media_type": "video/mp4", "data": "AAAA"}},
+                    {"type": "text", "text": "what does it print?"},
+                ]),
+            }],
+            None,
+        );
+        let body = anthropic_to_gemini(&r).expect("translate");
+        let parts = body["contents"][0]["parts"].as_array().expect("parts");
+        assert_eq!(
+            parts[0],
+            json!({"inline_data": {"mime_type": "video/mp4", "data": "AAAA"}})
+        );
+        assert_eq!(parts[1]["text"], "what does it print?");
     }
 
     #[test]

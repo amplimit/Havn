@@ -67,6 +67,12 @@ const IMAGE_TOKENS: u64 = 5_000;
 /// base64 bytes; at least [`MIN_AUDIO_TOKENS`] (issue #164).
 const AUDIO_BASE64_BYTES_PER_TOKEN: u64 = 85;
 const MIN_AUDIO_TOKENS: u64 = 1_000;
+/// What a model counts for a video, from its base64 size: about 300 tokens
+/// a second (Gemini: a frame a second and the sound), a screencast at about
+/// 22 KB a second, so a token for about 100 base64 bytes, erring long for
+/// most videos; at least [`MIN_VIDEO_TOKENS`] (issue #355).
+const VIDEO_BASE64_BYTES_PER_TOKEN: u64 = 100;
+const MIN_VIDEO_TOKENS: u64 = 5_000;
 
 /// Least tokens reserved for a URL-sourced document, whose size the
 /// gateway cannot see: a large PDF runs to 100k-300k tokens. A base64
@@ -1474,7 +1480,7 @@ fn without_files(content: &mut serde_json::Value) -> bool {
     let mut changed = false;
     for block in blocks {
         match block.get("type").and_then(serde_json::Value::as_str) {
-            Some("image" | "document" | "audio") => {
+            Some("image" | "document" | "audio" | "video") => {
                 *block = serde_json::json!({
                     "type": "text",
                     "text": format!("(A file shown here earlier is left out: {LEFT_OUT}.)"),
@@ -2371,16 +2377,18 @@ impl Count {
                     Some("tool_use") => (false, None),
                     Some("document") if url_source => (true, Some(URL_DOCUMENT_TOKENS)),
                     Some("image" | "document") => (true, Some(IMAGE_TOKENS)),
-                    Some("audio") => {
+                    Some(kind @ ("audio" | "video")) => {
                         let bytes = map
                             .get("source")
                             .and_then(|source| source.get("data"))
                             .and_then(serde_json::Value::as_str)
                             .map_or(0, str::len) as u64;
-                        (
-                            true,
-                            Some((bytes / AUDIO_BASE64_BYTES_PER_TOKEN).max(MIN_AUDIO_TOKENS)),
-                        )
+                        let (per_token, least) = if kind == "audio" {
+                            (AUDIO_BASE64_BYTES_PER_TOKEN, MIN_AUDIO_TOKENS)
+                        } else {
+                            (VIDEO_BASE64_BYTES_PER_TOKEN, MIN_VIDEO_TOKENS)
+                        };
+                        (true, Some((bytes / per_token).max(least)))
                     }
                     _ => (true, None),
                 };
@@ -2388,9 +2396,11 @@ impl Count {
                 for (key, item) in map {
                     inner.text(key);
                     match (kind, key.as_str(), item) {
-                        (Some("image" | "audio"), "source", serde_json::Value::Object(source))
-                            if floor.is_some() =>
-                        {
+                        (
+                            Some("image" | "audio" | "video"),
+                            "source",
+                            serde_json::Value::Object(source),
+                        ) if floor.is_some() => {
                             for (k, v) in source.iter().filter(|(k, _)| *k != "data") {
                                 inner.text(k);
                                 inner.walk(v, false);
@@ -4345,6 +4355,14 @@ mod tests {
             let short = json!([{"type": "audio", "source": {"type": "base64",
                 "media_type": "audio/ogg", "data": "A".repeat(100)}}]);
             assert_eq!(estimate(short), 2 + 1_000);
+            // Two minutes of a screencast, 3 MB: 40,000 tokens, not the 2
+            // million its text would count.
+            let video = json!([{"type": "video", "source": {"type": "base64",
+                "media_type": "video/webm", "data": "A".repeat(4_000_000)}}]);
+            assert_eq!(estimate(video), 2 + 40_000);
+            let clip = json!([{"type": "video", "source": {"type": "base64",
+                "media_type": "video/mp4", "data": "A".repeat(100)}}]);
+            assert_eq!(estimate(clip), 2 + 5_000);
             let url = json!([{"type": "image", "source": {"type": "url",
                 "url": "https://example.test/a.png"}}]);
             assert_eq!(estimate(url), 2 + image);

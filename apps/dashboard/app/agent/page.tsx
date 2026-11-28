@@ -3075,7 +3075,13 @@ function ToolIcon({ tool, color }: { tool: string; color: string }) {
   if (tool === "web_search") return <Search {...look} />;
   if (tool === "web_fetch") return <Globe {...look} />;
   if (tool === "shell" || tool === "process") return <Terminal {...look} />;
-  if (tool.startsWith("file_") || tool === "send_file" || tool === "view_image" || tool === "transcribe")
+  if (
+    tool.startsWith("file_") ||
+    tool === "send_file" ||
+    tool === "view_image" ||
+    tool === "transcribe" ||
+    tool === "watch_video"
+  )
     return <FileText {...look} />;
   if (tool.startsWith("memory_")) return <Database {...look} />;
   if (tool === "conversation_search") return <MessagesSquare {...look} />;
@@ -3105,6 +3111,7 @@ function stepWords(tool: string, input: string): { did: string; what: string } {
     send_file: "Sent",
     view_image: "Looked at",
     transcribe: "Transcribed",
+    watch_video: "Watched",
     schedule: "Scheduled",
     set_timezone: "Set the time zone",
     skill_manage: "Updated a skill",
@@ -3299,6 +3306,7 @@ function stepText({ tool, detail }: Step): string {
     conversation_search: "Searching past chats",
     send_file: "Sending",
     transcribe: "Transcribing",
+    watch_video: "Watching",
     schedule: "Scheduling",
     set_timezone: "Setting the time zone",
     subagent_spawn: "Handing off a task",

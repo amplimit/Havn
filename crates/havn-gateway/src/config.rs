@@ -134,6 +134,10 @@ pub struct GatewayConfig {
     /// unset, they are not. Hot-reloaded.
     #[serde(default)]
     pub transcription: Option<crate::transcribe::Transcription>,
+    /// The model `watch_video` asks about videos (issue #355); unset, the
+    /// tool is not offered. Hot-reloaded.
+    #[serde(default)]
+    pub video: Option<crate::video::Video>,
     /// How much of what people sent (images, documents' text) a request
     /// carries (issue #211). Hot-reloaded.
     #[serde(default)]
@@ -963,6 +967,7 @@ impl Default for GatewayConfig {
             workspace: WorkspaceConfig::default(),
             channel_texts: ChannelTexts::default(),
             transcription: None,
+            video: None,
             attachments: AttachmentLimits::default(),
             search: SearchConfig::default(),
             fetch: FetchConfig::default(),

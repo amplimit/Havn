@@ -2254,6 +2254,8 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
   const fetchLocked = saving || (view !== null && !view.fetch_permitted && !view.can_fetch_web);
   const transcribeLocked =
     saving || (view !== null && !view.transcribe_permitted && !view.can_transcribe);
+  const videoLocked =
+    saving || (view !== null && !view.watch_video_permitted && !view.can_watch_video);
   const egressLocked = saving || (view !== null && !view.egress_permitted && !view.egress_allowed);
 
   return (
@@ -2341,6 +2343,22 @@ function WebAccessEditor({ agentId }: { agentId: string }) {
               transcript, counted against the agent&apos;s budget.
               {!view.transcription && " The gateway has no [transcription] set up, so it is not offered."}
               {!view.transcribe_permitted && " Your role does not allow it."}
+            </span>
+          </label>
+          <label className="flex items-start gap-3 text-sm">
+            <input
+              type="checkbox"
+              className={`mt-1 h-4 w-4 shrink-0 ${videoLocked ? "cursor-not-allowed" : "cursor-pointer"}`}
+              checked={view.can_watch_video}
+              disabled={videoLocked}
+              onChange={(e) => save({ can_watch_video: e.target.checked })}
+            />
+            <span>
+              <strong>watch videos</strong>: the gateway sends a video of the agent&apos;s
+              workspace and the agent&apos;s question to the gateway&apos;s video model and gives
+              the agent its answer, counted against the agent&apos;s budget.
+              {!view.video && " The gateway has no [video] set up, so it is not offered."}
+              {!view.watch_video_permitted && " Your role does not allow it."}
             </span>
           </label>
           <label className="grid gap-1 text-sm">

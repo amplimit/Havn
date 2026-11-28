@@ -87,6 +87,10 @@ export type AgentWebView = {
   can_transcribe: boolean;
   /** The gateway has `[transcription]` set. */
   transcription: boolean;
+  /** watch_video: the gateway asks a model about a video of the agent's workspace. */
+  can_watch_video: boolean;
+  /** The gateway has `[video]` set. */
+  video: boolean;
   /** Network egress from the agent's sandbox. */
   egress_allowed: boolean;
   /** That egress goes through the gateway's proxy, which asks about new domains. */
@@ -95,6 +99,7 @@ export type AgentWebView = {
   search_permitted: boolean;
   fetch_permitted: boolean;
   transcribe_permitted: boolean;
+  watch_video_permitted: boolean;
   egress_permitted: boolean;
   /** The backend this agent would search with, or null when none is set up. */
   search_backend: string | null;
@@ -119,6 +124,7 @@ export type AgentWebPatch = {
   can_search_web?: boolean;
   can_fetch_web?: boolean;
   can_transcribe?: boolean;
+  can_watch_video?: boolean;
   egress_allowed?: boolean;
   egress_proxy?: boolean;
   allowed_domains?: string[];

@@ -35,6 +35,7 @@ mod supervisor;
 mod timezone;
 mod transcribe;
 mod update_check;
+mod video;
 mod web_fetch;
 mod web_search;
 mod webchat;
@@ -195,6 +196,8 @@ struct AppState {
     pub channel_texts: Arc<ArcSwap<config::ChannelTexts>>,
     /// `[transcription]`, hot-reloaded (issue #164).
     pub transcription: Arc<ArcSwap<Option<transcribe::Transcription>>>,
+    /// `[video]`, hot-reloaded (issue #355).
+    pub video: Arc<ArcSwap<Option<video::Video>>>,
     pub config_path: PathBuf,
     pub models_write: Arc<tokio::sync::Mutex<()>>,
     pub search: Arc<web_search::WebSearch>,
@@ -512,6 +515,7 @@ async fn serve() -> anyhow::Result<()> {
     let workspace_browse = reload_handles.workspace_browse.clone();
     let channel_texts = reload_handles.channel_texts.clone();
     let transcription = reload_handles.transcription.clone();
+    let video = reload_handles.video.clone();
     info!(
         allowed_origins = ?allowed_origins.load(),
         "webchat origin allowlist"
@@ -609,6 +613,7 @@ async fn serve() -> anyhow::Result<()> {
         workspace_browse,
         channel_texts,
         transcription,
+        video,
         config_path: config_path.clone(),
         models_write: Arc::new(tokio::sync::Mutex::new(())),
         search: Arc::clone(&search),
@@ -685,6 +690,8 @@ async fn serve() -> anyhow::Result<()> {
         transcribe_rate: Arc::new(web_search::UserRate::new(
             transcribe::TOOL_PER_USER_PER_MINUTE,
         )),
+        video: reload_handles.video.clone(),
+        video_rate: Arc::new(web_search::UserRate::new(video::TOOL_PER_USER_PER_MINUTE)),
     };
     let socket_path = cfg.agent_socket_path.clone();
     let socket_task = tokio::spawn(async move {

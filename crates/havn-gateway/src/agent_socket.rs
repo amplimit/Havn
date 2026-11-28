@@ -185,6 +185,11 @@ pub struct AgentSocketCtx {
     pub transcription: Arc<arc_swap::ArcSwap<Option<crate::transcribe::Transcription>>>,
     /// Rate of the `transcribe` gateway tool, per owner.
     pub transcribe_rate: Arc<crate::web_search::UserRate>,
+    /// `[video]`, hot-reloaded, shared with `AppState`: with it, agents are
+    /// offered `watch_video` (issue #355).
+    pub video: Arc<arc_swap::ArcSwap<Option<crate::video::Video>>>,
+    /// Rate of the `watch_video` gateway tool, per owner.
+    pub video_rate: Arc<crate::web_search::UserRate>,
 }
 
 /// Model entries, by id and hash, whose provider refused images.
@@ -2124,7 +2129,7 @@ async fn egress_proxy_for(ctx: &AgentSocketCtx, agent_id: AgentId) -> Option<Str
 /// The gateway-run tools `agent` may use: `web_search` when its policy
 /// allows it and its owner has a search backend, `web_fetch` when its
 /// policy allows it, `transcribe` when its policy allows it and the
-/// gateway transcribes audio.
+/// gateway transcribes audio, `watch_video` likewise with `[video]`.
 async fn gateway_tools_for(
     ctx: &AgentSocketCtx,
     agent: &havn_db::repo::agents::Agent,
@@ -2163,6 +2168,11 @@ async fn gateway_tools_for(
         && let Some(how) = &**ctx.transcription.load()
     {
         tools.push(crate::transcribe::spec(how));
+    }
+    if policy.permissions.watches_video()
+        && let Some(how) = &**ctx.video.load()
+    {
+        tools.push(crate::video::spec(how));
     }
     // Secrets reach shell commands and MCP servers; the owner can set
     // them only with HAVN_AGE_KEY.
@@ -2206,6 +2216,7 @@ async fn run_gateway_tool(
         crate::choice::TOOL_NAME => run_ask_choice(agent_id, call, ctx).await,
         crate::secrets::TOOL_NAME => run_secret_request(agent_id, call, ctx).await,
         crate::transcribe::TOOL_NAME => run_transcribe(agent_id, call, ctx).await,
+        crate::video::TOOL_NAME => run_watch_video(agent_id, call, ctx).await,
         other => Err(format!("the gateway has no tool named {other:?}")),
     }
 }
@@ -2291,6 +2302,85 @@ async fn run_transcribe(
     )
     .await;
     heard.map(|heard| crate::transcribe::told(&path, &heard.text))
+}
+
+/// `watch_video` (issue #355): a question about a video of the agent's
+/// workspace, answered by the model of `[video]` in one request, its use
+/// counted as the agent's. Audited as `video.watch`.
+async fn run_watch_video(
+    agent_id: AgentId,
+    call: &GatewayToolCall,
+    ctx: &AgentSocketCtx,
+) -> Result<String, String> {
+    let agent = match agents_repo::find_by_id(&ctx.db, agent_id).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => return Err(format!("agent {agent_id} not found")),
+        Err(e) => return Err(format!("agent lookup failed: {e}")),
+    };
+    // Counted before any other work, as for transcribe.
+    if !ctx.video_rate.admit(agent.owner_id).await {
+        return Err(format!(
+            "this user's agents have asked about {} videos in the last minute; wait and retry",
+            crate::video::TOOL_PER_USER_PER_MINUTE
+        ));
+    }
+    // Set since the tool was offered, or not any more.
+    let Some(how) = (**ctx.video.load()).clone() else {
+        return Err("this gateway does not watch videos: its operator has not set [video]".into());
+    };
+    let asked = crate::video::asked(&call.input)?;
+    let workspace = ctx
+        .workspace_root
+        .join(agent_id.to_string())
+        .join("workspace");
+    let models = ctx.models.load();
+    let gateway = crate::transcribe::Gateway {
+        db: &ctx.db,
+        http: &ctx.http,
+        keyring: ctx.keyring.as_ref(),
+        llm: &ctx.llm,
+        models: &models,
+        multi_user: ctx.multi_user,
+    };
+    // Waiting for a turn counts within the limit too.
+    let watched = tokio::time::timeout(
+        crate::video::TOOL_DEADLINE,
+        crate::video::run_tool(gateway, &agent, &how, workspace, &asked),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(format!(
+            "the video model took longer than {}s: ask about a shorter video, or a part cut \
+             out of it",
+            crate::video::TOOL_DEADLINE.as_secs()
+        ))
+    });
+    let details = match &watched {
+        Ok(watched) => serde_json::json!({
+            "path": asked.path,
+            "start": asked.start,
+            "end": asked.end,
+            "media_type": watched.media_type,
+            "bytes": watched.bytes,
+            "chars": watched.text.chars().count(),
+        }),
+        Err(message) => serde_json::json!({
+            "path": asked.path,
+            "start": asked.start,
+            "end": asked.end,
+            "error": message,
+        }),
+    };
+    crate::audit::record(
+        &ctx.db,
+        agent.owner_id,
+        agent.team_id,
+        Some(agent_id),
+        "video.watch",
+        details,
+    )
+    .await;
+    watched.map(|watched| crate::video::told(&asked.path, &watched.text))
 }
 
 /// `secret_request` (issue #233): the agent asks its owner for a secret it
@@ -4471,6 +4561,10 @@ mod tests {
             transcribe_rate: Arc::new(crate::web_search::UserRate::new(
                 crate::transcribe::TOOL_PER_USER_PER_MINUTE,
             )),
+            video: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+            video_rate: Arc::new(crate::web_search::UserRate::new(
+                crate::video::TOOL_PER_USER_PER_MINUTE,
+            )),
         }
     }
 
@@ -4780,6 +4874,254 @@ mod tests {
         assert_eq!(
             counted, 2,
             "the one heard and the one that failed after it was sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_video_sends_the_agent_s_own_video_and_its_question() {
+        let mut ctx = ctx_with(false, false).await;
+        ctx.video_rate = Arc::new(crate::web_search::UserRate::new(100));
+        let root = tempfile::tempdir().expect("tempdir");
+        ctx.workspace_root = root.path().to_path_buf();
+        let owner = create_user(&ctx.db, NewUser { display_name: "o" })
+            .await
+            .expect("user")
+            .id;
+        let (agent, _rx) = connected_agent(&ctx, owner, "a", serde_json::json!({})).await;
+        let workspace = root.path().join(agent.to_string()).join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(
+            workspace.join("talk.webm"),
+            b"\x1a\x45\xdf\xa3\x42\x82webm\x16\x54\xaeV_VP9 frames",
+        )
+        .expect("video");
+        let mut big = b"\0\0\0\x20ftypisom\0\0\x02\0".to_vec();
+        big.resize(1024 * 1024 + 1, 0);
+        std::fs::write(workspace.join("big.mp4"), big).expect("big");
+        std::fs::write(workspace.join("voice.m4a"), b"\0\0\0\x20ftypM4A \0\0").expect("audio");
+        std::fs::write(workspace.join("clip.mkv"), b"\x1a\x45\xdf\xa3matroska").expect("mkv");
+        std::fs::write(root.path().join("secret.webm"), b"\x1a\x45\xdf\xa3webm").expect("secret");
+        std::os::unix::fs::symlink(root.path().join("secret.webm"), workspace.join("link.webm"))
+            .expect("link");
+        let call = |input: serde_json::Value| GatewayToolCall {
+            request_id: "v1".into(),
+            name: crate::video::TOOL_NAME.into(),
+            input,
+            conversation: None,
+            chat: None,
+            sender: None,
+            from_owner: true,
+            in_group: false,
+        };
+        let asking = |path: &str| {
+            call(serde_json::json!({
+                "path": path, "question": "What does the first run print?", "start": "0:30"
+            }))
+        };
+        let names =
+            |tools: Vec<GatewayToolSpec>| tools.into_iter().map(|t| t.name).collect::<Vec<_>>();
+        let row = agents_repo::find_by_id(&ctx.db, agent)
+            .await
+            .expect("lookup")
+            .expect("agent");
+        let policy = policy_resolver::for_session(&ctx.db, &row, false).await;
+
+        // Not offered, and refused, without [video].
+        assert!(
+            !names(gateway_tools_for(&ctx, &row, &policy).await)
+                .contains(&"watch_video".to_string())
+        );
+        let off = run_gateway_tool(agent, &asking("talk.webm"), &ctx).await;
+        assert!(off.expect_err("off").contains("does not watch videos"));
+
+        // A model that takes video, at an OpenRouter that answers.
+        let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post({
+                let seen = Arc::clone(&seen);
+                move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    seen.lock().expect("seen").push(body);
+                    axum::Json(serde_json::json!({
+                        "choices": [{"message": {"content": "It prints 43.199999999999996, at 00:42."},
+                            "finish_reason": "stop"}],
+                        "model": "google/gemini-3.8-flash",
+                        "usage": {"prompt_tokens": 1200, "completion_tokens": 12}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let ring = crate::keyring::KeyRing::from_passphrase("video-tests");
+        havn_db::repo::credentials::create(
+            &ctx.db,
+            havn_db::repo::credentials::NewCredential {
+                scope: havn_db::repo::credentials::CredentialScope::User,
+                scope_id: &owner.to_string(),
+                provider: "llm:openrouter",
+                name: None,
+                api_key_ciphertext: &ring.encrypt(b"key-1").expect("encrypt"),
+                priority: 0,
+                limits: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("credential");
+        ctx.keyring = Some(ring);
+        let mut llm = crate::config::LlmConfig::default();
+        llm.base_url.insert("openrouter".into(), base);
+        ctx.llm = Arc::new(llm);
+        let entry = |id: &str| crate::model_catalog::ModelEntry {
+            id: id.into(),
+            label: None,
+            max_output_tokens: None,
+            vision: None,
+            thinking: None,
+            context_window: None,
+            fallback: Vec::new(),
+            price: None,
+        };
+        ctx.models
+            .store(Arc::new(crate::model_catalog::ModelCatalog {
+                default_model: None,
+                title_model: None,
+                models: vec![
+                    entry("openrouter:google/gemini-3.8-flash"),
+                    entry("anthropic:claude-x"),
+                ],
+            }));
+        ctx.video.store(Arc::new(Some(crate::video::Video::Model {
+            model: "openrouter:google/gemini-3.8-flash".into(),
+            max_mb: 1,
+        })));
+        assert!(
+            names(gateway_tools_for(&ctx, &row, &policy).await)
+                .contains(&"watch_video".to_string())
+        );
+        let answer = run_gateway_tool(agent, &asking("talk.webm"), &ctx)
+            .await
+            .expect("answer");
+        assert!(
+            answer.starts_with("What the video model answered about \"talk.webm\""),
+            "{answer}"
+        );
+        assert!(
+            answer.ends_with("It prints 43.199999999999996, at 00:42."),
+            "{answer}"
+        );
+        {
+            let seen = seen.lock().expect("seen");
+            assert_eq!(seen.len(), 1, "one request");
+            assert_eq!(seen[0]["model"], "google/gemini-3.8-flash");
+            let parts = seen[0]["messages"][0]["content"].as_array().expect("parts");
+            assert!(
+                parts[0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("from 00:30 on")
+                        && t.ends_with("Question: What does the first run print?")),
+                "{parts:?}"
+            );
+            assert_eq!(parts[1]["type"], "video_url");
+            assert!(
+                parts[1]["video_url"]["url"]
+                    .as_str()
+                    .is_some_and(|u| u.starts_with("data:video/webm;base64,GkXfo0KCd2Vib")),
+                "{}",
+                parts[1]
+            );
+        }
+        // Counted against the agent's budget, on its owner's key.
+        let used: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT provider, model, tokens_in FROM credential_usages WHERE agent_id = ?1",
+        )
+        .bind(agent.to_string())
+        .fetch_all(&ctx.db)
+        .await
+        .expect("usage");
+        assert_eq!(
+            used,
+            [(
+                "openrouter".to_string(),
+                "google/gemini-3.8-flash".to_string(),
+                1200
+            )]
+        );
+
+        // Nothing through a link, outside the workspace, over the size
+        // limit, or not a video this sends; nothing read without a question.
+        for (input, why) in [
+            (asking("link.webm"), "cannot be read"),
+            (asking("../secret.webm"), "not a path inside your workspace"),
+            (asking("big.mp4"), "of at most 1 MB"),
+            (asking("voice.m4a"), "is audio"),
+            (asking("clip.mkv"), "convert it first"),
+            (
+                call(serde_json::json!({"path": "talk.webm"})),
+                "missing required field: question",
+            ),
+            (
+                call(serde_json::json!({
+                    "path": "talk.webm", "question": "q", "start": "2:00", "end": "1:00"
+                })),
+                "must come before",
+            ),
+        ] {
+            let refused = run_gateway_tool(agent, &input, &ctx)
+                .await
+                .expect_err(&input.input.to_string());
+            assert!(refused.contains(why), "{}: {refused}", input.input);
+        }
+        // A model that takes no video is not sent one.
+        ctx.video.store(Arc::new(Some(crate::video::Video::Model {
+            model: "anthropic:claude-x".into(),
+            max_mb: 20,
+        })));
+        let refused = run_gateway_tool(agent, &asking("talk.webm"), &ctx)
+            .await
+            .expect_err("anthropic");
+        assert!(refused.contains("cannot be sent a video"), "{refused}");
+        assert_eq!(seen.lock().expect("seen").len(), 1, "nothing more was sent");
+        let audited: Vec<String> =
+            sqlx::query_scalar("SELECT details FROM audit_log WHERE action = 'video.watch'")
+                .fetch_all(&ctx.db)
+                .await
+                .expect("audit");
+        // The answer, five files refused and the model that takes no video;
+        // inputs refused before anything was read are not.
+        assert_eq!(audited.len(), 7, "{audited:?}");
+        assert!(
+            audited[0].contains("\"media_type\":\"video/webm\"")
+                && audited[0].contains("\"start\":30"),
+            "{}",
+            audited[0]
+        );
+
+        // A user's agents ask about so many videos a minute.
+        ctx.video_rate = Arc::new(crate::web_search::UserRate::new(1));
+        let _ = run_gateway_tool(agent, &asking("talk.webm"), &ctx).await;
+        let limited = run_gateway_tool(agent, &asking("talk.webm"), &ctx)
+            .await
+            .expect_err("limited");
+        assert!(limited.contains("in the last minute"), "{limited}");
+
+        // A policy that keeps the agent from transcribing keeps videos
+        // from leaving too.
+        let mut p = Policy::default();
+        p.permissions.can_transcribe = Some(false);
+        let (denied, _rx2) =
+            connected_agent(&ctx, owner, "b", serde_json::json!({ "policy": p })).await;
+        let denied_row = agents_repo::find_by_id(&ctx.db, denied)
+            .await
+            .expect("lookup")
+            .expect("agent");
+        let denied_policy = policy_resolver::for_session(&ctx.db, &denied_row, false).await;
+        assert!(
+            !names(gateway_tools_for(&ctx, &denied_row, &denied_policy).await)
+                .contains(&"watch_video".to_string())
         );
     }
 
