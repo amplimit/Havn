@@ -157,11 +157,14 @@ pub fn asked(input: &serde_json::Value) -> Result<Asked, String> {
             .map(str::trim)
             .filter(|s| !s.is_empty())
     };
+    // A path is taken whole or not at all: the hook rules the runtime
+    // checked saw all of it.
     let path: String = text("path")
         .ok_or("missing required field: path")?
-        .chars()
-        .take(1024)
-        .collect();
+        .to_string();
+    if path.chars().count() > 1024 {
+        return Err("the path is over 1024 characters".into());
+    }
     let question = text("question").ok_or("missing required field: question")?;
     if question.chars().count() > MAX_QUESTION_CHARS {
         return Err(format!(
@@ -655,6 +658,10 @@ mod tests {
             (
                 json!({"path": "a.mp4", "question": "x".repeat(MAX_QUESTION_CHARS + 1)}),
                 "over 2000 characters",
+            ),
+            (
+                json!({"path": format!("./private/a.mp4{}/..", " ".repeat(1009)), "question": "q"}),
+                "the path is over 1024 characters",
             ),
             (
                 json!({"path": "a.mp4", "question": "q", "start": "2:00", "end": "1:00"}),

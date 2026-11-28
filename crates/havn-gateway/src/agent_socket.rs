@@ -2250,14 +2250,17 @@ async fn run_transcribe(
                 .into(),
         );
     };
+    // A path is taken whole or not at all: the hook rules the runtime
+    // checked saw all of it.
     let path: String = call
         .input
         .get("path")
         .and_then(serde_json::Value::as_str)
         .ok_or("missing required field: path")?
-        .chars()
-        .take(1024)
-        .collect();
+        .to_string();
+    if path.chars().count() > 1024 {
+        return Err("the path is over 1024 characters".into());
+    }
     let workspace = ctx
         .workspace_root
         .join(agent_id.to_string())
