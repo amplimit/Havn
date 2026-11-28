@@ -742,25 +742,13 @@ pub async fn chat_delete(
     havn_db::repo::cron::forget_chat(&state.db, agent.id, &conversation).await?;
     // The files it carried go with it (issue #229): those the person sent,
     // which the runtime removed as it told that no other chat names them
-    // (issue #322), and those the agent sent; and the images its tools
-    // showed (issue #354).
-    let outbox = crate::outbox::dir(&state.workspace_root, agent.id);
-    let kept = crate::llm_proxy::KeptImages::of(
-        &state.workspace_root,
-        agent.id,
-        Some(conversation.clone()),
-    );
-    let chat = conversation.clone();
-    let sent = tokio::task::spawn_blocking(move || {
-        kept.forget();
-        let sent = crate::outbox::list(&outbox, Some(&chat), usize::MAX);
-        for file in &sent {
-            crate::outbox::remove(&outbox, &file.id);
-        }
-        sent.len()
-    })
-    .await
-    .unwrap_or(0);
+    // (issue #322), and those the agent sent.
+    let root = state.workspace_root.clone();
+    let (agent_id, channel, chat) = (agent.id, session(&user, agent.id), conversation.clone());
+    let sent =
+        tokio::task::spawn_blocking(move || forget_chat_files(&root, agent_id, &channel, &chat))
+            .await
+            .unwrap_or(0);
     let named = deleted.removed + sent;
     crate::audit::record_agent_action(
         &state.db,
@@ -771,6 +759,24 @@ pub async fn chat_delete(
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Remove what chat `chat` of conversation `channel` of agent `agent` left
+/// with the gateway: the files the agent sent to it, and the images its
+/// tools showed in it (issue #354). How many files. Blocking.
+fn forget_chat_files(
+    workspace_root: &std::path::Path,
+    agent: havn_core::AgentId,
+    channel: &str,
+    chat: &str,
+) -> usize {
+    crate::llm_proxy::KeptImages::of(workspace_root, agent).forget(channel, chat);
+    let outbox = crate::outbox::dir(workspace_root, agent);
+    let sent = crate::outbox::list(&outbox, Some(chat), usize::MAX);
+    for file in &sent {
+        crate::outbox::remove(&outbox, &file.id);
+    }
+    sent.len()
 }
 
 fn role_str(r: Role) -> &'static str {
@@ -941,6 +947,64 @@ mod scope_tests {
         assert_eq!(
             scope_of(&state, &me, agent, None).await.unwrap(),
             session(&me, agent)
+        );
+    }
+
+    #[test]
+    fn a_deleted_chat_takes_the_files_sent_to_it_and_the_images_shown_in_it() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = havn_core::AgentId::new();
+        let ws = root.path().join(agent.to_string()).join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("report.txt"), b"report").unwrap();
+        std::fs::write(ws.join("chart.png"), b"\x89PNG\r\n\x1a\nchart").unwrap();
+        let outbox = crate::outbox::dir(root.path(), agent);
+        for chat in ["c1", "c2"] {
+            crate::outbox::send(&ws, &outbox, "report.txt", None, "web", Some(chat)).unwrap();
+        }
+        let kept = crate::llm_proxy::KeptImages::of(root.path(), agent);
+        let show = |key: &str, chat: &str| {
+            let mut request: crate::llm_proxy::AnthropicRequest =
+                serde_json::from_value(serde_json::json!({
+                    "model": "m",
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "call_0", "content": [
+                            {"type": "image", "source": {
+                                "type": "workspace", "path": "chart.png", "key": key,
+                                "channel": "web", "chat": chat,
+                            }},
+                        ]},
+                    ]}],
+                }))
+                .unwrap();
+            crate::llm_proxy::resolve_workspace_images(
+                &mut request,
+                &ws,
+                true,
+                &Default::default(),
+                &|_| Err(String::new()),
+                Some(&kept),
+            );
+            request.messages[0].content[0]["content"][0].clone()
+        };
+        show("k1", "c1");
+        show("k2", "c2");
+        let files = |dir: &std::path::Path| std::fs::read_dir(dir).unwrap().count();
+        assert_eq!(files(&kept.dir), 4, "two images, each with its mark");
+
+        assert_eq!(forget_chat_files(root.path(), agent, "web", "c1"), 1);
+        assert_eq!(files(&kept.dir), 2, "the other chat's image stays");
+        assert_eq!(crate::outbox::list(&outbox, None, 10).len(), 1);
+        // Its image is gone from the gateway; the other chat's is shown on.
+        std::fs::remove_file(ws.join("chart.png")).unwrap();
+        assert_eq!(show("k2", "c2")["type"], "image");
+        let gone = show("k1", "c1");
+        assert!(
+            gone["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("removed before it could be shown")),
+            "{gone}"
         );
     }
 }
