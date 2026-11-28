@@ -1204,7 +1204,8 @@ pub struct Seen {
 }
 
 /// Send `request` (by `send`) with the images its turn names in
-/// `workspace` shown when `show`, fitted to a context window of `context`
+/// `workspace` shown when `show`, those of tools' results as `kept` keeps
+/// them once shown, fitted to a context window of `context`
 /// tokens ([`fit_context`]). A request the provider refuses as too long
 /// goes once more, fitted tighter. With `retry_blind`, a request that
 /// showed images and was refused outright goes once more with each image a
@@ -1214,6 +1215,7 @@ pub struct Seen {
 pub async fn send_seeing<F, Fut>(
     request: AnthropicRequest,
     workspace: std::path::PathBuf,
+    kept: Option<KeptImages>,
     limits: crate::config::AttachmentLimits,
     context: u32,
     show: bool,
@@ -1237,7 +1239,14 @@ where
         // it has images to leave out.
         let blind =
             (show && retry_blind && names_workspace_images(&request)).then(|| request.clone());
-        resolve_workspace_images(&mut request, &workspace, show, &limits, &shrink);
+        resolve_workspace_images(
+            &mut request,
+            &workspace,
+            show,
+            &limits,
+            &shrink,
+            kept.as_ref(),
+        );
         // Kept for a second try, fitted tighter, when the provider finds it
         // too long after all: only one that comes near the window can be.
         let near = context_tokens(&request) * 2 > window_budget(&request, context, FIT_SHARE);
@@ -1287,6 +1296,7 @@ where
         false,
         &limits_blind,
         &|_| Err(String::new()),
+        None,
     );
     trimmed |= fit_context(&mut blind, context, FIT_SHARE);
     match send(blind).await {
@@ -1582,23 +1592,30 @@ pub fn too_long(e: &ProxyError) -> bool {
 /// as that copy. Every other one (not a PNG, JPEG, GIF or WebP by its first
 /// bytes, too large, missing, not a path in the workspace, one too many) becomes a
 /// line saying why. A file of the workspace a model cannot be shown as it
-/// is goes as the copy `shrink` makes of it. Blocking: it reads files. See
-/// [`send_seeing`] for a model that may not take them.
+/// is goes as the copy `shrink` makes of it. An image of a tool's result
+/// whose reference carries the key the runtime made for it is shown from
+/// its first showing on as `kept` keeps it, whatever became of its file
+/// (issue #354). Blocking: it reads files. See [`send_seeing`] for a model
+/// that may not take them.
 pub fn resolve_workspace_images(
     request: &mut AnthropicRequest,
     workspace: &std::path::Path,
     vision: bool,
     limits: &crate::config::AttachmentLimits,
     shrink: &dyn Fn(&[u8]) -> Result<Vec<u8>, String>,
+    kept: Option<&KeptImages>,
 ) {
     let mut inbox: Option<std::io::Result<Option<crate::agent_files::WorkspaceDir>>> = None;
-    // What each path gave, so a path named again is not read again; apart
-    // for a tool's result, which may name any file of the workspace.
+    // What each reference gave, so one named again is not read again: a
+    // message's by its path, a tool's result's by its key, chat and path,
+    // as it may name any file of the workspace.
     let mut seen: std::collections::HashMap<
-        (bool, String),
+        (Option<String>, String),
         Result<(serde_json::Value, u64), String>,
     > = std::collections::HashMap::new();
     let (mut count, mut total) = (0_usize, 0_u64);
+    // What `kept` keeps is pruned once a request, before it keeps more.
+    let mut pruned = false;
     // The newest messages first: past a limit, the oldest images are left
     // out.
     let mut one = |block: &mut serde_json::Value, nested: bool| {
@@ -1615,7 +1632,15 @@ pub fn resolve_workspace_images(
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let key = (nested, path.clone());
+        let image_key = nested.then(|| ImageKey::of(&block["source"])).flatten();
+        let key = (
+            nested.then(|| {
+                image_key.as_ref().map_or_else(String::new, |k| {
+                    serde_json::json!([k.key, k.channel, k.chat]).to_string()
+                })
+            }),
+            path.clone(),
+        );
         // Every block counts, a repeat of one shown too: each is a copy
         // of its bytes in the request.
         let result = if !vision {
@@ -1637,17 +1662,30 @@ pub fn resolve_workspace_images(
             }
         } else {
             let room = limits.image_bytes.saturating_sub(total);
-            let read = if havn_core::Attachment::in_inbox(&path) {
-                let dir = inbox.get_or_insert_with(|| {
-                    crate::agent_files::WorkspaceDir::open(workspace)
-                        .and_then(|root| root.subdir(havn_core::INBOX_DIR))
-                });
-                image_block(dir, &path, room)
-            } else if nested {
-                workspace_image_block(workspace, &path, room, shrink)
-            } else {
-                Err("it is not a file of the inbox".to_string())
+            let mut read = || {
+                if havn_core::Attachment::in_inbox(&path) {
+                    let dir = inbox.get_or_insert_with(|| {
+                        crate::agent_files::WorkspaceDir::open(workspace)
+                            .and_then(|root| root.subdir(havn_core::INBOX_DIR))
+                    });
+                    inbox_image(dir, &path, room)
+                } else if nested {
+                    workspace_image(workspace, &path, room, shrink)
+                } else {
+                    Err("it is not a file of the inbox".to_string())
+                }
             };
+            let read = match (kept, &image_key) {
+                (Some(kept), Some(image_key)) => {
+                    if !pruned {
+                        kept.prune();
+                        pruned = true;
+                    }
+                    kept.shown_as(image_key, room, read)
+                }
+                _ => read(),
+            }
+            .map(|bytes| (image_of(&bytes), bytes.len() as u64));
             seen.insert(key, read.clone());
             read.map(|(image, size)| {
                 total += size;
@@ -1835,13 +1873,13 @@ fn file_text(
     }
 }
 
-/// The image at `path` as a block, and its size, if it is at most
-/// `room` bytes.
-fn image_block(
+/// The bytes of the image at `path` of the inbox, if it is at most `room`
+/// bytes and can be shown.
+fn inbox_image(
     inbox: &std::io::Result<Option<crate::agent_files::WorkspaceDir>>,
     path: &str,
     room: u64,
-) -> Result<(serde_json::Value, u64), String> {
+) -> Result<Vec<u8>, String> {
     if !havn_core::Attachment::in_inbox(path) {
         return Err("it is not a file of the inbox".into());
     }
@@ -1867,7 +1905,7 @@ fn image_block(
         Some(Ok(Some(copy))) => Ok(Some(copy)),
         _ => original,
     };
-    block_of(read, limit)
+    showable(read, limit)
 }
 
 /// What [`SHRUNK`] knows a copy by: the workspace, so one agent's images
@@ -1925,17 +1963,17 @@ fn shrunk(
     copy
 }
 
-/// [`image_block`] for a file of the workspace outside the inbox, at
+/// [`inbox_image`] for a file of the workspace outside the inbox, at
 /// `path` (`/`-separated, relative to the workspace root), read through
 /// [`crate::agent_files`] so no link is followed. One a model cannot be
 /// shown as it is (too large, HEIC) goes as the copy `shrink` makes of it
 /// (issue #227); nothing is written.
-fn workspace_image_block(
+fn workspace_image(
     workspace: &std::path::Path,
     path: &str,
     room: u64,
     shrink: &dyn Fn(&[u8]) -> Result<Vec<u8>, String>,
-) -> Result<(serde_json::Value, u64), String> {
+) -> Result<Vec<u8>, String> {
     let parts: Vec<&str> = path.split('/').collect();
     let Some((name, dirs)) = parts.split_last() else {
         return Err("it is not a path in the workspace".into());
@@ -1951,14 +1989,14 @@ fn workspace_image_block(
     for part in dirs {
         dir = match dir.subdir(part) {
             Ok(Some(sub)) => sub,
-            Ok(None) => return Err("it is not there any more".into()),
+            Ok(None) => return Err(GONE.into()),
             Err(e) => return Err(format!("it cannot be read ({e})")),
         };
     }
     let most = crate::api::files::MAX_UPLOAD_BYTES as u64;
     let original = match dir.read_bytes(name, most) {
         Ok(Some(bytes)) => bytes,
-        Ok(None) => return Err("it is not there any more".into()),
+        Ok(None) => return Err(GONE.into()),
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
             return Err(format!("it is over {most} bytes"));
         }
@@ -1977,23 +2015,27 @@ fn workspace_image_block(
     } else {
         original
     };
-    let read = if bytes.len() as u64 > limit {
+    showable(within(bytes, limit), limit)
+}
+
+/// `bytes` as read up to `limit` bytes.
+fn within(bytes: Vec<u8>, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+    if bytes.len() as u64 > limit {
         Err(std::io::Error::from(std::io::ErrorKind::InvalidData))
     } else {
         Ok(Some(bytes))
-    };
-    block_of(read, limit)
+    }
 }
 
-/// The image block of `read`, a file read up to `limit` bytes, or why it
-/// is not shown.
-fn block_of(
-    read: std::io::Result<Option<Vec<u8>>>,
-    limit: u64,
-) -> Result<(serde_json::Value, u64), String> {
+/// Why an image is not shown when its file is not there.
+const GONE: &str = "it is not there any more";
+
+/// The bytes of `read`, a file read up to `limit` bytes, if they are an
+/// image a model can be shown, or why not.
+fn showable(read: std::io::Result<Option<Vec<u8>>>, limit: u64) -> Result<Vec<u8>, String> {
     let bytes = match read {
         Ok(Some(bytes)) => bytes,
-        Ok(None) => return Err("it is not there any more".into()),
+        Ok(None) => return Err(GONE.into()),
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData && limit < MAX_IMAGE_BYTES => {
             return Err("the images of this chat are too large together".into());
         }
@@ -2002,7 +2044,9 @@ fn block_of(
         }
         Err(e) => return Err(format!("it cannot be read ({e})")),
     };
-    let media_type = image_type(&bytes).ok_or("it is not a PNG, JPEG, GIF or WebP image")?;
+    if image_type(&bytes).is_none() {
+        return Err("it is not a PNG, JPEG, GIF or WebP image".into());
+    }
     if let Some((width, height)) = image_size(&bytes)
         && width.max(height) > MAX_IMAGE_SIDE
     {
@@ -2010,14 +2054,325 @@ fn block_of(
             "it is {width}x{height} pixels, over {MAX_IMAGE_SIDE} on a side"
         ));
     }
-    let size = bytes.len() as u64;
-    Ok((
-        serde_json::json!({
-            "type": "image",
-            "source": {"type": "base64", "media_type": media_type, "data": base64(&bytes)},
-        }),
-        size,
-    ))
+    Ok(bytes)
+}
+
+/// The block showing `bytes`, an image [`showable`] passed.
+fn image_of(bytes: &[u8]) -> serde_json::Value {
+    let media_type = image_type(bytes).unwrap_or("image/png");
+    serde_json::json!({
+        "type": "image",
+        "source": {"type": "base64", "media_type": media_type, "data": base64(bytes)},
+    })
+}
+
+/// Why an image of a tool's result is not shown when its file was gone
+/// before any request showed it (issue #354).
+const UNSHOWN: &str = "it was removed before it could be shown";
+
+/// An image of a tool's result as its reference names it (issue #354): by
+/// the key the runtime made for it when the tool ran, which no other image
+/// has (a call's id may: providers number them anew), and the conversation
+/// (`channel_id`) and chat it was shown in.
+#[derive(Debug, Clone)]
+struct ImageKey {
+    key: String,
+    channel: Option<String>,
+    chat: Option<String>,
+}
+
+/// Characters of a key, and of a conversation or chat, an image reference
+/// names at most.
+const MAX_IMAGE_KEY_CHARS: usize = 64;
+const MAX_IMAGE_CHAT_CHARS: usize = 1024;
+
+impl ImageKey {
+    /// The key `source`, an image reference's, names, if it names one.
+    fn of(source: &serde_json::Value) -> Option<Self> {
+        let key = source.get("key").and_then(serde_json::Value::as_str)?;
+        if key.is_empty()
+            || key.len() > MAX_IMAGE_KEY_CHARS
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return None;
+        }
+        let named = |field: &str| {
+            source
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| s.len() <= MAX_IMAGE_CHAT_CHARS)
+                .map(str::to_string)
+        };
+        Some(Self {
+            key: key.to_string(),
+            channel: named("channel"),
+            chat: named("chat"),
+        })
+    }
+}
+
+/// What the first request that came to an image of a tool's result found
+/// (issue #354): its file, shown, or none; and where it was shown.
+#[derive(Debug, Serialize, Deserialize)]
+struct Mark {
+    shown: bool,
+    channel: Option<String>,
+    chat: Option<String>,
+}
+
+/// Where the gateway keeps the images tools' results showed an agent
+/// (issue #354), next to its workspace in the directory only the gateway
+/// enters: an image shown once is shown as it was, whatever the agent did
+/// with its file since. Each is kept by its key, as a mark of what the
+/// first request that came to it found and the bytes that request sent.
+#[derive(Debug, Clone)]
+pub struct KeptImages {
+    pub dir: std::path::PathBuf,
+}
+
+/// What an agent's kept images take at most, in bytes and images, and for
+/// how many days one not shown since is kept: a day, as no image outlives
+/// the turn that showed it (a stored turn names it in a line instead). A
+/// request keeps its images past them until the next one prunes.
+#[cfg(not(test))]
+const KEPT_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(test)]
+const KEPT_IMAGE_BYTES: u64 = 4 * 1024;
+#[cfg(not(test))]
+const KEPT_IMAGES: usize = 2000;
+#[cfg(test)]
+const KEPT_IMAGES: usize = 4;
+const KEPT_IMAGE_DAYS: u64 = 1;
+/// Free space keeping an image leaves on the filesystem at least.
+const KEPT_IMAGE_FREE_BYTES: u64 = 1024 * 1024 * 1024;
+
+impl KeptImages {
+    /// Agent `agent`'s.
+    #[must_use]
+    pub fn of(workspace_root: &std::path::Path, agent: AgentId) -> Self {
+        Self {
+            dir: workspace_root.join(agent.to_string()).join("shown"),
+        }
+    }
+
+    /// The name image `key` is kept by.
+    fn name(key: &str) -> String {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(key)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn mark(&self, name: &str) -> Option<Mark> {
+        let bytes = std::fs::read(self.dir.join(format!("{name}.json"))).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Note image `name` as shown now: it is kept as long again.
+    fn touch(&self, name: &str) {
+        for file in [self.dir.join(name), self.dir.join(format!("{name}.json"))] {
+            let _ = std::fs::File::options()
+                .write(true)
+                .open(file)
+                .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        }
+    }
+
+    /// The bytes image `image` is shown as, of at most `room`: those kept
+    /// when a request first showed it, else what `read` reads of its file
+    /// now, kept for the requests after. One whose file the first request
+    /// found gone says so from then on.
+    fn shown_as(
+        &self,
+        image: &ImageKey,
+        room: u64,
+        read: impl FnOnce() -> Result<Vec<u8>, String>,
+    ) -> Result<Vec<u8>, String> {
+        let name = Self::name(&image.key);
+        match self.mark(&name) {
+            // Named in another chat: its file as it is, nothing kept.
+            Some(mark) if mark.channel != image.channel || mark.chat != image.chat => read(),
+            Some(mark) if !mark.shown => {
+                self.touch(&name);
+                Err(UNSHOWN.into())
+            }
+            Some(_) => {
+                if let Ok(bytes) = std::fs::read(self.dir.join(&name)) {
+                    self.touch(&name);
+                    let limit = MAX_IMAGE_BYTES.min(room);
+                    return showable(within(bytes, limit), limit);
+                }
+                // Its bytes were let go to keep within bounds.
+                let read = read();
+                if let Ok(bytes) = &read {
+                    self.keep(&name, image, Some(bytes));
+                }
+                read
+            }
+            None => match read() {
+                Ok(bytes) => {
+                    self.keep(&name, image, Some(&bytes));
+                    Ok(bytes)
+                }
+                Err(why) if why == GONE && self.keep(&name, image, None) => Err(UNSHOWN.into()),
+                other => other,
+            },
+        }
+    }
+
+    /// Keep image `name` as shown as `bytes`, or as found gone; whether
+    /// its mark was written.
+    fn keep(&self, name: &str, image: &ImageKey, bytes: Option<&[u8]>) -> bool {
+        match self.write(name, image, bytes) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(dir = %self.dir.display(), error = %e, "an image shown could not be kept");
+                // A mark written without its bytes still says it was shown.
+                self.mark(name).is_some()
+            }
+        }
+    }
+
+    fn write(&self, name: &str, image: &ImageKey, bytes: Option<&[u8]>) -> std::io::Result<()> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let size = bytes.map_or(0, |b| b.len() as u64);
+        if size > KEPT_IMAGE_BYTES {
+            return Err(std::io::Error::other("it is larger than all images kept"));
+        }
+        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&self.dir)
+            && e.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(e);
+        }
+        // The root gateway leaves alone what the filesystem keeps for root.
+        crate::agent_files::WorkspaceDir::open(&self.dir)?
+            .require_free(size + KEPT_IMAGE_FREE_BYTES)?;
+        let mark = serde_json::to_vec(&Mark {
+            shown: bytes.is_some(),
+            channel: image.channel.clone(),
+            chat: image.chat.clone(),
+        })?;
+        // The mark first: an image whose bytes are not kept was shown all
+        // the same.
+        self.put(&format!("{name}.json"), &mark)?;
+        match bytes {
+            Some(bytes) => self.put(name, bytes),
+            None => Ok(()),
+        }
+    }
+
+    /// Write `bytes` as `name` whole: under a temporary name, on disk
+    /// before it is moved into place.
+    fn put(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let part = self
+            .dir
+            .join(format!("{name}.{}.part", uuid::Uuid::now_v7()));
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&part)
+            .and_then(|mut file| {
+                file.write_all(bytes)?;
+                file.sync_all()
+            })
+            .and_then(|()| std::fs::rename(&part, self.dir.join(name)));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&part);
+        }
+        written
+    }
+
+    /// Remove what was not shown for [`KEPT_IMAGE_DAYS`] and what a failed
+    /// write left, then the bytes of the images shown longest ago past
+    /// [`KEPT_IMAGE_BYTES`], and those images' marks too past
+    /// [`KEPT_IMAGES`]. Blocking.
+    pub fn prune(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
+        let kept_for = std::time::Duration::from_secs(KEPT_IMAGE_DAYS * 24 * 60 * 60);
+        let part_for = std::time::Duration::from_secs(60 * 60);
+        let (mut images, mut marks) = (Vec::new(), Vec::new());
+        for entry in entries.flatten().take(KEPT_IMAGES * 3 + 10) {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let age = meta
+                .modified()
+                .ok()
+                .and_then(|at| now.duration_since(at).ok())
+                .unwrap_or_default();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let part = name.ends_with(".part");
+            if age > kept_for || part && age > part_for {
+                let _ = std::fs::remove_file(entry.path());
+            } else if let Some(image) = name.strip_suffix(".json") {
+                marks.push((age, image.to_string()));
+            } else if !part {
+                images.push((age, name, meta.len()));
+            }
+        }
+        // Shown longest ago first.
+        images.sort_by_key(|(age, _, _)| std::cmp::Reverse(*age));
+        marks.sort_by_key(|(age, _)| std::cmp::Reverse(*age));
+        let mut used: u64 = images.iter().map(|(_, _, len)| len).sum();
+        for (_, name, len) in &images {
+            if used <= KEPT_IMAGE_BYTES {
+                break;
+            }
+            let _ = std::fs::remove_file(self.dir.join(name));
+            used -= len;
+        }
+        let over = marks.len().saturating_sub(KEPT_IMAGES);
+        for (_, name) in marks.iter().take(over) {
+            let _ = std::fs::remove_file(self.dir.join(format!("{name}.json")));
+            let _ = std::fs::remove_file(self.dir.join(name));
+        }
+    }
+
+    /// [`Self::prune`] what every agent under `workspace_root` keeps, as
+    /// the gateway starts: an agent that shows no more images has its kept
+    /// ones age out all the same. Blocking.
+    pub fn prune_all(workspace_root: &std::path::Path) {
+        let Ok(agents) = std::fs::read_dir(workspace_root) else {
+            return;
+        };
+        for agent in agents.flatten() {
+            let kept = Self {
+                dir: agent.path().join("shown"),
+            };
+            if kept.dir.is_dir() {
+                kept.prune();
+            }
+        }
+    }
+
+    /// Remove the images kept for chat `chat` of conversation `channel`,
+    /// deleted. Blocking.
+    pub fn forget(&self, channel: &str, chat: &str) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten().take(KEPT_IMAGES * 3 + 10) {
+            let file = entry.file_name().to_string_lossy().into_owned();
+            let Some(name) = file.strip_suffix(".json") else {
+                continue;
+            };
+            if self.mark(name).is_some_and(|mark| {
+                mark.channel.as_deref() == Some(channel) && mark.chat.as_deref() == Some(chat)
+            }) {
+                let _ = std::fs::remove_file(entry.path());
+                let _ = std::fs::remove_file(self.dir.join(name));
+            }
+        }
+    }
 }
 
 /// Width and height of the image `bytes` hold, when its header says.
@@ -2634,6 +2989,7 @@ mod tests {
             true,
             &crate::config::AttachmentLimits::default(),
             &shown_image,
+            None,
         );
         let blocks = request.messages[0].content.as_array().expect("blocks");
         // Every block counts, a repeat too: the same image a thousand
@@ -2929,7 +3285,7 @@ mod tests {
             images: 1,
             ..Default::default()
         };
-        resolve_workspace_images(&mut request, ws.path(), true, &limits, &shown_image);
+        resolve_workspace_images(&mut request, ws.path(), true, &limits, &shown_image, None);
         assert_eq!(request.messages[1].content[0]["type"], "image");
         let old = request.messages[0].content[0]["text"]
             .as_str()
@@ -3208,6 +3564,7 @@ mod tests {
             true,
             &Default::default(),
             &shown_image,
+            None,
         );
         let blocks = &request.messages[0].content;
         assert_eq!(blocks[0]["source"]["media_type"], "image/png");
@@ -3249,6 +3606,7 @@ mod tests {
             true,
             &Default::default(),
             &shown_image,
+            None,
         );
         let parts = &request.messages[0].content[0]["content"];
         assert_eq!(parts[0]["text"], "The image:");
@@ -3271,12 +3629,309 @@ mod tests {
             false,
             &Default::default(),
             &shown_image,
+            None,
         );
         let line = blind.messages[0].content[0]["content"][1]["text"]
             .as_str()
             .unwrap_or_default()
             .to_string();
         assert!(line.contains("cannot see images"), "{line}");
+    }
+
+    /// A reference to the image at `path` a tool's result shows, by `key`,
+    /// in chat `chat` of the conversation "web", as the runtime makes it.
+    fn keyed(path: &str, key: &str, chat: &str) -> serde_json::Value {
+        serde_json::json!({"type": "image", "source": {
+            "type": "workspace", "path": path, "key": key, "channel": "web", "chat": chat,
+        }})
+    }
+
+    fn tool_result(id: &str, image: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"type": "tool_result", "tool_use_id": id, "content": [image]})
+    }
+
+    #[test]
+    fn an_image_a_tool_showed_is_shown_as_kept_whatever_becomes_of_its_file() {
+        let ws = tempfile::tempdir().expect("tmp");
+        let root = tempfile::tempdir().expect("root");
+        std::fs::create_dir_all(ws.path().join("shots")).expect("shots");
+        std::fs::create_dir(ws.path().join("inbox")).expect("inbox");
+        let first = png(&noise(4, 4, u8::MAX));
+        let second = png(&noise(5, 5, u8::MAX));
+        std::fs::write(ws.path().join("shots/a.png"), &first).expect("a");
+        std::fs::write(ws.path().join("inbox/b.png"), &first).expect("b");
+        let refer = |path: &str| serde_json::json!({"type": "image", "source": {"type": "workspace", "path": path}});
+        let kept = KeptImages {
+            dir: root.path().join("shown"),
+        };
+        let resolve_with = |turns: Vec<Vec<serde_json::Value>>,
+                            limits: &crate::config::AttachmentLimits,
+                            kept: &KeptImages| {
+            let mut request = chat(turns);
+            resolve_workspace_images(
+                &mut request,
+                ws.path(),
+                true,
+                limits,
+                &shown_image,
+                Some(kept),
+            );
+            request
+        };
+        let resolve =
+            |turns: Vec<Vec<serde_json::Value>>| resolve_with(turns, &Default::default(), &kept);
+        let shown = |request: &AnthropicRequest, m: usize| {
+            request.messages[m].content[0]["content"][0].clone()
+        };
+        let data =
+            |request: &AnthropicRequest, m: usize| shown(request, m)["source"]["data"].clone();
+        let why =
+            |image: &serde_json::Value| image["text"].as_str().unwrap_or_default().to_string();
+
+        let request = resolve(vec![
+            vec![tool_result("call_0", keyed("shots/a.png", "k1", "c1"))],
+            vec![refer("inbox/b.png")],
+        ]);
+        assert_eq!(data(&request, 0), base64(&first));
+        assert_eq!(request.messages[1].content[0]["type"], "image");
+
+        // The agent removes the files: what the call showed is shown on, an
+        // image a message names is not, nor one of a reference without a
+        // key; one removed before any request came to it says so.
+        std::fs::remove_file(ws.path().join("shots/a.png")).expect("rm a");
+        std::fs::remove_file(ws.path().join("inbox/b.png")).expect("rm b");
+        let turns = || {
+            vec![
+                vec![tool_result("call_0", keyed("shots/a.png", "k1", "c1"))],
+                vec![refer("inbox/b.png")],
+                vec![tool_result("call_1", keyed("shots/gone.png", "k2", "c1"))],
+                vec![tool_result("call_2", refer("shots/a.png"))],
+            ]
+        };
+        let request = resolve(turns());
+        assert_eq!(data(&request, 0), base64(&first));
+        let inbox = why(&request.messages[1].content[0]);
+        assert!(inbox.contains("not there any more"), "{inbox}");
+        let gone = why(&shown(&request, 2));
+        assert!(gone.contains(UNSHOWN), "{gone}");
+        let unkeyed = why(&shown(&request, 3));
+        assert!(unkeyed.contains("not there any more"), "{unkeyed}");
+
+        // A provider's call ids repeat (Gemini's `gemini_call_0`, each
+        // answer anew): a later call of the same id and path, in this chat
+        // or another, shows what is there now, as does a key named in
+        // another chat than its own; the image first found gone stays so.
+        std::fs::write(ws.path().join("shots/a.png"), &second).expect("again");
+        std::fs::write(ws.path().join("shots/gone.png"), &second).expect("back");
+        let mut later = turns();
+        later.push(vec![tool_result(
+            "call_0",
+            keyed("shots/a.png", "k3", "c1"),
+        )]);
+        later.push(vec![tool_result(
+            "call_0",
+            keyed("shots/a.png", "k4", "c2"),
+        )]);
+        later.push(vec![tool_result(
+            "call_0",
+            keyed("shots/a.png", "k1", "c2"),
+        )]);
+        let request = resolve(later.clone());
+        assert_eq!(data(&request, 0), base64(&first));
+        assert!(why(&shown(&request, 2)).contains(UNSHOWN));
+        for m in 4..7 {
+            assert_eq!(data(&request, m), base64(&second), "{m}");
+        }
+        std::fs::remove_file(ws.path().join("shots/a.png")).expect("rm a");
+        let request = resolve(later.clone());
+        assert_eq!(data(&request, 0), base64(&first));
+        assert_eq!(data(&request, 4), base64(&second));
+        assert_eq!(data(&request, 5), base64(&second));
+        assert!(why(&shown(&request, 6)).contains("not there any more"));
+
+        // The limits count kept images as any other, the newest first.
+        let one = crate::config::AttachmentLimits {
+            images: 1,
+            ..Default::default()
+        };
+        let request = resolve_with(later, &one, &kept);
+        assert_eq!(data(&request, 5), base64(&second));
+        let old = why(&shown(&request, 0));
+        assert!(old.contains("the newest"), "{old}");
+
+        let mut blind = chat(turns());
+        resolve_workspace_images(
+            &mut blind,
+            ws.path(),
+            false,
+            &Default::default(),
+            &shown_image,
+            Some(&kept),
+        );
+        assert!(why(&shown(&blind, 0)).contains("cannot see images"));
+
+        // Where nothing can be kept, an image found gone is not said to
+        // have been removed before it was shown: that is not known.
+        let unkept = KeptImages {
+            dir: root.path().join("missing/shown"),
+        };
+        let request = resolve_with(
+            vec![vec![tool_result(
+                "call_0",
+                keyed("shots/a.png", "k5", "c1"),
+            )]],
+            &Default::default(),
+            &unkept,
+        );
+        assert!(why(&shown(&request, 0)).contains("not there any more"));
+
+        // A chat deleted takes its images, not another's.
+        let marked = |key: &str| kept.mark(&KeptImages::name(key)).is_some();
+        assert!(marked("k1") && marked("k2") && marked("k3") && marked("k4"));
+        kept.forget("web", "c1");
+        assert!(!marked("k1") && !marked("k2") && !marked("k3"));
+        assert!(!kept.dir.join(KeptImages::name("k1")).exists());
+        assert!(marked("k4"));
+        kept.forget("elsewhere", "c2");
+        assert!(marked("k4"), "the conversation is matched too");
+    }
+
+    #[test]
+    fn a_reference_s_key_is_taken_only_as_a_plain_name() {
+        let source = |key: serde_json::Value| serde_json::json!({"type": "workspace", "path": "a.png", "key": key});
+        assert!(ImageKey::of(&source(serde_json::json!("0193ab_c-D"))).is_some());
+        for bad in [
+            serde_json::json!(""),
+            serde_json::json!("../x"),
+            serde_json::json!("a b"),
+            serde_json::json!("x".repeat(65)),
+            serde_json::json!(7),
+        ] {
+            assert!(ImageKey::of(&source(bad.clone())).is_none(), "{bad}");
+        }
+        assert!(ImageKey::of(&serde_json::json!({"type": "workspace", "path": "a.png"})).is_none());
+    }
+
+    #[test]
+    fn kept_images_are_bounded_in_bytes_count_and_age() {
+        let root = tempfile::tempdir().expect("root");
+        let kept = KeptImages {
+            dir: root.path().join("shown"),
+        };
+        let image = |key: &str| ImageKey {
+            key: key.into(),
+            channel: None,
+            chat: None,
+        };
+        let keep =
+            |key: &str, bytes: &[u8]| kept.keep(&KeptImages::name(key), &image(key), Some(bytes));
+        let age = |key: &str, hours: u64| {
+            let at = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
+            let name = KeptImages::name(key);
+            for file in [kept.dir.join(&name), kept.dir.join(format!("{name}.json"))] {
+                if let Ok(file) = std::fs::File::options().write(true).open(file) {
+                    file.set_modified(at).expect("age");
+                }
+            }
+        };
+        let bytes = |key: &str| kept.dir.join(KeptImages::name(key)).exists();
+        let marked = |key: &str| kept.mark(&KeptImages::name(key)).is_some();
+        let large = vec![7_u8; 1500];
+        for (n, key) in ["a", "b", "c"].into_iter().enumerate() {
+            assert!(keep(key, &large));
+            age(key, 10 - n as u64);
+        }
+        // Past the bytes kept, those shown longest ago go, though it is
+        // still known they were shown.
+        kept.prune();
+        assert!(!bytes("a") && marked("a"));
+        assert!(bytes("b") && bytes("c"));
+
+        // Past the images kept, the oldest is forgotten.
+        assert!(keep("d", b"d"));
+        age("d", 2);
+        assert!(keep("e", b"e"));
+        age("e", 1);
+        kept.prune();
+        assert!(!marked("a"));
+        assert!(["b", "c", "d", "e"].iter().all(|k| marked(k)));
+
+        // One not shown for the days images are kept goes, and what a
+        // failed write left.
+        age("b", KEPT_IMAGE_DAYS * 24 + 1);
+        let part = kept.dir.join("x.part");
+        std::fs::write(&part, b"half").expect("part");
+        std::fs::File::options()
+            .write(true)
+            .open(&part)
+            .expect("open")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+            .expect("age");
+        kept.prune();
+        assert!(!marked("b") && !bytes("b"));
+        assert!(!part.exists());
+        assert!(["c", "d", "e"].iter().all(|k| marked(k)));
+
+        // None larger than all that is kept.
+        assert!(!keep("g", &[0_u8; 5000]));
+        assert!(!marked("g"));
+
+        // As the gateway starts, every agent's are pruned.
+        let other = root.path().join("agent/shown");
+        std::fs::create_dir_all(&other).expect("other");
+        std::fs::write(other.join("old.json"), b"{}").expect("old");
+        std::fs::File::options()
+            .write(true)
+            .open(other.join("old.json"))
+            .expect("open")
+            .set_modified(
+                std::time::SystemTime::now()
+                    - std::time::Duration::from_secs((KEPT_IMAGE_DAYS + 1) * 24 * 3600),
+            )
+            .expect("age");
+        KeptImages::prune_all(root.path());
+        assert!(!other.join("old.json").exists());
+    }
+
+    #[tokio::test]
+    async fn a_request_shows_an_image_kept_from_the_one_before() {
+        let ws = tempfile::tempdir().expect("tmp");
+        let root = tempfile::tempdir().expect("root");
+        let page = png(&noise(4, 4, u8::MAX));
+        std::fs::write(ws.path().join("page.png"), &page).expect("page");
+        let kept = KeptImages {
+            dir: root.path().join("shown"),
+        };
+        let sent = std::sync::Mutex::new(Vec::new());
+        for _ in 0..2 {
+            let mut request = picture_request(ws.path());
+            request.messages[0].content =
+                serde_json::json!([tool_result("call_0", keyed("page.png", "k1", "c1")),]);
+            let seen = send_seeing(
+                request,
+                ws.path().to_path_buf(),
+                Some(kept.clone()),
+                crate::config::AttachmentLimits::default(),
+                200_000,
+                true,
+                false,
+                |request| {
+                    sent.lock().expect("lock").push(request);
+                    std::future::ready(Ok(answer()))
+                },
+            )
+            .await
+            .expect("join");
+            assert!(seen.result.is_ok());
+            let _ = std::fs::remove_file(ws.path().join("page.png"));
+        }
+        let sent = sent.into_inner().expect("lock");
+        for request in &sent {
+            assert_eq!(
+                request.messages[0].content[0]["content"][0]["source"]["data"],
+                base64(&page)
+            );
+        }
     }
 
     #[test]
@@ -3340,7 +3995,14 @@ mod tests {
         };
         for _ in 0..2 {
             let mut request = chat(vec![vec![refer.clone()]]);
-            resolve_workspace_images(&mut request, ws.path(), true, &Default::default(), &shrink);
+            resolve_workspace_images(
+                &mut request,
+                ws.path(),
+                true,
+                &Default::default(),
+                &shrink,
+                None,
+            );
             let image = &request.messages[0].content[0]["content"][0];
             assert_eq!(image["type"], "image", "{image}");
             let data = image["source"]["data"].as_str().expect("data");
@@ -3355,7 +4017,14 @@ mod tests {
         let mut request = chat(vec![vec![
             serde_json::json!({"type": "image", "source": {"type": "workspace", "path": "page.png"}}),
         ]]);
-        resolve_workspace_images(&mut request, ws.path(), true, &Default::default(), &shrink);
+        resolve_workspace_images(
+            &mut request,
+            ws.path(),
+            true,
+            &Default::default(),
+            &shrink,
+            None,
+        );
         let line = request.messages[0].content[0]["text"]
             .as_str()
             .unwrap_or_default()
@@ -3379,6 +4048,7 @@ mod tests {
         let seen = send_seeing(
             request,
             ws.path().to_path_buf(),
+            None,
             crate::config::AttachmentLimits::default(),
             200_000,
             true,
@@ -3423,6 +4093,7 @@ mod tests {
         let seen = send_seeing(
             picture_request(ws.path()),
             ws.path().to_path_buf(),
+            None,
             crate::config::AttachmentLimits::default(),
             200_000,
             true,
@@ -3450,6 +4121,7 @@ mod tests {
             let seen = send_seeing(
                 picture_request(ws.path()),
                 ws.path().to_path_buf(),
+                None,
                 crate::config::AttachmentLimits::default(),
                 200_000,
                 show,
@@ -3471,6 +4143,7 @@ mod tests {
         let seen = send_seeing(
             picture_request(ws.path()),
             ws.path().to_path_buf(),
+            None,
             crate::config::AttachmentLimits::default(),
             200_000,
             true,
@@ -3496,6 +4169,7 @@ mod tests {
         let seen = send_seeing(
             picture_request(ws.path()),
             ws.path().to_path_buf(),
+            None,
             crate::config::AttachmentLimits::default(),
             200_000,
             true,
@@ -3520,6 +4194,7 @@ mod tests {
         let seen = send_seeing(
             picture_request(ws.path()),
             ws.path().to_path_buf(),
+            None,
             crate::config::AttachmentLimits::default(),
             200_000,
             true,
@@ -3621,6 +4296,7 @@ mod tests {
             true,
             &crate::config::AttachmentLimits::default(),
             &shown_image,
+            None,
         );
         let blocks = seen.messages[0].content.as_array().expect("blocks").clone();
         assert_eq!(blocks[1]["source"]["type"], "base64");
@@ -3643,6 +4319,7 @@ mod tests {
             false,
             &crate::config::AttachmentLimits::default(),
             &shown_image,
+            None,
         );
         let blocks = blind.messages[0].content.as_array().expect("blocks");
         assert!(

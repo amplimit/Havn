@@ -799,6 +799,13 @@ pub async fn delete(
     {
         warn!(agent_id = %id, error = %e, "outbox removal failed");
     }
+    // And the images its tools showed.
+    let kept = crate::llm_proxy::KeptImages::of(&state.workspace_root, id);
+    if let Err(e) = tokio::fs::remove_dir_all(&kept.dir).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(agent_id = %id, error = %e, "kept images removal failed");
+    }
 
     info!(agent_id = %id, "agent deleted");
     Ok(StatusCode::NO_CONTENT)
@@ -1275,6 +1282,47 @@ mod tests {
         assert!(check_model(&state, Some(&json!("gpt-5"))).is_err());
         assert!(check_model(&state, Some(&json!("openai:gpt-4o"))).is_err());
         assert!(check_model(&state, Some(&json!(5))).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_deleted_agent_takes_its_workspace_outbox_and_kept_images() {
+        let (mut state, owner) = crate::auth::tests::state_with(false).await;
+        let root = tempfile::tempdir().unwrap();
+        state.workspace_root = root.path().to_path_buf();
+        let agent = havn_db::repo::agents::create(
+            &state.db,
+            havn_db::repo::agents::NewAgent {
+                owner_id: owner,
+                team_id: None,
+                name: "gone",
+                config: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let kept = crate::llm_proxy::KeptImages::of(root.path(), agent.id);
+        for dir in [
+            super::workspace_for(&state, agent.id),
+            crate::outbox::dir(root.path(), agent.id),
+            kept.dir.clone(),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("x"), b"x").unwrap();
+        }
+        let user = crate::auth::AuthedUser {
+            id: owner,
+            display_name: "owner".into(),
+        };
+        super::delete(
+            axum::extract::State(state.clone()),
+            user,
+            axum::extract::Path(agent.id.to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(!super::workspace_for(&state, agent.id).exists());
+        assert!(!crate::outbox::dir(root.path(), agent.id).exists());
+        assert!(!kept.dir.exists());
     }
 
     #[test]
