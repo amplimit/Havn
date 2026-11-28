@@ -799,6 +799,13 @@ pub async fn delete(
     {
         warn!(agent_id = %id, error = %e, "outbox removal failed");
     }
+    // And the images its tools showed.
+    let kept = crate::llm_proxy::KeptImages::of(&state.workspace_root, id, None);
+    if let Err(e) = tokio::fs::remove_dir_all(&kept.dir).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(agent_id = %id, error = %e, "kept images removal failed");
+    }
 
     info!(agent_id = %id, "agent deleted");
     Ok(StatusCode::NO_CONTENT)

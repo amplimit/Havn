@@ -742,10 +742,17 @@ pub async fn chat_delete(
     havn_db::repo::cron::forget_chat(&state.db, agent.id, &conversation).await?;
     // The files it carried go with it (issue #229): those the person sent,
     // which the runtime removed as it told that no other chat names them
-    // (issue #322), and those the agent sent.
+    // (issue #322), and those the agent sent; and the images its tools
+    // showed (issue #354).
     let outbox = crate::outbox::dir(&state.workspace_root, agent.id);
+    let kept = crate::llm_proxy::KeptImages::of(
+        &state.workspace_root,
+        agent.id,
+        Some(conversation.clone()),
+    );
     let chat = conversation.clone();
     let sent = tokio::task::spawn_blocking(move || {
+        kept.forget();
         let sent = crate::outbox::list(&outbox, Some(&chat), usize::MAX);
         for file in &sent {
             crate::outbox::remove(&outbox, &file.id);

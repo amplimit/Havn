@@ -3044,8 +3044,22 @@ async fn handle_llm_request(
                 ar.max_tokens,
                 ctx.llm.max_tokens_ceiling,
             );
-            let seeing =
-                llm_proxy::send_seeing(ar, workspace, limits, context, show, try_blind, send);
+            // Images its tools showed, kept as they were shown (issue #354).
+            let kept = llm_proxy::KeptImages::of(
+                &ctx.workspace_root,
+                agent_id,
+                req.reply.as_ref().and_then(|r| r.conversation.clone()),
+            );
+            let seeing = llm_proxy::send_seeing(
+                ar,
+                workspace,
+                Some(kept),
+                limits,
+                context,
+                show,
+                try_blind,
+                send,
+            );
             // A call shown to nobody is not cut short: it runs on and
             // records what it used, as before issue #305, and the turn's
             // stop is answered at once with nothing written.
