@@ -448,8 +448,7 @@ impl ToolRegistry {
             // The snapshot guard is not held across the approval wait.
             let verdict = {
                 let snapshot = hooks.load();
-                (!snapshot.is_empty())
-                    .then(|| snapshot.veto(name, &flatten_input_for_hook(name, &input)))
+                (!snapshot.is_empty()).then(|| snapshot.veto_any(name, &hook_inputs(name, &input)))
             };
             if let Some(veto) = verdict {
                 match veto {
@@ -577,6 +576,48 @@ fn flatten_input_for_hook(tool: &str, input: &serde_json::Value) -> String {
         // raw JSON if they want to be precise; deny patterns over the
         // raw blob are blunt but safe.
         _ => input.to_string(),
+    }
+}
+
+/// What hook rules match for a call: its flattened input and, when the
+/// input has a `path`, that path as written and as the tools resolve it,
+/// so a rule such as `^private/` also stops `./private/a.txt` and
+/// ` private/a.txt`, for any tool that takes a path.
+fn hook_inputs(tool: &str, input: &serde_json::Value) -> Vec<String> {
+    let mut inputs = vec![flatten_input_for_hook(tool, input)];
+    if let Some(path) = input.get("path").and_then(serde_json::Value::as_str) {
+        for form in [path.to_string(), resolved_path(path)] {
+            if !inputs.contains(&form) {
+                inputs.push(form);
+            }
+        }
+    }
+    inputs
+}
+
+/// `path` as the file tools and the gateway's resolve it, by its text
+/// alone: trimmed, without `.` segments, repeated or trailing `/`, and
+/// with `..` taking off the segment before it. A path whose `..` goes
+/// above its start is left as given (trimmed): the tools refuse it.
+fn resolved_path(path: &str) -> String {
+    let path = path.trim();
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    return path.to_string();
+                }
+            }
+            name => parts.push(name),
+        }
+    }
+    let joined = parts.join("/");
+    if path.starts_with('/') {
+        format!("/{joined}")
+    } else {
+        joined
     }
 }
 
@@ -766,6 +807,89 @@ mod tests {
             .await;
         assert!(res.is_error(), "{}", res.text());
         assert!(!dir.path().join("out.md").exists());
+    }
+
+    #[test]
+    fn a_path_resolves_as_the_tools_find_its_file() {
+        for (given, resolved) in [
+            ("private/a.txt", "private/a.txt"),
+            ("./private/a.txt", "private/a.txt"),
+            ("././private/a.txt", "private/a.txt"),
+            (" private/a.txt\n", "private/a.txt"),
+            (".//private//a.txt", "private/a.txt"),
+            ("private/./a.txt", "private/a.txt"),
+            ("x/../private/a.txt", "private/a.txt"),
+            ("private/", "private"),
+            (".", ""),
+            ("../private/a.txt", "../private/a.txt"),
+            ("x/../../private/a.txt", "x/../../private/a.txt"),
+            ("/private/./a.txt", "/private/a.txt"),
+        ] {
+            assert_eq!(resolved_path(given), resolved, "{given:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_rules_see_a_path_as_the_tool_resolves_it() {
+        use crate::hooks::Veto;
+        let mut policy = Policy::default();
+        for tool in ["file_read", "send_file", "shell"] {
+            policy.hooks.pre_tool_use.push(havn_core::ToolHookRule {
+                tool: tool.into(),
+                deny: vec!["^private/".into(), r"^\./raw$".into()],
+                ask: vec!["^shared/".into()],
+            });
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let set = crate::hooks::load(&policy.hooks, dir.path())
+            .await
+            .expect("hooks");
+        let veto =
+            |tool: &str, input: serde_json::Value| set.veto_any(tool, &hook_inputs(tool, &input));
+        // send_file's input is matched as its JSON, and its path besides.
+        for tool in ["file_read", "send_file"] {
+            for path in [
+                "private/a",
+                "./private/a",
+                " private/a",
+                ".//private/a",
+                "x/../private/a",
+                "private//a/",
+                "./raw",
+            ] {
+                let got = veto(tool, serde_json::json!({"path": path}));
+                assert!(matches!(got, Veto::Deny { .. }), "{tool} {path:?}: {got:?}");
+            }
+            for path in ["shared/a", "./shared/a", " shared//a\n", "x/../shared/a"] {
+                let got = veto(tool, serde_json::json!({"path": path}));
+                assert!(matches!(got, Veto::Ask { .. }), "{tool} {path:?}: {got:?}");
+            }
+            // A path above the workspace, or absolute, is refused by the
+            // tool itself.
+            for path in [
+                "public/a",
+                "./public/a",
+                "privates/a",
+                "../private/a",
+                "/private/a",
+            ] {
+                let got = veto(tool, serde_json::json!({"path": path}));
+                assert_eq!(got, Veto::Allow, "{tool} {path:?}");
+            }
+        }
+        // A tool without a path is matched as before.
+        assert_eq!(
+            hook_inputs("shell", &serde_json::json!({"command": "./private/a"})),
+            ["./private/a"]
+        );
+        assert_eq!(
+            veto("shell", serde_json::json!({"command": "./private/a"})),
+            Veto::Allow
+        );
+        assert!(matches!(
+            veto("shell", serde_json::json!({"command": "private/a"})),
+            Veto::Deny { .. }
+        ));
     }
 
     #[tokio::test]

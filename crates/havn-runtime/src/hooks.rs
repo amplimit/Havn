@@ -27,8 +27,10 @@
 //! Hooks are guardrails against model mistakes, not a security
 //! boundary: each pattern is a regex on a *flattened-string view* of the
 //! input (the shell tool's `command` field, the file_write's `path`,
-//! etc.), and a determined agent can phrase the same action so no
-//! pattern matches (`rm  -rf`, `cd / && rm -rf`, a script file).
+//! etc.; a `path` is also matched as the tools resolve it, so
+//! `./private/a` counts as `private/a`), and a determined agent can
+//! phrase the same action so no pattern matches (`rm  -rf`,
+//! `cd / && rm -rf`, a script file).
 //! Enforcement belongs to the policy permissions (`can_use_shell`,
 //! `can_access_network`, `network_policy`, mounts) and the sandbox.
 //!
@@ -307,6 +309,25 @@ impl HookSet {
             Some(reason) => Veto::Ask { reason },
             None => Veto::Allow,
         }
+    }
+
+    /// [`Self::veto`] over several forms of one call's input, such as a
+    /// path as written and as the tool resolves it: a deny for any form
+    /// wins, then an ask for any.
+    pub fn veto_any(&self, tool: &str, inputs: &[String]) -> Veto {
+        let mut ask = None;
+        for input in inputs {
+            match self.veto(tool, input) {
+                Veto::Allow => {}
+                deny @ Veto::Deny { .. } => return deny,
+                Veto::Ask { reason } => {
+                    if ask.is_none() {
+                        ask = Some(reason);
+                    }
+                }
+            }
+        }
+        ask.map_or(Veto::Allow, |reason| Veto::Ask { reason })
     }
 
     pub fn is_empty(&self) -> bool {

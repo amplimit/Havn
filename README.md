@@ -341,7 +341,7 @@ The policy an agent's tools and sandbox get is resolved when the agent starts, s
 
 ## Tool Hooks
 
-PreToolUse hooks refuse a tool call before it runs when one of its regex patterns matches the call's main input (the shell command, the file path, the URL). The agent sees the refusal as the tool result and can adjust its plan.
+PreToolUse hooks refuse a tool call before it runs when one of its regex patterns matches the call's main input (the shell command, the file path, the URL). A path is matched both as written and as the tool resolves it, so a rule for `^private/` also covers `./private/a.txt`. The agent sees the refusal as the tool result and can adjust its plan.
 
 Operators put hooks in the policy (a role's policy, or a per-agent override), under `hooks`:
 
