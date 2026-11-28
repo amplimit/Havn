@@ -3480,9 +3480,10 @@ async fn handle_inbound(
                 steps::without_results_of(
                     &mut done,
                     |tool| {
-                        // What a transcript says, though the owner allowed
-                        // it before it ran (issue #230).
-                        matches!(tool, "subagent_spawn" | "transcribe")
+                        // What a transcript or a video's answer says, though
+                        // the owner allowed it before it ran (issues #230
+                        // and #355).
+                        matches!(tool, "subagent_spawn" | "transcribe" | "watch_video")
                             || approvals::Review::of(tool) == Some(approvals::Review::Result)
                     },
                     lang().pick(

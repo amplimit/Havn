@@ -223,7 +223,7 @@ pub struct Gateway<'a> {
 
 /// What a transcription for `agent`, under `policy`, is billed as: the
 /// agent owner's credentials, the agent's budget.
-fn model_call<'a>(
+pub(crate) fn model_call<'a>(
     gateway: Gateway<'a>,
     agent: &havn_db::repo::agents::Agent,
     policy: &'a havn_core::Policy,
@@ -271,24 +271,25 @@ static TOOL_RUNNING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(
 /// its first kilobytes.
 const HEAD_BYTES: usize = 4096;
 
-/// A user whose agents' `transcribe` call is running: one at a time.
-struct UserCall(havn_core::UserId);
+/// A user whose agents' call of a gateway tool (`transcribe`,
+/// `watch_video`) is running: one at a time, per tool.
+pub(crate) struct UserCall(&'static str, havn_core::UserId);
+
+type Running = std::sync::Mutex<std::collections::HashSet<(&'static str, havn_core::UserId)>>;
 
 impl UserCall {
-    fn running() -> &'static std::sync::Mutex<std::collections::HashSet<havn_core::UserId>> {
-        static RUNNING: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashSet<havn_core::UserId>>,
-        > = std::sync::OnceLock::new();
+    fn running() -> &'static Running {
+        static RUNNING: std::sync::OnceLock<Running> = std::sync::OnceLock::new();
         RUNNING.get_or_init(Default::default)
     }
 
-    fn take(user: havn_core::UserId) -> Option<Self> {
+    pub(crate) fn take(tool: &'static str, user: havn_core::UserId) -> Option<Self> {
         // The lock is let go before a `UserCall` is made: its drop takes it.
         let free = Self::running()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(user);
-        if free { Some(Self(user)) } else { None }
+            .insert((tool, user));
+        if free { Some(Self(tool, user)) } else { None }
     }
 }
 
@@ -297,7 +298,7 @@ impl Drop for UserCall {
         Self::running()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.0);
+            .remove(&(self.0, self.1));
     }
 }
 
@@ -324,7 +325,7 @@ pub async fn run_tool(
     if !policy.permissions.transcribes() {
         return Err("this agent's policy does not allow transcribing audio".into());
     }
-    let Some(_mine) = UserCall::take(agent.owner_id) else {
+    let Some(_mine) = UserCall::take(TOOL_NAME, agent.owner_id) else {
         return Err(
             "another transcription for this user's agents is running; wait for it to end".into(),
         );
@@ -694,7 +695,12 @@ async fn by_model(
     )
     .await
     .map_err(|e| format!("the transcription model failed: {e}"))?;
-    Ok(answer
+    Ok(text_of(&answer))
+}
+
+/// The text of a model's answer.
+pub(crate) fn text_of(answer: &llm_proxy::AnthropicResponse) -> String {
+    answer
         .content
         .as_array()
         .into_iter()
@@ -702,7 +708,7 @@ async fn by_model(
         .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
         .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str))
         .collect::<Vec<_>>()
-        .join(""))
+        .join("")
 }
 
 #[cfg(test)]
@@ -792,12 +798,17 @@ mod tests {
     #[test]
     fn a_user_s_agents_transcribe_one_at_a_time() {
         let (one, other) = (havn_core::UserId::new(), havn_core::UserId::new());
-        let running = UserCall::take(one).expect("the first");
-        assert!(UserCall::take(one).is_none(), "the second waits");
-        let elsewhere = UserCall::take(other).expect("another user's");
+        let running = UserCall::take(TOOL_NAME, one).expect("the first");
+        assert!(UserCall::take(TOOL_NAME, one).is_none(), "the second waits");
+        let elsewhere = UserCall::take(TOOL_NAME, other).expect("another user's");
+        let other_tool = UserCall::take("watch_video", one).expect("another tool's");
         drop(running);
-        assert!(UserCall::take(one).is_some(), "once the first ended");
+        assert!(
+            UserCall::take(TOOL_NAME, one).is_some(),
+            "once the first ended"
+        );
         drop(elsewhere);
+        drop(other_tool);
     }
 
     #[test]

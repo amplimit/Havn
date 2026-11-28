@@ -76,10 +76,10 @@ pub struct ToolHook {
 impl ToolHook {
     /// Whether the rule is about `tool`: its name, a prefix ending in `*`,
     /// and `file_write` covering `file_edit`, which changes the same files.
-    /// `view_image` and `transcribe` read files: a rule about `file_read`
-    /// covers them.
+    /// `view_image`, `transcribe` and `watch_video` read files: a rule
+    /// about `file_read` covers them.
     fn covers(&self, tool: &str) -> bool {
-        if matches!(tool, "view_image" | "transcribe") && self.covers("file_read") {
+        if matches!(tool, "view_image" | "transcribe" | "watch_video") && self.covers("file_read") {
             return true;
         }
         match self.tool.strip_suffix('*') {
@@ -578,6 +578,15 @@ mod tests {
             Veto::Deny { .. }
         ));
         assert!(matches!(set.veto("transcribe", "call.ogg"), Veto::Allow));
+        assert!(matches!(
+            set.veto("watch_video", "private/talk.mp4"),
+            Veto::Deny { .. }
+        ));
+        assert!(matches!(
+            set.veto("watch_video", "shared/talk.mp4"),
+            Veto::Ask { .. }
+        ));
+        assert!(matches!(set.veto("watch_video", "talk.mp4"), Veto::Allow));
     }
 
     #[test]
