@@ -67,10 +67,10 @@ impl Review {
     pub fn of(tool: &str) -> Option<Self> {
         match tool {
             "memory_search" | "file_read" | "file_find" | "file_search" => Some(Self::Result),
-            // `transcribe` sends a file out and spends before anyone sees
-            // what it gave (issue #230).
+            // `transcribe` and `watch_video` send a file out and spend
+            // before anyone sees what they gave (issues #230 and #355).
             "shell" | "process" | "file_write" | "file_edit" | "skill_manage" | "send_file"
-            | "set_timezone" | "view_image" | "transcribe" => Some(Self::Call),
+            | "set_timezone" | "view_image" | "transcribe" | "watch_video" => Some(Self::Call),
             _ if tool.starts_with("mcp__") => Some(Self::Call),
             _ => None,
         }
@@ -718,6 +718,7 @@ mod tests {
         assert!(matches!(Review::of("view_image"), Some(Review::Call)));
         assert!(matches!(Review::of("file_read"), Some(Review::Result)));
         assert!(matches!(Review::of("transcribe"), Some(Review::Call)));
+        assert!(matches!(Review::of("watch_video"), Some(Review::Call)));
     }
 
     fn decision(channel: &str, id: &str, approve: bool, remember: bool) -> ApprovalDecision {

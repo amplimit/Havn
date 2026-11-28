@@ -319,9 +319,9 @@ impl ToolRegistry {
     /// `policy.context_toolsets[context].disabled`.
     /// Disabling `file_write` disables `file_edit` too: both change files,
     /// and a policy written before `file_edit` existed means both. Likewise
-    /// disabling `file_read` disables `file_find`, `file_search`, `view_image`
-    /// and `transcribe`, and disabling `shell` disables `process`, which
-    /// reaches what it started.
+    /// disabling `file_read` disables `file_find`, `file_search`,
+    /// `view_image`, `transcribe` and `watch_video`, and disabling `shell`
+    /// disables `process`, which reaches what it started.
     fn disabled_in(&self, context: &str, tool_name: &str) -> bool {
         // Scheduled runs, heartbeats and other agents' queries answer no
         // one's chat message: there are no past chats of theirs to search.
@@ -344,7 +344,11 @@ impl ToolRegistry {
                         || (d == "file_read"
                             && matches!(
                                 tool_name,
-                                "file_find" | "file_search" | "view_image" | "transcribe"
+                                "file_find"
+                                    | "file_search"
+                                    | "view_image"
+                                    | "transcribe"
+                                    | "watch_video"
                             ))
                         || (d == "shell" && tool_name == "process")
                 })
@@ -557,7 +561,9 @@ fn flatten_input_for_hook(tool: &str, input: &serde_json::Value) -> String {
     match tool {
         "shell" => pick("command"),
         "web_fetch" => pick("url"),
-        "file_read" | "file_write" | "file_edit" | "view_image" | "transcribe" => pick("path"),
+        "file_read" | "file_write" | "file_edit" | "view_image" | "transcribe" | "watch_video" => {
+            pick("path")
+        }
         "file_find" | "file_search" => pick("path"),
         "memory_search" => pick("query"),
         "memory_remember" | "memory_forget" => pick("key"),
@@ -821,11 +827,23 @@ mod tests {
                         disabled: vec!["file_read".into()],
                     },
                 );
-                let names = names_in(&registry(policy).schemas_for(context::CRON));
+                let reg = registry(policy);
+                let names = names_in(&reg.schemas_for(context::CRON));
                 assert!(
                     !names.contains(&"file_find".into())
                         && !names.contains(&"file_search".into())
                         && !names.contains(&"view_image".into())
+                );
+                // The gateway's tools that read a file too.
+                assert!(reg.disabled_in(context::CRON, "transcribe"));
+                assert!(reg.disabled_in(context::CRON, "watch_video"));
+                assert!(!reg.disabled_in(context::WEBCHAT, "watch_video"));
+                assert_eq!(
+                    flatten_input_for_hook(
+                        "watch_video",
+                        &serde_json::json!({"path": "talk.mp4", "question": "what is shown?"})
+                    ),
+                    "talk.mp4"
                 );
             })
             .await;

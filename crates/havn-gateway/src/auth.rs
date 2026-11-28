@@ -448,6 +448,7 @@ pub(crate) mod tests {
             workspace_browse: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             channel_texts: Arc::new(arc_swap::ArcSwap::from_pointee(Default::default())),
             transcription: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+            video: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
             models: Arc::new(arc_swap::ArcSwap::from_pointee(
                 crate::model_catalog::ModelCatalog::default(),
             )),

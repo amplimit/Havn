@@ -497,6 +497,25 @@ fn translate_message_to_openai(
                     "input_audio": {"data": data, "format": format},
                 }));
             }
+            // A video (issue #355, `watch_video`), as OpenRouter's
+            // `video_url` part with a data URL.
+            "video"
+                if m.role == "user"
+                    && block.pointer("/source/type").and_then(Value::as_str) == Some("base64") =>
+            {
+                let media = block
+                    .pointer("/source/media_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("video/mp4");
+                let data = block
+                    .pointer("/source/data")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                images.push(json!({
+                    "type": "video_url",
+                    "video_url": {"url": format!("data:{media};base64,{data}")},
+                }));
+            }
             // A model's reasoning goes back only where it asks for it.
             "thinking" => {
                 if reasoning_field.is_some()
@@ -917,6 +936,30 @@ mod tests {
         assert_eq!(parts[1]["type"], "input_audio");
         assert_eq!(parts[1]["input_audio"]["format"], "mp3");
         assert_eq!(parts[1]["input_audio"]["data"], "AAAA");
+    }
+
+    #[test]
+    fn a_video_becomes_a_video_url_part() {
+        let r = req(
+            vec![AnthropicMessage {
+                role: "user".into(),
+                content: json!([
+                    {"type": "video", "source": {"type": "base64", "media_type": "video/webm", "data": "AAAA"}},
+                    {"type": "text", "text": "what does it print?"},
+                ]),
+            }],
+            None,
+        );
+        let body = anthropic_to_openai(&r, "max_tokens", "openrouter").expect("translate");
+        let parts = body["messages"][0]["content"].as_array().expect("parts");
+        assert_eq!(
+            parts[0],
+            json!({"type": "text", "text": "what does it print?"})
+        );
+        assert_eq!(
+            parts[1],
+            json!({"type": "video_url", "video_url": {"url": "data:video/webm;base64,AAAA"}})
+        );
     }
 
     #[test]

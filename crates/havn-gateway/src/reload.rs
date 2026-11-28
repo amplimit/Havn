@@ -108,6 +108,10 @@ pub const RULES: &[ReloadRule] = &[
         kind: ReloadKind::Hot,
     },
     ReloadRule {
+        prefix: "video",
+        kind: ReloadKind::Hot,
+    },
+    ReloadRule {
         prefix: "attachments",
         kind: ReloadKind::Hot,
     },
@@ -222,6 +226,8 @@ pub struct ReloadHandles {
     pub channel_texts: Arc<ArcSwap<crate::config::ChannelTexts>>,
     /// `[transcription]`.
     pub transcription: Arc<ArcSwap<Option<crate::transcribe::Transcription>>>,
+    /// `[video]`.
+    pub video: Arc<ArcSwap<Option<crate::video::Video>>>,
     /// `[attachments]`.
     pub attachments: Arc<ArcSwap<crate::config::AttachmentLimits>>,
     /// `[channels]`: the accounts and who may reach them.
@@ -239,6 +245,7 @@ impl ReloadHandles {
             workspace_browse: Arc::new(std::sync::atomic::AtomicBool::new(cfg.workspace.browse)),
             channel_texts: Arc::new(ArcSwap::from_pointee(cfg.channel_texts.clone())),
             transcription: Arc::new(ArcSwap::from_pointee(cfg.transcription.clone())),
+            video: Arc::new(ArcSwap::from_pointee(cfg.video.clone())),
             attachments: Arc::new(ArcSwap::from_pointee(cfg.attachments.clone())),
             channels: Arc::new(ArcSwap::from_pointee(cfg.channels.clone())),
             endpoints: Arc::new(cfg.llm.endpoints.clone()),
@@ -283,6 +290,12 @@ impl ReloadHandles {
                 info!(
                     on = new.transcription.is_some(),
                     "hot-reloaded the transcription of audio"
+                );
+            } else if path.starts_with("video") {
+                self.video.store(Arc::new(new.video.clone()));
+                info!(
+                    on = new.video.is_some(),
+                    "hot-reloaded the model that watches videos"
                 );
             } else if path.starts_with("channels") {
                 let mut waiting = Vec::new();
@@ -547,6 +560,22 @@ mod tests {
         let account = &now["telegram"].accounts[0];
         assert_eq!(account.group_policy, crate::config::GroupPolicy::Allowlist);
         assert_eq!(account.dm_policy, crate::config::DmPolicy::Open);
+    }
+
+    #[test]
+    fn handles_apply_hot_swaps_the_video_model() {
+        let cfg = GatewayConfig::default();
+        let handles = ReloadHandles::from_config(&cfg);
+        assert!(handles.video.load().is_none());
+        let mut edited = cfg.clone();
+        edited.video = Some(crate::video::Video::Model {
+            model: "openrouter:google/gemini-3.8-flash".into(),
+            max_mb: 20,
+        });
+        let plan = ReloadPlan::build(&["video".to_string()]);
+        assert!(plan.restart_paths.is_empty());
+        handles.apply_hot(&edited, &plan.hot_paths);
+        assert_eq!(*handles.video.load_full(), edited.video);
     }
 
     #[test]

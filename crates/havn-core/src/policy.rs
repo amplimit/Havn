@@ -417,6 +417,12 @@ pub struct Permissions {
     /// [`Permissions::transcribes`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub can_transcribe: Option<bool>,
+    /// `watch_video`, run by the gateway with `[video]`: a video of the
+    /// agent's workspace goes to the video model, on the owner's budget
+    /// (issue #355). Unset, it is what `transcribe` is: see
+    /// [`Permissions::watches_video`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_watch_video: Option<bool>,
 }
 
 impl Permissions {
@@ -426,6 +432,14 @@ impl Permissions {
     #[must_use]
     pub fn transcribes(&self) -> bool {
         self.can_transcribe.unwrap_or(self.can_fetch_web)
+    }
+
+    /// Whether `watch_video` is allowed: `can_watch_video`, or, unset, what
+    /// [`Permissions::transcribes`] says, so a policy that keeps audio files
+    /// from leaving the host keeps videos from it too.
+    #[must_use]
+    pub fn watches_video(&self) -> bool {
+        self.can_watch_video.unwrap_or_else(|| self.transcribes())
     }
 }
 
@@ -445,6 +459,7 @@ impl Default for Permissions {
             can_search_web: true,
             can_fetch_web: true,
             can_transcribe: None,
+            can_watch_video: None,
         }
     }
 }
@@ -929,6 +944,7 @@ impl Policy {
                 can_search_web: own.can_search_web && cap.can_search_web,
                 can_fetch_web: own.can_fetch_web && cap.can_fetch_web,
                 can_transcribe: Some(own.transcribes() && cap.transcribes()),
+                can_watch_video: Some(own.watches_video() && cap.watches_video()),
             },
             network_policy: NetworkPolicy {
                 egress_allowed: self.network_policy.egress_allowed
@@ -1037,6 +1053,7 @@ impl Policy {
                 can_search_web: a.can_search_web || b.can_search_web,
                 can_fetch_web: a.can_fetch_web || b.can_fetch_web,
                 can_transcribe: Some(a.transcribes() || b.transcribes()),
+                can_watch_video: Some(a.watches_video() || b.watches_video()),
             },
             network_policy: NetworkPolicy {
                 egress_allowed: self.network_policy.egress_allowed
@@ -1405,6 +1422,19 @@ mod tests {
     }
 
     #[test]
+    fn watching_video_follows_transcribing_unless_set() {
+        let read = |json: &str| -> Permissions { serde_json::from_str(json).expect("permissions") };
+        assert!(read("{}").watches_video());
+        assert!(!read(r#"{"can_fetch_web": false}"#).watches_video());
+        assert!(!read(r#"{"can_transcribe": false}"#).watches_video());
+        assert!(read(r#"{"can_transcribe": false, "can_watch_video": true}"#).watches_video());
+        assert!(!read(r#"{"can_watch_video": false}"#).watches_video());
+        assert!(read(r#"{"can_watch_video": false}"#).transcribes());
+        let unset = serde_json::to_value(Permissions::default()).expect("json");
+        assert!(unset.get("can_watch_video").is_none(), "{unset}");
+    }
+
+    #[test]
     fn clamp_never_widens_permissions_or_limits() {
         let mut cap = Policy::default();
         cap.permissions.can_use_shell = false;
@@ -1412,6 +1442,7 @@ mod tests {
         cap.permissions.can_search_web = false;
         cap.permissions.can_fetch_web = false;
         cap.permissions.can_transcribe = Some(false);
+        cap.permissions.can_watch_video = Some(false);
         cap.resource_limits.memory_mb = 256;
         cap.resource_limits.pids_max = 32;
         cap.budget.max_tokens_per_day = 10_000;
@@ -1431,6 +1462,7 @@ mod tests {
         assert!(!p.permissions.can_search_web);
         assert!(!p.permissions.can_fetch_web);
         assert!(!p.permissions.transcribes());
+        assert!(!p.permissions.watches_video());
         assert!(!p.network_policy.egress_allowed);
         assert_eq!(p.resource_limits.memory_mb, 256);
         assert_eq!(p.resource_limits.pids_max, 32);
@@ -1472,6 +1504,7 @@ mod tests {
     fn widen_takes_the_most_permissive_of_two_roles() {
         let mut a = Policy::default();
         a.permissions.can_use_shell = false;
+        a.permissions.can_watch_video = Some(false);
         a.resource_limits.memory_mb = 512;
         a.budget.max_tokens_per_day = 1_000;
         a.allowed_models = vec!["m1".into()];
@@ -1494,6 +1527,10 @@ mod tests {
         );
         let p = a.widen_with(&b);
         assert!(p.permissions.can_use_shell);
+        assert!(
+            p.permissions.watches_video(),
+            "b does not set it, so b transcribes"
+        );
         assert_eq!(p.resource_limits.memory_mb, 1024);
         assert_eq!(p.budget.max_tokens_per_day, 0);
         assert_eq!(p.allowed_models, vec!["m1".to_string(), "m2".to_string()]);
